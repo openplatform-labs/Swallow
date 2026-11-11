@@ -2,6 +2,8 @@
 
 > 기준: `novuhq/novu`의 `next`, 커밋 `895388f37efe9e06de0aa333e5727303e6ad6853`. 정적 코드 분석이며 모든 설정·버전·배포 모드를 실행 검증한 명세는 아니다. 100% 호환을 선언하기 위한 테스트 목록의 출발점으로 유지한다.
 
+> 현재 미구현·미검증 항목은 [구현·검증 현황](RUST_IMPLEMENTATION_STATUS_KO.md)에 정리한다.
+
 ## 패키지와 서비스 경계
 
 사용자가 제공한 [GitHub Packages 목록](https://github.com/orgs/novuhq/packages?repo_name=novu)은 배포된 패키지 목록이며 그 자체가 의존성 그래프나 현재 서비스 집합을 증명하지 않는다. 해당 화면의 `web`, `widget`, `embed`, `sdk`, `base`를 기준 커밋에서 모두 필수 서비스로 간주하지 않는다. 이미지 태그와 소스 커밋의 대응도 별도로 확인해야 한다.
