@@ -1,0 +1,71 @@
+import { TenantRepository } from '@novu/dal';
+import { UserSession } from '@novu/testing';
+import axios from 'axios';
+import type { AxiosResponse } from 'axios';
+import { expect } from 'chai';
+
+describe('Delete Tenant - /tenants/:identifier (DELETE) #novu-v0', () => {
+  let session: UserSession;
+  const tenantRepository = new TenantRepository();
+
+  beforeEach(async () => {
+    session = new UserSession();
+    await session.initialize();
+  });
+
+  it('should delete newly created tenant', async () => {
+    await tenantRepository.create({
+      _organizationId: session.organization._id,
+      _environmentId: session.environment._id,
+      identifier: 'identifier_123',
+      name: 'name_123',
+      data: { test1: 'test value1', test2: 'test value2' },
+    });
+
+    const existingTenant = await tenantRepository.findOne({
+      _environmentId: session.environment._id,
+      identifier: 'identifier_123',
+    });
+
+    expect(existingTenant).to.be.ok;
+
+    await deleteTenant({
+      session,
+      identifier: 'identifier_123',
+    });
+
+    const deletedTenant = await tenantRepository.findOne({
+      _environmentId: session.environment._id,
+      identifier: 'identifier_123',
+    });
+
+    expect(deletedTenant).to.equal(null);
+  });
+
+  it('should throw exception while trying to delete not existing tenant', async () => {
+    const identifier = '4f3c4146-e471-4fe8-b23d-e3411689db00';
+
+    try {
+      await deleteTenant({
+        session,
+        identifier,
+      });
+
+      throw new Error('');
+    } catch (e) {
+      expect(e?.response?.data?.message || e?.message).to.contains(
+        `Tenant with identifier: ${identifier} does not exist under environment ${session.environment._id}`
+      );
+    }
+  });
+});
+
+export async function deleteTenant({ session, identifier }: { session; identifier?: string }): Promise<AxiosResponse> {
+  const axiosInstance = axios.create();
+
+  return await axiosInstance.delete(`${session.serverUrl}/v1/tenants/${identifier}`, {
+    headers: {
+      authorization: `ApiKey ${session.apiKey}`,
+    },
+  });
+}

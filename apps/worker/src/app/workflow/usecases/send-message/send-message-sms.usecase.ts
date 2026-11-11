@@ -1,0 +1,484 @@
+import { Injectable } from '@nestjs/common';
+import { ModuleRef } from '@nestjs/core';
+import {
+  CompileTemplate,
+  CompileTemplateCommand,
+  CreateExecutionDetails,
+  CreateExecutionDetailsCommand,
+  DetailEnum,
+  GetNovuProviderCredentials,
+  InstrumentUsecase,
+  messageWebhookMapper,
+  SelectIntegration,
+  SelectVariant,
+  SendWebhookMessage,
+  SmsFactory,
+} from '@novu/application-generic';
+
+import { IntegrationEntity, MessageEntity, MessageRepository, SubscriberRepository } from '@novu/dal';
+import { SmsOutput } from '@novu/framework/internal';
+import {
+  ChannelTypeEnum,
+  DeliveryLifecycleDetail,
+  DeliveryLifecycleStatusEnum,
+  ExecutionDetailsSourceEnum,
+  ExecutionDetailsStatusEnum,
+  WebhookEventEnum,
+  WebhookObjectTypeEnum,
+} from '@novu/shared';
+import { addBreadcrumb } from '@sentry/node';
+import { PlatformException } from '../../../shared/utils';
+import { combineProviderOverrides, mergeTriggerProviderOverrides, SendMessageBase } from './send-message.base';
+import { SendMessageChannelCommand } from './send-message-channel.command';
+import { SendMessageResult, SendMessageStatus } from './send-message-type.usecase';
+
+type SmsMessageOverrides = {
+  to?: string;
+  from?: string;
+  content?: string;
+  customData?: Record<string, unknown>;
+};
+
+@Injectable()
+export class SendMessageSms extends SendMessageBase {
+  channelType = ChannelTypeEnum.SMS;
+
+  constructor(
+    protected subscriberRepository: SubscriberRepository,
+    protected messageRepository: MessageRepository,
+    protected createExecutionDetails: CreateExecutionDetails,
+    private compileTemplate: CompileTemplate,
+    protected selectIntegration: SelectIntegration,
+    protected getNovuProviderCredentials: GetNovuProviderCredentials,
+    protected selectVariant: SelectVariant,
+    protected moduleRef: ModuleRef,
+    private sendWebhookMessage: SendWebhookMessage
+  ) {
+    super(
+      messageRepository,
+      createExecutionDetails,
+      subscriberRepository,
+      selectIntegration,
+      getNovuProviderCredentials,
+      selectVariant,
+      moduleRef
+    );
+  }
+
+  @InstrumentUsecase()
+  public async execute(command: SendMessageChannelCommand): Promise<SendMessageResult> {
+    const overrideSelectedIntegration = command.overrides?.sms?.integrationIdentifier;
+
+    const selection = await this.getIntegration({
+      organizationId: command.organizationId,
+      environmentId: command.environmentId,
+      channelType: ChannelTypeEnum.SMS,
+      userId: command.userId,
+      identifier: overrideSelectedIntegration as string,
+      filterData: this.getIntegrationFilterData(command),
+    });
+
+    addBreadcrumb({
+      message: 'Sending SMS',
+    });
+
+    const { step } = command;
+
+    if (!step.template) throw new PlatformException(`Unexpected error: SMS template is missing`);
+
+    const { subscriber } = command.compileContext;
+    const template = await this.processVariants(command);
+    const i18nInstance = await this.initiateTranslations(
+      command.environmentId,
+      command.organizationId,
+      subscriber.locale
+    );
+
+    if (template) {
+      step.template = template;
+    }
+
+    const bridgeOutput = command.bridgeData?.outputs as SmsOutput | undefined;
+    let content: string = bridgeOutput?.body || '';
+
+    try {
+      if (!command.bridgeData) {
+        content = await this.compileTemplate.execute(
+          CompileTemplateCommand.create({
+            template: step.template.content as string,
+            data: this.getCompilePayload(command.compileContext),
+          }),
+          i18nInstance
+        );
+
+        if (!content) {
+          throw new PlatformException(`Unexpected error: SMS content is missing`);
+        }
+      }
+    } catch (e) {
+      await this.sendErrorHandlebars(command.job, e.message);
+
+      return {
+        status: SendMessageStatus.FAILED,
+        errorMessage: DetailEnum.MESSAGE_CONTENT_NOT_GENERATED,
+      };
+    }
+
+    if (!selection) {
+      await this.createExecutionDetails.execute(
+        CreateExecutionDetailsCommand.create({
+          ...CreateExecutionDetailsCommand.getDetailsFromJob(command.job),
+          detail: DetailEnum.SUBSCRIBER_NO_ACTIVE_INTEGRATION,
+          source: ExecutionDetailsSourceEnum.INTERNAL,
+          status: ExecutionDetailsStatusEnum.FAILED,
+          isTest: false,
+          isRetry: false,
+          ...(overrideSelectedIntegration
+            ? {
+                raw: JSON.stringify({
+                  integrationIdentifier: overrideSelectedIntegration,
+                }),
+              }
+            : {}),
+        })
+      );
+
+      return {
+        status: SendMessageStatus.FAILED,
+        errorMessage: DetailEnum.SUBSCRIBER_NO_ACTIVE_INTEGRATION,
+      };
+    }
+
+    const { integration } = selection;
+
+    // Conditions or an integration override can send through a different provider
+    // than the one snapshotted onto the job. message_sent traces read job.providerId.
+    command.job.providerId = integration.providerId;
+
+    await this.sendSelectedIntegrationExecution(command.job, selection);
+
+    const overrides = mergeTriggerProviderOverrides(
+      command.overrides,
+      integration?.channel,
+      integration?.providerId,
+      command.step.stepId
+    ) as SmsMessageOverrides;
+    const phone = resolveSmsDestination(overrides.to, command.payload.phone, subscriber.phone);
+
+    const messagePayload = { ...command.payload };
+    delete messagePayload.attachments;
+
+    const message: MessageEntity = await this.messageRepository.create({
+      _notificationId: command.notificationId,
+      _environmentId: command.environmentId,
+      _organizationId: command.organizationId,
+      _subscriberId: command._subscriberId,
+      _templateId: command._templateId,
+      _messageTemplateId: step.template._id,
+      channel: ChannelTypeEnum.SMS,
+      transactionId: command.transactionId,
+      phone,
+      content: this.storeContent() ? content : null,
+      providerId: integration?.providerId,
+      payload: this.payloadToPersist(command, messagePayload),
+      overrides,
+      templateIdentifier: command.identifier,
+      stepId: command.step.stepId,
+      _jobId: command.jobId,
+      tags: command.tags,
+      severity: command.severity,
+      contextKeys: command.contextKeys,
+    });
+
+    await this.createExecutionDetails.execute(
+      CreateExecutionDetailsCommand.create({
+        ...CreateExecutionDetailsCommand.getDetailsFromJob(command.job),
+        detail: DetailEnum.MESSAGE_CREATED,
+        source: ExecutionDetailsSourceEnum.INTERNAL,
+        status: ExecutionDetailsStatusEnum.PENDING,
+        messageId: message._id,
+        isTest: false,
+        isRetry: false,
+        raw: this.storeContent() ? JSON.stringify(messagePayload) : null,
+      })
+    );
+
+    if (!phone || !integration) {
+      return await this.sendErrors(phone, integration, message, command);
+    }
+
+    return await this.sendMessage(phone, integration, content, message, command, overrides);
+  }
+
+  private async sendErrors(
+    phone,
+    integration,
+    message: MessageEntity,
+    command: SendMessageChannelCommand
+  ): Promise<SendMessageResult> {
+    if (!phone) {
+      await this.messageRepository.updateMessageStatus(
+        command.environmentId,
+        message._id,
+        'warning',
+        null,
+        'no_subscriber_phone',
+        'Subscriber does not have active phone'
+      );
+
+      await this.createExecutionDetails.execute(
+        CreateExecutionDetailsCommand.create({
+          ...CreateExecutionDetailsCommand.getDetailsFromJob(command.job),
+          messageId: message._id,
+          detail: DetailEnum.SUBSCRIBER_MISSING_PHONE_NUMBER,
+          source: ExecutionDetailsSourceEnum.INTERNAL,
+          status: ExecutionDetailsStatusEnum.FAILED,
+          isTest: false,
+          isRetry: false,
+        })
+      );
+
+      return {
+        status: SendMessageStatus.SKIPPED,
+        deliveryLifecycleState: {
+          status: DeliveryLifecycleStatusEnum.SKIPPED,
+          detail: DeliveryLifecycleDetail.USER_MISSING_PHONE,
+        },
+      };
+    }
+    if (!integration) {
+      await this.sendErrorStatus(
+        message,
+        'warning',
+        'sms_missing_integration_error',
+        'Subscriber does not have an active sms integration',
+        command
+      );
+
+      await this.createExecutionDetails.execute(
+        CreateExecutionDetailsCommand.create({
+          ...CreateExecutionDetailsCommand.getDetailsFromJob(command.job),
+          messageId: message._id,
+          detail: DetailEnum.SUBSCRIBER_NO_ACTIVE_INTEGRATION,
+          source: ExecutionDetailsSourceEnum.INTERNAL,
+          status: ExecutionDetailsStatusEnum.FAILED,
+          isTest: false,
+          isRetry: false,
+        })
+      );
+
+      return {
+        status: SendMessageStatus.FAILED,
+        errorMessage: DetailEnum.SUBSCRIBER_NO_ACTIVE_INTEGRATION,
+      };
+    }
+    if (!integration?.credentials?.from) {
+      await this.sendErrorStatus(
+        message,
+        'warning',
+        'no_integration_from_phone',
+        'Integration does not have from phone configured',
+        command
+      );
+
+      await this.createExecutionDetails.execute(
+        CreateExecutionDetailsCommand.create({
+          ...CreateExecutionDetailsCommand.getDetailsFromJob(command.job),
+          messageId: message._id,
+          detail: DetailEnum.SUBSCRIBER_NO_ACTIVE_CHANNEL,
+          source: ExecutionDetailsSourceEnum.INTERNAL,
+          status: ExecutionDetailsStatusEnum.FAILED,
+          isTest: false,
+          isRetry: false,
+        })
+      );
+
+      return {
+        status: SendMessageStatus.FAILED,
+        errorMessage: DetailEnum.SUBSCRIBER_NO_ACTIVE_CHANNEL,
+      };
+    }
+
+    return {
+      status: SendMessageStatus.FAILED,
+      errorMessage: DetailEnum.PROVIDER_ERROR,
+    };
+  }
+
+  private async sendMessage(
+    phone: string,
+    integration: IntegrationEntity,
+    content: string,
+    message: MessageEntity,
+    command: SendMessageChannelCommand,
+    overrides: SmsMessageOverrides = {}
+  ): Promise<SendMessageResult> {
+    try {
+      const bridgeBody = (command.bridgeData?.outputs as SmsOutput | undefined)?.body;
+
+      const smsFactory = new SmsFactory();
+      const smsHandler = smsFactory.getHandler(this.buildFactoryIntegration(integration));
+      if (!smsHandler) {
+        throw new PlatformException(`Sms handler for provider ${integration.providerId} is  not found`);
+      }
+
+      const result = await smsHandler.send({
+        to: phone,
+        from: overrides.from || integration.credentials.from,
+        content: bridgeBody || overrides.content || content,
+        id: message._id,
+        customData: overrides.customData || {},
+        bridgeProviderData: omitBlankSmsDestination(
+          combineProviderOverrides(command.bridgeData, command.overrides, command.step.stepId, integration.providerId)
+        ),
+      });
+
+      await this.createExecutionDetails.execute(
+        CreateExecutionDetailsCommand.create({
+          ...CreateExecutionDetailsCommand.getDetailsFromJob(command.job),
+          messageId: message._id,
+          detail: DetailEnum.MESSAGE_SENT,
+          source: ExecutionDetailsSourceEnum.INTERNAL,
+          status: ExecutionDetailsStatusEnum.SUCCESS,
+          isTest: false,
+          isRetry: false,
+          raw: JSON.stringify(result),
+        })
+      );
+
+      if (!result?.id) {
+        return {
+          status: SendMessageStatus.FAILED,
+          errorMessage: DetailEnum.PROVIDER_ERROR,
+        };
+      }
+
+      await this.messageRepository.update(
+        { _environmentId: command.environmentId, _id: message._id },
+        {
+          $set: {
+            identifier: result.id,
+          },
+        }
+      );
+
+      await this.sendWebhookMessage.execute({
+        eventType: WebhookEventEnum.MESSAGE_SENT,
+        objectType: WebhookObjectTypeEnum.MESSAGE,
+        payload: {
+          object: messageWebhookMapper(message, command.subscriberId, {
+            providerResponseId: result.id,
+          }),
+        },
+        organizationId: command.organizationId,
+        environmentId: command.environmentId,
+      });
+
+      return {
+        status: SendMessageStatus.SUCCESS,
+      };
+    } catch (e) {
+      await this.sendErrorStatus(
+        message,
+        'error',
+        'unexpected_sms_error',
+        e.message || e.name || 'Un-expect SMS provider error',
+        command,
+        e
+      );
+
+      await this.sendWebhookMessage.execute({
+        eventType: WebhookEventEnum.MESSAGE_FAILED,
+        objectType: WebhookObjectTypeEnum.MESSAGE,
+        payload: {
+          object: messageWebhookMapper(message, command.subscriberId),
+          error: {
+            message: e.message || e.name || 'Error while sending sms with provider',
+          },
+        },
+        organizationId: command.organizationId,
+        environmentId: command.environmentId,
+      });
+
+      await this.createExecutionDetails.execute(
+        CreateExecutionDetailsCommand.create({
+          ...CreateExecutionDetailsCommand.getDetailsFromJob(command.job),
+          messageId: message._id,
+          detail: DetailEnum.PROVIDER_ERROR,
+          source: ExecutionDetailsSourceEnum.INTERNAL,
+          status: ExecutionDetailsStatusEnum.FAILED,
+          isTest: false,
+          isRetry: false,
+          raw: JSON.stringify({ message: e?.response?.data || e.message, name: e.name }),
+        })
+      );
+
+      return {
+        status: SendMessageStatus.FAILED,
+        errorMessage: DetailEnum.PROVIDER_ERROR,
+      };
+    }
+  }
+
+  public buildFactoryIntegration(integration: IntegrationEntity, _senderName?: string) {
+    return {
+      ...integration,
+      providerId: integration.providerId,
+    };
+  }
+}
+
+function resolveSmsDestination(...candidates: unknown[]): string | undefined {
+  for (const candidate of candidates) {
+    if (isSmsDestination(candidate)) {
+      return candidate;
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * Provider SDKs merge this object over the resolved recipient. A blank `to` would replace the
+ * subscriber or payload phone that `resolveSmsDestination` already chose.
+ */
+function omitBlankSmsDestination(providerData: Record<string, unknown>): Record<string, unknown> {
+  const withoutTopLevelTo = isBlankString(providerData.to) ? withoutKey(providerData, 'to') : providerData;
+  const passthrough = withoutTopLevelTo._passthrough;
+
+  if (!isRecord(passthrough)) {
+    return withoutTopLevelTo;
+  }
+
+  const body = passthrough.body;
+
+  if (!isRecord(body) || !isBlankString(body.to)) {
+    return withoutTopLevelTo;
+  }
+
+  return {
+    ...withoutTopLevelTo,
+    _passthrough: {
+      ...passthrough,
+      body: withoutKey(body, 'to'),
+    },
+  };
+}
+
+function isSmsDestination(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function isBlankString(value: unknown): boolean {
+  return typeof value === 'string' && value.trim().length === 0;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function withoutKey(record: Record<string, unknown>, key: string): Record<string, unknown> {
+  const { [key]: _removed, ...rest } = record;
+
+  return rest;
+}

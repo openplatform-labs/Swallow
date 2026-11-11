@@ -1,0 +1,19 @@
+[package]
+name = "novu-rust-api"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+axum = "0.8"
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+tokio-postgres = "0.7"
+uuid = { version = "1", features = ["v4"] }
+novu-rust-contracts = { path = "../rust-contracts" }
+
+[dev-dependencies]
+novu-postgres-queue = { path = "../../worker/rust-queue" }
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }

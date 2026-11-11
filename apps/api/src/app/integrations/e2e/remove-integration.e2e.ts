@@ -1,0 +1,418 @@
+import { HttpStatus } from '@nestjs/common';
+import {
+  ChannelConnectionRepository,
+  ChannelEndpointRepository,
+  EnvironmentRepository,
+  IntegrationRepository,
+} from '@novu/dal';
+import {
+  ChannelTypeEnum,
+  ChatProviderIdEnum,
+  EmailProviderIdEnum,
+  ENDPOINT_TYPES,
+  PushProviderIdEnum,
+} from '@novu/shared';
+import { UserSession } from '@novu/testing';
+import { expect } from 'chai';
+
+describe('Delete Integration - /integration/:integrationId (DELETE) #novu-v2', () => {
+  let session: UserSession;
+  const integrationRepository = new IntegrationRepository();
+  const envRepository = new EnvironmentRepository();
+  const channelEndpointRepository = new ChannelEndpointRepository();
+  const channelConnectionRepository = new ChannelConnectionRepository();
+
+  beforeEach(async () => {
+    session = new UserSession();
+    await session.initialize();
+  });
+
+  it('should throw not found exception when integration is not found', async () => {
+    const integrationId = IntegrationRepository.createObjectId();
+    const { body } = await session.testAgent.delete(`/v1/integrations/${integrationId}`).send();
+
+    expect(body.statusCode).to.equal(404);
+    expect(body.message).to.equal(`Entity with id ${integrationId} not found`);
+  });
+
+  it('should delete channel connections immediately and clean up subscriber endpoints in the background', async () => {
+    const identifier = `slack-delete-${Date.now()}`;
+    const connectionIdentifier = `${identifier}-connection`;
+    const endpointIdentifier = `${identifier}-endpoint`;
+    const integration = await integrationRepository.create({
+      name: 'Slack',
+      identifier,
+      providerId: ChatProviderIdEnum.Slack,
+      channel: ChannelTypeEnum.CHAT,
+      active: true,
+      _organizationId: session.organization._id,
+      _environmentId: session.environment._id,
+    });
+
+    await channelConnectionRepository.create({
+      identifier: connectionIdentifier,
+      integrationIdentifier: identifier,
+      providerId: ChatProviderIdEnum.Slack,
+      channel: ChannelTypeEnum.CHAT,
+      subscriberId: 'subscriber-delete-integration',
+      contextKeys: [],
+      workspace: { id: 'T-delete-integration' },
+      auth: { accessToken: 'xoxb-delete-integration' },
+      _organizationId: session.organization._id,
+      _environmentId: session.environment._id,
+    });
+    await channelEndpointRepository.create({
+      identifier: endpointIdentifier,
+      connectionIdentifier,
+      integrationIdentifier: identifier,
+      providerId: ChatProviderIdEnum.Slack,
+      channel: ChannelTypeEnum.CHAT,
+      subscriberId: 'subscriber-delete-integration',
+      contextKeys: [],
+      type: ENDPOINT_TYPES.SLACK_CHANNEL,
+      endpoint: { channelId: 'C-delete-integration' },
+      _organizationId: session.organization._id,
+      _environmentId: session.environment._id,
+    });
+
+    const { statusCode } = await session.testAgent.delete(`/v1/integrations/${integration._id}`).send();
+
+    expect(statusCode).to.equal(HttpStatus.OK);
+    expect(
+      await channelConnectionRepository.findOne({
+        identifier: connectionIdentifier,
+        _environmentId: session.environment._id,
+        _organizationId: session.organization._id,
+      })
+    ).to.equal(null);
+
+    const endpointGone = await waitUntilGone(() =>
+      channelEndpointRepository.findOne({
+        identifier: endpointIdentifier,
+        _environmentId: session.environment._id,
+        _organizationId: session.organization._id,
+      })
+    );
+    expect(endpointGone).to.equal(true);
+  });
+
+  it('should not recalculate primary and priority fields for push channel', async () => {
+    await integrationRepository.deleteMany({
+      _organizationId: session.organization._id,
+      _environmentId: session.environment._id,
+    });
+
+    const primaryIntegration = await integrationRepository.create({
+      name: 'primaryIntegration',
+      identifier: 'primaryIntegration',
+      providerId: EmailProviderIdEnum.SendGrid,
+      channel: ChannelTypeEnum.EMAIL,
+      active: true,
+      primary: true,
+      priority: 2,
+      _organizationId: session.organization._id,
+      _environmentId: session.environment._id,
+    });
+
+    const integration = await integrationRepository.create({
+      name: 'integration',
+      identifier: 'integration',
+      providerId: EmailProviderIdEnum.SendGrid,
+      channel: ChannelTypeEnum.EMAIL,
+      active: true,
+      primary: false,
+      priority: 1,
+      _organizationId: session.organization._id,
+      _environmentId: session.environment._id,
+    });
+
+    const pushIntegration = await integrationRepository.create({
+      name: 'FCM',
+      identifier: 'identifier1',
+      providerId: PushProviderIdEnum.FCM,
+      channel: ChannelTypeEnum.PUSH,
+      active: false,
+      _organizationId: session.organization._id,
+      _environmentId: session.environment._id,
+    });
+
+    const { statusCode } = await session.testAgent.delete(`/v1/integrations/${pushIntegration._id}`).send();
+    expect(statusCode).to.equal(200);
+
+    const [first, second] = await integrationRepository.find(
+      {
+        _organizationId: session.organization._id,
+        _environmentId: session.environment._id,
+        channel: ChannelTypeEnum.EMAIL,
+      },
+      undefined,
+      { sort: { priority: -1 } }
+    );
+
+    expect(first._id).to.equal(primaryIntegration._id);
+    expect(first.primary).to.equal(true);
+    expect(first.active).to.equal(true);
+    expect(first.priority).to.equal(2);
+
+    expect(second._id).to.equal(integration._id);
+    expect(second.primary).to.equal(false);
+    expect(second.active).to.equal(true);
+    expect(second.priority).to.equal(1);
+  });
+
+  it('should not recalculate primary and priority fields for chat channel', async () => {
+    await integrationRepository.deleteMany({
+      _organizationId: session.organization._id,
+      _environmentId: session.environment._id,
+    });
+
+    const primaryIntegration = await integrationRepository.create({
+      name: 'primaryIntegration',
+      identifier: 'primaryIntegration',
+      providerId: EmailProviderIdEnum.SendGrid,
+      channel: ChannelTypeEnum.EMAIL,
+      active: true,
+      primary: true,
+      priority: 2,
+      _organizationId: session.organization._id,
+      _environmentId: session.environment._id,
+    });
+
+    const integration = await integrationRepository.create({
+      name: 'integration',
+      identifier: 'integration',
+      providerId: EmailProviderIdEnum.SendGrid,
+      channel: ChannelTypeEnum.EMAIL,
+      active: true,
+      primary: false,
+      priority: 1,
+      _organizationId: session.organization._id,
+      _environmentId: session.environment._id,
+    });
+
+    const chatIntegration = await integrationRepository.create({
+      name: 'Slack',
+      identifier: 'identifier1',
+      providerId: ChatProviderIdEnum.Slack,
+      channel: ChannelTypeEnum.CHAT,
+      active: false,
+      _organizationId: session.organization._id,
+      _environmentId: session.environment._id,
+    });
+
+    const { statusCode } = await session.testAgent.delete(`/v1/integrations/${chatIntegration._id}`).send();
+    expect(statusCode).to.equal(200);
+
+    const [first, second] = await integrationRepository.find(
+      {
+        _organizationId: session.organization._id,
+        _environmentId: session.environment._id,
+        channel: ChannelTypeEnum.EMAIL,
+      },
+      undefined,
+      { sort: { priority: -1 } }
+    );
+
+    expect(first._id).to.equal(primaryIntegration._id);
+    expect(first.primary).to.equal(true);
+    expect(first.active).to.equal(true);
+    expect(first.priority).to.equal(2);
+
+    expect(second._id).to.equal(integration._id);
+    expect(second.primary).to.equal(false);
+    expect(second.active).to.equal(true);
+    expect(second.priority).to.equal(1);
+  });
+
+  it('should recalculate primary and priority fields for email channel', async () => {
+    await integrationRepository.deleteMany({
+      _organizationId: session.organization._id,
+      _environmentId: session.environment._id,
+    });
+
+    const primaryIntegration = await integrationRepository.create({
+      name: 'primaryIntegration',
+      identifier: 'primaryIntegration',
+      providerId: EmailProviderIdEnum.SendGrid,
+      channel: ChannelTypeEnum.EMAIL,
+      active: true,
+      primary: true,
+      priority: 3,
+      _organizationId: session.organization._id,
+      _environmentId: session.environment._id,
+    });
+
+    const integrationOne = await integrationRepository.create({
+      name: 'integrationOne',
+      identifier: 'integrationOne',
+      providerId: EmailProviderIdEnum.SendGrid,
+      channel: ChannelTypeEnum.EMAIL,
+      active: true,
+      primary: false,
+      priority: 2,
+      _organizationId: session.organization._id,
+      _environmentId: session.environment._id,
+    });
+
+    const integrationTwo = await integrationRepository.create({
+      name: 'integrationTwo',
+      identifier: 'integrationTwo',
+      providerId: EmailProviderIdEnum.SendGrid,
+      channel: ChannelTypeEnum.EMAIL,
+      active: true,
+      primary: false,
+      priority: 2,
+      _organizationId: session.organization._id,
+      _environmentId: session.environment._id,
+    });
+
+    const { statusCode } = await session.testAgent.delete(`/v1/integrations/${integrationOne._id}`).send();
+    expect(statusCode).to.equal(200);
+
+    const [first, second] = await integrationRepository.find(
+      {
+        _organizationId: session.organization._id,
+        _environmentId: session.environment._id,
+        channel: ChannelTypeEnum.EMAIL,
+      },
+      undefined,
+      { sort: { priority: -1 } }
+    );
+
+    expect(first._id).to.equal(primaryIntegration._id);
+    expect(first.primary).to.equal(true);
+    expect(first.active).to.equal(true);
+    expect(first.priority).to.equal(2);
+
+    expect(second._id).to.equal(integrationTwo._id);
+    expect(second.primary).to.equal(false);
+    expect(second.active).to.equal(true);
+    expect(second.priority).to.equal(1);
+  });
+
+  it('should not allow deleting an integration belonging to another organization', async () => {
+    const otherSession = new UserSession();
+    await otherSession.initialize();
+
+    const otherOrgIntegration = await integrationRepository.create({
+      name: 'OtherOrg',
+      identifier: 'other-org-delete',
+      providerId: EmailProviderIdEnum.SendGrid,
+      channel: ChannelTypeEnum.EMAIL,
+      active: false,
+      _organizationId: otherSession.organization._id,
+      _environmentId: otherSession.environment._id,
+    });
+
+    const { body } = await session.testAgent.delete(`/v1/integrations/${otherOrgIntegration._id}`).send();
+
+    expect(body.statusCode).to.equal(404);
+    expect(body.message).to.equal(`Entity with id ${otherOrgIntegration._id} not found`);
+
+    const stillExists = await integrationRepository.findOne({
+      _id: otherOrgIntegration._id,
+      _environmentId: otherSession.environment._id,
+    });
+    expect(stillExists?._id).to.equal(otherOrgIntegration._id);
+  });
+
+  it('should remove a newly created integration', async () => {
+    const payload = {
+      providerId: EmailProviderIdEnum.SendGrid,
+      channel: ChannelTypeEnum.EMAIL,
+      credentials: { apiKey: '123', secretKey: 'abc' },
+      active: true,
+      check: false,
+    };
+
+    const integration = await session.testAgent.post('/v1/integrations').send(payload);
+    expect(integration.status).to.equal(HttpStatus.CREATED);
+    const integrationId = integration.body.data._id;
+
+    const res = await session.testAgent.delete(`/v1/integrations/${integrationId}`).send();
+    expect(res.status).to.equal(HttpStatus.OK);
+
+    const isDeleted = !(await integrationRepository.findOne({
+      _environmentId: session.environment._id,
+      _id: integrationId,
+    }));
+
+    expect(isDeleted).to.equal(true);
+
+    const deletedIntegration = (
+      await integrationRepository.findDeleted({ _environmentId: session.environment._id, _id: integrationId })
+    )[0];
+
+    expect(deletedIntegration.deleted).to.equal(true);
+  });
+
+  describe('API key authentication is scoped to the key environment', () => {
+    it('should forbid deleting an integration that lives in a different environment when authenticated via API key', async () => {
+      const prodEnv = await envRepository.findOne({ name: 'Production', _organizationId: session.organization._id });
+      expect(prodEnv?._id, 'Expected Production environment fixture').to.exist;
+
+      const otherEnvironmentIntegration = await integrationRepository.create({
+        name: 'OtherEnvDelete',
+        identifier: 'other-env-delete-api-key',
+        providerId: EmailProviderIdEnum.SendGrid,
+        channel: ChannelTypeEnum.EMAIL,
+        active: false,
+        _organizationId: session.organization._id,
+        _environmentId: prodEnv!._id,
+      });
+
+      const { body } = await session.testAgent
+        .delete(`/v1/integrations/${otherEnvironmentIntegration._id}`)
+        .set('authorization', `ApiKey ${session.apiKey}`)
+        .send();
+
+      expect(body.statusCode).to.equal(403);
+      expect(body.message).to.contain('is scoped to a single environment');
+
+      const untouched = await integrationRepository.findOne({
+        _id: otherEnvironmentIntegration._id,
+        _environmentId: prodEnv!._id,
+      });
+      expect(untouched?._id).to.equal(otherEnvironmentIntegration._id);
+    });
+
+    it('should still allow JWT-authenticated requests to delete integrations in another environment', async () => {
+      const prodEnv = await envRepository.findOne({ name: 'Production', _organizationId: session.organization._id });
+      expect(prodEnv?._id, 'Expected Production environment fixture').to.exist;
+
+      const otherEnvironmentIntegration = await integrationRepository.create({
+        name: 'OtherEnvDeleteJwt',
+        identifier: 'other-env-delete-jwt',
+        providerId: EmailProviderIdEnum.SendGrid,
+        channel: ChannelTypeEnum.EMAIL,
+        active: false,
+        _organizationId: session.organization._id,
+        _environmentId: prodEnv!._id,
+      });
+
+      const res = await session.testAgent.delete(`/v1/integrations/${otherEnvironmentIntegration._id}`).send();
+
+      expect(res.status).to.equal(HttpStatus.OK);
+
+      const isDeleted = !(await integrationRepository.findOne({
+        _id: otherEnvironmentIntegration._id,
+        _environmentId: prodEnv!._id,
+      }));
+      expect(isDeleted).to.equal(true);
+    });
+  });
+});
+
+async function waitUntilGone(lookup: () => Promise<unknown>, timeoutMs = 2000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    if ((await lookup()) == null) {
+      return true;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+
+  return false;
+}

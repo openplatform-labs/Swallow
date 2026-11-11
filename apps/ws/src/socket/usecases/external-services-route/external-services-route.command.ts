@@ -1,0 +1,35 @@
+import { BaseCommand } from '@novu/application-generic';
+import { MessageEntity } from '@novu/dal';
+import { IsArray, IsDefined, IsOptional, IsString } from 'class-validator';
+
+export class ExternalServicesRouteCommand extends BaseCommand {
+  @IsDefined()
+  @IsString()
+  userId: string;
+
+  @IsDefined()
+  @IsString()
+  event: string;
+
+  @IsOptional()
+  payload?: {
+    /*
+     * TODO: We shouldn't import DAL here but this is temporary as we will remove
+     * the ability of send full message
+     */
+    message?: MessageEntity;
+    messageId?: string;
+    unreadCount?: number;
+    unseenCount?: number;
+    /** Agent envelopes and other passthrough payloads beyond inbox fields. */
+    [key: string]: unknown;
+  };
+
+  @IsString()
+  _environmentId: string;
+
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  contextKeys: string[] = [];
+}

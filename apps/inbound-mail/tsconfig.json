@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "allowJs": false,
+    "module": "commonjs",
+    "outDir": "./dist",
+    "sourceMap": true,
+    "strictNullChecks": false,
+    "types": ["node", "mocha", "chai", "sinon"]
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "**/*.spec.ts"]
+}

@@ -1,0 +1,16 @@
+import { forwardRef, Module } from '@nestjs/common';
+import { TerminusModule } from '@nestjs/terminus';
+import { AuthModule } from '../auth/auth.module';
+import { SharedModule } from '../shared/shared.module';
+import { SubscribersV1Module } from '../subscribers/subscribersV1.module';
+import { WidgetsModule } from '../widgets/widgets.module';
+import { MessagesController } from './messages.controller';
+import { USE_CASES } from './usecases';
+
+@Module({
+  imports: [SharedModule, SubscribersV1Module, AuthModule, TerminusModule, forwardRef(() => WidgetsModule)],
+  controllers: [MessagesController],
+  providers: [...USE_CASES],
+  exports: [...USE_CASES],
+})
+export class MessagesModule {}

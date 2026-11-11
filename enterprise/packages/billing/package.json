@@ -1,0 +1,55 @@
+{
+  "name": "@novu/ee-billing",
+  "version": "2.0.28",
+  "private": true,
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "npm run build:watch",
+    "build": "node ./check-ee.mjs",
+    "build:esm": "node_modules/.bin/tsc -p tsconfig.json",
+    "build:watch": "node_modules/.bin/tsc -w -p tsconfig.json",
+    "typecheck:spec": "tsc --noEmit -p tsconfig.spec.json",
+    "test": "if [ -e src ]; then pnpm test-ee; else echo 'skip test: the enterprise source (.source) is not checked out'; fi",
+    "check": "biome check .",
+    "check:fix": "biome check --write .",
+    "test-ee": "cross-env NODE_ENV=test mocha --timeout 10000 --require @novu/testing/swc-register --exit 'src/**/*.spec.ts'",
+    "start:proxy": "ngrok http http://localhost:3000"
+  },
+  "dependencies": {
+    "@date-fns/utc": "^2.1.0",
+    "@novu/application-generic": "workspace:*",
+    "@novu/ee-auth": "workspace:*",
+    "@novu/shared": "workspace:*",
+    "@novu/notifications": "workspace:*",
+    "class-transformer": "0.5.1",
+    "class-validator": "0.15.1",
+    "date-fns": "^4.1.0",
+    "date-fns-tz": "^3.2.0",
+    "mongoose": "^8.22.1",
+    "rxjs": "7.8.2",
+    "shortid": "^2.2.17",
+    "stripe": "^11.18.0",
+    "stripe-event-types": "^3.1.0"
+  },
+  "devDependencies": {
+    "@novu/testing": "workspace:*",
+    "@types/chai": "^4.2.11",
+    "@types/mocha": "^8.0.1",
+    "@types/node": "^22.0.0",
+    "@types/sinon": "^9.0.0",
+    "chai": "^4.2.0",
+    "cross-env": "^7.0.3",
+    "mocha": "^11.7.6",
+    "sinon": "^9.2.4",
+    "typescript": "6.0.3"
+  },
+  "peerDependencies": {
+    "@nestjs/common": "11.1.27",
+    "@nestjs/core": "11.1.27",
+    "@nestjs/jwt": "11.0.2",
+    "@nestjs/platform-express": "11.1.27",
+    "@nestjs/swagger": "11.4.7",
+    "@nestjs/throttler": "6.5.0",
+    "@novu/dal": "workspace:*"
+  }
+}

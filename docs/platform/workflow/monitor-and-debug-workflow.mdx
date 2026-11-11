@@ -1,0 +1,108 @@
+---
+title: 'Monitor and Debug Workflow'
+description: "Monitor Novu workflow executions and debug delivery issues from the Activity Feed with per-step timelines, provider responses, and payload previews."
+---
+
+The Novu Activity Feed tracks the full execution lifecycle after a workflow is triggered. It provides real-time visibility into how workflows run, helping you understand what happened and why.
+
+From the Activity Feed, you can inspect each workflow run and API request to see how each subscriber notification was processed.
+
+![Workflow runs list](/images/workflows/activity-feed/workflow-runs-list.png)
+
+<Note>
+  Each environment has its own Activity Feed, ensuring execution data is isolated and easy to reason about.
+</Note>
+
+## Inspect workflow runs
+
+The Workflow Runs tab shows the details of every workflow triggered to each subscriber. Each run represents a single execution instance and reflects how the workflow behaved for that subscriber.
+
+You can filter workflow runs using parameters such as time period, workflow identifier, and channel. Selecting a workflow run opens the run details view, which gives you access to execution outcomes of each step in the workflow and investigate delivery issues.
+
+![workflow run](/images/workflows/activity-feed/workflow-run.png)
+
+The workflow run details include:
+
+| Field                   | Description                                                                                                        |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| **Workflow identifier** | The unique identifier of the workflow that was executed.                                                           |
+| **Transaction ID**      | A unique ID associated with the trigger event. Use this to correlate workflow runs with trigger requests and logs. |
+| **Topic key**           | The topic key used to trigger the workflow, if the workflow was triggered to a topic.                              |
+| **Subscriber ID**       | The identifier of the subscriber for whom this workflow run was executed.                                          |
+| **Triggered at**        | The timestamp indicating when the workflow execution started.                                                      |
+| **Status**    | The current state of the workflow run. Possible statuses include Completed, Pending, and Failed.            |
+| **Severity**            | The severity level associated with the workflow execution, if defined.                                             |
+| **Critical**            | Indicates whether the workflow was marked as critical.                                            |
+| **Context data**        | Context values passed when triggering the workflow.         |
+| **Trigger payload**     | The payload data sent with the trigger event and used to personalize notification content.                         |
+
+Each workflow run also includes execution details that show how Novu processed each step for a single subscriber. The timeline is ordered chronologically and reflects the internal state transitions of each step as the workflow runs.
+
+Execution details are step-specific and vary depending on:
+
+- The type of step  
+- Whether the step succeeded, was skipped, or failed  
+- Provider behavior and delivery outcomes  
+
+## Inspect trigger requests
+
+The Requests tab in the Activity Feed shows detailed information about every request made to the Event API. Selecting a request opens a detailed view of how Novu processed it, the API response, and execution traces.
+
+![Request tab](/images/workflows/activity-feed/request-tab.png)
+
+You can filter requests using parameters such as time period, transaction ID, statuses or API endpoint. When you open a request, Novu displays details about the API call:
+
+| Field              | Description                                                                                                                  |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| **Endpoint**       | The API endpoint that received the request, for example, `POST /v1/events/trigger` and a unique identifier for the API request.                                        |
+| **Received at**    | Timestamp indicating when Novu received the request.                                                                         |
+| **Transaction ID** | The transaction associated with the trigger. Use this to correlate the request with workflow runs.                           |
+| **Source**         | Indicates where the request originated, either the **Dashboard** or the **API**.                                            |
+| **Request body**   | The payload sent in the API call, including the workflow identifier, subscriber or topic targeting, and any additional data. |
+| **Response body**  | Novu’s response to the request, confirming whether it was acknowledged and processed successfully.                           |
+
+Each request also includes API trace events that show how Novu handled the trigger internally.
+
+Common trace entries include:
+- Workflow execution started
+- Request subscriber processing completed
+
+## Why a notification was not delivered
+
+Open the [Activity Feed](https://dashboard.novu.co/activity-feed), select the workflow run, and read the step that did not send. The step status and execution detail name the cause.
+
+- **Skipped**: a [step condition](/platform/workflow/add-and-configure-steps/step-conditions) did not match, or a throttle limit was exceeded.
+- **Error**: the provider rejected the message or no active integration matched. See [Common errors](/platform/additional-resources/errors).
+- **Canceled**: required subscriber contact data may be missing, such as an email address or a phone number. Open the step details to check the cause.
+- **Subscriber preferences**: the subscriber turned that channel off for the workflow, or globally, and the workflow is not marked critical. See [Preferences](/platform/concepts/preferences).
+- **Wrong environment**: the trigger used a secret key for an environment where the workflow is not published, or the Inbox is using a different application identifier than the environment you triggered.
+- **Demo email**: the [demo email integration](/platform/integrations/demo-integration) only delivers to the email address on your Novu account.
+- **Inbox context**: the notification was sent, but the Inbox was initialized with a different [context](/platform/concepts/contexts) than the trigger, so it does not appear in that session.
+
+The run’s transaction ID matches the trigger response and the Requests tab, which shows whether Novu accepted the API call.
+
+## Debug a failed workflow run
+
+1. In the Activity Feed, filter by workflow, subscriber ID, channel, or transaction ID.
+2. Open the run. The status is Completed, Pending, or Failed.
+3. Open the failed step. The timeline lists each state change and the provider response.
+4. Compare the trigger payload on the run with the variables the template uses.
+5. On the Requests tab, open the same transaction ID to see the API body Novu received and the response it returned.
+
+Each environment has its own Activity Feed. A Development trigger does not appear in the Production feed.
+
+## Activity statuses
+
+The **Status** field on a workflow run is Completed, Pending, or Failed. Each step inside that run has its own badge:
+
+| Status | Meaning |
+| --- | --- |
+| **Success** | The step finished. For a channel step, Novu handed the message to the provider or stored the in-app notification. |
+| **Error** | The step failed. Open it for the provider response. |
+| **Skipped** | The step did not run. A step condition did not match, or a throttle limit was exceeded. After a condition skip, Novu continues with the next step. A throttle skip also skips the steps that follow that throttle step. |
+| **Delayed** | A Delay step is waiting. The following steps have not started. |
+| **Merged** | A Digest step folded this event into an existing digest window. |
+| **Canceled** | The step was canceled before it finished. A missing subscriber email address or phone number is recorded as Canceled. Open the step details to check the cause. |
+| **Pending**, **Queued**, **Running** | The step has been accepted and has not finished yet. |
+
+Provider delivery events such as delivered, bounced, opened, or clicked are separate from the step status. They appear on the message when [activity tracking](/platform/integrations/email/activity-tracking) is configured for that provider. **Success** means Novu sent the message, not that the recipient opened it.

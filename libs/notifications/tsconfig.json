@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "sourceMap": true,
+    "strictNullChecks": false,
+    "outDir": "build/main",
+    "module": "commonjs",
+    "rootDir": "src",
+    "strict": true,
+    "types": ["node", "jest"],
+    "jsx": "react",
+    "typeRoots": ["./node_modules/@types", "../../node_modules/@types"]
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules/**"]
+}

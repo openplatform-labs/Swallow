@@ -1,0 +1,60 @@
+---
+title: 'API keys'
+description: 'Find your Novu application identifier, secret key, and API hostnames, and rotate secret keys without downtime using rolling rotation.'
+---
+
+Novu provides a set of keys and hostnames that your application uses to authenticate requests, send events to the Novu API, and to interact with the [`<Inbox />`](/platform/inbox).
+
+Your API keys are environment specific and allow Novu to tie all request to a particular Novu environment.
+
+## Finding your API keys
+
+Follow these steps to find your environment-specific API keys:
+1. Login to the Novu dashboard.
+2. On the developer section, click **API Keys** to find all your environment keys, whiich are:
+      - Application Identifier
+      - Secret Keys
+      - API URLs
+![API Keys](/images/developer-tools/api-keys.png)
+
+## Application identifier
+
+The application identifier is the public key for one environment. It initializes the [`<Inbox />`](/platform/inbox) component and other client SDKs so the browser can load that subscriber’s notifications. It is safe to expose in client-side code.
+
+It does not authorize server API calls. Those need the secret key. Development and Production each have their own application identifier, so an Inbox pointed at the Development identifier does not show Production notifications.
+
+## Secret key
+
+The secret key is the private token your backend uses to call `https://api.novu.co`. That includes triggering workflows, creating subscribers, and every other API request. Pass it as `Authorization: ApiKey <SECRET_KEY>`, or as `secretKey` when you construct `@novu/api` or another Novu server SDK.
+
+The key is scoped to one environment. A Development key only reads and writes Development. It grants full access to that environment and should never be used in publicly accessible code, such as frontend applications, mobile apps, or public repositories (GitHub, GitLab). The Inbox does not use the secret key.
+
+<Warning>
+  Keep your secret key private.
+</Warning>
+
+You can regenerate the secret key from the API Keys dashboard. This will invalidate the old key and require you to update your environment variables.
+
+## Rolling secret key rotation
+
+Rolling rotation lets you replace a secret key without downtime by keeping two active keys during the switchover. You generate a second key, roll your applications over to it, and then delete the old key once nothing is still using it.
+
+An environment can have at most **two active secret keys** at any time, and at least one key must always exist.
+
+### Rotate a key from the dashboard
+
+The **Secret Keys** card on the API Keys page lists every active key with per-key mask, reveal, and copy controls.
+
+1. Click **Generate new key** to add a second secret key. The card now shows both keys.
+2. Update your applications, workflow bridge endpoints, and any other integrations to use the new key.
+3. Once nothing is using the old key, click **Delete** next to it and confirm. The dashboard blocks deletion of the last remaining key.
+
+## API URLs
+
+The following hostnames are used to connect to the Novu cloud platform.
+
+| **Endpoint**           | **URL**               | **Description**                                                                                                                          |
+| ---------------------- | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| **API Hostname**       | `https://api.novu.co` | The domain that your application sends API requests to. It identifies the Novu API server.                                               |
+| **WebSocket Hostname** | `https://ws.novu.co`  | The domain used to establish a WebSocket connection. Similar to the API Hostname, but specifically for real-time, two-way communication. |
+

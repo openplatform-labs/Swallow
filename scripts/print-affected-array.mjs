@@ -1,0 +1,229 @@
+import { execFileSync } from 'node:child_process';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import spawn from 'cross-spawn';
+import { getPackageFolders } from './get-packages-folder.mjs';
+
+const dirname = path.dirname(fileURLToPath(import.meta.url));
+const processArguments = process.argv.slice(2);
+
+const ALL_FLAG = '--all';
+const TASK_NAME = processArguments[0];
+const BASE_BRANCH_NAME = processArguments[1];
+const GROUP = processArguments[2];
+
+const ROOT_PATH = path.resolve(dirname, '..');
+const ENCODING_TYPE = 'utf8';
+const NEW_LINE_CHAR = '\n';
+
+class CliLogs {
+  constructor() {
+    this._logs = [];
+    this.log = this.log.bind(this);
+  }
+
+  log(log) {
+    const cleanLog = log.trim();
+    if (cleanLog.length) {
+      this._logs.push(cleanLog);
+    }
+  }
+
+  get logs() {
+    return this._logs;
+  }
+
+  get joinedLogs() {
+    return this.logs.join(NEW_LINE_CHAR);
+  }
+}
+
+function pnpmRun(...args) {
+  const logData = new CliLogs();
+  let pnpmProcess;
+
+  return new Promise((resolve, reject) => {
+    const processOptions = {
+      cwd: ROOT_PATH,
+      env: process.env,
+    };
+
+    pnpmProcess = spawn('pnpm', args, processOptions);
+
+    pnpmProcess.stdin.setEncoding(ENCODING_TYPE);
+    pnpmProcess.stdout.setEncoding(ENCODING_TYPE);
+    pnpmProcess.stderr.setEncoding(ENCODING_TYPE);
+    pnpmProcess.stdout.on('data', logData.log);
+    pnpmProcess.stderr.on('data', logData.log);
+
+    pnpmProcess.on('close', (code) => {
+      if (code !== 0) {
+        reject(logData.joinedLogs);
+      } else {
+        resolve(logData.joinedLogs);
+      }
+    });
+  });
+}
+
+function getAffectedCommandResult(str) {
+  const outputLines = str.trim().split(/\r?\n/);
+
+  // Find the line that contains the JSON array (starts with [ and ends with ])
+  for (const line of outputLines) {
+    const trimmedLine = line.trim();
+    if (trimmedLine.startsWith('[') && trimmedLine.endsWith(']')) {
+      return trimmedLine;
+    }
+  }
+
+  // Fallback: look for any line that contains JSON-like content
+  for (const line of outputLines) {
+    const trimmedLine = line.trim();
+    if (trimmedLine.includes('[') && trimmedLine.includes(']')) {
+      // Extract just the JSON part from the line
+      const jsonStart = trimmedLine.indexOf('[');
+      const jsonEnd = trimmedLine.lastIndexOf(']') + 1;
+      return trimmedLine.substring(jsonStart, jsonEnd);
+    }
+  }
+
+  // If no JSON found, return empty array
+  return '[]';
+}
+
+async function affectedProjectsContainingTask(taskName, baseBranch) {
+  const cachePath = `${taskName + baseBranch.replace('/', '').replace('/', '')}-contain-task-cache.json`;
+
+  const isCacheExists = existsSync(cachePath);
+  if (isCacheExists) {
+    const cache = readFileSync(cachePath, 'utf8');
+
+    return JSON.parse(cache);
+  }
+
+  const affectedCommandResult = await pnpmRun(
+    'nx',
+    'show',
+    'projects',
+    '--affected',
+    '--withTarget',
+    taskName,
+    '--base',
+    baseBranch,
+    '--json'
+  );
+  // console.log("nx output:\n" + affectedCommandResult)
+
+  // pnpm nx show projects --affected --withTarget=[task] --base [base branch] --json
+  let result = JSON.parse(getAffectedCommandResult(affectedCommandResult));
+
+  // Nx maps the `.source` submodule pointer to no project, so a bump of it, which is how most enterprise changes
+  // reach this repo, would otherwise affect nothing.
+  if (isEnterpriseSourceChanged(baseBranch)) {
+    result = [...new Set([...result, ...(await enterpriseProjectsContainingTask(taskName))])];
+  }
+
+  writeFileSync(cachePath, JSON.stringify(result));
+
+  return result;
+}
+
+function git(...args) {
+  return execFileSync('git', args, {
+    cwd: ROOT_PATH,
+    encoding: ENCODING_TYPE,
+    stdio: ['ignore', 'pipe', 'ignore'],
+  }).trim();
+}
+
+function isEnterpriseSourceChanged(baseBranch) {
+  // Same range Nx diffs: from the merge base of the base branch and NX_HEAD (or HEAD), falling back to the base branch
+  // itself when the shallow CI clone doesn't reach the merge base.
+  const head = process.env.NX_HEAD || 'HEAD';
+  let from = baseBranch;
+  try {
+    from = git('merge-base', baseBranch, head);
+  } catch {}
+
+  return git('diff', '--name-only', from, head, '--', '.source').length > 0;
+}
+
+async function enterpriseProjectsContainingTask(taskName) {
+  const commandResult = await pnpmRun('nx', 'show', 'projects', '--withTarget', taskName, '--json');
+
+  return JSON.parse(getAffectedCommandResult(commandResult)).filter((project) => project.startsWith('@novu/ee-'));
+}
+
+async function allProjectsContainingTask(taskName) {
+  const cachePath = `${taskName}-all-contain-task-cache.json`;
+
+  const isCacheExists = existsSync(cachePath);
+  if (isCacheExists) {
+    const cache = readFileSync(cachePath, 'utf8');
+
+    return JSON.parse(cache);
+  }
+
+  // pnpm nx show projects --affected --withTarget=[task] --files package.json --json
+  const affectedCommandResult = await pnpmRun(
+    'nx',
+    'show',
+    'projects',
+    '--affected',
+    '--withTarget',
+    taskName,
+    '--files',
+    'package.json',
+    '--json'
+  );
+
+  const result = JSON.parse(getAffectedCommandResult(affectedCommandResult));
+
+  writeFileSync(cachePath, JSON.stringify(result));
+
+  return result;
+}
+
+async function printAffectedProjectsContainingTask() {
+  const { providers, packages, libs } = await getPackageFolders(['providers', 'packages', 'libs']);
+
+  let projects =
+    BASE_BRANCH_NAME === ALL_FLAG
+      ? await allProjectsContainingTask(TASK_NAME)
+      : await affectedProjectsContainingTask(TASK_NAME, BASE_BRANCH_NAME);
+  const allProjects = projects;
+
+  const foundProviders = projects.filter((project) => providers.includes(project));
+  if (foundProviders.length) {
+    projects = projects.filter((project) => !providers.includes(project));
+  }
+
+  const foundPackages = projects.filter((project) => packages.includes(project));
+  if (foundPackages.length) {
+    projects = projects.filter((project) => !packages.includes(project));
+  }
+
+  const foundLibs = projects.filter((project) => libs.includes(project));
+  if (foundLibs.length) {
+    projects = projects.filter((project) => !libs.includes(project));
+  }
+
+  if (GROUP === 'providers') {
+    console.log(JSON.stringify(foundProviders));
+  } else if (GROUP === 'packages') {
+    console.log(JSON.stringify(foundPackages));
+  } else if (GROUP === 'libs') {
+    console.log(JSON.stringify(foundLibs));
+  } else if (GROUP === 'all') {
+    console.log(JSON.stringify(allProjects));
+  } else {
+    console.log(JSON.stringify(projects));
+  }
+}
+
+printAffectedProjectsContainingTask().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

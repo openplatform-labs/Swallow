@@ -1,0 +1,155 @@
+import {
+  Body,
+  ClassSerializerInterceptor,
+  Controller,
+  Delete,
+  Get,
+  Param,
+  Patch,
+  Post,
+  UseInterceptors,
+} from '@nestjs/common';
+import { ApiExcludeController, ApiOperation, ApiTags } from '@nestjs/swagger';
+import { RequirePermissions } from '@novu/application-generic';
+import { PermissionsEnum, UserSessionData } from '@novu/shared';
+import { RequireAuthentication } from '../auth/framework/auth.decorator';
+import { ExternalApiAccessible } from '../auth/framework/external-api.decorator';
+import { ApiCommonResponses, ApiResponse } from '../shared/framework/response.decorator';
+import { UserSession } from '../shared/framework/user.decorator';
+import { CreateNotificationGroupRequestDto } from './dtos/create-notification-group-request.dto';
+import { DeleteNotificationGroupResponseDto } from './dtos/delete-notification-group-response.dto';
+import { NotificationGroupResponseDto } from './dtos/notification-group-response.dto';
+import { CreateNotificationGroupCommand } from './usecases/create-notification-group/create-notification-group.command';
+import { CreateNotificationGroup } from './usecases/create-notification-group/create-notification-group.usecase';
+import { DeleteNotificationGroupCommand } from './usecases/delete-notification-group/delete-notification-group.command';
+import { DeleteNotificationGroup } from './usecases/delete-notification-group/delete-notification-group.usecase';
+import { GetNotificationGroupCommand } from './usecases/get-notification-group/get-notification-group.command';
+import { GetNotificationGroup } from './usecases/get-notification-group/get-notification-group.usecase';
+import { GetNotificationGroupsCommand } from './usecases/get-notification-groups/get-notification-groups.command';
+import { GetNotificationGroups } from './usecases/get-notification-groups/get-notification-groups.usecase';
+import { UpdateNotificationGroupCommand } from './usecases/update-notification-group/update-notification-group.command';
+import { UpdateNotificationGroup } from './usecases/update-notification-group/update-notification-group.usecase';
+
+@ApiCommonResponses()
+@Controller('/notification-groups')
+@UseInterceptors(ClassSerializerInterceptor)
+@RequireAuthentication()
+@ApiTags('Workflow groups')
+@ApiExcludeController()
+export class NotificationGroupsController {
+  constructor(
+    private createNotificationGroupUsecase: CreateNotificationGroup,
+    private getNotificationGroupsUsecase: GetNotificationGroups,
+    private getNotificationGroupUsecase: GetNotificationGroup,
+    private deleteNotificationGroupUsecase: DeleteNotificationGroup,
+    private updateNotificationGroupUsecase: UpdateNotificationGroup
+  ) {}
+
+  @Post('')
+  @ExternalApiAccessible()
+  @ApiResponse(NotificationGroupResponseDto, 201)
+  @ApiOperation({
+    summary: 'Create workflow group',
+    description: `workflow group was previously named notification group`,
+  })
+  @RequirePermissions(PermissionsEnum.WORKFLOW_WRITE)
+  createNotificationGroup(
+    @UserSession() user: UserSessionData,
+    @Body() body: CreateNotificationGroupRequestDto
+  ): Promise<NotificationGroupResponseDto> {
+    return this.createNotificationGroupUsecase.execute(
+      CreateNotificationGroupCommand.create({
+        organizationId: user.organizationId,
+        userId: user._id,
+        environmentId: user.environmentId,
+        name: body.name,
+      })
+    );
+  }
+
+  @Get('')
+  @ExternalApiAccessible()
+  @ApiResponse(NotificationGroupResponseDto, 200, true)
+  @ApiOperation({
+    summary: 'Get workflow groups',
+    description: `workflow group was previously named notification group`,
+  })
+  @RequirePermissions(PermissionsEnum.WORKFLOW_READ)
+  listNotificationGroups(@UserSession() user: UserSessionData): Promise<NotificationGroupResponseDto[]> {
+    return this.getNotificationGroupsUsecase.execute(
+      GetNotificationGroupsCommand.create({
+        organizationId: user.organizationId,
+        userId: user._id,
+        environmentId: user.environmentId,
+      })
+    );
+  }
+
+  @Get('/:id')
+  @ExternalApiAccessible()
+  @ApiResponse(NotificationGroupResponseDto, 200)
+  @ApiOperation({
+    summary: 'Get workflow group',
+    description: `workflow group was previously named notification group`,
+  })
+  @RequirePermissions(PermissionsEnum.WORKFLOW_READ)
+  getNotificationGroup(
+    @UserSession() user: UserSessionData,
+    @Param('id') id: string
+  ): Promise<NotificationGroupResponseDto> {
+    return this.getNotificationGroupUsecase.execute(
+      GetNotificationGroupCommand.create({
+        environmentId: user.environmentId,
+        organizationId: user.organizationId,
+        userId: user._id,
+        id,
+      })
+    );
+  }
+
+  @Patch('/:id')
+  @ExternalApiAccessible()
+  @ApiResponse(NotificationGroupResponseDto, 200)
+  @ApiOperation({
+    summary: 'Update workflow group',
+    description: `workflow group was previously named notification group`,
+  })
+  @RequirePermissions(PermissionsEnum.WORKFLOW_WRITE)
+  updateNotificationGroup(
+    @UserSession() user: UserSessionData,
+    @Param('id') id: string,
+    @Body() body: CreateNotificationGroupRequestDto
+  ): Promise<NotificationGroupResponseDto> {
+    return this.updateNotificationGroupUsecase.execute(
+      UpdateNotificationGroupCommand.create({
+        organizationId: user.organizationId,
+        userId: user._id,
+        environmentId: user.environmentId,
+        name: body.name,
+        id,
+      })
+    );
+  }
+
+  @Delete('/:id')
+  @ExternalApiAccessible()
+  @ApiResponse(DeleteNotificationGroupResponseDto, 200)
+  @ApiOperation({
+    summary: 'Delete workflow group',
+    description: `workflow group was previously named notification group`,
+  })
+  @RequirePermissions(PermissionsEnum.WORKFLOW_WRITE)
+  deleteNotificationGroup(
+    @UserSession() user: UserSessionData,
+    @Param('id') id: string
+  ): Promise<DeleteNotificationGroupResponseDto> {
+    return this.deleteNotificationGroupUsecase.execute(
+      DeleteNotificationGroupCommand.create({
+        environmentId: user.environmentId,
+        organizationId: user.organizationId,
+        userId: user._id,
+        id,
+      })
+    );
+  }
+}

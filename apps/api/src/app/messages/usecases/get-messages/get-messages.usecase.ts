@@ -1,0 +1,132 @@
+import { BadRequestException, Injectable } from '@nestjs/common';
+import { FeatureFlagsService, NotificationPayloadService } from '@novu/application-generic';
+import { MessageEntity, MessageRepository, OrganizationEntity, SubscriberEntity } from '@novu/dal';
+import { ActorTypeEnum, ChannelTypeEnum, FeatureFlagsKeysEnum, sanitizeMessageCta } from '@novu/shared';
+import { GetSubscriber, GetSubscriberCommand } from '../../../subscribers/usecases/get-subscriber';
+import { GetMessagesCommand } from './get-messages.command';
+
+@Injectable()
+export class GetMessages {
+  constructor(
+    private messageRepository: MessageRepository,
+    private notificationPayloadService: NotificationPayloadService,
+    private getSubscriberUseCase: GetSubscriber,
+    private featureFlagService: FeatureFlagsService
+  ) {}
+
+  async execute(command: GetMessagesCommand) {
+    const LIMIT = command.limit;
+    const COUNT_LIMIT = 1000;
+
+    if (LIMIT > 1000) {
+      throw new BadRequestException('Limit can not be larger then 1000');
+    }
+
+    const query: Partial<Omit<MessageEntity, 'transactionId'>> & {
+      _environmentId: string;
+      transactionId?: string[];
+      contextKeys?: string[];
+    } = {
+      _environmentId: command.environmentId,
+    };
+
+    if (command.subscriberId) {
+      const subscriber = await this.getSubscriberUseCase.execute(
+        GetSubscriberCommand.create({
+          subscriberId: command.subscriberId,
+          environmentId: command.environmentId,
+          organizationId: command.organizationId,
+        })
+      );
+
+      query._subscriberId = subscriber._id;
+    }
+
+    if (command.channel) {
+      query.channel = command.channel;
+    }
+
+    if (command.transactionIds) {
+      query.transactionId = command.transactionIds;
+    }
+
+    if (command.contextKeys) {
+      query.contextKeys = command.contextKeys;
+    }
+
+    const data = await this.messageRepository.getMessages(query, '', {
+      limit: LIMIT,
+      sort: { createdAt: -1 },
+      skip: command.page * LIMIT,
+    });
+
+    for (const message of data) {
+      if (message._actorId && message.actor?.type === ActorTypeEnum.USER) {
+        message.actor.data = this.processUserAvatar(message.actorSubscriber);
+      }
+
+      message.cta = sanitizeMessageCta(message.cta);
+    }
+
+    // Payload-dedup: email/SMS/push messages no longer persist their own payload;
+    // backfill from the parent notification so the API response shape stays stable.
+    await this.notificationPayloadService.hydrateEntitiesPayload(data);
+    this.stripAttachmentsForParity(data);
+
+    const isEnabled = await this.featureFlagService.getFlag({
+      key: FeatureFlagsKeysEnum.IS_NEW_MESSAGES_API_RESPONSE_ENABLED,
+      organization: { _id: command.organizationId } as OrganizationEntity,
+      defaultValue: false,
+    });
+
+    if (isEnabled) {
+      return {
+        hasMore: data?.length === command.limit,
+        page: command.page,
+        pageSize: LIMIT,
+        data,
+      };
+    }
+
+    const totalCount = await this.messageRepository.count(query);
+
+    const hasMore = this.getHasMore(command.page, LIMIT, data.length, totalCount);
+
+    return {
+      page: command.page,
+      totalCount,
+      hasMore,
+      pageSize: LIMIT,
+      data,
+    };
+  }
+
+  /**
+   * Email/SMS message payloads historically omitted `attachments` (stripped at
+   * send time). Hydrating from the notification re-introduces the uploaded
+   * attachment metadata, so drop it for those channels to preserve the prior
+   * API shape. Clones (via rest) so the shared notification payload reference
+   * is never mutated. Push kept attachments before, so it is left untouched.
+   */
+  private stripAttachmentsForParity(messages: MessageEntity[]): void {
+    for (const message of messages) {
+      const isAttachmentStrippingChannel =
+        message.channel === ChannelTypeEnum.EMAIL || message.channel === ChannelTypeEnum.SMS;
+
+      if (isAttachmentStrippingChannel && message.payload?.attachments) {
+        const { attachments, ...payloadWithoutAttachments } = message.payload;
+        message.payload = payloadWithoutAttachments;
+      }
+    }
+  }
+
+  private getHasMore(page: number, limit: number, feedLength: number, totalCount: number) {
+    const currentPaginationTotal = page * limit + feedLength;
+
+    return currentPaginationTotal < totalCount;
+  }
+
+  private processUserAvatar(actorSubscriber?: SubscriberEntity): string | null {
+    return actorSubscriber?.avatar || null;
+  }
+}

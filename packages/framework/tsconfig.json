@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2019",
+    "module": "ES2020",
+    "moduleResolution": "Bundler",
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "noImplicitAny": true,
+    "sourceMap": true,
+    "rootDir": ".",
+    "outDir": "./dist",
+    "experimentalDecorators": true,
+    "allowJs": true,
+    "strict": true,
+    "types": ["node"]
+  },
+  "include": ["./src/**/*", "scripts/devtool.ts"],
+  "exclude": ["node_modules"]
+}

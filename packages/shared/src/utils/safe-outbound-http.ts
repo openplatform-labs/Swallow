@@ -1,0 +1,563 @@
+import * as http from 'node:http';
+import * as https from 'node:https';
+import { Readable } from 'node:stream';
+import { assertSafeOutboundUrl, resolvePublicAddresses, SsrfBlockedError } from './ssrf-url-validation';
+
+const DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_MAX_REDIRECTS = 3;
+const DEFAULT_MAX_RESPONSE_BYTES = 25 * 1024 * 1024;
+const REDIRECT_STATUS_CODES = new Set([301, 302, 303, 307, 308]);
+
+export type SafeOutboundMethod = 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH' | 'HEAD' | 'OPTIONS';
+
+export interface SafeOutboundRequestOptions {
+  /** Original request URL. Will be re-validated on every redirect. */
+  url: string | URL;
+  method?: SafeOutboundMethod;
+  /** Headers attached to the original request. Forwarded across redirects only when the host matches. */
+  headers?: Record<string, string | undefined>;
+  /** Body for the request. Strings, Buffers, and Readables are supported. Objects are JSON-stringified. */
+  body?: string | Buffer | Readable | object;
+  /** Per-request timeout in ms (applies to each redirect hop). Default {@link DEFAULT_TIMEOUT_MS}. */
+  timeoutMs?: number;
+  /** Maximum number of redirects to follow. Default {@link DEFAULT_MAX_REDIRECTS}. Set to 0 to disable redirects. */
+  maxRedirects?: number;
+  /** Maximum response size before the request is aborted. Default {@link DEFAULT_MAX_RESPONSE_BYTES}. */
+  maxResponseBytes?: number;
+  /** When true, disables TLS verification. Use only for development bridges. */
+  rejectUnauthorized?: boolean;
+}
+
+export interface SafeOutboundResponse {
+  statusCode: number;
+  statusMessage: string;
+  headers: http.IncomingHttpHeaders;
+  body: Buffer;
+}
+
+export interface SafeOutboundStreamRequestOptions extends Omit<SafeOutboundRequestOptions, 'maxResponseBytes'> {
+  /** Socket idle timeout once the response headers arrived. `timeoutMs` applies until then. */
+  idleTimeoutMs?: number;
+}
+
+export interface SafeOutboundStreamResponse {
+  statusCode: number;
+  statusMessage: string;
+  headers: http.IncomingHttpHeaders;
+  /** Unread response body. Consume or `resume()` it so the socket is released. */
+  body: Readable;
+}
+
+/**
+ * Result of {@link safeOutboundJsonRequest}. The body is parsed JSON when the
+ * payload is JSON. Otherwise it stays the raw text and `isJson` is false.
+ */
+export interface SafeOutboundJsonResponse<T = unknown> {
+  statusCode: number;
+  statusMessage: string;
+  headers: http.IncomingHttpHeaders;
+  body: T;
+  /** False when a non-blank body could not be parsed as JSON. Then `body` is the raw text. */
+  isJson: boolean;
+}
+
+/**
+ * Centralized SSRF-safe HTTP client.
+ *
+ * Properties enforced:
+ *  - URL must be http/https with no embedded credentials and no blocked hostname.
+ *  - Hostname is resolved via DNS once per attempt; if **any** returned address
+ *    is private/reserved/loopback/link-local/IPv4-mapped variant, the request
+ *    is rejected before a TCP connection is opened.
+ *  - The TCP connection is **pinned** to a validated IP. The original hostname
+ *    is preserved as the `Host` header and as SNI servername.
+ *  - Redirects are followed manually (never by the HTTP stack). Each `Location`
+ *    target re-runs the full SSRF policy (URL validation + DNS rejection +
+ *    pinning), defending against late-binding attacks.
+ *  - URLs in `Location` headers cannot relocate to a different scheme that
+ *    bypasses the policy.
+ *
+ * Throws {@link SsrfBlockedError} on policy violations.
+ */
+export async function safeOutboundRequest(options: SafeOutboundRequestOptions): Promise<SafeOutboundResponse> {
+  const maxRedirects = options.maxRedirects ?? DEFAULT_MAX_REDIRECTS;
+  const initialOriginHost = originHost(options.url);
+
+  let currentUrl: string | URL = options.url;
+  let currentMethod: SafeOutboundMethod = options.method ?? 'GET';
+  let currentBody = options.body;
+  const currentHeaders = { ...(options.headers ?? {}) };
+
+  for (let redirect = 0; redirect <= maxRedirects; redirect += 1) {
+    const parsed = assertSafeOutboundUrl(currentUrl);
+
+    if (redirect > 0 && initialOriginHost && parsed.host.toLowerCase() !== initialOriginHost) {
+      stripSensitiveHeaders(currentHeaders);
+      currentBody = undefined;
+    }
+
+    const response = await performPinnedRequest({
+      parsed,
+      address: await resolvePinnedAddress(parsed.hostname),
+      method: currentMethod,
+      headers: currentHeaders,
+      body: currentBody,
+      timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      maxResponseBytes: options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES,
+      rejectUnauthorized: options.rejectUnauthorized ?? true,
+    });
+    const status = response.statusCode;
+
+    if (REDIRECT_STATUS_CODES.has(status) && redirect < maxRedirects) {
+      const location = headerString(response.headers.location);
+
+      if (!location) {
+        return response;
+      }
+
+      const nextUrl = new URL(location, parsed.toString());
+      assertNoCrossOriginMethodPreservingRedirect(status, parsed, nextUrl, initialOriginHost);
+      currentUrl = nextUrl;
+
+      if (redirectsToGet(status, currentMethod)) {
+        currentMethod = 'GET';
+        currentBody = undefined;
+      }
+
+      continue;
+    }
+
+    return response;
+  }
+
+  throw new SsrfBlockedError('INVALID_URL', `Maximum redirect count (${maxRedirects}) exceeded.`);
+}
+
+/** Like {@link safeOutboundRequest}, but resolves on the response headers with the body unread. */
+export async function safeOutboundStreamRequest(
+  options: SafeOutboundStreamRequestOptions
+): Promise<SafeOutboundStreamResponse> {
+  const maxRedirects = options.maxRedirects ?? DEFAULT_MAX_REDIRECTS;
+  const initialOriginHost = originHost(options.url);
+
+  let currentUrl: string | URL = options.url;
+  let currentMethod: SafeOutboundMethod = options.method ?? 'GET';
+  let currentBody = options.body;
+  const currentHeaders = { ...(options.headers ?? {}) };
+
+  for (let redirect = 0; redirect <= maxRedirects; redirect += 1) {
+    const parsed = assertSafeOutboundUrl(currentUrl);
+
+    if (redirect > 0 && initialOriginHost && parsed.host.toLowerCase() !== initialOriginHost) {
+      stripSensitiveHeaders(currentHeaders);
+      currentBody = undefined;
+    }
+
+    const res = await openPinnedRequest({
+      parsed,
+      address: await resolvePinnedAddress(parsed.hostname),
+      method: currentMethod,
+      headers: currentHeaders,
+      body: currentBody,
+      timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      idleTimeoutMs: options.idleTimeoutMs,
+      rejectUnauthorized: options.rejectUnauthorized ?? true,
+    });
+    const response: SafeOutboundStreamResponse = {
+      statusCode: res.statusCode ?? 0,
+      statusMessage: res.statusMessage ?? '',
+      headers: res.headers,
+      body: res,
+    };
+    const status = response.statusCode;
+
+    if (REDIRECT_STATUS_CODES.has(status) && redirect < maxRedirects) {
+      const location = headerString(response.headers.location);
+
+      if (!location) {
+        return response;
+      }
+
+      res.destroy();
+      const nextUrl = new URL(location, parsed.toString());
+      assertNoCrossOriginMethodPreservingRedirect(status, parsed, nextUrl, initialOriginHost);
+      currentUrl = nextUrl;
+
+      if (redirectsToGet(status, currentMethod)) {
+        currentMethod = 'GET';
+        currentBody = undefined;
+      }
+
+      continue;
+    }
+
+    return response;
+  }
+
+  throw new SsrfBlockedError('INVALID_URL', `Maximum redirect count (${maxRedirects}) exceeded.`);
+}
+
+/**
+ * JSON-friendly variant. Sets Content-Type if a JSON body is provided and
+ * parses JSON responses automatically.
+ */
+export async function safeOutboundJsonRequest<T = unknown>(
+  options: SafeOutboundRequestOptions
+): Promise<SafeOutboundJsonResponse<T>> {
+  const isPlainObject =
+    options.body !== undefined &&
+    options.body !== null &&
+    typeof options.body === 'object' &&
+    !(options.body instanceof Buffer) &&
+    !(options.body instanceof Readable);
+
+  const headers: Record<string, string | undefined> = { ...(options.headers ?? {}) };
+
+  if (isPlainObject && !findHeader(headers, 'content-type')) {
+    headers['content-type'] = 'application/json';
+  }
+  if (!findHeader(headers, 'accept')) {
+    headers.accept = 'application/json, text/plain, */*';
+  }
+
+  const body = isPlainObject ? JSON.stringify(options.body) : (options.body as string | Buffer | Readable | undefined);
+
+  const response = await safeOutboundRequest({ ...options, headers, body });
+
+  const contentType = headerString(response.headers['content-type']) ?? '';
+  const text = response.body.toString('utf8');
+  const trimmed = text.trim();
+  let parsed: unknown = text;
+  let isJson = trimmed.length === 0;
+
+  if (contentType.includes('application/json') || contentType.includes('+json')) {
+    try {
+      parsed = response.body.length === 0 ? undefined : JSON.parse(text);
+      isJson = true;
+    } catch {}
+  } else if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      parsed = JSON.parse(trimmed);
+      isJson = true;
+    } catch {}
+  }
+
+  return {
+    statusCode: response.statusCode,
+    statusMessage: response.statusMessage,
+    headers: response.headers,
+    body: parsed as T,
+    isJson,
+  };
+}
+
+interface PinnedRequestParams {
+  parsed: URL;
+  address: { address: string; family: number };
+  method: SafeOutboundMethod;
+  headers: Record<string, string | undefined>;
+  body: SafeOutboundRequestOptions['body'];
+  timeoutMs: number;
+  maxResponseBytes: number;
+  rejectUnauthorized: boolean;
+}
+
+function performPinnedRequest(params: PinnedRequestParams): Promise<SafeOutboundResponse> {
+  const { parsed, address, method, headers, body, timeoutMs, maxResponseBytes, rejectUnauthorized } = params;
+  const isHttps = parsed.protocol === 'https:';
+  const transport = isHttps ? https : http;
+
+  const requestHeaders = buildOutboundHeaders(headers, parsed, body);
+
+  return new Promise<SafeOutboundResponse>((resolve, reject) => {
+    const requestOptions: http.RequestOptions & { servername?: string; rejectUnauthorized?: boolean } = {
+      protocol: parsed.protocol,
+      hostname: address.address,
+      family: address.family,
+      port: parsed.port ? Number(parsed.port) : undefined,
+      path: `${parsed.pathname || '/'}${parsed.search}`,
+      method,
+      headers: requestHeaders,
+      timeout: timeoutMs,
+    };
+
+    if (isHttps) {
+      requestOptions.servername = parsed.hostname;
+      requestOptions.rejectUnauthorized = rejectUnauthorized;
+    }
+
+    const req = transport.request(requestOptions, (res) => {
+      const chunks: Buffer[] = [];
+      let total = 0;
+      let aborted = false;
+
+      res.on('data', (chunk: Buffer) => {
+        if (aborted) return;
+        total += chunk.length;
+        if (total > maxResponseBytes) {
+          aborted = true;
+          res.destroy();
+          reject(new Error(`Response exceeded maximum size of ${maxResponseBytes} bytes.`));
+
+          return;
+        }
+        chunks.push(chunk);
+      });
+
+      res.on('end', () => {
+        if (aborted) return;
+        resolve({
+          statusCode: res.statusCode ?? 0,
+          statusMessage: res.statusMessage ?? '',
+          headers: res.headers,
+          body: Buffer.concat(chunks, total),
+        });
+      });
+
+      res.on('error', reject);
+    });
+
+    stripTracePropagationHeaders(req);
+
+    req.on('timeout', () => {
+      const timeoutError: NodeJS.ErrnoException = new Error(
+        `Request to ${parsed.hostname} timed out after ${timeoutMs}ms.`
+      );
+      // Tag the error so callers (e.g. HttpClientService retry logic) can treat
+      // socket timeouts as a retryable transport failure, matching the `got` path.
+      timeoutError.code = 'ETIMEDOUT';
+      req.destroy(timeoutError);
+    });
+    req.on('error', reject);
+
+    if (body === undefined || body === null) {
+      req.end();
+
+      return;
+    }
+
+    if (typeof body === 'string' || body instanceof Buffer) {
+      req.end(body);
+
+      return;
+    }
+
+    if (body instanceof Readable) {
+      body.pipe(req);
+
+      return;
+    }
+
+    req.end(JSON.stringify(body));
+  });
+}
+
+interface OpenPinnedRequestParams {
+  parsed: URL;
+  address: { address: string; family: number };
+  method: SafeOutboundMethod;
+  headers: Record<string, string | undefined>;
+  body: SafeOutboundRequestOptions['body'];
+  timeoutMs: number;
+  idleTimeoutMs?: number;
+  rejectUnauthorized: boolean;
+}
+
+function openPinnedRequest(params: OpenPinnedRequestParams): Promise<http.IncomingMessage> {
+  const { parsed, address, method, headers, body, timeoutMs, idleTimeoutMs, rejectUnauthorized } = params;
+  const isHttps = parsed.protocol === 'https:';
+  const transport = isHttps ? https : http;
+  const requestHeaders = buildOutboundHeaders(headers, parsed, body);
+
+  return new Promise<http.IncomingMessage>((resolve, reject) => {
+    const requestOptions: http.RequestOptions & { servername?: string; rejectUnauthorized?: boolean } = {
+      protocol: parsed.protocol,
+      hostname: address.address,
+      family: address.family,
+      port: parsed.port ? Number(parsed.port) : undefined,
+      path: `${parsed.pathname || '/'}${parsed.search}`,
+      method,
+      headers: requestHeaders,
+      timeout: timeoutMs,
+    };
+
+    if (isHttps) {
+      requestOptions.servername = parsed.hostname;
+      requestOptions.rejectUnauthorized = rejectUnauthorized;
+    }
+
+    let activeTimeoutMs = timeoutMs;
+    let response: http.IncomingMessage | undefined;
+    const req = transport.request(requestOptions, (res) => {
+      response = res;
+      if (idleTimeoutMs !== undefined) {
+        activeTimeoutMs = idleTimeoutMs;
+        req.setTimeout(idleTimeoutMs);
+      }
+      resolve(res);
+    });
+
+    stripTracePropagationHeaders(req);
+
+    req.on('timeout', () => {
+      const timeoutError: NodeJS.ErrnoException = new Error(
+        `Request to ${parsed.hostname} timed out after ${activeTimeoutMs}ms.`
+      );
+      timeoutError.code = 'ETIMEDOUT';
+      response?.destroy(timeoutError);
+      req.destroy(timeoutError);
+    });
+    req.on('error', reject);
+
+    if (body === undefined || body === null) {
+      req.end();
+
+      return;
+    }
+
+    if (typeof body === 'string' || body instanceof Buffer) {
+      req.end(body);
+
+      return;
+    }
+
+    if (body instanceof Readable) {
+      body.pipe(req);
+
+      return;
+    }
+
+    req.end(JSON.stringify(body));
+  });
+}
+
+async function resolvePinnedAddress(hostname: string) {
+  const [chosen] = await resolvePublicAddresses(hostname);
+  if (!chosen) {
+    throw new SsrfBlockedError('DNS_LOOKUP_FAILED', `Unable to resolve hostname "${hostname}".`, { hostname });
+  }
+
+  return chosen;
+}
+
+function originHost(url: string | URL): string | null {
+  try {
+    return new URL(url).host.toLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+function assertNoCrossOriginMethodPreservingRedirect(
+  status: number,
+  current: URL,
+  nextUrl: URL,
+  initialOriginHost: string | null
+): void {
+  const preservesMethod = status === 307 || status === 308;
+  if (!preservesMethod || !initialOriginHost || nextUrl.host.toLowerCase() === initialOriginHost) {
+    return;
+  }
+
+  throw new SsrfBlockedError(
+    'CROSS_ORIGIN_METHOD_PRESERVING_REDIRECT',
+    `Refusing to follow ${status} redirect from ${current.host} to ${nextUrl.host}: method-preserving redirects across origin boundaries are not allowed.`,
+    { hostname: nextUrl.hostname }
+  );
+}
+
+function redirectsToGet(status: number, method: SafeOutboundMethod): boolean {
+  return status === 303 || ((status === 301 || status === 302) && method === 'POST');
+}
+
+function buildOutboundHeaders(
+  headers: Record<string, string | undefined>,
+  parsed: URL,
+  body: SafeOutboundRequestOptions['body']
+): Record<string, string> {
+  const out: Record<string, string> = {};
+
+  for (const [key, value] of Object.entries(headers)) {
+    if (value === undefined || value === null) continue;
+    out[key] = String(value);
+  }
+
+  if (!findHeader(out, 'host')) {
+    out.Host = parsed.host;
+  }
+  if (!findHeader(out, 'accept')) {
+    out.Accept = '*/*';
+  }
+  if (!findHeader(out, 'user-agent')) {
+    out['User-Agent'] = 'novu-safe-outbound/1.0';
+  }
+
+  if (body !== undefined && body !== null) {
+    if (typeof body === 'string') {
+      out['Content-Length'] = String(Buffer.byteLength(body));
+    } else if (body instanceof Buffer) {
+      out['Content-Length'] = String(body.length);
+    } else if (!(body instanceof Readable)) {
+      const serialized = JSON.stringify(body);
+      out['Content-Length'] = String(Buffer.byteLength(serialized));
+      if (!findHeader(out, 'content-type')) {
+        out['Content-Type'] = 'application/json';
+      }
+    }
+  }
+
+  return out;
+}
+
+const SENSITIVE_HEADER_PATTERNS = [
+  /^authorization$/i,
+  /^cookie$/i,
+  /^proxy-authorization$/i,
+  /^novu-signature$/i,
+  /-signature$/i,
+  /-hmac/i,
+];
+
+const TRACE_PROPAGATION_HEADER_PATTERNS = [
+  /^traceparent$/i,
+  /^tracestate$/i,
+  /^baggage$/i,
+  /^b3$/i,
+  /^x-b3-/i,
+  /^newrelic$/i,
+  /^x-newrelic-/i,
+  /^sentry-trace$/i,
+];
+
+function stripSensitiveHeaders(headers: Record<string, string | undefined>): void {
+  for (const key of Object.keys(headers)) {
+    if (SENSITIVE_HEADER_PATTERNS.some((re) => re.test(key))) {
+      delete headers[key];
+    }
+  }
+}
+
+function stripTracePropagationHeaders(request: http.ClientRequest): void {
+  for (const header of request.getHeaderNames()) {
+    if (TRACE_PROPAGATION_HEADER_PATTERNS.some((re) => re.test(header))) {
+      request.removeHeader(header);
+    }
+  }
+}
+
+function findHeader(headers: Record<string, string | undefined>, name: string): string | undefined {
+  const lower = name.toLowerCase();
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === lower && value !== undefined) {
+      return value;
+    }
+  }
+
+  return undefined;
+}
+
+function headerString(value: string | string[] | undefined): string | undefined {
+  if (value === undefined) return undefined;
+
+  return Array.isArray(value) ? value[0] : value;
+}
