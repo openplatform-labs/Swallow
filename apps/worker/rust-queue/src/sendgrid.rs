@@ -224,6 +224,7 @@ pub struct Sendgrid {
     http: Client,
     endpoint: String,
     config: Config,
+    dispatch_tracking: bool,
 }
 impl Sendgrid {
     pub fn new(config: Config) -> Result<Self, SendError> {
@@ -233,6 +234,16 @@ impl Sendgrid {
         };
         Self::with_endpoint(config, endpoint)
     }
+    /// Opt into an additional SendGrid custom argument for dispatch evidence.
+    pub fn with_dispatch_tracking(mut self) -> Self {
+        self.dispatch_tracking = true;
+        self
+    }
+
+    pub(crate) fn tracks_dispatches(&self) -> bool {
+        self.dispatch_tracking
+    }
+
     #[cfg(test)]
     pub(crate) fn test_endpoint(config: Config, endpoint: &str) -> Result<Self, SendError> {
         Self::with_endpoint(config, endpoint)
@@ -253,6 +264,7 @@ impl Sendgrid {
             http,
             endpoint: endpoint.to_owned(),
             config,
+            dispatch_tracking: false,
         })
     }
     /// Send once; ambiguous network failures are never automatically retried.

@@ -16,6 +16,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio_postgres::Client;
+use uuid::Uuid;
 
 fn verify(key: &str, signature: &[u8], timestamp: &str, raw: &[u8]) -> bool {
     let Ok(der) = STANDARD.decode(key.trim()) else {
@@ -143,8 +144,14 @@ pub async fn receive(
             {
                 return None;
             }
+            // A missing, malformed or unmatched custom argument stays
+            // unbound; it must never be treated as a different dispatch.
+            let dispatch = event
+                .get("swallow_dispatch_id")
+                .and_then(Value::as_str)
+                .and_then(|raw| Uuid::parse_str(raw).ok().filter(|id| id.to_string() == raw));
             Some(
-                json!({"event_id":event_id,"message_id":id,"event_type":kind,"event_timestamp":timestamp,"recipient_hash":format!("{:x}",Sha256::digest(address.as_bytes()))}),
+                json!({"event_id":event_id,"message_id":id,"event_type":kind,"event_timestamp":timestamp,"recipient_hash":format!("{:x}",Sha256::digest(address.as_bytes())),"dispatch_id":dispatch.map(|id| id.to_string())}),
             )
         };
         let Some(record) = valid() else {
@@ -155,6 +162,6 @@ pub async fn receive(
         };
         records.push(record);
     }
-    let inserted=match db.query("WITH incoming AS MATERIALIZED (SELECT * FROM jsonb_to_recordset($2::jsonb) AS e(event_id text,message_id text,event_type text,event_timestamp bigint,recipient_hash text)), locked_jobs AS MATERIALIZED (SELECT j.id FROM novu_queue_jobs j WHERE j.environment_id=$1 AND j.kind='experimental_sendgrid_email' AND EXISTS(SELECT 1 FROM incoming e JOIN novu_rust_email_messages m ON m.environment_id=$1 AND m.internal_id=e.message_id WHERE m.email_job_id=j.id) ORDER BY j.id FOR UPDATE) INSERT INTO novu_rust_sendgrid_delivery_events(environment_id,event_id,message_internal_id,event_type,event_timestamp,recipient_hash) SELECT $1,e.event_id,e.message_id,e.event_type,e.event_timestamp,e.recipient_hash FROM incoming e JOIN novu_rust_email_messages m ON m.environment_id=$1 AND m.internal_id=e.message_id CROSS JOIN (SELECT count(*) AS n FROM locked_jobs) locks WHERE locks.n >= 0 ON CONFLICT(environment_id,event_id) DO NOTHING RETURNING event_id", &[&environment,&json!(records)]).await { Ok(rows)=>rows.len(),Err(_)=>return (StatusCode::INTERNAL_SERVER_ERROR,Json(json!({"message":"webhook unavailable"}))) };
+    let inserted=match db.query("WITH incoming AS MATERIALIZED (SELECT * FROM jsonb_to_recordset($2::jsonb) AS e(event_id text,message_id text,event_type text,event_timestamp bigint,recipient_hash text,dispatch_id uuid)), locked_jobs AS MATERIALIZED (SELECT j.id FROM novu_queue_jobs j WHERE j.environment_id=$1 AND j.kind='experimental_sendgrid_email' AND EXISTS(SELECT 1 FROM incoming e JOIN novu_rust_email_messages m ON m.environment_id=$1 AND m.internal_id=e.message_id WHERE m.email_job_id=j.id) ORDER BY j.id FOR UPDATE) INSERT INTO novu_rust_sendgrid_delivery_events(environment_id,event_id,message_internal_id,event_type,event_timestamp,recipient_hash,dispatch_id) SELECT $1,e.event_id,e.message_id,e.event_type,e.event_timestamp,e.recipient_hash,d.id FROM incoming e JOIN novu_rust_email_messages m ON m.environment_id=$1 AND m.internal_id=e.message_id LEFT JOIN novu_rust_sendgrid_dispatch_ids d ON d.id=e.dispatch_id AND d.environment_id=m.environment_id AND d.job_id=m.email_job_id CROSS JOIN (SELECT count(*) AS n FROM locked_jobs) locks WHERE locks.n >= 0 ON CONFLICT(environment_id,event_id) DO NOTHING RETURNING event_id", &[&environment,&json!(records)]).await { Ok(rows)=>rows.len(),Err(_)=>return (StatusCode::INTERNAL_SERVER_ERROR,Json(json!({"message":"webhook unavailable"}))) };
     (StatusCode::OK, Json(json!({"data":[],"recorded":inserted})))
 }

@@ -52,6 +52,34 @@ pub async fn email_evidence(client: &Client, environment: &str, job: Uuid) -> Re
     Ok(rows.into_iter().map(|r|json!({"event":r.get::<_,String>(0),"eventCount":r.get::<_,i64>(1),"recipientCount":r.get::<_,i64>(2),"latestEventTimestamp":r.get::<_,Option<i64>>(3)})).collect())
 }
 
+/// Summarize SendGrid evidence by dispatch without exposing recipient hashes.
+pub async fn email_dispatch_evidence(
+    client: &Client,
+    environment: &str,
+    job: Uuid,
+) -> Result<Vec<Value>> {
+    if environment.is_empty() {
+        return Err("environment is required".into());
+    }
+    if client
+        .query_opt(
+            "SELECT 1 FROM novu_queue_jobs WHERE environment_id=$1 AND id=$2 AND kind=$3",
+            &[&environment, &job, &crate::sendgrid_queue::JOB_KIND],
+        )
+        .await?
+        .is_none()
+    {
+        return Err("email job not found".into());
+    }
+    let rows = client.query("SELECT e.dispatch_id,e.event_type,count(*),count(DISTINCT e.recipient_hash),max(e.event_timestamp) FROM novu_rust_sendgrid_delivery_events e JOIN novu_rust_email_messages m ON m.environment_id=e.environment_id AND m.internal_id=e.message_internal_id WHERE m.environment_id=$1 AND m.email_job_id=$2 GROUP BY e.dispatch_id,e.event_type ORDER BY e.dispatch_id NULLS FIRST,e.event_type LIMIT 101", &[&environment,&job]).await?;
+    if rows.len() > 100 {
+        return Err(
+            "more than 100 email evidence groups; query the evidence table directly".into(),
+        );
+    }
+    Ok(rows.into_iter().map(|r|json!({"dispatchId":r.get::<_,Option<Uuid>>(0).map(|id|id.to_string()),"event":r.get::<_,String>(1),"eventCount":r.get::<_,i64>(2),"recipientCount":r.get::<_,i64>(3),"latestEventTimestamp":r.get::<_,Option<i64>>(4)})).collect())
+}
+
 /// Show signed Twilio evidence explicitly bound to this job, without phone numbers.
 pub async fn sms_evidence(client: &Client, environment: &str, job: Uuid) -> Result<Vec<Value>> {
     if environment.is_empty() {
@@ -111,7 +139,7 @@ pub async fn resolve(
         return Err("cannot retry push job with a different failure reason".into());
     }
     let attempt=match (kind.as_str(),target) {
-        (crate::sendgrid_queue::JOB_KIND,None)=>tx.query_opt("SELECT http_status,NULL::uuid FROM novu_rust_sendgrid_attempts WHERE environment_id=$1 AND job_id=$2 AND state='unknown' FOR UPDATE", &[&environment,&job]).await?,
+        (crate::sendgrid_queue::JOB_KIND,None)=>tx.query_opt("SELECT http_status,dispatch_id FROM novu_rust_sendgrid_attempts WHERE environment_id=$1 AND job_id=$2 AND state='unknown' FOR UPDATE", &[&environment,&job]).await?,
         (crate::twilio_queue::JOB_KIND,None)=>tx.query_opt("SELECT http_status,dispatch_id FROM novu_rust_twilio_attempts WHERE environment_id=$1 AND job_id=$2 AND state='unknown' FOR UPDATE", &[&environment,&job]).await?,
         (crate::fcm_queue::JOB_KIND,Some(index))=>tx.query_opt("SELECT http_status,NULL::uuid FROM novu_rust_fcm_attempts WHERE environment_id=$1 AND job_id=$2 AND target_index=$3 AND state='unknown' FOR UPDATE", &[&environment,&job,&index]).await?,
         _=>return Err("job kind and target do not match".into()),
@@ -125,7 +153,7 @@ pub async fn resolve(
     if kind == crate::sendgrid_queue::JOB_KIND && decision == "retry" {
         // Any recipient event means that SendGrid accepted at least part of
         // this request. Retrying the full request could duplicate delivery.
-        let evidence: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_sendgrid_delivery_events e JOIN novu_rust_email_messages m ON m.environment_id=e.environment_id AND m.internal_id=e.message_internal_id WHERE m.environment_id=$1 AND m.email_job_id=$2)", &[&environment,&job]).await?.get(0);
+        let evidence: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_sendgrid_delivery_events e JOIN novu_rust_email_messages m ON m.environment_id=e.environment_id AND m.internal_id=e.message_internal_id WHERE m.environment_id=$1 AND m.email_job_id=$2 AND ($3::uuid IS NULL OR e.dispatch_id IS NULL OR e.dispatch_id=$3))", &[&environment,&job,&retry_dispatch]).await?.get(0);
         if evidence {
             tx.rollback().await?;
             return Err("email retry refused: authenticated provider callback already exists; inspect evidence".into());

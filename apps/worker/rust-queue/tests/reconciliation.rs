@@ -12,7 +12,7 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     tokio::spawn(async move {
         connection.await.unwrap();
     });
-    db.batch_execute("DROP TABLE IF EXISTS novu_rust_twilio_dispatch_ids,novu_rust_delivery_reconciliations,novu_rust_sendgrid_attempts,novu_rust_twilio_attempts,novu_rust_fcm_attempts,novu_rust_email_messages,novu_rust_sms_messages,novu_rust_push_messages,novu_queue_jobs CASCADE").await.unwrap();
+    db.batch_execute("DROP TABLE IF EXISTS novu_rust_sendgrid_dispatch_ids,novu_rust_twilio_dispatch_ids,novu_rust_delivery_reconciliations,novu_rust_sendgrid_attempts,novu_rust_twilio_attempts,novu_rust_fcm_attempts,novu_rust_email_messages,novu_rust_sms_messages,novu_rust_push_messages,novu_queue_jobs CASCADE").await.unwrap();
     for migration in [
         queue::MIGRATION,
         queue::sendgrid_queue::MIGRATION,
@@ -28,6 +28,32 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     ] {
         db.batch_execute(migration).await.unwrap();
     }
+    let legacy_email = Uuid::new_v4();
+    queue::enqueue(
+        &db,
+        legacy_email,
+        "legacy",
+        queue::sendgrid_queue::JOB_KIND,
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO novu_rust_sendgrid_attempts(job_id,environment_id,state) VALUES ($1,'legacy','unknown')", &[&legacy_email]).await.unwrap();
+    db.batch_execute(queue::sendgrid_queue::DISPATCH_ID_MIGRATION)
+        .await
+        .unwrap();
+    db.batch_execute(queue::sendgrid_queue::DISPATCH_ID_MIGRATION)
+        .await
+        .unwrap();
+    let legacy_dispatch: Option<Uuid> = db
+        .query_one(
+            "SELECT dispatch_id FROM novu_rust_sendgrid_attempts WHERE job_id=$1",
+            &[&legacy_email],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(legacy_dispatch, None);
     // The new migration must preserve old decisions and be safely re-runnable.
     let legacy_job = Uuid::new_v4();
     queue::enqueue(
@@ -52,6 +78,11 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     db.batch_execute("DROP TABLE IF EXISTS novu_rust_sendgrid_delivery_events,novu_rust_sendgrid_webhook_keys,novu_rust_environments CASCADE; CREATE TABLE novu_rust_environments(id text PRIMARY KEY,organization_id text NOT NULL); INSERT INTO novu_rust_environments VALUES ('tenant-a','org-a'),('tenant-b','org-b')").await.unwrap();
     db.batch_execute(include_str!(
         "../../../api/rust-api/migrations/0004_sendgrid_webhooks.sql"
+    ))
+    .await
+    .unwrap();
+    db.batch_execute(include_str!(
+        "../../../api/rust-api/migrations/0008_sendgrid_dispatch_identity.sql"
     ))
     .await
     .unwrap();
@@ -113,6 +144,20 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
         .await
         .unwrap();
     assert_eq!(evidence,json!([{"event":"deferred","eventCount":1,"recipientCount":1,"latestEventTimestamp":102},{"event":"delivered","eventCount":2,"recipientCount":2,"latestEventTimestamp":101}]).as_array().unwrap().clone());
+    let dispatch_evidence = reconciliation::email_dispatch_evidence(&db, "tenant-a", email)
+        .await
+        .unwrap();
+    assert_eq!(dispatch_evidence.len(), 2);
+    assert!(
+        dispatch_evidence
+            .iter()
+            .all(|item| item["dispatchId"].is_null())
+    );
+    assert!(
+        reconciliation::email_dispatch_evidence(&db, "tenant-b", email)
+            .await
+            .is_err()
+    );
     assert!(
         reconciliation::email_evidence(&db, "tenant-b", email)
             .await
@@ -216,8 +261,16 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     )
     .await
     .unwrap();
-    db.execute("INSERT INTO novu_rust_sendgrid_attempts(job_id,environment_id,state) VALUES ($1,'tenant-a','unknown')", &[&email_retry]).await.unwrap();
+    let retry_dispatch = Uuid::new_v4();
+    let prior_dispatch = Uuid::new_v4();
+    db.execute("INSERT INTO novu_rust_sendgrid_attempts(job_id,environment_id,state,dispatch_id) VALUES ($1,'tenant-a','unknown',$2)", &[&email_retry,&retry_dispatch]).await.unwrap();
     db.execute("INSERT INTO novu_rust_email_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,subject,status,email_job_id,delivery_state) VALUES ('email-retry','tenant-a','s','s','n','w','t','subject','error',$1,'unknown')", &[&email_retry]).await.unwrap();
+    db.execute("INSERT INTO novu_rust_sendgrid_delivery_events(environment_id,event_id,message_internal_id,event_type,event_timestamp,recipient_hash,dispatch_id) VALUES ('tenant-a','earlier-email','email-retry','delivered',104,'hash',$1)", &[&prior_dispatch]).await.unwrap();
+    let grouped = reconciliation::email_dispatch_evidence(&db, "tenant-a", email_retry)
+        .await
+        .unwrap();
+    assert_eq!(grouped.len(), 1);
+    assert_eq!(grouped[0]["dispatchId"], prior_dispatch.to_string());
     // A message ID collision from another environment does not block retry.
     db.batch_execute("INSERT INTO novu_rust_sendgrid_delivery_events(environment_id,event_id,message_internal_id,event_type,event_timestamp,recipient_hash) VALUES ('tenant-b','cross-retry','email-retry','delivered',104,'hash')").await.unwrap();
     let (mut other, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
@@ -249,6 +302,8 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     assert_eq!(row.get::<_, String>(0), "pending");
     assert_eq!(row.get::<_, i64>(1), 0);
     assert_eq!(row.get::<_, String>(2), "not_attempted");
+    let retry_recorded: Option<Uuid> = db.query_one("SELECT retry_dispatch_id FROM novu_rust_delivery_reconciliations WHERE job_id=$1 AND decision='retry'", &[&email_retry]).await.unwrap().get(0);
+    assert_eq!(retry_recorded, Some(retry_dispatch));
     reconciliation::resolve(
         &mut db,
         "tenant-a",
@@ -351,6 +406,19 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     );
     let from_cli: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(from_cli, evidence);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .args(["email-dispatch-evidence", "tenant-a", &email.to_string()])
+        .env("DATABASE_URL", &url)
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let from_cli: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(from_cli, dispatch_evidence);
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
         .args(["sms-evidence", "tenant-a", &sms.to_string()])
         .env("DATABASE_URL", &url)

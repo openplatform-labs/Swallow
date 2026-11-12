@@ -35,9 +35,11 @@ async fn signed_events_are_scoped_idempotent_and_private() {
         novu_postgres_queue::MIGRATION,
         novu_postgres_queue::in_app::EMAIL_MESSAGES_MIGRATION,
         novu_postgres_queue::sendgrid_queue::MIGRATION,
+        novu_postgres_queue::sendgrid_queue::DISPATCH_ID_MIGRATION,
         novu_postgres_queue::reconciliation::MIGRATION,
         novu_postgres_queue::reconciliation::RETRY_DISPATCH_MIGRATION,
         include_str!("../migrations/0004_sendgrid_webhooks.sql"),
+        include_str!("../migrations/0008_sendgrid_dispatch_identity.sql"),
     ] {
         db.batch_execute(sql).await.unwrap();
     }
@@ -223,10 +225,78 @@ async fn signed_events_are_scoped_idempotent_and_private() {
     let mut signed = timestamp.as_bytes().to_vec();
     signed.extend_from_slice(&cross);
     let signature = STANDARD.encode(key.sign(&rng, &signed).unwrap().as_ref());
-    let (status, body) = call(router, path, &timestamp, &signature, cross).await;
+    let (status, body) = call(router.clone(), path, &timestamp, &signature, cross).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["recorded"], 0);
     let row=db.query_one("SELECT count(*),bool_or(recipient_hash LIKE '%private%') FROM novu_rust_sendgrid_delivery_events", &[]).await.unwrap();
     assert_eq!(row.get::<_, i64>(0), 1);
     assert!(!row.get::<_, bool>(1));
+    let tracked_job = uuid::Uuid::new_v4();
+    let tracked_dispatch = uuid::Uuid::new_v4();
+    novu_postgres_queue::enqueue(
+        db.as_ref(),
+        tracked_job,
+        "env-a",
+        novu_postgres_queue::sendgrid_queue::JOB_KIND,
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE novu_queue_jobs SET status='failed' WHERE id=$1",
+        &[&tracked_job],
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO novu_rust_email_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,subject,status,email_job_id) VALUES ('64a000000000000000000097','env-a','s','s','n','w','t','subject','sent',$1)", &[&tracked_job]).await.unwrap();
+    db.execute("INSERT INTO novu_rust_sendgrid_dispatch_ids(id,job_id,environment_id) VALUES ($1,$2,'env-a')", &[&tracked_dispatch,&tracked_job]).await.unwrap();
+    db.execute("INSERT INTO novu_rust_sendgrid_attempts(job_id,environment_id,state,dispatch_id) VALUES ($1,'env-a','unknown',$2)", &[&tracked_job,&tracked_dispatch]).await.unwrap();
+    let tracked = json!([{"id":"64a000000000000000000097","event":"delivered","sg_event_id":"tracked","timestamp":1730000000,"email":"private@example.test","swallow_dispatch_id":tracked_dispatch.to_string()}]);
+    let tracked = serde_json::to_vec(&tracked).unwrap();
+    let mut signed = timestamp.as_bytes().to_vec();
+    signed.extend_from_slice(&tracked);
+    let signature = STANDARD.encode(key.sign(&rng, &signed).unwrap().as_ref());
+    let result = call(router.clone(), path, &timestamp, &signature, tracked).await;
+    assert_eq!(result.0, StatusCode::OK);
+    assert_eq!(result.1["recorded"], 1);
+    let saved: Option<uuid::Uuid> = db.query_one("SELECT dispatch_id FROM novu_rust_sendgrid_delivery_events WHERE environment_id='env-a' AND event_id='tracked'", &[]).await.unwrap().get(0);
+    assert_eq!(saved, Some(tracked_dispatch));
+    let err = novu_postgres_queue::reconciliation::resolve(
+        &mut operator_db,
+        "env-a",
+        tracked_job,
+        None,
+        "retry",
+        "operator",
+        "ticket",
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("authenticated provider callback"));
+    let other_dispatch = uuid::Uuid::new_v4();
+    db.execute("INSERT INTO novu_rust_sendgrid_dispatch_ids(id,job_id,environment_id) VALUES ($1,$2,'env-a')", &[&other_dispatch,&job]).await.unwrap();
+    let cross_dispatch = json!([{"id":"64a000000000000000000097","event":"delivered","sg_event_id":"unmatched","timestamp":1730000000,"email":"private@example.test","swallow_dispatch_id":other_dispatch.to_string()}]);
+    let raw = serde_json::to_vec(&cross_dispatch).unwrap();
+    let mut signed = timestamp.as_bytes().to_vec();
+    signed.extend_from_slice(&raw);
+    let signature = STANDARD.encode(key.sign(&rng, &signed).unwrap().as_ref());
+    assert_eq!(
+        call(router.clone(), path, &timestamp, &signature, raw)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let unbound: Option<uuid::Uuid> = db.query_one("SELECT dispatch_id FROM novu_rust_sendgrid_delivery_events WHERE environment_id='env-a' AND event_id='unmatched'", &[]).await.unwrap().get(0);
+    assert_eq!(unbound, None);
+    let malformed_id = json!([{"id":"64a000000000000000000097","event":"delivered","sg_event_id":"bad-dispatch","timestamp":1730000000,"email":"private@example.test","swallow_dispatch_id":"not-a-uuid"}]);
+    let raw = serde_json::to_vec(&malformed_id).unwrap();
+    let mut signed = timestamp.as_bytes().to_vec();
+    signed.extend_from_slice(&raw);
+    let signature = STANDARD.encode(key.sign(&rng, &signed).unwrap().as_ref());
+    assert_eq!(
+        call(router, path, &timestamp, &signature, raw).await.0,
+        StatusCode::OK
+    );
+    let unbound: Option<uuid::Uuid> = db.query_one("SELECT dispatch_id FROM novu_rust_sendgrid_delivery_events WHERE environment_id='env-a' AND event_id='bad-dispatch'", &[]).await.unwrap().get(0);
+    assert_eq!(unbound, None);
 }

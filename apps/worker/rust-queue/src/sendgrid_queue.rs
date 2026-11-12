@@ -10,6 +10,9 @@ use uuid::Uuid;
 
 pub const JOB_KIND: &str = "experimental_sendgrid_email";
 pub const MIGRATION: &str = include_str!("../migrations/0035_experimental_sendgrid_attempts.sql");
+pub const DISPATCH_ID_MIGRATION: &str =
+    include_str!("../migrations/0057_sendgrid_dispatch_identity.sql");
+const DISPATCH_ARGUMENT: &str = "swallow_dispatch_id";
 
 async fn claim(
     client: &Client,
@@ -75,9 +78,10 @@ pub async fn process_one(
     }
     // Webhook insertion and this check serialize on the job row. Email
     // events lack per-attempt IDs, so older linked evidence is conservative.
-    let evidence = tx.query_opt("SELECT 1 FROM novu_rust_delivery_reconciliations r WHERE r.environment_id=$1 AND r.job_id=$2 AND r.target_index IS NULL AND r.decision='retry' AND EXISTS(SELECT 1 FROM novu_rust_sendgrid_delivery_events e JOIN novu_rust_email_messages m ON m.environment_id=e.environment_id AND m.internal_id=e.message_internal_id WHERE m.environment_id=$1 AND m.email_job_id=$2) LIMIT 1", &[&environment,&job.id]).await?;
-    if evidence.is_some() {
-        let inserted = tx.execute("INSERT INTO novu_rust_sendgrid_attempts(job_id,environment_id,state) VALUES ($1,$2,'unknown') ON CONFLICT(job_id) DO NOTHING", &[&job.id,&environment]).await?;
+    let evidence = tx.query_opt("SELECT r.retry_dispatch_id FROM (SELECT retry_dispatch_id FROM novu_rust_delivery_reconciliations WHERE environment_id=$1 AND job_id=$2 AND target_index IS NULL AND decision='retry' ORDER BY decision_order DESC LIMIT 1) r WHERE EXISTS(SELECT 1 FROM novu_rust_sendgrid_delivery_events e JOIN novu_rust_email_messages m ON m.environment_id=e.environment_id AND m.internal_id=e.message_internal_id WHERE m.environment_id=$1 AND m.email_job_id=$2 AND (r.retry_dispatch_id IS NULL OR e.dispatch_id IS NULL OR e.dispatch_id=r.retry_dispatch_id))", &[&environment,&job.id]).await?;
+    if let Some(evidence) = evidence {
+        let dispatch: Option<Uuid> = evidence.get(0);
+        let inserted = tx.execute("INSERT INTO novu_rust_sendgrid_attempts(job_id,environment_id,state,dispatch_id) VALUES ($1,$2,'unknown',$3) ON CONFLICT(job_id) DO NOTHING", &[&job.id,&environment,&dispatch]).await?;
         if inserted == 1 {
             tx.execute("UPDATE novu_rust_email_messages SET delivery_state='unknown',status='error',error_id='mail_unexpected_error',error_text='email retry blocked by provider callback' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
         }
@@ -260,11 +264,24 @@ pub async fn process_one(
             .to_owned();
         tx.execute("UPDATE novu_rust_email_messages SET email=$3 WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id,&address]).await?;
     }
-    let inserted=tx.execute("INSERT INTO novu_rust_sendgrid_attempts(job_id,environment_id,state) VALUES ($1,$2,'dispatching') ON CONFLICT(job_id) DO NOTHING", &[&job.id,&job.environment_id]).await?;
+    if provider.tracks_dispatches() && email.custom_data.contains_key(DISPATCH_ARGUMENT) {
+        tx.execute("UPDATE novu_rust_email_messages SET delivery_state='rejected',status='error',error_id='mail_unexpected_error',error_text='reserved SendGrid custom argument' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
+        tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='reserved SendGrid custom argument',lease_token=NULL,lease_until=NULL WHERE id=$1 AND environment_id=$2", &[&job.id,&environment]).await?;
+        tx.commit().await?;
+        return Ok(true);
+    }
+    let dispatch = provider.tracks_dispatches().then(Uuid::new_v4);
+    let inserted=tx.execute("INSERT INTO novu_rust_sendgrid_attempts(job_id,environment_id,state,dispatch_id) VALUES ($1,$2,'dispatching',$3) ON CONFLICT(job_id) DO NOTHING", &[&job.id,&job.environment_id,&dispatch]).await?;
     if inserted == 0 {
         tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='email attempt already exists',lease_token=NULL,lease_until=NULL WHERE id=$1", &[&job.id]).await?;
         tx.commit().await?;
         return Ok(true);
+    }
+    if let Some(dispatch) = dispatch {
+        tx.execute("INSERT INTO novu_rust_sendgrid_dispatch_ids(id,job_id,environment_id) VALUES ($1,$2,$3)", &[&dispatch,&job.id,&job.environment_id]).await?;
+        email
+            .custom_data
+            .insert(DISPATCH_ARGUMENT.into(), dispatch.to_string().into());
     }
     tx.execute("UPDATE novu_rust_email_messages SET delivery_state='dispatching' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
     tx.commit().await?;
@@ -440,12 +457,13 @@ mod tests {
         let (mut db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
         tokio::spawn(async move { driver.await.unwrap() });
         db.batch_execute(
-            "DROP TABLE IF EXISTS novu_rust_sendgrid_attempts,novu_queue_jobs CASCADE",
+            "DROP TABLE IF EXISTS novu_rust_sendgrid_dispatch_ids,novu_rust_sendgrid_attempts,novu_queue_jobs CASCADE",
         )
         .await
         .unwrap();
         db.batch_execute(crate::MIGRATION).await.unwrap();
         db.batch_execute(MIGRATION).await.unwrap();
+        db.batch_execute(DISPATCH_ID_MIGRATION).await.unwrap();
         db.batch_execute(crate::in_app::EMAIL_MESSAGES_MIGRATION)
             .await
             .unwrap();
@@ -462,6 +480,11 @@ mod tests {
         db.batch_execute("CREATE TABLE IF NOT EXISTS novu_rust_environments(id text PRIMARY KEY, organization_id text NOT NULL); INSERT INTO novu_rust_environments VALUES ('env-a','org') ON CONFLICT DO NOTHING").await.unwrap();
         db.batch_execute(include_str!(
             "../../../api/rust-api/migrations/0004_sendgrid_webhooks.sql"
+        ))
+        .await
+        .unwrap();
+        db.batch_execute(include_str!(
+            "../../../api/rust-api/migrations/0008_sendgrid_dispatch_identity.sql"
         ))
         .await
         .unwrap();
@@ -792,5 +815,86 @@ mod tests {
         );
         assert_eq!(row.get::<_, String>(2), "unknown");
         assert_eq!(row.get::<_, String>(3), "unknown");
+
+        // A different earlier dispatch must not block a tracked retry.
+        let tracked = Uuid::new_v4();
+        let older = Uuid::new_v4();
+        let retry_target = Uuid::new_v4();
+        crate::enqueue(&db, tracked, "env-a", JOB_KIND, &message)
+            .await
+            .unwrap();
+        db.execute("INSERT INTO novu_rust_email_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,subject,status,email_job_id) VALUES ('tracked-email','env-a','s','s','n','w','t','subject','sent',$1)", &[&tracked]).await.unwrap();
+        db.execute("INSERT INTO novu_rust_delivery_reconciliations(id,environment_id,job_id,decision,operator_name,reason,retry_dispatch_id) VALUES ($1,'env-a',$2,'retry','operator','verified',$3)", &[&Uuid::new_v4(),&tracked,&retry_target]).await.unwrap();
+        db.execute("INSERT INTO novu_rust_sendgrid_delivery_events(environment_id,event_id,message_internal_id,event_type,event_timestamp,recipient_hash,dispatch_id) VALUES ('env-a','older','tracked-email','delivered',1,'hash',$1)", &[&older]).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v3/mail/send", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut data = Vec::new();
+            let mut buf = [0; 4096];
+            let dispatch = loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                data.extend_from_slice(&buf[..n]);
+                if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&data[..pos]);
+                    let length = headers
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .and_then(|v| v.parse::<usize>().ok())
+                        })
+                        .unwrap();
+                    if data.len() >= pos + 4 + length {
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&data[pos + 4..pos + 4 + length]).unwrap();
+                        break Uuid::parse_str(
+                            body["custom_args"][DISPATCH_ARGUMENT].as_str().unwrap(),
+                        )
+                        .unwrap();
+                    }
+                }
+            };
+            socket
+                .write_all(
+                    b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            dispatch
+        });
+        let provider = Sendgrid::test_endpoint(
+            Config {
+                api_key: "SG.fixture".into(),
+                from: "sender@example.test".into(),
+                sender_name: "Sender".into(),
+                region: Region::Global,
+            },
+            &endpoint,
+        )
+        .unwrap()
+        .with_dispatch_tracking();
+        assert!(process_one(&mut db, "env-a", &provider).await.unwrap());
+        let dispatch = server.await.unwrap();
+        let count:i64=db.query_one("SELECT count(*) FROM novu_rust_sendgrid_attempts a JOIN novu_rust_sendgrid_dispatch_ids d ON d.id=a.dispatch_id AND d.job_id=a.job_id AND d.environment_id=a.environment_id WHERE a.job_id=$1 AND d.id=$2", &[&tracked,&dispatch]).await.unwrap().get(0);
+        assert_eq!(count, 1);
+        // Never overwrite a user-provided argument used for trusted correlation.
+        let collision = Uuid::new_v4();
+        let mut bad = message.clone();
+        bad["custom_data"][DISPATCH_ARGUMENT] = "user-supplied".into();
+        crate::enqueue(&db, collision, "env-a", JOB_KIND, &bad)
+            .await
+            .unwrap();
+        assert!(process_one(&mut db, "env-a", &provider).await.unwrap());
+        let row = db
+            .query_one(
+                "SELECT status,last_error FROM novu_queue_jobs WHERE id=$1",
+                &[&collision],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, String>(0), "failed");
+        assert_eq!(row.get::<_, String>(1), "reserved SendGrid custom argument");
     }
 }

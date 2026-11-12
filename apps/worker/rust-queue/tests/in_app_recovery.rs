@@ -21,7 +21,7 @@ async fn worker_recovers_expired_jobs_and_isolates_invalid_jobs() {
     let url = std::env::var("TEST_DATABASE_URL").unwrap();
     let (db, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move { connection.await.unwrap() });
-    db.batch_execute("DROP TABLE IF EXISTS novu_rust_twilio_dispatch_ids, novu_rust_ws_events, novu_rust_subscription_preferences, novu_rust_topic_subscribers, novu_rust_topics, novu_rust_contexts, novu_rust_in_app_messages, novu_rust_subscribers, novu_queue_jobs, novu_rust_workflows CASCADE; CREATE TABLE novu_rust_workflows (environment_id text, identifier text, in_app_content text, has_steps boolean NOT NULL DEFAULT true, PRIMARY KEY (environment_id, identifier));").await.unwrap();
+    db.batch_execute("DROP TABLE IF EXISTS novu_rust_sendgrid_dispatch_ids, novu_rust_twilio_dispatch_ids, novu_rust_ws_events, novu_rust_subscription_preferences, novu_rust_topic_subscribers, novu_rust_topics, novu_rust_contexts, novu_rust_in_app_messages, novu_rust_subscribers, novu_queue_jobs, novu_rust_workflows CASCADE; CREATE TABLE novu_rust_workflows (environment_id text, identifier text, in_app_content text, has_steps boolean NOT NULL DEFAULT true, PRIMARY KEY (environment_id, identifier));").await.unwrap();
     for migration in [
         MIGRATION,
         in_app::MIGRATION,
@@ -72,6 +72,7 @@ async fn worker_recovers_expired_jobs_and_isolates_invalid_jobs() {
         in_app::MULTIPLE_FCM_CHANNELS_MIGRATION,
         in_app::PUSH_STEP_ID_MIGRATION,
         novu_postgres_queue::sendgrid_queue::MIGRATION,
+        novu_postgres_queue::sendgrid_queue::DISPATCH_ID_MIGRATION,
         novu_postgres_queue::twilio_queue::MIGRATION,
         novu_postgres_queue::twilio_queue::DISPATCH_ID_MIGRATION,
         novu_postgres_queue::fcm_queue::MIGRATION,

@@ -6,7 +6,7 @@ use uuid::Uuid;
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if ![2, 3, 4, 6].contains(&args.len()) {
-        return Err("usage: delivery-reconcile list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | sms-evidence ENV SMS_JOB | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
+        return Err("usage: delivery-reconcile list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | email-dispatch-evidence ENV EMAIL_JOB | sms-evidence ENV SMS_JOB | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
     }
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let (mut db, connection) = config.connect(tls).await?;
@@ -45,6 +45,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             "{}",
             serde_json::to_string(
                 &novu_postgres_queue::reconciliation::email_evidence(
+                    &db,
+                    &args[1],
+                    Uuid::parse_str(&args[2])?
+                )
+                .await?
+            )?
+        );
+    } else if args.len() == 3 && args[0] == "email-dispatch-evidence" {
+        println!(
+            "{}",
+            serde_json::to_string(
+                &novu_postgres_queue::reconciliation::email_dispatch_evidence(
                     &db,
                     &args[1],
                     Uuid::parse_str(&args[2])?

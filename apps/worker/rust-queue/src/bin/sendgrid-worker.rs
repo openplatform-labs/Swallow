@@ -16,12 +16,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok("global") | Err(std::env::VarError::NotPresent) => Region::Global,
         _ => return Err("invalid NOVU_SENDGRID_REGION".into()),
     };
-    let provider = Sendgrid::new(Config {
+    let mut provider = Sendgrid::new(Config {
         api_key: std::env::var("NOVU_SENDGRID_API_KEY")?,
         from: std::env::var("NOVU_SENDGRID_FROM")?,
         sender_name: std::env::var("NOVU_SENDGRID_SENDER_NAME")?,
         region,
     })?;
+    match std::env::var("NOVU_SENDGRID_DISPATCH_TRACKING").as_deref() {
+        Ok("true") => provider = provider.with_dispatch_tracking(),
+        Ok("false") | Err(std::env::VarError::NotPresent) => {}
+        _ => return Err("invalid NOVU_SENDGRID_DISPATCH_TRACKING".into()),
+    }
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let (mut db, connection) = config.connect(tls).await?;
     tokio::spawn(async move {
