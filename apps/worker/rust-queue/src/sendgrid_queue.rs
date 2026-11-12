@@ -115,23 +115,24 @@ pub async fn process_one(
         }
         // The original channel worker resolves actor and contexts at execution
         // time. Old jobs without context_keys retain their stored snapshot.
-        let actor = if let Some(actor_id) = context
-            .actor
-            .as_ref()
-            .and_then(|v| v.get("subscriberId"))
-            .and_then(serde_json::Value::as_str)
+        let actor = match crate::resolve_actor(
+            &tx,
+            environment,
+            context.actor.as_ref(),
+            context.actor_internal_id.as_deref(),
+            email.subscriber_id.as_deref().unwrap_or(""),
+            &profile,
+        )
+        .await?
         {
-            if email.subscriber_id.as_deref() == Some(actor_id) {
-                Some(profile.clone())
-            } else {
-                tx.query_opt("SELECT profile FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2", &[&environment,&actor_id]).await?.map(|row| {
-                    let mut actor: serde_json::Value = row.get(0);
-                    if let Some(fields) = actor.as_object_mut() { fields.insert("subscriberId".into(), actor_id.into()); }
-                    actor
-                })
+            Ok(actor) => actor,
+            Err(()) => {
+                tx.execute("DELETE FROM novu_rust_email_messages WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
+                tx.execute("UPDATE novu_rust_email_step_outcomes SET status='failed',email_job_id=NULL WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
+                tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='actor identity changed or missing',lease_token=NULL,lease_until=NULL WHERE id=$1", &[&job.id]).await?;
+                tx.commit().await?;
+                return Ok(true);
             }
-        } else {
-            context.actor.clone()
         };
         let resolved_context = if let Some(keys) = context.context_keys.as_ref() {
             let mut result = serde_json::Map::new();

@@ -178,3 +178,43 @@ pub async fn requeue_expired(client: &Client, kind: &str) -> Result<u64, Error> 
 pub fn allow_recreated_subscriber() -> bool {
     std::env::var("NOVU_ALLOW_RECREATED_SUBSCRIBER").as_deref() == Ok("true")
 }
+
+/// Resolve an actor without ever substituting a different subscriber identity.
+/// The caller has already fenced the recipient. Missing old-job snapshots fail
+/// closed in safe mode; compatibility mode preserves Novu's external-ID lookup.
+pub(crate) async fn resolve_actor(
+    tx: &tokio_postgres::Transaction<'_>,
+    environment: &str,
+    actor: Option<&serde_json::Value>,
+    actor_internal_id: Option<&str>,
+    recipient_id: &str,
+    recipient_profile: &serde_json::Value,
+) -> Result<Result<Option<serde_json::Value>, ()>, tokio_postgres::Error> {
+    let Some(id) = actor
+        .and_then(|a| a.get("subscriberId"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(Ok(actor.cloned()));
+    };
+    if id == recipient_id {
+        return Ok(Ok(Some(recipient_profile.clone())));
+    }
+    if !allow_recreated_subscriber() && actor_internal_id.is_none_or(str::is_empty) {
+        return Ok(Err(()));
+    }
+    let row = tx.query_opt("SELECT profile FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2 AND ($3::boolean OR internal_id=$4)", &[&environment,&id,&allow_recreated_subscriber(),&actor_internal_id]).await?;
+    match row {
+        Some(row) => {
+            let mut profile: serde_json::Value = row.get(0);
+            if let Some(fields) = profile.as_object_mut() {
+                fields.insert("subscriberId".into(), id.into());
+            }
+            Ok(Ok(Some(profile)))
+        }
+        None if allow_recreated_subscriber() => Ok(Ok(None)),
+        None => Ok(Err(())),
+    }
+}
+
+#[cfg(test)]
+mod actor_delivery_tests;

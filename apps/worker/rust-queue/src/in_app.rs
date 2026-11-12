@@ -659,6 +659,7 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         .get("recipientIdentitySnapshot")
         .and_then(serde_json::Value::as_object);
     let mut created_actor_identity = None;
+    let mut actor_internal_id: Option<String> = None;
     let mut actor_profile = if let (Some(actor), Some(actor_id)) = (actor.as_ref(), actor_id) {
         let mut fields = actor
             .as_object()
@@ -685,6 +686,7 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
             None => Some(tx.query_one("INSERT INTO novu_rust_subscribers (environment_id,subscriber_id,profile,internal_id) VALUES ($1,$2,$3,novu_rust_new_objectid()) ON CONFLICT (environment_id,subscriber_id) DO UPDATE SET updated_at=CASE WHEN novu_rust_subscribers.profile IS DISTINCT FROM novu_rust_subscribers.profile || EXCLUDED.profile THEN now() ELSE novu_rust_subscribers.updated_at END,profile=novu_rust_subscribers.profile || EXCLUDED.profile RETURNING profile,internal_id", &[&job.environment_id,&actor_id,&fields]).await?),
         };
         let row = row.ok_or(InvalidJob("subscriber identity changed"))?;
+        actor_internal_id = Some(row.get(1));
         if matches!(expected, Some(serde_json::Value::Null)) {
             created_actor_identity = Some(serde_json::Value::String(row.get(1)));
         }
@@ -796,7 +798,7 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         let notification_id: String = notification.get(0);
         if let Some((push_title, push_content)) = push_step.as_ref() {
             let push_job_id = Uuid::new_v4();
-            let push_payload = serde_json::json!({"workflow_context":{"subscriber_id":subscriber,"subscriber_internal_id":subscriber_internal_id,"notification_internal_id":notification_id,"transaction_id":transaction_id,"workflow_identifier":workflow,"workflow_internal_id":workflow_internal_id,"title_template":push_title,"content_template":push_content,"payload":payload,"context_keys":context_keys,"actor":actor_profile,"overrides":data.get("pushFlatProviderOverride").and_then(|v| v.as_object()).cloned().unwrap_or_default(),"provider_data":push_provider_data}});
+            let push_payload = serde_json::json!({"workflow_context":{"subscriber_id":subscriber,"subscriber_internal_id":subscriber_internal_id,"notification_internal_id":notification_id,"transaction_id":transaction_id,"workflow_identifier":workflow,"workflow_internal_id":workflow_internal_id,"title_template":push_title,"content_template":push_content,"payload":payload,"context_keys":context_keys,"actor":actor_profile,"actor_internal_id":actor_internal_id,"overrides":data.get("pushFlatProviderOverride").and_then(|v| v.as_object()).cloned().unwrap_or_default(),"provider_data":push_provider_data}});
             tx.execute(
                 "INSERT INTO novu_queue_jobs(id,environment_id,kind,payload) VALUES ($1,$2,$3,$4)",
                 &[
@@ -820,7 +822,7 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
                     "workflow_identifier":workflow,"workflow_internal_id":workflow_internal_id,
                     "notification_internal_id":notification_id,"message_id":message_id,"transaction_id":transaction_id,
                     "content_template":sms_content,"payload":payload,"context":resolved_context,
-                    "context_keys":context_keys,"actor":actor_profile,"overrides":merged_sms_override}});
+                    "context_keys":context_keys,"actor":actor_profile,"actor_internal_id":actor_internal_id,"overrides":merged_sms_override}});
             tx.execute(
                 "INSERT INTO novu_queue_jobs(id,environment_id,kind,payload) VALUES ($1,$2,$3,$4)",
                 &[
@@ -868,7 +870,7 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
             for (key, value) in &raw_provider_headers {
                 headers.insert(provider_header_key(key), value.clone());
             }
-            let email_payload = serde_json::json!({"to":[],"cc":override_list("cc"),"bcc":override_list("bcc"),"from":option("from"),"sender_name":option("senderName"),"provider_from_without_name":provider_from_without_name,"reply_to":option("replyTo"),"text":option("text"),"headers":headers,"custom_data":email_override.and_then(|v| v.get("customData")).cloned().unwrap_or_else(||serde_json::json!({})),"subject":"","html":"","message_id":message_id,"transaction_id":transaction_id,"workflow_identifier":workflow,"subscriber_id":subscriber,"workflow_context":{"subscriber_internal_id":subscriber_internal_id,"check_workflow":true,"workflow_internal_id":workflow_internal_id,"notification_internal_id":notification_id,"subject_template":subject,"html_template":html,"payload":payload,"context":resolved_context,"context_keys":context_keys,"actor":actor_profile,"overrides":merged_email_override}});
+            let email_payload = serde_json::json!({"to":[],"cc":override_list("cc"),"bcc":override_list("bcc"),"from":option("from"),"sender_name":option("senderName"),"provider_from_without_name":provider_from_without_name,"reply_to":option("replyTo"),"text":option("text"),"headers":headers,"custom_data":email_override.and_then(|v| v.get("customData")).cloned().unwrap_or_else(||serde_json::json!({})),"subject":"","html":"","message_id":message_id,"transaction_id":transaction_id,"workflow_identifier":workflow,"subscriber_id":subscriber,"workflow_context":{"subscriber_internal_id":subscriber_internal_id,"check_workflow":true,"workflow_internal_id":workflow_internal_id,"notification_internal_id":notification_id,"subject_template":subject,"html_template":html,"payload":payload,"context":resolved_context,"context_keys":context_keys,"actor":actor_profile,"actor_internal_id":actor_internal_id,"overrides":merged_email_override}});
             tx.execute(
                 "INSERT INTO novu_queue_jobs(id,environment_id,kind,payload) VALUES ($1,$2,$3,$4)",
                 &[

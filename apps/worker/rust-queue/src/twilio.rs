@@ -49,6 +49,8 @@ pub struct WorkflowContext {
     pub context: serde_json::Value,
     pub context_keys: Vec<String>,
     pub actor: Option<serde_json::Value>,
+    #[serde(default)]
+    pub actor_internal_id: Option<String>,
     pub overrides: Option<serde_json::Value>,
 }
 

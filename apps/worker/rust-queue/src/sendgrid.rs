@@ -59,6 +59,8 @@ pub struct WorkflowContext {
     #[serde(default)]
     pub context_keys: Option<Vec<String>>,
     pub actor: Option<Value>,
+    #[serde(default)]
+    pub actor_internal_id: Option<String>,
     pub overrides: Map<String, Value>,
 }
 
