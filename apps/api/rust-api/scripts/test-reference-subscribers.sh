@@ -2,6 +2,8 @@
 # Run bounded subscriber API comparisons on isolated, disposable databases.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# Differential comparisons intentionally enable Novu's unsafe ID-reuse behavior.
+export NOVU_ALLOW_RECREATED_SUBSCRIBER=${NOVU_ALLOW_RECREATED_SUBSCRIBER:-true}
 reference_source=${NOVU_REFERENCE_SOURCE:?Set NOVU_REFERENCE_SOURCE to the built original Novu checkout}
 case "$reference_source" in /*) ;; *) echo 'NOVU_REFERENCE_SOURCE must be absolute' >&2; exit 2;; esac
 if [[ ! -f "$reference_source/apps/api/dist/main.js" ]]; then echo 'Reference API build is missing' >&2; exit 2; fi

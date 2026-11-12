@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# Legacy synthetic jobs and tokens exercise the original compatibility mode.
+export NOVU_ALLOW_RECREATED_SUBSCRIBER=true
 name="novu-rust-api-test-$$"
 cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; }
 trap cleanup EXIT

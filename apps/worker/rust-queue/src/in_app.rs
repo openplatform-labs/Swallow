@@ -158,9 +158,30 @@ pub const IN_APP_SUBSCRIBER_IDENTITY_MIGRATION: &str =
     include_str!("../migrations/0050_in_app_subscriber_identity.sql");
 pub const MULTIPLE_FCM_CHANNELS_MIGRATION: &str =
     include_str!("../migrations/0051_multiple_fcm_channels.sql");
+pub const PUSH_STEP_ID_MIGRATION: &str =
+    include_str!("../migrations/0052_experimental_push_step_id.sql");
 pub const JOB_KIND: &str = novu_rust_contracts::EXPERIMENTAL_IN_APP_JOB_KIND;
 pub const UNSNOOZE_JOB_KIND: &str = "experimental-in-app-unsnooze";
 type WorkerResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+
+// Trigger provider layers use lodash merge with replacement for arrays.
+fn merge_provider_layer(target: &mut serde_json::Value, source: &serde_json::Value) {
+    match (target, source) {
+        (serde_json::Value::Object(target), serde_json::Value::Object(source)) => {
+            for (key, value) in source {
+                if matches!(key.as_str(), "__proto__" | "constructor" | "prototype") {
+                    continue;
+                }
+                if let Some(existing) = target.get_mut(key) {
+                    merge_provider_layer(existing, value);
+                } else {
+                    target.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        (target, source) => *target = source.clone(),
+    }
+}
 
 /// Atomically consume a due unsnooze job and update its message. Subscriber
 /// locking follows the same order as API mutations and subscriber deletion.
@@ -269,6 +290,14 @@ pub async fn process_one_with_lease(client: &mut Client, lease: Duration) -> Wor
 
 async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> WorkerResult<()> {
     let data = &job.payload;
+    if !crate::allow_recreated_subscriber()
+        && data
+            .get("recipientIdentitySnapshot")
+            .and_then(serde_json::Value::as_object)
+            .is_none()
+    {
+        return Err(InvalidJob("subscriber identity snapshot missing").into());
+    }
     let id = |key| {
         data.get(key)
             .and_then(|v| v.as_str())
@@ -386,8 +415,9 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         sms_step,
         sms_step_id,
         push_step,
+        push_step_id,
     ) = if data.get("severityOverride").is_some() {
-        let row = tx.query_opt("SELECT inbox_metadata->>'severity',in_app_content,inbox_metadata->'tags',has_steps,in_app_step_active,inbox_metadata->>'id',email_subject,email_html,email_step_active,email_step_id,sms_content,sms_step_active,sms_step_id,push_title,push_content,push_step_active FROM novu_rust_workflows WHERE environment_id=$1 AND identifier=$2", &[&job.environment_id, &workflow]).await?
+        let row = tx.query_opt("SELECT inbox_metadata->>'severity',in_app_content,inbox_metadata->'tags',has_steps,in_app_step_active,inbox_metadata->>'id',email_subject,email_html,email_step_active,email_step_id,sms_content,sms_step_active,sms_step_id,push_title,push_content,push_step_active,push_step_id FROM novu_rust_workflows WHERE environment_id=$1 AND identifier=$2", &[&job.environment_id, &workflow]).await?
             .ok_or(InvalidJob("workflow no longer exists"))?;
         let has_steps = row.get::<_, bool>(3);
         let email_subject: Option<String> = row.get(6);
@@ -437,6 +467,7 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
             sms_step,
             row.get::<_, Option<String>>(12),
             push_step,
+            row.get::<_, Option<String>>(16),
         )
     } else {
         (
@@ -450,8 +481,35 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
             None,
             None,
             None,
+            None,
         )
     };
+    let push_provider = data
+        .get("emailProviderOverrides")
+        .and_then(|v| v.get("fcm"));
+    let push_step_provider = push_step_id
+        .as_ref()
+        .and_then(|step| data.get("emailStepOverrides").and_then(|v| v.get(step)))
+        .and_then(|v| v.get("providers"))
+        .and_then(|v| v.get("fcm"));
+    let mut push_provider_data = serde_json::Value::Object(serde_json::Map::new());
+    for layer in [push_provider, push_step_provider].into_iter().flatten() {
+        if layer.as_object().is_some_and(|v| {
+            ["token", "topic", "condition", "tokens"].iter().any(|key| {
+                v.get(*key).is_some_and(|value| {
+                    value.as_str().is_some_and(|s| !s.is_empty())
+                        || value.as_array().is_some_and(|items| !items.is_empty())
+                })
+            })
+        }) {
+            if let Some(fields) = push_provider_data.as_object_mut() {
+                for key in ["token", "topic", "condition", "tokens"] {
+                    fields.remove(key);
+                }
+            }
+        }
+        merge_provider_layer(&mut push_provider_data, layer);
+    }
     let mut merged_sms_override = data
         .get("smsOverride")
         .and_then(serde_json::Value::as_object)
@@ -555,6 +613,7 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
     // The original expands topics during multicast processing, not when the
     // trigger HTTP request is accepted. Direct recipients take precedence.
     let mut topic_preferences: HashMap<String, Vec<Option<serde_json::Value>>> = HashMap::new();
+    let mut topic_identities: HashMap<String, String> = HashMap::new();
     if !topic_keys.is_empty() {
         let direct: Vec<String> = recipients
             .iter()
@@ -564,12 +623,13 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
                     .map(str::to_owned)
             })
             .collect();
-        let rows = tx.query("SELECT t.subscriber_id,p.preferences,(w.inbox_metadata->>'id' IS NULL AND p.preferences IS NOT NULL) FROM novu_rust_topic_subscribers t JOIN novu_rust_subscribers s ON s.environment_id=t.environment_id AND s.subscriber_id=t.subscriber_id LEFT JOIN novu_rust_workflows w ON w.environment_id=t.environment_id AND w.identifier=$6 LEFT JOIN LATERAL (SELECT preferences FROM novu_rust_subscription_preferences p WHERE p.environment_id=t.environment_id AND p.subscription_internal_id=t.internal_id AND p.subscriber_internal_id=s.internal_id AND (w.inbox_metadata->>'id' IS NULL OR p.workflow_internal_id=w.inbox_metadata->>'id') ORDER BY p.created_at,p.context_keys_hash LIMIT 1) p ON true WHERE t.environment_id=$1 AND t.topic_key=ANY($2) AND NOT (t.subscriber_id=ANY($3)) AND NOT (t.subscriber_id=ANY($4)) AND ($5::text IS NULL OR t.subscriber_id<>$5) ORDER BY t.subscriber_id,t.internal_id", &[&job.environment_id,&topic_keys,&topic_exclusions,&direct,&actor_id,&workflow]).await?;
+        let rows = tx.query("SELECT t.subscriber_id,p.preferences,(w.inbox_metadata->>'id' IS NULL AND p.preferences IS NOT NULL),s.internal_id FROM novu_rust_topic_subscribers t JOIN novu_rust_subscribers s ON s.environment_id=t.environment_id AND s.subscriber_id=t.subscriber_id LEFT JOIN novu_rust_workflows w ON w.environment_id=t.environment_id AND w.identifier=$6 LEFT JOIN LATERAL (SELECT preferences FROM novu_rust_subscription_preferences p WHERE p.environment_id=t.environment_id AND p.subscription_internal_id=t.internal_id AND p.subscriber_internal_id=s.internal_id AND (w.inbox_metadata->>'id' IS NULL OR p.workflow_internal_id=w.inbox_metadata->>'id') ORDER BY p.created_at,p.context_keys_hash LIMIT 1) p ON true WHERE t.environment_id=$1 AND t.topic_key=ANY($2) AND NOT (t.subscriber_id=ANY($3)) AND NOT (t.subscriber_id=ANY($4)) AND ($5::text IS NULL OR t.subscriber_id<>$5) ORDER BY t.subscriber_id,t.internal_id", &[&job.environment_id,&topic_keys,&topic_exclusions,&direct,&actor_id,&workflow]).await?;
         for row in rows {
             if row.get::<_, bool>(2) {
                 return Err(InvalidJob("workflow identity required for topic preferences").into());
             }
             let subscriber: String = row.get(0);
+            topic_identities.insert(subscriber.clone(), row.get(3));
             if !topic_preferences.contains_key(&subscriber) {
                 recipients.push(serde_json::json!({"subscriberId":subscriber}));
             }
@@ -626,6 +686,10 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         }
     }
     let resolved_context = serde_json::Value::Object(resolved_context);
+    let snapshots = data
+        .get("recipientIdentitySnapshot")
+        .and_then(serde_json::Value::as_object);
+    let mut identity_changed = false;
     for recipient in recipients {
         let mut fields = recipient
             .as_object()
@@ -637,7 +701,27 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
             .ok_or(InvalidJob("invalid subscriber id"))?;
         let fields = serde_json::Value::Object(fields);
         let seconds = u32::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?;
-        let row = tx.query_one("INSERT INTO novu_rust_subscribers (environment_id, subscriber_id, profile, internal_id) VALUES ($1, $2, $3, novu_rust_new_objectid()) ON CONFLICT (environment_id, subscriber_id) DO UPDATE SET updated_at = CASE WHEN novu_rust_subscribers.profile IS DISTINCT FROM novu_rust_subscribers.profile || EXCLUDED.profile THEN now() ELSE novu_rust_subscribers.updated_at END, profile = novu_rust_subscribers.profile || EXCLUDED.profile RETURNING profile, internal_id", &[&job.environment_id, &subscriber, &fields]).await?;
+        let topic_identity = topic_identities
+            .get(&subscriber)
+            .cloned()
+            .map(serde_json::Value::String);
+        let expected = if crate::allow_recreated_subscriber() {
+            None
+        } else {
+            snapshots
+                .and_then(|map| map.get(&subscriber))
+                .or(topic_identity.as_ref())
+        };
+        let row = match expected {
+            Some(serde_json::Value::String(id)) => tx.query_opt("UPDATE novu_rust_subscribers SET updated_at=CASE WHEN profile IS DISTINCT FROM profile || $3::jsonb THEN now() ELSE updated_at END,profile=profile || $3::jsonb WHERE environment_id=$1 AND subscriber_id=$2 AND internal_id=$4 RETURNING profile,internal_id", &[&job.environment_id,&subscriber,&fields,&id]).await?,
+            Some(serde_json::Value::Null) => tx.query_opt("INSERT INTO novu_rust_subscribers (environment_id,subscriber_id,profile,internal_id) VALUES ($1,$2,$3,novu_rust_new_objectid()) ON CONFLICT (environment_id,subscriber_id) DO NOTHING RETURNING profile,internal_id", &[&job.environment_id,&subscriber,&fields]).await?,
+            Some(_) => return Err(InvalidJob("invalid subscriber identity snapshot").into()),
+            None => Some(tx.query_one("INSERT INTO novu_rust_subscribers (environment_id, subscriber_id, profile, internal_id) VALUES ($1, $2, $3, novu_rust_new_objectid()) ON CONFLICT (environment_id, subscriber_id) DO UPDATE SET updated_at = CASE WHEN novu_rust_subscribers.profile IS DISTINCT FROM novu_rust_subscribers.profile || EXCLUDED.profile THEN now() ELSE novu_rust_subscribers.updated_at END, profile = novu_rust_subscribers.profile || EXCLUDED.profile RETURNING profile, internal_id", &[&job.environment_id, &subscriber, &fields]).await?),
+        };
+        let Some(row) = row else {
+            identity_changed = true;
+            continue;
+        };
         let subscriber_internal_id: String = row.get(1);
         let mut profile: serde_json::Value = row.get(0);
         profile
@@ -683,7 +767,7 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         let notification_id: String = notification.get(0);
         if let Some((push_title, push_content)) = push_step.as_ref() {
             let push_job_id = Uuid::new_v4();
-            let push_payload = serde_json::json!({"workflow_context":{"subscriber_id":subscriber,"subscriber_internal_id":subscriber_internal_id,"notification_internal_id":notification_id,"transaction_id":transaction_id,"workflow_identifier":workflow,"workflow_internal_id":workflow_internal_id,"title_template":push_title,"content_template":push_content,"payload":payload,"context_keys":context_keys,"actor":actor_profile}});
+            let push_payload = serde_json::json!({"workflow_context":{"subscriber_id":subscriber,"subscriber_internal_id":subscriber_internal_id,"notification_internal_id":notification_id,"transaction_id":transaction_id,"workflow_identifier":workflow,"workflow_internal_id":workflow_internal_id,"title_template":push_title,"content_template":push_content,"payload":payload,"context_keys":context_keys,"actor":actor_profile,"overrides":data.get("pushFlatProviderOverride").and_then(|v| v.as_object()).cloned().unwrap_or_default(),"provider_data":push_provider_data}});
             tx.execute(
                 "INSERT INTO novu_queue_jobs(id,environment_id,kind,payload) VALUES ($1,$2,$3,$4)",
                 &[
@@ -798,7 +882,12 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         }
         tx.execute("INSERT INTO novu_rust_in_app_step_outcomes (job_id,environment_id,subscriber_id,subscriber_internal_id,workflow_identifier,transaction_id,status) VALUES ($1,$2,$3,$4,$5,$6,'completed')", &[&job.id,&job.environment_id,&subscriber,&subscriber_internal_id,&workflow,&transaction_id]).await?;
     }
-    let completed = tx.execute("UPDATE novu_queue_jobs SET status = 'completed', lease_token = NULL, lease_until = NULL WHERE id = $1 AND lease_token = $2 AND lease_until > clock_timestamp()", &[&job.id, &job.lease_token]).await?;
+    let (status, diagnostic) = if identity_changed {
+        ("failed", Some("subscriber identity changed"))
+    } else {
+        ("completed", None)
+    };
+    let completed = tx.execute("UPDATE novu_queue_jobs SET status = $3, last_error=$4, lease_token = NULL, lease_until = NULL WHERE id = $1 AND lease_token = $2 AND lease_until > clock_timestamp()", &[&job.id, &job.lease_token, &status, &diagnostic]).await?;
     if completed != 1 {
         tx.rollback().await?;
         return Err(LeaseLost.into());

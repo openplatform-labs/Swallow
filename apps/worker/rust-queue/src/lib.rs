@@ -173,3 +173,7 @@ pub async fn requeue_expired(client: &Client, kind: &str) -> Result<u64, Error> 
         )
         .await
 }
+/// Unsafe compatibility mode retains Novu's behavior when an external ID is reused.
+pub fn allow_recreated_subscriber() -> bool {
+    std::env::var("NOVU_ALLOW_RECREATED_SUBSCRIBER").as_deref() == Ok("true")
+}

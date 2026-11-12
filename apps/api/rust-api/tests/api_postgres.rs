@@ -501,6 +501,9 @@ async fn trigger_api_contract_inner() {
     db.batch_execute(novu_postgres_queue::in_app::MULTIPLE_FCM_CHANNELS_MIGRATION)
         .await
         .unwrap();
+    db.batch_execute(novu_postgres_queue::in_app::PUSH_STEP_ID_MIGRATION)
+        .await
+        .unwrap();
     db.batch_execute(novu_postgres_queue::in_app::MULTIPLE_FCM_CHANNELS_MIGRATION)
         .await
         .unwrap();

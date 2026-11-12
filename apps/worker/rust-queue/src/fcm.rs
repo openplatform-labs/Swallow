@@ -34,6 +34,10 @@ pub struct WorkflowContext {
     pub payload: Value,
     pub context_keys: Vec<String>,
     pub actor: Option<Value>,
+    #[serde(default)]
+    pub overrides: Map<String, Value>,
+    #[serde(default)]
+    pub provider_data: Map<String, Value>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -67,6 +71,14 @@ fn claimed(layer: &Map<String, Value>) -> Option<(&str, Value)> {
     None
 }
 
+pub(crate) fn routing(data: &Map<String, Value>) -> Option<(&str, Value)> {
+    data.get("_passthrough")
+        .and_then(|v| v.get("body"))
+        .and_then(Value::as_object)
+        .and_then(claimed)
+        .or_else(|| claimed(data))
+}
+
 // BaseProvider deepmerge concatenates arrays and recursively merges objects.
 fn merge(target: &mut Value, source: &Value) {
     match (target, source) {
@@ -94,9 +106,7 @@ pub fn plan(push: &Push) -> Plan {
         .get("_passthrough")
         .and_then(|v| v.get("body"))
         .and_then(Value::as_object);
-    let routing = passthrough
-        .and_then(claimed)
-        .or_else(|| claimed(&push.provider_data));
+    let routing = routing(&push.provider_data);
     let mut message = Map::new();
     let multicast = match routing {
         Some((key @ ("token" | "topic" | "condition"), Value::String(value))) => {

@@ -60,7 +60,7 @@ pub async fn process_one(
     };
     let tx = client.transaction().await?;
     let subscriber = if let Some(context) = sms.workflow_context.as_ref() {
-        tx.query_opt("SELECT s.profile,w.read_only,w.all_enabled,w.sms_enabled,(p.channels->>'sms')::boolean,(sp.channels->>'sms')::boolean,EXISTS(SELECT 1 FROM novu_rust_workflows wf WHERE wf.environment_id=s.environment_id AND wf.identifier=$3 AND ($4::text IS NULL OR wf.inbox_metadata->>'id'=$4)) FROM novu_rust_subscribers s LEFT JOIN novu_rust_workflow_preferences w ON w.environment_id=s.environment_id AND w.workflow_identifier=$3 LEFT JOIN novu_rust_subscriber_preferences p ON p.environment_id=s.environment_id AND p.subscriber_id=s.subscriber_id LEFT JOIN novu_rust_subscriber_workflow_preferences sp ON sp.environment_id=s.environment_id AND sp.subscriber_id=s.subscriber_id AND sp.workflow_identifier=$3 WHERE s.environment_id=$1 AND s.subscriber_id=$2 FOR UPDATE OF s", &[&environment,&context.subscriber_id,&context.workflow_identifier,&context.workflow_internal_id]).await?
+        tx.query_opt("SELECT s.profile,w.read_only,w.all_enabled,w.sms_enabled,(p.channels->>'sms')::boolean,(sp.channels->>'sms')::boolean,EXISTS(SELECT 1 FROM novu_rust_workflows wf WHERE wf.environment_id=s.environment_id AND wf.identifier=$3 AND ($4::text IS NULL OR wf.inbox_metadata->>'id'=$4)),s.internal_id FROM novu_rust_subscribers s LEFT JOIN novu_rust_workflow_preferences w ON w.environment_id=s.environment_id AND w.workflow_identifier=$3 LEFT JOIN novu_rust_subscriber_preferences p ON p.environment_id=s.environment_id AND p.subscriber_id=s.subscriber_id LEFT JOIN novu_rust_subscriber_workflow_preferences sp ON sp.environment_id=s.environment_id AND sp.subscriber_id=s.subscriber_id AND sp.workflow_identifier=$3 WHERE s.environment_id=$1 AND s.subscriber_id=$2 FOR UPDATE OF s", &[&environment,&context.subscriber_id,&context.workflow_identifier,&context.workflow_internal_id]).await?
     } else {
         None
     };
@@ -71,6 +71,12 @@ pub async fn process_one(
     if let Some(context) = sms.workflow_context.take() {
         let skip = match subscriber.as_ref() {
             None => Some(("failed", "failed", "subscriber not found")),
+            Some(row)
+                if !crate::allow_recreated_subscriber()
+                    && row.get::<_, String>(7) != context.subscriber_internal_id =>
+            {
+                Some(("failed", "failed", "subscriber identity changed"))
+            }
             Some(row) if !row.get::<_, bool>(6) => Some(("failed", "failed", "workflow not found")),
             Some(row)
                 if !novu_rust_contracts::preference::in_app_enabled(

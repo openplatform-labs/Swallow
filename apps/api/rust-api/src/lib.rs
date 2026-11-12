@@ -246,7 +246,7 @@ async fn authenticate_inbox(
         .ok_or_else(unauthorized)?;
     let exists = db
         .query_opt(
-            "SELECT 1 FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2",
+            "SELECT internal_id FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2",
             &[&claims.environment_id, &claims.subscriber_id],
         )
         .await
@@ -258,7 +258,10 @@ async fn authenticate_inbox(
                 path,
             )
         })?;
-    if exists.is_none() {
+    if exists.as_ref().is_none_or(|row| {
+        std::env::var("NOVU_ALLOW_RECREATED_SUBSCRIBER").as_deref() != Ok("true")
+            && claims.internal_id.as_deref() != Some(row.get::<_, String>(0).as_str())
+    }) {
         return Err(unauthorized());
     }
     Ok(claims)
@@ -2547,6 +2550,7 @@ async fn trigger(
                     "sms",
                     "sendgrid",
                     "twilio",
+                    "fcm",
                     "providers",
                     "steps",
                 ]
@@ -2657,6 +2661,7 @@ async fn trigger(
     };
     let flat = overrides.and_then(|v| v.get("sendgrid"));
     let sms_flat = overrides.and_then(|v| v.get("twilio"));
+    let fcm_flat = overrides.and_then(|v| v.get("fcm"));
     let providers = overrides.and_then(|v| v.get("providers"));
     let steps = overrides.and_then(|v| v.get("steps"));
     let valid_sms_fields = |fields: &serde_json::Map<String, Value>| {
@@ -2704,17 +2709,74 @@ async fn trigger(
             })
         })
     };
+    let valid_fcm_fields = |fields: &serde_json::Map<String, Value>| {
+        fields.iter().all(|(key, value)| match key.as_str() {
+            "token" | "topic" | "condition" => value.as_str().is_some_and(|v| !v.is_empty()),
+            "tokens" => value.as_array().is_some_and(|items| {
+                !items.is_empty()
+                    && items.len() <= 500
+                    && items
+                        .iter()
+                        .all(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+            }),
+            "data" => value
+                .as_object()
+                .is_some_and(|v| v.values().all(Value::is_string)),
+            "notification" => value.as_object().is_some_and(|v| {
+                v.iter().all(|(key, value)| {
+                    ["title", "body", "imageUrl"].contains(&key.as_str()) && value.is_string()
+                })
+            }),
+            _ => false,
+        })
+    };
+    let valid_fcm_layer = |layer: &Value| {
+        layer.as_object().is_some_and(|fields| {
+            fields.iter().all(|(key, value)| {
+                if key == "_passthrough" {
+                    value.as_object().is_some_and(|v| {
+                        v.len() == 1
+                            && v.get("body")
+                                .and_then(Value::as_object)
+                                .is_some_and(valid_fcm_fields)
+                    })
+                } else {
+                    valid_fcm_fields(&serde_json::Map::from_iter([(key.clone(), value.clone())]))
+                }
+            })
+        })
+    };
     let valid_providers = |value: &Value| {
         value.as_object().is_some_and(|entries| {
             entries.iter().all(|(key, layer)| match key.as_str() {
                 "sendgrid" => valid_layer(layer),
                 "twilio" => valid_sms_layer(layer),
+                "fcm" => valid_fcm_layer(layer),
                 _ => false,
             })
         })
     };
     if flat.is_some_and(|v| !valid_layer(v))
         || sms_flat.is_some_and(|v| !valid_sms_layer(v))
+        || fcm_flat.is_some_and(|v| {
+            !v.as_object().is_some_and(|fields| {
+                fields.iter().all(|(key, value)| match key.as_str() {
+                    "type" => value
+                        .as_str()
+                        .is_some_and(|v| v == "data" || v == "notification"),
+                    "data" => value
+                        .as_object()
+                        .is_some_and(|v| v.values().all(Value::is_string)),
+                    "deviceTokens" => value.as_array().is_some_and(|items| {
+                        !items.is_empty()
+                            && items
+                                .iter()
+                                .all(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+                    }),
+                    _ => false,
+                })
+            })
+        })
         || providers.is_some_and(|v| !valid_providers(v))
         || steps.is_some_and(|v| {
             !v.as_object().is_some_and(|entries| {
@@ -2860,10 +2922,10 @@ async fn trigger(
             );
         }
         let organization_id: Option<String> = row.get(4);
-        let data = json!({"organizationId": organization_id, "workflow": name, "transactionId": txn, "recipients": recipients, "topicKeys": topic_keys, "topicExclusions": topic_exclusions, "actor": actor, "content": content, "payload": payload, "tags": tags, "contextKeys": context_keys, "severity": severity, "severityOverride": override_severity, "emailOverride": email_override, "smsOverride": sms_override, "emailFlatProviderOverride":flat,"smsFlatProviderOverride":sms_flat,"emailProviderOverrides":providers,"emailStepOverrides":steps});
+        let data = json!({"organizationId": organization_id, "workflow": name, "transactionId": txn, "recipients": recipients, "topicKeys": topic_keys, "topicExclusions": topic_exclusions, "actor": actor, "content": content, "payload": payload, "tags": tags, "contextKeys": context_keys, "severity": severity, "severityOverride": override_severity, "emailOverride": email_override, "smsOverride": sms_override, "emailFlatProviderOverride":flat,"smsFlatProviderOverride":sms_flat,"pushFlatProviderOverride":fcm_flat,"emailProviderOverrides":providers,"emailStepOverrides":steps});
         // The ledger and queue entry are inserted atomically. This provisional deduplication
         // policy is not yet equivalent to Novu's tier-dependent retention behaviour.
-        let result = db.execute("WITH accepted AS (INSERT INTO novu_rust_trigger_transactions (environment_id, transaction_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING 1), contexts AS (INSERT INTO novu_rust_contexts (environment_id,context_key,data) SELECT $1, entry->>'key', COALESCE(NULLIF(entry->'data','null'::jsonb),'{}'::jsonb) FROM accepted CROSS JOIN jsonb_array_elements($6::jsonb) entry ON CONFLICT (environment_id,context_key) DO UPDATE SET data=CASE WHEN EXISTS (SELECT 1 FROM jsonb_array_elements($6::jsonb) element WHERE element->>'key'=EXCLUDED.context_key AND element->'data' <> 'null'::jsonb) THEN EXCLUDED.data ELSE novu_rust_contexts.data END, updated_at=CASE WHEN EXISTS (SELECT 1 FROM jsonb_array_elements($6::jsonb) element WHERE element->>'key'=EXCLUDED.context_key AND element->'data' <> 'null'::jsonb) AND novu_rust_contexts.data IS DISTINCT FROM EXCLUDED.data THEN now() ELSE novu_rust_contexts.updated_at END RETURNING 1) INSERT INTO novu_queue_jobs (id, environment_id, kind, payload) SELECT $3, $1, $4, $5 FROM accepted", &[&environment_id, &txn, &Uuid::new_v4(), &novu_rust_contracts::EXPERIMENTAL_IN_APP_JOB_KIND, &data, &context_entries]).await;
+        let result = db.execute("WITH accepted AS (INSERT INTO novu_rust_trigger_transactions (environment_id, transaction_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING 1), contexts AS (INSERT INTO novu_rust_contexts (environment_id,context_key,data) SELECT $1, entry->>'key', COALESCE(NULLIF(entry->'data','null'::jsonb),'{}'::jsonb) FROM accepted CROSS JOIN jsonb_array_elements($6::jsonb) entry ON CONFLICT (environment_id,context_key) DO UPDATE SET data=CASE WHEN EXISTS (SELECT 1 FROM jsonb_array_elements($6::jsonb) element WHERE element->>'key'=EXCLUDED.context_key AND element->'data' <> 'null'::jsonb) THEN EXCLUDED.data ELSE novu_rust_contexts.data END, updated_at=CASE WHEN EXISTS (SELECT 1 FROM jsonb_array_elements($6::jsonb) element WHERE element->>'key'=EXCLUDED.context_key AND element->'data' <> 'null'::jsonb) AND novu_rust_contexts.data IS DISTINCT FROM EXCLUDED.data THEN now() ELSE novu_rust_contexts.updated_at END RETURNING 1) INSERT INTO novu_queue_jobs (id, environment_id, kind, payload) SELECT $3, $1, $4, $5::jsonb || jsonb_build_object('recipientIdentitySnapshot',(SELECT COALESCE(jsonb_object_agg(r->>'subscriberId',s.internal_id),'{}'::jsonb) FROM jsonb_array_elements($5::jsonb->'recipients') r LEFT JOIN novu_rust_subscribers s ON s.environment_id=$1 AND s.subscriber_id=r->>'subscriberId')) FROM accepted", &[&environment_id, &txn, &Uuid::new_v4(), &novu_rust_contracts::EXPERIMENTAL_IN_APP_JOB_KIND, &data, &context_entries]).await;
         if result.is_err() {
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,

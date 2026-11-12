@@ -124,6 +124,77 @@ sort=lambda items:sorted(items,key=lambda item:json.dumps(item,sort_keys=True))
 assert sort(source_history)==sort(rust_history)==sort([{'deviceTokens':['first-a','first-b'],'status':'sent'},{'deviceTokens':['first-a','first-b'],'status':'sent'},{'deviceTokens':['second-b'],'status':'sent'}]),(source_history,rust_history)
 print('multi-integration requests match; Rust uses the configured test credential for each integration')
 
+# A provider-wide token is sent once per populated channel, while a topic or
+# a subscriber with no channels uses the most recently created integration.
+for label,target_user,route_key,count,expected_auth in [
+    ('token-channels',subscriber,'token',2,['first-fixture-secret','second-fixture-secret']),
+    ('topic-broadcast',subscriber,'topic',1,['second-fixture-secret']),
+    ('token-no-channel','route-empty-'+uuid.uuid4().hex,'token',1,['second-fixture-secret']),
+]:
+    if label=='token-no-channel':
+        for base in bases:assert request(base,'POST','/v2/subscribers',{'subscriberId':target_user})[0]==201
+    destination='multi-route-'+uuid.uuid4().hex
+    transaction='route-'+uuid.uuid4().hex
+    event={'name':'push-multi','to':target_user,'transactionId':transaction,'overrides':{'providers':{'fcm':{route_key:destination}}}}
+    for base in bases:
+        status,response=request(base,'POST','/v1/events/trigger',event)
+        assert status==201,(base,status,response)
+    for _ in range(90):
+        job=run('docker','exec',pg,'psql','-U','postgres','-d','novu_compat','-At','-c',f"SELECT push_job_id FROM novu_rust_push_step_outcomes WHERE transaction_id='{transaction}' AND status='queued'")
+        log=subprocess.run(['docker','exec',worker,'cat','/tmp/novu-push-capture.jsonl'],capture_output=True,text=True).stdout.splitlines()
+        reference=[json.loads(line) for line in log if json.loads(line).get(route_key)==destination]
+        if job and len(reference)==count:break
+        time.sleep(.5)
+    else:raise AssertionError((label,job,reference))
+    with tempfile.TemporaryDirectory(prefix='novu-multi-route-') as directory:
+        capture=Path(directory)/'capture.json';auth=Path(directory)/'auth.json'
+        config={first:'first-fixture-secret',second:'second-fixture-secret'}
+        subprocess.run(['cargo','test','--locked','--offline','--lib','capture_reference_workflow_push','--','--ignored'],cwd=Path(__file__).resolve().parents[3]/'worker'/'rust-queue',env=dict(os.environ,TEST_PUSH_CAPTURE_PATH=str(capture),TEST_PUSH_AUTH_CAPTURE_PATH=str(auth),TEST_PUSH_EXPECTED_COUNT=str(count),TEST_PUSH_INTEGRATIONS=json.dumps(config)),check=True)
+        actual=[item['message'] for item in json.loads(capture.read_text())]
+        assert json.loads(auth.read_text())==['Bearer '+secret for secret in expected_auth],(label,auth.read_text())
+    for original,rust in zip(reference,actual):
+        original['data'].pop('__nvMessageId');rust['data'].pop('__nvMessageId')
+        assert original==rust,(label,original,rust)
+    source_history=json.loads(run('docker','exec',mongo,'mongosh','--quiet','--eval',f'''const d=db.getSiblingDB("novu-db");print(JSON.stringify(d.messages.find({{transactionId:"{transaction}"}}).toArray().map(m=>({{deviceTokens:m.deviceTokens,status:m.status}}))));'''))
+    rust_history=json.loads(run('docker','exec',pg,'psql','-U','postgres','-d','novu_compat','-At','-c',f"SELECT COALESCE(json_agg(json_build_object('deviceTokens',device_tokens,'status',status)),'[]'::json)::text FROM novu_rust_push_messages WHERE transaction_id='{transaction}'"))
+    assert sort(source_history)==sort(rust_history)==[{'deviceTokens':[],'status':'sent'}]*count,(label,source_history,rust_history)
+    print(label+': multiple integration routing and history matched')
+
+# A tokens override is one logical multicast per subscriber integration, even
+# though the Rust HTTP v1 adapter dispatches each target individually.
+transaction='multi-multicast-'+uuid.uuid4().hex
+tokens=['multi-cast-a-'+uuid.uuid4().hex,'multi-cast-b-'+uuid.uuid4().hex]
+for base in bases:
+    status,response=request(base,'POST','/v1/events/trigger',{'name':'push-multi','to':subscriber,'transactionId':transaction,'overrides':{'providers':{'fcm':{'tokens':tokens}}}})
+    assert status==201,(base,status,response)
+for _ in range(90):
+    job=run('docker','exec',pg,'psql','-U','postgres','-d','novu_compat','-At','-c',f"SELECT push_job_id FROM novu_rust_push_step_outcomes WHERE transaction_id='{transaction}' AND status='queued'")
+    log=subprocess.run(['docker','exec',worker,'cat','/tmp/novu-push-capture.jsonl'],capture_output=True,text=True).stdout.splitlines()
+    reference=[json.loads(line) for line in log if json.loads(line).get('tokens')==tokens]
+    if job and len(reference)==2:break
+    time.sleep(.5)
+else:raise AssertionError((job,reference))
+with tempfile.TemporaryDirectory(prefix='novu-multi-multicast-') as directory:
+    config={first:'first-fixture-secret',second:'second-fixture-secret'}
+    capture=Path(directory)/'capture.json';auth=Path(directory)/'auth.json'
+    subprocess.run(['cargo','test','--locked','--offline','--lib','capture_reference_workflow_push','--','--ignored'],cwd=Path(__file__).resolve().parents[3]/'worker'/'rust-queue',env=dict(os.environ,TEST_PUSH_CAPTURE_PATH=str(capture),TEST_PUSH_AUTH_CAPTURE_PATH=str(auth),TEST_PUSH_EXPECTED_COUNT='4',TEST_PUSH_INTEGRATIONS=json.dumps(config)),check=True)
+    actual=[entry['message'] for entry in json.loads(capture.read_text())]
+    assert json.loads(auth.read_text())==['Bearer first-fixture-secret']*2+['Bearer second-fixture-secret']*2
+reference_ids=[];rust_ids=[]
+for idx,original in enumerate(reference):
+    reference_ids.append(original['data'].pop('__nvMessageId'));original.pop('tokens')
+    ids=set()
+    for token,message in zip(tokens,actual[2*idx:2*idx+2]):
+        ids.add(message['data'].pop('__nvMessageId'));assert message.pop('token')==token
+        assert original==message,(original,message)
+    assert len(ids)==1
+    rust_ids.append(next(iter(ids)))
+source_history=json.loads(run('docker','exec',mongo,'mongosh','--quiet','--eval',f'''const d=db.getSiblingDB("novu-db");print(JSON.stringify(d.messages.find({{transactionId:"{transaction}"}}).toArray().map(m=>({{id:String(m._id),deviceTokens:m.deviceTokens,status:m.status}}))));'''))
+rust_history=json.loads(run('docker','exec',pg,'psql','-U','postgres','-d','novu_compat','-At','-c',f"SELECT COALESCE(json_agg(json_build_object('id',internal_id,'deviceTokens',device_tokens,'status',status)),'[]'::json)::text FROM novu_rust_push_messages WHERE transaction_id='{transaction}'"))
+assert sort(source_history)==sort([{'id':identity,'deviceTokens':tokens,'status':'sent'} for identity in reference_ids]),source_history
+assert sort(rust_history)==sort([{'id':identity,'deviceTokens':tokens,'status':'sent'} for identity in rust_ids]),rust_history
+print('multicast uses separate shared history for each integration: match')
+
 # An absent credential must fail before the first provider request, even when
 # the first target has valid credentials.
 missing_tx=subscriber+'-missing-config'

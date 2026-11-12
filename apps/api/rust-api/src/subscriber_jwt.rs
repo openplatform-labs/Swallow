@@ -7,6 +7,7 @@ use sha2_11::Sha256;
 pub struct Claims {
     pub environment_id: String,
     pub subscriber_id: String,
+    pub internal_id: Option<String>,
     pub context_keys: Vec<String>,
 }
 
@@ -92,6 +93,10 @@ pub fn verify(token: &str, secret: &[u8], now: u64) -> Option<Claims> {
     Some(Claims {
         environment_id,
         subscriber_id,
+        internal_id: payload
+            .get("_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         context_keys,
     })
 }

@@ -93,17 +93,50 @@ async fn process_one_inner(
     let tx = client.transaction().await?;
     // Match subscriber mutation lock ordering before locking the job.
     let subscriber = if let Some(context) = push.workflow_context.as_ref() {
-        tx.query_opt("SELECT s.profile,w.read_only,w.all_enabled,w.push_enabled,(p.channels->>'push')::boolean,(sp.channels->>'push')::boolean,EXISTS(SELECT 1 FROM novu_rust_workflows wf WHERE wf.environment_id=s.environment_id AND wf.identifier=$3 AND ($4::text IS NULL OR wf.inbox_metadata->>'id'=$4)),d.device_tokens,d.integration_internal_id IS NULL OR EXISTS(SELECT 1 FROM novu_rust_fcm_integrations i WHERE i.environment_id=s.environment_id AND i.internal_id=d.integration_internal_id AND i.active),d.integration_internal_id,EXISTS(SELECT 1 FROM novu_rust_fcm_devices x WHERE x.environment_id=s.environment_id AND x.subscriber_id=s.subscriber_id OFFSET 1) FROM novu_rust_subscribers s LEFT JOIN novu_rust_workflow_preferences w ON w.environment_id=s.environment_id AND w.workflow_identifier=$3 LEFT JOIN novu_rust_subscriber_preferences p ON p.environment_id=s.environment_id AND p.subscriber_id=s.subscriber_id LEFT JOIN novu_rust_subscriber_workflow_preferences sp ON sp.environment_id=s.environment_id AND sp.subscriber_id=s.subscriber_id AND sp.workflow_identifier=$3 LEFT JOIN LATERAL (SELECT * FROM novu_rust_fcm_devices d WHERE d.environment_id=s.environment_id AND d.subscriber_id=s.subscriber_id ORDER BY d.channel_order LIMIT 1) d ON true WHERE s.environment_id=$1 AND s.subscriber_id=$2 FOR UPDATE OF s",&[&environment,&context.subscriber_id,&context.workflow_identifier,&context.workflow_internal_id]).await?
+        tx.query_opt("SELECT s.profile,w.read_only,w.all_enabled,w.push_enabled,(p.channels->>'push')::boolean,(sp.channels->>'push')::boolean,EXISTS(SELECT 1 FROM novu_rust_workflows wf WHERE wf.environment_id=s.environment_id AND wf.identifier=$3 AND ($4::text IS NULL OR wf.inbox_metadata->>'id'=$4)),d.device_tokens,d.integration_internal_id IS NULL OR EXISTS(SELECT 1 FROM novu_rust_fcm_integrations i WHERE i.environment_id=s.environment_id AND i.internal_id=d.integration_internal_id AND i.active),d.integration_internal_id,EXISTS(SELECT 1 FROM novu_rust_fcm_devices x WHERE x.environment_id=s.environment_id AND x.subscriber_id=s.subscriber_id OFFSET 1),s.internal_id FROM novu_rust_subscribers s LEFT JOIN novu_rust_workflow_preferences w ON w.environment_id=s.environment_id AND w.workflow_identifier=$3 LEFT JOIN novu_rust_subscriber_preferences p ON p.environment_id=s.environment_id AND p.subscriber_id=s.subscriber_id LEFT JOIN novu_rust_subscriber_workflow_preferences sp ON sp.environment_id=s.environment_id AND sp.subscriber_id=s.subscriber_id AND sp.workflow_identifier=$3 LEFT JOIN LATERAL (SELECT * FROM novu_rust_fcm_devices d WHERE d.environment_id=s.environment_id AND d.subscriber_id=s.subscriber_id ORDER BY d.channel_order LIMIT 1) d ON true WHERE s.environment_id=$1 AND s.subscriber_id=$2 FOR UPDATE OF s",&[&environment,&context.subscriber_id,&context.workflow_identifier,&context.workflow_internal_id]).await?
     } else {
         None
+    };
+    let prepared_identity_valid = if !crate::allow_recreated_subscriber()
+        && push.workflow_context.is_none()
+    {
+        if let Some(context) = prepared_context.as_ref() {
+            let id = context
+                .get("subscriber_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let expected = context
+                .get("subscriber_internal_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            tx.query_opt("SELECT internal_id FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2 FOR UPDATE", &[&environment,&id]).await?.is_some_and(|row| row.get::<_, String>(0)==expected)
+        } else {
+            true
+        }
+    } else {
+        true
     };
     if !lock_live(&tx, &job).await? {
         tx.rollback().await?;
         return Ok(true);
     }
+    if !prepared_identity_valid {
+        tx.execute("UPDATE novu_rust_push_step_outcomes SET status='failed',push_job_id=NULL WHERE environment_id=$1 AND push_job_id=$2", &[&environment,&job.id]).await?;
+        tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='subscriber identity changed',lease_token=NULL,lease_until=NULL WHERE id=$1", &[&job.id]).await?;
+        tx.commit().await?;
+        return Ok(true);
+    }
     let messages = if let Some(context) = push.workflow_context.take() {
+        let route = fcm::routing(&context.provider_data);
         let skip = match subscriber.as_ref() {
             None => Some(("failed", "failed", "subscriber not found")),
+            Some(row)
+                if !crate::allow_recreated_subscriber()
+                    && context.subscriber_internal_id.as_deref()
+                        != Some(row.get::<_, String>(11).as_str()) =>
+            {
+                Some(("failed", "failed", "subscriber identity changed"))
+            }
             Some(row) if !row.get::<_, bool>(6) => Some(("failed", "failed", "workflow not found")),
             Some(row)
                 if !novu_rust_contracts::preference::in_app_enabled(
@@ -116,13 +149,16 @@ async fn process_one_inner(
             {
                 Some(("canceled", "cancelled", "push preference disabled"))
             }
-            Some(row) if row.get::<_, bool>(10) && providers.is_none() => Some((
-                "failed",
-                "failed",
-                "multiple push integrations not configured for delivery",
-            )),
+            Some(row) if route.is_none() && row.get::<_, bool>(10) && providers.is_none() => {
+                Some((
+                    "failed",
+                    "failed",
+                    "multiple push integrations not configured for delivery",
+                ))
+            }
             Some(row)
-                if !row.get::<_, bool>(10)
+                if route.is_none()
+                    && !row.get::<_, bool>(10)
                     && row
                         .get::<_, Option<Vec<String>>>(7)
                         .is_none_or(|tokens| tokens.is_empty()) =>
@@ -133,11 +169,13 @@ async fn process_one_inner(
                     "subscriber missing push device",
                 ))
             }
-            Some(row) if !row.get::<_, bool>(10) && !row.get::<_, bool>(8) => Some((
-                "failed",
-                "failed",
-                "subscriber has no active push integration",
-            )),
+            Some(row) if route.is_none() && !row.get::<_, bool>(10) && !row.get::<_, bool>(8) => {
+                Some((
+                    "failed",
+                    "failed",
+                    "subscriber has no active push integration",
+                ))
+            }
             _ => None,
         };
         if let Some((outcome, status, diagnostic)) = skip {
@@ -147,7 +185,34 @@ async fn process_one_inner(
             return Ok(true);
         }
         let row = subscriber.as_ref().unwrap();
-        let groups: Vec<(Option<String>, Vec<String>, bool)> = if row.get::<_, bool>(10) {
+        let groups: Vec<(Option<String>, Vec<String>, bool)> = if let Some((key, _)) =
+            route.as_ref()
+        {
+            // The reference keeps one send per populated subscriber channel for
+            // token routes. Broadcasts and token-less subscribers instead use
+            // the newest active provider selected by Novu's default policy.
+            let mut channels = if *key == "token" || *key == "tokens" {
+                tx.query("SELECT d.integration_internal_id FROM novu_rust_fcm_devices d JOIN novu_rust_fcm_integrations i ON i.environment_id=d.environment_id AND i.internal_id=d.integration_internal_id AND i.active WHERE d.environment_id=$1 AND d.subscriber_id=$2 AND cardinality(d.device_tokens)>0 ORDER BY d.channel_order", &[&environment,&context.subscriber_id]).await?.into_iter().map(|row| (Some(row.get::<_, String>(0)),vec![String::new()],true)).collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            if channels.is_empty() {
+                let active = tx.query_opt("SELECT internal_id,identifier FROM novu_rust_fcm_integrations WHERE environment_id=$1 AND active ORDER BY created_at DESC,internal_id DESC LIMIT 1", &[&environment]).await?;
+                if let Some(active) = active.filter(|row| {
+                    row.get::<_, Option<String>>(1)
+                        .is_some_and(|value| !value.is_empty())
+                }) {
+                    channels.push((Some(active.get(0)), vec![String::new()], true));
+                }
+            }
+            if channels.is_empty() || (channels.len() > 1 && providers.is_none()) {
+                tx.execute("UPDATE novu_rust_push_step_outcomes SET status='failed',push_job_id=NULL WHERE environment_id=$1 AND push_job_id=$2",&[&environment,&job.id]).await?;
+                tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='FCM routing integration unavailable',lease_token=NULL,lease_until=NULL WHERE id=$1",&[&job.id]).await?;
+                tx.commit().await?;
+                return Ok(true);
+            }
+            channels
+        } else if row.get::<_, bool>(10) {
             tx.query("SELECT d.integration_internal_id,d.device_tokens,d.integration_internal_id IS NULL OR EXISTS(SELECT 1 FROM novu_rust_fcm_integrations i WHERE i.environment_id=d.environment_id AND i.internal_id=d.integration_internal_id AND i.active) FROM novu_rust_fcm_devices d WHERE d.environment_id=$1 AND d.subscriber_id=$2 ORDER BY d.channel_order", &[&environment,&context.subscriber_id]).await?
                 .into_iter().map(|r| (r.get(0),r.get(1),r.get(2))).collect()
         } else {
@@ -240,24 +305,50 @@ async fn process_one_inner(
         let mut messages = Vec::new();
         let mut target_metadata = Vec::new();
         for (integration, tokens, _) in eligible {
-            for token in tokens {
+            let override_tokens: Option<Vec<String>> = context
+                .overrides
+                .get("deviceTokens")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                });
+            let targets = if route.is_some() {
+                tokens
+            } else {
+                override_tokens.as_ref().unwrap_or(tokens)
+            };
+            for token in targets {
                 let message_id: String = tx
                     .query_one("SELECT novu_rust_new_objectid()", &[])
                     .await?
                     .get(0);
                 let mut payload = context.payload.as_object().cloned().unwrap_or_default();
-                payload.insert("__nvMessageId".into(), message_id.into());
+                payload.insert("__nvMessageId".into(), message_id.clone().into());
                 let candidate = Push {
                     title: title.clone(),
                     content: content.clone(),
                     targets: vec![token.clone()],
                     payload,
+                    overrides: context.overrides.clone(),
+                    provider_data: context.provider_data.clone(),
                     ..Push::default()
                 };
                 match fcm::wire_messages(&fcm::plan(&candidate)) {
                     Ok(mut bodies) => {
+                        let history_index = messages.len();
+                        let group_size = bodies.len();
+                        let recorded_tokens = match route.as_ref() {
+                            Some(("tokens", value)) => value.clone(),
+                            Some(_) => serde_json::json!([]),
+                            None => serde_json::json!(targets),
+                        };
+                        for _ in 0..group_size {
+                            target_metadata.push(serde_json::json!({"device_tokens":recorded_tokens,"integration_internal_id":integration,"message_id":message_id,"routed":route.is_some(),"history_index":history_index,"group_size":group_size}));
+                        }
                         messages.append(&mut bodies);
-                        target_metadata.push(serde_json::json!({"device_tokens":tokens,"integration_internal_id":integration}));
                     }
                     Err(_) => {
                         tx.execute("UPDATE novu_rust_push_step_outcomes SET status='failed',push_job_id=NULL WHERE environment_id=$1 AND push_job_id=$2",&[&environment,&job.id]).await?;
@@ -346,6 +437,17 @@ async fn process_one_inner(
     let integration_id = target_metadata
         .and_then(|meta| meta.get("integration_internal_id"))
         .and_then(serde_json::Value::as_str);
+    let history_index = target_metadata
+        .and_then(|meta| meta.get("history_index"))
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .unwrap_or(index_i32);
+    let group_size = target_metadata
+        .and_then(|meta| meta.get("group_size"))
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1);
     let selected_provider = if let Some(providers) = providers {
         integration_id.and_then(|id| providers.get(id))
     } else {
@@ -373,11 +475,16 @@ async fn process_one_inner(
                     .map(|v| v.as_str().map(str::to_owned))
                     .collect::<Option<Vec<_>>>()
             });
-        let message_id = messages[index]
-            .get("message")
-            .and_then(|v| v.get("data"))
-            .and_then(|v| v.get("__nvMessageId"))
-            .and_then(serde_json::Value::as_str);
+        let message_id = target_metadata
+            .and_then(|v| v.get("message_id"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                messages[index]
+                    .get("message")
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.get("__nvMessageId"))
+                    .and_then(serde_json::Value::as_str)
+            });
         if let (
             Some(message_id),
             Some(subscriber_id),
@@ -402,7 +509,7 @@ async fn process_one_inner(
             let stored_content = (std::env::var("STORE_NOTIFICATION_CONTENT").as_deref()
                 == Ok("true"))
             .then_some(content);
-            tx.execute("INSERT INTO novu_rust_push_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,device_tokens,title,content,status,push_job_id,target_index) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'sent',$11,$12) ON CONFLICT(push_job_id,target_index) DO NOTHING",&[&message_id,&environment,&subscriber_id,&subscriber_internal_id,&notification_internal_id,&workflow,&transaction,&tokens,&title,&stored_content,&job.id,&index_i32]).await?;
+            tx.execute("INSERT INTO novu_rust_push_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,device_tokens,title,content,status,push_job_id,target_index) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'sent',$11,$12) ON CONFLICT(push_job_id,target_index) DO NOTHING",&[&message_id,&environment,&subscriber_id,&subscriber_internal_id,&notification_internal_id,&workflow,&transaction,&tokens,&title,&stored_content,&job.id,&history_index]).await?;
         } else {
             tx.rollback().await?;
             crate::fail(
@@ -443,6 +550,10 @@ async fn process_one_inner(
     if updated == 1 {
         if invalid_token
             && std::env::var("IS_EXPIRED_TOKENS_REMOVAL_ENABLED").as_deref() == Ok("true")
+            && !target_metadata
+                .and_then(|v| v.get("routed"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
         {
             if let (Some(context), Some(token)) = (
                 prepared_context.as_ref(),
@@ -468,20 +579,27 @@ async fn process_one_inner(
             }
         }
         if prepared_context.is_some() {
-            let diagnostic = if state == "accepted" {
-                None
-            } else if state == "rejected" {
-                Some("push provider rejected request")
-            } else {
-                Some("push delivery outcome unknown")
-            };
-            let message_status = if state == "accepted" { "sent" } else { "error" };
-            let error_id = if state == "accepted" {
-                None
-            } else {
-                Some("unexpected_push_error")
-            };
-            tx.execute("UPDATE novu_rust_push_messages SET status=$4,error_id=$5,error_text=$6,identifier=internal_id WHERE environment_id=$1 AND push_job_id=$2 AND target_index=$3",&[&environment,&job.id,&index_i32,&message_status,&error_id,&diagnostic]).await?;
+            let end = history_index.saturating_add(group_size);
+            let counts = tx.query_one("SELECT count(*), count(*) FILTER (WHERE state='accepted'), count(*) FILTER (WHERE state IN ('unknown','dispatching')) FROM novu_rust_fcm_attempts WHERE environment_id=$1 AND job_id=$2 AND target_index >= $3 AND target_index < $4", &[&environment,&job.id,&history_index,&end]).await?;
+            let count: i64 = counts.get(0);
+            if count == i64::from(group_size) {
+                let accepted: i64 = counts.get(1);
+                let unknown: i64 = counts.get(2);
+                let message_status = if accepted > 0 && unknown == 0 {
+                    "sent"
+                } else {
+                    "error"
+                };
+                let diagnostic = if unknown > 0 {
+                    Some("push delivery outcome unknown")
+                } else if accepted == 0 {
+                    Some("push provider rejected request")
+                } else {
+                    None
+                };
+                let error_id = (message_status == "error").then_some("unexpected_push_error");
+                tx.execute("UPDATE novu_rust_push_messages SET status=$4,error_id=$5,error_text=$6,identifier=internal_id WHERE environment_id=$1 AND push_job_id=$2 AND target_index=$3",&[&environment,&job.id,&history_index,&message_status,&error_id,&diagnostic]).await?;
+            }
         }
         if attempted.len() + 1 < messages.len() {
             tx.execute("UPDATE novu_queue_jobs SET status='pending',available_at=clock_timestamp(),lease_token=NULL,lease_until=NULL WHERE id=$1 AND lease_token=$2",&[&job.id,&job.lease_token]).await?;
