@@ -1,5 +1,5 @@
 //! Deliberately limited Handlebars-compatible variable interpolation.
-//! Helpers, block syntax, arrays and numeric interpolation are not implemented.
+//! Helpers, block syntax, arrays and floating-point interpolation are not implemented.
 use serde_json::Value;
 
 fn valid_segment(s: &str) -> bool {
@@ -78,6 +78,17 @@ pub fn render(template: &str, context: &Value) -> Result<String, &'static str> {
         match value {
             Some(Value::String(s)) => escape(s, &mut output),
             Some(Value::Bool(b)) => output.push_str(if *b { "true" } else { "false" }),
+            Some(Value::Number(n)) => {
+                // JavaScript represents JSON numbers as IEEE-754 doubles; only accept
+                // integers whose exact value is preserved in the reference runtime.
+                const MAX_SAFE: i64 = 9_007_199_254_740_991;
+                match n.as_i64() {
+                    Some(value) if (-MAX_SAFE..=MAX_SAFE).contains(&value) => {
+                        output.push_str(&value.to_string())
+                    }
+                    _ => return Err("unsupported number"),
+                }
+            }
             Some(Value::Null) | None => (),
             _ => return Err("unsupported value"),
         }
@@ -87,30 +98,66 @@ pub fn render(template: &str, context: &Value) -> Result<String, &'static str> {
     Ok(output.replace("&#x27;", "'"))
 }
 
-/// The prototype supports subscriber IDs only and the default branding color.
+/// The prototype supports selected subscriber fields and the default branding color.
 pub fn render_in_app(
     template: &str,
     payload: &Value,
-    subscriber_id: &str,
+    subscriber: &Value,
+    resolved_context: &Value,
 ) -> Result<String, &'static str> {
-    // Subscriber profiles and organization branding are not loaded by this prototype.
+    render_in_app_with_actor(template, payload, subscriber, resolved_context, None)
+}
+
+pub fn render_in_app_with_actor(
+    template: &str,
+    payload: &Value,
+    subscriber: &Value,
+    resolved_context: &Value,
+    actor: Option<&Value>,
+) -> Result<String, &'static str> {
+    // Only selected subscriber fields and default organization branding are supported.
     let mut rest = template;
     while let Some(start) = rest.find("{{") {
         rest = &rest[start + 2..];
         let end = rest.find("}}").ok_or("unclosed expression")?;
         let path = rest[..end].trim();
-        if (path.starts_with("subscriber.") && path != "subscriber.subscriberId")
-            || (path.starts_with("branding.") && path != "branding.color")
+        let person_path = path
+            .strip_prefix("subscriber.")
+            .or_else(|| actor.and_then(|_| path.strip_prefix("actor.")));
+        if (person_path.is_some_and(|field| {
+            ![
+                "subscriberId",
+                "firstName",
+                "lastName",
+                "email",
+                "phone",
+                "avatar",
+                "locale",
+                "timezone",
+            ]
+            .contains(&field)
+                && !field.starts_with("data.")
+        })) || (path.starts_with("branding.") && path != "branding.color")
         {
             return Err("unsupported subscriber or branding field");
         }
         rest = &rest[end + 2..];
     }
     let mut context = payload.as_object().ok_or("invalid payload")?.clone();
-    context.insert(
-        "subscriber".into(),
-        serde_json::json!({"subscriberId": subscriber_id}),
-    );
+    if !subscriber.is_object() {
+        return Err("invalid subscriber");
+    }
+    if !resolved_context.is_object() {
+        return Err("invalid context");
+    }
+    context.insert("context".into(), resolved_context.clone());
+    context.insert("subscriber".into(), subscriber.clone());
+    if let Some(actor) = actor {
+        if !actor.is_object() {
+            return Err("invalid actor");
+        }
+        context.insert("actor".into(), actor.clone());
+    }
     context.insert("branding".into(), serde_json::json!({"color": "#f47373"}));
     render(template, &Value::Object(context))
 }
@@ -121,6 +168,27 @@ mod tests {
     use serde_json::json;
     #[test]
     fn escapes_and_rejects_unsupported_syntax() {
+        assert_eq!(
+            render_in_app(
+                "{{actor.custom}}",
+                &json!({"actor":{"custom":"payload"}}),
+                &json!({}),
+                &json!({})
+            )
+            .unwrap(),
+            "payload"
+        );
+        assert_eq!(
+            render_in_app_with_actor(
+                "{{actor.firstName}}",
+                &json!({"actor":{"firstName":"payload"}}),
+                &json!({}),
+                &json!({}),
+                Some(&json!({"firstName":"real"}))
+            )
+            .unwrap(),
+            "real"
+        );
         assert_eq!(
             render(
                 "Hi {{name}} {{subscriber.subscriberId}}",
@@ -138,9 +206,38 @@ mod tests {
         ] {
             assert!(render(template, &json!({})).is_err());
         }
-        assert!(render("{{n}}", &json!({"n":1})).is_err());
+        assert_eq!(render("{{n}}", &json!({"n":1})).unwrap(), "1");
+        assert!(render("{{n}}", &json!({"n":1.25})).is_err());
+        assert!(render("{{n}}", &json!({"n":9_007_199_254_740_992u64})).is_err());
         assert!(render("{{if}}", &json!({})).is_err());
-        assert!(render_in_app("{{subscriber.firstName}}", &json!({}), "alice").is_err());
-        assert!(render_in_app("{{branding.logo}}", &json!({}), "alice").is_err());
+        assert_eq!(
+            render_in_app(
+                "{{subscriber.firstName}}",
+                &json!({}),
+                &json!({"subscriberId":"alice", "firstName":"Kim"}),
+                &json!({})
+            )
+            .unwrap(),
+            "Kim"
+        );
+        assert_eq!(
+            render_in_app(
+                "{{subscriber.locale}}",
+                &json!({}),
+                &json!({"subscriberId":"alice","locale":"ko-KR"}),
+                &json!({})
+            )
+            .unwrap(),
+            "ko-KR"
+        );
+        assert!(
+            render_in_app(
+                "{{branding.logo}}",
+                &json!({}),
+                &json!({"subscriberId":"alice"}),
+                &json!({})
+            )
+            .is_err()
+        );
     }
 }

@@ -20,4 +20,4 @@ done
 port=$(docker port "$name" 5432/tcp)
 port=${port##*:}
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_queue_test" \
-  cargo test --locked --test postgres -- --ignored
+  cargo test --locked --test postgres --test in_app_recovery -- --ignored

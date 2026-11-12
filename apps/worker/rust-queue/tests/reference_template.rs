@@ -9,10 +9,15 @@ fn supported_interpolation_matches_reference_handlebars() {
         {"template":"Hello {{name}}!", "data":{"name":"<Alice & Bob>"}},
         {"template":"{{name}}", "data":{"name":"a&<>\"'`="}},
         {"template":"{{subscriber.subscriberId}} / {{missing}} / {{flag}}", "data":{"subscriber":{"subscriberId":"s-1"}, "flag":false}},
+        {"template":"{{subscriber.phone}}|{{subscriber.avatar}}|{{subscriber.data.plan}}", "data":{"subscriber":{"phone":"+12025550123","avatar":"https://example.test/?a=1&b=2","data":{"plan":"gold"}}}},
+        {"template":"{{subscriber.phone}}|{{subscriber.data.plan}}", "data":{"subscriber":{"phone":null,"data":null}}},
         {"template":"{{ branding.color }}", "data":{"branding":{"color":"#f47373"}}},
         {"template":"{{absent.value}}", "data":{"absent":null}},
         {"template":"text with no variables", "data":{}},
-        {"template":"literal &#x27; and {{name}}", "data":{"name":"&#x27;"}}
+        {"template":"literal &#x27; and {{name}}", "data":{"name":"&#x27;"}},
+        {"template":"{{context.tenant.id}}|{{context.tenant.data.plan}}|{{context.tenant.data.nested.name}}", "data":{"context":{"tenant":{"id":"acme","data":{"plan":"gold & <safe>","nested":{"name":"Team"}}}}}},
+        {"template":"{{context.tenant.id}}", "data":{"context":{}}},
+        {"template":"{{n}}/{{z}}/{{limit}}", "data":{"n":-42,"z":0,"limit":9007199254740991i64}}
     ]);
     let script = r#"const h=require('handlebars'); if (require('handlebars/package.json').version !== '4.7.10') process.exit(2); const x=JSON.parse(process.argv[1]); console.log(JSON.stringify(x.map(v=>h.compile(v.template)(v.data,{}).replace(/&#x27;/g, "'"))));"#;
     let result = Command::new("node")
@@ -37,6 +42,6 @@ fn supported_interpolation_matches_reference_handlebars() {
         })
         .collect();
     assert_eq!(actual, reference);
-    assert!(novu_rust_contracts::template::render("{{value}}", &json!({"value": 1})).is_err());
+    assert!(novu_rust_contracts::template::render("{{value}}", &json!({"value": 1.25})).is_err());
     let _: Value = fixtures;
 }

@@ -1,0 +1,18 @@
+[package]
+name = "novu-rust-ws"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+novu-rust-contracts = { path = "../../api/rust-contracts" }
+axum = "0.8"
+base64 = "0.22"
+form_urlencoded = "1"
+hmac = "0.13"
+serde_json = "1"
+sha2 = "0.11"
+socketioxide = { version = "0.18.9", features = ["extensions"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-serde_json-1"] }
+uuid = { version = "1", features = ["v4"] }

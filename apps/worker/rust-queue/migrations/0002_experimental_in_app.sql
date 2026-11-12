@@ -2,7 +2,10 @@
 CREATE TABLE IF NOT EXISTS novu_rust_subscribers (
   environment_id text NOT NULL,
   subscriber_id text NOT NULL,
+  internal_id text NOT NULL,
+  profile jsonb NOT NULL DEFAULT '{}'::jsonb,
   created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (environment_id, subscriber_id)
 );
 CREATE TABLE IF NOT EXISTS novu_rust_in_app_messages (

@@ -15,7 +15,7 @@ async fn postgres_queue_contract() {
         std::env::var("TEST_DATABASE_URL").expect("set TEST_DATABASE_URL to a disposable database");
     let (mut db, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move { connection.await.unwrap() });
-    db.batch_execute("DROP TABLE IF EXISTS novu_queue_jobs")
+    db.batch_execute("DROP TABLE IF EXISTS novu_rust_in_app_step_outcomes, novu_queue_jobs")
         .await
         .unwrap();
     db.batch_execute(MIGRATION).await.unwrap();
@@ -154,6 +154,21 @@ async fn postgres_queue_contract() {
             .unwrap()
     );
     assert_eq!(requeue_expired(&db, "other").await.unwrap(), 0);
+    let lock = db.transaction().await.unwrap();
+    lock.query_one(
+        "SELECT id FROM novu_queue_jobs WHERE id=$1 FOR UPDATE",
+        &[&id],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), requeue_expired(&other, "workflow"))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    lock.rollback().await.unwrap();
     assert_eq!(requeue_expired(&db, "workflow").await.unwrap(), 1);
     let second = claim(&db, "workflow", Duration::from_secs(30))
         .await
@@ -182,5 +197,71 @@ async fn postgres_queue_contract() {
             .unwrap()
             .is_none()
     );
+    // A lease may expire while a queue mutation waits on an unrelated row
+    // lock. Every mutation must check wall-clock time after acquiring it.
+    for operation in ["complete", "fail", "retry", "renew"] {
+        let held_id = Uuid::new_v4();
+        enqueue(&db, held_id, "env-a", "lock-test", &json!({}))
+            .await
+            .unwrap();
+        let held = claim(&db, "lock-test", Duration::from_millis(500))
+            .await
+            .unwrap()
+            .unwrap();
+        let lock = db.transaction().await.unwrap();
+        lock.query_one(
+            "SELECT id FROM novu_queue_jobs WHERE id=$1 FOR UPDATE",
+            &[&held_id],
+        )
+        .await
+        .unwrap();
+        let (waiting, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+        tokio::spawn(async move { connection.await.unwrap() });
+        let pid: i32 = waiting
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let task = tokio::spawn(async move {
+            match operation {
+                "complete" => complete(&waiting, held_id, held.lease_token).await,
+                "fail" => fail(&waiting, held_id, held.lease_token, "failure").await,
+                "retry" => {
+                    retry(&waiting, held_id, held.lease_token, Duration::ZERO, "retry").await
+                }
+                "renew" => {
+                    renew(&waiting, held_id, held.lease_token, Duration::from_secs(30)).await
+                }
+                _ => unreachable!(),
+            }
+        });
+        let mut waited = false;
+        for _ in 0..400 {
+            let row = lock.query_one("SELECT lease_until <= clock_timestamp(), EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=$2 AND wait_event_type='Lock') FROM novu_queue_jobs WHERE id=$1", &[&held_id,&pid]).await.unwrap();
+            if row.get::<_, bool>(0) && row.get::<_, bool>(1) {
+                waited = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(waited, "{operation} did not wait beyond lease expiry");
+        lock.commit().await.unwrap();
+        assert!(
+            !task.await.unwrap().unwrap(),
+            "{operation} accepted an expired lease"
+        );
+        let row = db
+            .query_one(
+                "SELECT status,attempts,last_error FROM novu_queue_jobs WHERE id=$1",
+                &[&held_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, String>(0), "running");
+        assert_eq!(row.get::<_, i32>(1), 1);
+        assert_eq!(row.get::<_, Option<String>>(2), None);
+        assert_eq!(requeue_expired(&db, "lock-test").await.unwrap(), 1);
+        assert!(cancel_pending(&db, "env-a", held_id).await.unwrap());
+    }
     db.batch_execute("TRUNCATE novu_queue_jobs").await.unwrap();
 }

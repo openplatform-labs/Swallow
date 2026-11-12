@@ -60,9 +60,11 @@ pub async fn retry(
 ) -> Result<bool, Error> {
     let seconds = delay.as_secs_f64();
     Ok(client.execute(
-        "UPDATE novu_queue_jobs SET status = 'pending', available_at = now() + $3 * interval '1 second', \
+        "WITH owned AS MATERIALIZED (SELECT id,lease_until FROM novu_queue_jobs WHERE id=$1 AND status='running' AND lease_token=$2 FOR UPDATE), \
+         live AS MATERIALIZED (SELECT id FROM owned WHERE lease_until > clock_timestamp()) \
+         UPDATE novu_queue_jobs j SET status = 'pending', available_at = clock_timestamp() + $3 * interval '1 second', \
          last_error = $4, lease_token = NULL, lease_until = NULL \
-         WHERE id = $1 AND status = 'running' AND lease_token = $2 AND lease_until > now()",
+         FROM live WHERE j.id = live.id AND j.status = 'running' AND j.lease_token = $2 AND j.lease_until > clock_timestamp()",
         &[&id, &token, &seconds, &error],
     ).await? == 1)
 }
@@ -117,8 +119,10 @@ pub async fn claim(
 /// Completion is valid only while this exact lease is still live.
 pub async fn complete(client: &Client, id: Uuid, token: Uuid) -> Result<bool, Error> {
     Ok(client.execute(
-        "UPDATE novu_queue_jobs SET status = 'completed', lease_token = NULL, lease_until = NULL \
-         WHERE id = $1 AND status = 'running' AND lease_token = $2 AND lease_until > now()",
+        "WITH owned AS MATERIALIZED (SELECT id,lease_until FROM novu_queue_jobs WHERE id=$1 AND status='running' AND lease_token=$2 FOR UPDATE), \
+         live AS MATERIALIZED (SELECT id FROM owned WHERE lease_until > clock_timestamp()) \
+         UPDATE novu_queue_jobs j SET status = 'completed', lease_token = NULL, lease_until = NULL \
+         FROM live WHERE j.id = live.id AND j.status = 'running' AND j.lease_token = $2 AND j.lease_until > clock_timestamp()",
         &[&id, &token],
     ).await? == 1)
 }
@@ -126,8 +130,10 @@ pub async fn complete(client: &Client, id: Uuid, token: Uuid) -> Result<bool, Er
 /// Record a permanent failure. Callers decide which failures are non-retryable.
 pub async fn fail(client: &Client, id: Uuid, token: Uuid, error: &str) -> Result<bool, Error> {
     Ok(client.execute(
-        "UPDATE novu_queue_jobs SET status = 'failed', last_error = $3, lease_token = NULL, lease_until = NULL \
-         WHERE id = $1 AND status = 'running' AND lease_token = $2 AND lease_until > now()",
+        "WITH owned AS MATERIALIZED (SELECT id,lease_until FROM novu_queue_jobs WHERE id=$1 AND status='running' AND lease_token=$2 FOR UPDATE), \
+         live AS MATERIALIZED (SELECT id FROM owned WHERE lease_until > clock_timestamp()) \
+         UPDATE novu_queue_jobs j SET status = 'failed', last_error = $3, lease_token = NULL, lease_until = NULL \
+         FROM live WHERE j.id = live.id AND j.status = 'running' AND j.lease_token = $2 AND j.lease_until > clock_timestamp()",
         &[&id, &token, &error],
     ).await? == 1)
 }
@@ -137,8 +143,10 @@ pub async fn renew(client: &Client, id: Uuid, token: Uuid, lease: Duration) -> R
     let seconds = lease.as_secs_f64();
     Ok(client
         .execute(
-            "UPDATE novu_queue_jobs SET lease_until = now() + $3 * interval '1 second' \
-         WHERE id = $1 AND status = 'running' AND lease_token = $2 AND lease_until > now()",
+            "WITH owned AS MATERIALIZED (SELECT id,lease_until FROM novu_queue_jobs WHERE id=$1 AND status='running' AND lease_token=$2 FOR UPDATE), \
+         live AS MATERIALIZED (SELECT id FROM owned WHERE lease_until > clock_timestamp()) \
+         UPDATE novu_queue_jobs j SET lease_until = clock_timestamp() + $3 * interval '1 second' \
+         FROM live WHERE j.id = live.id AND j.status = 'running' AND j.lease_token = $2 AND j.lease_until > clock_timestamp()",
             &[&id, &token, &seconds],
         )
         .await?
@@ -150,8 +158,10 @@ pub async fn renew(client: &Client, id: Uuid, token: Uuid, lease: Duration) -> R
 pub async fn requeue_expired(client: &Client, kind: &str) -> Result<u64, Error> {
     client
         .execute(
-            "UPDATE novu_queue_jobs SET status = 'pending', lease_token = NULL, lease_until = NULL \
-         WHERE kind = $1 AND status = 'running' AND lease_until <= now()",
+            "WITH expired AS (SELECT id FROM novu_queue_jobs WHERE kind = $1 AND status = 'running' \
+         AND lease_until <= now() FOR UPDATE SKIP LOCKED) \
+         UPDATE novu_queue_jobs j SET status = 'pending', lease_token = NULL, lease_until = NULL \
+         FROM expired WHERE j.id = expired.id",
             &[&kind],
         )
         .await

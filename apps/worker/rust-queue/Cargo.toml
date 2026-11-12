@@ -8,5 +8,6 @@ publish = false
 novu-rust-contracts = { path = "../../api/rust-contracts" }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-uuid-1"] }
 serde_json = "1"
+jsonlogic = "0.5.1"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

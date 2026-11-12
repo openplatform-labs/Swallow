@@ -11,7 +11,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             eprintln!("database connection failed: {error}");
         }
     });
+    // Only this handler has its side effects and completion in one transaction;
+    // expired jobs of other kinds must not be recovered by this process.
+    let mut next_recovery = tokio::time::Instant::now();
     loop {
+        if tokio::time::Instant::now() >= next_recovery {
+            novu_postgres_queue::requeue_expired(&db, novu_postgres_queue::in_app::JOB_KIND)
+                .await?;
+            next_recovery = tokio::time::Instant::now() + Duration::from_secs(5);
+        }
+        if novu_postgres_queue::in_app::process_one_unsnooze(&db).await? {
+            continue;
+        }
         match novu_postgres_queue::in_app::process_one(&mut db).await {
             Ok(true) => continue,
             Ok(false) => tokio::time::sleep(Duration::from_secs(1)).await,
