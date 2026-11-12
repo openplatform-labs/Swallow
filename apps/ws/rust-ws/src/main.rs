@@ -58,6 +58,9 @@ fn compatibility_mode() -> bool {
     std::env::var("NOVU_ALLOW_RECREATED_SUBSCRIBER").as_deref() == Ok("true")
 }
 
+#[derive(Clone, Copy)]
+struct ConnectionId(Uuid);
+
 enum ListenerEvent {
     Delivery(Uuid),
     SubscriberDeleted {
@@ -116,6 +119,50 @@ async fn reconcile_socket_identities(
             socket.disconnect().ok();
         }
     }
+    Ok(())
+}
+
+// Only renew leases which have not already expired. An instance that pauses
+// beyond the lease must close its sockets rather than resurrect stale rows.
+async fn maintain_connection_leases(
+    db: &Database,
+    io: &SocketIo,
+) -> Result<(), tokio_postgres::Error> {
+    if let Some(namespace) = io.of("/") {
+        let sockets: Vec<_> = namespace
+            .sockets()
+            .into_iter()
+            .filter_map(|socket| {
+                socket
+                    .extensions
+                    .get::<ConnectionId>()
+                    .map(|id| (socket, id.0))
+            })
+            .collect();
+        if !sockets.is_empty() {
+            let ids: Vec<Uuid> = sockets.iter().map(|(_, id)| *id).collect();
+            let rows = db.lock().await?.query("UPDATE novu_rust_ws_connections SET lease_expires_at=clock_timestamp()+interval '30 seconds' WHERE id=ANY($1::uuid[]) AND lease_expires_at>clock_timestamp() RETURNING id", &[&ids]).await?;
+            let renewed: std::collections::HashSet<Uuid> =
+                rows.into_iter().map(|row| row.get(0)).collect();
+            for (socket, id) in sockets {
+                if !renewed.contains(&id) {
+                    socket.disconnect().ok();
+                }
+            }
+        }
+    }
+    // Acquire the same subscriber lock as connect/disconnect before deleting
+    // expired leases and recalculating presence. Exclude all expired leases
+    // from the count, including rows deleted by this same statement's CTE.
+    for _ in 0..32 {
+        let row=db.lock().await?.query_one("WITH candidate AS MATERIALIZED (SELECT s.environment_id,s.internal_id FROM novu_rust_subscribers s WHERE EXISTS(SELECT 1 FROM novu_rust_ws_connections c WHERE c.environment_id=s.environment_id AND c.subscriber_internal_id=s.internal_id AND c.lease_expires_at<=clock_timestamp()) ORDER BY s.environment_id,s.internal_id FOR UPDATE OF s SKIP LOCKED LIMIT 1), removed AS (DELETE FROM novu_rust_ws_connections c USING candidate x WHERE c.environment_id=x.environment_id AND c.subscriber_internal_id=x.internal_id AND c.lease_expires_at<=clock_timestamp() RETURNING c.id), changed AS (UPDATE novu_rust_subscribers s SET is_online=EXISTS(SELECT 1 FROM novu_rust_ws_connections c WHERE c.environment_id=s.environment_id AND c.subscriber_internal_id=s.internal_id AND (c.lease_expires_at IS NULL OR c.lease_expires_at>clock_timestamp())),last_online_at=now(),updated_at=now() FROM candidate x WHERE s.environment_id=x.environment_id AND s.internal_id=x.internal_id AND EXISTS(SELECT 1 FROM removed) RETURNING s.internal_id) SELECT EXISTS(SELECT 1 FROM removed)", &[]).await?;
+        if !row.get::<_, bool>(0) {
+            break;
+        }
+    }
+    // Deleted subscriber identities do not have a row to lock; connection IDs
+    // and internal IDs are immutable, so stale orphan leases can be removed.
+    db.lock().await?.execute("WITH orphan AS MATERIALIZED (SELECT c.id FROM novu_rust_ws_connections c WHERE c.lease_expires_at<=clock_timestamp() AND NOT EXISTS(SELECT 1 FROM novu_rust_subscribers s WHERE s.environment_id=c.environment_id AND s.internal_id=c.subscriber_internal_id) ORDER BY c.lease_expires_at,c.id FOR UPDATE OF c SKIP LOCKED LIMIT 100) DELETE FROM novu_rust_ws_connections c USING orphan o WHERE c.id=o.id", &[]).await?;
     Ok(())
 }
 
@@ -335,7 +382,8 @@ async fn connect(db: &Database, id: Uuid, claims: &Claims) -> Result<bool, tokio
         tx.rollback().await?;
         return Ok(false);
     }
-    tx.execute("INSERT INTO novu_rust_ws_connections(id,environment_id,subscriber_internal_id) VALUES ($1,$2,$3)", &[&id,&claims.environment_id,&claims.id]).await?;
+    let leased = !compatibility_mode();
+    tx.execute("INSERT INTO novu_rust_ws_connections(id,environment_id,subscriber_internal_id,lease_expires_at) VALUES ($1,$2,$3,CASE WHEN $4 THEN clock_timestamp()+interval '30 seconds' ELSE NULL END)", &[&id,&claims.environment_id,&claims.id,&leased]).await?;
     tx.execute("UPDATE novu_rust_subscribers SET is_online=true,updated_at=now() WHERE environment_id=$1 AND internal_id=$2", &[&claims.environment_id,&claims.id]).await?;
     tx.commit().await?;
     Ok(true)
@@ -501,6 +549,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 interval.tick().await;
+                if let Err(error) = maintain_connection_leases(&check_db, &check_io).await {
+                    eprintln!("socket lease maintenance failed: {error}");
+                }
                 if let Err(error) = reconcile_socket_identities(&check_db, &check_io).await {
                     eprintln!("socket identity reconciliation failed: {error}");
                 }
@@ -550,6 +601,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         return;
                     }
                 }
+                socket.extensions.insert(ConnectionId(id));
                 socket.extensions.insert(claims.clone());
                 socket.join(claims.id.clone());
                 let cleanup_db = db.clone();

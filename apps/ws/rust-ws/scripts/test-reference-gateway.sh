@@ -24,7 +24,7 @@ for ((i=0;i<30;i++)); do
   if (( i == 29 )); then echo 'PostgreSQL did not become ready' >&2; exit 1; fi
   sleep 1
 done
-for file in ../../worker/rust-queue/migrations/0002_experimental_in_app.sql ../../worker/rust-queue/migrations/0014_experimental_subscriber_objectid.sql ../../worker/rust-queue/migrations/0019_experimental_subscriber_online.sql migrations/0001_connections.sql migrations/0002_subscriber_revocation.sql ../../worker/rust-queue/migrations/0030_experimental_ws_events.sql ../../worker/rust-queue/migrations/0032_experimental_message_severity.sql ../../worker/rust-queue/migrations/0034_experimental_notifications.sql ../../worker/rust-queue/migrations/0050_in_app_subscriber_identity.sql; do
+for file in ../../worker/rust-queue/migrations/0002_experimental_in_app.sql ../../worker/rust-queue/migrations/0014_experimental_subscriber_objectid.sql ../../worker/rust-queue/migrations/0019_experimental_subscriber_online.sql migrations/0001_connections.sql migrations/0002_subscriber_revocation.sql migrations/0003_connection_leases.sql ../../worker/rust-queue/migrations/0030_experimental_ws_events.sql ../../worker/rust-queue/migrations/0032_experimental_message_severity.sql ../../worker/rust-queue/migrations/0034_experimental_notifications.sql ../../worker/rust-queue/migrations/0050_in_app_subscriber_identity.sql; do
   docker exec -i "$name" psql -v ON_ERROR_STOP=1 -U postgres -d novu_ws_test < "$file" >/dev/null
 done
 docker exec "$name" psql -v ON_ERROR_STOP=1 -U postgres -d novu_ws_test -c "INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id) VALUES ('64a000000000000000000002','alice','64a000000000000000000010')" >/dev/null
@@ -52,3 +52,5 @@ for ((i=0;i<30;i++)); do
   sleep 1
 done
 node tests/strict_identity.cjs
+export STRICT_WS_PID="$strict_pid"
+node tests/crash_recovery.cjs
