@@ -1,6 +1,6 @@
 # Experimental PostgreSQL queue primitives
 
-This crate is an isolated starting point for a Rust/PostgreSQL rewrite. It is **not a Novu-compatible worker** and is not wired into the existing service. Do not deploy it as a replacement. The target is 100% compatibility with the selected Novu version, but this crate does not establish that compatibility.
+This crate contains experimental Rust/PostgreSQL queue and worker implementations used by the Rust API. It is **not a fully Novu-compatible worker**. Do not deploy it as a replacement. The target is 100% compatibility with the selected Novu version, but this crate does not establish that compatibility.
 
 The migration defines a queue table. The library exposes transactional enqueue (including delay), per-kind claim with `SKIP LOCKED`, lease renewal, token-fenced completion, failure and retry, pending-job cancellation scoped by environment, and explicit recovery of expired jobs. Claim and recovery policy are deliberately separate: automatically retrying every expired job could change Novu's delivery semantics or duplicate external side effects. The shared [`trigger_gate`](../../api/rust-contracts/src/trigger_gate.rs) module reproduces a small, explicitly bounded part of the stored-workflow trigger decisions from the reference source; it does not implement the full API or workflow engine.
 

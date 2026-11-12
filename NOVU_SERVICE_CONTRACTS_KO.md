@@ -62,12 +62,6 @@
 
 원본 인앱 워커는 WS 큐에 `messageId`를 넣는다. WS 계층은 메시지를 조회·변환해 클라이언트로 보낼 수 있으므로 큐 내부 payload와 Socket.IO 최종 payload를 동일시하지 않는다. [인앱 발송](apps/worker/src/app/workflow/usecases/send-message/send-message-in-app.usecase.ts), [WS 작업 DTO](libs/application-generic/src/dtos/web-sockets-job.dto.ts), [socket worker](libs/application-generic/src/services/socket-worker/socket-worker.service.ts).
 
-## Rust 구현과 호환성 검증 상태
+## 구현 및 검증 현황
 
-현재 구현은 별도 실험용 API·worker·WS 및 PostgreSQL 스키마다. 공통의 제한된 트리거 판단, 템플릿 기능, 내부 실험용 작업 이름을 `apps/api/rust-contracts`로 분리하여 API의 실행 시 워커 crate 의존을 제거했다. Socket.IO 이벤트 이름과 context 필터 함수도 공통 계약에 추가했으며, context 함수는 체크아웃한 원본 gateway의 함수를 직접 실행해 제한된 입력을 비교했다. [실험 WS 서비스](apps/ws/rust-ws/README.md)는 Socket.IO 연결·JWT 인증·온라인 상태와 제한적인 인앱 이벤트를 지원한다. 이는 원본의 모든 DTO나 모듈을 재현한 것이 아니다. API의 worker 의존은 통합 테스트에만 남는다.
-
-실험용 API 키는 환경과 사용자 식별자를 보관하고, 키 소유 사용자가 없으면 `User not found`로 거절한다. 이는 Community API 키 인증의 일부에 대한 구현이다. 사용자 JWT 검증은 미구현이며 트리거·관리 API는 Bearer 요청을 거절한다. 별도의 제한적 Inbox 경로에서는 구독자 JWT를 발급·검증하며 명시적인 테스트용 환경 설정과 HMAC 키가 필요하다. context HMAC·운영용 키 관리·구성원·역할과 다른 에디션의 권한 정책은 구현하지 않았다. 키의 `enabled` 필드는 실험용 모델의 자체 기능으로 원본과 동일한 폐기 모델을 뜻하지 않는다.
-
-부분 확인: PostgreSQL 큐 및 단일 인앱 경로, 수신자 검증/중복 제거, 제한된 Handlebars 치환과 Socket.IO 연결·온라인 상태. 동일 기준 커밋의 원본 API·워커와 선택된 사례를 비교했고, WS 연결은 원본 gateway 소스를 독립 실행하여 비교했다. 미구현 또는 미검증: 전체 API·인증·권한·Inbox·Socket.IO 이벤트·실시간 다중 노드 전달·provider·workflow 기능과 그 전체에 대한 종단 간 비교. 실험용 큐 이름은 원본 `trigger-handler` 등의 이름이나 DTO와 호환되는 것으로 간주하지 않는다.
-
-후속 작업에서 원본과 동일한 커밋의 실행 환경을 구축해 API/SDK 시나리오, 인증 거부와 격리, 각 큐의 실패·재시도, Socket.IO 연결·이벤트·context 필터, 사용자 설정 및 채널 발송을 비교한다. 기준 커밋과 배포 이미지의 대응이 확인되지 않은 상태에서 다른 버전의 이미지를 동등한 비교 기준으로 쓰지 않는다. 테스트별 성공/실패와 미지원 동작을 기록하고 100% 호환 여부를 전체 범위의 결과로 판단한다.
+이 문서는 위 기준 커밋의 원본 구조와 계약을 설명한다. Rust의 현재 구현·원본과의 차이·선택적으로 수행한 비교 테스트·미검증 항목은 [구현·검증 현황](RUST_IMPLEMENTATION_STATUS_KO.md)을 기준으로 한다. 이 분석만으로 전체 호환성을 판단하지 않는다.

@@ -1,6 +1,6 @@
 # Novu 기반 Rust·PostgreSQL 재구현 검토
 
-> 상태: **제안 및 분석 기록**. 실험적인 Rust 큐 기반을 구현 중이며, Novu 호환 구현과 데이터 이전은 완료되지 않았다.
+> 상태: **초기 제안 및 분석 기록**. 아래의 제안과 변경 기록은 작성 당시의 내용이며 현재 구현을 나타내지 않는다. Novu 호환 구현과 데이터 이전은 완료되지 않았다.
 > 작성: 2026-11-12 · 원본 저장소: https://github.com/novuhq/novu · 분석 기준: `next` 브랜치, 커밋 `895388f37efe9e06de0aa333e5727303e6ad6853` (2026-11-11).
 
 > 구현되지 않은 기능과 검증하지 않은 범위는 [구현·검증 현황](RUST_IMPLEMENTATION_STATUS_KO.md)을 참조한다.
@@ -34,7 +34,7 @@ Novu를 Rust로 재작성하면서 기존 MongoDB와 Redis 의존성을 PostgreS
 | 클라이언트 | [`packages/js`](packages/js)와 [`packages/react`](packages/react)는 Inbox SDK와 React 연동을 제공한다. |
 | 배포 | [`docker/community/docker-compose.yml`](docker/community/docker-compose.yml)은 MongoDB, Redis, API, 워커, WS, 대시보드를 포함한다. ClickHouse 관련 코드도 저장소에 있으나 이 Compose에 포함되어 있지는 않다. |
 
-이번 검토는 정적 소스 분석이다. 전체 기능, 설정 조합, 런타임 동작, 성능과 운영 안정성을 검증하지 않았다. 이 클론은 shallow clone이며 엔터프라이즈 서브모듈 `.source`는 초기화되지 않았다. 원본은 Open Core 구조로, 적용되는 라이선스와 사용할 기능 범위는 별도 확인이 필요하다. [`README.md`](README.md), [`.gitmodules`](.gitmodules).
+이번 검토는 정적 소스 분석이다. 전체 기능, 설정 조합, 런타임 동작, 성능과 운영 안정성을 검증하지 않았다. 이 클론은 shallow clone이며 엔터프라이즈 서브모듈 `.source`는 초기화되지 않았다. 원본은 Open Core 구조로, 적용되는 라이선스와 사용할 기능 범위는 별도 확인이 필요하다. [원본 저장소](https://github.com/novuhq/novu), [`.gitmodules`](.gitmodules).
 
 ### 대표 처리 흐름
 
@@ -116,7 +116,7 @@ Socket.IO 프로토콜, 인증, 이벤트 형식 및 읽음·보관 상태를 �
 
 기존 서비스를 대체하는지부터 결정한다. 이전이 필요하다면 원본과 대상 스키마 매핑, 식별자 변환, 암호화 키 처리, 데이터 정합성 검증, 증분 동기화, 중복 발송 방지, 중단 시간과 cutover/rollback 기준을 별도 계획으로 작성한다. 이 문서는 실시간 전환이나 무중단 이전을 보장하지 않는다.
 
-## 10. 검증 체크리스트와 변경 기록
+## 10. 초기 검증 체크리스트와 당시 변경 기록
 
 - [ ] 목표 기능과 호환되지 않아도 되는 동작이 문서화되었다.
 - [ ] 원본과 Rust 구현에 같은 입력을 사용해 응답, 오류, 저장 상태와 발송 결과를 비교했다.
