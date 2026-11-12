@@ -62,6 +62,7 @@ async fn signed_status_events_are_scoped_deduplicated_and_private() {
         include_str!("../migrations/0005_twilio_webhooks.sql"),
         include_str!("../migrations/0006_twilio_webhook_job_link.sql"),
         include_str!("../../../worker/rust-queue/migrations/0041_experimental_twilio_attempts.sql"),
+        novu_postgres_queue::reconciliation::MIGRATION,
     ] {
         db.batch_execute(migration).await.unwrap();
     }
@@ -202,6 +203,7 @@ async fn signed_job_callbacks_bind_evidence_without_changing_attempt_state() {
         include_str!("../migrations/0005_twilio_webhooks.sql"),
         include_str!("../migrations/0006_twilio_webhook_job_link.sql"),
         include_str!("../../../worker/rust-queue/migrations/0041_experimental_twilio_attempts.sql"),
+        novu_postgres_queue::reconciliation::MIGRATION,
     ] {
         db.batch_execute(migration).await.unwrap();
     }
@@ -289,7 +291,7 @@ async fn signed_job_callbacks_bind_evidence_without_changing_attempt_state() {
     let missing = uuid::Uuid::new_v4();
     assert_eq!(
         post(
-            router,
+            router.clone(),
             &format!("{PATH}/jobs/{missing}"),
             BODY,
             &signature_for(missing),
@@ -301,4 +303,59 @@ async fn signed_job_callbacks_bind_evidence_without_changing_attempt_state() {
     let row = db.query_one("SELECT job_id,(SELECT state FROM novu_rust_twilio_attempts WHERE job_id=$1) FROM novu_rust_twilio_delivery_events", &[&job]).await.unwrap();
     assert_eq!(row.get::<_, uuid::Uuid>(0), job);
     assert_eq!(row.get::<_, String>(1), "dispatching");
+    // The reconciler inserts its retry audit and deletes the attempt in one transaction.
+    // A different environment's decision must never authorize this callback.
+    db.execute(
+        "DELETE FROM novu_rust_twilio_attempts WHERE job_id=$1",
+        &[&job],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        post(router.clone(), &path, BODY, &sig, form).await,
+        StatusCode::NOT_FOUND
+    );
+    db.execute("INSERT INTO novu_rust_delivery_reconciliations(id,environment_id,job_id,decision,operator_name,reason) VALUES ($1,'env-b',$2,'retry','operator','test')", &[&uuid::Uuid::new_v4(),&job]).await.unwrap();
+    assert_eq!(
+        post(router.clone(), &path, BODY, &sig, form).await,
+        StatusCode::NOT_FOUND
+    );
+    db.execute("INSERT INTO novu_rust_delivery_reconciliations(id,environment_id,job_id,decision,operator_name,reason) VALUES ($1,'env-a',$2,'accepted','operator','test')", &[&uuid::Uuid::new_v4(),&job]).await.unwrap();
+    assert_eq!(
+        post(router.clone(), &path, BODY, &sig, form).await,
+        StatusCode::NOT_FOUND
+    );
+    db.execute("INSERT INTO novu_rust_twilio_attempts(job_id,environment_id,state) VALUES ($1,'env-a','unknown')", &[&job]).await.unwrap();
+    let (retry_db, retry_driver) =
+        tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(), NoTls)
+            .await
+            .unwrap();
+    tokio::spawn(async move {
+        retry_driver.await.unwrap();
+    });
+    retry_db.batch_execute("BEGIN").await.unwrap();
+    retry_db.execute("INSERT INTO novu_rust_delivery_reconciliations(id,environment_id,job_id,decision,operator_name,reason) VALUES ($1,'env-a',$2,'retry','operator','test')", &[&uuid::Uuid::new_v4(),&job]).await.unwrap();
+    retry_db
+        .execute(
+            "DELETE FROM novu_rust_twilio_attempts WHERE job_id=$1",
+            &[&job],
+        )
+        .await
+        .unwrap();
+    // The API sees the old committed attempt while retry is in flight.
+    assert_eq!(
+        post(router.clone(), &path, BODY, &sig, form).await,
+        StatusCode::NO_CONTENT
+    );
+    retry_db.batch_execute("COMMIT").await.unwrap();
+    // After commit it sees the retry audit even before a new attempt exists.
+    assert_eq!(
+        post(router, &path, BODY, &sig, form).await,
+        StatusCode::NO_CONTENT
+    );
+    let row = db
+        .query_one("SELECT job_id FROM novu_rust_twilio_delivery_events", &[])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, uuid::Uuid>(0), job);
 }

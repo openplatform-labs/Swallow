@@ -267,6 +267,38 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     );
     let from_cli: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(from_cli, sms_events);
+    let sms_retry = Uuid::new_v4();
+    queue::enqueue(
+        &db,
+        sms_retry,
+        "tenant-a",
+        queue::twilio_queue::JOB_KIND,
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE novu_queue_jobs SET status='failed' WHERE id=$1",
+        &[&sms_retry],
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO novu_rust_twilio_attempts(job_id,environment_id,state) VALUES ($1,'tenant-a','unknown')", &[&sms_retry]).await.unwrap();
+    reconciliation::resolve(
+        &mut db,
+        "tenant-a",
+        sms_retry,
+        None,
+        "retry",
+        "operator",
+        "confirmed not accepted",
+    )
+    .await
+    .unwrap();
+    let row = db.query_one("SELECT j.status,(SELECT count(*) FROM novu_rust_twilio_attempts a WHERE a.job_id=j.id),(SELECT count(*) FROM novu_rust_delivery_reconciliations r WHERE r.job_id=j.id AND r.environment_id=j.environment_id AND r.decision='retry') FROM novu_queue_jobs j WHERE j.id=$1", &[&sms_retry]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "pending");
+    assert_eq!(row.get::<_, i64>(1), 0);
+    assert_eq!(row.get::<_, i64>(2), 1);
     let bulk = Uuid::new_v4();
     queue::enqueue(
         &db,
