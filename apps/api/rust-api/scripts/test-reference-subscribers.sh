@@ -87,6 +87,10 @@ for ((i=0;i<90;i++)); do
 done
 export NOVU_REFERENCE_URL="http://127.0.0.1:$reference_port" NOVU_RUST_URL="http://127.0.0.1:$rust_port" NOVU_TEST_API_KEY=compat-key
 export NOVU_RUST_PG_CONTAINER="$postgres" NOVU_REFERENCE_MONGO_CONTAINER="$mongo" NOVU_REFERENCE_REDIS_CONTAINER="$redis"
+if [[ "${NOVU_TEST_ACTION_ONLY:-0}" == 1 ]]; then
+  python3 tests/reference_notification_action_compare.py
+  exit 0
+fi
 if [[ "${NOVU_TEST_INAPP_IDENTITY_ONLY:-0}" == 1 ]]; then
   python3 tests/reference_in_app_identity_compare.py
   exit 0

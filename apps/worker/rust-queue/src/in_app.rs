@@ -72,6 +72,7 @@ impl std::fmt::Display for LeaseLost {
 impl Error for LeaseLost {}
 
 pub const MIGRATION: &str = include_str!("../migrations/0002_experimental_in_app.sql");
+pub const ACTION_CTA_MIGRATION: &str = include_str!("../migrations/0059_in_app_action_cta.sql");
 pub const STATE_MIGRATION: &str = include_str!("../migrations/0003_experimental_message_state.sql");
 pub const STATE_DATES_MIGRATION: &str =
     include_str!("../migrations/0004_experimental_message_state_dates.sql");

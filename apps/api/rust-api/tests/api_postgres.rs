@@ -335,6 +335,9 @@ async fn trigger_api_contract_inner() {
     db.batch_execute(novu_postgres_queue::in_app::IDENTIFIER_MIGRATION)
         .await
         .unwrap();
+    db.batch_execute(novu_postgres_queue::in_app::ACTION_CTA_MIGRATION)
+        .await
+        .unwrap();
     db.batch_execute(novu_postgres_queue::in_app::INBOX_METADATA_MIGRATION)
         .await
         .unwrap();
@@ -4345,6 +4348,7 @@ async fn trigger_api_contract_inner() {
         count_notifications(app.clone(), Some("ApiKey test-key"), "seen-user", "[{}]").await;
     assert_eq!(remaining["data"][0]["count"], 0);
     worker.execute("INSERT INTO novu_rust_in_app_messages (id, environment_id, subscriber_id, workflow_identifier, transaction_id, content, payload) SELECT md5('counter-fixture-' || n)::uuid, 'env-a', 'counter', 'fixture', 'bulk-' || n, 'x', '{}'::jsonb FROM generate_series(1, 110) AS n", &[]).await.unwrap();
+    Box::pin(notification_action_contract(app.clone(), &mut worker)).await;
     Box::pin(email_workflow_contract(app.clone(), &mut worker)).await;
     Box::pin(fcm_credentials_contract(app.clone(), &mut worker)).await;
     let (_, count) = count_notifications(app, Some("ApiKey test-key"), "counter", "[{}]").await;
@@ -4513,6 +4517,54 @@ async fn fcm_credentials_contract(app: axum::Router, db: &mut tokio_postgres::Cl
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(db.query_opt("SELECT 1 FROM novu_rust_fcm_devices WHERE environment_id='env-a' AND subscriber_id='fcm-concurrent'",&[]).await.unwrap().is_none());
+}
+
+async fn notification_action_contract(app: axum::Router, db: &mut tokio_postgres::Client) {
+    let id = "64a000000000000000000077";
+    db.batch_execute("INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES ('env-a','action-user','action-internal','{}'); INSERT INTO novu_rust_workflows(environment_id,identifier,active,has_steps,inbox_metadata) VALUES ('env-a','action-fixture',true,true,'{\"id\":\"64a000000000000000000004\",\"identifier\":\"action-fixture\",\"name\":\"Actions\",\"critical\":false,\"tags\":[],\"severity\":\"none\",\"payloadAsData\":true}'); INSERT INTO novu_rust_in_app_messages(id,internal_id,environment_id,subscriber_id,subscriber_internal_id,workflow_identifier,transaction_id,content,payload,cta,context_keys) VALUES (gen_random_uuid(),'64a000000000000000000077','env-a','action-user','action-internal','action-fixture','action','hello','{}','{\"action\":{\"buttons\":[{\"type\":\"primary\",\"content\":\"Approve\"}]}}',ARRAY['tenant:one'])").await.unwrap();
+    let base = format!("/v2/subscribers/action-user/notifications/{id}/actions/primary/complete");
+    let (status, _) = inbox_mutate(
+        app.clone(),
+        "PATCH",
+        &base,
+        Some("ApiKey test-key-b"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = inbox_mutate(
+        app.clone(),
+        "PATCH",
+        &format!("{base}?contextKeys=tenant:other"),
+        Some("ApiKey test-key"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = inbox_mutate(app.clone(), "PATCH", &base, None, json!({})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, result) = inbox_mutate(
+        app.clone(),
+        "PATCH",
+        &format!("{base}?contextKeys=tenant:one"),
+        Some("ApiKey test-key"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        result["data"]["primaryAction"],
+        json!({"label":"Approve","isCompleted":true})
+    );
+    assert_eq!(result["data"]["isRead"], true);
+    assert_eq!(result["data"]["isSeen"], true);
+    let (status, _) = inbox_mutate(app.clone(),"PATCH",&format!("/v2/subscribers/action-user/notifications/{id}/actions/secondary/complete?contextKeys=tenant:one"),Some("ApiKey test-key"),json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let row = db.query_one("SELECT cta#>>'{action,status}',is_read,is_seen,first_seen_at FROM novu_rust_in_app_messages WHERE internal_id=$1", &[&id]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "done");
+    assert!(row.get::<_, bool>(1));
+    assert!(row.get::<_, bool>(2));
+    assert_eq!(row.get::<_, Option<std::time::SystemTime>>(3), None);
 }
 
 async fn email_workflow_contract(app: axum::Router, worker: &mut tokio_postgres::Client) {

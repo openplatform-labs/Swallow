@@ -223,6 +223,14 @@ pub fn router_with_twilio_config(
             axum::routing::delete(delete_notification),
         )
         .route(
+            "/v2/subscribers/{subscriber_id}/notifications/{notification_id}/actions/{action_type}/complete",
+            axum::routing::patch(management_action),
+        )
+        .route(
+            "/v2/subscribers/{subscriber_id}/notifications/{notification_id}/actions/{action_type}/revert",
+            axum::routing::patch(management_action),
+        )
+        .route(
             "/v2/subscribers/{subscriber_id}/notifications/{notification_id}/{action}",
             axum::routing::patch(mark_notification),
         )
@@ -625,6 +633,46 @@ async fn inbox_mark(
         Ok(claims) => claims,
         Err(response) => return response.into_response(),
     };
+    if action == "complete" || action == "revert" {
+        let input: Value = match serde_json::from_slice(&body) {
+            Ok(value) => value,
+            Err(_) => {
+                return error_at(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid JSON",
+                    "Bad Request",
+                    &uri.to_string(),
+                )
+                .into_response();
+            }
+        };
+        let action_type = input
+            .get("actionType")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        if !["primary", "secondary"].contains(&action_type.as_str()) {
+            let mut messages = Vec::new();
+            if input.get("actionType").is_none_or(Value::is_null) {
+                messages.push("actionType should not be null or undefined");
+            }
+            messages.push("actionType must be one of the following values: primary, secondary");
+            let mut response = validation_error(messages);
+            response.1.0["path"] = json!(uri.to_string());
+            return response.into_response();
+        }
+        return notification_action_for(
+            &db,
+            claims.environment_id,
+            claims.subscriber_id,
+            notification_id,
+            action_type,
+            action,
+            uri,
+            Some(claims.context_keys),
+        )
+        .await;
+    }
     if action == "snooze" {
         return snooze_notification_for(
             &db,
@@ -842,6 +890,174 @@ async fn mark_notification(
     .await
 }
 
+async fn management_action(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    Path((subscriber_id, notification_id, action_type)): Path<(String, String, String)>,
+    OriginalUri(uri): OriginalUri,
+) -> Response {
+    let path = uri.to_string();
+    let environment_id = match authenticate(&db, &headers, &path).await {
+        Ok(value) => value,
+        Err(response) => return response.into_response(),
+    };
+    let operation = if uri.path().ends_with("/complete") {
+        "complete"
+    } else {
+        "revert"
+    }
+    .to_owned();
+    notification_action_for(
+        &db,
+        environment_id,
+        subscriber_id,
+        notification_id,
+        action_type,
+        operation,
+        uri,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn notification_action_for(
+    db: &Client,
+    environment_id: String,
+    subscriber_id: String,
+    notification_id: String,
+    action_type: String,
+    operation: String,
+    uri: axum::http::Uri,
+    context_keys: Option<Vec<String>>,
+) -> Response {
+    let path = uri.to_string();
+    if !["complete", "revert"].contains(&operation.as_str()) {
+        return error_at(
+            StatusCode::NOT_IMPLEMENTED,
+            "Notification operation not implemented",
+            "Not Implemented",
+            &path,
+        )
+        .into_response();
+    }
+    let context_keys = match individual_context_keys(&uri, context_keys) {
+        Ok(keys) => keys,
+        Err(()) => {
+            return error_at(
+                StatusCode::NOT_IMPLEMENTED,
+                "Notification operation not implemented",
+                "Not Implemented",
+                &path,
+            )
+            .into_response();
+        }
+    };
+    if notification_id.len() != 24 || !notification_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"statusCode":422,"timestamp":timestamp,"path":path,"message":"Validation failed for UpdateNotificationActionCommand: notificationId: notificationId must be a mongodb id","ctx":{},"errors":{"notificationId":{"messages":["notificationId must be a mongodb id"],"value":notification_id}}}))).into_response();
+    }
+    if !["primary", "secondary"].contains(&action_type.as_str()) {
+        let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"statusCode":422,"timestamp":timestamp,"path":path,"message":"Validation failed for UpdateNotificationActionCommand: actionType: actionType must be one of the following values: primary, secondary","ctx":{},"errors":{"actionType":{"messages":["actionType must be one of the following values: primary, secondary"],"value":action_type}}}))).into_response();
+    }
+    let status = if operation == "complete" {
+        "done"
+    } else {
+        "pending"
+    };
+    let result = db.query_opt(r#"WITH target AS MATERIALIZED (
+        SELECT environment_id,subscriber_id,internal_id,profile FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2 FOR UPDATE
+      ), candidate AS MATERIALIZED (
+        SELECT m.id,w.inbox_metadata AS metadata,EXISTS(SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(m.cta#>'{action,buttons}')='array' THEN m.cta#>'{action,buttons}' ELSE '[]'::jsonb END) b WHERE b->>'type'=$4) AS has_button
+        FROM novu_rust_in_app_messages m JOIN target ON m.environment_id=target.environment_id AND m.subscriber_id=target.subscriber_id AND m.subscriber_internal_id=target.internal_id
+        LEFT JOIN novu_rust_workflows w ON w.environment_id=m.environment_id AND w.identifier=m.workflow_identifier
+        WHERE m.internal_id=lower($3) AND ($6::text[] IS NULL OR (cardinality(m.context_keys)=cardinality($6) AND m.context_keys @> $6)) FOR UPDATE OF m
+      ), updated AS (
+        UPDATE novu_rust_in_app_messages m SET
+        cta=jsonb_set(jsonb_set(m.cta,'{action,result}',COALESCE(m.cta#>'{action,result}','{}'::jsonb)||jsonb_build_object('type',$4::text),true),'{action,status}',to_jsonb($5::text),true),
+        is_seen=CASE WHEN m.is_read THEN m.is_seen ELSE true END,
+        last_seen_at=CASE WHEN m.is_read THEN m.last_seen_at ELSE now() END,
+        last_read_at=CASE WHEN m.is_read THEN m.last_read_at ELSE now() END,
+        read_at_present=CASE WHEN m.is_read THEN m.read_at_present ELSE true END,is_read=true
+        FROM candidate c WHERE m.id=c.id AND c.has_button AND jsonb_typeof(c.metadata->'id')='string' AND jsonb_typeof(c.metadata->'identifier')='string' AND jsonb_typeof(c.metadata->'name')='string' AND jsonb_typeof(c.metadata->'critical')='boolean' AND jsonb_typeof(c.metadata->'tags')='array' AND jsonb_typeof(c.metadata->'payloadAsData')='boolean' AND c.metadata->>'severity' IN ('none','low','medium','high') RETURNING m.*
+      ) SELECT m.internal_id,m.transaction_id,m.content,m.payload,m.is_read,m.is_seen,m.is_archived,
+        to_char(m.created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),to_char(m.delivered_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+        to_char(m.last_read_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),to_char(m.first_seen_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),to_char(m.archived_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+        m.tags,w.inbox_metadata,m.read_at_present,m.archived_at_present,m.data,target.internal_id,target.profile,candidate.id::text,candidate.has_button,
+        to_char(m.snoozed_until AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS snoozed_until,
+        CASE WHEN m.delivered_history IS NULL THEN NULL ELSE to_jsonb(ARRAY(SELECT to_char(t AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') FROM unnest(m.delivered_history) WITH ORDINALITY AS h(t,ord) ORDER BY ord)) END AS delivered_history,m.severity AS message_severity,m.cta AS message_cta
+      FROM target LEFT JOIN candidate ON true LEFT JOIN updated m ON true LEFT JOIN novu_rust_workflows w ON w.environment_id=m.environment_id AND w.identifier=m.workflow_identifier"#,
+      &[&environment_id,&subscriber_id,&notification_id,&action_type,&status,&context_keys]).await;
+    let row = match result {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return error_at(
+                StatusCode::NOT_FOUND,
+                &format!("Subscriber '{subscriber_id}' was not found"),
+                "Not Found",
+                &path,
+            )
+            .into_response();
+        }
+        Err(_) => {
+            return error_at(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal server error",
+                "Internal Server Error",
+                &path,
+            )
+            .into_response();
+        }
+    };
+    if row.get::<_, Option<String>>(19).is_none() {
+        return error_at(
+            StatusCode::NOT_FOUND,
+            &format!("Notification with id: {notification_id} is not found."),
+            "Not Found",
+            &path,
+        )
+        .into_response();
+    }
+    if row.get::<_, Option<bool>>(20) == Some(false) {
+        return error_at(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "Could not perform action on the {action_type} button because it does not exist."
+            ),
+            "Bad Request",
+            &path,
+        )
+        .into_response();
+    }
+    if row.get::<_, Option<String>>(0).is_none() {
+        return error_at(
+            StatusCode::NOT_IMPLEMENTED,
+            "Notification metadata not implemented",
+            "Not Implemented",
+            &path,
+        )
+        .into_response();
+    }
+    let profile: Value = row.get(18);
+    let mut to = json!({"id":row.get::<_,String>(17),"subscriberId":subscriber_id});
+    for key in ["firstName", "lastName", "avatar"] {
+        if let Some(value) = profile.get(key) {
+            to[key] = value.clone();
+        }
+    }
+    match notification_dto(&row, &to) {
+        Some(item) => (StatusCode::OK, Json(json!({"data":item}))).into_response(),
+        None => error_at(
+            StatusCode::NOT_IMPLEMENTED,
+            "Notification metadata not implemented",
+            "Not Implemented",
+            &path,
+        )
+        .into_response(),
+    }
+}
+
 async fn snooze_notification_for(
     db: &Client,
     environment_id: String,
@@ -942,7 +1158,7 @@ async fn snooze_notification_for(
           m.tags,w.inbox_metadata,m.read_at_present,m.archived_at_present,m.data,target.internal_id,target.profile,candidate.id::text,
           to_char(m.snoozed_until AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS snoozed_until,
           CASE WHEN m.delivered_history IS NULL THEN NULL ELSE to_jsonb(ARRAY(SELECT to_char(t AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') FROM unnest(m.delivered_history) WITH ORDINALITY AS h(t,ord) ORDER BY ord)) END AS delivered_history,
-          (SELECT count(*) FROM queued),(SELECT count(*) FROM emitted),m.severity AS message_severity FROM target LEFT JOIN candidate ON true LEFT JOIN updated m ON true LEFT JOIN novu_rust_workflows w ON w.environment_id=m.environment_id AND w.identifier=m.workflow_identifier"#,
+          (SELECT count(*) FROM queued),(SELECT count(*) FROM emitted),m.severity AS message_severity,m.cta AS message_cta FROM target LEFT JOIN candidate ON true LEFT JOIN updated m ON true LEFT JOIN novu_rust_workflows w ON w.environment_id=m.environment_id AND w.identifier=m.workflow_identifier"#,
         &[&environment_id,&subscriber_id,&notification_id,&stamp,&context_keys,&job_id]).await;
     let row = match result {
         Ok(Some(row)) => row,
@@ -1044,7 +1260,7 @@ async fn mark_notification_for(
         return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"statusCode":422,"timestamp":timestamp,"path":path,"message":format!("Validation failed for {command}: notificationId: notificationId must be a mongodb id"),"ctx":{},"errors":{"notificationId":{"messages":["notificationId must be a mongodb id"],"value":notification_id}}}))).into_response();
     }
     // Lock the subscriber and update the selected message in the same statement.
-    let result = db.query_opt("WITH target AS MATERIALIZED (SELECT environment_id, subscriber_id, internal_id, profile FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2 FOR UPDATE), candidate AS MATERIALIZED (SELECT m.id, m.snoozed_until IS NOT NULL AS is_snoozed, w.inbox_metadata AS metadata FROM novu_rust_in_app_messages m JOIN target ON m.environment_id=target.environment_id AND m.subscriber_id=target.subscriber_id AND m.subscriber_internal_id=target.internal_id LEFT JOIN novu_rust_workflows w ON w.environment_id=m.environment_id AND w.identifier=m.workflow_identifier WHERE m.internal_id=lower($3) AND ($5::text[] IS NULL OR (cardinality(m.context_keys)=cardinality($5) AND m.context_keys @> $5)) FOR UPDATE OF m), updated AS (UPDATE novu_rust_in_app_messages m SET is_seen=true, first_seen_at=COALESCE(m.first_seen_at,now()), last_seen_at=now(), is_read=CASE WHEN $4='unsnooze' THEN m.is_read ELSE ($4 <> 'unread') END, last_read_at=CASE WHEN $4='unsnooze' THEN m.last_read_at WHEN $4='unread' THEN NULL ELSE now() END, read_at_present=CASE WHEN $4='unsnooze' THEN m.read_at_present ELSE true END, snoozed_until=CASE WHEN $4='unsnooze' THEN NULL ELSE m.snoozed_until END, archived_at_present=CASE WHEN $4='read' THEN m.archived_at_present ELSE true END, is_archived=CASE WHEN $4='read' THEN m.is_archived WHEN $4='archive' THEN true ELSE false END, archived_at=CASE WHEN $4='read' THEN m.archived_at WHEN $4='archive' THEN now() ELSE NULL END FROM candidate WHERE m.id=candidate.id AND ($4 <> 'unsnooze' OR m.snoozed_until IS NOT NULL) AND jsonb_typeof(candidate.metadata->'id')='string' AND jsonb_typeof(candidate.metadata->'identifier')='string' AND jsonb_typeof(candidate.metadata->'name')='string' AND jsonb_typeof(candidate.metadata->'critical')='boolean' AND jsonb_typeof(candidate.metadata->'tags')='array' AND jsonb_typeof(candidate.metadata->'payloadAsData')='boolean' AND candidate.metadata->>'severity' IN ('none','low','medium','high') RETURNING m.*), cancelled AS (UPDATE novu_queue_jobs q SET status='cancelled' WHERE q.id=(SELECT pending.id FROM novu_queue_jobs pending WHERE $4='unsnooze' AND EXISTS(SELECT 1 FROM updated) AND pending.environment_id=$1 AND pending.kind='experimental-in-app-unsnooze' AND pending.status='pending' AND pending.payload->>'subscriberId'=$2 AND pending.payload->>'notificationId'=lower($3) ORDER BY pending.created_at,pending.id FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING q.id), emitted AS MATERIALIZED (SELECT novu_rust_emit_ws_event(t.environment_id,t.internal_id,COALESCE($5::text[],ARRAY[]::text[]),'unread_count_changed','{\"recalculate\":true}'::jsonb) AS sent FROM target t WHERE EXISTS(SELECT 1 FROM updated)) SELECT m.internal_id,m.transaction_id,m.content,m.payload,m.is_read,m.is_seen,m.is_archived,to_char(m.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),to_char(m.delivered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),to_char(m.last_read_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),to_char(m.first_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),to_char(m.archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),m.tags,w.inbox_metadata,m.read_at_present,m.archived_at_present,m.data,target.internal_id,target.profile,candidate.id::text,to_char(m.snoozed_until AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS snoozed_until,candidate.is_snoozed,CASE WHEN m.delivered_history IS NULL THEN NULL ELSE to_jsonb(ARRAY(SELECT to_char(t AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') FROM unnest(m.delivered_history) WITH ORDINALITY AS h(t,ord) ORDER BY ord)) END AS delivered_history,(SELECT count(*) FROM cancelled) AS cancelled_jobs,(SELECT count(*) FROM emitted),m.severity AS message_severity FROM target LEFT JOIN candidate ON true LEFT JOIN updated m ON true LEFT JOIN novu_rust_workflows w ON w.environment_id=m.environment_id AND w.identifier=m.workflow_identifier", &[&environment_id, &subscriber_id, &notification_id, &action, &context_keys]).await;
+    let result = db.query_opt("WITH target AS MATERIALIZED (SELECT environment_id, subscriber_id, internal_id, profile FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2 FOR UPDATE), candidate AS MATERIALIZED (SELECT m.id, m.snoozed_until IS NOT NULL AS is_snoozed, w.inbox_metadata AS metadata FROM novu_rust_in_app_messages m JOIN target ON m.environment_id=target.environment_id AND m.subscriber_id=target.subscriber_id AND m.subscriber_internal_id=target.internal_id LEFT JOIN novu_rust_workflows w ON w.environment_id=m.environment_id AND w.identifier=m.workflow_identifier WHERE m.internal_id=lower($3) AND ($5::text[] IS NULL OR (cardinality(m.context_keys)=cardinality($5) AND m.context_keys @> $5)) FOR UPDATE OF m), updated AS (UPDATE novu_rust_in_app_messages m SET is_seen=true, first_seen_at=COALESCE(m.first_seen_at,now()), last_seen_at=now(), is_read=CASE WHEN $4='unsnooze' THEN m.is_read ELSE ($4 <> 'unread') END, last_read_at=CASE WHEN $4='unsnooze' THEN m.last_read_at WHEN $4='unread' THEN NULL ELSE now() END, read_at_present=CASE WHEN $4='unsnooze' THEN m.read_at_present ELSE true END, snoozed_until=CASE WHEN $4='unsnooze' THEN NULL ELSE m.snoozed_until END, archived_at_present=CASE WHEN $4='read' THEN m.archived_at_present ELSE true END, is_archived=CASE WHEN $4='read' THEN m.is_archived WHEN $4='archive' THEN true ELSE false END, archived_at=CASE WHEN $4='read' THEN m.archived_at WHEN $4='archive' THEN now() ELSE NULL END FROM candidate WHERE m.id=candidate.id AND ($4 <> 'unsnooze' OR m.snoozed_until IS NOT NULL) AND jsonb_typeof(candidate.metadata->'id')='string' AND jsonb_typeof(candidate.metadata->'identifier')='string' AND jsonb_typeof(candidate.metadata->'name')='string' AND jsonb_typeof(candidate.metadata->'critical')='boolean' AND jsonb_typeof(candidate.metadata->'tags')='array' AND jsonb_typeof(candidate.metadata->'payloadAsData')='boolean' AND candidate.metadata->>'severity' IN ('none','low','medium','high') RETURNING m.*), cancelled AS (UPDATE novu_queue_jobs q SET status='cancelled' WHERE q.id=(SELECT pending.id FROM novu_queue_jobs pending WHERE $4='unsnooze' AND EXISTS(SELECT 1 FROM updated) AND pending.environment_id=$1 AND pending.kind='experimental-in-app-unsnooze' AND pending.status='pending' AND pending.payload->>'subscriberId'=$2 AND pending.payload->>'notificationId'=lower($3) ORDER BY pending.created_at,pending.id FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING q.id), emitted AS MATERIALIZED (SELECT novu_rust_emit_ws_event(t.environment_id,t.internal_id,COALESCE($5::text[],ARRAY[]::text[]),'unread_count_changed','{\"recalculate\":true}'::jsonb) AS sent FROM target t WHERE EXISTS(SELECT 1 FROM updated)) SELECT m.internal_id,m.transaction_id,m.content,m.payload,m.is_read,m.is_seen,m.is_archived,to_char(m.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),to_char(m.delivered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),to_char(m.last_read_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),to_char(m.first_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),to_char(m.archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),m.tags,w.inbox_metadata,m.read_at_present,m.archived_at_present,m.data,target.internal_id,target.profile,candidate.id::text,to_char(m.snoozed_until AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS snoozed_until,candidate.is_snoozed,CASE WHEN m.delivered_history IS NULL THEN NULL ELSE to_jsonb(ARRAY(SELECT to_char(t AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') FROM unnest(m.delivered_history) WITH ORDINALITY AS h(t,ord) ORDER BY ord)) END AS delivered_history,(SELECT count(*) FROM cancelled) AS cancelled_jobs,(SELECT count(*) FROM emitted),m.severity AS message_severity,m.cta AS message_cta FROM target LEFT JOIN candidate ON true LEFT JOIN updated m ON true LEFT JOIN novu_rust_workflows w ON w.environment_id=m.environment_id AND w.identifier=m.workflow_identifier", &[&environment_id, &subscriber_id, &notification_id, &action, &context_keys]).await;
     let row = match result {
         Ok(Some(row)) => row,
         Ok(None) => {
@@ -1430,7 +1646,7 @@ async fn list_notifications_for(
     let archived = filter.get("archived").and_then(Value::as_bool);
     let snoozed = filter.get("snoozed").and_then(Value::as_bool);
     let actual_offset = if after.is_some() { 0 } else { offset };
-    let rows = match db.query("SELECT m.internal_id, m.transaction_id, m.content, m.payload, m.is_read, m.is_seen, m.is_archived, to_char(m.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(m.delivered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(m.last_read_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(m.first_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(m.archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), m.tags, w.inbox_metadata, m.read_at_present, m.archived_at_present, m.data, to_char(m.snoozed_until AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS snoozed_until,CASE WHEN m.delivered_history IS NULL THEN NULL ELSE to_jsonb(ARRAY(SELECT to_char(t AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') FROM unnest(m.delivered_history) WITH ORDINALITY AS h(t,ord) ORDER BY ord)) END AS delivered_history, m.severity AS message_severity FROM novu_rust_in_app_messages m LEFT JOIN novu_rust_workflows w ON w.environment_id=m.environment_id AND w.identifier=m.workflow_identifier WHERE m.environment_id=$1 AND m.subscriber_id=$2 AND m.subscriber_internal_id=(SELECT internal_id FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2) AND ($3::boolean IS NULL OR m.is_read=$3) AND ($4::boolean IS NULL OR m.is_seen=$4) AND ($5::boolean IS NULL OR m.is_archived=$5) AND ($9::text[] IS NULL OR m.tags ?| $9) AND novu_rust_inbox_data_matches(m.data,$10) AND ($11::boolean IS NULL OR (m.snoozed_until IS NOT NULL)=$11) AND ($13::text[] IS NULL OR (NOT m.severity_present AND 'none'=ANY($13)) OR m.severity=ANY($13)) AND ($14::bigint IS NULL OR m.created_at >= to_timestamp($14::double precision/1000.0)) AND ($15::bigint IS NULL OR m.created_at <= to_timestamp($15::double precision/1000.0)) AND ($12::text[] IS NULL OR (cardinality(m.context_keys)=cardinality($12) AND m.context_keys @> $12)) AND ($8::text IS NULL OR (m.created_at,m.internal_id) < (SELECT boundary.created_at,boundary.internal_id FROM novu_rust_in_app_messages boundary WHERE boundary.environment_id=$1 AND boundary.internal_id=$8)) ORDER BY m.created_at DESC, m.internal_id DESC LIMIT $6 OFFSET $7", &[&environment_id, &subscriber_id, &read, &seen, &archived, &(limit + 1), &actual_offset, &after, &tag_filter, &data_filter, &snoozed, &context_keys, &severity_filter, &created_bounds[0], &created_bounds[1]]).await {
+    let rows = match db.query("SELECT m.internal_id, m.transaction_id, m.content, m.payload, m.is_read, m.is_seen, m.is_archived, to_char(m.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(m.delivered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(m.last_read_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(m.first_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(m.archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), m.tags, w.inbox_metadata, m.read_at_present, m.archived_at_present, m.data, to_char(m.snoozed_until AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS snoozed_until,CASE WHEN m.delivered_history IS NULL THEN NULL ELSE to_jsonb(ARRAY(SELECT to_char(t AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') FROM unnest(m.delivered_history) WITH ORDINALITY AS h(t,ord) ORDER BY ord)) END AS delivered_history, m.severity AS message_severity,m.cta AS message_cta FROM novu_rust_in_app_messages m LEFT JOIN novu_rust_workflows w ON w.environment_id=m.environment_id AND w.identifier=m.workflow_identifier WHERE m.environment_id=$1 AND m.subscriber_id=$2 AND m.subscriber_internal_id=(SELECT internal_id FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2) AND ($3::boolean IS NULL OR m.is_read=$3) AND ($4::boolean IS NULL OR m.is_seen=$4) AND ($5::boolean IS NULL OR m.is_archived=$5) AND ($9::text[] IS NULL OR m.tags ?| $9) AND novu_rust_inbox_data_matches(m.data,$10) AND ($11::boolean IS NULL OR (m.snoozed_until IS NOT NULL)=$11) AND ($13::text[] IS NULL OR (NOT m.severity_present AND 'none'=ANY($13)) OR m.severity=ANY($13)) AND ($14::bigint IS NULL OR m.created_at >= to_timestamp($14::double precision/1000.0)) AND ($15::bigint IS NULL OR m.created_at <= to_timestamp($15::double precision/1000.0)) AND ($12::text[] IS NULL OR (cardinality(m.context_keys)=cardinality($12) AND m.context_keys @> $12)) AND ($8::text IS NULL OR (m.created_at,m.internal_id) < (SELECT boundary.created_at,boundary.internal_id FROM novu_rust_in_app_messages boundary WHERE boundary.environment_id=$1 AND boundary.internal_id=$8)) ORDER BY m.created_at DESC, m.internal_id DESC LIMIT $6 OFFSET $7", &[&environment_id, &subscriber_id, &read, &seen, &archived, &(limit + 1), &actual_offset, &after, &tag_filter, &data_filter, &snoozed, &context_keys, &severity_filter, &created_bounds[0], &created_bounds[1]]).await {
         Ok(rows) => rows,
         Err(_) => return error_at(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error", "Internal Server Error", &path),
     };
@@ -1473,6 +1689,60 @@ fn parse_date_integer(value: &str) -> Result<Option<i64>, ()> {
     let number = digits[..prefix].parse::<i128>().map_err(|_| ())?;
     let signed = if negative { -number } else { number };
     i64::try_from(signed).map(Some).map_err(|_| ())
+}
+
+// Bounded implementation of the source in-app redirect allowlist.
+fn in_app_redirect(value: &Value) -> Option<Value> {
+    let url = value.get("url")?.as_str()?;
+    if url.is_empty() {
+        return None;
+    }
+    let rest = if let Some(stripped) = url.strip_prefix("{{") {
+        let end = stripped.find('}')? + 2;
+        if !url[end..].starts_with("}}") || url[end + 2..].contains(['\n', '\r']) {
+            return None;
+        }
+        None
+    } else if url.starts_with('/') && !url.starts_with("//") {
+        Some(&url[1..])
+    } else if let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    {
+        let first = rest.chars().next()?;
+        if first.is_whitespace() || first == '\u{feff}' || "/$.?#{}".contains(first) {
+            return None;
+        }
+        Some(rest)
+    } else {
+        return None;
+    };
+    if let Some(mut rest) = rest {
+        while !rest.is_empty() {
+            if rest.starts_with("{{") {
+                let end = rest[2..].find('}')? + 2;
+                if !rest[end..].starts_with("}}") {
+                    return None;
+                }
+                rest = &rest[end + 2..];
+            } else {
+                let ch = rest.chars().next()?;
+                if ch.is_whitespace() || ch == '\u{feff}' || ch == '{' || ch == '}' {
+                    return None;
+                }
+                rest = &rest[ch.len_utf8()..];
+            }
+        }
+    }
+    let mut result = json!({"url":url});
+    if let Some(target) = value
+        .get("target")
+        .and_then(Value::as_str)
+        .filter(|v| ["_self", "_blank", "_parent", "_top", "_unfencedTop"].contains(v))
+    {
+        result["target"] = json!(target);
+    }
+    Some(result)
 }
 
 fn notification_dto(row: &tokio_postgres::Row, to: &Value) -> Option<Value> {
@@ -1535,6 +1805,35 @@ fn notification_dto(row: &tokio_postgres::Row, to: &Value) -> Option<Value> {
         && payload.as_object().is_some_and(|value| !value.is_empty())
     {
         item["data"] = payload;
+    }
+    let cta: Option<Value> = row.get("message_cta");
+    if let Some(cta) = cta {
+        if let Some(redirect) = cta.get("data").and_then(in_app_redirect) {
+            item["redirect"] = redirect;
+        }
+        if let Some(buttons) = cta.pointer("/action/buttons").and_then(Value::as_array) {
+            for (kind, key) in [
+                ("primary", "primaryAction"),
+                ("secondary", "secondaryAction"),
+            ] {
+                if let Some(button) = buttons
+                    .iter()
+                    .find(|button| button.get("type").and_then(Value::as_str) == Some(kind))
+                {
+                    let completed = cta.pointer("/action/result/type").and_then(Value::as_str)
+                        == Some(kind)
+                        && cta.pointer("/action/status").and_then(Value::as_str) == Some("done");
+                    let mut action = json!({"isCompleted":completed});
+                    if let Some(label) = button.get("content") {
+                        action["label"] = label.clone();
+                    }
+                    if let Some(redirect) = in_app_redirect(button) {
+                        action["redirect"] = redirect;
+                    }
+                    item[key] = action;
+                }
+            }
+        }
     }
     Some(item)
 }
