@@ -59,4 +59,23 @@ async function disconnected(sockets,timeout=3000) {
   sql(`ALTER TABLE novu_rust_subscribers DISABLE TRIGGER novu_rust_subscriber_deleted_notify; DELETE FROM novu_rust_subscribers WHERE internal_id='${deliveryId}' AND environment_id='${env}'; ALTER TABLE novu_rust_subscribers ENABLE TRIGGER novu_rust_subscriber_deleted_notify; INSERT INTO novu_rust_ws_events(environment_id,subscriber_internal_id,event,data) VALUES ('${env}','${deliveryId}','sensitive_probe','{}')`);
   await disconnected([delivery]);assert.equal(received,0);
   console.log('strict WS event delivery rejects deleted identity');
+  const expiring=jwt.sign({_id:newId,environmentId:env,organizationId:'64a000000000000000000003',subscriberId:'strict-user',aud:'widget_user'},process.env.JWT_SECRET,{expiresIn:'2s'});
+  const expired=await open(process.env.STRICT_WS_URL,expiring);let expiredEvents=0;expired.on('expiry_probe',()=>{expiredEvents++});
+  await wait(2600);
+  sql(`INSERT INTO novu_rust_ws_events(environment_id,subscriber_internal_id,event,data) VALUES ('${env}','${newId}','expiry_probe','{}')`);
+  await disconnected([expired],9000);await wait(300);assert.equal(expiredEvents,0);
+  assert.equal(sql(`SELECT is_online FROM novu_rust_subscribers WHERE internal_id='${newId}' AND environment_id='${env}'`),'f');
+  assert.equal(sql(`SELECT count(*) FROM novu_rust_ws_connections WHERE subscriber_internal_id='${newId}'`),'0');
+  console.log('expired WS token stops event delivery and clears presence');
+  const outageToken=jwt.sign({_id:newId,environmentId:env,organizationId:'64a000000000000000000003',subscriberId:'strict-user',aud:'widget_user'},process.env.JWT_SECRET,{expiresIn:'3s'});
+  const outage=await open(process.env.STRICT_WS_URL,outageToken);
+  let result=spawnSync('docker',['stop','-t','0',process.env.PG_CONTAINER],{encoding:'utf8'});assert.equal(result.status,0,result.stderr);
+  await disconnected([outage],9000);
+  result=spawnSync('docker',['start',process.env.PG_CONTAINER],{encoding:'utf8'});assert.equal(result.status,0,result.stderr);
+  let ready=false;
+  for(let i=0;i<60&&!ready;i++) {ready=spawnSync('docker',['exec',process.env.PG_CONTAINER,'pg_isready','-q','-U','postgres','-d','novu_ws_test']).status===0;if(!ready)await wait(250);}
+  assert(ready,'PostgreSQL did not restart');
+  for(let i=0;i<80;i++) {if(sql(`SELECT count(*) FROM novu_rust_ws_connections WHERE subscriber_internal_id='${newId}'`)==='0')break;if(i===79)throw Error('expired connection cleanup did not recover');await wait(100);}
+  assert.equal(sql(`SELECT is_online FROM novu_rust_subscribers WHERE internal_id='${newId}' AND environment_id='${env}'`),'f');
+  console.log('token expiry closes socket during PostgreSQL outage and cleanup recovers');
 })().catch(error=>{console.error(error);process.exitCode=1});

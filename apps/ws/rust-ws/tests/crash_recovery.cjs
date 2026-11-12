@@ -35,4 +35,9 @@ async function until(predicate,message){for(let i=0;i<100;i++){if(predicate())re
   sql(`INSERT INTO novu_rust_ws_connections(id,environment_id,subscriber_internal_id,lease_expires_at) VALUES ('${orphan}','${env}','deleted-internal',clock_timestamp()-interval '1 second')`);
   await until(()=>sql(`SELECT count(*) FROM novu_rust_ws_connections WHERE id='${orphan}'`)==='0','orphaned lease was not reclaimed');
   console.log('expired orphan lease reclaimed');
+  const d=await open(process.env.STRICT_WS_URL2);
+  sql(`INSERT INTO novu_rust_ws_connections(id,environment_id,subscriber_internal_id,lease_expires_at) VALUES ('11111111-1111-4111-8111-111111111112','${env}','${id}',clock_timestamp()-interval '1 second'),('11111111-1111-4111-8111-111111111113','${env}','${id}',clock_timestamp()-interval '1 second')`);
+  d.disconnect();await until(()=>sql(`SELECT count(*) FROM novu_rust_ws_connections WHERE subscriber_internal_id='${id}' AND lease_expires_at>clock_timestamp()`)==='0','active row not removed');
+  assert.equal(sql(`SELECT is_online FROM novu_rust_subscribers WHERE internal_id='${id}'`),'f','expired rows must not keep presence online');
+  console.log('disconnect presence excludes expired lease rows');
 })().catch(error=>{console.error(error);process.exitCode=1});

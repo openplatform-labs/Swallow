@@ -52,10 +52,34 @@ struct Claims {
     id: String,
     environment_id: String,
     context_keys: Vec<String>,
+    expires_at: Option<f64>,
 }
 
 fn compatibility_mode() -> bool {
     std::env::var("NOVU_ALLOW_RECREATED_SUBSCRIBER").as_deref() == Ok("true")
+}
+
+fn token_expired(claims: &Claims) -> bool {
+    claims.expires_at.is_some_and(|expiry| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(true, |now| now.as_secs() as f64 >= expiry)
+    })
+}
+
+fn disconnect_expired_sockets(io: &SocketIo) {
+    let Some(namespace) = io.of("/") else {
+        return;
+    };
+    for socket in namespace.sockets() {
+        if socket
+            .extensions
+            .get::<Claims>()
+            .is_some_and(|claims| token_expired(&claims))
+        {
+            socket.disconnect().ok();
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -209,6 +233,10 @@ async fn deliver_event(
         .into_iter()
         .filter(|socket| {
             socket.extensions.get::<Claims>().is_some_and(|claims| {
+                if !compatibility_mode() && token_expired(&claims) {
+                    socket.clone().disconnect().ok();
+                    return false;
+                }
                 claims.environment_id == environment
                     && context_matches(&context, &claims.context_keys)
             })
@@ -367,6 +395,7 @@ fn verify(token: &str, secret: &[u8]) -> Option<Claims> {
         id: payload.get("_id")?.as_str()?.to_owned(),
         environment_id: payload.get("environmentId")?.as_str()?.to_owned(),
         context_keys,
+        expires_at: payload.get("exp").and_then(Value::as_f64),
     })
 }
 
@@ -405,7 +434,7 @@ async fn disconnect(
     let removed = tx.execute("DELETE FROM novu_rust_ws_connections WHERE id=$1 AND environment_id=$2 AND subscriber_internal_id=$3", &[&id,&claims.environment_id,&claims.id]).await?;
     if removed > 0 && update_presence {
         // The original gateway tests whether more than one socket remains.
-        tx.execute("UPDATE novu_rust_subscribers SET is_online=(SELECT count(*) > 1 FROM novu_rust_ws_connections WHERE environment_id=$1 AND subscriber_internal_id=$2),last_online_at=now(),updated_at=now() WHERE environment_id=$1 AND internal_id=$2", &[&claims.environment_id,&claims.id]).await?;
+        tx.execute("UPDATE novu_rust_subscribers SET is_online=(SELECT count(*) > 1 FROM novu_rust_ws_connections WHERE environment_id=$1 AND subscriber_internal_id=$2 AND (lease_expires_at IS NULL OR lease_expires_at>clock_timestamp())),last_online_at=now(),updated_at=now() WHERE environment_id=$1 AND internal_id=$2", &[&claims.environment_id,&claims.id]).await?;
     }
     tx.commit().await
 }
@@ -543,6 +572,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
     });
     if !compatibility_mode() {
+        let expiry_io = io.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                disconnect_expired_sockets(&expiry_io);
+            }
+        });
         let check_db = db.clone();
         let check_io = io.clone();
         tokio::spawn(async move {
@@ -595,7 +632,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     }
                     Err(_) => {
                         // A lost COMMIT acknowledgement may mean the row exists.
-                        let update_presence = verify(&token, &secret).is_some();
+                        let update_presence =
+                            !compatibility_mode() || verify(&token, &secret).is_some();
                         tokio::spawn(retry_disconnect(db.clone(), id, claims, update_presence));
                         socket.disconnect().ok();
                         return;
@@ -614,12 +652,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     let token = cleanup_token.clone();
                     let secret = cleanup_secret.clone();
                     async move {
-                        let update_presence = verify(&token, &secret).is_some();
+                        let update_presence =
+                            !compatibility_mode() || verify(&token, &secret).is_some();
                         tokio::spawn(retry_disconnect(db, id, claims, update_presence));
                     }
                 });
                 if !socket.connected() {
-                    let update_presence = verify(&token, &secret).is_some();
+                    let update_presence =
+                        !compatibility_mode() || verify(&token, &secret).is_some();
                     tokio::spawn(retry_disconnect(db, id, claims, update_presence));
                 }
             }
