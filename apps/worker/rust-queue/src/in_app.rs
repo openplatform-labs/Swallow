@@ -152,6 +152,12 @@ pub const FCM_CREDENTIALS_MIGRATION: &str =
     include_str!("../migrations/0047_experimental_fcm_credentials.sql");
 pub const PUSH_MESSAGES_MIGRATION: &str =
     include_str!("../migrations/0048_experimental_push_messages.sql");
+pub const MESSAGE_SUBSCRIBER_CLEANUP_INDEXES_MIGRATION: &str =
+    include_str!("../migrations/0049_message_subscriber_cleanup_indexes.sql");
+pub const IN_APP_SUBSCRIBER_IDENTITY_MIGRATION: &str =
+    include_str!("../migrations/0050_in_app_subscriber_identity.sql");
+pub const MULTIPLE_FCM_CHANNELS_MIGRATION: &str =
+    include_str!("../migrations/0051_multiple_fcm_channels.sql");
 pub const JOB_KIND: &str = novu_rust_contracts::EXPERIMENTAL_IN_APP_JOB_KIND;
 pub const UNSNOOZE_JOB_KIND: &str = "experimental-in-app-unsnooze";
 type WorkerResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -171,10 +177,10 @@ pub async fn process_one_unsnooze(client: &Client) -> Result<bool, tokio_postgre
            UPDATE novu_rust_in_app_messages m SET snoozed_until=NULL,created_at=now(),is_read=false,last_read_at=NULL,read_at_present=true, \
              delivered_history=COALESCE(m.delivered_history,ARRAY[COALESCE(m.delivered_at,m.created_at)]) || ARRAY[now()] \
            FROM job j WHERE m.environment_id=j.environment_id AND m.subscriber_id=j.payload->>'subscriberId' \
-             AND m.internal_id=j.payload->>'notificationId' AND m.snoozed_until IS NOT NULL RETURNING m.id,m.internal_id,m.environment_id,m.subscriber_id,m.context_keys\
+             AND m.subscriber_internal_id=(SELECT s.internal_id FROM novu_rust_subscribers s WHERE s.environment_id=m.environment_id AND s.subscriber_id=m.subscriber_id) AND m.internal_id=j.payload->>'notificationId' AND m.snoozed_until IS NOT NULL RETURNING m.id,m.internal_id,m.environment_id,m.subscriber_id,m.subscriber_internal_id,m.context_keys\
          ), emitted AS (\
            SELECT novu_rust_emit_ws_event(m.environment_id,s.internal_id,m.context_keys,'notification_received',jsonb_build_object('messageId',m.internal_id)) \
-           FROM updated m JOIN novu_rust_subscribers s ON s.environment_id=m.environment_id AND s.subscriber_id=m.subscriber_id\
+           FROM updated m JOIN novu_rust_subscribers s ON s.environment_id=m.environment_id AND s.subscriber_id=m.subscriber_id AND s.internal_id=m.subscriber_internal_id\
          ), completed AS (\
            UPDATE novu_queue_jobs q SET status=CASE WHEN EXISTS(SELECT 1 FROM updated) THEN 'completed' ELSE 'failed' END, \
              attempts=q.attempts+1,last_error=CASE WHEN EXISTS(SELECT 1 FROM updated) THEN NULL ELSE 'snoozed notification not found' END \
@@ -786,7 +792,7 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         .map_err(|_| InvalidJob("unsupported template or input"))?;
         let message_random = Uuid::new_v4().simple().to_string();
         let message_internal_id = format!("{seconds:08x}{}", &message_random[..16]);
-        let inserted = tx.query_opt("INSERT INTO novu_rust_in_app_messages (id, internal_id, environment_id, subscriber_id, workflow_identifier, transaction_id, content, payload, delivered_at, tags, context_keys, severity, severity_present, notification_internal_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), $9, $10, $11, true, $12) ON CONFLICT (environment_id, subscriber_id, workflow_identifier, transaction_id) DO NOTHING RETURNING internal_id", &[&Uuid::new_v4(), &message_internal_id, &job.environment_id, &subscriber, &workflow, &transaction_id, &rendered_content, &message_payload, &tags, &context_keys, &severity, &notification_id]).await?;
+        let inserted = tx.query_opt("INSERT INTO novu_rust_in_app_messages (id, internal_id, environment_id, subscriber_id, workflow_identifier, transaction_id, content, payload, delivered_at, tags, context_keys, severity, severity_present, notification_internal_id, subscriber_internal_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), $9, $10, $11, true, $12, $13) ON CONFLICT (environment_id, subscriber_internal_id, workflow_identifier, transaction_id) DO NOTHING RETURNING internal_id", &[&Uuid::new_v4(), &message_internal_id, &job.environment_id, &subscriber, &workflow, &transaction_id, &rendered_content, &message_payload, &tags, &context_keys, &severity, &notification_id, &subscriber_internal_id]).await?;
         if inserted.is_some() {
             tx.query_one("SELECT novu_rust_emit_ws_event($1,$2,$3,'notification_received',jsonb_build_object('messageId',$4::text))", &[&job.environment_id,&subscriber_internal_id,&context_keys,&message_internal_id]).await?;
         }

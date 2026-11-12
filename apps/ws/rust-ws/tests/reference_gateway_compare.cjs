@@ -13,6 +13,8 @@ const badAudience = jwt.sign({...claims,aud:'user'},process.env.JWT_SECRET,{expi
 const otherEnvironment = jwt.sign({...claims,environmentId:'64a000000000000000000012'},process.env.JWT_SECRET,{expiresIn:'1h'});
 const expired = jwt.sign({...claims,exp:1},process.env.JWT_SECRET);
 const forged = jwt.sign(claims,'wrong-secret',{expiresIn:'1h'});
+const fractional = jwt.sign({...claims,exp:4102444800.5,nbf:-0.5},process.env.JWT_SECRET);
+const futureFractional = jwt.sign({...claims,exp:4102444800.5,nbf:4102444800.5},process.env.JWT_SECRET);
 const wait = ms => new Promise(r => setTimeout(r,ms));
 async function status(kind) {
   if (kind === 'reference') return await (await fetch(process.env.REF_WS_URL + '/status')).json();
@@ -43,7 +45,7 @@ async function rejected(socket) {
 }
 (async()=>{
   for (const [kind,url] of [['reference',process.env.REF_WS_URL],['rust',process.env.RUST_WS_URL]]) {
-    for (const invalid of [undefined,'null',forged,expired,badAudience]) {
+    for (const invalid of [undefined,'null',forged,expired,badAudience,futureFractional]) {
       const s=client(url,{query:invalid === undefined ? {} : {token:invalid}});
       await rejected(s); await online(kind,false,false);
     }
@@ -52,6 +54,8 @@ async function rejected(socket) {
     console.log(kind+' cross-environment presence isolation: match');
     let s=client(url,{query:{token}}); await connected(s); await online(kind,true,false); s.disconnect(); await online(kind,false,true);
     console.log(kind+' query authentication and presence: match');
+    let numeric=client(url,{query:{token:fractional}}); await connected(numeric); await online(kind,true,true); numeric.disconnect(); await online(kind,false,true);
+    console.log(kind+' fractional and negative JWT times: accepted');
     s=io(url,{transports:['polling'],reconnection:false,timeout:2000,query:{token}}); await connected(s); await online(kind,true,true); s.disconnect(); await online(kind,false,true);
     console.log(kind+' polling authentication: match');
     s=client(url,{query:{token:contextToken}}); await connected(s); await online(kind,true,true); s.disconnect(); await online(kind,false,true);

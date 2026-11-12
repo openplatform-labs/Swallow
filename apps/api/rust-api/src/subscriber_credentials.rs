@@ -17,11 +17,11 @@ pub(super) async fn attach(
     mut response: ApiError,
     path: &str,
 ) -> ApiError {
-    let row=db.query_opt("SELECT integration_internal_id,device_tokens FROM novu_rust_fcm_devices WHERE environment_id=$1 AND subscriber_id=$2 AND integration_internal_id IS NOT NULL",&[&environment,&subscriber]).await;
-    match row {
-        Ok(row) => {
-            let channels=row.map(|r|json!([{"providerId":"fcm","_integrationId":r.get::<_,String>(0),"credentials":{"deviceTokens":r.get::<_,Vec<String>>(1)}}])).unwrap_or_else(||json!([]));
-            response.1.0["data"]["channels"] = channels;
+    let rows=db.query("SELECT integration_internal_id,device_tokens FROM novu_rust_fcm_devices WHERE environment_id=$1 AND subscriber_id=$2 AND integration_internal_id IS NOT NULL ORDER BY channel_order",&[&environment,&subscriber]).await;
+    match rows {
+        Ok(rows) => {
+            let channels:Vec<_>=rows.into_iter().map(|r|json!({"providerId":"fcm","_integrationId":r.get::<_,String>(0),"credentials":{"deviceTokens":r.get::<_,Vec<String>>(1)}})).collect();
+            response.1.0["data"]["channels"] = json!(channels);
             response
         }
         Err(_) => error_at(
@@ -150,7 +150,7 @@ pub(super) async fn update(
             );
         }
     }
-    let found=match db.query_opt("SELECT internal_id FROM novu_rust_fcm_integrations WHERE environment_id=$1 AND active AND ($2::text IS NULL OR $2='' OR identifier=$2)",&[&env,&identifier]).await {Ok(value)=>value,Err(_)=>return error_at(StatusCode::INTERNAL_SERVER_ERROR,"Internal server error","Internal Server Error",&path)};
+    let found=match db.query_opt("SELECT internal_id FROM novu_rust_fcm_integrations WHERE environment_id=$1 AND active AND ($2::text IS NULL OR $2='' OR identifier=$2) ORDER BY created_at DESC,internal_id DESC LIMIT 1",&[&env,&identifier]).await {Ok(value)=>value,Err(_)=>return error_at(StatusCode::INTERNAL_SERVER_ERROR,"Internal server error","Internal Server Error",&path)};
     let Some(found) = found else {
         return error_at(
             StatusCode::BAD_REQUEST,
@@ -161,48 +161,88 @@ pub(super) async fn update(
     };
     let integration: String = found.get(0);
     let replace = method == Method::PUT;
-    let row=db.query_opt("WITH target AS MATERIALIZED (SELECT environment_id,subscriber_id FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2 FOR UPDATE), incoming AS MATERIALIZED (SELECT COALESCE(array_agg(v ORDER BY first_pos),'{}'::text[]) AS tokens FROM (SELECT v,min(pos) AS first_pos FROM unnest($3::text[]) WITH ORDINALITY AS x(v,pos) GROUP BY v) dedup), written AS (INSERT INTO novu_rust_fcm_devices AS d(environment_id,subscriber_id,device_tokens,integration_internal_id) SELECT target.environment_id,target.subscriber_id,incoming.tokens,$4 FROM target CROSS JOIN incoming WHERE cardinality(incoming.tokens)<=100 ON CONFLICT(environment_id,subscriber_id) DO UPDATE SET device_tokens=(SELECT COALESCE(array_agg(v ORDER BY first_pos),'{}'::text[]) FROM (SELECT v,min(pos) AS first_pos FROM unnest(CASE WHEN $5::boolean OR cardinality(EXCLUDED.device_tokens)=0 THEN EXCLUDED.device_tokens ELSE d.device_tokens || EXCLUDED.device_tokens END) WITH ORDINALITY AS x(v,pos) GROUP BY v) dedup),integration_internal_id=EXCLUDED.integration_internal_id WHERE (SELECT count(DISTINCT v) FROM unnest(CASE WHEN $5::boolean OR cardinality(EXCLUDED.device_tokens)=0 THEN EXCLUDED.device_tokens ELSE d.device_tokens || EXCLUDED.device_tokens END) AS x(v))<=100 RETURNING 1), changed AS (UPDATE novu_rust_subscribers s SET updated_at=now() FROM target WHERE s.environment_id=target.environment_id AND s.subscriber_id=target.subscriber_id AND EXISTS(SELECT 1 FROM written) RETURNING s.*) SELECT changed.internal_id,changed.profile,e.organization_id,to_char(changed.created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),to_char(changed.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),changed.is_online,to_char(changed.last_online_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS last_online_at FROM changed JOIN novu_rust_environments e ON e.id=changed.environment_id",&[&env,&subscriber,&tokens,&integration,&replace]).await;
-    match row {
-        Ok(Some(row)) => {
-            attach(
-                &db,
-                &env,
-                &subscriber,
-                subscriber_entity_response(row, &subscriber, &env),
-                &path,
-            )
-            .await
-        }
-        Ok(None) => {
-            let exists=db.query_opt("SELECT 1 FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2",&[&env,&subscriber]).await;
-            match exists {
-                Ok(Some(_)) => error_at(
-                    StatusCode::BAD_REQUEST,
-                    "Device tokens limit exceeded",
-                    "Bad Request",
+    for _ in 0..4 {
+        let row=db.query_opt("WITH target AS MATERIALIZED (SELECT environment_id,subscriber_id FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2 FOR UPDATE), incoming AS MATERIALIZED (SELECT COALESCE(array_agg(v ORDER BY first_pos),'{}'::text[]) AS tokens FROM (SELECT v,min(pos) AS first_pos FROM unnest($3::text[]) WITH ORDINALITY AS x(v,pos) GROUP BY v) dedup), written AS (INSERT INTO novu_rust_fcm_devices AS d(environment_id,subscriber_id,device_tokens,integration_internal_id) SELECT target.environment_id,target.subscriber_id,incoming.tokens,$4 FROM target CROSS JOIN incoming WHERE cardinality(incoming.tokens)<=100 ON CONFLICT(environment_id,subscriber_id,integration_internal_id) WHERE integration_internal_id IS NOT NULL DO UPDATE SET device_tokens=(SELECT COALESCE(array_agg(v ORDER BY first_pos),'{}'::text[]) FROM (SELECT v,min(pos) AS first_pos FROM unnest(CASE WHEN $5::boolean OR cardinality(EXCLUDED.device_tokens)=0 THEN EXCLUDED.device_tokens ELSE d.device_tokens || EXCLUDED.device_tokens END) WITH ORDINALITY AS x(v,pos) GROUP BY v) dedup),integration_internal_id=EXCLUDED.integration_internal_id WHERE (SELECT count(DISTINCT v) FROM unnest(CASE WHEN $5::boolean OR cardinality(EXCLUDED.device_tokens)=0 THEN EXCLUDED.device_tokens ELSE d.device_tokens || EXCLUDED.device_tokens END) AS x(v))<=100 AND (d.integration_internal_id IS DISTINCT FROM EXCLUDED.integration_internal_id OR d.device_tokens IS DISTINCT FROM EXCLUDED.device_tokens) RETURNING 1), changed AS (UPDATE novu_rust_subscribers s SET updated_at=now() FROM target WHERE s.environment_id=target.environment_id AND s.subscriber_id=target.subscriber_id AND EXISTS(SELECT 1 FROM written) RETURNING s.*) SELECT changed.internal_id,changed.profile,e.organization_id,to_char(changed.created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),to_char(changed.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),changed.is_online,to_char(changed.last_online_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS last_online_at FROM changed JOIN novu_rust_environments e ON e.id=changed.environment_id",&[&env,&subscriber,&tokens,&integration,&replace]).await;
+        match row {
+            Ok(Some(row)) => {
+                return attach(
+                    &db,
+                    &env,
+                    &subscriber,
+                    subscriber_entity_response(row, &subscriber, &env),
                     &path,
-                ),
-                Ok(None) => error_at(
-                    StatusCode::BAD_REQUEST,
-                    &format!("SubscriberId: {subscriber} not found"),
-                    "Bad Request",
-                    &path,
-                ),
-                Err(_) => error_at(
+                )
+                .await;
+            }
+            Ok(None) => {
+                // A conflict can be an exact no-op, a token limit violation, or a
+                // concurrent change after the statement snapshot. Re-read and retry
+                // the last case rather than misreporting it as a limit violation.
+                let current = db.query_opt("SELECT s.internal_id,s.profile,e.organization_id,to_char(s.created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),to_char(s.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),s.is_online,to_char(s.last_online_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS last_online_at,COALESCE(d.integration_internal_id=$3 AND d.device_tokens=ARRAY(SELECT v FROM (SELECT v,min(pos) AS first_pos FROM unnest($4::text[]) WITH ORDINALITY AS x(v,pos) GROUP BY v) dedup ORDER BY first_pos),false) AS unchanged,(SELECT count(DISTINCT v) FROM unnest(CASE WHEN $5::boolean OR cardinality($4::text[])=0 THEN $4::text[] ELSE COALESCE(d.device_tokens,'{}'::text[]) || $4::text[] END) AS x(v)) AS token_count FROM novu_rust_subscribers s JOIN novu_rust_environments e ON e.id=s.environment_id LEFT JOIN novu_rust_fcm_devices d ON d.environment_id=s.environment_id AND d.subscriber_id=s.subscriber_id AND d.integration_internal_id=$3 WHERE s.environment_id=$1 AND s.subscriber_id=$2", &[&env,&subscriber,&integration,&tokens,&replace]).await;
+                match current {
+                    Ok(Some(row)) if row.get::<_, bool>(7) => {
+                        return attach(
+                            &db,
+                            &env,
+                            &subscriber,
+                            subscriber_entity_response(row, &subscriber, &env),
+                            &path,
+                        )
+                        .await;
+                    }
+                    Ok(Some(row)) if row.get::<_, i64>(8) > 100 => {
+                        let count: i64 = row.get(8);
+                        let mut error = error_at(
+                            StatusCode::BAD_REQUEST,
+                            &format!(
+                                "Device tokens limit exceeded. Maximum allowed tokens per subscriber channel is 100, but got {count} tokens."
+                            ),
+                            "Bad Request",
+                            &path,
+                        );
+                        if let Some(body) = error.1.0.as_object_mut() {
+                            body.remove("error");
+                            body.insert("currentCount".into(), json!(count));
+                            body.insert("limit".into(), json!(100));
+                            body.insert("ctx".into(), json!({"currentCount":count,"limit":100}));
+                        }
+                        return error;
+                    }
+                    Ok(Some(_)) => continue,
+                    Ok(None) => {
+                        return error_at(
+                            StatusCode::BAD_REQUEST,
+                            &format!("SubscriberId: {subscriber} not found"),
+                            "Bad Request",
+                            &path,
+                        );
+                    }
+                    Err(_) => {
+                        return error_at(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Internal server error",
+                            "Internal Server Error",
+                            &path,
+                        );
+                    }
+                }
+            }
+            Err(_) => {
+                return error_at(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Internal server error",
                     "Internal Server Error",
                     &path,
-                ),
+                );
             }
         }
-        Err(_) => error_at(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Internal server error",
-            "Internal Server Error",
-            &path,
-        ),
     }
+    error_at(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Concurrent credentials update could not be completed",
+        "Internal Server Error",
+        &path,
+    )
 }
 
 pub(super) async fn delete(
@@ -225,7 +265,7 @@ pub(super) async fn delete(
         )
         .into_response();
     }
-    let result=db.query_opt("WITH target AS MATERIALIZED (SELECT environment_id,subscriber_id FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2 FOR UPDATE), removed AS (DELETE FROM novu_rust_fcm_devices d USING target WHERE d.environment_id=target.environment_id AND d.subscriber_id=target.subscriber_id RETURNING 1), touched AS (UPDATE novu_rust_subscribers s SET updated_at=now() FROM target WHERE s.environment_id=target.environment_id AND s.subscriber_id=target.subscriber_id AND EXISTS(SELECT 1 FROM removed) RETURNING 1) SELECT subscriber_id FROM target",&[&env,&subscriber]).await;
+    let result=db.query_opt("WITH target AS MATERIALIZED (SELECT environment_id,subscriber_id FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2 FOR UPDATE), removed AS (DELETE FROM novu_rust_fcm_devices d USING target WHERE d.environment_id=target.environment_id AND d.subscriber_id=target.subscriber_id RETURNING 1), touched AS (UPDATE novu_rust_subscribers s SET updated_at=now() FROM target WHERE s.environment_id=target.environment_id AND s.subscriber_id=target.subscriber_id RETURNING 1) SELECT subscriber_id FROM target",&[&env,&subscriber]).await;
     match result {
         Ok(Some(_)) => StatusCode::NO_CONTENT.into_response(),
         Ok(None) => error_at(

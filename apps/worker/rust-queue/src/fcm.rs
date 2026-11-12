@@ -201,6 +201,7 @@ pub enum SendError {
     UnsupportedMessage,
     Transport,
     Provider(u16),
+    InvalidDeviceToken(u16),
     InvalidResponse,
     OAuth(crate::google_oauth::AuthError),
 }
@@ -211,12 +212,86 @@ impl std::fmt::Display for SendError {
             Self::UnsupportedMessage => f.write_str("unsupported FCM message"),
             Self::Transport => f.write_str("FCM transport failed"),
             Self::Provider(code) => write!(f, "FCM returned HTTP {code}"),
+            Self::InvalidDeviceToken(code) => {
+                write!(f, "FCM returned HTTP {code}: invalid device token")
+            }
             Self::InvalidResponse => f.write_str("invalid FCM response"),
             Self::OAuth(error) => write!(f, "FCM authentication failed: {error}"),
         }
     }
 }
 impl std::error::Error for SendError {}
+
+// Mirrors the pinned firebase-admin error conversion followed by Novu's FCM
+// isTokenInvalid check. Unknown JSON errors and non-JSON responses include the
+// raw response in the SDK's generated message; known errors do not.
+fn invalid_device_token_response(body: &[u8]) -> bool {
+    const INVALID: &str = "Requested entity was not found";
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return String::from_utf8_lossy(body).contains(INVALID);
+    };
+    let error = value.get("error");
+    if error
+        .and_then(|v| v.get("message"))
+        .and_then(Value::as_str)
+        .is_some_and(|v| v.contains(INVALID))
+    {
+        return true;
+    }
+    let code = error.and_then(|error| {
+        error.as_str().or_else(|| {
+            if let Some(detail) =
+                error
+                    .get("details")
+                    .and_then(Value::as_array)
+                    .and_then(|details| {
+                        details.iter().find(|item| {
+                            item.get("@type").and_then(Value::as_str)
+                                == Some("type.googleapis.com/google.firebase.fcm.v1.FcmError")
+                        })
+                    })
+            {
+                detail.get("errorCode").and_then(Value::as_str)
+            } else {
+                error
+                    .get("status")
+                    .or_else(|| error.get("message"))
+                    .and_then(Value::as_str)
+            }
+        })
+    });
+    let known = code.is_some_and(|code| {
+        matches!(
+            code,
+            "InvalidParameters"
+                | "MismatchSenderId"
+                | "Unavailable"
+                | "InternalServerError"
+                | "InvalidRegistration"
+                | "NotRegistered"
+                | "InvalidPackageName"
+                | "MessageTooBig"
+                | "InvalidDataKey"
+                | "InvalidTtl"
+                | "DeviceMessageRateExceeded"
+                | "TopicsMessageRateExceeded"
+                | "InvalidApnsCredential"
+                | "NOT_FOUND"
+                | "PERMISSION_DENIED"
+                | "RESOURCE_EXHAUSTED"
+                | "UNAUTHENTICATED"
+                | "APNS_AUTH_ERROR"
+                | "INTERNAL"
+                | "INVALID_ARGUMENT"
+                | "QUOTA_EXCEEDED"
+                | "SENDER_ID_MISMATCH"
+                | "THIRD_PARTY_AUTH_ERROR"
+                | "UNAVAILABLE"
+                | "UNREGISTERED"
+        )
+    });
+    !known && value.to_string().contains(INVALID)
+}
 
 /// Convert the bounded Firebase message subset into HTTP v1 single-send bodies.
 /// Unsupported platform-specific options are rejected rather than dropped.
@@ -386,7 +461,7 @@ impl Fcm {
                 account.access_token().await.map_err(SendError::OAuth)?
             }
         };
-        let response = self
+        let mut response = self
             .http
             .post(&self.endpoint)
             .bearer_auth(&token)
@@ -395,7 +470,26 @@ impl Fcm {
             .await
             .map_err(|_| SendError::Transport)?;
         if !response.status().is_success() {
-            return Err(SendError::Provider(response.status().as_u16()));
+            let status = response.status().as_u16();
+            // The source Firebase SDK exposes error.message to the provider.
+            // Bound the body and keep only the classification, never the raw
+            // provider response, which can contain sensitive data.
+            let mut bytes = Vec::new();
+            loop {
+                let chunk = match response.chunk().await {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => break,
+                    Err(_) => return Err(SendError::Provider(status)),
+                };
+                if bytes.len() + chunk.len() > 16 * 1024 {
+                    return Err(SendError::Provider(status));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            if invalid_device_token_response(&bytes) {
+                return Err(SendError::InvalidDeviceToken(status));
+            }
+            return Err(SendError::Provider(status));
         }
         let result = response.json::<Value>().await.ok().and_then(|v| {
             v.get("name")
@@ -414,6 +508,32 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+    #[test]
+    #[ignore = "requires the built pinned Firebase SDK and Node.js"]
+    fn original_firebase_error_classification_matches() {
+        let output = std::process::Command::new("node")
+            .arg("tests/reference_fcm_errors.cjs")
+            .env(
+                "NOVU_REFERENCE_SOURCE",
+                std::env::var("NOVU_REFERENCE_SOURCE").unwrap(),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let cases: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
+        for case in cases {
+            let body = case["body"].as_str().unwrap();
+            assert_eq!(
+                invalid_device_token_response(body.as_bytes()),
+                case["invalid"].as_bool().unwrap(),
+                "{body}"
+            );
+        }
+    }
     #[tokio::test]
     async fn sends_multicast_separately_and_records_each_http_outcome() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

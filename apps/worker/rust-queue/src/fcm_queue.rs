@@ -3,6 +3,7 @@ use crate::{
     ClaimedJob,
     fcm::{self, Fcm, Push, SendError},
 };
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio_postgres::{Client, Error, Transaction};
 use uuid::Uuid;
@@ -59,6 +60,25 @@ pub async fn process_one(
     environment: &str,
     provider: &Fcm,
 ) -> Result<bool, Error> {
+    process_one_inner(client, environment, Some(provider), None).await
+}
+
+/// Process workflow targets using an explicit integration-to-provider map.
+/// Missing credentials fail the job before any target is sent.
+pub async fn process_one_with_integrations(
+    client: &mut Client,
+    environment: &str,
+    providers: &HashMap<String, Fcm>,
+) -> Result<bool, Error> {
+    process_one_inner(client, environment, None, Some(providers)).await
+}
+
+async fn process_one_inner(
+    client: &mut Client,
+    environment: &str,
+    default_provider: Option<&Fcm>,
+    providers: Option<&HashMap<String, Fcm>>,
+) -> Result<bool, Error> {
     let Some(job) = claim(client, environment).await? else {
         return Ok(false);
     };
@@ -73,7 +93,7 @@ pub async fn process_one(
     let tx = client.transaction().await?;
     // Match subscriber mutation lock ordering before locking the job.
     let subscriber = if let Some(context) = push.workflow_context.as_ref() {
-        tx.query_opt("SELECT s.profile,w.read_only,w.all_enabled,w.push_enabled,(p.channels->>'push')::boolean,(sp.channels->>'push')::boolean,EXISTS(SELECT 1 FROM novu_rust_workflows wf WHERE wf.environment_id=s.environment_id AND wf.identifier=$3 AND ($4::text IS NULL OR wf.inbox_metadata->>'id'=$4)),d.device_tokens FROM novu_rust_subscribers s LEFT JOIN novu_rust_workflow_preferences w ON w.environment_id=s.environment_id AND w.workflow_identifier=$3 LEFT JOIN novu_rust_subscriber_preferences p ON p.environment_id=s.environment_id AND p.subscriber_id=s.subscriber_id LEFT JOIN novu_rust_subscriber_workflow_preferences sp ON sp.environment_id=s.environment_id AND sp.subscriber_id=s.subscriber_id AND sp.workflow_identifier=$3 LEFT JOIN novu_rust_fcm_devices d ON d.environment_id=s.environment_id AND d.subscriber_id=s.subscriber_id WHERE s.environment_id=$1 AND s.subscriber_id=$2 FOR UPDATE OF s",&[&environment,&context.subscriber_id,&context.workflow_identifier,&context.workflow_internal_id]).await?
+        tx.query_opt("SELECT s.profile,w.read_only,w.all_enabled,w.push_enabled,(p.channels->>'push')::boolean,(sp.channels->>'push')::boolean,EXISTS(SELECT 1 FROM novu_rust_workflows wf WHERE wf.environment_id=s.environment_id AND wf.identifier=$3 AND ($4::text IS NULL OR wf.inbox_metadata->>'id'=$4)),d.device_tokens,d.integration_internal_id IS NULL OR EXISTS(SELECT 1 FROM novu_rust_fcm_integrations i WHERE i.environment_id=s.environment_id AND i.internal_id=d.integration_internal_id AND i.active),d.integration_internal_id,EXISTS(SELECT 1 FROM novu_rust_fcm_devices x WHERE x.environment_id=s.environment_id AND x.subscriber_id=s.subscriber_id OFFSET 1) FROM novu_rust_subscribers s LEFT JOIN novu_rust_workflow_preferences w ON w.environment_id=s.environment_id AND w.workflow_identifier=$3 LEFT JOIN novu_rust_subscriber_preferences p ON p.environment_id=s.environment_id AND p.subscriber_id=s.subscriber_id LEFT JOIN novu_rust_subscriber_workflow_preferences sp ON sp.environment_id=s.environment_id AND sp.subscriber_id=s.subscriber_id AND sp.workflow_identifier=$3 LEFT JOIN LATERAL (SELECT * FROM novu_rust_fcm_devices d WHERE d.environment_id=s.environment_id AND d.subscriber_id=s.subscriber_id ORDER BY d.channel_order LIMIT 1) d ON true WHERE s.environment_id=$1 AND s.subscriber_id=$2 FOR UPDATE OF s",&[&environment,&context.subscriber_id,&context.workflow_identifier,&context.workflow_internal_id]).await?
     } else {
         None
     };
@@ -96,10 +116,16 @@ pub async fn process_one(
             {
                 Some(("canceled", "cancelled", "push preference disabled"))
             }
+            Some(row) if row.get::<_, bool>(10) && providers.is_none() => Some((
+                "failed",
+                "failed",
+                "multiple push integrations not configured for delivery",
+            )),
             Some(row)
-                if row
-                    .get::<_, Option<Vec<String>>>(7)
-                    .is_none_or(|tokens| tokens.is_empty()) =>
+                if !row.get::<_, bool>(10)
+                    && row
+                        .get::<_, Option<Vec<String>>>(7)
+                        .is_none_or(|tokens| tokens.is_empty()) =>
             {
                 Some((
                     "missing_device",
@@ -107,6 +133,11 @@ pub async fn process_one(
                     "subscriber missing push device",
                 ))
             }
+            Some(row) if !row.get::<_, bool>(10) && !row.get::<_, bool>(8) => Some((
+                "failed",
+                "failed",
+                "subscriber has no active push integration",
+            )),
             _ => None,
         };
         if let Some((outcome, status, diagnostic)) = skip {
@@ -116,6 +147,50 @@ pub async fn process_one(
             return Ok(true);
         }
         let row = subscriber.as_ref().unwrap();
+        let groups: Vec<(Option<String>, Vec<String>, bool)> = if row.get::<_, bool>(10) {
+            tx.query("SELECT d.integration_internal_id,d.device_tokens,d.integration_internal_id IS NULL OR EXISTS(SELECT 1 FROM novu_rust_fcm_integrations i WHERE i.environment_id=d.environment_id AND i.internal_id=d.integration_internal_id AND i.active) FROM novu_rust_fcm_devices d WHERE d.environment_id=$1 AND d.subscriber_id=$2 ORDER BY d.channel_order", &[&environment,&context.subscriber_id]).await?
+                .into_iter().map(|r| (r.get(0),r.get(1),r.get(2))).collect()
+        } else {
+            vec![(
+                row.get(9),
+                row.get::<_, Option<Vec<String>>>(7).unwrap_or_default(),
+                row.get(8),
+            )]
+        };
+        let eligible: Vec<_> = groups
+            .iter()
+            .filter(|(_, tokens, active)| *active && !tokens.is_empty())
+            .collect();
+        let unavailable = providers.is_some_and(|providers| {
+            eligible
+                .iter()
+                .any(|(id, _, _)| id.as_ref().is_none_or(|id| !providers.contains_key(id)))
+        });
+        if eligible.is_empty() || unavailable {
+            let missing =
+                eligible.is_empty() && groups.iter().any(|(_, tokens, _)| tokens.is_empty());
+            let (outcome, status, diagnostic) = if missing {
+                (
+                    "missing_device",
+                    "cancelled",
+                    "subscriber missing push device",
+                )
+            } else {
+                (
+                    "failed",
+                    "failed",
+                    if unavailable {
+                        "push integration credentials not configured"
+                    } else {
+                        "subscriber has no active push integration"
+                    },
+                )
+            };
+            tx.execute("UPDATE novu_rust_push_step_outcomes SET status=$3,push_job_id=NULL WHERE environment_id=$1 AND push_job_id=$2",&[&environment,&job.id,&outcome]).await?;
+            tx.execute("UPDATE novu_queue_jobs SET status=$2,last_error=$3,lease_token=NULL,lease_until=NULL WHERE id=$1",&[&job.id,&status,&diagnostic]).await?;
+            tx.commit().await?;
+            return Ok(true);
+        }
         let mut profile: serde_json::Value = row.get(0);
         if let Some(fields) = profile.as_object_mut() {
             fields.insert("subscriberId".into(), context.subscriber_id.clone().into());
@@ -162,7 +237,37 @@ pub async fn process_one(
                 return Ok(true);
             }
         };
-        let tokens: Vec<String> = row.get::<_, Option<Vec<String>>>(7).unwrap_or_default();
+        let mut messages = Vec::new();
+        let mut target_metadata = Vec::new();
+        for (integration, tokens, _) in eligible {
+            for token in tokens {
+                let message_id: String = tx
+                    .query_one("SELECT novu_rust_new_objectid()", &[])
+                    .await?
+                    .get(0);
+                let mut payload = context.payload.as_object().cloned().unwrap_or_default();
+                payload.insert("__nvMessageId".into(), message_id.into());
+                let candidate = Push {
+                    title: title.clone(),
+                    content: content.clone(),
+                    targets: vec![token.clone()],
+                    payload,
+                    ..Push::default()
+                };
+                match fcm::wire_messages(&fcm::plan(&candidate)) {
+                    Ok(mut bodies) => {
+                        messages.append(&mut bodies);
+                        target_metadata.push(serde_json::json!({"device_tokens":tokens,"integration_internal_id":integration}));
+                    }
+                    Err(_) => {
+                        tx.execute("UPDATE novu_rust_push_step_outcomes SET status='failed',push_job_id=NULL WHERE environment_id=$1 AND push_job_id=$2",&[&environment,&job.id]).await?;
+                        tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='unsupported push message',lease_token=NULL,lease_until=NULL WHERE id=$1",&[&job.id]).await?;
+                        tx.commit().await?;
+                        return Ok(true);
+                    }
+                }
+            }
+        }
         if let (
             Some(subscriber_internal_id),
             Some(notification_internal_id),
@@ -173,33 +278,8 @@ pub async fn process_one(
             &context.transaction_id,
         ) {
             prepared_context = Some(
-                serde_json::json!({"subscriber_id":context.subscriber_id,"subscriber_internal_id":subscriber_internal_id,"notification_internal_id":notification_internal_id,"transaction_id":transaction_id,"workflow_identifier":context.workflow_identifier,"device_tokens":tokens,"title":title,"content":content}),
+                serde_json::json!({"subscriber_id":context.subscriber_id,"subscriber_internal_id":subscriber_internal_id,"notification_internal_id":notification_internal_id,"transaction_id":transaction_id,"workflow_identifier":context.workflow_identifier,"target_metadata":target_metadata,"title":title,"content":content}),
             );
-        }
-        let mut messages = Vec::new();
-        for token in tokens {
-            let message_id: String = tx
-                .query_one("SELECT novu_rust_new_objectid()", &[])
-                .await?
-                .get(0);
-            let mut payload = context.payload.as_object().cloned().unwrap_or_default();
-            payload.insert("__nvMessageId".into(), message_id.into());
-            let candidate = Push {
-                title: title.clone(),
-                content: content.clone(),
-                targets: vec![token],
-                payload,
-                ..Push::default()
-            };
-            match fcm::wire_messages(&fcm::plan(&candidate)) {
-                Ok(mut bodies) => messages.append(&mut bodies),
-                Err(_) => {
-                    tx.execute("UPDATE novu_rust_push_step_outcomes SET status='failed',push_job_id=NULL WHERE environment_id=$1 AND push_job_id=$2",&[&environment,&job.id]).await?;
-                    tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='unsupported push message',lease_token=NULL,lease_until=NULL WHERE id=$1",&[&job.id]).await?;
-                    tx.commit().await?;
-                    return Ok(true);
-                }
-            }
         }
         let updated =
             serde_json::json!({"prepared_messages":messages,"prepared_context":prepared_context});
@@ -256,9 +336,36 @@ pub async fn process_one(
         return Ok(true);
     };
     let index_i32 = index as i32;
+    let target_metadata = prepared_context.as_ref().map(|context| {
+        context
+            .get("target_metadata")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|targets| targets.get(index))
+            .unwrap_or(context)
+    });
+    let integration_id = target_metadata
+        .and_then(|meta| meta.get("integration_internal_id"))
+        .and_then(serde_json::Value::as_str);
+    let selected_provider = if let Some(providers) = providers {
+        integration_id.and_then(|id| providers.get(id))
+    } else {
+        default_provider
+    };
+    let Some(selected_provider) = selected_provider else {
+        tx.rollback().await?;
+        crate::fail(
+            client,
+            job.id,
+            job.lease_token,
+            "push integration credentials not configured",
+        )
+        .await?;
+        return Ok(true);
+    };
     if let Some(context) = prepared_context.as_ref() {
         let string = |key: &str| context.get(key).and_then(serde_json::Value::as_str);
-        let tokens = context
+        let tokens = target_metadata
+            .unwrap_or(context)
             .get("device_tokens")
             .and_then(serde_json::Value::as_array)
             .and_then(|a| {
@@ -310,14 +417,20 @@ pub async fn process_one(
     }
     tx.execute("INSERT INTO novu_rust_fcm_attempts(job_id,environment_id,target_index,state) VALUES ($1,$2,$3,'dispatching')",&[&job.id,&environment,&index_i32]).await?;
     tx.commit().await?;
-    let (state, status, id) = match provider.send_wire(&messages[index]).await {
+    let result = selected_provider.send_wire(&messages[index]).await;
+    let invalid_token = matches!(result, Err(SendError::InvalidDeviceToken(_)));
+    let (state, status, id) = match result {
         Ok(id) => (
             "accepted",
             None,
             Some(id.chars().take(1024).collect::<String>()),
         ),
-        Err(SendError::Provider(code)) if code >= 500 => ("unknown", Some(i32::from(code)), None),
-        Err(SendError::Provider(code)) => ("rejected", Some(i32::from(code)), None),
+        Err(SendError::Provider(code) | SendError::InvalidDeviceToken(code)) if code >= 500 => {
+            ("unknown", Some(i32::from(code)), None)
+        }
+        Err(SendError::Provider(code) | SendError::InvalidDeviceToken(code)) => {
+            ("rejected", Some(i32::from(code)), None)
+        }
         Err(SendError::Transport | SendError::InvalidResponse) => ("unknown", None, None),
         Err(_) => ("rejected", None, None),
     };
@@ -328,6 +441,32 @@ pub async fn process_one(
     }
     let updated=tx.execute("UPDATE novu_rust_fcm_attempts SET state=$4,http_status=$5,provider_message_id=$6,updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$2 AND target_index=$3 AND state='dispatching'",&[&job.id,&environment,&index_i32,&state,&status,&id]).await?;
     if updated == 1 {
+        if invalid_token
+            && std::env::var("IS_EXPIRED_TOKENS_REMOVAL_ENABLED").as_deref() == Ok("true")
+        {
+            if let (Some(context), Some(token)) = (
+                prepared_context.as_ref(),
+                messages[index]
+                    .pointer("/message/token")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|v| !v.is_empty()),
+            ) {
+                if let (Some(subscriber_id), Some(internal_id), Some(integration_id)) = (
+                    context
+                        .get("subscriber_id")
+                        .and_then(serde_json::Value::as_str),
+                    context
+                        .get("subscriber_internal_id")
+                        .and_then(serde_json::Value::as_str),
+                    target_metadata
+                        .unwrap_or(context)
+                        .get("integration_internal_id")
+                        .and_then(serde_json::Value::as_str),
+                ) {
+                    tx.execute("WITH target AS MATERIALIZED (SELECT environment_id,subscriber_id FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2 AND internal_id=$3 FOR UPDATE), removed AS (UPDATE novu_rust_fcm_devices d SET device_tokens=array_remove(d.device_tokens,$5) FROM target WHERE d.environment_id=target.environment_id AND d.subscriber_id=target.subscriber_id AND d.integration_internal_id=$4 RETURNING 1) UPDATE novu_rust_subscribers s SET updated_at=now() FROM target WHERE s.environment_id=target.environment_id AND s.subscriber_id=target.subscriber_id AND EXISTS(SELECT 1 FROM removed)",&[&environment,&subscriber_id,&internal_id,&integration_id,&token]).await?;
+                }
+            }
+        }
         if prepared_context.is_some() {
             let diagnostic = if state == "accepted" {
                 None
@@ -393,6 +532,7 @@ mod tests {
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
             let mut captures = Vec::new();
+            let mut authorizations = Vec::new();
             if count == 0 {
                 assert!(
                     tokio::time::timeout(Duration::from_secs(1), listener.accept())
@@ -424,6 +564,18 @@ mod tests {
                             })
                             .unwrap();
                         if buf.len() >= pos + 4 + len {
+                            authorizations.push(
+                                headers
+                                    .lines()
+                                    .find_map(|line| {
+                                        line.split_once(':')
+                                            .filter(|(name, _)| {
+                                                name.eq_ignore_ascii_case("authorization")
+                                            })
+                                            .map(|(_, value)| value.trim().to_owned())
+                                    })
+                                    .unwrap(),
+                            );
                             captures.push(
                                 serde_json::from_slice::<serde_json::Value>(
                                     &buf[pos + 4..pos + 4 + len],
@@ -434,10 +586,39 @@ mod tests {
                         }
                     }
                 }
-                let body = r#"{"name":"projects/demo/messages/123"}"#;
-                let status =
-                    std::env::var("TEST_PUSH_HTTP_STATUS").unwrap_or_else(|_| "200".into());
-                assert!(status == "200" || status == "429");
+                let status = if let Ok(invalid_target) = std::env::var("TEST_PUSH_INVALID_TARGET") {
+                    if captures
+                        .last()
+                        .and_then(|v| v.pointer("/message/token"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(invalid_target.as_str())
+                    {
+                        "404".into()
+                    } else {
+                        "200".into()
+                    }
+                } else {
+                    std::env::var("TEST_PUSH_HTTP_STATUS").unwrap_or_else(|_| "200".into())
+                };
+                assert!(status == "200" || status == "429" || status == "404");
+                let body = std::env::var("TEST_PUSH_ERROR_BODY").unwrap_or_else(|_| {
+                    if status == "404" {
+                        r#"{"error":{"message":"Requested entity was not found."}}"#.into()
+                    } else {
+                        r#"{"name":"projects/demo/messages/123"}"#.into()
+                    }
+                });
+                if let Ok(directory) = std::env::var("TEST_PUSH_BARRIER_DIR") {
+                    let directory = std::path::Path::new(&directory);
+                    std::fs::write(directory.join("ready"), b"ready").unwrap();
+                    tokio::time::timeout(Duration::from_secs(12), async {
+                        while !directory.join("release").exists() {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                    })
+                    .await
+                    .expect("push test barrier timed out");
+                }
                 socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
             }
             std::fs::write(
@@ -445,14 +626,27 @@ mod tests {
                 serde_json::to_vec(&captures).unwrap(),
             )
             .unwrap();
+            if let Ok(path) = std::env::var("TEST_PUSH_AUTH_CAPTURE_PATH") {
+                std::fs::write(path, serde_json::to_vec(&authorizations).unwrap()).unwrap();
+            }
         });
         let provider = Fcm::with_origin("demo", "fixture".into(), &origin).unwrap();
+        let integrations: Option<HashMap<String, Fcm>> =
+            std::env::var("TEST_PUSH_INTEGRATIONS").ok().map(|raw| {
+                let tokens: HashMap<String, String> = serde_json::from_str(&raw).unwrap();
+                tokens
+                    .into_iter()
+                    .map(|(id, token)| (id, Fcm::with_origin("demo", token, &origin).unwrap()))
+                    .collect()
+            });
         for _ in 0..count.max(1) {
-            assert!(
-                process_one(&mut db, "64a000000000000000000002", &provider)
+            let processed = if let Some(integrations) = integrations.as_ref() {
+                process_one_with_integrations(&mut db, "64a000000000000000000002", integrations)
                     .await
-                    .unwrap()
-            );
+            } else {
+                process_one(&mut db, "64a000000000000000000002", &provider).await
+            };
+            assert!(processed.unwrap());
         }
         server.await.unwrap();
     }

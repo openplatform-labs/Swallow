@@ -67,12 +67,12 @@ pub fn verify(token: &str, secret: &[u8], now: u64) -> Option<Claims> {
         return None;
     }
     if let Some(exp) = payload.get("exp")
-        && exp.as_u64().is_none_or(|exp| now >= exp)
+        && exp.as_f64().is_none_or(|exp| now as f64 >= exp)
     {
         return None;
     }
     if let Some(nbf) = payload.get("nbf")
-        && nbf.as_u64().is_none_or(|nbf| now < nbf)
+        && nbf.as_f64().is_none_or(|nbf| (now as f64) < nbf)
     {
         return None;
     }

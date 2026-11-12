@@ -207,11 +207,31 @@ pub async fn list(
             }
         }
     }
+    // Fetch page credentials in one environment-scoped query, rather than one
+    // lookup for every subscriber. Legacy rows without an integration identity
+    // are omitted consistently with the individual subscriber response.
+    let subscriber_ids: Vec<String> = rows.iter().map(|row| row.get(5)).collect();
+    let mut channels = HashMap::new();
+    if !subscriber_ids.is_empty() {
+        let credential_rows = match db.query("SELECT subscriber_id,integration_internal_id,device_tokens FROM novu_rust_fcm_devices WHERE environment_id=$1 AND subscriber_id=ANY($2) AND integration_internal_id IS NOT NULL ORDER BY channel_order", &[&env, &subscriber_ids]).await {
+            Ok(rows) => rows,
+            Err(_) => return internal(&path),
+        };
+        for row in credential_rows {
+            channels.entry(row.get::<_, String>(0)).or_insert_with(Vec::new).push(
+                json!({"providerId":"fcm","_integrationId":row.get::<_,String>(1),"credentials":{"deviceTokens":row.get::<_,Vec<String>>(2)}}),
+            );
+        }
+    }
     let data: Vec<_> = rows
         .into_iter()
         .map(|row| {
             let id: String = row.get(5);
-            subscriber_response(row, &id, &env, false).1.0["data"].clone()
+            let mut data = subscriber_response(row, &id, &env, false).1.0["data"].clone();
+            if let Some(value) = channels.remove(&id) {
+                data["channels"] = json!(value);
+            }
+            data
         })
         .collect();
     Json(json!({"data":data,"next":next,"previous":previous,"totalCount":count.min(50000),"totalCountCapped":count>50000})).into_response()

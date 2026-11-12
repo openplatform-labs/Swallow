@@ -490,6 +490,33 @@ async fn trigger_api_contract_inner() {
     db.batch_execute(novu_postgres_queue::in_app::PUSH_MESSAGES_MIGRATION)
         .await
         .unwrap();
+    db.batch_execute(novu_postgres_queue::in_app::MESSAGE_SUBSCRIBER_CLEANUP_INDEXES_MIGRATION)
+        .await
+        .unwrap();
+    db.batch_execute("INSERT INTO novu_rust_notifications(internal_id,job_id,environment_id,subscriber_id,subscriber_internal_id,workflow_identifier,transaction_id,recipient,payload,channels,tags,severity,critical) VALUES ('old-notification','00000000-0000-4000-8000-000000000098','legacy-env','legacy','previous-id','legacy','old','{}','{}','{}','[]','none',false); INSERT INTO novu_rust_in_app_messages(id,environment_id,subscriber_id,workflow_identifier,transaction_id,content,payload,notification_internal_id) VALUES ('00000000-0000-4000-8000-000000000098','legacy-env','legacy','legacy','old','x','{}','old-notification')").await.unwrap();
+    db.batch_execute(novu_postgres_queue::in_app::IN_APP_SUBSCRIBER_IDENTITY_MIGRATION)
+        .await
+        .unwrap();
+    db.batch_execute("INSERT INTO novu_rust_fcm_integrations(environment_id,internal_id,identifier) VALUES ('legacy-env','legacy-integration','legacy-fcm'); INSERT INTO novu_rust_fcm_devices(environment_id,subscriber_id,integration_internal_id,device_tokens) VALUES ('legacy-env','legacy','legacy-integration',ARRAY['legacy-token'])").await.unwrap();
+    db.batch_execute(novu_postgres_queue::in_app::MULTIPLE_FCM_CHANNELS_MIGRATION)
+        .await
+        .unwrap();
+    db.batch_execute(novu_postgres_queue::in_app::MULTIPLE_FCM_CHANNELS_MIGRATION)
+        .await
+        .unwrap();
+    let legacy_fcm: Vec<String> = db.query_one("SELECT device_tokens FROM novu_rust_fcm_devices WHERE environment_id='legacy-env' AND subscriber_id='legacy' AND integration_internal_id='legacy-integration'",&[]).await.unwrap().get(0);
+    assert_eq!(legacy_fcm, vec!["legacy-token"]);
+    db.batch_execute(novu_postgres_queue::in_app::IN_APP_SUBSCRIBER_IDENTITY_MIGRATION)
+        .await
+        .unwrap();
+    let legacy_identities: Vec<String> = db.query_one("SELECT array_agg(subscriber_internal_id ORDER BY transaction_id) FROM novu_rust_in_app_messages WHERE environment_id='legacy-env' AND subscriber_id='legacy'",&[]).await.unwrap().get(0);
+    assert_eq!(legacy_identities, vec!["legacy-id", "previous-id"]);
+    db.execute(
+        "DELETE FROM novu_rust_in_app_messages WHERE id='00000000-0000-4000-8000-000000000098'",
+        &[],
+    )
+    .await
+    .unwrap();
     let old = db.query_one("SELECT internal_id,identifier,updated_at=created_at FROM novu_rust_topic_subscribers WHERE environment_id='legacy-env'", &[]).await.unwrap();
     let old_id: String = old.get(0);
     assert_eq!(old_id.len(), 24);
@@ -2603,6 +2630,7 @@ async fn trigger_api_contract_inner() {
     let before: i64 = worker.query_one("SELECT count(*) FROM novu_rust_in_app_messages WHERE environment_id = 'env-a' AND subscriber_id = 'carol'", &[]).await.unwrap().get(0);
     assert!(before > 0);
     worker.execute("INSERT INTO novu_rust_subscription_preferences(environment_id,subscriber_internal_id,subscription_internal_id,workflow_internal_id,preferences) SELECT environment_id,internal_id,'orphan','workflow','{}'::jsonb FROM novu_rust_subscribers WHERE environment_id='env-a' AND subscriber_id='carol'", &[]).await.unwrap();
+    worker.batch_execute("INSERT INTO novu_rust_email_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,subject,status) SELECT 'rollback-email',environment_id,subscriber_id,internal_id,'n','w','delete-rollback','subject','sent' FROM novu_rust_subscribers WHERE environment_id='env-a' AND subscriber_id='carol'; INSERT INTO novu_rust_sms_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,status) SELECT 'rollback-sms',environment_id,subscriber_id,internal_id,'n','w','delete-rollback','sent' FROM novu_rust_subscribers WHERE environment_id='env-a' AND subscriber_id='carol'; INSERT INTO novu_rust_push_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,device_tokens,title,status,push_job_id,target_index) SELECT 'rollback-push',s.environment_id,s.subscriber_id,s.internal_id,'n','w','delete-rollback','{}','title','sent',q.id,98765 FROM novu_rust_subscribers s CROSS JOIN LATERAL (SELECT id FROM novu_queue_jobs WHERE environment_id='env-a' LIMIT 1) q WHERE s.environment_id='env-a' AND s.subscriber_id='carol'").await.unwrap();
     // A dependent FK forces the final delete to fail; all related deletions must roll back.
     worker.batch_execute("CREATE TABLE delete_test_blocker (environment_id text NOT NULL, subscriber_id text NOT NULL, FOREIGN KEY (environment_id, subscriber_id) REFERENCES novu_rust_subscribers(environment_id, subscriber_id)); INSERT INTO delete_test_blocker VALUES ('env-a', 'carol')").await.unwrap();
     let (status, _) = delete_subscriber(app.clone(), Some("ApiKey test-key"), "carol").await;
@@ -2611,6 +2639,8 @@ async fn trigger_api_contract_inner() {
     assert_eq!(before, after);
     let preferences: i64 = worker.query_one("SELECT count(*) FROM novu_rust_subscription_preferences WHERE environment_id='env-a' AND subscription_internal_id='orphan'", &[]).await.unwrap().get(0);
     assert_eq!(preferences, 1);
+    let channel_history: i64 = worker.query_one("SELECT (SELECT count(*) FROM novu_rust_email_messages WHERE transaction_id='delete-rollback')+(SELECT count(*) FROM novu_rust_sms_messages WHERE transaction_id='delete-rollback')+(SELECT count(*) FROM novu_rust_push_messages WHERE transaction_id='delete-rollback')",&[]).await.unwrap().get(0);
+    assert_eq!(channel_history, 3);
     worker
         .batch_execute("DROP TABLE delete_test_blocker")
         .await
@@ -2629,6 +2659,8 @@ async fn trigger_api_contract_inner() {
     assert_eq!(after, 0);
     let preferences: i64 = worker.query_one("SELECT count(*) FROM novu_rust_subscription_preferences WHERE environment_id='env-a' AND subscription_internal_id='orphan'", &[]).await.unwrap().get(0);
     assert_eq!(preferences, 0);
+    let channel_history: i64 = worker.query_one("SELECT (SELECT count(*) FROM novu_rust_email_messages WHERE transaction_id='delete-rollback')+(SELECT count(*) FROM novu_rust_sms_messages WHERE transaction_id='delete-rollback')+(SELECT count(*) FROM novu_rust_push_messages WHERE transaction_id='delete-rollback')",&[]).await.unwrap().get(0);
+    assert_eq!(channel_history, 0);
     let (status, response) = delete_subscriber(app.clone(), Some("ApiKey test-key"), "carol").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(response["message"], "Subscriber was not found");
@@ -4343,6 +4375,17 @@ async fn fcm_credentials_contract(app: axum::Router, db: &mut tokio_postgres::Cl
     let (status, _) =
         inbox_mutate(app.clone(), "PUT", path, Some("ApiKey test-key"), initial).await;
     assert_eq!(status, StatusCode::OK);
+    db.execute("UPDATE novu_rust_subscribers SET updated_at='2000-01-01T00:00:00Z' WHERE environment_id='env-a' AND subscriber_id='fcm-concurrent'", &[]).await.unwrap();
+    let (status, same) = inbox_mutate(
+        app.clone(),
+        "PUT",
+        path,
+        Some("ApiKey test-key"),
+        json!({"providerId":"fcm","credentials":{"deviceTokens":["initial","initial"]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(same["data"]["updatedAt"], "2000-01-01T00:00:00.000Z");
     let (second, driver) =
         tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(), NoTls)
             .await
@@ -4353,7 +4396,13 @@ async fn fcm_credentials_contract(app: axum::Router, db: &mut tokio_postgres::Cl
     let two = json!({"providerId":"fcm","credentials":{"deviceTokens":["two"]}});
     let (a, b) = tokio::join!(
         inbox_mutate(app.clone(), "PATCH", path, Some("ApiKey test-key"), one),
-        inbox_mutate(second_app, "PATCH", path, Some("ApiKey test-key"), two)
+        inbox_mutate(
+            second_app.clone(),
+            "PATCH",
+            path,
+            Some("ApiKey test-key"),
+            two
+        )
     );
     assert_eq!(a.0, StatusCode::OK);
     assert_eq!(b.0, StatusCode::OK);
@@ -4362,8 +4411,19 @@ async fn fcm_credentials_contract(app: axum::Router, db: &mut tokio_postgres::Cl
     for token in ["initial", "one", "two"] {
         assert!(tokens.iter().any(|v| v == token));
     }
+    db.execute("UPDATE novu_rust_subscribers SET updated_at='2000-01-01T00:00:00Z' WHERE environment_id='env-a' AND subscriber_id='fcm-concurrent'", &[]).await.unwrap();
+    let (status, subset) = inbox_mutate(
+        app.clone(),
+        "PATCH",
+        path,
+        Some("ApiKey test-key"),
+        json!({"providerId":"fcm","credentials":{"deviceTokens":["initial"]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(subset["data"]["updatedAt"], "2000-01-01T00:00:00.000Z");
     let overflow: Vec<String> = (0..101).map(|i| format!("device-{i}")).collect();
-    let (status, _) = inbox_mutate(
+    let (status, overflow_body) = inbox_mutate(
         app.clone(),
         "PUT",
         path,
@@ -4372,8 +4432,53 @@ async fn fcm_credentials_contract(app: axum::Router, db: &mut tokio_postgres::Cl
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(overflow_body["currentCount"], 101);
+    assert_eq!(overflow_body["limit"], 100);
+    assert_eq!(
+        overflow_body["ctx"],
+        json!({"currentCount":101,"limit":100})
+    );
     let after:Vec<String>=db.query_one("SELECT device_tokens FROM novu_rust_fcm_devices WHERE environment_id='env-a' AND subscriber_id='fcm-concurrent'",&[]).await.unwrap().get(0);
     assert_eq!(tokens, after);
+    for _ in 0..2 {
+        db.execute("UPDATE novu_rust_subscribers SET updated_at='2000-01-01T00:00:00Z' WHERE environment_id='env-a' AND subscriber_id='fcm-concurrent'", &[]).await.unwrap();
+        let (status, body) = inbox_mutate(
+            app.clone(),
+            "DELETE",
+            "/v1/subscribers/fcm-concurrent/credentials/fcm",
+            Some("ApiKey test-key"),
+            json!({}),
+        )
+        .await;
+        assert_eq!((status, body), (StatusCode::NO_CONTENT, Value::Null));
+        let touched: bool = db.query_one("SELECT updated_at > '2000-01-01T00:00:00Z'::timestamptz FROM novu_rust_subscribers WHERE environment_id='env-a' AND subscriber_id='fcm-concurrent'", &[]).await.unwrap().get(0);
+        assert!(touched);
+    }
+    db.batch_execute("INSERT INTO novu_rust_fcm_integrations(environment_id,internal_id,identifier) VALUES ('env-a','integration-second','fcm-second'); INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES ('env-a','fcm-multiple-race',novu_rust_new_objectid(),'{}')").await.unwrap();
+    let multi_path = "/v1/subscribers/fcm-multiple-race/credentials";
+    let (first, second) = tokio::join!(
+        inbox_mutate(
+            app.clone(),
+            "PUT",
+            multi_path,
+            Some("ApiKey test-key"),
+            json!({"providerId":"fcm","integrationIdentifier":"fcm-test","credentials":{"deviceTokens":["token-a"]}})
+        ),
+        inbox_mutate(
+            second_app,
+            "PUT",
+            multi_path,
+            Some("ApiKey test-key"),
+            json!({"providerId":"fcm","integrationIdentifier":"fcm-second","credentials":{"deviceTokens":["token-b"]}})
+        )
+    );
+    assert_eq!((first.0, second.0), (StatusCode::OK, StatusCode::OK));
+    let rows=db.query("SELECT integration_internal_id,device_tokens FROM novu_rust_fcm_devices WHERE environment_id='env-a' AND subscriber_id='fcm-multiple-race' ORDER BY integration_internal_id",&[]).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, String>(0), "integration-second");
+    assert_eq!(rows[0].get::<_, Vec<String>>(1), vec!["token-b"]);
+    assert_eq!(rows[1].get::<_, String>(0), "integration-test");
+    assert_eq!(rows[1].get::<_, Vec<String>>(1), vec!["token-a"]);
     let (status, _) = inbox_mutate(
         app,
         "DELETE",

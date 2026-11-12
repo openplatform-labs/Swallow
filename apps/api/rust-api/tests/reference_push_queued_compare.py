@@ -103,3 +103,58 @@ for label,subscriber in cases:
         assert not captured and not rust_requests and rust['status']=='failed' and rust['outcome']=='failed' and rust['messages']==0,(label,ref,rust)
         assert any(j['status']=='failed' for j in ref['jobs']),ref
     print(label+': selected queued push behavior matched')
+
+# Integration selection is evaluated after the channel job has been created.
+# Use direct fixture changes on both databases: integration management is not
+# implemented in Rust and the reference repository reads these records at send.
+for label in ('integration_inactive','integration_deleted','integration_replaced','integration_reactivated','inactive_empty_tokens'):
+    subscriber='push-'+label+'-'+uuid.uuid4().hex
+    queue_action('pause')
+    try:
+        for base in bases:
+            assert request(base,'POST','/v2/subscribers',{'subscriberId':subscriber,'firstName':'Before'})[0]==201
+            assert set_tokens(base,subscriber,[] if label=='inactive_empty_tokens' else ['integration-token'])==200
+            assert request(base,'POST','/v1/events/trigger',{'name':'push-queued','to':subscriber,'transactionId':subscriber})[0]==201
+        for _ in range(90):
+            ref_count=int(mq(f'print(db.getSiblingDB("novu-db").jobs.countDocuments({{transactionId:"{subscriber}",type:"push"}}))'))
+            job=pq(f"SELECT push_job_id FROM novu_rust_push_step_outcomes WHERE transaction_id='{subscriber}' AND status='queued'")
+            if ref_count==1 and job:break
+            time.sleep(.5)
+        assert ref_count==1 and job,(label,ref_count,job)
+        pq(f"UPDATE novu_queue_jobs SET available_at=now()+interval '1 hour' WHERE id='{job}'")
+        if label in ('integration_inactive','inactive_empty_tokens','integration_reactivated'):
+            mq('db.getSiblingDB("novu-db").integrations.updateOne({_id:ObjectId("64a000000000000000000053")},{$set:{active:false}})')
+            pq("UPDATE novu_rust_fcm_integrations SET active=false WHERE environment_id='64a000000000000000000002'")
+            if label=='integration_reactivated':
+                mq('db.getSiblingDB("novu-db").integrations.updateOne({_id:ObjectId("64a000000000000000000053")},{$set:{active:true}})')
+                pq("UPDATE novu_rust_fcm_integrations SET active=true WHERE environment_id='64a000000000000000000002'")
+        else:
+            mq('''const d=db.getSiblingDB("novu-db"),i=d.integrations.findOne({_id:ObjectId("64a000000000000000000053")});d.integrations.deleteOne({_id:i._id});if('''+('true' if label=='integration_replaced' else 'false')+'''){i._id=ObjectId("64a000000000000000000054");d.integrations.insertOne(i)}''')
+            if label=='integration_replaced':pq("UPDATE novu_rust_fcm_integrations SET internal_id='64a000000000000000000054' WHERE environment_id='64a000000000000000000002'")
+            else:pq("DELETE FROM novu_rust_fcm_integrations WHERE environment_id='64a000000000000000000002'")
+    finally:queue_action('resume')
+    try:
+        for _ in range(90):
+            ref=json.loads(mq(f'''const d=db.getSiblingDB("novu-db");print(JSON.stringify({{jobs:d.jobs.find({{transactionId:"{subscriber}",type:"push"}}).toArray().map(j=>({{status:j.status,detail:j.deliveryLifecycleState?.detail}})),messages:d.messages.countDocuments({{transactionId:"{subscriber}"}})}}));'''))
+            if ref['jobs'] and all(j['status'] in ('completed','skipped','canceled','failed') for j in ref['jobs']):break
+            time.sleep(.5)
+        assert ref['jobs'] and all(j['status'] in ('completed','skipped','canceled','failed') for j in ref['jobs']),(label,ref)
+        should_send=label=='integration_reactivated'
+        pq(f"UPDATE novu_queue_jobs SET available_at=now() WHERE id='{job}'")
+        with tempfile.TemporaryDirectory(prefix='novu-push-integration-') as directory:
+            capture=Path(directory)/'capture.json'
+            subprocess.run(['cargo','test','--locked','--offline','--lib','capture_reference_workflow_push','--','--ignored'],cwd=Path(__file__).resolve().parents[3]/'worker'/'rust-queue',env=dict(os.environ,TEST_PUSH_CAPTURE_PATH=str(capture),TEST_PUSH_EXPECTED_COUNT='1' if should_send else '0'),check=True)
+            rust_requests=json.loads(capture.read_text())
+        rust=json.loads(pq(f"SELECT json_build_object('status',q.status,'outcome',o.status,'messages',(SELECT count(*) FROM novu_rust_push_messages m WHERE m.environment_id=q.environment_id AND m.transaction_id='{subscriber}'))::text FROM novu_queue_jobs q JOIN novu_rust_push_step_outcomes o ON o.environment_id=q.environment_id AND o.transaction_id='{subscriber}' WHERE q.id='{job}'"))
+        log=subprocess.run(['docker','exec',worker,'cat','/tmp/novu-push-capture.jsonl'],capture_output=True,text=True).stdout.splitlines()
+        captured=[m for m in map(json.loads,log) if subscriber in m.get('notification',{}).get('body','')]
+        expected='completed' if should_send else 'canceled' if label=='inactive_empty_tokens' else 'failed'
+        assert ref['jobs'][0]['status']==expected,(label,ref)
+        assert len(captured)==len(rust_requests)==(1 if should_send else 0),(label,ref,rust,captured,rust_requests)
+        assert ref['messages']==rust['messages']==(1 if should_send else 0),(label,ref,rust)
+        assert rust['status']==('cancelled' if label=='inactive_empty_tokens' else expected),(label,ref,rust)
+        assert rust['outcome']==('queued' if should_send else 'missing_device' if label=='inactive_empty_tokens' else 'failed'),(label,ref,rust)
+        print(label+': selected integration behavior matched')
+    finally:
+        mq('''const d=db.getSiblingDB("novu-db");d.integrations.deleteMany({_id:{$in:[ObjectId("64a000000000000000000053"),ObjectId("64a000000000000000000054")]}});d.integrations.insertOne({_id:ObjectId("64a000000000000000000053"),_environmentId:ObjectId("64a000000000000000000002"),_organizationId:ObjectId("64a000000000000000000003"),providerId:"fcm",channel:"push",active:true,primary:true,credentials:{serviceAccount:JSON.stringify({project_id:"demo",client_email:"fixture@example.test",private_key:"fixture"})},deleted:false});''')
+        pq("DELETE FROM novu_rust_fcm_integrations WHERE environment_id='64a000000000000000000002'; INSERT INTO novu_rust_fcm_integrations(environment_id,internal_id,identifier,active) VALUES ('64a000000000000000000002','64a000000000000000000053','fixture-fcm',true)")
