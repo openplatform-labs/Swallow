@@ -70,6 +70,8 @@ API 마이그레이션 `0004_sendgrid_webhooks.sql`은 환경별 SendGrid 공개
 
 ## 수행한 검증
 
+- 2026-11-12 기준 코드에서 Docker의 원본 API·워커와 Rust API·워커를 다시 실행해 대기 중 발송을 비교했다. SendGrid 11개, Twilio 10개, FCM 16개 선택 사례에서 모의 provider 요청과 관련 상태가 각 스크립트의 검증 범위 내에서 일치했다. 세 비교는 `NOVU_ALLOW_RECREATED_SUBSCRIBER=true` 호환 모드이며, 실제 provider 발송과 전체 채널·장애 정책을 검증하지 않는다. 별도 actor 삭제·재생성의 원본과 기본 안전 모드 차이는 위에 기록했다. [이메일](apps/api/rust-api/tests/reference_email_queued_compare.py), [SMS](apps/api/rust-api/tests/reference_sms_queued_compare.py), [푸시](apps/api/rust-api/tests/reference_push_queued_compare.py).
+
 - Rust 컴파일·포맷·Clippy 및 제한된 단위 테스트.
 - 일회용 Docker PostgreSQL 17에서 큐와 API → 작업 → 인앱 메시지 저장의 통합 테스트. 트랜잭션 롤백, 작업 선점, 만료·복구, 토큰 기반 완료, 예약·취소, 일부 동시 요청, 환경 범위의 API 키 인증을 다뤘다.
 - 같은 PostgreSQL 테스트에서 구독자 조회, 존재하지 않는 구독자, 인증 누락, 다른 환경의 구독자 격리를 확인했다. 기준 커밋의 원본 API와 Rust API에 동일한 격리 fixture를 넣어 조회 성공·없는 구독자·인증 누락·잘못된 키 4개 HTTP 응답을 비교했고 모두 일치했다. 오류 시각은 형식만 검증했다. [비교 스크립트](apps/api/rust-api/tests/reference_subscriber_compare.py). 이메일 등 다른 속성이나 실제 채널·온라인 상태는 비교하지 않았다.
@@ -316,7 +318,7 @@ API 마이그레이션 `0004_sendgrid_webhooks.sql`은 환경별 SendGrid 공개
 
 - [0040 이메일 재확인 마이그레이션](apps/worker/rust-queue/migrations/0040_experimental_email_revalidation.sql)은 이메일 단계 실패 상태를 추가한다. 새 형식 이메일 작업은 발송 직전 동일 환경·외부 구독자 ID와 현재 이메일 설정을 잠금 아래 확인한다. 이메일·이름 등 프로필이 바뀌면 이를 반영해 제목·HTML과 수신자를 다시 만든다. 수신 설정이 꺼지면 대기 요청을 취소하고, 구독자가 없으면 작업은 실패한다. 같은 외부 ID의 재생성 구독자는 기본 안전 모드에서 거절하고, 호환 모드에서는 원본처럼 새 프로필을 사용한다. [원본 종단 간 비교](apps/api/rust-api/tests/reference_email_queued_compare.py)는 원본 표준 큐를 멈춰 작업 생성 후 이메일 변경·수신 거부·삭제·수신 거부 해제·주소 추가를 적용하고 실제 워커를 재개해 요청과 선택된 결과를 비교했다. 외부 ID 재생성의 검증 범위는 아래 재생성 비교를 참고한다. 최초 처리 시 수신 거부되었거나 주소가 없어도 이메일 단계 작업을 생성하며 발송 전 설정 해제와 주소 추가를 반영한다. 단계 및 토픽 설정의 대기 중 변경과 발송 시작 후 변경, 더 복잡한 설정과 모든 오류 경계는 미구현 또는 미검증이다. 큐에는 렌더링 전 템플릿과 payload·context·설정이 추가로 저장된다. 발송 전 구독자·설정 조회와 잠금, 메시지 삽입 및 템플릿 렌더링이 추가된다.
 
-- 이메일 작업은 발송 시점에 같은 환경의 actor 프로필과 context 키를 다시 조회해 템플릿을 렌더링한다. [원본 대기 작업 비교](apps/api/rust-api/tests/reference_email_queued_compare.py)는 작업 생성 후 actor 이름과 context 데이터를 변경하고 원본·Rust 워커의 모의 SendGrid 요청이 일치함을 확인했다. context 키가 없는 이전 형식의 이메일 작업은 저장된 스냅샷을 사용한다. actor·context 삭제와 재생성, 동시 변경 및 모든 표현식은 미검증이다. actor가 별도 구독자인 경우 발송당 조회 1회, context 키가 있는 경우 조회 1회가 추가된다.
+- 이메일 작업은 발송 시점에 같은 환경의 actor 프로필과 context 키를 다시 조회해 템플릿을 렌더링한다. [원본 대기 작업 비교](apps/api/rust-api/tests/reference_email_queued_compare.py)는 작업 생성 후 actor 이름과 context 데이터를 변경하고 원본·Rust 워커의 모의 SendGrid 요청이 일치함을 확인했다. context 키가 없는 이전 형식의 이메일 작업은 저장된 스냅샷을 사용한다. 원본과의 추가 비교에서 별도 actor를 채널 작업 생성 후 삭제·재생성하면 호환 모드에서는 양쪽 모두 새 actor 프로필을 렌더링했다. 기본 안전 모드는 이 상황에서 발송을 실패 처리하므로 원본과 의도적으로 다르다. context 삭제·재생성, 동시 변경 및 모든 표현식은 미검증이다. actor가 별도 구독자인 경우 발송당 조회 1회, context 키가 있는 경우 조회 1회가 추가된다.
 
 - 새 이메일 작업은 채널 발송 시점에 워크플로 존재를 확인하며, 작업 생성 시 내부 ID를 알고 있다면 같은 식별자로 재생성된 다른 워크플로도 구별한다. [원본 대기 작업 비교](apps/api/rust-api/tests/reference_email_queued_compare.py)에서는 이메일 단계 작업 생성 후 템플릿 수정, 워크플로 삭제, 다른 내부 ID로 재생성을 수행했다. 기본 설정의 원본은 생성 당시 템플릿 스냅샷으로 발송했고, 워크플로가 사라지거나 다른 ID로 교체되면 발송하지 않았으며 선택된 결과가 Rust와 일치했다. 원본의 `IS_JOB_STEP_DEDUP_ENABLED` 활성 시 최신 또는 삭제된 템플릿을 복원하는 경로, 워크플로 캐시와 단계 변경, 내부 ID가 없는 실험 설정에서 동일 식별자 재생성은 미검증 또는 미구현이다. 이전 형식 이메일 작업은 존재 확인을 추가하지 않는다. 발송 전 기존 구독자 조회에 환경별 워크플로 존재 확인이 추가된다.
 

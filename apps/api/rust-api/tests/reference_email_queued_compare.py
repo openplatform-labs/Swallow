@@ -31,8 +31,9 @@ d.preferences.insertOne({_environmentId:e,_organizationId:o,_templateId:w,type:"
 pg_query('''INSERT INTO novu_rust_workflows(environment_id,identifier,active,has_steps,email_subject,email_html) VALUES ('64a000000000000000000002','email-queued',true,true,'Hello {{subscriber.firstName}}','<p>{{subscriber.email}}|{{actor.firstName}}|{{context.tenant.data.plan}}</p>');''')
 mongo_query('''const d=db.getSiblingDB("novu-db"),e=ObjectId("64a000000000000000000002"),o=ObjectId("64a000000000000000000003"); for (const [w,m,name] of [["64a000000000000000000041","64a000000000000000000042","email-template-snapshot"],["64a000000000000000000043","64a000000000000000000044","email-workflow-deleted"],["64a000000000000000000045","64a000000000000000000046","email-workflow-recreated"]]) {const wi=ObjectId(w),mi=ObjectId(m);d.messagetemplates.insertOne({_id:mi,_environmentId:e,_organizationId:o,type:"email",active:true,subject:"Original",content:"<p>Original</p>",contentType:"customHtml",deleted:false});d.notificationtemplates.insertOne({_id:wi,_environmentId:e,_organizationId:o,name,active:true,draft:false,critical:false,type:"REGULAR",deleted:false,tags:[],triggers:[{type:"event",identifier:name}],steps:[{active:true,_templateId:mi}],createdAt:new Date(),updatedAt:new Date()});d.preferences.insertOne({_environmentId:e,_organizationId:o,_templateId:wi,type:"WORKFLOW_RESOURCE",preferences:{all:{enabled:true,readOnly:false},channels:{email:{enabled:true}}},deleted:false});}''')
 pg_query('''INSERT INTO novu_rust_workflows(environment_id,identifier,active,has_steps,email_subject,email_html,inbox_metadata) VALUES ('64a000000000000000000002','email-template-snapshot',true,true,'Original','<p>Original</p>','{"id":"64a000000000000000000041"}'),('64a000000000000000000002','email-workflow-deleted',true,true,'Original','<p>Original</p>','{"id":"64a000000000000000000043"}'),('64a000000000000000000002','email-workflow-recreated',true,true,'Original','<p>Original</p>','{"id":"64a000000000000000000045"}');''')
-cases=[('changed','queued-change-'+uuid.uuid4().hex),('disabled','queued-disable-'+uuid.uuid4().hex),('deleted','queued-delete-'+uuid.uuid4().hex),('recreated','queued-recreated-'+uuid.uuid4().hex),('enabled_later','queued-enable-'+uuid.uuid4().hex),('address_added','queued-address-'+uuid.uuid4().hex),('actor_context','queued-variables-'+uuid.uuid4().hex),('template_changed','queued-template-'+uuid.uuid4().hex),('workflow_deleted','queued-workflow-delete-'+uuid.uuid4().hex),('workflow_recreated','queued-workflow-recreated-'+uuid.uuid4().hex)]
+cases=[('changed','queued-change-'+uuid.uuid4().hex),('disabled','queued-disable-'+uuid.uuid4().hex),('deleted','queued-delete-'+uuid.uuid4().hex),('recreated','queued-recreated-'+uuid.uuid4().hex),('enabled_later','queued-enable-'+uuid.uuid4().hex),('address_added','queued-address-'+uuid.uuid4().hex),('actor_context','queued-variables-'+uuid.uuid4().hex),('actor_recreated','queued-actor-recreated-'+uuid.uuid4().hex),('template_changed','queued-template-'+uuid.uuid4().hex),('workflow_deleted','queued-workflow-delete-'+uuid.uuid4().hex),('workflow_recreated','queued-workflow-recreated-'+uuid.uuid4().hex)]
 actor='queued-actor-'+uuid.uuid4().hex
+recreated_actor='queued-actor-recreated-'+uuid.uuid4().hex
 context_id='queued-tenant-'+uuid.uuid4().hex
 queue_action('pause')
 try:
@@ -44,6 +45,7 @@ try:
             if label=='enabled_later': assert request(base,'PATCH','/v2/subscribers/'+subscriber+'/preferences',{'channels':{'email':False}})[0]==200
             event={'name':{'template_changed':'email-template-snapshot','workflow_deleted':'email-workflow-deleted','workflow_recreated':'email-workflow-recreated'}.get(label,'email-queued'),'to':subscriber,'transactionId':subscriber}
             if label=='actor_context': event.update({'actor':{'subscriberId':actor,'firstName':'ActorBefore'},'context':{'tenant':{'id':context_id,'data':{'plan':'basic'}}}})
+            if label=='actor_recreated': event['actor']={'subscriberId':recreated_actor,'firstName':'OriginalActor'}
             assert request(base,'POST','/v1/events/trigger',event)[0]==201
     for label,subscriber in cases:
         for _ in range(90):
@@ -65,6 +67,12 @@ try:
                 status=200
             elif label=='enabled_later': status,_=request(base,'PATCH','/v2/subscribers/'+subscriber+'/preferences',{'channels':{'email':True}})
             elif label=='address_added': status,_=request(base,'PATCH','/v2/subscribers/'+subscriber,{'email':'after@example.test','firstName':'After'})
+            elif label=='actor_recreated':
+                status,_=request(base,'DELETE','/v2/subscribers/'+recreated_actor)
+                assert status==200
+                status,_=request(base,'POST','/v2/subscribers',{'subscriberId':recreated_actor,'firstName':'ReplacementActor'})
+                assert status==201
+                status=200
             elif label=='actor_context':
                 status,_=request(base,'PATCH','/v2/subscribers/'+actor,{'firstName':'ActorAfter'})
                 assert status==200
@@ -88,7 +96,7 @@ for label,subscriber in cases:
         subprocess.run(['cargo','test','--locked','--offline','--lib','capture_reference_workflow_email','--','--ignored'],cwd=Path(__file__).resolve().parents[3]/'worker'/'rust-queue',env=dict(os.environ,TEST_EMAIL_CAPTURE_PATH=str(capture),TEST_EMAIL_ALLOW_NO_REQUEST='1'),check=True)
         rust_request=json.loads(capture.read_text())
     rust=json.loads(pg_query(f"SELECT json_build_object('status',q.status,'outcome',o.status,'messages',(SELECT count(*) FROM novu_rust_email_messages m WHERE m.environment_id=q.environment_id AND m.transaction_id='{subscriber}'))::text FROM novu_queue_jobs q JOIN novu_rust_email_step_outcomes o ON o.transaction_id=q.payload->>'transaction_id' AND o.environment_id=q.environment_id WHERE q.kind='experimental_sendgrid_email' AND q.payload->>'transaction_id'='{subscriber}'"))
-    if label in ('changed','recreated','enabled_later','address_added','actor_context','template_changed'):
+    if label in ('changed','recreated','enabled_later','address_added','actor_context','actor_recreated','template_changed'):
         assert len(captured)==1 and rust_request,(label,ref,captured,rust)
         original=captured[0]
         for message in (original,rust_request):
@@ -101,6 +109,7 @@ for label,subscriber in cases:
             rust_ids=json.loads(pg_query(f"SELECT json_build_object('current',s.internal_id,'job',o.subscriber_internal_id,'message',m.subscriber_internal_id)::text FROM novu_rust_subscribers s JOIN novu_rust_email_step_outcomes o ON o.environment_id=s.environment_id AND o.subscriber_id=s.subscriber_id JOIN novu_rust_email_messages m ON m.environment_id=o.environment_id AND m.transaction_id=o.transaction_id WHERE s.environment_id='64a000000000000000000002' AND o.transaction_id='{subscriber}'"))
             for ids in (identities,rust_ids): assert ids['job']==ids['message'] and ids['current']!=ids['job'],ids
             assert rust_request['personalizations'][0]['to']==[{'email':'new@example.test'}],rust_request
+        if label=='actor_recreated': assert 'ReplacementActor' in rust_request['content'][0]['value'],rust_request
         if label=='actor_context': assert 'ActorAfter|premium' in rust_request['content'][0]['value'],rust_request
         if label=='template_changed': assert rust_request['subject']=='Original' and 'Original' in rust_request['content'][0]['value'],rust_request
         assert rust['status']=='completed' and rust['messages']==1,rust
