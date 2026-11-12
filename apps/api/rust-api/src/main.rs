@@ -1,10 +1,10 @@
 use std::{error::Error, sync::Arc};
-use tokio_postgres::NoTls;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let url = std::env::var("DATABASE_URL")?;
-    let (db, connection) = tokio_postgres::connect(&url, NoTls).await?;
+    let (config, tls) = novu_rust_contracts::postgres::configure(&url)?;
+    let (db, connection) = config.connect(tls).await?;
     tokio::spawn(async move {
         if let Err(error) = connection.await {
             eprintln!("database connection failed: {error}");

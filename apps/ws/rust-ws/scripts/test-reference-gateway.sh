@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Disposable database; compares the pinned gateway code, not the full WS app.
 set -euo pipefail
+export NOVU_POSTGRES_ALLOW_INSECURE=true
 cd "$(dirname "$0")/.."
 reference=${NOVU_REFERENCE_SOURCE:?Set NOVU_REFERENCE_SOURCE to the built reference checkout}
 case "$reference" in /*) ;; *) echo 'NOVU_REFERENCE_SOURCE must be absolute' >&2; exit 2;; esac

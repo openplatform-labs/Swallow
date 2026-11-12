@@ -1,11 +1,11 @@
 //! Experimental static in-app worker; not a Novu-compatible production worker.
 use std::{error::Error, time::Duration};
-use tokio_postgres::NoTls;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let url = std::env::var("DATABASE_URL")?;
-    let (mut db, connection) = tokio_postgres::connect(&url, NoTls).await?;
+    let (config, tls) = novu_rust_contracts::postgres::configure(&url)?;
+    let (mut db, connection) = config.connect(tls).await?;
     tokio::spawn(async move {
         if let Err(error) = connection.await {
             eprintln!("database connection failed: {error}");

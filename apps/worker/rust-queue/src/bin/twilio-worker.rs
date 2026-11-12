@@ -4,7 +4,6 @@ use novu_postgres_queue::{
     twilio_queue,
 };
 use std::{error::Error, time::Duration};
-use tokio_postgres::NoTls;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -25,8 +24,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         from: std::env::var("NOVU_TWILIO_FROM")?,
         region,
     })?;
-    let (mut db, connection) =
-        tokio_postgres::connect(&std::env::var("DATABASE_URL")?, NoTls).await?;
+    let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
+    let (mut db, connection) = config.connect(tls).await?;
     tokio::spawn(async move {
         if connection.await.is_err() {
             eprintln!("sms worker database connection failed");

@@ -2,6 +2,7 @@
 pub mod email;
 pub mod locale;
 pub mod message;
+pub mod postgres;
 pub mod preference;
 pub mod recipients;
 pub mod socket;

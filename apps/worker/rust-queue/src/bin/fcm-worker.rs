@@ -1,7 +1,6 @@
 //! Experimental environment-scoped FCM worker; not a full Novu worker.
 use novu_postgres_queue::{fcm::Fcm, fcm_queue};
 use std::{collections::HashMap, error::Error, time::Duration};
-use tokio_postgres::NoTls;
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,8 +55,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         };
         (Some(provider), None)
     };
-    let (mut db, connection) =
-        tokio_postgres::connect(&std::env::var("DATABASE_URL")?, NoTls).await?;
+    let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
+    let (mut db, connection) = config.connect(tls).await?;
     tokio::spawn(async move {
         if connection.await.is_err() {
             eprintln!("push worker database connection failed");

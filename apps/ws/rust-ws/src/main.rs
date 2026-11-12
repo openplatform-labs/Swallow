@@ -15,17 +15,21 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex, MutexGuard, mpsc};
-use tokio_postgres::{AsyncMessage, Client, NoTls};
+use tokio_postgres::{AsyncMessage, Client};
 use uuid::Uuid;
 
 struct Database {
     config: tokio_postgres::Config,
+    tls: novu_rust_contracts::postgres::MakeRustlsConnect,
     client: Mutex<Client>,
 }
 
 impl Database {
-    async fn connect(config: &tokio_postgres::Config) -> Result<Client, tokio_postgres::Error> {
-        let (client, connection) = config.connect(NoTls).await?;
+    async fn connect(
+        config: &tokio_postgres::Config,
+        tls: &novu_rust_contracts::postgres::MakeRustlsConnect,
+    ) -> Result<Client, tokio_postgres::Error> {
+        let (client, connection) = config.connect(tls.clone()).await?;
         tokio::spawn(async move {
             if let Err(error) = connection.await {
                 eprintln!("database connection failed: {error}");
@@ -37,7 +41,7 @@ impl Database {
     async fn lock(&self) -> Result<MutexGuard<'_, Client>, tokio_postgres::Error> {
         let mut client = self.client.lock().await;
         if client.is_closed() {
-            *client = Self::connect(&self.config).await?;
+            *client = Self::connect(&self.config, &self.tls).await?;
         }
         Ok(client)
     }
@@ -300,10 +304,10 @@ async fn retry_disconnect(db: Arc<Database>, id: Uuid, claims: Claims, update_pr
 async fn start_event_listener(
     database_url: &str,
     event_tx: mpsc::Sender<Uuid>,
-) -> Result<(Client, tokio::task::JoinHandle<()>), tokio_postgres::Error> {
-    let mut config: tokio_postgres::Config = database_url.parse()?;
+) -> Result<(Client, tokio::task::JoinHandle<()>), Box<dyn Error + Send + Sync>> {
+    let (mut config, tls) = novu_rust_contracts::postgres::configure(database_url)?;
     config.application_name("novu-rust-ws-listener");
-    let (client, mut connection) = config.connect(NoTls).await?;
+    let (client, mut connection) = config.connect(tls).await?;
     let driver = tokio::spawn(async move {
         while let Some(message) = poll_fn(|cx| connection.poll_message(cx)).await {
             match message {
@@ -326,7 +330,7 @@ async fn start_event_listener(
     });
     if let Err(error) = client.batch_execute("LISTEN novu_rust_ws_events").await {
         driver.abort();
-        return Err(error);
+        return Err(error.into());
     }
     Ok((client, driver))
 }
@@ -338,11 +342,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if secret.is_empty() {
         return Err("JWT_SECRET must not be empty".into());
     }
-    let mut query_config: tokio_postgres::Config = database_url.parse()?;
+    let (mut query_config, tls) = novu_rust_contracts::postgres::configure(&database_url)?;
     query_config.application_name("novu-rust-ws-query");
-    let client = Database::connect(&query_config).await?;
+    let client = Database::connect(&query_config, &tls).await?;
     let db = Arc::new(Database {
         config: query_config,
+        tls,
         client: Mutex::new(client),
     });
     let (layer, io) = SocketIo::new_layer();

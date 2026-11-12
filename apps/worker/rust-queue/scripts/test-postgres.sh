@@ -3,6 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 # Legacy synthetic job fixtures do not have recipient identity snapshots.
 export NOVU_ALLOW_RECREATED_SUBSCRIBER=true
+export NOVU_POSTGRES_ALLOW_INSECURE=true
 name="novu-rust-queue-test-$$"
 cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
