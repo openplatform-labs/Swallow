@@ -962,6 +962,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "der",
+ "form_urlencoded",
  "hmac",
  "http-body-util",
  "novu-postgres-queue",

@@ -20,3 +20,6 @@ TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_api_test" \
   cargo test --locked --test api_postgres -- --ignored
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_api_test" \
   cargo test --locked --test sendgrid_webhook -- --ignored
+
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_api_test" \
+  cargo test --locked --test twilio_webhook -- --ignored

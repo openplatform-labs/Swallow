@@ -13,6 +13,7 @@ mod topic_subscription_preferences;
 mod topic_subscriptions;
 mod topics;
 mod topics_v2;
+pub mod twilio_webhook;
 use axum::{
     Json, Router,
     body::Bytes,
@@ -72,7 +73,7 @@ pub fn router(db: Arc<Client>) -> Router {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    router_with_session_keys(db, secret, keys)
+    router_with_twilio_config(db, secret, keys, twilio_webhook::Config::from_env())
 }
 
 pub fn router_with_subscriber_secret(db: Arc<Client>, secret: Option<Vec<u8>>) -> Router {
@@ -84,10 +85,23 @@ pub fn router_with_session_keys(
     secret: Option<Vec<u8>>,
     keys: HashMap<String, Vec<String>>,
 ) -> Router {
+    router_with_twilio_config(db, secret, keys, None)
+}
+
+pub fn router_with_twilio_config(
+    db: Arc<Client>,
+    secret: Option<Vec<u8>>,
+    keys: HashMap<String, Vec<String>>,
+    twilio: Option<twilio_webhook::Config>,
+) -> Router {
     Router::new()
         .route(
             "/webhooks/organizations/{organization}/environments/{environment}/email/{provider}",
             post(sendgrid_webhook::receive),
+        )
+        .route(
+            "/webhooks/organizations/{organization}/environments/{environment}/sms/twilio",
+            post(twilio_webhook::receive),
         )
         .route("/v1/events/trigger", post(trigger))
         .route(
@@ -217,6 +231,7 @@ pub fn router_with_session_keys(
         .with_state(db)
         .layer(Extension(Arc::new(secret)))
         .layer(Extension(Arc::new(InboxHmacKeys(keys))))
+        .layer(Extension(Arc::new(twilio)))
 }
 
 async fn authenticate_inbox(
