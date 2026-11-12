@@ -54,6 +54,71 @@ struct Claims {
     context_keys: Vec<String>,
 }
 
+fn compatibility_mode() -> bool {
+    std::env::var("NOVU_ALLOW_RECREATED_SUBSCRIBER").as_deref() == Ok("true")
+}
+
+enum ListenerEvent {
+    Delivery(Uuid),
+    SubscriberDeleted {
+        environment: String,
+        subscriber: String,
+    },
+}
+
+fn disconnect_identity(io: &SocketIo, environment: &str, subscriber: &str) {
+    if io.of("/").is_none() {
+        return;
+    }
+    for socket in io.within(subscriber.to_owned()).sockets() {
+        if socket
+            .extensions
+            .get::<Claims>()
+            .is_some_and(|c| c.environment_id == environment && c.id == subscriber)
+        {
+            socket.disconnect().ok();
+        }
+    }
+}
+
+// The notification is ephemeral. Periodically check connected identities to
+// recover from a missed event and from deletion racing socket registration.
+async fn reconcile_socket_identities(
+    db: &Database,
+    io: &SocketIo,
+) -> Result<(), tokio_postgres::Error> {
+    let Some(namespace) = io.of("/") else {
+        return Ok(());
+    };
+    let sockets: Vec<_> = namespace
+        .sockets()
+        .into_iter()
+        .filter_map(|socket| {
+            socket
+                .extensions
+                .get::<Claims>()
+                .map(|claims| (socket, claims))
+        })
+        .collect();
+    if sockets.is_empty() {
+        return Ok(());
+    }
+    let environments: Vec<_> = sockets
+        .iter()
+        .map(|(_, c)| c.environment_id.clone())
+        .collect();
+    let subscribers: Vec<_> = sockets.iter().map(|(_, c)| c.id.clone()).collect();
+    let rows = db.lock().await?.query("SELECT DISTINCT x.environment_id,x.internal_id FROM unnest($1::text[],$2::text[]) x(environment_id,internal_id) JOIN novu_rust_subscribers s ON s.environment_id=x.environment_id AND s.internal_id=x.internal_id", &[&environments,&subscribers]).await?;
+    let existing: std::collections::HashSet<(String, String)> =
+        rows.into_iter().map(|r| (r.get(0), r.get(1))).collect();
+    for (socket, claims) in sockets {
+        if !existing.contains(&(claims.environment_id, claims.id)) {
+            socket.disconnect().ok();
+        }
+    }
+    Ok(())
+}
+
 fn javascript_truthy(value: &Value) -> bool {
     match value {
         Value::Null => false,
@@ -74,7 +139,7 @@ async fn deliver_event(
     id: Uuid,
 ) -> Result<(), tokio_postgres::Error> {
     let row = db.lock().await?.query_opt(
-        "SELECT environment_id,subscriber_internal_id,context_keys,event,data FROM novu_rust_ws_events WHERE id=$1", &[&id]
+        "SELECT e.environment_id,e.subscriber_internal_id,e.context_keys,e.event,e.data,EXISTS(SELECT 1 FROM novu_rust_subscribers s WHERE s.environment_id=e.environment_id AND s.internal_id=e.subscriber_internal_id) FROM novu_rust_ws_events e WHERE e.id=$1", &[&id]
     ).await?;
     let Some(row) = row else {
         return Ok(());
@@ -84,6 +149,13 @@ async fn deliver_event(
     let context: Vec<String> = row.get(2);
     let event: String = row.get(3);
     let data: Value = row.get(4);
+    if io.of("/").is_none() {
+        return Ok(());
+    }
+    if !compatibility_mode() && !row.get::<_, bool>(5) {
+        disconnect_identity(io, &environment, &subscriber);
+        return Ok(());
+    }
     let sockets: Vec<_> = io
         .within(subscriber.clone())
         .sockets()
@@ -259,9 +331,7 @@ async fn connect(db: &Database, id: Uuid, claims: &Claims) -> Result<bool, tokio
         &[&claims.environment_id, &claims.id],
     )
     .await?;
-    if subscriber.is_none()
-        && std::env::var("NOVU_ALLOW_RECREATED_SUBSCRIBER").as_deref() != Ok("true")
-    {
+    if subscriber.is_none() && !compatibility_mode() {
         tx.rollback().await?;
         return Ok(false);
     }
@@ -310,7 +380,7 @@ async fn retry_disconnect(db: Arc<Database>, id: Uuid, claims: Claims, update_pr
 // LISTEN must be active before the server accepts sockets.
 async fn start_event_listener(
     database_url: &str,
-    event_tx: mpsc::Sender<Uuid>,
+    event_tx: mpsc::Sender<ListenerEvent>,
 ) -> Result<(Client, tokio::task::JoinHandle<()>), Box<dyn Error + Send + Sync>> {
     let (mut config, tls) = novu_rust_contracts::postgres::configure(database_url)?;
     config.application_name("novu-rust-ws-listener");
@@ -322,7 +392,26 @@ async fn start_event_listener(
                     if notification.channel() == "novu_rust_ws_events" =>
                 {
                     if let Ok(id) = Uuid::parse_str(notification.payload())
-                        && event_tx.send(id).await.is_err()
+                        && event_tx.send(ListenerEvent::Delivery(id)).await.is_err()
+                    {
+                        break;
+                    }
+                }
+                Ok(AsyncMessage::Notification(notification))
+                    if notification.channel() == "novu_rust_subscriber_deleted" =>
+                {
+                    if let Ok(payload) = serde_json::from_str::<Value>(notification.payload())
+                        && let (Some(environment), Some(subscriber)) = (
+                            payload.get("environment").and_then(Value::as_str),
+                            payload.get("subscriber").and_then(Value::as_str),
+                        )
+                        && event_tx
+                            .send(ListenerEvent::SubscriberDeleted {
+                                environment: environment.to_owned(),
+                                subscriber: subscriber.to_owned(),
+                            })
+                            .await
+                            .is_err()
                     {
                         break;
                     }
@@ -335,6 +424,13 @@ async fn start_event_listener(
             }
         }
     });
+    if let Err(error) = client
+        .batch_execute("LISTEN novu_rust_subscriber_deleted")
+        .await
+    {
+        driver.abort();
+        return Err(error.into());
+    }
     if let Err(error) = client.batch_execute("LISTEN novu_rust_ws_events").await {
         driver.abort();
         return Err(error.into());
@@ -358,7 +454,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         client: Mutex::new(client),
     });
     let (layer, io) = SocketIo::new_layer();
-    let (event_tx, mut event_rx) = mpsc::channel::<Uuid>(1024);
+    let (event_tx, mut event_rx) = mpsc::channel::<ListenerEvent>(1024);
     let initial_listener = start_event_listener(&database_url, event_tx.clone()).await?;
     tokio::spawn(async move {
         let mut listener = initial_listener;
@@ -380,12 +476,37 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let events_db = db.clone();
     let events_io = io.clone();
     tokio::spawn(async move {
-        while let Some(id) = event_rx.recv().await {
-            if let Err(error) = deliver_event(&events_db, &events_io, id).await {
-                eprintln!("socket event delivery failed: {error}");
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                ListenerEvent::Delivery(id) => {
+                    if let Err(error) = deliver_event(&events_db, &events_io, id).await {
+                        eprintln!("socket event delivery failed: {error}");
+                    }
+                }
+                ListenerEvent::SubscriberDeleted {
+                    environment,
+                    subscriber,
+                } => {
+                    if !compatibility_mode() {
+                        disconnect_identity(&events_io, &environment, &subscriber);
+                    }
+                }
             }
         }
     });
+    if !compatibility_mode() {
+        let check_db = db.clone();
+        let check_io = io.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                if let Err(error) = reconcile_socket_identities(&check_db, &check_io).await {
+                    eprintln!("socket identity reconciliation failed: {error}");
+                }
+            }
+        });
+    }
     io.ns(
         "/",
         move |socket: SocketRef, TryData(auth): TryData<Value>| {

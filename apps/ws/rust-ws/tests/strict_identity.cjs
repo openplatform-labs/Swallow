@@ -26,13 +26,37 @@ async function socketState(auth,accepted) {
   socket.disconnect();
   await wait(250);
 }
+async function open(url, auth) {
+  const socket=io(url,{transports:['websocket'],reconnection:false,timeout:2000,query:{token:auth}});
+  let error;socket.on('connect_error',e=>{error=e});
+  for(let i=0;i<50 && !socket.connected && !error;i++) await wait(100);
+  assert(socket.connected,`connection failed: ${error}`);await wait(300);assert(socket.connected);
+  return socket;
+}
+async function disconnected(sockets,timeout=3000) {
+  for(let i=0;i<timeout/100 && sockets.some(s=>s.connected);i++) await wait(100);
+  assert(sockets.every(s=>!s.connected),'revoked socket remained connected');
+}
 (async()=>{
   sql(`INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id) VALUES ('${env}','strict-user','${oldId}')`);
-  await socketState(token(oldId),true);
+  const sockets=await Promise.all([open(process.env.STRICT_WS_URL,token(oldId)),open(process.env.STRICT_WS_URL2,token(oldId))]);
+  sql(`BEGIN; DELETE FROM novu_rust_subscribers WHERE environment_id='${env}' AND subscriber_id='strict-user'; ROLLBACK`);
+  await wait(500);assert(sockets.every(s=>s.connected),'rolled-back deletion revoked sockets');
   sql(`DELETE FROM novu_rust_subscribers WHERE environment_id='${env}' AND subscriber_id='strict-user'; INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id) VALUES ('${env}','strict-user','${newId}')`);
-  await socketState(token(oldId),false);
-  await socketState(token(newId,'64a000000000000000000012'),false);
-  await socketState(token(newId),true);
+  await disconnected(sockets);
+  await socketState(token(oldId),false);await socketState(token(newId,'64a000000000000000000012'),false);await socketState(token(newId),true);
   assert.equal(sql(`SELECT count(*) FROM novu_rust_ws_connections WHERE subscriber_internal_id IN ('${oldId}','${newId}')`),'0');
-  console.log('strict WS identity: current accepted; deleted and cross-environment rejected');
+  console.log('strict WS deletion closes two instances and rollback preserves connections');
+  const lostId='64a000000000000000000022';
+  sql(`INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id) VALUES ('${env}','lost-user','${lostId}')`);
+  const lost=await open(process.env.STRICT_WS_URL,token(lostId));
+  sql(`ALTER TABLE novu_rust_subscribers DISABLE TRIGGER novu_rust_subscriber_deleted_notify; DELETE FROM novu_rust_subscribers WHERE internal_id='${lostId}' AND environment_id='${env}'; ALTER TABLE novu_rust_subscribers ENABLE TRIGGER novu_rust_subscriber_deleted_notify`);
+  await disconnected([lost],9000);
+  console.log('strict WS reconciliation closes sockets after missed notification');
+  const deliveryId='64a000000000000000000023';
+  sql(`INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id) VALUES ('${env}','delivery-user','${deliveryId}')`);
+  const delivery=await open(process.env.STRICT_WS_URL,token(deliveryId));let received=0;delivery.on('sensitive_probe',()=>{received++});
+  sql(`ALTER TABLE novu_rust_subscribers DISABLE TRIGGER novu_rust_subscriber_deleted_notify; DELETE FROM novu_rust_subscribers WHERE internal_id='${deliveryId}' AND environment_id='${env}'; ALTER TABLE novu_rust_subscribers ENABLE TRIGGER novu_rust_subscriber_deleted_notify; INSERT INTO novu_rust_ws_events(environment_id,subscriber_internal_id,event,data) VALUES ('${env}','${deliveryId}','sensitive_probe','{}')`);
+  await disconnected([delivery]);assert.equal(received,0);
+  console.log('strict WS event delivery rejects deleted identity');
 })().catch(error=>{console.error(error);process.exitCode=1});
