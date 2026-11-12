@@ -89,6 +89,24 @@ pub async fn process_one(
         tx.rollback().await?;
         return Ok(true);
     }
+    // A previously authenticated callback proves that a request for this job
+    // reached Twilio. Legacy audit records do not identify the exact attempt. Stop a manual retry for operator review. The webhook
+    // and this check serialize on the queue row; late callbacks can still
+    // arrive after this transaction commits and dispatch has begun.
+    if provider.tracks_status_callbacks() {
+        let evidence = tx.query_opt("SELECT 1 FROM novu_rust_twilio_delivery_events e WHERE e.environment_id=$1 AND e.job_id=$2 AND EXISTS(SELECT 1 FROM novu_rust_delivery_reconciliations r WHERE r.environment_id=$1 AND r.job_id=$2 AND r.target_index IS NULL AND r.decision='retry') LIMIT 1", &[&environment,&job.id]).await?;
+        if evidence.is_some() {
+            // An old audit does not identify the retried dispatch. Do not
+            // attribute the restored unknown to a possibly unrelated event.
+            let inserted = tx.execute("INSERT INTO novu_rust_twilio_attempts(job_id,environment_id,state) VALUES ($1,$2,'unknown') ON CONFLICT(job_id) DO NOTHING", &[&job.id,&environment]).await?;
+            if inserted == 1 {
+                tx.execute("UPDATE novu_rust_sms_messages SET delivery_state='unknown',status='error',error_id='unexpected_sms_error',error_text='sms retry blocked by provider callback' WHERE environment_id=$1 AND sms_job_id=$2", &[&environment,&job.id]).await?;
+            }
+            tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='sms retry blocked by provider callback',lease_token=NULL,lease_until=NULL WHERE id=$1 AND environment_id=$2", &[&job.id,&environment]).await?;
+            tx.commit().await?;
+            return Ok(true);
+        }
+    }
     if let Some(context) = sms.workflow_context.take() {
         let skip = match subscriber.as_ref() {
             None => Some(("failed", "failed", "subscriber not found")),
@@ -473,6 +491,25 @@ mod tests {
         db.batch_execute(crate::MIGRATION).await.unwrap();
         db.batch_execute(MIGRATION).await.unwrap();
         db.batch_execute(DISPATCH_ID_MIGRATION).await.unwrap();
+        db.batch_execute(crate::reconciliation::MIGRATION)
+            .await
+            .unwrap();
+        db.batch_execute("CREATE TABLE IF NOT EXISTS novu_rust_environments(id text PRIMARY KEY, organization_id text NOT NULL); INSERT INTO novu_rust_environments VALUES ('test','org'),('other','org') ON CONFLICT DO NOTHING").await.unwrap();
+        db.batch_execute(include_str!(
+            "../../../api/rust-api/migrations/0005_twilio_webhooks.sql"
+        ))
+        .await
+        .unwrap();
+        db.batch_execute(include_str!(
+            "../../../api/rust-api/migrations/0006_twilio_webhook_job_link.sql"
+        ))
+        .await
+        .unwrap();
+        db.batch_execute(include_str!(
+            "../../../api/rust-api/migrations/0007_twilio_dispatch_identity.sql"
+        ))
+        .await
+        .unwrap();
         db.batch_execute(crate::in_app::SMS_MESSAGES_MIGRATION)
             .await
             .unwrap();
@@ -493,6 +530,12 @@ mod tests {
                 .await
                 .unwrap();
             db.execute("INSERT INTO novu_rust_sms_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,status,sms_job_id) VALUES ($1,'test','alice','subscriber','notification','workflow','transaction','sent',$2)", &[&id.to_string(),&id]).await.unwrap();
+            if status == 201 && !malformed {
+                // An audited retry without linked evidence is still sent.
+                db.execute("INSERT INTO novu_rust_delivery_reconciliations(id,environment_id,job_id,decision,operator_name,reason) VALUES ($1,'test',$2,'retry','operator','verified')", &[&Uuid::new_v4(),&id]).await.unwrap();
+                // Evidence from a different environment cannot block this job.
+                db.execute("INSERT INTO novu_rust_twilio_delivery_events(environment_id,account_sid,message_sid,status,job_id) VALUES ('other','ACfixture',$1,'delivered',$2)", &[&format!("SM{id}"),&id]).await.unwrap();
+            }
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let origin = format!("http://{}", listener.local_addr().unwrap());
             let server = tokio::spawn(async move {
@@ -633,6 +676,48 @@ mod tests {
             .get::<_, i64>(0),
             1
         );
+        // An authenticated callback that arrives after a retry decision but
+        // before dispatch prevents another provider request.
+        let blocked = Uuid::new_v4();
+        let old_dispatch = Uuid::new_v4();
+        crate::enqueue(&db, blocked, "test", JOB_KIND, &payload)
+            .await
+            .unwrap();
+        db.execute("INSERT INTO novu_rust_twilio_dispatch_ids(id,job_id,environment_id) VALUES ($1,$2,'test')", &[&old_dispatch,&blocked]).await.unwrap();
+        db.execute("INSERT INTO novu_rust_delivery_reconciliations(id,environment_id,job_id,decision,operator_name,reason) VALUES ($1,'test',$2,'retry','operator','verified')", &[&Uuid::new_v4(),&blocked]).await.unwrap();
+        db.execute("INSERT INTO novu_rust_twilio_delivery_events(environment_id,account_sid,message_sid,status,job_id,dispatch_id) VALUES ('test','ACfixture','SMfixture','delivered',$1,$2)", &[&blocked,&old_dispatch]).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider = Twilio::test_origin(
+            Config {
+                account_sid: "ACfixture".into(),
+                auth_token: "fixture".into(),
+                api_key_sid: None,
+                api_key_secret: None,
+                from: "+15550000001".into(),
+                region: Region::Us,
+            },
+            &format!("http://{}", listener.local_addr().unwrap()),
+        )
+        .unwrap()
+        .with_status_callback(
+            "https://events.example.test/webhooks/organizations/org/environments/test/sms/twilio",
+            "test",
+        )
+        .unwrap();
+        assert!(process_one(&mut db, "test", &provider).await.unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+        let row = db.query_one("SELECT j.status,j.last_error,a.state,a.dispatch_id FROM novu_queue_jobs j JOIN novu_rust_twilio_attempts a ON a.job_id=j.id WHERE j.id=$1", &[&blocked]).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), "failed");
+        assert_eq!(
+            row.get::<_, String>(1),
+            "sms retry blocked by provider callback"
+        );
+        assert_eq!(row.get::<_, String>(2), "unknown");
+        assert_eq!(row.get::<_, Option<Uuid>>(3), None);
         let before = Uuid::new_v4();
         let after = Uuid::new_v4();
         for id in [before, after] {

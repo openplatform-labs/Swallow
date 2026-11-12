@@ -249,6 +249,10 @@ impl Twilio {
         Ok(self)
     }
 
+    pub(crate) fn tracks_status_callbacks(&self) -> bool {
+        self.status_callback_base.is_some()
+    }
+
     pub(crate) fn status_callback(&self, job: uuid::Uuid, dispatch: uuid::Uuid) -> Option<String> {
         self.status_callback_base
             .as_ref()

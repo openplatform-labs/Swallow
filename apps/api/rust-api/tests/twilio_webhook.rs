@@ -346,12 +346,24 @@ async fn signed_job_callbacks_bind_evidence_without_changing_attempt_state() {
         )
         .await
         .unwrap();
-    // The API sees the old committed attempt while retry is in flight.
-    assert_eq!(
-        post(router.clone(), &path, BODY, &sig, form).await,
-        StatusCode::NO_CONTENT
-    );
+    // The audit foreign key and callback's queue-row lock serialize retry.
+    let waiting_router = router.clone();
+    let waiting_path = path.clone();
+    let waiting_signature = sig.clone();
+    let waiting = tokio::spawn(async move {
+        post(
+            waiting_router,
+            &waiting_path,
+            BODY,
+            &waiting_signature,
+            form,
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!waiting.is_finished());
     retry_db.batch_execute("COMMIT").await.unwrap();
+    assert_eq!(waiting.await.unwrap(), StatusCode::NO_CONTENT);
     // After commit it sees the retry audit even before a new attempt exists.
     assert_eq!(
         post(router.clone(), &path, BODY, &sig, form).await,
@@ -390,6 +402,31 @@ async fn signed_job_callbacks_bind_evidence_without_changing_attempt_state() {
         .await,
         StatusCode::NO_CONTENT
     );
+    // Callback insert and retry dispatch serialize on the queue row.
+    retry_db.batch_execute("BEGIN").await.unwrap();
+    retry_db
+        .query_one(
+            "SELECT id FROM novu_queue_jobs WHERE id=$1 FOR UPDATE",
+            &[&job],
+        )
+        .await
+        .unwrap();
+    let waiting_router = router.clone();
+    let waiting_path = dispatch_path.clone();
+    let callback = tokio::spawn(async move {
+        post(
+            waiting_router,
+            &waiting_path,
+            BODY,
+            dispatch_signature,
+            form,
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!callback.is_finished());
+    retry_db.batch_execute("COMMIT").await.unwrap();
+    assert_eq!(callback.await.unwrap(), StatusCode::NO_CONTENT);
     let assigned: uuid::Uuid = db
         .query_one(
             "SELECT dispatch_id FROM novu_rust_twilio_delivery_events WHERE job_id=$1",
