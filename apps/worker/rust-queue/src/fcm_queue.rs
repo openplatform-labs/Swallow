@@ -857,6 +857,9 @@ mod tests {
         db.batch_execute(crate::reconciliation::MIGRATION)
             .await
             .unwrap();
+        db.batch_execute(crate::reconciliation::RETRY_DISPATCH_MIGRATION)
+            .await
+            .unwrap();
         let payload = json!({"title":"Hi","content":"Hello","targets":["a","b","c"]});
         let other = Uuid::new_v4();
         let id = Uuid::new_v4();

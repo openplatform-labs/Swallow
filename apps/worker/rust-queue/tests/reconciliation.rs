@@ -28,6 +28,27 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     ] {
         db.batch_execute(migration).await.unwrap();
     }
+    // The new migration must preserve old decisions and be safely re-runnable.
+    let legacy_job = Uuid::new_v4();
+    queue::enqueue(
+        &db,
+        legacy_job,
+        "legacy",
+        queue::twilio_queue::JOB_KIND,
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO novu_rust_delivery_reconciliations(id,environment_id,job_id,decision,operator_name,reason) VALUES ($1,'legacy',$2,'retry','operator','legacy')", &[&Uuid::new_v4(),&legacy_job]).await.unwrap();
+    db.batch_execute(reconciliation::RETRY_DISPATCH_MIGRATION)
+        .await
+        .unwrap();
+    db.batch_execute(reconciliation::RETRY_DISPATCH_MIGRATION)
+        .await
+        .unwrap();
+    let row = db.query_one("SELECT retry_dispatch_id,decision_order FROM novu_rust_delivery_reconciliations WHERE job_id=$1", &[&legacy_job]).await.unwrap();
+    assert_eq!(row.get::<_, Option<Uuid>>(0), None);
+    assert!(row.get::<_, i64>(1) > 0);
     db.batch_execute("DROP TABLE IF EXISTS novu_rust_sendgrid_delivery_events,novu_rust_sendgrid_webhook_keys,novu_rust_environments CASCADE; CREATE TABLE novu_rust_environments(id text PRIMARY KEY,organization_id text NOT NULL); INSERT INTO novu_rust_environments VALUES ('tenant-a','org-a'),('tenant-b','org-b')").await.unwrap();
     db.batch_execute(include_str!(
         "../../../api/rust-api/migrations/0004_sendgrid_webhooks.sql"
@@ -310,6 +331,8 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     assert_eq!(row.get::<_, String>(0), "pending");
     assert_eq!(row.get::<_, i64>(1), 0);
     assert_eq!(row.get::<_, i64>(2), 1);
+    let recorded: Uuid = db.query_one("SELECT retry_dispatch_id FROM novu_rust_delivery_reconciliations WHERE job_id=$1 AND decision='retry'", &[&sms_retry]).await.unwrap().get(0);
+    assert_eq!(recorded, old_dispatch);
     let retained: bool = db.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_twilio_dispatch_ids WHERE id=$1 AND job_id=$2 AND environment_id='tenant-a')", &[&old_dispatch,&sms_retry]).await.unwrap().get(0);
     assert!(retained);
     let bulk = Uuid::new_v4();

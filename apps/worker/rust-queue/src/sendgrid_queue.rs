@@ -444,6 +444,9 @@ mod tests {
         db.batch_execute(crate::reconciliation::MIGRATION)
             .await
             .unwrap();
+        db.batch_execute(crate::reconciliation::RETRY_DISPATCH_MIGRATION)
+            .await
+            .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/v3/mail/send", listener.local_addr().unwrap());
         let provider = Sendgrid::test_endpoint(

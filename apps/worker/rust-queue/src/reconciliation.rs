@@ -4,6 +4,8 @@ use tokio_postgres::Client;
 use uuid::Uuid;
 
 pub const MIGRATION: &str = include_str!("../migrations/0054_delivery_reconciliation.sql");
+pub const RETRY_DISPATCH_MIGRATION: &str =
+    include_str!("../migrations/0056_retry_dispatch_identity.sql");
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// List bounded unknown attempts without returning recipient data or payloads.
@@ -109,13 +111,18 @@ pub async fn resolve(
         return Err("cannot retry push job with a different failure reason".into());
     }
     let attempt=match (kind.as_str(),target) {
-        (crate::sendgrid_queue::JOB_KIND,None)=>tx.query_opt("SELECT http_status FROM novu_rust_sendgrid_attempts WHERE environment_id=$1 AND job_id=$2 AND state='unknown' FOR UPDATE", &[&environment,&job]).await?,
-        (crate::twilio_queue::JOB_KIND,None)=>tx.query_opt("SELECT http_status FROM novu_rust_twilio_attempts WHERE environment_id=$1 AND job_id=$2 AND state='unknown' FOR UPDATE", &[&environment,&job]).await?,
-        (crate::fcm_queue::JOB_KIND,Some(index))=>tx.query_opt("SELECT http_status FROM novu_rust_fcm_attempts WHERE environment_id=$1 AND job_id=$2 AND target_index=$3 AND state='unknown' FOR UPDATE", &[&environment,&job,&index]).await?,
+        (crate::sendgrid_queue::JOB_KIND,None)=>tx.query_opt("SELECT http_status,NULL::uuid FROM novu_rust_sendgrid_attempts WHERE environment_id=$1 AND job_id=$2 AND state='unknown' FOR UPDATE", &[&environment,&job]).await?,
+        (crate::twilio_queue::JOB_KIND,None)=>tx.query_opt("SELECT http_status,dispatch_id FROM novu_rust_twilio_attempts WHERE environment_id=$1 AND job_id=$2 AND state='unknown' FOR UPDATE", &[&environment,&job]).await?,
+        (crate::fcm_queue::JOB_KIND,Some(index))=>tx.query_opt("SELECT http_status,NULL::uuid FROM novu_rust_fcm_attempts WHERE environment_id=$1 AND job_id=$2 AND target_index=$3 AND state='unknown' FOR UPDATE", &[&environment,&job,&index]).await?,
         _=>return Err("job kind and target do not match".into()),
     }.ok_or("unknown attempt not found")?;
     let http_status: Option<i32> = attempt.get(0);
-    tx.execute("INSERT INTO novu_rust_delivery_reconciliations(id,environment_id,job_id,target_index,decision,operator_name,reason,previous_http_status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",&[&Uuid::new_v4(),&environment,&job,&target,&decision,&operator,&reason,&http_status]).await?;
+    let retry_dispatch: Option<Uuid> = if decision == "retry" {
+        attempt.get(1)
+    } else {
+        None
+    };
+    tx.execute("INSERT INTO novu_rust_delivery_reconciliations(id,environment_id,job_id,target_index,decision,operator_name,reason,previous_http_status,retry_dispatch_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",&[&Uuid::new_v4(),&environment,&job,&target,&decision,&operator,&reason,&http_status,&retry_dispatch]).await?;
     match (kind.as_str(), target, decision) {
         (crate::sendgrid_queue::JOB_KIND, None, "retry") => {
             tx.execute(
