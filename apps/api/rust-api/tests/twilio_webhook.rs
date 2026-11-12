@@ -64,6 +64,7 @@ async fn signed_status_events_are_scoped_deduplicated_and_private() {
         include_str!("../migrations/0007_twilio_dispatch_identity.sql"),
         include_str!("../../../worker/rust-queue/migrations/0041_experimental_twilio_attempts.sql"),
         novu_postgres_queue::reconciliation::MIGRATION,
+        novu_postgres_queue::reconciliation::RETRY_DISPATCH_MIGRATION,
         novu_postgres_queue::twilio_queue::DISPATCH_ID_MIGRATION,
     ] {
         db.batch_execute(migration).await.unwrap();
@@ -207,6 +208,7 @@ async fn signed_job_callbacks_bind_evidence_without_changing_attempt_state() {
         include_str!("../migrations/0007_twilio_dispatch_identity.sql"),
         include_str!("../../../worker/rust-queue/migrations/0041_experimental_twilio_attempts.sql"),
         novu_postgres_queue::reconciliation::MIGRATION,
+        novu_postgres_queue::reconciliation::RETRY_DISPATCH_MIGRATION,
         novu_postgres_queue::twilio_queue::DISPATCH_ID_MIGRATION,
     ] {
         db.batch_execute(migration).await.unwrap();
@@ -330,7 +332,7 @@ async fn signed_job_callbacks_bind_evidence_without_changing_attempt_state() {
         StatusCode::NOT_FOUND
     );
     db.execute("INSERT INTO novu_rust_twilio_attempts(job_id,environment_id,state) VALUES ($1,'env-a','unknown')", &[&job]).await.unwrap();
-    let (retry_db, retry_driver) =
+    let (mut retry_db, retry_driver) =
         tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(), NoTls)
             .await
             .unwrap();
@@ -492,6 +494,30 @@ async fn signed_job_callbacks_bind_evidence_without_changing_attempt_state() {
         .await,
         StatusCode::NOT_FOUND
     );
+    // A real signed callback accepted above prevents an operator from
+    // asserting non-acceptance for that dispatch and requeueing the job.
+    db.execute(
+        "UPDATE novu_queue_jobs SET status='failed' WHERE id=$1",
+        &[&job],
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO novu_rust_twilio_attempts(job_id,environment_id,state,dispatch_id) VALUES ($1,'env-a','unknown',$2)", &[&job,&dispatch]).await.unwrap();
+    let err = novu_postgres_queue::reconciliation::resolve(
+        &mut retry_db,
+        "env-a",
+        job,
+        None,
+        "retry",
+        "operator",
+        "ticket",
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("authenticated provider callback"));
+    let state = db.query_one("SELECT j.status,a.state FROM novu_queue_jobs j JOIN novu_rust_twilio_attempts a ON a.job_id=j.id WHERE j.id=$1", &[&job]).await.unwrap();
+    assert_eq!(state.get::<_, String>(0), "failed");
+    assert_eq!(state.get::<_, String>(1), "unknown");
     let missing_dispatch = uuid::Uuid::new_v4();
     assert_eq!(
         post(

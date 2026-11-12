@@ -316,6 +316,9 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     let old_dispatch = Uuid::new_v4();
     db.execute("INSERT INTO novu_rust_twilio_dispatch_ids(id,job_id,environment_id) VALUES ($1,$2,'tenant-a')", &[&old_dispatch,&sms_retry]).await.unwrap();
     db.execute("INSERT INTO novu_rust_twilio_attempts(job_id,environment_id,state,dispatch_id) VALUES ($1,'tenant-a','unknown',$2)", &[&sms_retry,&old_dispatch]).await.unwrap();
+    // A callback for a different dispatch (or environment) cannot block a retry.
+    let unrelated_dispatch = Uuid::new_v4();
+    db.execute("INSERT INTO novu_rust_twilio_delivery_events(environment_id,account_sid,message_sid,status,job_id,dispatch_id) VALUES ('tenant-a','ACfixture','SMother','delivered',$1,$2),('tenant-b','ACfixture','SMcross','delivered',$1,$3)", &[&sms_retry,&unrelated_dispatch,&old_dispatch]).await.unwrap();
     reconciliation::resolve(
         &mut db,
         "tenant-a",
@@ -335,6 +338,63 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     assert_eq!(recorded, old_dispatch);
     let retained: bool = db.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_twilio_dispatch_ids WHERE id=$1 AND job_id=$2 AND environment_id='tenant-a')", &[&old_dispatch,&sms_retry]).await.unwrap().get(0);
     assert!(retained);
+    for (legacy_event, legacy_attempt) in [(false, false), (true, false), (false, true)] {
+        let blocked = Uuid::new_v4();
+        let dispatch = Uuid::new_v4();
+        queue::enqueue(
+            &db,
+            blocked,
+            "tenant-a",
+            queue::twilio_queue::JOB_KIND,
+            &json!({}),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "UPDATE novu_queue_jobs SET status='failed' WHERE id=$1",
+            &[&blocked],
+        )
+        .await
+        .unwrap();
+        let attempt_dispatch = if legacy_attempt { None } else { Some(dispatch) };
+        db.execute("INSERT INTO novu_rust_twilio_attempts(job_id,environment_id,state,dispatch_id) VALUES ($1,'tenant-a','unknown',$2)", &[&blocked,&attempt_dispatch]).await.unwrap();
+        let event_dispatch = if legacy_event { None } else { Some(dispatch) };
+        db.execute("INSERT INTO novu_rust_twilio_delivery_events(environment_id,account_sid,message_sid,status,job_id,dispatch_id) VALUES ('tenant-a','ACfixture',$1,'delivered',$2,$3)", &[&format!("SM{blocked}"),&blocked,&event_dispatch]).await.unwrap();
+        let err = reconciliation::resolve(
+            &mut db, "tenant-a", blocked, None, "retry", "operator", "ticket",
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("authenticated provider callback"));
+        let row = db.query_one("SELECT j.status,a.state,(SELECT count(*) FROM novu_rust_delivery_reconciliations WHERE job_id=j.id) FROM novu_queue_jobs j JOIN novu_rust_twilio_attempts a ON a.job_id=j.id WHERE j.id=$1", &[&blocked]).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), "failed");
+        assert_eq!(row.get::<_, String>(1), "unknown");
+        assert_eq!(row.get::<_, i64>(2), 0);
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+            .args([
+                "retry",
+                "tenant-a",
+                &blocked.to_string(),
+                "-",
+                "operator",
+                "ticket",
+            ])
+            .env("DATABASE_URL", &url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("authenticated provider callback")
+        );
+        // Continue the existing test without leaving extra unknown attempts.
+        db.execute(
+            "UPDATE novu_rust_twilio_attempts SET state='accepted' WHERE job_id=$1",
+            &[&blocked],
+        )
+        .await
+        .unwrap();
+    }
     let bulk = Uuid::new_v4();
     queue::enqueue(
         &db,

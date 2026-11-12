@@ -122,6 +122,15 @@ pub async fn resolve(
     } else {
         None
     };
+    if kind == crate::twilio_queue::JOB_KIND && decision == "retry" {
+        // Webhook inserts serialize on the same job row. A callback already
+        // committed at this point proves Twilio accepted some request; never
+        // assert non-acceptance for the matching or ambiguous dispatch.
+        let evidence: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_twilio_delivery_events WHERE environment_id=$1 AND job_id=$2 AND ($3::uuid IS NULL OR dispatch_id IS NULL OR dispatch_id=$3))", &[&environment,&job,&retry_dispatch]).await?.get(0);
+        if evidence {
+            return Err("SMS retry refused: authenticated provider callback already exists; inspect sms-evidence".into());
+        }
+    }
     tx.execute("INSERT INTO novu_rust_delivery_reconciliations(id,environment_id,job_id,target_index,decision,operator_name,reason,previous_http_status,retry_dispatch_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",&[&Uuid::new_v4(),&environment,&job,&target,&decision,&operator,&reason,&http_status,&retry_dispatch]).await?;
     match (kind.as_str(), target, decision) {
         (crate::sendgrid_queue::JOB_KIND, None, "retry") => {
