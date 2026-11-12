@@ -42,7 +42,7 @@ API 마이그레이션 `0004_sendgrid_webhooks.sql`은 환경별 SendGrid 공개
 - 제한적인 `POST /v2/subscribers`: 이름·제한적인 ASCII 이메일·전화·아바타·locale·`data`로 구독자를 생성하거나 기존 구독자를 갱신하며, `failIfExists`의 제한된 값을 지원한다. ID 공백 제거 및 기본 오류 검증을 처리한다. 빈 `data` 객체는 GET·POST 응답에서 생략되나 명시적으로 갱신한 PATCH 응답에는 포함된다. 일부 이메일 형식과 전체 입력 검증·권한은 미구현이다. locale은 제한된 validator.js 호환 검증을 지원한다.
 - 제한적인 `PATCH /v2/subscribers/:subscriberId`: 이름·제한적인 ASCII 이메일·전화·아바타·locale·`data`의 부분 갱신과 null을 처리하고 동일 구독자의 동시 갱신을 직렬화한다. 지원 필드의 타입 오류는 제한적으로 422를 반환한다. 일부 이메일 형식과 전체 입력 검증·권한은 미구현이며, 지원하지 않는 필드는 501로 거절한다.
 - 제한적인 `DELETE /v2/subscribers/:subscriberId`: API 키 환경에 속한 실험 구독자와 저장된 인앱 메시지, 구독별 설정을 하나의 PostgreSQL 문으로 삭제하며 전역·워크플로 설정과 토픽 구독은 외래 키로 함께 정리한다. 구독별 설정은 v1 관계 삭제 등으로 구독이 이미 없어진 경우에도 구독자의 내부 ID를 기준으로 제거한다. FCM 토큰과 실험 이메일·SMS·푸시 이력도 삭제한다. 전체 채널 연결 데이터와 대기 작업의 모든 의미는 미구현 또는 미검증이다.
-- 제한적인 `GET /v2/subscribers/:subscriberId/notifications/count`: API 키 환경에 속한 인앱 메시지를 `read`·`seen`·`archived`와 태그 필터별로 세고 각 결과를 최대 100으로 제한한다. 태그는 배열·`or`·여러 `or` 그룹의 `and`를 지원한다. 나머지 필터·인증 방식 및 Inbox 전체 계약은 미구현이다.
+- 제한적인 `GET /v2/subscribers/:subscriberId/notifications/count`: API 키 환경에 속한 인앱 메시지를 `read`·`seen`·`archived`와 태그 필터별로 세고 각 결과를 최대 100으로 제한한다. 태그는 배열·`or`·여러 `or` 그룹의 `and`를 지원한다. severity·snoozed 필터도 제한적으로 지원한다. count 필터 객체의 `contextKeys`는 원본과 같이 유효성만 확인하고 카운트에 적용하지 않는다. 이 값으로 데이터 격리가 보장되지 않으므로 사용하지 않는다. Inbox 세션의 context 범위는 별도로 정확히 적용한다. 나머지 필터·인증 방식 및 Inbox 전체 계약은 미구현이다.
 - 제한적인 구독자 알림 일괄 상태 변경: `POST .../notifications/read`, `archive`, `read-archive`에서 전체 또는 태그·data 조건에 맞는 인앱 메시지의 읽음·확인·보관 상태와 관련 시각을 갱신하고 제한적인 읽지 않은 수 이벤트를 발행한다. 관리 API의 context 필터와 웹훅·추적은 구현하지 않았다.
 - 제한적인 `POST .../notifications/seen`: 인앱 메시지 전체, 태그·data 조건 또는 24자리 hex ID 목록을 확인 처리하고 최초·마지막 확인 시각을 저장한다. ID 목록이 있으면 필터보다 우선하며 빈 ID 배열은 원본처럼 구독자 유무와 무관하게 성공한다. 제한적인 미확인 수 이벤트를 발행하며 관리 API의 context 필터, 웹훅·추적은 미구현이다.
 - 제한적인 `GET .../notifications`: 실험 워크플로 메타데이터가 설정된 메시지의 ID, 구독자, 내용, 상태, 시각, 워크플로 및 data 또는 payload를 조회한다. `read`·`seen`·`archived`, 단일 또는 반복 `tags` OR 필터, 제한적인 `data` 필터와 `limit`·`offset`·같은 환경의 `after` 커서를 지원한다. 메타데이터 누락·미지원 옵션은 501이며 나머지 Inbox DTO와 필터 전체를 구현한 것은 아니다.
@@ -62,13 +62,15 @@ API 마이그레이션 `0004_sendgrid_webhooks.sql`은 환경별 SendGrid 공개
 | 워크플로 | 다단계 실행, 조건·분기, 지연·digest의 실제 워크플로 처리, 취소, bridge/stateless 워크플로, actor·tenant·복잡한 context, 첨부와 overrides. 큐 기본 연산의 존재는 워크플로 지원을 뜻하지 않는다. |
 | 구독자·설정 | Unicode·따옴표 이메일과 해당 오류 응답, 나머지 구독자 관리 API, topic, 나머지 사용자별/워크플로별 알림 설정, channel 연결·자격증명. 실험 스키마는 원본 데이터 모델의 대체물이 아니다. |
 | 템플릿 | Handlebars 전체 문법, helpers, blocks, 부동소수·안전 범위를 벗어난 정수·배열·객체 보간, 번역, 일부 사용자 프로필 및 사용자 정의 branding. 지원 범위의 일부 입력만 검증되었다. |
-| Inbox·실시간 | Inbox 목록의 나머지 DTO·복잡한 태그 쿼리·필터 오류·커서 사례, data 필터의 미검증 MongoDB 배열 경계, snooze·action 등 나머지 개별 상태 변경, 일괄 작업 및 삭제의 context 필터·설정 API, 카운트의 severity 필터와 잘못된 태그 오류 응답, 나머지 session 계약, Socket.IO 이벤트·SDK 전체 호환성, 상태 변경과 삭제 이벤트·웹훅, 실시간 전달과 다중 인스턴스 fan-out·복구. |
+| Inbox·실시간 | Inbox 목록의 나머지 DTO·복잡한 태그 쿼리·필터 오류·커서 사례, data 필터의 미검증 MongoDB 배열 경계, snooze·action 등 나머지 개별 상태 변경, 일괄 작업 및 삭제의 context 필터·설정 API, 카운트의 나머지 필터와 잘못된 태그 오류 응답, 나머지 session 계약, Socket.IO 이벤트·SDK 전체 호환성, 상태 변경과 삭제 이벤트·웹훅, 실시간 전달과 다중 인스턴스 fan-out·복구. |
 | 채널 | 이메일은 제한적인 SendGrid 워크플로와 실험 워커가 있고, SMS는 수동 설정한 제한적인 Twilio 워크플로와 실험 워커가 있다. 푸시는 수동 설정한 제한적인 FCM 워크플로와 실험 워커가 있다. 채팅 발송과 채널 통합 관리, 원본 호환 결과·재시도·웹훅은 미구현이다. 실제 외부 서비스 발송은 검증하지 않았다. 인앱도 완전한 Inbox 전달이 아니다. |
 | 큐 정책 | 원본 각 단계의 전달·실패·재시도·백오프·중복·취소·보존 정책 전체. 실험용 트리거 ID 기록은 무기한 유지되며 원본의 요금제별 보존과 같지 않다. DB 장애 시 워커는 종료하며 외부 재시작이 필요하다. 만료 인앱 작업의 실험적 자동 복구는 원본과 정책을 비교하지 않았다. |
 | 운영·이전 | 운영용 DB 마이그레이션과 MongoDB 데이터 이전, 키 관리, 서비스 간 TLS, 관측성, 백업 복구·고가용성·부하 및 용량 계획. 실험 SQL은 빈 테스트 DB에만 적용한다. |
 | 에디션·범위 | 클론은 shallow이고 enterprise 서브모듈 `.source`는 초기화되지 않았다. Enterprise/Cloud 전용 기능과 라이선스 범위, 외부 패키지·서비스는 별도 확인이 필요하다. |
 
 ## 수행한 검증
+
+- 구독자 count 필터 객체의 `contextKeys` 배열·빈 배열·null과 severity 조합을 원본 API 및 Rust API에서 비교했다. 현재 원본은 해당 필드를 반환하면서 실제 카운트에는 적용하지 않으며 Rust도 같은 결과를 반환했다. 이는 인증된 Inbox 세션 자체의 context 범위와 별개다. 잘못된 입력의 오류 DTO는 비교하지 않았다. [비교 테스트](apps/api/rust-api/tests/reference_count_severity_compare.py).
 
 - 2026-11-12 기준 코드에서 Docker의 원본 API·워커와 Rust API·워커를 다시 실행해 대기 중 발송을 비교했다. SendGrid 11개, Twilio 10개, FCM 16개 선택 사례에서 모의 provider 요청과 관련 상태가 각 스크립트의 검증 범위 내에서 일치했다. 세 비교는 `NOVU_ALLOW_RECREATED_SUBSCRIBER=true` 호환 모드이며, 실제 provider 발송과 전체 채널·장애 정책을 검증하지 않는다. 별도 actor 삭제·재생성의 원본과 기본 안전 모드 차이는 위에 기록했다. [이메일](apps/api/rust-api/tests/reference_email_queued_compare.py), [SMS](apps/api/rust-api/tests/reference_sms_queued_compare.py), [푸시](apps/api/rust-api/tests/reference_push_queued_compare.py).
 

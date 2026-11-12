@@ -21,7 +21,7 @@ SELECT gen_random_uuid(),lpad(n::text,24,'0'),'64a000000000000000000002','alice'
 CASE n WHEN 3 THEN 'none' WHEN 4 THEN 'low' WHEN 5 THEN 'medium' WHEN 6 THEN 'high' END,n<>1,'2024-01-01T00:00:00Z' FROM generate_series(1,6) n"""
 subprocess.run(['docker','exec',postgres,'psql','-v','ON_ERROR_STOP=1','-U','postgres','-d','novu_compat','-c',sql],check=True,stdout=subprocess.DEVNULL)
 subprocess.run(['docker','exec',redis,'redis-cli','FLUSHALL'],check=True,stdout=subprocess.DEVNULL)
-filters=[{}, {'severity':'none'}, {'severity':'low'}, {'severity':'medium'}, {'severity':'high'}, {'severity':['none','high']}, {'severity':[]}, {'severity':None}, {'severity':['low','medium'], 'read':False}, {'severity':['none','low'], 'tags':['news']}]
+filters=[{}, {'severity':'none'}, {'severity':'low'}, {'severity':'medium'}, {'severity':'high'}, {'severity':['none','high']}, {'severity':[]}, {'severity':None}, {'severity':['low','medium'], 'read':False}, {'severity':['none','low'], 'tags':['news']}, {'contextKeys':['tenant:missing']}, {'contextKeys':[]}, {'contextKeys':None}, {'contextKeys':['tenant:missing'], 'severity':'high'}]
 query=urllib.parse.urlencode({'filters':json.dumps(filters,separators=(',',':'))})
 def request(base):
     req=urllib.request.Request(base+'/v2/subscribers/alice/notifications/count?'+query,headers={'Authorization':'ApiKey '+os.environ['NOVU_TEST_API_KEY']})
@@ -29,8 +29,8 @@ def request(base):
         return response.status,json.load(response)
 left,right=(request(os.environ[name]) for name in ('NOVU_REFERENCE_URL','NOVU_RUST_URL'))
 assert left==right,(left,right)
-assert [item['count'] for item in left[1]['data']]==[6,2,1,1,1,3,6,6,1,3],left
-print('severity counts, missing/null, arrays and combined filters: match')
+assert [item['count'] for item in left[1]['data']]==[6,2,1,1,1,3,6,6,1,3,6,6,6,1],left
+print('severity counts and filter contextKeys: match')
 
 # The list DTO must return message severity separately from workflow severity.
 for params in [[], [('severity','none')], [('severity','high')], [('severity','low'),('severity','medium')], [('severity','none'),('severity','high'),('read','false')]]:

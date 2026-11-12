@@ -1670,6 +1670,14 @@ async fn count_notifications_for(
                         !value.is_boolean() && !value.is_null()
                     }
                     "tags" => normalize_tag_groups(value).is_none(),
+                    // Novu validates filter.contextKeys, but its DAL does not
+                    // apply this property to the count query.
+                    "contextKeys" => {
+                        !value.is_null()
+                            && value
+                                .as_array()
+                                .is_none_or(|keys| !keys.iter().all(Value::is_string))
+                    }
                     "severity" => {
                         let valid = |v: &Value| {
                             matches!(v.as_str(), Some("none" | "low" | "medium" | "high"))
