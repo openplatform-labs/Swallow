@@ -72,6 +72,20 @@ async fn changed_actor_is_rejected_by_all_channels() {
         db.batch_execute(migration).await.unwrap();
     }
 
+    db.batch_execute(
+        "CREATE TABLE novu_rust_environments(id text PRIMARY KEY, organization_id text NOT NULL)",
+    )
+    .await
+    .unwrap();
+    db.batch_execute(crate::reconciliation::MIGRATION)
+        .await
+        .unwrap();
+    db.batch_execute(include_str!(
+        "../../../api/rust-api/migrations/0004_sendgrid_webhooks.sql"
+    ))
+    .await
+    .unwrap();
+
     db.batch_execute("INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES ('env','recipient','recipient-internal','{\"email\":\"r@example.test\",\"phone\":\"+15555555555\"}'),('env','actor','old-id','{\"firstName\":\"Original\"}'); INSERT INTO novu_rust_workflows(environment_id,identifier,in_app_content,email_subject,email_html,sms_content,push_title,push_content) VALUES ('env','workflow','hello','{{actor.firstName}}','hello','{{actor.firstName}}','{{actor.firstName}}','hello'); INSERT INTO novu_rust_fcm_devices(environment_id,subscriber_id,device_tokens) VALUES ('env','recipient',ARRAY['device']);").await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());

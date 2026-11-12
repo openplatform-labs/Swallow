@@ -25,7 +25,7 @@ API, 인앱·SendGrid·Twilio·FCM 워커 및 WS의 조회·이벤트 연결은 
 
 [0053 마이그레이션](apps/worker/rust-queue/migrations/0053_delivery_state.sql)은 실험 이메일·SMS·푸시 이력에 `delivery_state`를 추가한다. `not_attempted`, `dispatching`, 멀티캐스트의 `in_progress`, provider `accepted`·`rejected`, 결과 `unknown`을 구분한다. `accepted`는 provider 접수이며 실제 수신이 아니다. 기존 원본 호환 `status`의 `sent` 의미는 바꾸지 않으므로 운영 판단에는 두 필드를 함께 확인해야 한다. 외부 요청 중 임대가 만료되면 복구가 이력을 `unknown`으로 갱신한다. 기존 이력은 연결된 단일 발송 시도에서 상태를 이관하고, 시도 기록이 없거나 복수 대상 그룹의 과거 결과를 확정할 수 없으면 `unknown`으로 남긴다.
 
-이 필드는 현재 PostgreSQL 이력에만 있으며 완전한 메시지 API나 운영 화면에는 노출되지 않는다. provider 웹훅·실제 수신 확인과 결과 불명 알림은 미구현이다. 불명 상태는 자동 재발송하지 않으므로 발송 누락 가능성도 남는다. 채널별 이력 상태 갱신과 FCM 그룹 집계에 DB 작업이 추가된다.
+이 필드는 현재 PostgreSQL 이력에만 있으며 완전한 메시지 API나 운영 화면에는 노출되지 않는다. SendGrid·Twilio의 서명 웹훅은 아래의 제한된 증거 수집과 재시도 보호를 지원하며, 전체 provider 웹훅·실제 수신 확인과 결과 불명 알림은 미완성이다. 불명 상태는 자동 재발송하지 않으므로 발송 누락 가능성도 남는다. 채널별 이력 상태 갱신과 FCM 그룹 집계에 DB 작업이 추가된다.
 
 [0054 마이그레이션](apps/worker/rust-queue/migrations/0054_delivery_reconciliation.sql)과 `delivery-reconcile` 도구는 환경별 불명 시도를 페이지당 최대 100건 조회하고, 운영자가 provider 측 증거를 확인한 뒤 재시도 또는 접수 확인을 기록한다. 작업 잠금과 트랜잭션으로 중복 결정과 다른 환경 변경을 차단하고 DB 사용자·운영자 이름·사유·이전 HTTP 상태를 감사 테이블에 저장한다. 예를 들어 `cargo run --bin delivery-reconcile -- list ENV`, `cargo run --bin delivery-reconcile -- retry ENV JOB - OPERATOR TICKET`을 사용하며 FCM은 `-` 대신 대상 인덱스를 지정한다. `accepted`는 `retry` 대신 전달한다. 다음 페이지는 마지막 행의 값으로 `list ENV AFTER_JOB AFTER_TARGET`을 호출하며 target이 null이면 `-`를 사용한다. 조회 중 데이터가 바뀌면 누락될 수 있으므로 처음부터 다시 확인해야 한다. TLS 연결 설정과 워커 마이그레이션 0056까지 필요하다. 0056은 기존 감사 행에 순서 값을 채우고 인덱스를 생성하므로 테이블 잠금과 작업량을 고려해 적용해야 하며 운영 환경 마이그레이션은 아직 검증하지 않았다. `evidence ENV EMAIL_JOB`은 서명 검증을 통과해 기록된 SendGrid 이벤트의 유형별 건수와 서로 다른 수신자 해시 수를 요약한다. API의 0004 마이그레이션과 해당 테이블 읽기 권한이 필요하며, 이 요약만으로 모든 예정 수신자에게 전달됐는지 증명할 수 없다.
 
@@ -37,6 +37,8 @@ API 마이그레이션 `0004_sendgrid_webhooks.sql`은 환경별 SendGrid 공개
 
 `delivered`, `bounce`, `dropped`, `blocked`, `deferred`, `processed` 이벤트의 근거만 저장하며, `delivered`는 수신 메일 서버의 수락이지 수신함 표시나 사용자의 읽음을 보장하지 않는다. 이벤트를 자동으로 `delivery_state`·작업 상태에 반영하거나 불명 작업을 재시도하지 않는다. 검증 후 7일이 넘는 서명 timestamp는 거절하며 배치 1,000개·본문 1 MiB와 활성 키 10개로 제한한다. 서명이 없는 원본 Novu 요청과 통합 ID 경로, 원본 webhook 응답 및 전체 이벤트 계약은 호환되지 않는다. 키 관리 API·회전 자동화, 이벤트 보존·삭제, 받는 사람별 집계, 원본 webhook 서버와 실제 SendGrid의 종단 간 검증, 운영 접근 제어는 미구현 또는 미검증이다. 외부 HTTPS 종단과 방화벽·DB 권한을 별도로 구성해야 한다. [격리 테스트](apps/api/rust-api/tests/sendgrid_webhook.rs)는 임시 서명 키와 PostgreSQL로 변조·재생·환경 격리·유효하지 않은 배치를 확인한다.
 
+
+SendGrid 이메일의 수동 `retry`도 같은 환경·이메일 작업에 연결된 인증 이벤트가 한 건이라도 있으면 거절한다. 한 수신자의 이벤트는 전체 수신자에게 전달됐음을 증명하지 않지만 전체 요청을 다시 보내면 중복될 수 있기 때문이다. 재시도 결정 이후 이벤트가 도착할 경우 워커도 발송 전에 확인해 불명 상태로 복원한다. 배치 웹훅은 연관된 작업을 ID 순서로 잠가 재시도 검사와 직렬화한다. 배포 시 API 인스턴스를 모두 먼저 교체하고 이후 워커와 재조정 도구를 교체해야 하며, 이전 API가 남아 있는 동안에는 이 직렬화를 보장하지 못한다. API의 DB 계정은 큐 행 잠금에 필요한 SELECT·UPDATE 권한이 필요하며, 이메일 워커와 재조정 도구는 API 마이그레이션 0004의 이벤트 테이블과 워커 감사 테이블 읽기 권한이 필요하다. 기존 이메일 이벤트에는 시도 ID가 없어 이전 시도의 이벤트도 재시도를 보수적으로 막을 수 있다. 메시지 연결이 없거나 삭제된 이벤트, 서명 검증되지 않은 이벤트, 검사 트랜잭션이 끝난 뒤 도착한 이벤트는 재발송을 막지 못한다. 거절 명령의 별도 감사 이력과 실제 SendGrid 호출·콜백 검증은 아직 없다. Docker PostgreSQL에서 서명된 SendGrid 이벤트 수신 후 재시도 거절, 재시도 결정 후 이벤트 도착 시 재발송 중단, 작업 잠금 대기 및 환경 격리를 검증했다. 원본 Novu와 모의 SendGrid를 이용한 대기 이메일 11개 선택 사례도 비교했다. 이벤트 조회 및 웹훅 배치의 작업 행 잠금 비용이 추가된다.
 
 ### 서명된 Twilio SMS 상태 이벤트
 

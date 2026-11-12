@@ -122,12 +122,22 @@ pub async fn resolve(
     } else {
         None
     };
+    if kind == crate::sendgrid_queue::JOB_KIND && decision == "retry" {
+        // Any recipient event means that SendGrid accepted at least part of
+        // this request. Retrying the full request could duplicate delivery.
+        let evidence: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_sendgrid_delivery_events e JOIN novu_rust_email_messages m ON m.environment_id=e.environment_id AND m.internal_id=e.message_internal_id WHERE m.environment_id=$1 AND m.email_job_id=$2)", &[&environment,&job]).await?.get(0);
+        if evidence {
+            tx.rollback().await?;
+            return Err("email retry refused: authenticated provider callback already exists; inspect evidence".into());
+        }
+    }
     if kind == crate::twilio_queue::JOB_KIND && decision == "retry" {
         // Webhook inserts serialize on the same job row. A callback already
         // committed at this point proves Twilio accepted some request; never
         // assert non-acceptance for the matching or ambiguous dispatch.
         let evidence: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_twilio_delivery_events WHERE environment_id=$1 AND job_id=$2 AND ($3::uuid IS NULL OR dispatch_id IS NULL OR dispatch_id=$3))", &[&environment,&job,&retry_dispatch]).await?.get(0);
         if evidence {
+            tx.rollback().await?;
             return Err("SMS retry refused: authenticated provider callback already exists; inspect sms-evidence".into());
         }
     }

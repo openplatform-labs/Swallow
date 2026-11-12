@@ -73,6 +73,18 @@ pub async fn process_one(
         tx.rollback().await?;
         return Ok(true);
     }
+    // Webhook insertion and this check serialize on the job row. Email
+    // events lack per-attempt IDs, so older linked evidence is conservative.
+    let evidence = tx.query_opt("SELECT 1 FROM novu_rust_delivery_reconciliations r WHERE r.environment_id=$1 AND r.job_id=$2 AND r.target_index IS NULL AND r.decision='retry' AND EXISTS(SELECT 1 FROM novu_rust_sendgrid_delivery_events e JOIN novu_rust_email_messages m ON m.environment_id=e.environment_id AND m.internal_id=e.message_internal_id WHERE m.environment_id=$1 AND m.email_job_id=$2) LIMIT 1", &[&environment,&job.id]).await?;
+    if evidence.is_some() {
+        let inserted = tx.execute("INSERT INTO novu_rust_sendgrid_attempts(job_id,environment_id,state) VALUES ($1,$2,'unknown') ON CONFLICT(job_id) DO NOTHING", &[&job.id,&environment]).await?;
+        if inserted == 1 {
+            tx.execute("UPDATE novu_rust_email_messages SET delivery_state='unknown',status='error',error_id='mail_unexpected_error',error_text='email retry blocked by provider callback' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
+        }
+        tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='email retry blocked by provider callback',lease_token=NULL,lease_until=NULL WHERE id=$1 AND environment_id=$2", &[&job.id,&environment]).await?;
+        tx.commit().await?;
+        return Ok(true);
+    }
     if let Some(context) = email.workflow_context.take() {
         let skip = if let Some(row) = subscriber.as_ref() {
             if !crate::allow_recreated_subscriber()
@@ -447,6 +459,12 @@ mod tests {
         db.batch_execute(crate::reconciliation::RETRY_DISPATCH_MIGRATION)
             .await
             .unwrap();
+        db.batch_execute("CREATE TABLE IF NOT EXISTS novu_rust_environments(id text PRIMARY KEY, organization_id text NOT NULL); INSERT INTO novu_rust_environments VALUES ('env-a','org') ON CONFLICT DO NOTHING").await.unwrap();
+        db.batch_execute(include_str!(
+            "../../../api/rust-api/migrations/0004_sendgrid_webhooks.sql"
+        ))
+        .await
+        .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/v3/mail/send", listener.local_addr().unwrap());
         let provider = Sendgrid::test_endpoint(
@@ -728,5 +746,51 @@ mod tests {
         assert_eq!(row.get::<_, String>(1), "accepted");
         assert_eq!(row.get::<_, String>(2), "accepted");
         assert!(!process_one(&mut db, "env-a", &provider).await.unwrap());
+
+        // Evidence arriving after the operator's retry decision stops the
+        // queued job before another provider request is made.
+        let late = Uuid::new_v4();
+        crate::enqueue(&db, late, "env-a", JOB_KIND, &message)
+            .await
+            .unwrap();
+        db.execute(
+            "UPDATE novu_queue_jobs SET status='failed' WHERE id=$1",
+            &[&late],
+        )
+        .await
+        .unwrap();
+        db.execute("INSERT INTO novu_rust_sendgrid_attempts(job_id,environment_id,state) VALUES ($1,'env-a','unknown')", &[&late]).await.unwrap();
+        db.execute("INSERT INTO novu_rust_email_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,subject,status,email_job_id,delivery_state) VALUES ('late-email','env-a','s','s','n','w','t','subject','error',$1,'unknown')", &[&late]).await.unwrap();
+        crate::reconciliation::resolve(
+            &mut db, "env-a", late, None, "retry", "operator", "verified",
+        )
+        .await
+        .unwrap();
+        db.execute("INSERT INTO novu_rust_sendgrid_delivery_events(environment_id,event_id,message_internal_id,event_type,event_timestamp,recipient_hash) VALUES ('env-a','late','late-email','delivered',1,'hash')", &[]).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider = Sendgrid::test_endpoint(
+            Config {
+                api_key: "SG.fixture".into(),
+                from: "sender@example.test".into(),
+                sender_name: "Sender".into(),
+                region: Region::Global,
+            },
+            &format!("http://{}/v3/mail/send", listener.local_addr().unwrap()),
+        )
+        .unwrap();
+        assert!(process_one(&mut db, "env-a", &provider).await.unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+        let row = db.query_one("SELECT j.status,j.last_error,a.state,m.delivery_state FROM novu_queue_jobs j JOIN novu_rust_sendgrid_attempts a ON a.job_id=j.id JOIN novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1", &[&late]).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), "failed");
+        assert_eq!(
+            row.get::<_, String>(1),
+            "email retry blocked by provider callback"
+        );
+        assert_eq!(row.get::<_, String>(2), "unknown");
+        assert_eq!(row.get::<_, String>(3), "unknown");
     }
 }

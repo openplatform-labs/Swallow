@@ -34,6 +34,9 @@ async fn signed_events_are_scoped_idempotent_and_private() {
         novu_rust_api::MIGRATION,
         novu_postgres_queue::MIGRATION,
         novu_postgres_queue::in_app::EMAIL_MESSAGES_MIGRATION,
+        novu_postgres_queue::sendgrid_queue::MIGRATION,
+        novu_postgres_queue::reconciliation::MIGRATION,
+        novu_postgres_queue::reconciliation::RETRY_DISPATCH_MIGRATION,
         include_str!("../migrations/0004_sendgrid_webhooks.sql"),
     ] {
         db.batch_execute(sql).await.unwrap();
@@ -51,6 +54,24 @@ async fn signed_events_are_scoped_idempotent_and_private() {
     db.batch_execute("INSERT INTO novu_rust_environments VALUES ('env-a','org-a'),('env-b','org-b'); INSERT INTO novu_rust_email_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,subject,status) VALUES ('64a000000000000000000099','env-a','s','s','n','w','t','subject','sent'),('64a000000000000000000098','env-b','s','s','n','w','t','subject','sent')").await.unwrap();
     db.execute("INSERT INTO novu_rust_sendgrid_webhook_keys(environment_id,key_id,public_key_base64) VALUES ('env-a','key',$1)", &[&public]).await.unwrap();
     assert!(db.execute("INSERT INTO novu_rust_sendgrid_webhook_keys(environment_id,key_id,public_key_base64) VALUES ('env-b','reused',$1)", &[&public]).await.is_err());
+    let job = uuid::Uuid::new_v4();
+    novu_postgres_queue::enqueue(
+        &db,
+        job,
+        "env-a",
+        novu_postgres_queue::sendgrid_queue::JOB_KIND,
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE novu_queue_jobs SET status='failed' WHERE id=$1",
+        &[&job],
+    )
+    .await
+    .unwrap();
+    db.execute("UPDATE novu_rust_email_messages SET email_job_id=$1 WHERE internal_id='64a000000000000000000099'", &[&job]).await.unwrap();
+    db.execute("INSERT INTO novu_rust_sendgrid_attempts(job_id,environment_id,state) VALUES ($1,'env-a','unknown')", &[&job]).await.unwrap();
     let db = Arc::new(db);
     let router = novu_rust_api::router_with_subscriber_secret(db.clone(), None);
     let event = json!([{"id":"64a000000000000000000099","event":"delivered","sg_event_id":"event-1","timestamp":1730000000,"email":"private@example.test"}]);
@@ -91,6 +112,56 @@ async fn signed_events_are_scoped_idempotent_and_private() {
     let (status, body) = call(router.clone(), path, &timestamp, &signature, raw.clone()).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["recorded"], 1);
+    let (mut operator_db, operator_driver) =
+        tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(), NoTls)
+            .await
+            .unwrap();
+    tokio::spawn(async move {
+        operator_driver.await.unwrap();
+    });
+    let err = novu_postgres_queue::reconciliation::resolve(
+        &mut operator_db,
+        "env-a",
+        job,
+        None,
+        "retry",
+        "operator",
+        "ticket",
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("authenticated provider callback"));
+    let row = db.query_one("SELECT j.status,a.state FROM novu_queue_jobs j JOIN novu_rust_sendgrid_attempts a ON a.job_id=j.id WHERE j.id=$1", &[&job]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "failed");
+    assert_eq!(row.get::<_, String>(1), "unknown");
+    // Signed batch insertion locks matching jobs, serializing against retry.
+    operator_db.batch_execute("BEGIN").await.unwrap();
+    operator_db
+        .query_one(
+            "SELECT id FROM novu_queue_jobs WHERE id=$1 FOR UPDATE",
+            &[&job],
+        )
+        .await
+        .unwrap();
+    let waiting_router = router.clone();
+    let waiting_timestamp = timestamp.clone();
+    let waiting_signature = signature.clone();
+    let waiting_raw = raw.clone();
+    let callback = tokio::spawn(async move {
+        call(
+            waiting_router,
+            path,
+            &waiting_timestamp,
+            &waiting_signature,
+            waiting_raw,
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!callback.is_finished());
+    operator_db.batch_execute("COMMIT").await.unwrap();
+    assert_eq!(callback.await.unwrap().0, StatusCode::OK);
+
     let (status, body) = call(router.clone(), path, &timestamp, &signature, raw.clone()).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["recorded"], 0);

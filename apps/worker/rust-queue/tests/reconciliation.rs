@@ -165,20 +165,87 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
             .await
             .is_err()
     );
+    // A previously authenticated event rejects retry without changing state.
+    let denied = reconciliation::resolve(
+        &mut db, "tenant-a", email, None, "retry", "operator", "ticket",
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        denied
+            .to_string()
+            .contains("authenticated provider callback")
+    );
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .args([
+            "retry",
+            "tenant-a",
+            &email.to_string(),
+            "-",
+            "operator",
+            "ticket",
+        ])
+        .env("DATABASE_URL", &url)
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("authenticated provider callback"));
+    let row = db.query_one("SELECT j.status,a.state,(SELECT count(*) FROM novu_rust_delivery_reconciliations WHERE job_id=j.id) FROM novu_queue_jobs j JOIN novu_rust_sendgrid_attempts a ON a.job_id=j.id WHERE j.id=$1", &[&email]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "failed");
+    assert_eq!(row.get::<_, String>(1), "unknown");
+    assert_eq!(row.get::<_, i64>(2), 0);
+    reconciliation::resolve(
+        &mut db, "tenant-a", email, None, "accepted", "operator", "verified",
+    )
+    .await
+    .unwrap();
+    let email_retry = Uuid::new_v4();
+    queue::enqueue(
+        &db,
+        email_retry,
+        "tenant-a",
+        queue::sendgrid_queue::JOB_KIND,
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE novu_queue_jobs SET status='failed' WHERE id=$1",
+        &[&email_retry],
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO novu_rust_sendgrid_attempts(job_id,environment_id,state) VALUES ($1,'tenant-a','unknown')", &[&email_retry]).await.unwrap();
+    db.execute("INSERT INTO novu_rust_email_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,subject,status,email_job_id,delivery_state) VALUES ('email-retry','tenant-a','s','s','n','w','t','subject','error',$1,'unknown')", &[&email_retry]).await.unwrap();
+    // A message ID collision from another environment does not block retry.
+    db.batch_execute("INSERT INTO novu_rust_sendgrid_delivery_events(environment_id,event_id,message_internal_id,event_type,event_timestamp,recipient_hash) VALUES ('tenant-b','cross-retry','email-retry','delivered',104,'hash')").await.unwrap();
     let (mut other, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move {
         connection.await.unwrap();
     });
     let (a, b) = tokio::join!(
         reconciliation::resolve(
-            &mut db, "tenant-a", email, None, "retry", "operator", "ticket 1"
+            &mut db,
+            "tenant-a",
+            email_retry,
+            None,
+            "retry",
+            "operator",
+            "ticket 1"
         ),
         reconciliation::resolve(
-            &mut other, "tenant-a", email, None, "retry", "operator", "ticket 1"
+            &mut other,
+            "tenant-a",
+            email_retry,
+            None,
+            "retry",
+            "operator",
+            "ticket 1"
         )
     );
     assert_ne!(a.is_ok(), b.is_ok());
-    let row=db.query_one("SELECT status,(SELECT count(*) FROM novu_rust_sendgrid_attempts WHERE job_id=$1),(SELECT delivery_state FROM novu_rust_email_messages WHERE email_job_id=$1) FROM novu_queue_jobs WHERE id=$1", &[&email]).await.unwrap();
+    let row=db.query_one("SELECT status,(SELECT count(*) FROM novu_rust_sendgrid_attempts WHERE job_id=$1),(SELECT delivery_state FROM novu_rust_email_messages WHERE email_job_id=$1) FROM novu_queue_jobs WHERE id=$1", &[&email_retry]).await.unwrap();
     assert_eq!(row.get::<_, String>(0), "pending");
     assert_eq!(row.get::<_, i64>(1), 0);
     assert_eq!(row.get::<_, String>(2), "not_attempted");
@@ -219,7 +286,7 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
             .is_empty()
     );
     let audits:i64=db.query_one("SELECT count(*) FROM novu_rust_delivery_reconciliations WHERE environment_id='tenant-a' AND operator_name='operator' AND database_user=current_user", &[]).await.unwrap().get(0);
-    assert_eq!(audits, 3);
+    assert_eq!(audits, 4);
     let pending = Uuid::new_v4();
     queue::enqueue(&db,pending,"tenant-a",queue::fcm_queue::JOB_KIND,&json!({"prepared_messages":[{},{}],"prepared_context":{"target_metadata":[{"history_index":0,"group_size":2},{"history_index":0,"group_size":2}]}})).await.unwrap();
     db.execute(
