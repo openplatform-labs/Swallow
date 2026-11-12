@@ -57,6 +57,14 @@ async fn worker_recovers_expired_jobs_and_isolates_invalid_jobs() {
         in_app::MESSAGE_SEVERITY_MIGRATION,
         in_app::IN_APP_STEP_ACTIVE_MIGRATION,
         in_app::NOTIFICATIONS_MIGRATION,
+        in_app::EMAIL_STEP_MIGRATION,
+        in_app::EMAIL_MESSAGES_MIGRATION,
+        in_app::EMAIL_PROVIDER_RESULT_MIGRATION,
+        in_app::EMAIL_STEP_ID_MIGRATION,
+        in_app::EMAIL_REVALIDATION_MIGRATION,
+        in_app::SMS_STEP_MIGRATION,
+        in_app::SMS_MESSAGES_MIGRATION,
+        in_app::SMS_STEP_ID_MIGRATION,
     ] {
         db.batch_execute(migration).await.unwrap();
     }

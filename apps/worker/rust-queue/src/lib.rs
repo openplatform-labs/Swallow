@@ -1,5 +1,9 @@
 //! PostgreSQL queue primitives for the Rust rewrite. This is not yet a Novu-compatible worker.
 pub mod in_app;
+pub mod sendgrid;
+pub mod sendgrid_queue;
+pub mod twilio;
+pub mod twilio_queue;
 
 use serde_json::Value;
 use std::time::Duration;

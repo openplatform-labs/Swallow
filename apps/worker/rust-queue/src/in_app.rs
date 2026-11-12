@@ -21,6 +21,48 @@ impl Error for InvalidJob {}
 #[derive(Debug)]
 struct LeaseLost;
 
+// Restricted ASCII header-key conversion matching the reference provider's
+// camelCase transform for the accepted header characters.
+fn provider_header_key(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut words = Vec::new();
+    let mut word = String::new();
+    for (index, c) in chars.iter().copied().enumerate() {
+        if c == '-' {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+            continue;
+        }
+        let boundary = index > 0
+            && c.is_ascii_uppercase()
+            && (chars[index - 1].is_ascii_lowercase()
+                || (chars[index - 1].is_ascii_uppercase()
+                    && chars.get(index + 1).is_some_and(char::is_ascii_lowercase)));
+        if boundary && !word.is_empty() {
+            words.push(std::mem::take(&mut word));
+        }
+        word.push(c);
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    let mut result = String::new();
+    for (index, word) in words.iter().enumerate() {
+        let lower = word.to_ascii_lowercase();
+        if index == 0 {
+            result.push_str(&lower);
+        } else {
+            let mut chars = lower.chars();
+            if let Some(first) = chars.next() {
+                result.push(first.to_ascii_uppercase());
+            }
+            result.extend(chars);
+        }
+    }
+    result
+}
+
 impl std::fmt::Display for LeaseLost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("job lease expired or was replaced")
@@ -90,6 +132,21 @@ pub const IN_APP_STEP_ACTIVE_MIGRATION: &str =
     include_str!("../migrations/0033_experimental_in_app_step_active.sql");
 pub const NOTIFICATIONS_MIGRATION: &str =
     include_str!("../migrations/0034_experimental_notifications.sql");
+pub const EMAIL_STEP_MIGRATION: &str =
+    include_str!("../migrations/0036_experimental_email_step.sql");
+pub const EMAIL_MESSAGES_MIGRATION: &str =
+    include_str!("../migrations/0037_experimental_email_messages.sql");
+pub const EMAIL_PROVIDER_RESULT_MIGRATION: &str =
+    include_str!("../migrations/0038_experimental_email_provider_result.sql");
+pub const EMAIL_STEP_ID_MIGRATION: &str =
+    include_str!("../migrations/0039_experimental_email_step_id.sql");
+pub const EMAIL_REVALIDATION_MIGRATION: &str =
+    include_str!("../migrations/0040_experimental_email_revalidation.sql");
+pub const SMS_STEP_MIGRATION: &str = include_str!("../migrations/0042_experimental_sms_step.sql");
+pub const SMS_MESSAGES_MIGRATION: &str =
+    include_str!("../migrations/0043_experimental_sms_messages.sql");
+pub const SMS_STEP_ID_MIGRATION: &str =
+    include_str!("../migrations/0044_experimental_sms_step_id.sql");
 pub const JOB_KIND: &str = novu_rust_contracts::EXPERIMENTAL_IN_APP_JOB_KIND;
 pub const UNSNOOZE_JOB_KIND: &str = "experimental-in-app-unsnooze";
 type WorkerResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -176,7 +233,7 @@ pub fn unique_recipient_ids(recipients: &[String]) -> Vec<&str> {
 /// Atomically create subscribers/messages and complete the claimed job.
 /// Other Novu step types, complex templates, preferences and integrations are not supported.
 pub async fn process_one(client: &mut Client) -> WorkerResult<bool> {
-    process_one_with_lease(client, Duration::from_secs(60)).await
+    Box::pin(process_one_with_lease(client, Duration::from_secs(60))).await
 }
 
 /// Process at most one job with a caller-selected lease. Expired jobs remain
@@ -185,7 +242,7 @@ pub async fn process_one_with_lease(client: &mut Client, lease: Duration) -> Wor
     let Some(job) = crate::claim(client, JOB_KIND, lease).await? else {
         return Ok(false);
     };
-    match process_claimed(client, &job).await {
+    match Box::pin(process_claimed(client, &job)).await {
         Ok(()) => Ok(true),
         Err(error) if error.downcast_ref::<LeaseLost>().is_some() => Ok(true),
         Err(error) if error.downcast_ref::<InvalidJob>().is_some() => {
@@ -215,6 +272,11 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         .filter(|v| v.is_object())
         .ok_or(InvalidJob("invalid job payload"))?;
     let message_payload = novu_rust_contracts::message::in_app_payload(payload);
+    let email_override = match data.get("emailOverride") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Object(value)) => Some(value.clone()),
+        _ => return Err(InvalidJob("invalid email override").into()),
+    };
     let job_severity = match data.get("severity") {
         None | Some(serde_json::Value::Null) => "none",
         Some(serde_json::Value::String(value))
@@ -302,13 +364,37 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
     }
     // The reference's first workflow worker resolves the trigger identifier
     // after enqueue. Older queued jobs retain their previous semantics.
-    let (workflow_metadata, content, tags, step_active, workflow_internal_id) = if data
-        .get("severityOverride")
-        .is_some()
-    {
-        let row = tx.query_opt("SELECT inbox_metadata->>'severity',in_app_content,inbox_metadata->'tags',has_steps,in_app_step_active,inbox_metadata->>'id' FROM novu_rust_workflows WHERE environment_id=$1 AND identifier=$2", &[&job.environment_id, &workflow]).await?
+    let (
+        workflow_metadata,
+        content,
+        tags,
+        step_active,
+        workflow_internal_id,
+        email_step,
+        email_step_id,
+        sms_step,
+        sms_step_id,
+    ) = if data.get("severityOverride").is_some() {
+        let row = tx.query_opt("SELECT inbox_metadata->>'severity',in_app_content,inbox_metadata->'tags',has_steps,in_app_step_active,inbox_metadata->>'id',email_subject,email_html,email_step_active,email_step_id,sms_content,sms_step_active,sms_step_id FROM novu_rust_workflows WHERE environment_id=$1 AND identifier=$2", &[&job.environment_id, &workflow]).await?
             .ok_or(InvalidJob("workflow no longer exists"))?;
-        let step_active = row.get::<_, bool>(3) && row.get::<_, bool>(4);
+        let has_steps = row.get::<_, bool>(3);
+        let email_subject: Option<String> = row.get(6);
+        let email_html: Option<String> = row.get(7);
+        let email_configured = email_subject.is_some() && email_html.is_some();
+        let sms_content: Option<String> = row.get(10);
+        let sms_configured = sms_content.is_some();
+        let sms_step = sms_content.filter(|_| has_steps && row.get::<_, bool>(11));
+        let email_step = match (email_subject, email_html) {
+            (Some(subject), Some(html)) if has_steps && row.get::<_, bool>(8) => {
+                Some((subject, html))
+            }
+            (None, None) | (Some(_), Some(_)) => None,
+            _ => return Err(InvalidJob("invalid email step").into()),
+        };
+        let step_active = has_steps
+            && row.get::<_, bool>(4)
+            && (row.get::<_, Option<String>>(1).is_some()
+                || (!email_configured && !sms_configured));
         let current_content = match row.get::<_, Option<String>>(1) {
             Some(content) => content,
             None if !step_active => String::new(),
@@ -324,10 +410,117 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
             current_tags,
             step_active,
             row.get::<_, Option<String>>(5),
+            email_step,
+            row.get::<_, Option<String>>(9),
+            sms_step,
+            row.get::<_, Option<String>>(12),
         )
     } else {
-        (None, queued_content, queued_tags, true, None)
+        (
+            None,
+            queued_content,
+            queued_tags,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
     };
+    let mut merged_sms_override = data
+        .get("smsOverride")
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let sms_provider = data
+        .get("emailProviderOverrides")
+        .and_then(|v| v.get("twilio"));
+    let sms_step_provider = sms_step_id
+        .as_deref()
+        .and_then(|step| data.get("emailStepOverrides").and_then(|v| v.get(step)))
+        .and_then(|v| v.get("providers"))
+        .and_then(|v| v.get("twilio"));
+    for layer in [
+        data.get("smsFlatProviderOverride"),
+        sms_provider,
+        sms_step_provider,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !layer.is_null() {
+            merged_sms_override.extend(
+                layer
+                    .as_object()
+                    .ok_or(InvalidJob("invalid sms provider override"))?
+                    .clone(),
+            );
+        }
+    }
+    let mut provider_data = serde_json::Map::new();
+    let mut passthrough_body = serde_json::Map::new();
+    for layer in [sms_provider, sms_step_provider]
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_object)
+    {
+        for (key, value) in layer {
+            if key != "_passthrough" {
+                provider_data.insert(key.clone(), value.clone());
+            }
+        }
+        if let Some(body) = layer
+            .get("_passthrough")
+            .and_then(|v| v.get("body"))
+            .and_then(serde_json::Value::as_object)
+        {
+            passthrough_body.extend(body.clone());
+        }
+    }
+    if !passthrough_body.is_empty() {
+        provider_data.insert(
+            "_passthrough".into(),
+            serde_json::json!({"body":passthrough_body}),
+        );
+    }
+    let mut merged_email_override = email_override.unwrap_or_default();
+    let provider_layer = data
+        .get("emailProviderOverrides")
+        .and_then(|v| v.get("sendgrid"));
+    let step_layer = email_step_id
+        .as_deref()
+        .and_then(|step| data.get("emailStepOverrides").and_then(|v| v.get(step)))
+        .and_then(|v| v.get("providers"))
+        .and_then(|v| v.get("sendgrid"));
+    let mut raw_provider_headers = serde_json::Map::new();
+    let mut provider_from_without_name = false;
+    for layer in [provider_layer, step_layer].into_iter().flatten() {
+        if let Some(fields) = layer.as_object() {
+            if fields.contains_key("from") {
+                provider_from_without_name = true;
+            }
+            if let Some(headers) = fields.get("headers").and_then(serde_json::Value::as_object) {
+                raw_provider_headers.extend(headers.clone());
+            }
+        }
+    }
+    for layer in [
+        data.get("emailFlatProviderOverride"),
+        provider_layer,
+        step_layer,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !layer.is_null() {
+            let fields = layer
+                .as_object()
+                .ok_or(InvalidJob("invalid provider override"))?;
+            merged_email_override.extend(fields.clone());
+        }
+    }
+    let email_override = Some(&merged_email_override);
     let severity = severity_override
         .map(str::to_owned)
         .or(workflow_metadata)
@@ -444,14 +637,95 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         }
         // The subscriber upsert holds its row lock. Preference updates acquire
         // the same lock, so the channel decision is serialized with updates.
-        let preference = tx.query_one("SELECT w.read_only,w.all_enabled,w.in_app_enabled,(p.channels->>'in_app')::boolean,(sp.channels->>'in_app')::boolean FROM (SELECT 1) singleton LEFT JOIN novu_rust_workflow_preferences w ON w.environment_id=$1 AND w.workflow_identifier=$3 LEFT JOIN novu_rust_subscriber_preferences p ON p.environment_id=$1 AND p.subscriber_id=$2 LEFT JOIN novu_rust_subscriber_workflow_preferences sp ON sp.environment_id=$1 AND sp.subscriber_id=$2 AND sp.workflow_identifier=$3", &[&job.environment_id,&subscriber,&workflow]).await?;
+        let preference = tx.query_one("SELECT w.read_only,w.all_enabled,w.in_app_enabled,(p.channels->>'in_app')::boolean,(sp.channels->>'in_app')::boolean,w.email_enabled,(p.channels->>'email')::boolean,(sp.channels->>'email')::boolean FROM (SELECT 1) singleton LEFT JOIN novu_rust_workflow_preferences w ON w.environment_id=$1 AND w.workflow_identifier=$3 LEFT JOIN novu_rust_subscriber_preferences p ON p.environment_id=$1 AND p.subscriber_id=$2 LEFT JOIN novu_rust_subscriber_workflow_preferences sp ON sp.environment_id=$1 AND sp.subscriber_id=$2 AND sp.workflow_identifier=$3", &[&job.environment_id,&subscriber,&workflow]).await?;
         let critical = preference.get::<_, Option<bool>>(0).unwrap_or(false);
-        let channels: Vec<&str> = if step_active { vec!["in_app"] } else { vec![] };
+        let mut channels: Vec<&str> = Vec::new();
+        if step_active {
+            channels.push("in_app");
+        }
+        if email_step.is_some() {
+            channels.push("email");
+        }
+        if sms_step.is_some() {
+            channels.push("sms");
+        }
         let organization_id = data
             .get("organizationId")
             .and_then(serde_json::Value::as_str);
         let notification = tx.query_one("INSERT INTO novu_rust_notifications (job_id,environment_id,organization_id,subscriber_id,subscriber_internal_id,workflow_identifier,workflow_internal_id,transaction_id,recipient,payload,channels,tags,severity,critical,context_keys) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT (job_id,subscriber_internal_id) DO UPDATE SET job_id=EXCLUDED.job_id RETURNING internal_id", &[&job.id,&job.environment_id,&organization_id,&subscriber,&subscriber_internal_id,&workflow,&workflow_internal_id,&transaction_id,&recipient,&payload,&channels,&tags,&severity,&critical,&context_keys]).await?;
         let notification_id: String = notification.get(0);
+        if let Some(sms_content) = sms_step.as_ref() {
+            let sms_job_id = Uuid::new_v4();
+            let message_id: String = tx
+                .query_one("SELECT novu_rust_new_objectid()", &[])
+                .await?
+                .get(0);
+            let sms_payload = serde_json::json!({"to":"", "content":"", "from":null,"provider_data":provider_data,
+                "workflow_context":{"subscriber_id":subscriber,"subscriber_internal_id":subscriber_internal_id,
+                    "workflow_identifier":workflow,"workflow_internal_id":workflow_internal_id,
+                    "notification_internal_id":notification_id,"message_id":message_id,"transaction_id":transaction_id,
+                    "content_template":sms_content,"payload":payload,"context":resolved_context,
+                    "context_keys":context_keys,"actor":actor_profile,"overrides":merged_sms_override}});
+            tx.execute(
+                "INSERT INTO novu_queue_jobs(id,environment_id,kind,payload) VALUES ($1,$2,$3,$4)",
+                &[
+                    &sms_job_id,
+                    &job.environment_id,
+                    &crate::twilio_queue::JOB_KIND,
+                    &sms_payload,
+                ],
+            )
+            .await?;
+            tx.execute("INSERT INTO novu_rust_sms_step_outcomes(job_id,environment_id,subscriber_id,subscriber_internal_id,workflow_identifier,transaction_id,status,sms_job_id) VALUES ($1,$2,$3,$4,$5,$6,'queued',$7)", &[&job.id,&job.environment_id,&subscriber,&subscriber_internal_id,&workflow,&transaction_id,&sms_job_id]).await?;
+        }
+        if let Some((subject, html)) = email_step.as_ref() {
+            // The original evaluates preferences and recipient data in the
+            // channel worker, after the workflow job has been queued.
+            let option = |key: &str| {
+                email_override
+                    .and_then(|v| v.get(key))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|v| !v.is_empty())
+            };
+            let override_list = |key: &str| -> Vec<String> {
+                email_override
+                    .and_then(|v| v.get(key))
+                    .and_then(serde_json::Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let message_id: String = tx
+                .query_one("SELECT novu_rust_new_objectid()", &[])
+                .await?
+                .get(0);
+            let email_job_id = Uuid::new_v4();
+            let mut headers = email_override
+                .and_then(|v| v.get("headers"))
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            for (key, value) in &raw_provider_headers {
+                headers.insert(provider_header_key(key), value.clone());
+            }
+            let email_payload = serde_json::json!({"to":[],"cc":override_list("cc"),"bcc":override_list("bcc"),"from":option("from"),"sender_name":option("senderName"),"provider_from_without_name":provider_from_without_name,"reply_to":option("replyTo"),"text":option("text"),"headers":headers,"custom_data":email_override.and_then(|v| v.get("customData")).cloned().unwrap_or_else(||serde_json::json!({})),"subject":"","html":"","message_id":message_id,"transaction_id":transaction_id,"workflow_identifier":workflow,"subscriber_id":subscriber,"workflow_context":{"subscriber_internal_id":subscriber_internal_id,"check_workflow":true,"workflow_internal_id":workflow_internal_id,"notification_internal_id":notification_id,"subject_template":subject,"html_template":html,"payload":payload,"context":resolved_context,"context_keys":context_keys,"actor":actor_profile,"overrides":merged_email_override}});
+            tx.execute(
+                "INSERT INTO novu_queue_jobs(id,environment_id,kind,payload) VALUES ($1,$2,$3,$4)",
+                &[
+                    &email_job_id,
+                    &job.environment_id,
+                    &crate::sendgrid_queue::JOB_KIND,
+                    &email_payload,
+                ],
+            )
+            .await?;
+            tx.execute("INSERT INTO novu_rust_email_step_outcomes(job_id,environment_id,subscriber_id,subscriber_internal_id,workflow_identifier,transaction_id,status,email_job_id) VALUES ($1,$2,$3,$4,$5,$6,'queued',$7)", &[&job.id,&job.environment_id,&subscriber,&subscriber_internal_id,&workflow,&transaction_id,&email_job_id]).await?;
+        }
         if !step_active {
             continue;
         }

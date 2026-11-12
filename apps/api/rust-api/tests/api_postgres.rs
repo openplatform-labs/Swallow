@@ -286,9 +286,26 @@ async fn mark_one(
 }
 
 // This drops tables: only run against a dedicated disposable database.
-#[tokio::test]
+#[test]
 #[ignore = "requires a disposable PostgreSQL database in TEST_DATABASE_URL"]
-async fn trigger_api_contract() {
+fn trigger_api_contract() {
+    // This long integration scenario holds many async states; use an explicit
+    // test thread stack instead of depending on platform-specific defaults.
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(trigger_api_contract_inner());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn trigger_api_contract_inner() {
     let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL required");
     let (db, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move { connection.await.unwrap() });
@@ -438,6 +455,30 @@ async fn trigger_api_contract() {
         .await
         .unwrap();
     db.batch_execute(novu_postgres_queue::in_app::NOTIFICATIONS_MIGRATION)
+        .await
+        .unwrap();
+    db.batch_execute(novu_postgres_queue::in_app::EMAIL_STEP_MIGRATION)
+        .await
+        .unwrap();
+    db.batch_execute(novu_postgres_queue::in_app::EMAIL_MESSAGES_MIGRATION)
+        .await
+        .unwrap();
+    db.batch_execute(novu_postgres_queue::in_app::EMAIL_PROVIDER_RESULT_MIGRATION)
+        .await
+        .unwrap();
+    db.batch_execute(novu_postgres_queue::in_app::EMAIL_STEP_ID_MIGRATION)
+        .await
+        .unwrap();
+    db.batch_execute(novu_postgres_queue::in_app::EMAIL_REVALIDATION_MIGRATION)
+        .await
+        .unwrap();
+    db.batch_execute(novu_postgres_queue::in_app::SMS_STEP_MIGRATION)
+        .await
+        .unwrap();
+    db.batch_execute(novu_postgres_queue::in_app::SMS_MESSAGES_MIGRATION)
+        .await
+        .unwrap();
+    db.batch_execute(novu_postgres_queue::in_app::SMS_STEP_ID_MIGRATION)
         .await
         .unwrap();
     let old = db.query_one("SELECT internal_id,identifier,updated_at=created_at FROM novu_rust_topic_subscribers WHERE environment_id='legacy-env'", &[]).await.unwrap();
@@ -4239,6 +4280,7 @@ async fn trigger_api_contract() {
         count_notifications(app.clone(), Some("ApiKey test-key"), "seen-user", "[{}]").await;
     assert_eq!(remaining["data"][0]["count"], 0);
     worker.execute("INSERT INTO novu_rust_in_app_messages (id, environment_id, subscriber_id, workflow_identifier, transaction_id, content, payload) SELECT md5('counter-fixture-' || n)::uuid, 'env-a', 'counter', 'fixture', 'bulk-' || n, 'x', '{}'::jsonb FROM generate_series(1, 110) AS n", &[]).await.unwrap();
+    Box::pin(email_workflow_contract(app.clone(), &mut worker)).await;
     let (_, count) = count_notifications(app, Some("ApiKey test-key"), "counter", "[{}]").await;
     assert_eq!(count["data"][0]["count"], 100);
     worker.execute("INSERT INTO novu_rust_in_app_messages (id,internal_id,environment_id,subscriber_id,workflow_identifier,transaction_id,content,payload,tags) VALUES ('00000000-0000-4000-8000-000000000031','64a000000000000000000131','env-a','seen-user','names','jwt-delete-1','a','{}'::jsonb,'[\"red\"]'::jsonb),('00000000-0000-4000-8000-000000000032','64a000000000000000000132','env-a','seen-user','names','jwt-delete-2','b','{}'::jsonb,'[\"blue\"]'::jsonb)", &[]).await.unwrap();
@@ -4282,4 +4324,63 @@ async fn trigger_api_contract() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     let count: i64 = worker.query_one("SELECT count(*) FROM novu_rust_in_app_messages WHERE environment_id='env-a' AND subscriber_id='seen-user'", &[]).await.unwrap().get(0);
     assert_eq!(count, 0);
+}
+
+async fn email_workflow_contract(app: axum::Router, worker: &mut tokio_postgres::Client) {
+    // Email workflow fixture: the API queues the workflow, then the worker
+    // atomically creates recipient jobs for channel-time evaluation.
+    worker.batch_execute("INSERT INTO novu_rust_workflows(environment_id,identifier,active,has_steps,email_subject,email_html) VALUES ('env-a','email-only',true,true,'Hello {{subscriber.firstName}}','<p>{{name}}</p>'); INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES ('env-a','email-disabled',novu_rust_new_objectid(),'{\"email\":\"disabled@example.test\"}'); INSERT INTO novu_rust_subscriber_preferences(environment_id,subscriber_id,channels) VALUES ('env-a','email-disabled','{\"email\":false}')").await.unwrap();
+    let event = json!({"name":"email-only","to":[{"subscriberId":"email-yes","email":"yes@example.test","firstName":"Jane"},"email-disabled","email-missing"],"payload":{"name":"<Alice>"},"transactionId":"email-workflow-test"});
+    let (status, _) = request(app.clone(), Some("ApiKey test-key"), event.clone()).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = request(app.clone(), Some("ApiKey test-key"), event).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(
+        novu_postgres_queue::in_app::process_one(worker)
+            .await
+            .unwrap()
+    );
+    let rows = worker.query("SELECT subscriber_id,status,email_job_id FROM novu_rust_email_step_outcomes WHERE transaction_id='email-workflow-test' ORDER BY subscriber_id", &[]).await.unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+            .collect::<Vec<_>>(),
+        vec![
+            ("email-disabled".into(), "queued".into()),
+            ("email-missing".into(), "queued".into()),
+            ("email-yes".into(), "queued".into())
+        ]
+    );
+    let email_job: uuid::Uuid = rows[2].get::<_, Option<uuid::Uuid>>(2).unwrap();
+    let row = worker
+        .query_one(
+            "SELECT environment_id,kind,payload FROM novu_queue_jobs WHERE id=$1",
+            &[&email_job],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), "env-a");
+    assert_eq!(
+        row.get::<_, String>(1),
+        novu_postgres_queue::sendgrid_queue::JOB_KIND
+    );
+    let email: Value = row.get(2);
+    assert_eq!(email["to"], json!([]));
+    assert_eq!(
+        email["workflow_context"]["subject_template"],
+        "Hello {{subscriber.firstName}}"
+    );
+    assert_eq!(email["transaction_id"], "email-workflow-test");
+    let messages: i64 = worker.query_one("SELECT count(*) FROM novu_rust_email_messages WHERE environment_id='env-a' AND transaction_id='email-workflow-test'", &[]).await.unwrap().get(0);
+    assert_eq!(messages, 0);
+    let count: i64 = worker.query_one("SELECT count(*) FROM novu_rust_in_app_messages WHERE transaction_id='email-workflow-test'", &[]).await.unwrap().get(0);
+    assert_eq!(count, 0);
+    let count: i64 = worker.query_one("SELECT count(*) FROM novu_rust_notifications WHERE transaction_id='email-workflow-test' AND channels=ARRAY['email']", &[]).await.unwrap().get(0);
+    assert_eq!(count, 3);
+    assert!(
+        !novu_postgres_queue::in_app::process_one(worker)
+            .await
+            .unwrap()
+    );
 }

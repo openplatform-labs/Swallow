@@ -2491,10 +2491,23 @@ async fn trigger(
             "Not Implemented",
         );
     }
-    let override_severity = match object.get("overrides") {
-        None | Some(Value::Null) => None,
-        Some(Value::Object(overrides)) if overrides.keys().all(|key| key == "severity") => {
-            match overrides.get("severity") {
+    let (override_severity, email_override, sms_override) = match object.get("overrides") {
+        None | Some(Value::Null) => (None, None, None),
+        Some(Value::Object(overrides))
+            if overrides.keys().all(|key| {
+                [
+                    "severity",
+                    "email",
+                    "sms",
+                    "sendgrid",
+                    "twilio",
+                    "providers",
+                    "steps",
+                ]
+                .contains(&key.as_str())
+            }) =>
+        {
+            let severity = match overrides.get("severity") {
                 None | Some(Value::Null) => None,
                 Some(Value::String(value))
                     if matches!(value.as_str(), "none" | "low" | "medium" | "high") =>
@@ -2508,7 +2521,61 @@ async fn trigger(
                         "Not Implemented",
                     );
                 }
-            }
+            };
+            let email = match overrides.get("email") {
+                None | Some(Value::Null) => None,
+                Some(Value::Object(email))
+                    if email.iter().all(|(key, value)| match key.as_str() {
+                        "toRecipient" | "from" | "senderName" | "replyTo" | "subject" | "html"
+                        | "text" => value.is_string(),
+                        "to" | "cc" | "bcc" => value.as_array().is_some_and(|items| {
+                            items
+                                .iter()
+                                .all(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+                        }),
+                        "replaceToRecipient" => value.is_boolean(),
+                        "headers" => value
+                            .as_object()
+                            .is_some_and(|items| items.values().all(Value::is_string)),
+                        "customData" => value.is_object(),
+                        _ => false,
+                    }) && (!email
+                        .get("replaceToRecipient")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                        || email
+                            .get("to")
+                            .and_then(Value::as_array)
+                            .is_some_and(|to| !to.is_empty())) =>
+                {
+                    Some(Value::Object(email.clone()))
+                }
+                _ => {
+                    return error(
+                        StatusCode::NOT_IMPLEMENTED,
+                        "Email override not implemented",
+                        "Not Implemented",
+                    );
+                }
+            };
+            let sms = match overrides.get("sms") {
+                None | Some(Value::Null) => None,
+                Some(Value::Object(sms))
+                    if sms.iter().all(|(key, value)| {
+                        ["to", "from", "content"].contains(&key.as_str()) && value.is_string()
+                    }) =>
+                {
+                    Some(Value::Object(sms.clone()))
+                }
+                _ => {
+                    return error(
+                        StatusCode::NOT_IMPLEMENTED,
+                        "SMS override not implemented",
+                        "Not Implemented",
+                    );
+                }
+            };
+            (severity, email, sms)
         }
         _ => {
             return error(
@@ -2518,6 +2585,109 @@ async fn trigger(
             );
         }
     };
+    let overrides = object.get("overrides").and_then(Value::as_object);
+    // Provider/step layers are bounded to understood fields. Unknown
+    // passthrough shapes must not be silently accepted.
+    let valid_layer = |layer: &Value| {
+        layer.as_object().is_some_and(|fields| {
+            fields.iter().all(|(key, value)| match key.as_str() {
+                "subject" | "html" | "senderName" => value.is_string(),
+                "from" => value.as_str().is_some_and(|s| !s.is_empty()),
+                "to" | "cc" | "bcc" => value.as_array().is_some_and(|items| {
+                    items
+                        .iter()
+                        .all(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+                }),
+                "headers" => value.as_object().is_some_and(|items| {
+                    items.iter().all(|(key, value)| {
+                        key.bytes().any(|b| b.is_ascii_alphabetic())
+                            && key.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-')
+                            && value.is_string()
+                    })
+                }),
+                _ => false,
+            })
+        })
+    };
+    let flat = overrides.and_then(|v| v.get("sendgrid"));
+    let sms_flat = overrides.and_then(|v| v.get("twilio"));
+    let providers = overrides.and_then(|v| v.get("providers"));
+    let steps = overrides.and_then(|v| v.get("steps"));
+    let valid_sms_fields = |fields: &serde_json::Map<String, Value>| {
+        fields.iter().all(|(key, value)| match key.as_str() {
+            "to"
+            | "from"
+            | "content"
+            | "body"
+            | "statusCallback"
+            | "applicationSid"
+            | "messagingServiceSid"
+            | "contentRetention"
+            | "addressRetention"
+            | "scheduleType"
+            | "sendAt"
+            | "contentVariables"
+            | "riskCheck"
+            | "contentSid" => value.is_string(),
+            "maxPrice" | "attempt" | "validityPeriod" => value.is_string() || value.is_number(),
+            "provideFeedback" | "forceDelivery" | "smartEncoded" | "shortenUrls" | "sendAsMms" => {
+                value.is_boolean() || value.is_string()
+            }
+            "persistentAction" | "mediaUrl" => {
+                value.is_string()
+                    || value
+                        .as_array()
+                        .is_some_and(|items| items.iter().all(Value::is_string))
+            }
+            _ => false,
+        })
+    };
+    let valid_sms_layer = |layer: &Value| {
+        layer.as_object().is_some_and(|fields| {
+            fields.iter().all(|(key, value)| {
+                if key == "_passthrough" {
+                    value.as_object().is_some_and(|v| {
+                        v.keys().all(|k| k == "body")
+                            && v.get("body")
+                                .and_then(Value::as_object)
+                                .is_some_and(valid_sms_fields)
+                    })
+                } else {
+                    valid_sms_fields(&serde_json::Map::from_iter([(key.clone(), value.clone())]))
+                }
+            })
+        })
+    };
+    let valid_providers = |value: &Value| {
+        value.as_object().is_some_and(|entries| {
+            entries.iter().all(|(key, layer)| match key.as_str() {
+                "sendgrid" => valid_layer(layer),
+                "twilio" => valid_sms_layer(layer),
+                _ => false,
+            })
+        })
+    };
+    if flat.is_some_and(|v| !valid_layer(v))
+        || sms_flat.is_some_and(|v| !valid_sms_layer(v))
+        || providers.is_some_and(|v| !valid_providers(v))
+        || steps.is_some_and(|v| {
+            !v.as_object().is_some_and(|entries| {
+                entries.iter().all(|(step, value)| {
+                    !step.is_empty()
+                        && value.as_object().is_some_and(|step_value| {
+                            step_value.keys().all(|k| k == "providers")
+                                && step_value.get("providers").is_some_and(valid_providers)
+                        })
+                })
+            })
+        })
+    {
+        return error(
+            StatusCode::NOT_IMPLEMENTED,
+            "Provider override not implemented",
+            "Not Implemented",
+        );
+    }
     let parsed_context = match object.get("context") {
         None | Some(Value::Null) => None,
         Some(value) => match inbox_context::parse(value) {
@@ -2538,7 +2708,7 @@ async fn trigger(
     let context_entries = parsed_context
         .map(|context| context.entries)
         .unwrap_or_else(|| json!([]));
-    let row = match db.query_opt("SELECT active, has_steps, in_app_content, inbox_metadata, (SELECT organization_id FROM novu_rust_environments WHERE id=$1) FROM novu_rust_workflows WHERE environment_id = $1 AND identifier = $2", &[&environment_id, &name]).await {
+    let row = match db.query_opt("SELECT active, has_steps, in_app_content, inbox_metadata, (SELECT organization_id FROM novu_rust_environments WHERE id=$1), email_subject, email_html, sms_content FROM novu_rust_workflows WHERE environment_id = $1 AND identifier = $2", &[&environment_id, &name]).await {
         Ok(Some(row)) => row,
         Ok(None) => return error(StatusCode::UNPROCESSABLE_ENTITY, "workflow_not_found", "Unprocessable Entity"),
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error", "Internal Server Error"),
@@ -2571,6 +2741,16 @@ async fn trigger(
             },
         };
         let content: Option<String> = row.get(2);
+        let email_subject: Option<String> = row.get(5);
+        let email_html: Option<String> = row.get(6);
+        let sms_content: Option<String> = row.get(7);
+        let content = if content.is_none()
+            && ((email_subject.is_some() && email_html.is_some()) || sms_content.is_some())
+        {
+            Some(String::new())
+        } else {
+            content
+        };
         let recipients = object
             .get("to")
             .and_then(|v| novu_rust_contracts::recipients::split(v).ok());
@@ -2630,7 +2810,7 @@ async fn trigger(
             );
         }
         let organization_id: Option<String> = row.get(4);
-        let data = json!({"organizationId": organization_id, "workflow": name, "transactionId": txn, "recipients": recipients, "topicKeys": topic_keys, "topicExclusions": topic_exclusions, "actor": actor, "content": content, "payload": payload, "tags": tags, "contextKeys": context_keys, "severity": severity, "severityOverride": override_severity});
+        let data = json!({"organizationId": organization_id, "workflow": name, "transactionId": txn, "recipients": recipients, "topicKeys": topic_keys, "topicExclusions": topic_exclusions, "actor": actor, "content": content, "payload": payload, "tags": tags, "contextKeys": context_keys, "severity": severity, "severityOverride": override_severity, "emailOverride": email_override, "smsOverride": sms_override, "emailFlatProviderOverride":flat,"smsFlatProviderOverride":sms_flat,"emailProviderOverrides":providers,"emailStepOverrides":steps});
         // The ledger and queue entry are inserted atomically. This provisional deduplication
         // policy is not yet equivalent to Novu's tier-dependent retention behaviour.
         let result = db.execute("WITH accepted AS (INSERT INTO novu_rust_trigger_transactions (environment_id, transaction_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING 1), contexts AS (INSERT INTO novu_rust_contexts (environment_id,context_key,data) SELECT $1, entry->>'key', COALESCE(NULLIF(entry->'data','null'::jsonb),'{}'::jsonb) FROM accepted CROSS JOIN jsonb_array_elements($6::jsonb) entry ON CONFLICT (environment_id,context_key) DO UPDATE SET data=CASE WHEN EXISTS (SELECT 1 FROM jsonb_array_elements($6::jsonb) element WHERE element->>'key'=EXCLUDED.context_key AND element->'data' <> 'null'::jsonb) THEN EXCLUDED.data ELSE novu_rust_contexts.data END, updated_at=CASE WHEN EXISTS (SELECT 1 FROM jsonb_array_elements($6::jsonb) element WHERE element->>'key'=EXCLUDED.context_key AND element->'data' <> 'null'::jsonb) AND novu_rust_contexts.data IS DISTINCT FROM EXCLUDED.data THEN now() ELSE novu_rust_contexts.updated_at END RETURNING 1) INSERT INTO novu_queue_jobs (id, environment_id, kind, payload) SELECT $3, $1, $4, $5 FROM accepted", &[&environment_id, &txn, &Uuid::new_v4(), &novu_rust_contracts::EXPERIMENTAL_IN_APP_JOB_KIND, &data, &context_entries]).await;

@@ -119,11 +119,39 @@ if [[ "${NOVU_TEST_PREFERENCE_DELIVERY:-0}" == 1 ]]; then
     python3 tests/reference_subscription_preference_api_compare.py
     python3 tests/reference_subscriber_subscriptions_compare.py
   fi
-  docker run -d --name "$reference_worker" --network "$network" -v "$reference_source:/app:ro" -w /app/apps/worker -e NODE_ENV=ci -e PORT=3001 -e LOG_LEVEL=error -e API_ROOT_URL="http://$reference:3000" -e REDIS_HOST="$redis" -e REDIS_PORT=6379 -e REDIS_DB_INDEX=0 -e MONGO_URL="mongodb://$mongo:27017/novu-db" -e JWT_SECRET=local-compat-test-secret -e STORE_ENCRYPTION_KEY=0123456789abcdef0123456789abcdef -e NOVU_SECRET_KEY=local-fixture-secret -e IS_SELF_HOSTED=true -e NOVU_ENTERPRISE=false -e NEW_RELIC_ENABLED=false node:22.23.4-alpine3.23 node dist/main.js >/dev/null
+  worker_options=()
+  if [[ "${NOVU_TEST_EMAIL_ONLY:-0}" == 1 || "${NOVU_TEST_EMAIL_QUEUED_ONLY:-0}" == 1 ]]; then
+    worker_options=(-v "$PWD/tests/reference_email_preload.cjs:/novu-email-preload.cjs:ro" -e NODE_OPTIONS=--require=/novu-email-preload.cjs)
+  fi
+  if [[ "${NOVU_TEST_SMS_ONLY:-0}" == 1 || "${NOVU_TEST_SMS_QUEUED_ONLY:-0}" == 1 ]]; then
+    worker_options=(-v "$PWD/tests/reference_sms_preload.cjs:/novu-sms-preload.cjs:ro" -e NODE_OPTIONS=--require=/novu-sms-preload.cjs)
+  fi
+  docker run -d --name "$reference_worker" --network "$network" -v "$reference_source:/app:ro" "${worker_options[@]}" -w /app/apps/worker -e NODE_ENV=ci -e PORT=3001 -e LOG_LEVEL=error -e API_ROOT_URL="http://$reference:3000" -e REDIS_HOST="$redis" -e REDIS_PORT=6379 -e REDIS_DB_INDEX=0 -e MONGO_URL="mongodb://$mongo:27017/novu-db" -e JWT_SECRET=local-compat-test-secret -e STORE_NOTIFICATION_CONTENT="${NOVU_TEST_STORE_CONTENT:-false}" -e STORE_ENCRYPTION_KEY=0123456789abcdef0123456789abcdef -e NOVU_SECRET_KEY=local-fixture-secret -e IS_SELF_HOSTED=true -e NOVU_ENTERPRISE=false -e NEW_RELIC_ENABLED=false node:22.23.4-alpine3.23 node dist/main.js >/dev/null
   cargo build --locked --offline --manifest-path "$root/worker/rust-queue/Cargo.toml" --bin in-app-worker >/dev/null
   DATABASE_URL="postgresql://postgres@127.0.0.1:$postgres_port/novu_compat" "$CARGO_TARGET_DIR/debug/in-app-worker" >/dev/null 2>&1 &
   rust_worker_pid=$!
   export NOVU_REFERENCE_MONGO_CONTAINER="$mongo" NOVU_RUST_PG_CONTAINER="$postgres" NOVU_REFERENCE_WORKER_CONTAINER="$reference_worker" NOVU_RUST_WORKER_PID="$rust_worker_pid"
+  if [[ "${NOVU_TEST_SMS_QUEUED_ONLY:-0}" == 1 ]]; then
+    export TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:$postgres_port/novu_compat"
+    python3 tests/reference_sms_queued_compare.py
+    exit 0
+  fi
+  if [[ "${NOVU_TEST_SMS_ONLY:-0}" == 1 ]]; then
+    export TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:$postgres_port/novu_compat"
+    export STORE_NOTIFICATION_CONTENT="${NOVU_TEST_STORE_CONTENT:-false}"
+    python3 tests/reference_sms_workflow_compare.py
+    exit 0
+  fi
+  if [[ "${NOVU_TEST_EMAIL_QUEUED_ONLY:-0}" == 1 ]]; then
+    export TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:$postgres_port/novu_compat"
+    python3 tests/reference_email_queued_compare.py
+    exit 0
+  fi
+  if [[ "${NOVU_TEST_EMAIL_ONLY:-0}" == 1 ]]; then
+    export TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:$postgres_port/novu_compat"
+    python3 tests/reference_email_workflow_compare.py
+    exit 0
+  fi
   if [[ "${NOVU_TEST_SNOOZE_ONLY:-0}" != 1 ]]; then
     python3 tests/reference_workflow_preferences_compare.py
     python3 tests/reference_preference_delivery_compare.py
