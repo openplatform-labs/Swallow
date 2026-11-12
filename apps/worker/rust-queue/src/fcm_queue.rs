@@ -1019,5 +1019,39 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["accepted", "accepted", "accepted"]
         );
+
+        // Confirming an uncertain first target resumes only untouched targets.
+        let resume = Uuid::new_v4();
+        let plan = fcm::plan(&serde_json::from_value(payload.clone()).unwrap());
+        let messages = fcm::wire_messages(&plan).unwrap();
+        crate::enqueue(
+            &db,
+            resume,
+            "test",
+            JOB_KIND,
+            &json!({"prepared_messages":messages}),
+        )
+        .await
+        .unwrap();
+        db.execute("UPDATE novu_queue_jobs SET status='failed',last_error='push delivery outcome unknown' WHERE id=$1", &[&resume]).await.unwrap();
+        db.execute("INSERT INTO novu_rust_fcm_attempts(job_id,environment_id,target_index,state) VALUES ($1,'test',0,'unknown')", &[&resume]).await.unwrap();
+        crate::reconciliation::resolve(
+            &mut db,
+            "test",
+            resume,
+            Some(0),
+            "accepted",
+            "fixture-operator",
+            "provider confirmed acceptance",
+        )
+        .await
+        .unwrap();
+        let (provider, server) = mock(vec![200, 200]).await;
+        assert!(process_one(&mut db, "test", &provider).await.unwrap());
+        assert!(process_one(&mut db, "test", &provider).await.unwrap());
+        assert_eq!(server.await.unwrap(), ["b", "c"]);
+        let row=db.query_one("SELECT status,(SELECT count(*) FROM novu_rust_fcm_attempts WHERE job_id=$1 AND state='accepted') FROM novu_queue_jobs WHERE id=$1", &[&resume]).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), "completed");
+        assert_eq!(row.get::<_, i64>(1), 3);
     }
 }

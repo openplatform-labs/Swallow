@@ -64,6 +64,12 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     db.execute("INSERT INTO novu_rust_sendgrid_attempts(job_id,environment_id,state,http_status) VALUES ($1,'tenant-a','unknown',500)", &[&email]).await.unwrap();
     db.execute("INSERT INTO novu_rust_twilio_attempts(job_id,environment_id,state) VALUES ($1,'tenant-a','unknown')", &[&sms]).await.unwrap();
     db.execute("INSERT INTO novu_rust_fcm_attempts(job_id,environment_id,target_index,state) VALUES ($1,'tenant-a',0,'unknown'),($1,'tenant-a',1,'accepted')", &[&push]).await.unwrap();
+    db.execute(
+        "UPDATE novu_queue_jobs SET last_error='push delivery outcome unknown' WHERE id=$1",
+        &[&push],
+    )
+    .await
+    .unwrap();
     db.execute("INSERT INTO novu_rust_email_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,subject,status,email_job_id,delivery_state) VALUES ('email','tenant-a','s','s','n','w','t','subject','error',$1,'unknown')", &[&email]).await.unwrap();
     db.batch_execute("INSERT INTO novu_rust_sendgrid_delivery_events(environment_id,event_id,message_internal_id,event_type,event_timestamp,recipient_hash) VALUES ('tenant-a','e1','email','delivered',100,'hash-a'),('tenant-a','e2','email','delivered',101,'hash-b'),('tenant-a','e3','email','deferred',102,'hash-a'),('tenant-b','cross','email','delivered',103,'hash-c')").await.unwrap();
     let evidence = reconciliation::email_evidence(&db, "tenant-a", email)
@@ -160,7 +166,7 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     let pending = Uuid::new_v4();
     queue::enqueue(&db,pending,"tenant-a",queue::fcm_queue::JOB_KIND,&json!({"prepared_messages":[{},{}],"prepared_context":{"target_metadata":[{"history_index":0,"group_size":2},{"history_index":0,"group_size":2}]}})).await.unwrap();
     db.execute(
-        "UPDATE novu_queue_jobs SET status='failed' WHERE id=$1",
+        "UPDATE novu_queue_jobs SET status='failed',last_error='push delivery outcome unknown' WHERE id=$1",
         &[&pending],
     )
     .await
@@ -260,4 +266,77 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
         })
         .collect();
     assert_eq!(identities.len(), 106);
+
+    // An accepted unknown can leave unsent targets, but cannot erase a
+    // different failure or resume while another outcome is still unknown.
+    for (suffix, error, other_state, expected_status, expected_delivery) in [
+        (
+            "resume",
+            "push delivery outcome unknown",
+            "rejected",
+            "pending",
+            "in_progress",
+        ),
+        (
+            "identity",
+            "subscriber identity changed",
+            "rejected",
+            "failed",
+            "in_progress",
+        ),
+        (
+            "unresolved",
+            "push delivery outcome unknown",
+            "unknown",
+            "failed",
+            "unknown",
+        ),
+    ] {
+        let job = Uuid::new_v4();
+        let payload = json!({"prepared_messages":[{},{},{}],"prepared_context":{"target_metadata":[{"history_index":0,"group_size":3},{"history_index":0,"group_size":3},{"history_index":0,"group_size":3}]}});
+        queue::enqueue(&db, job, "tenant-a", queue::fcm_queue::JOB_KIND, &payload)
+            .await
+            .unwrap();
+        db.execute(
+            "UPDATE novu_queue_jobs SET status='failed',last_error=$2 WHERE id=$1",
+            &[&job, &error],
+        )
+        .await
+        .unwrap();
+        db.execute("INSERT INTO novu_rust_fcm_attempts(job_id,environment_id,target_index,state) VALUES ($1,'tenant-a',0,'unknown'),($1,'tenant-a',1,$2)", &[&job,&other_state]).await.unwrap();
+        db.execute("INSERT INTO novu_rust_push_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,device_tokens,title,status,push_job_id,target_index,delivery_state) VALUES ($1,'tenant-a','s','s','n','w','t',ARRAY['a','b','c'],'title','error',$2,0,'unknown')", &[&suffix,&job]).await.unwrap();
+        if suffix == "identity" {
+            assert!(
+                reconciliation::resolve(
+                    &mut db,
+                    "tenant-a",
+                    job,
+                    Some(0),
+                    "retry",
+                    "operator",
+                    "checked"
+                )
+                .await
+                .is_err()
+            );
+        }
+        reconciliation::resolve(
+            &mut db,
+            "tenant-a",
+            job,
+            Some(0),
+            "accepted",
+            "operator",
+            "checked receipt",
+        )
+        .await
+        .unwrap();
+        let row=db.query_one("SELECT j.status,j.last_error,m.delivery_state,(SELECT count(*) FROM novu_rust_fcm_attempts a WHERE a.job_id=j.id) FROM novu_queue_jobs j JOIN novu_rust_push_messages m ON m.push_job_id=j.id WHERE j.id=$1", &[&job]).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), expected_status);
+        assert_eq!(row.get::<_, String>(2), expected_delivery);
+        assert_eq!(row.get::<_, i64>(3), 2);
+        if expected_status == "failed" {
+            assert_eq!(row.get::<_, Option<String>>(1).as_deref(), Some(error));
+        }
+    }
 }

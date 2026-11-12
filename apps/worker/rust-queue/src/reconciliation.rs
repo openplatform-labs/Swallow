@@ -72,12 +72,19 @@ pub async fn resolve(
         return Err("invalid reconciliation parameters".into());
     }
     let tx = client.transaction().await?;
-    let row=tx.query_opt("SELECT kind,status,payload FROM novu_queue_jobs WHERE environment_id=$1 AND id=$2 FOR UPDATE", &[&environment,&job]).await?.ok_or("job not found")?;
+    let row=tx.query_opt("SELECT kind,status,payload,last_error FROM novu_queue_jobs WHERE environment_id=$1 AND id=$2 FOR UPDATE", &[&environment,&job]).await?.ok_or("job not found")?;
     let kind: String = row.get(0);
     let status: String = row.get(1);
     let payload: Value = row.get(2);
+    let last_error: Option<String> = row.get(3);
     if status != "failed" {
         return Err("job must be failed and not running".into());
+    }
+    if kind == crate::fcm_queue::JOB_KIND
+        && decision == "retry"
+        && last_error.as_deref() != Some("push delivery outcome unknown")
+    {
+        return Err("cannot retry push job with a different failure reason".into());
     }
     let attempt=match (kind.as_str(),target) {
         (crate::sendgrid_queue::JOB_KIND,None)=>tx.query_opt("SELECT http_status FROM novu_rust_sendgrid_attempts WHERE environment_id=$1 AND job_id=$2 AND state='unknown' FOR UPDATE", &[&environment,&job]).await?,
@@ -139,8 +146,14 @@ pub async fn resolve(
                     .unwrap_or(1);
                 let end = history_index.saturating_add(group_size);
                 let row=tx.query_one("SELECT count(*),count(*) FILTER (WHERE state IN ('unknown','dispatching')) FROM novu_rust_fcm_attempts WHERE environment_id=$1 AND job_id=$2 AND target_index >= $3 AND target_index < $4", &[&environment,&job,&history_index,&end]).await?;
-                if row.get::<_, i64>(0) == i64::from(group_size) && row.get::<_, i64>(1) == 0 {
+                let count = row.get::<_, i64>(0);
+                let uncertain = row.get::<_, i64>(1);
+                if uncertain > 0 {
+                    tx.execute("UPDATE novu_rust_push_messages SET delivery_state='unknown' WHERE environment_id=$1 AND push_job_id=$2 AND target_index=$3", &[&environment,&job,&history_index]).await?;
+                } else if count == i64::from(group_size) {
                     tx.execute("UPDATE novu_rust_push_messages SET delivery_state='accepted',status='sent',error_id=NULL,error_text=NULL,identifier=internal_id WHERE environment_id=$1 AND push_job_id=$2 AND target_index=$3", &[&environment,&job,&history_index]).await?;
+                } else if count < i64::from(group_size) {
+                    tx.execute("UPDATE novu_rust_push_messages SET delivery_state='in_progress' WHERE environment_id=$1 AND push_job_id=$2 AND target_index=$3", &[&environment,&job,&history_index]).await?;
                 }
             }
         }
@@ -158,8 +171,19 @@ pub async fn resolve(
         let counts=tx.query_one("SELECT count(*),count(*) FILTER (WHERE state IN ('unknown','dispatching')) FROM novu_rust_fcm_attempts WHERE environment_id=$1 AND job_id=$2", &[&environment,&job]).await?;
         let count = counts.get::<_, i64>(0);
         let unknown = counts.get::<_, i64>(1);
-        if unknown == 0 && expected.is_some_and(|n| i64::try_from(n).ok() == Some(count)) {
-            tx.execute("UPDATE novu_queue_jobs SET status='completed',last_error=NULL WHERE environment_id=$1 AND id=$2", &[&environment,&job]).await?;
+        // Resolving an attempt cannot override a different failure, such as
+        // a replaced subscriber or invalid prepared payload.
+        if unknown == 0
+            && last_error.as_deref() == Some("push delivery outcome unknown")
+            && let Some(expected) = expected
+                .and_then(|n| i64::try_from(n).ok())
+                .filter(|n| *n > 0)
+        {
+            if count == expected {
+                tx.execute("UPDATE novu_queue_jobs SET status='completed',last_error=NULL WHERE environment_id=$1 AND id=$2", &[&environment,&job]).await?;
+            } else if count < expected {
+                tx.execute("UPDATE novu_queue_jobs SET status='pending',available_at=now(),last_error=NULL WHERE environment_id=$1 AND id=$2", &[&environment,&job]).await?;
+            }
         }
     }
     tx.commit().await?;
