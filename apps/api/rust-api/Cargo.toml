@@ -13,6 +13,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde_json = "1"
 ryu = "1"
 sha2 = "0.10"
+ring = "0.17"
+spki = "0.7"
+der = "0.7"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-uuid-1"] }
 uuid = { version = "1", features = ["v4"] }

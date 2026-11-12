@@ -3,6 +3,7 @@ mod contexts;
 mod inbox_context;
 mod inbox_data;
 mod preferences;
+mod sendgrid_webhook;
 mod subscriber_credentials;
 mod subscriber_jwt;
 mod subscriber_subscriptions;
@@ -84,6 +85,10 @@ pub fn router_with_session_keys(
     keys: HashMap<String, Vec<String>>,
 ) -> Router {
     Router::new()
+        .route(
+            "/webhooks/organizations/{organization}/environments/{environment}/email/{provider}",
+            post(sendgrid_webhook::receive),
+        )
         .route("/v1/events/trigger", post(trigger))
         .route(
             "/v1/subscribers/{subscriber_id}/credentials",

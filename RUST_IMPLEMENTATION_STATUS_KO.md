@@ -23,7 +23,13 @@ API, 인앱·SendGrid·Twilio·FCM 워커 및 WS의 조회·이벤트 연결은 
 
 [0054 마이그레이션](apps/worker/rust-queue/migrations/0054_delivery_reconciliation.sql)과 `delivery-reconcile` 도구는 환경별 불명 시도 최대 100건을 조회하고, 운영자가 provider 측 증거를 확인한 뒤 재시도 또는 접수 확인을 기록한다. 작업 잠금과 트랜잭션으로 중복 결정과 다른 환경 변경을 차단하고 DB 사용자·운영자 이름·사유·이전 HTTP 상태를 감사 테이블에 저장한다. 예를 들어 `cargo run --bin delivery-reconcile -- list ENV`, `cargo run --bin delivery-reconcile -- retry ENV JOB - OPERATOR TICKET`을 사용하며 FCM은 `-` 대신 대상 인덱스를 지정한다. `accepted`는 `retry` 대신 전달한다. TLS 연결 설정과 0054까지의 마이그레이션이 필요하다.
 
-`retry`는 **외부 provider가 접수하지 않았음을 독립적으로 확인한 경우에만** 사용한다. 실제로는 접수된 요청을 재시도하면 중복 발송될 수 있다. `accepted` 역시 실제 수신이 아니라 운영자가 확인한 provider 접수다. 자동 판정, provider 조회·웹훅, 100건을 넘는 목록 페이지네이션, 운영자 인증·역할별 권한 및 감사 위변조 방지는 미구현이다. 운영자 이름은 입력값이므로 DB 접근 권한과 감사 테이블의 수정·삭제 권한을 별도로 제한해야 한다. 사유에는 개인정보·비밀을 넣지 않는다. 재시도 시 이메일·SMS는 현재 프로필·설정을 재검증하고 내용을 다시 렌더링하므로 이전 시도와 내용이 달라질 수 있다. 독립 수동 FCM 작업의 접수 확인은 전체 작업을 자동 완료하지 못할 수 있다.
+`retry`는 **외부 provider가 접수하지 않았음을 독립적으로 확인한 경우에만** 사용한다. 실제로는 접수된 요청을 재시도하면 중복 발송될 수 있다. `accepted` 역시 실제 수신이 아니라 운영자가 확인한 provider 접수다. 자동 판정, provider 조회·Twilio 웹훅·SendGrid 이벤트의 자동 연계, 100건을 넘는 목록 페이지네이션, 운영자 인증·역할별 권한 및 감사 위변조 방지는 미구현이다. 운영자 이름은 입력값이므로 DB 접근 권한과 감사 테이블의 수정·삭제 권한을 별도로 제한해야 한다. 사유에는 개인정보·비밀을 넣지 않는다. 재시도 시 이메일·SMS는 현재 프로필·설정을 재검증하고 내용을 다시 렌더링하므로 이전 시도와 내용이 달라질 수 있다. 독립 수동 FCM 작업의 접수 확인은 전체 작업을 자동 완료하지 못할 수 있다.
+
+### 서명된 SendGrid 전달 이벤트
+
+API 마이그레이션 `0004_sendgrid_webhooks.sql`은 환경별 SendGrid 공개키와 최소 이벤트 이력을 만든다. `POST /webhooks/organizations/{organizationId}/environments/{environmentId}/email/sendgrid`는 원본 바이트와 timestamp에 대한 ECDSA P-256 서명을 필수 검증하고 환경·조직을 확인한다. 활성 공개키는 `novu_rust_sendgrid_webhook_keys`에 SendGrid가 제공한 Base64 DER 공개키로 수동 등록한다. 하나의 활성 공개키를 두 환경이 공유하지 못한다. 같은 `sg_event_id`는 환경별로 한 번만 기록하고 다른 환경의 메시지 ID는 무시한다. 이메일 주소 원문과 이벤트 본문은 저장하지 않지만 주소의 SHA-256 해시는 추측될 수 있는 개인정보이므로 DB 접근을 제한해야 한다.
+
+`delivered`, `bounce`, `dropped`, `blocked`, `deferred`, `processed` 이벤트의 근거만 저장하며, `delivered`는 수신 메일 서버의 수락이지 수신함 표시나 사용자의 읽음을 보장하지 않는다. 이벤트를 자동으로 `delivery_state`·작업 상태에 반영하거나 불명 작업을 재시도하지 않는다. 검증 후 7일이 넘는 서명 timestamp는 거절하며 배치 1,000개·본문 1 MiB와 활성 키 10개로 제한한다. 서명이 없는 원본 Novu 요청과 통합 ID 경로, 원본 webhook 응답 및 전체 이벤트 계약은 호환되지 않는다. 키 관리 API·회전 자동화, 이벤트 보존·삭제, 받는 사람별 집계, 원본 webhook 서버와 실제 SendGrid의 종단 간 검증, Twilio 상태 웹훅과 운영 접근 제어는 미구현 또는 미검증이다. 외부 HTTPS 종단과 방화벽·DB 권한을 별도로 구성해야 한다. [격리 테스트](apps/api/rust-api/tests/sendgrid_webhook.rs)는 임시 서명 키와 PostgreSQL로 변조·재생·환경 격리·유효하지 않은 배치를 확인한다.
 
 ## 구현된 범위
 

@@ -1,0 +1,161 @@
+//! Uses and resets a disposable PostgreSQL database.
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use http_body_util::BodyExt;
+use ring::{
+    rand::SystemRandom,
+    signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair},
+};
+use serde_json::{Value, json};
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+use tokio_postgres::NoTls;
+use tower::ServiceExt;
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL"]
+async fn signed_events_are_scoped_idempotent_and_private() {
+    let (db, connection) =
+        tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(), NoTls)
+            .await
+            .unwrap();
+    tokio::spawn(async move {
+        connection.await.unwrap();
+    });
+    db.batch_execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public")
+        .await
+        .unwrap();
+    for sql in [
+        novu_rust_api::MIGRATION,
+        novu_postgres_queue::MIGRATION,
+        novu_postgres_queue::in_app::EMAIL_MESSAGES_MIGRATION,
+        include_str!("../migrations/0004_sendgrid_webhooks.sql"),
+    ] {
+        db.batch_execute(sql).await.unwrap();
+    }
+    let rng = SystemRandom::new();
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+    let key =
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+    let mut spki = vec![
+        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08,
+        0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+    ];
+    spki.extend_from_slice(key.public_key().as_ref());
+    let public = STANDARD.encode(spki);
+    db.batch_execute("INSERT INTO novu_rust_environments VALUES ('env-a','org-a'),('env-b','org-b'); INSERT INTO novu_rust_email_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,subject,status) VALUES ('64a000000000000000000099','env-a','s','s','n','w','t','subject','sent'),('64a000000000000000000098','env-b','s','s','n','w','t','subject','sent')").await.unwrap();
+    db.execute("INSERT INTO novu_rust_sendgrid_webhook_keys(environment_id,key_id,public_key_base64) VALUES ('env-a','key',$1)", &[&public]).await.unwrap();
+    assert!(db.execute("INSERT INTO novu_rust_sendgrid_webhook_keys(environment_id,key_id,public_key_base64) VALUES ('env-b','reused',$1)", &[&public]).await.is_err());
+    let db = Arc::new(db);
+    let router = novu_rust_api::router_with_subscriber_secret(db.clone(), None);
+    let event = json!([{"id":"64a000000000000000000099","event":"delivered","sg_event_id":"event-1","timestamp":1730000000,"email":"private@example.test"}]);
+    let raw = serde_json::to_vec(&event).unwrap();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .to_string();
+    let mut signed = timestamp.as_bytes().to_vec();
+    signed.extend_from_slice(&raw);
+    let signature = STANDARD.encode(key.sign(&rng, &signed).unwrap().as_ref());
+    async fn call(
+        router: axum::Router,
+        path: &str,
+        ts: &str,
+        sig: &str,
+        body: Vec<u8>,
+    ) -> (StatusCode, Value) {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("x-twilio-email-event-webhook-timestamp", ts)
+                    .header("x-twilio-email-event-webhook-signature", sig)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+    let path = "/webhooks/organizations/org-a/environments/env-a/email/sendgrid";
+    let (status, body) = call(router.clone(), path, &timestamp, &signature, raw.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["recorded"], 1);
+    let (status, body) = call(router.clone(), path, &timestamp, &signature, raw.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["recorded"], 0);
+    assert_eq!(
+        call(router.clone(), path, &timestamp, &signature, b"[]".to_vec())
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(
+            router.clone(),
+            "/webhooks/organizations/org-b/environments/env-a/email/sendgrid",
+            &timestamp,
+            &signature,
+            raw.clone()
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(
+            router.clone(),
+            "/webhooks/organizations/org-a/environments/env-b/email/sendgrid",
+            &timestamp,
+            &signature,
+            raw.clone()
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(router.clone(), path, "1", &signature, raw.clone())
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let malformed = json!([{"id":"64a000000000000000000099","event":"delivered","sg_event_id":"event-3","timestamp":1730000000,"email":"private@example.test"},{"id":"bad","event":"delivered","sg_event_id":"event-4","timestamp":1730000000,"email":"private@example.test"}]);
+    let malformed = serde_json::to_vec(&malformed).unwrap();
+    let mut input = timestamp.as_bytes().to_vec();
+    input.extend_from_slice(&malformed);
+    let malformed_signature = STANDARD.encode(key.sign(&rng, &input).unwrap().as_ref());
+    assert_eq!(
+        call(
+            router.clone(),
+            path,
+            &timestamp,
+            &malformed_signature,
+            malformed
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    let cross = json!([{"id":"64a000000000000000000098","event":"delivered","sg_event_id":"event-2","timestamp":1730000000,"email":"private@example.test"}]);
+    let cross = serde_json::to_vec(&cross).unwrap();
+    let mut signed = timestamp.as_bytes().to_vec();
+    signed.extend_from_slice(&cross);
+    let signature = STANDARD.encode(key.sign(&rng, &signed).unwrap().as_ref());
+    let (status, body) = call(router, path, &timestamp, &signature, cross).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["recorded"], 0);
+    let row=db.query_one("SELECT count(*),bool_or(recipient_hash LIKE '%private%') FROM novu_rust_sendgrid_delivery_events", &[]).await.unwrap();
+    assert_eq!(row.get::<_, i64>(0), 1);
+    assert!(!row.get::<_, bool>(1));
+}
