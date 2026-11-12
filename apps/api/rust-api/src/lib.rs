@@ -1229,7 +1229,16 @@ async fn list_notifications_for(
     };
     if query.keys().any(|key| {
         ![
-            "limit", "offset", "after", "read", "seen", "archived", "snoozed", "data",
+            "limit",
+            "offset",
+            "after",
+            "read",
+            "seen",
+            "archived",
+            "snoozed",
+            "data",
+            "createdGte",
+            "createdLte",
         ]
         .contains(&key.as_str())
     }) {
@@ -1283,6 +1292,23 @@ async fn list_notifications_for(
             }
         }
     }
+    let mut created_bounds = [None, None];
+    for (index, key) in ["createdGte", "createdLte"].iter().enumerate() {
+        if let Some(value) = query.get(*key).filter(|value| !value.is_empty()) {
+            let Ok(timestamp) = value.parse::<i64>() else {
+                return unsupported();
+            };
+            // JavaScript Date accepts milliseconds in this range. Novu keeps
+            // zero in the response but treats it as no database bound.
+            if timestamp.unsigned_abs() > 8_640_000_000_000_000 {
+                return unsupported();
+            }
+            filter.insert((*key).into(), json!(timestamp));
+            if timestamp != 0 {
+                created_bounds[index] = Some(timestamp);
+            }
+        }
+    }
     let subscriber = match db.query_opt("SELECT internal_id, profile FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2", &[&environment_id, &subscriber_id]).await {
         Ok(Some(row)) => row,
         Ok(None) => return error_at(StatusCode::NOT_FOUND, &format!("Subscriber '{subscriber_id}' was not found"), "Not Found", &path),
@@ -1315,7 +1341,7 @@ async fn list_notifications_for(
     let archived = filter.get("archived").and_then(Value::as_bool);
     let snoozed = filter.get("snoozed").and_then(Value::as_bool);
     let actual_offset = if after.is_some() { 0 } else { offset };
-    let rows = match db.query("SELECT m.internal_id, m.transaction_id, m.content, m.payload, m.is_read, m.is_seen, m.is_archived, to_char(m.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(m.delivered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(m.last_read_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(m.first_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(m.archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), m.tags, w.inbox_metadata, m.read_at_present, m.archived_at_present, m.data, to_char(m.snoozed_until AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS snoozed_until,CASE WHEN m.delivered_history IS NULL THEN NULL ELSE to_jsonb(ARRAY(SELECT to_char(t AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') FROM unnest(m.delivered_history) WITH ORDINALITY AS h(t,ord) ORDER BY ord)) END AS delivered_history, m.severity AS message_severity FROM novu_rust_in_app_messages m LEFT JOIN novu_rust_workflows w ON w.environment_id=m.environment_id AND w.identifier=m.workflow_identifier WHERE m.environment_id=$1 AND m.subscriber_id=$2 AND m.subscriber_internal_id=(SELECT internal_id FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2) AND ($3::boolean IS NULL OR m.is_read=$3) AND ($4::boolean IS NULL OR m.is_seen=$4) AND ($5::boolean IS NULL OR m.is_archived=$5) AND ($9::text[] IS NULL OR m.tags ?| $9) AND novu_rust_inbox_data_matches(m.data,$10) AND ($11::boolean IS NULL OR (m.snoozed_until IS NOT NULL)=$11) AND ($13::text[] IS NULL OR (NOT m.severity_present AND 'none'=ANY($13)) OR m.severity=ANY($13)) AND ($12::text[] IS NULL OR (cardinality(m.context_keys)=cardinality($12) AND m.context_keys @> $12)) AND ($8::text IS NULL OR (m.created_at,m.internal_id) < (SELECT boundary.created_at,boundary.internal_id FROM novu_rust_in_app_messages boundary WHERE boundary.environment_id=$1 AND boundary.internal_id=$8)) ORDER BY m.created_at DESC, m.internal_id DESC LIMIT $6 OFFSET $7", &[&environment_id, &subscriber_id, &read, &seen, &archived, &(limit + 1), &actual_offset, &after, &tag_filter, &data_filter, &snoozed, &context_keys, &severity_filter]).await {
+    let rows = match db.query("SELECT m.internal_id, m.transaction_id, m.content, m.payload, m.is_read, m.is_seen, m.is_archived, to_char(m.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(m.delivered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(m.last_read_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(m.first_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(m.archived_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), m.tags, w.inbox_metadata, m.read_at_present, m.archived_at_present, m.data, to_char(m.snoozed_until AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS snoozed_until,CASE WHEN m.delivered_history IS NULL THEN NULL ELSE to_jsonb(ARRAY(SELECT to_char(t AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') FROM unnest(m.delivered_history) WITH ORDINALITY AS h(t,ord) ORDER BY ord)) END AS delivered_history, m.severity AS message_severity FROM novu_rust_in_app_messages m LEFT JOIN novu_rust_workflows w ON w.environment_id=m.environment_id AND w.identifier=m.workflow_identifier WHERE m.environment_id=$1 AND m.subscriber_id=$2 AND m.subscriber_internal_id=(SELECT internal_id FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2) AND ($3::boolean IS NULL OR m.is_read=$3) AND ($4::boolean IS NULL OR m.is_seen=$4) AND ($5::boolean IS NULL OR m.is_archived=$5) AND ($9::text[] IS NULL OR m.tags ?| $9) AND novu_rust_inbox_data_matches(m.data,$10) AND ($11::boolean IS NULL OR (m.snoozed_until IS NOT NULL)=$11) AND ($13::text[] IS NULL OR (NOT m.severity_present AND 'none'=ANY($13)) OR m.severity=ANY($13)) AND ($14::bigint IS NULL OR m.created_at >= to_timestamp($14::double precision/1000.0)) AND ($15::bigint IS NULL OR m.created_at <= to_timestamp($15::double precision/1000.0)) AND ($12::text[] IS NULL OR (cardinality(m.context_keys)=cardinality($12) AND m.context_keys @> $12)) AND ($8::text IS NULL OR (m.created_at,m.internal_id) < (SELECT boundary.created_at,boundary.internal_id FROM novu_rust_in_app_messages boundary WHERE boundary.environment_id=$1 AND boundary.internal_id=$8)) ORDER BY m.created_at DESC, m.internal_id DESC LIMIT $6 OFFSET $7", &[&environment_id, &subscriber_id, &read, &seen, &archived, &(limit + 1), &actual_offset, &after, &tag_filter, &data_filter, &snoozed, &context_keys, &severity_filter, &created_bounds[0], &created_bounds[1]]).await {
         Ok(rows) => rows,
         Err(_) => return error_at(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error", "Internal Server Error", &path),
     };

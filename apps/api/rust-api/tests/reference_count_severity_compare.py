@@ -81,3 +81,22 @@ for params, expected in [([('contextKeys','tenant:a')], ['severity-4']), ([('con
     assert [item['transactionId'] for item in left['data']]==expected,(params,left)
     assert 'contextKeys' not in left['filter'],left
 print('notification list exact context-key filters: match')
+
+# Compare inclusive millisecond creation bounds and the reference's zero handling.
+subprocess.run(['docker','exec',mongo,'mongosh','--quiet','--eval', '''const d=db.getSiblingDB("novu-db");d.messages.updateOne({transactionId:"severity-3"},{$set:{createdAt:new Date(1704067199999)}});d.messages.updateOne({transactionId:"severity-6"},{$set:{createdAt:new Date(1704067200001)}});'''],check=True,stdout=subprocess.DEVNULL)
+subprocess.run(['docker','exec',postgres,'psql','-v','ON_ERROR_STOP=1','-U','postgres','-d','novu_compat','-c', "UPDATE novu_rust_in_app_messages SET created_at=CASE transaction_id WHEN 'severity-3' THEN '2023-12-31 23:59:59.999+00'::timestamptz WHEN 'severity-6' THEN '2024-01-01 00:00:00.001+00'::timestamptz ELSE created_at END WHERE transaction_id IN ('severity-3','severity-6')"],check=True,stdout=subprocess.DEVNULL)
+for params, expected in [([('createdGte','1704067200001')], ['severity-6']), ([('createdLte','1704067199999')], ['severity-3']), ([('createdGte','1704067200000'),('createdLte','1704067200000')], ['severity-5','severity-4','severity-2','severity-1']), ([('createdGte','0'),('createdLte','0')], ['severity-6','severity-5','severity-4','severity-2','severity-1','severity-3']), ([('createdGte','1704067200000'),('contextKeys','tenant:a')], ['severity-4'])]:
+    path='/v2/subscribers/alice/notifications?'+urllib.parse.urlencode(params)
+    def date_list(base):
+        req=urllib.request.Request(base+path,headers={'Authorization':'ApiKey '+os.environ['NOVU_TEST_API_KEY']})
+        with urllib.request.urlopen(req,timeout=10) as response: return json.load(response)
+    left,right=(date_list(os.environ[name]) for name in ('NOVU_REFERENCE_URL','NOVU_RUST_URL'))
+    for response in (left,right):
+        for item in response['data']:
+            for field in ('readAt','firstSeenAt'):
+                if item.get(field) is not None:
+                    assert item[field].endswith('Z')
+                    item[field]='<timestamp>'
+    assert left==right,(params,left,right)
+    assert [item['transactionId'] for item in left['data']]==expected,(params,left)
+print('notification list inclusive millisecond date bounds: match')
