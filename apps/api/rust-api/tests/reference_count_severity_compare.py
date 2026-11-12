@@ -129,3 +129,45 @@ for params, expected_status, expected_filter in [
     assert left[0]==expected_status,(params,left)
     if expected_status==200: assert left[1]['filter']['createdGte']==expected_filter
 print('notification date decimal-prefix parsing and validation errors: match')
+
+# Individual state mutations use exact context matching, unlike bulk overlap.
+message='000000000000000000000006'
+for action,params,expected in [
+    ('read',[('contextKeys','tenant:a')],404),
+    ('read',[('contextKeys','team:b'),('contextKeys','tenant:a')],200),
+    ('unread',[('contextKeys','tenant:a'),('contextKeys','team:b')],200),
+    ('archive',[('contextKeys','team:b'),('contextKeys','tenant:a')],200),
+    ('unarchive',[('contextKeys','team:b'),('contextKeys','tenant:a')],200),
+    ('read',[('contextKeys','tenant:missing')],404),
+]:
+    path=f'/v2/subscribers/alice/notifications/{message}/{action}?'+urllib.parse.urlencode(params)
+    def change(base):
+        req=urllib.request.Request(base+path,data=b'{}',method='PATCH',headers={'Authorization':'ApiKey '+os.environ['NOVU_TEST_API_KEY'],'Content-Type':'application/json'})
+        try: response=urllib.request.urlopen(req,timeout=10)
+        except urllib.error.HTTPError as error: response=error
+        with response: status,body=response.status,json.load(response)
+        if status>=400: assert body.pop('timestamp').endswith('Z')
+        else:
+            for field in ('readAt','firstSeenAt','archivedAt'):
+                if body['data'].get(field) is not None:
+                    assert body['data'][field].endswith('Z')
+                    body['data'][field]='<timestamp>'
+        return status,body
+    left,right=(change(os.environ[name]) for name in ('NOVU_REFERENCE_URL','NOVU_RUST_URL'))
+    assert left==right and left[0]==expected,(action,params,left,right)
+print('individual notification mutation exact context: match')
+
+for keys,expected in [(['tenant:a'],404),(['team:b','tenant:a'],204)]:
+    path=f'/v2/subscribers/alice/notifications/{message}?'+urllib.parse.urlencode([('contextKeys',key) for key in keys])
+    def remove(base):
+        req=urllib.request.Request(base+path,method='DELETE',headers={'Authorization':'ApiKey '+os.environ['NOVU_TEST_API_KEY']})
+        try: response=urllib.request.urlopen(req,timeout=10)
+        except urllib.error.HTTPError as error: response=error
+        with response:
+            status,raw=response.status,response.read()
+            body=json.loads(raw) if raw else None
+        if status>=400: assert body.pop('timestamp').endswith('Z')
+        return status,body
+    left,right=(remove(os.environ[name]) for name in ('NOVU_REFERENCE_URL','NOVU_RUST_URL'))
+    assert left==right and left[0]==expected,(keys,left,right)
+print('individual notification deletion exact context: match')

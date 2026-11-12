@@ -48,9 +48,9 @@ API 마이그레이션 `0004_sendgrid_webhooks.sql`은 환경별 SendGrid 공개
 - 제한적인 `GET .../notifications`: 실험 워크플로 메타데이터가 설정된 메시지의 ID, 구독자, 내용, 상태, 시각, 워크플로 및 data 또는 payload를 조회한다. `read`·`seen`·`archived`, 단일 또는 반복 `tags` OR 필터, 제한적인 `data` 필터, 반복 `contextKeys`의 순서 무관 정확 일치, 정수 밀리초 `createdGte`·`createdLte`의 포함 범위와 `limit`·`offset`·같은 환경의 `after` 커서를 지원한다. 시각 값 0은 원본처럼 응답에는 나타나지만 조회 범위에는 적용하지 않는다. 일부 JavaScript 십진수 접두 파싱과 숫자로 시작하지 않는 값의 422 오류를 지원한다. Date 허용 범위 밖 값과 극단적인 정수의 오류 계약은 미구현이다. 메타데이터 누락·미지원 옵션은 501이며 나머지 Inbox DTO와 필터 전체를 구현한 것은 아니다.
 - 제한적인 구독자 JWT Inbox 경로: `JWT_SECRET`이 설정된 경우 HS256 `widget_user` 토큰 서명·만료·not-before·audience를 검사하고 환경·외부 구독자 ID로 존재를 재확인한다. `/v1/inbox/notifications`의 목록·카운트, 개별 읽음·보관·스누즈·해제·삭제 및 일괄 상태 변경·삭제를 지원한다. 문자열 context의 목록·카운트는 context 키 집합이 정확히 일치하는 메시지만 반환한다. 개별 변경은 정확히 일치하는 context에 적용하며 일괄 변경은 원본처럼 일부 키가 겹치는 항목에 적용한다. 변경에 따른 제한적인 카운트 이벤트를 발행한다. 완전한 스누즈 입력과 요금제 계약, action 및 전체 이벤트 계약은 미구현이다. 토큰을 관리 API의 인증으로 사용하지 않는다.
 - 제한적인 `POST /v1/inbox/session`: 명시적으로 설정한 환경·인앱 통합에 대해 구독자를 생성하고 15일 HS256 토큰과 읽지 않은 수를 반환한다. HMAC 필수 설정을 확인하고 활성 API 키 해시와 일치하는 프로세스 설정 키로 서명을 검증한다. 서명 없이 기존 프로필을 갱신하지 않으며 키가 누락된 필수 HMAC 환경은 실패한다. 문자열·객체형 context와 필수 context HMAC 검증을 제한적으로 지원한다. 기본 스케줄·keyless·완전한 입력 검증 및 실제 통합 선택은 미구현이다. 테스트용 별도 설정 테이블과 프로세스 환경 키는 운영용 키 관리가 아니다.
-- 제한적인 알림 삭제: `DELETE .../notifications/:notificationId`와 `POST .../notifications/delete`에서 해당 환경과 구독자의 실험 인앱 메시지를 삭제한다. 일괄 삭제는 전체 또는 태그·data 조건을 지원하며 제한적인 읽지 않은 수 이벤트를 발행한다. 일괄 삭제의 관리 API `contextKeys`도 일부 키 겹침으로 제한하며 빈 배열은 제한하지 않는다. 웹훅·분석·추적은 미구현이다.
+- 제한적인 알림 삭제: `DELETE .../notifications/:notificationId`와 `POST .../notifications/delete`에서 해당 환경과 구독자의 실험 인앱 메시지를 삭제한다. 일괄 삭제는 전체 또는 태그·data 조건을 지원하며 제한적인 읽지 않은 수 이벤트를 발행한다. 개별 삭제의 관리 API `contextKeys`는 정확 일치하고, 일괄 삭제는 일부 키 겹침으로 제한하며 빈 배열은 제한하지 않는다. 웹훅·분석·추적은 미구현이다.
 - 메시지 `data`와 트리거 `payload`는 별개다. 마이그레이션 `0008`·`0009`의 data 필터는 스칼라, OR·AND 그룹, 2단계 객체 경로와 일부 MongoDB 배열 경로 탐색을 지원한다. 잘못된 필터 구조의 오류 계약, 성능 및 전체 MongoDB 배열 의미는 미검증이다. 기존 실험 데이터에서 없던 `data`는 복원되지 않는다.
-- 제한적인 개별 알림 상태 변경: `PATCH .../notifications/:notificationId/{read,unread,archive,unarchive}`는 해당 구독자의 인앱 메시지 상태·시각과 응답 DTO를 갱신하고 제한적인 읽지 않은 수 이벤트를 발행한다. 마이그레이션 `0007`은 시각 필드의 부재와 명시적 null을 구분한다. 기존 데이터에서 이미 지워진 시각의 과거 null 여부는 복구할 수 없다. 관리 API의 context 필터와 웹훅·분석·추적은 미구현이다.
+- 제한적인 개별 알림 상태 변경: `PATCH .../notifications/:notificationId/{read,unread,archive,unarchive}`는 해당 구독자의 인앱 메시지 상태·시각과 응답 DTO를 갱신하고 제한적인 읽지 않은 수 이벤트를 발행한다. 마이그레이션 `0007`은 시각 필드의 부재와 명시적 null을 구분한다. 기존 데이터에서 이미 지워진 시각의 과거 null 여부는 복구할 수 없다. 관리 API의 반복 `contextKeys` 쿼리는 순서 무관 정확 일치로 해당 알림을 제한한다. 웹훅·분석·추적은 미구현이다.
 - 공통 계약: 일부 트리거 상태, Socket.IO 이벤트 이름, context 비교 함수를 분리했다. 별도 실험 WS 서비스는 연결·상태 처리와 제한적인 인앱 이벤트를 지원한다.
 
 ## 미구현 또는 불완전
@@ -69,6 +69,8 @@ API 마이그레이션 `0004_sendgrid_webhooks.sql`은 환경별 SendGrid 공개
 | 에디션·범위 | 클론은 shallow이고 enterprise 서브모듈 `.source`는 초기화되지 않았다. Enterprise/Cloud 전용 기능과 라이선스 범위, 외부 패키지·서비스는 별도 확인이 필요하다. |
 
 ## 수행한 검증
+
+- 관리 API의 개별 읽음·읽지 않음·보관·보관 해제·삭제를 원본과 비교해 context 키의 정확 일치, 순서 변경 및 불일치 시 404를 확인했다. 상태 변경 시각은 각 서버에서 독립 생성하므로 형식만 검증했다. 관리 API의 스누즈·해제 context는 같은 조회 조건을 적용하지만 원본과 비교하지 않았다. [비교 테스트](apps/api/rust-api/tests/reference_count_severity_compare.py).
 
 - 관리 API의 일괄 읽음·확인·보관·읽음 후 보관·삭제에 context 필터를 적용해 원본과 저장 상태를 비교했다. 하나라도 겹치는 context, 빈 배열과 확인 ID 목록의 교집합을 확인했다. 빈 배열은 모든 context를 대상으로 하므로 주의해야 한다. 잘못된 context 입력의 오류 DTO와 이벤트·웹훅은 비교하지 않았다. [비교 테스트](apps/api/rust-api/tests/reference_notification_bulk_compare.py).
 
@@ -169,7 +171,7 @@ API 마이그레이션 `0004_sendgrid_webhooks.sql`은 환경별 SendGrid 공개
 ### context 실험 구현과 제한
 
 - `0010_experimental_context.sql`부터 `0013_experimental_context_cursor.sql`까지의 마이그레이션은 환경별 context 키·data와 메시지의 `context_keys`를 저장한다. 트리거와 Inbox 세션은 영숫자·`_`·`-`로 이루어진 ID의 문자열·객체형 context 최대 5개를 지원하고, 세션 HMAC 필수 환경에서는 정렬된 context JSON에 대한 별도 HMAC을 활성 환경 API 키로 검증한다. Inbox 목록·카운트·세션 읽지 않은 수는 키 집합이 정확히 일치하는 메시지만 선택한다. 기존 메시지는 빈 context로 취급하며 원본 데이터 가져오기는 구현하지 않았다.
-- 개별 상태 변경·삭제는 context의 정확한 일치를 요구한다. 일괄 확인·읽음·보관·삭제는 원본 MongoDB 조건처럼 context 키가 하나 이상 겹치는 메시지를 처리하며, 빈 context에서는 context 조건을 생략한다. **따라서 빈 context 세션의 일괄 작업이 동일 구독자의 다른 context 메시지에도 적용된다.** 인앱 템플릿의 단순 변수 치환은 context 데이터를 지원한다. 관리 API의 알림 context 필터 및 고급 context 관리, 워크플로 조건·다른 채널에서의 모든 context 사용과 관련 이벤트·완전한 실시간 fan-out은 미구현이다. 이메일·SMS의 선택된 context 렌더링은 아래 비교 항목을 참고한다.
+- 개별 상태 변경·삭제는 context의 정확한 일치를 요구한다. 일괄 확인·읽음·보관·삭제는 원본 MongoDB 조건처럼 context 키가 하나 이상 겹치는 메시지를 처리하며, 빈 context에서는 context 조건을 생략한다. **따라서 빈 context 세션의 일괄 작업이 동일 구독자의 다른 context 메시지에도 적용된다.** 인앱 템플릿의 단순 변수 치환은 context 데이터를 지원한다. 고급 context 관리, 워크플로 조건·다른 채널에서의 모든 context 사용과 관련 이벤트·완전한 실시간 fan-out은 미구현이다. 이메일·SMS의 선택된 context 렌더링은 아래 비교 항목을 참고한다.
 - Docker PostgreSQL 통합 테스트에서 문자열·객체형 context의 트리거·세션 저장, 세션에서 기존 데이터 변경 방지, 트리거 데이터 갱신, 환경 격리, 개별·일괄 변경 조건 및 필수 context HMAC을 확인했다. 선택된 중첩·유니코드·제어 문자 사례와 5,000개 비트 패턴 중 정수형 배정밀도 숫자의 직렬화는 원본 `@tufjs/canonical-json` 패키지와 직접 비교했다. HMAC 정규화는 안전 정수 범위를 넘는 JavaScript 배정밀도 정수의 표기를 지원한다. 소수에 대한 원본 오류 응답, 큰 숫자의 저장·다른 기능에서의 JavaScript 반올림 및 모든 숫자 경계는 아직 완전히 검증하지 않았다. [DB 조건 비교](apps/api/rust-api/tests/reference_context_query_compare.py)로 원본 MongoDB의 정확 일치·일괄 부분 일치 조건과 PostgreSQL 결과를 비교했다. 인앱 템플릿의 context ID·중첩 데이터·이스케이프는 원본 Handlebars 4.7.10과 비교했으며, Docker PostgreSQL에서 발송 시점 최신 데이터·환경 격리·payload의 context 덮어쓰기 방지 동작을 테스트했다. 워커는 context가 있는 작업마다 환경과 context 키를 조건으로 PostgreSQL을 한 번 추가 조회한다. [원본 세션 비교](apps/api/rust-api/tests/reference_context_session_compare.py)에서 객체형 context와 기존 데이터 보호, HMAC 누락·위조·정상, 양 서버의 JWT 교차 인증, 직접 삽입한 메시지의 정확·부분·빈 context별 읽지 않은 수를 비교했다. 원본 워커를 통한 context 메시지 발송과 context 목록 DTO·쓰기 이벤트, 부하·동시성은 비교하지 않았다. 이 결과는 전체 호환성 검증을 의미하지 않는다.
 
 ### context 관리 API의 현재 범위

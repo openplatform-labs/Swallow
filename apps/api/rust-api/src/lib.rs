@@ -721,6 +721,29 @@ async fn delete_notification(
     .await
 }
 
+// Management endpoints take contextKeys from the query. Subscriber sessions
+// retain their own scope and cannot override it through query parameters.
+fn individual_context_keys(
+    uri: &axum::http::Uri,
+    session: Option<Vec<String>>,
+) -> Result<Option<Vec<String>>, ()> {
+    if uri.query().is_none() {
+        return Ok(session);
+    }
+    if session.is_some() {
+        return Err(());
+    }
+    let Query(pairs) = Query::<Vec<(String, String)>>::try_from_uri(uri).map_err(|_| ())?;
+    let mut keys = Vec::new();
+    for (key, value) in pairs {
+        if key != "contextKeys" {
+            return Err(());
+        }
+        keys.push(value);
+    }
+    Ok((!keys.is_empty()).then_some(keys))
+}
+
 async fn delete_notification_for(
     db: &Client,
     environment_id: String,
@@ -730,15 +753,18 @@ async fn delete_notification_for(
     context_keys: Option<Vec<String>>,
 ) -> Response {
     let path = uri.to_string();
-    if uri.query().is_some() {
-        return error_at(
-            StatusCode::NOT_IMPLEMENTED,
-            "Notification filters not implemented",
-            "Not Implemented",
-            &path,
-        )
-        .into_response();
-    }
+    let context_keys = match individual_context_keys(&uri, context_keys) {
+        Ok(keys) => keys,
+        Err(()) => {
+            return error_at(
+                StatusCode::NOT_IMPLEMENTED,
+                "Notification filters not implemented",
+                "Not Implemented",
+                &path,
+            )
+            .into_response();
+        }
+    };
     if notification_id.len() != 24 || !notification_id.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -803,15 +829,18 @@ async fn snooze_notification_for(
     body: Bytes,
 ) -> Response {
     let path = uri.to_string();
-    if uri.query().is_some() {
-        return error_at(
-            StatusCode::NOT_IMPLEMENTED,
-            "Notification operation not implemented",
-            "Not Implemented",
-            &path,
-        )
-        .into_response();
-    }
+    let context_keys = match individual_context_keys(&uri, context_keys) {
+        Ok(keys) => keys,
+        Err(()) => {
+            return error_at(
+                StatusCode::NOT_IMPLEMENTED,
+                "Notification operation not implemented",
+                "Not Implemented",
+                &path,
+            )
+            .into_response();
+        }
+    };
     let input: Value = if body.is_empty() {
         json!({})
     } else {
@@ -960,9 +989,7 @@ async fn mark_notification_for(
     context_keys: Option<Vec<String>>,
 ) -> Response {
     let path = uri.to_string();
-    if !["read", "unread", "archive", "unarchive", "unsnooze"].contains(&action.as_str())
-        || uri.query().is_some()
-    {
+    if !["read", "unread", "archive", "unarchive", "unsnooze"].contains(&action.as_str()) {
         return error_at(
             StatusCode::NOT_IMPLEMENTED,
             "Notification operation not implemented",
@@ -971,6 +998,18 @@ async fn mark_notification_for(
         )
         .into_response();
     }
+    let context_keys = match individual_context_keys(&uri, context_keys) {
+        Ok(keys) => keys,
+        Err(()) => {
+            return error_at(
+                StatusCode::NOT_IMPLEMENTED,
+                "Notification operation not implemented",
+                "Not Implemented",
+                &path,
+            )
+            .into_response();
+        }
+    };
     if notification_id.len() != 24 || !notification_id.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
