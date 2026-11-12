@@ -21,9 +21,9 @@ API, 인앱·SendGrid·Twilio·FCM 워커 및 WS의 조회·이벤트 연결은 
 
 이 필드는 현재 PostgreSQL 이력에만 있으며 완전한 메시지 API나 운영 화면에는 노출되지 않는다. provider 웹훅·실제 수신 확인과 결과 불명 알림은 미구현이다. 불명 상태는 자동 재발송하지 않으므로 발송 누락 가능성도 남는다. 채널별 이력 상태 갱신과 FCM 그룹 집계에 DB 작업이 추가된다.
 
-[0054 마이그레이션](apps/worker/rust-queue/migrations/0054_delivery_reconciliation.sql)과 `delivery-reconcile` 도구는 환경별 불명 시도 최대 100건을 조회하고, 운영자가 provider 측 증거를 확인한 뒤 재시도 또는 접수 확인을 기록한다. 작업 잠금과 트랜잭션으로 중복 결정과 다른 환경 변경을 차단하고 DB 사용자·운영자 이름·사유·이전 HTTP 상태를 감사 테이블에 저장한다. 예를 들어 `cargo run --bin delivery-reconcile -- list ENV`, `cargo run --bin delivery-reconcile -- retry ENV JOB - OPERATOR TICKET`을 사용하며 FCM은 `-` 대신 대상 인덱스를 지정한다. `accepted`는 `retry` 대신 전달한다. TLS 연결 설정과 0054까지의 마이그레이션이 필요하다.
+[0054 마이그레이션](apps/worker/rust-queue/migrations/0054_delivery_reconciliation.sql)과 `delivery-reconcile` 도구는 환경별 불명 시도를 페이지당 최대 100건 조회하고, 운영자가 provider 측 증거를 확인한 뒤 재시도 또는 접수 확인을 기록한다. 작업 잠금과 트랜잭션으로 중복 결정과 다른 환경 변경을 차단하고 DB 사용자·운영자 이름·사유·이전 HTTP 상태를 감사 테이블에 저장한다. 예를 들어 `cargo run --bin delivery-reconcile -- list ENV`, `cargo run --bin delivery-reconcile -- retry ENV JOB - OPERATOR TICKET`을 사용하며 FCM은 `-` 대신 대상 인덱스를 지정한다. `accepted`는 `retry` 대신 전달한다. 다음 페이지는 마지막 행의 값으로 `list ENV AFTER_JOB AFTER_TARGET`을 호출하며 target이 null이면 `-`를 사용한다. 조회 중 데이터가 바뀌면 누락될 수 있으므로 처음부터 다시 확인해야 한다. TLS 연결 설정과 0054까지의 마이그레이션이 필요하다. `evidence ENV EMAIL_JOB`은 서명 검증을 통과해 기록된 SendGrid 이벤트의 유형별 건수와 서로 다른 수신자 해시 수를 요약한다. API의 0004 마이그레이션과 해당 테이블 읽기 권한이 필요하며, 이 요약만으로 모든 예정 수신자에게 전달됐는지 증명할 수 없다.
 
-`retry`는 **외부 provider가 접수하지 않았음을 독립적으로 확인한 경우에만** 사용한다. 실제로는 접수된 요청을 재시도하면 중복 발송될 수 있다. `accepted` 역시 실제 수신이 아니라 운영자가 확인한 provider 접수다. 자동 판정, provider 조회·Twilio 웹훅·SendGrid 이벤트의 자동 연계, 100건을 넘는 목록 페이지네이션, 운영자 인증·역할별 권한 및 감사 위변조 방지는 미구현이다. 운영자 이름은 입력값이므로 DB 접근 권한과 감사 테이블의 수정·삭제 권한을 별도로 제한해야 한다. 사유에는 개인정보·비밀을 넣지 않는다. 재시도 시 이메일·SMS는 현재 프로필·설정을 재검증하고 내용을 다시 렌더링하므로 이전 시도와 내용이 달라질 수 있다. 독립 수동 FCM 작업의 접수 확인은 전체 작업을 자동 완료하지 못할 수 있다.
+`retry`는 **외부 provider가 접수하지 않았음을 독립적으로 확인한 경우에만** 사용한다. 실제로는 접수된 요청을 재시도하면 중복 발송될 수 있다. `accepted` 역시 실제 수신이 아니라 운영자가 확인한 provider 접수다. 자동 판정, provider 조회·Twilio 웹훅·SendGrid 이벤트에 따른 자동 상태 변경, 운영자 인증·역할별 권한 및 감사 위변조 방지는 미구현이다. 운영자 이름은 입력값이므로 DB 접근 권한과 감사 테이블의 수정·삭제 권한을 별도로 제한해야 한다. 사유에는 개인정보·비밀을 넣지 않는다. 재시도 시 이메일·SMS는 현재 프로필·설정을 재검증하고 내용을 다시 렌더링하므로 이전 시도와 내용이 달라질 수 있다. 독립 수동 FCM 작업의 접수 확인은 전체 작업을 자동 완료하지 못할 수 있다.
 
 ### 서명된 SendGrid 전달 이벤트
 

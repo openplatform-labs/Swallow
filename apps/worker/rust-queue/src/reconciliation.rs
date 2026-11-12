@@ -8,11 +8,46 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 
 /// List bounded unknown attempts without returning recipient data or payloads.
 pub async fn list(client: &Client, environment: &str) -> Result<Vec<Value>> {
+    list_after(client, environment, None).await
+}
+
+/// Return the next page after the last job ID and target index of a prior page.
+pub async fn list_after(
+    client: &Client,
+    environment: &str,
+    after: Option<(Uuid, Option<i32>)>,
+) -> Result<Vec<Value>> {
     if environment.is_empty() {
         return Err("environment is required".into());
     }
-    let rows=client.query("SELECT j.id,j.kind,j.status,a.target_index,a.http_status,a.updated_at::text FROM novu_queue_jobs j JOIN (SELECT job_id,environment_id,NULL::integer AS target_index,http_status,updated_at FROM novu_rust_sendgrid_attempts WHERE state='unknown' UNION ALL SELECT job_id,environment_id,NULL::integer,http_status,updated_at FROM novu_rust_twilio_attempts WHERE state='unknown' UNION ALL SELECT job_id,environment_id,target_index,http_status,updated_at FROM novu_rust_fcm_attempts WHERE state='unknown') a ON a.job_id=j.id AND a.environment_id=j.environment_id WHERE j.environment_id=$1 ORDER BY a.updated_at,j.id,a.target_index LIMIT 100", &[&environment]).await?;
+    if after
+        .as_ref()
+        .is_some_and(|(_, index)| index.is_some_and(|index| index < 0))
+    {
+        return Err("invalid target index".into());
+    }
+    let after_job = after.as_ref().map(|(job, _)| *job);
+    let after_index = after.and_then(|(_, index)| index).unwrap_or(-1);
+    let rows=client.query("SELECT j.id,j.kind,j.status,a.target_index,a.http_status,a.updated_at::text FROM novu_queue_jobs j JOIN (SELECT job_id,environment_id,NULL::integer AS target_index,http_status,updated_at FROM novu_rust_sendgrid_attempts WHERE state='unknown' UNION ALL SELECT job_id,environment_id,NULL::integer,http_status,updated_at FROM novu_rust_twilio_attempts WHERE state='unknown' UNION ALL SELECT job_id,environment_id,target_index,http_status,updated_at FROM novu_rust_fcm_attempts WHERE state='unknown') a ON a.job_id=j.id AND a.environment_id=j.environment_id WHERE j.environment_id=$1 AND ($2::uuid IS NULL OR (j.id,COALESCE(a.target_index,-1))>($2,$3)) ORDER BY j.id,COALESCE(a.target_index,-1) LIMIT 100", &[&environment,&after_job,&after_index]).await?;
     Ok(rows.into_iter().map(|r| json!({"jobId":r.get::<_,Uuid>(0).to_string(),"kind":r.get::<_,String>(1),"jobStatus":r.get::<_,String>(2),"targetIndex":r.get::<_,Option<i32>>(3),"httpStatus":r.get::<_,Option<i32>>(4),"updatedAt":r.get::<_,String>(5)})).collect())
+}
+
+/// Summarize authenticated SendGrid evidence without exposing recipient hashes.
+pub async fn email_evidence(client: &Client, environment: &str, job: Uuid) -> Result<Vec<Value>> {
+    if environment.is_empty() {
+        return Err("environment is required".into());
+    }
+    let exists = client
+        .query_opt(
+            "SELECT 1 FROM novu_queue_jobs WHERE environment_id=$1 AND id=$2 AND kind=$3",
+            &[&environment, &job, &crate::sendgrid_queue::JOB_KIND],
+        )
+        .await?;
+    if exists.is_none() {
+        return Err("email job not found".into());
+    }
+    let rows=client.query("SELECT e.event_type,count(*),count(DISTINCT e.recipient_hash),max(e.event_timestamp) FROM novu_rust_sendgrid_delivery_events e JOIN novu_rust_email_messages m ON m.environment_id=e.environment_id AND m.internal_id=e.message_internal_id WHERE m.environment_id=$1 AND m.email_job_id=$2 GROUP BY e.event_type ORDER BY e.event_type", &[&environment,&job]).await?;
+    Ok(rows.into_iter().map(|r|json!({"event":r.get::<_,String>(0),"eventCount":r.get::<_,i64>(1),"recipientCount":r.get::<_,i64>(2),"latestEventTimestamp":r.get::<_,Option<i64>>(3)})).collect())
 }
 
 /// Resolve an unknown attempt after an operator independently verifies its outcome.
