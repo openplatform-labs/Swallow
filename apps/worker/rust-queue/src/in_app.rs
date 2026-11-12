@@ -160,6 +160,7 @@ pub const MULTIPLE_FCM_CHANNELS_MIGRATION: &str =
     include_str!("../migrations/0051_multiple_fcm_channels.sql");
 pub const PUSH_STEP_ID_MIGRATION: &str =
     include_str!("../migrations/0052_experimental_push_step_id.sql");
+pub const DELIVERY_STATE_MIGRATION: &str = include_str!("../migrations/0053_delivery_state.sql");
 pub const JOB_KIND: &str = novu_rust_contracts::EXPERIMENTAL_IN_APP_JOB_KIND;
 pub const UNSNOOZE_JOB_KIND: &str = "experimental-in-app-unsnooze";
 type WorkerResult<T> = Result<T, Box<dyn Error + Send + Sync>>;

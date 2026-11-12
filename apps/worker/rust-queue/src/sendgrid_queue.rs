@@ -253,6 +253,7 @@ pub async fn process_one(
         tx.commit().await?;
         return Ok(true);
     }
+    tx.execute("UPDATE novu_rust_email_messages SET delivery_state='dispatching' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
     tx.commit().await?;
     let (state, status, provider_id, diagnostic) = match provider.send(&email).await {
         Ok(receipt) => (
@@ -288,6 +289,7 @@ pub async fn process_one(
     }
     let updated=tx.execute("UPDATE novu_rust_sendgrid_attempts SET state=$2,http_status=$3,provider_message_id=$4,updated_at=clock_timestamp() WHERE job_id=$1 AND state='dispatching'", &[&job.id,&state,&status,&provider_id]).await?;
     if updated == 1 {
+        tx.execute("UPDATE novu_rust_email_messages SET delivery_state=$3 WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id,&state]).await?;
         if state == "accepted" {
             tx.execute("UPDATE novu_rust_email_messages SET identifier=$3 WHERE environment_id=$1 AND email_job_id=$2", &[&job.environment_id,&job.id,&provider_id]).await?;
         } else {
@@ -316,6 +318,7 @@ pub async fn recover_expired(client: &mut Client, environment: &str) -> Result<u
         let attempted=tx.query_opt("SELECT state FROM novu_rust_sendgrid_attempts WHERE job_id=$1 AND environment_id=$2", &[&id,&environment]).await?.is_some();
         if attempted {
             tx.execute("UPDATE novu_rust_sendgrid_attempts SET state='unknown',updated_at=clock_timestamp() WHERE job_id=$1 AND state='dispatching'", &[&id]).await?;
+            tx.execute("UPDATE novu_rust_email_messages SET delivery_state='unknown' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&id]).await?;
             tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='email delivery outcome unknown',lease_token=NULL,lease_until=NULL WHERE id=$1", &[&id]).await?;
         } else {
             tx.execute("UPDATE novu_queue_jobs SET status='pending',lease_token=NULL,lease_until=NULL WHERE id=$1", &[&id]).await?;
@@ -436,6 +439,7 @@ mod tests {
         db.batch_execute(crate::in_app::EMAIL_PROVIDER_RESULT_MIGRATION)
             .await
             .unwrap();
+        db.batch_execute("ALTER TABLE novu_rust_email_messages ADD COLUMN IF NOT EXISTS delivery_state text NOT NULL DEFAULT 'not_attempted'").await.unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/v3/mail/send", listener.local_addr().unwrap());
         let provider = Sendgrid::test_endpoint(
@@ -527,6 +531,15 @@ mod tests {
                 );
             }
             let message_row = db.query_one("SELECT status,error_id,error_text,identifier FROM novu_rust_email_messages WHERE environment_id='env-a' AND internal_id=$1", &[&message_id]).await.unwrap();
+            let delivery_state: String = db
+                .query_one(
+                    "SELECT delivery_state FROM novu_rust_email_messages WHERE internal_id=$1",
+                    &[&message_id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(delivery_state, state);
             if state == "accepted" {
                 assert_eq!(message_row.get::<_, String>(0), "sent");
                 assert_eq!(
@@ -649,6 +662,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(claimed.id, post);
+        db.execute("INSERT INTO novu_rust_email_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,subject,status,email_job_id,delivery_state) VALUES ($1,'env-a','alice','subscriber','notification','workflow','transaction','Hello','sent',$2,'dispatching')", &[&post.to_string(),&post]).await.unwrap();
         db.execute("INSERT INTO novu_rust_sendgrid_attempts(job_id,environment_id,state) VALUES ($1,'env-a','dispatching')", &[&post]).await.unwrap();
         db.execute(
             "UPDATE novu_queue_jobs SET lease_until=now()-interval '1 second' WHERE id=$1",
@@ -660,6 +674,16 @@ mod tests {
         let row=db.query_one("SELECT j.status,a.state FROM novu_queue_jobs j JOIN novu_rust_sendgrid_attempts a ON j.id=a.job_id WHERE j.id=$1", &[&post]).await.unwrap();
         assert_eq!(row.get::<_, String>(0), "failed");
         assert_eq!(row.get::<_, String>(1), "unknown");
+        assert_eq!(
+            db.query_one(
+                "SELECT delivery_state FROM novu_rust_email_messages WHERE email_job_id=$1",
+                &[&post]
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+            "unknown"
+        );
         assert!(!process_one(&mut db, "env-a", &provider).await.unwrap());
     }
 }

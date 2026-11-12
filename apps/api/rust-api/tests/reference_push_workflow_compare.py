@@ -347,8 +347,8 @@ for label in ([] if os.environ.get('NOVU_TEST_SECURITY_ONLY')=='1' else ['tokens
             subprocess.run(['cargo','test','--locked','--offline','--lib','capture_reference_workflow_push','--','--ignored'],cwd=Path(__file__).resolve().parents[3]/'worker'/'rust-queue',env=env,check=True)
             actual.extend(entry['message'] for entry in json.loads(capture.read_text()))
             if label=='tokens-restart' and stage==0:
-                interim=json.loads(run('docker','exec',pg,'psql','-U','postgres','-d','novu_compat','-At','-c',f"SELECT json_agg(json_build_object('id',internal_id,'identifier',identifier,'status',status))::text FROM novu_rust_push_messages WHERE transaction_id='{txn}'"))
-                assert len(interim)==1 and interim[0]['identifier'] is None and interim[0]['status']=='sent',interim
+                interim=json.loads(run('docker','exec',pg,'psql','-U','postgres','-d','novu_compat','-At','-c',f"SELECT json_agg(json_build_object('id',internal_id,'identifier',identifier,'status',status,'deliveryState',delivery_state))::text FROM novu_rust_push_messages WHERE transaction_id='{txn}'"))
+                assert len(interim)==1 and interim[0]['identifier'] is None and interim[0]['status']=='sent' and interim[0]['deliveryState']=='in_progress',interim
     original=messages[0];original_id=original['data'].pop('__nvMessageId');original.pop('tokens')
     rust_ids=set()
     for token,message in zip(tokens,actual):
@@ -360,10 +360,10 @@ for label in ([] if os.environ.get('NOVU_TEST_SECURITY_ONLY')=='1' else ['tokens
         history=json.loads(run('docker','exec',mongo,'mongosh','--quiet','--eval',f'''const d=db.getSiblingDB("novu-db");print(JSON.stringify(d.messages.find({{transactionId:"{txn}"}}).toArray().map(m=>({{id:String(m._id),deviceTokens:m.deviceTokens,status:m.status}}))));'''))
         if history and (label!='tokens-all-failed' or history[0]['status']=='error'):break
         time.sleep(.25)
-    rust_history=json.loads(run('docker','exec',pg,'psql','-U','postgres','-d','novu_compat','-At','-c',f"SELECT COALESCE(json_agg(json_build_object('id',internal_id,'deviceTokens',device_tokens,'status',status)),'[]'::json)::text FROM novu_rust_push_messages WHERE transaction_id='{txn}'"))
+    rust_history=json.loads(run('docker','exec',pg,'psql','-U','postgres','-d','novu_compat','-At','-c',f"SELECT COALESCE(json_agg(json_build_object('id',internal_id,'deviceTokens',device_tokens,'status',status,'deliveryState',delivery_state)),'[]'::json)::text FROM novu_rust_push_messages WHERE transaction_id='{txn}'"))
     expected_status='error' if label=='tokens-all-failed' else 'sent'
     assert history==[{'id':original_id,'deviceTokens':tokens,'status':expected_status}],(label,history)
-    assert rust_history==[{'id':next(iter(rust_ids)),'deviceTokens':tokens,'status':expected_status}],(label,rust_history)
+    assert rust_history==[{'id':next(iter(rust_ids)),'deviceTokens':tokens,'status':expected_status,'deliveryState':'rejected' if label=='tokens-all-failed' else 'accepted'}],(label,rust_history)
     print(label+': multicast requests and shared history matched')
 
 # Safety mode intentionally differs from Novu: a queued job must not send to

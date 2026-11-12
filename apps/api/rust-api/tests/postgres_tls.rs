@@ -7,11 +7,21 @@ async fn verifies_postgres_transport() {
     let (config, tls) = novu_rust_contracts::postgres::configure(&url).unwrap();
     let result = config.connect(tls).await;
     if expected == "reject" {
-        assert!(result.is_err(), "untrusted, wrong-host or plaintext server was accepted");
+        assert!(
+            result.is_err(),
+            "untrusted, wrong-host or plaintext server was accepted"
+        );
         return;
     }
     let (client, connection) = result.expect("expected database connection");
     tokio::spawn(async move { connection.await.unwrap() });
-    let encrypted: bool = client.query_one("SELECT ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid()", &[]).await.unwrap().get(0);
+    let encrypted: bool = client
+        .query_one(
+            "SELECT ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid()",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
     assert_eq!(encrypted, expected == "tls");
 }

@@ -187,6 +187,7 @@ pub async fn process_one(
         tx.commit().await?;
         return Ok(true);
     }
+    tx.execute("UPDATE novu_rust_sms_messages SET delivery_state='dispatching' WHERE environment_id=$1 AND sms_job_id=$2", &[&environment,&job.id]).await?;
     tx.commit().await?;
     let (state, status, provider_id, diagnostic) = match provider.send(&sms).await {
         Ok(receipt) => (
@@ -219,6 +220,7 @@ pub async fn process_one(
     }
     let updated = tx.execute("UPDATE novu_rust_twilio_attempts SET state=$2,http_status=$3,provider_message_id=$4,updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$5 AND state='dispatching'", &[&job.id,&state,&status,&provider_id,&environment]).await?;
     if updated == 1 {
+        tx.execute("UPDATE novu_rust_sms_messages SET delivery_state=$3 WHERE environment_id=$1 AND sms_job_id=$2", &[&environment,&job.id,&state]).await?;
         if state == "accepted" {
             tx.execute("UPDATE novu_rust_sms_messages SET identifier=$3 WHERE environment_id=$1 AND sms_job_id=$2", &[&environment,&job.id,&provider_id]).await?;
         } else {
@@ -250,6 +252,7 @@ pub async fn recover_expired(client: &mut Client, environment: &str) -> Result<u
             .is_some();
         if attempted {
             tx.execute("UPDATE novu_rust_twilio_attempts SET state='unknown',updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$2 AND state='dispatching'", &[&id,&environment]).await?;
+            tx.execute("UPDATE novu_rust_sms_messages SET delivery_state='unknown' WHERE environment_id=$1 AND sms_job_id=$2", &[&environment,&id]).await?;
             tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='sms delivery outcome unknown',lease_token=NULL,lease_until=NULL WHERE id=$1", &[&id]).await?;
         } else {
             tx.execute("UPDATE novu_queue_jobs SET status='pending',lease_token=NULL,lease_until=NULL WHERE id=$1", &[&id]).await?;
@@ -376,6 +379,7 @@ mod tests {
         db.batch_execute(crate::in_app::SMS_MESSAGES_MIGRATION)
             .await
             .unwrap();
+        db.batch_execute("ALTER TABLE novu_rust_sms_messages ADD COLUMN IF NOT EXISTS delivery_state text NOT NULL DEFAULT 'not_attempted'").await.unwrap();
         let payload = json!({"to":"+15550000002", "content":"Hi & hello", "from":null});
         let other = Uuid::new_v4();
         crate::enqueue(&db, other, "other", JOB_KIND, &payload)
@@ -391,6 +395,7 @@ mod tests {
             crate::enqueue(&db, id, "test", JOB_KIND, &payload)
                 .await
                 .unwrap();
+            db.execute("INSERT INTO novu_rust_sms_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,status,sms_job_id) VALUES ($1,'test','alice','subscriber','notification','workflow','transaction','sent',$2)", &[&id.to_string(),&id]).await.unwrap();
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let origin = format!("http://{}", listener.local_addr().unwrap());
             let server = tokio::spawn(async move {
@@ -421,6 +426,15 @@ mod tests {
             server.await.unwrap();
             let row = db.query_one("SELECT a.state,j.status,a.provider_message_id FROM novu_rust_twilio_attempts a JOIN novu_queue_jobs j ON j.id=a.job_id WHERE a.job_id=$1", &[&id]).await.unwrap();
             assert_eq!(row.get::<_, String>(0), expected);
+            let delivery_state: String = db
+                .query_one(
+                    "SELECT delivery_state FROM novu_rust_sms_messages WHERE sms_job_id=$1",
+                    &[&id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(delivery_state, expected);
             assert_eq!(
                 row.get::<_, String>(1),
                 if expected == "accepted" {
@@ -498,6 +512,7 @@ mod tests {
         }
         db.execute("UPDATE novu_queue_jobs SET status='running',lease_token=$2,lease_until=clock_timestamp()-interval '1 second' WHERE id=ANY($1)", &[&vec![before,after],&Uuid::new_v4()]).await.unwrap();
         db.execute("INSERT INTO novu_rust_twilio_attempts(job_id,environment_id,state) VALUES ($1,'test','dispatching')", &[&after]).await.unwrap();
+        db.execute("INSERT INTO novu_rust_sms_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,status,sms_job_id,delivery_state) VALUES ($1,'test','alice','subscriber','notification','workflow','transaction','sent',$2,'dispatching')", &[&after.to_string(),&after]).await.unwrap();
         assert_eq!(recover_expired(&mut db, "test").await.unwrap(), 2);
         assert_eq!(
             db.query_one("SELECT status FROM novu_queue_jobs WHERE id=$1", &[&before])
@@ -509,5 +524,15 @@ mod tests {
         let row=db.query_one("SELECT j.status,a.state FROM novu_queue_jobs j JOIN novu_rust_twilio_attempts a ON a.job_id=j.id WHERE j.id=$1", &[&after]).await.unwrap();
         assert_eq!(row.get::<_, String>(0), "failed");
         assert_eq!(row.get::<_, String>(1), "unknown");
+        assert_eq!(
+            db.query_one(
+                "SELECT delivery_state FROM novu_rust_sms_messages WHERE sms_job_id=$1",
+                &[&after]
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+            "unknown"
+        );
     }
 }

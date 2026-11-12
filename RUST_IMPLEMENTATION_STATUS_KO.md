@@ -15,6 +15,12 @@ API, 인앱·SendGrid·Twilio·FCM 워커 및 WS의 조회·이벤트 연결은 
 
 [Docker PostgreSQL TLS 테스트](apps/api/rust-api/scripts/test-postgres-tls.sh)는 임시 CA로 정상 암호화 연결 및 실제 서버의 SSL 상태를 확인하고, 신뢰되지 않은 CA·호스트명 불일치·평문 서버를 거절하는지 검사한다. 명시적 평문 테스트 모드도 확인한다. DB 클라이언트 인증서(mTLS), 비밀 관리, 인증서 자동 갱신과 운영 배포·HA는 미구현 또는 미검증이며 TLS만으로 운영 준비가 완료되지 않는다.
 
+## 발송 상태와 복구
+
+[0053 마이그레이션](apps/worker/rust-queue/migrations/0053_delivery_state.sql)은 실험 이메일·SMS·푸시 이력에 `delivery_state`를 추가한다. `not_attempted`, `dispatching`, 멀티캐스트의 `in_progress`, provider `accepted`·`rejected`, 결과 `unknown`을 구분한다. `accepted`는 provider 접수이며 실제 수신이 아니다. 기존 원본 호환 `status`의 `sent` 의미는 바꾸지 않으므로 운영 판단에는 두 필드를 함께 확인해야 한다. 외부 요청 중 임대가 만료되면 복구가 이력을 `unknown`으로 갱신한다. 기존 이력은 연결된 단일 발송 시도에서 상태를 이관하고, 시도 기록이 없거나 복수 대상 그룹의 과거 결과를 확정할 수 없으면 `unknown`으로 남긴다.
+
+이 필드는 현재 PostgreSQL 이력에만 있으며 완전한 메시지 API나 운영 화면에는 노출되지 않는다. provider 웹훅·실제 수신 확인, 결과 불명 알림·운영자 확인과 안전한 재처리 절차는 미구현이다. 불명 상태는 자동 재발송하지 않으므로 발송 누락 가능성도 남는다. 채널별 이력 상태 갱신과 FCM 그룹 집계에 DB 작업이 추가된다.
+
 ## 구현된 범위
 
 - 제한적인 트리거 API: API 키 해시로 환경과 연결된 사용자를 조회하고, 워크플로 없음·비활성·단계 없음의 일부 응답을 처리한다. 트리거와 관리 API의 사용자 Bearer 인증은 구현되지 않아 거절한다.

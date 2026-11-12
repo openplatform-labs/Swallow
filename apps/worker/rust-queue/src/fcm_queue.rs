@@ -121,6 +121,7 @@ async fn process_one_inner(
         return Ok(true);
     }
     if !prepared_identity_valid {
+        tx.execute("UPDATE novu_rust_push_messages SET delivery_state='unknown' WHERE environment_id=$1 AND push_job_id=$2 AND delivery_state IN ('dispatching','in_progress')", &[&environment,&job.id]).await?;
         tx.execute("UPDATE novu_rust_push_step_outcomes SET status='failed',push_job_id=NULL WHERE environment_id=$1 AND push_job_id=$2", &[&environment,&job.id]).await?;
         tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='subscriber identity changed',lease_token=NULL,lease_until=NULL WHERE id=$1", &[&job.id]).await?;
         tx.commit().await?;
@@ -523,6 +524,9 @@ async fn process_one_inner(
         }
     }
     tx.execute("INSERT INTO novu_rust_fcm_attempts(job_id,environment_id,target_index,state) VALUES ($1,$2,$3,'dispatching')",&[&job.id,&environment,&index_i32]).await?;
+    if prepared_context.is_some() {
+        tx.execute("UPDATE novu_rust_push_messages SET delivery_state=CASE WHEN delivery_state='unknown' THEN 'unknown' ELSE 'dispatching' END WHERE environment_id=$1 AND push_job_id=$2 AND target_index=$3", &[&environment,&job.id,&history_index]).await?;
+    }
     tx.commit().await?;
     let result = selected_provider.send_wire(&messages[index]).await;
     let invalid_token = matches!(result, Err(SendError::InvalidDeviceToken(_)));
@@ -598,7 +602,22 @@ async fn process_one_inner(
                     None
                 };
                 let error_id = (message_status == "error").then_some("unexpected_push_error");
-                tx.execute("UPDATE novu_rust_push_messages SET status=$4,error_id=$5,error_text=$6,identifier=internal_id WHERE environment_id=$1 AND push_job_id=$2 AND target_index=$3",&[&environment,&job.id,&history_index,&message_status,&error_id,&diagnostic]).await?;
+                let delivery_state = if unknown > 0 {
+                    "unknown"
+                } else if accepted > 0 {
+                    "accepted"
+                } else {
+                    "rejected"
+                };
+                tx.execute("UPDATE novu_rust_push_messages SET status=$4,error_id=$5,error_text=$6,identifier=internal_id,delivery_state=$7 WHERE environment_id=$1 AND push_job_id=$2 AND target_index=$3",&[&environment,&job.id,&history_index,&message_status,&error_id,&diagnostic,&delivery_state]).await?;
+            } else {
+                let unknown: i64 = counts.get(2);
+                let delivery_state = if unknown > 0 {
+                    "unknown"
+                } else {
+                    "in_progress"
+                };
+                tx.execute("UPDATE novu_rust_push_messages SET delivery_state=$4 WHERE environment_id=$1 AND push_job_id=$2 AND target_index=$3", &[&environment,&job.id,&history_index,&delivery_state]).await?;
             }
         }
         if attempted.len() + 1 < messages.len() {
@@ -617,6 +636,7 @@ pub async fn recover_expired(client: &mut Client, environment: &str) -> Result<u
     let rows=tx.query("SELECT id FROM novu_queue_jobs WHERE environment_id=$1 AND kind=$2 AND status='running' AND lease_until<=clock_timestamp() ORDER BY lease_until,id FOR UPDATE SKIP LOCKED LIMIT 100",&[&environment,&JOB_KIND]).await?;
     for row in &rows {
         let id: Uuid = row.get(0);
+        tx.execute("UPDATE novu_rust_push_messages m SET delivery_state='unknown' FROM novu_rust_fcm_attempts a JOIN novu_queue_jobs j ON j.id=a.job_id WHERE m.environment_id=$1 AND m.push_job_id=$2 AND a.environment_id=m.environment_id AND a.job_id=m.push_job_id AND a.state='dispatching' AND m.target_index=COALESCE((j.payload->'prepared_context'->'target_metadata'->a.target_index->>'history_index')::integer,a.target_index)",&[&environment,&id]).await?;
         tx.execute("UPDATE novu_rust_fcm_attempts SET state='unknown',updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$2 AND state='dispatching'",&[&id,&environment]).await?;
         tx.execute("UPDATE novu_queue_jobs SET status='pending',lease_token=NULL,lease_until=NULL WHERE id=$1",&[&id]).await?;
     }
@@ -828,6 +848,10 @@ mod tests {
             .unwrap();
         db.batch_execute(crate::MIGRATION).await.unwrap();
         db.batch_execute(MIGRATION).await.unwrap();
+        db.batch_execute(crate::in_app::PUSH_MESSAGES_MIGRATION)
+            .await
+            .unwrap();
+        db.batch_execute("ALTER TABLE novu_rust_push_messages ADD COLUMN IF NOT EXISTS delivery_state text NOT NULL DEFAULT 'not_attempted'").await.unwrap();
         let payload = json!({"title":"Hi","content":"Hello","targets":["a","b","c"]});
         let other = Uuid::new_v4();
         let id = Uuid::new_v4();
@@ -921,9 +945,20 @@ mod tests {
             .unwrap();
         let job = claim(&db, "test").await.unwrap().unwrap();
         assert_eq!(job.id, recovery);
+        db.execute("INSERT INTO novu_rust_push_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,device_tokens,title,status,push_job_id,target_index,delivery_state) VALUES ($1,'test','alice','subscriber','notification','workflow','transaction',ARRAY['a'],'Hi','sent',$2,0,'dispatching')", &[&recovery.to_string(),&recovery]).await.unwrap();
         db.execute("INSERT INTO novu_rust_fcm_attempts(job_id,environment_id,target_index,state) VALUES ($1,'test',0,'dispatching')",&[&recovery]).await.unwrap();
         db.execute("UPDATE novu_queue_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1",&[&recovery]).await.unwrap();
         assert_eq!(recover_expired(&mut db, "test").await.unwrap(), 1);
+        assert_eq!(
+            db.query_one(
+                "SELECT delivery_state FROM novu_rust_push_messages WHERE push_job_id=$1",
+                &[&recovery]
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+            "unknown"
+        );
         let (provider, server) = mock(vec![200, 200]).await;
         assert!(process_one(&mut db, "test", &provider).await.unwrap());
         assert!(process_one(&mut db, "test", &provider).await.unwrap());

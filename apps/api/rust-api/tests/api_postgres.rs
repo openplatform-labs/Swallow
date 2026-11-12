@@ -504,6 +504,22 @@ async fn trigger_api_contract_inner() {
     db.batch_execute(novu_postgres_queue::in_app::PUSH_STEP_ID_MIGRATION)
         .await
         .unwrap();
+    for migration in [
+        novu_postgres_queue::sendgrid_queue::MIGRATION,
+        novu_postgres_queue::twilio_queue::MIGRATION,
+        novu_postgres_queue::fcm_queue::MIGRATION,
+    ] {
+        db.batch_execute(migration).await.unwrap();
+    }
+    db.batch_execute("INSERT INTO novu_queue_jobs(id,environment_id,kind,payload) VALUES ('00000000-0000-4000-8000-000000000091','legacy-env','experimental_sendgrid_email','{}'),('00000000-0000-4000-8000-000000000092','legacy-env','experimental_sendgrid_email','{}'); INSERT INTO novu_rust_sendgrid_attempts(job_id,environment_id,state) VALUES ('00000000-0000-4000-8000-000000000091','legacy-env','accepted'); INSERT INTO novu_rust_email_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,subject,status,email_job_id) VALUES ('legacy-accepted','legacy-env','legacy','legacy-id','notification','workflow','one','subject','sent','00000000-0000-4000-8000-000000000091'),('legacy-ambiguous','legacy-env','legacy','legacy-id','notification','workflow','two','subject','sent','00000000-0000-4000-8000-000000000092')").await.unwrap();
+    for _ in 0..2 {
+        db.batch_execute(novu_postgres_queue::in_app::DELIVERY_STATE_MIGRATION)
+            .await
+            .unwrap();
+        let states: Vec<String> = db.query_one("SELECT array_agg(delivery_state ORDER BY internal_id) FROM novu_rust_email_messages WHERE internal_id IN ('legacy-accepted','legacy-ambiguous')", &[]).await.unwrap().get(0);
+        assert_eq!(states, vec!["accepted", "unknown"]);
+    }
+    db.batch_execute("DELETE FROM novu_rust_email_messages WHERE internal_id IN ('legacy-accepted','legacy-ambiguous'); DELETE FROM novu_queue_jobs WHERE id IN ('00000000-0000-4000-8000-000000000091','00000000-0000-4000-8000-000000000092')").await.unwrap();
     db.batch_execute(novu_postgres_queue::in_app::MULTIPLE_FCM_CHANNELS_MIGRATION)
         .await
         .unwrap();
