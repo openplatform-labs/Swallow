@@ -107,6 +107,10 @@ pub fn router_with_twilio_config(
             "/webhooks/organizations/{organization}/environments/{environment}/sms/twilio/jobs/{job}",
             post(twilio_webhook::receive_job),
         )
+        .route(
+            "/webhooks/organizations/{organization}/environments/{environment}/sms/twilio/jobs/{job}/attempts/{dispatch}",
+            post(twilio_webhook::receive_dispatch),
+        )
         .route("/v1/events/trigger", post(trigger))
         .route(
             "/v1/subscribers/{subscriber_id}/credentials",

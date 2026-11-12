@@ -12,11 +12,12 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     tokio::spawn(async move {
         connection.await.unwrap();
     });
-    db.batch_execute("DROP TABLE IF EXISTS novu_rust_delivery_reconciliations,novu_rust_sendgrid_attempts,novu_rust_twilio_attempts,novu_rust_fcm_attempts,novu_rust_email_messages,novu_rust_sms_messages,novu_rust_push_messages,novu_queue_jobs CASCADE").await.unwrap();
+    db.batch_execute("DROP TABLE IF EXISTS novu_rust_twilio_dispatch_ids,novu_rust_delivery_reconciliations,novu_rust_sendgrid_attempts,novu_rust_twilio_attempts,novu_rust_fcm_attempts,novu_rust_email_messages,novu_rust_sms_messages,novu_rust_push_messages,novu_queue_jobs CASCADE").await.unwrap();
     for migration in [
         queue::MIGRATION,
         queue::sendgrid_queue::MIGRATION,
         queue::twilio_queue::MIGRATION,
+        queue::twilio_queue::DISPATCH_ID_MIGRATION,
         queue::fcm_queue::MIGRATION,
         queue::in_app::EMAIL_MESSAGES_MIGRATION,
         queue::in_app::EMAIL_PROVIDER_RESULT_MIGRATION,
@@ -40,6 +41,11 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     .unwrap();
     db.batch_execute(include_str!(
         "../../../api/rust-api/migrations/0006_twilio_webhook_job_link.sql"
+    ))
+    .await
+    .unwrap();
+    db.batch_execute(include_str!(
+        "../../../api/rust-api/migrations/0007_twilio_dispatch_identity.sql"
     ))
     .await
     .unwrap();
@@ -91,13 +97,16 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
             .await
             .is_err()
     );
-    db.execute("INSERT INTO novu_rust_twilio_delivery_events(environment_id,account_sid,message_sid,status,job_id) VALUES ('tenant-a','ACfixture','SMfixture','delivered',$1)", &[&sms]).await.unwrap();
+    let sms_dispatch = Uuid::new_v4();
+    db.execute("INSERT INTO novu_rust_twilio_dispatch_ids(id,job_id,environment_id) VALUES ($1,$2,'tenant-a')", &[&sms_dispatch,&sms]).await.unwrap();
+    db.execute("INSERT INTO novu_rust_twilio_delivery_events(environment_id,account_sid,message_sid,status,job_id,dispatch_id) VALUES ('tenant-a','ACfixture','SMfixture','delivered',$1,$2)", &[&sms,&sms_dispatch]).await.unwrap();
     let sms_events = reconciliation::sms_evidence(&db, "tenant-a", sms)
         .await
         .unwrap();
     assert_eq!(sms_events.len(), 1);
     assert_eq!(sms_events[0]["providerMessageId"], "SMfixture");
     assert_eq!(sms_events[0]["status"], "delivered");
+    assert_eq!(sms_events[0]["dispatchId"], sms_dispatch.to_string());
     assert!(
         reconciliation::sms_evidence(&db, "tenant-b", sms)
             .await
@@ -283,7 +292,9 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     )
     .await
     .unwrap();
-    db.execute("INSERT INTO novu_rust_twilio_attempts(job_id,environment_id,state) VALUES ($1,'tenant-a','unknown')", &[&sms_retry]).await.unwrap();
+    let old_dispatch = Uuid::new_v4();
+    db.execute("INSERT INTO novu_rust_twilio_dispatch_ids(id,job_id,environment_id) VALUES ($1,$2,'tenant-a')", &[&old_dispatch,&sms_retry]).await.unwrap();
+    db.execute("INSERT INTO novu_rust_twilio_attempts(job_id,environment_id,state,dispatch_id) VALUES ($1,'tenant-a','unknown',$2)", &[&sms_retry,&old_dispatch]).await.unwrap();
     reconciliation::resolve(
         &mut db,
         "tenant-a",
@@ -299,6 +310,8 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     assert_eq!(row.get::<_, String>(0), "pending");
     assert_eq!(row.get::<_, i64>(1), 0);
     assert_eq!(row.get::<_, i64>(2), 1);
+    let retained: bool = db.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_twilio_dispatch_ids WHERE id=$1 AND job_id=$2 AND environment_id='tenant-a')", &[&old_dispatch,&sms_retry]).await.unwrap().get(0);
+    assert!(retained);
     let bulk = Uuid::new_v4();
     queue::enqueue(
         &db,

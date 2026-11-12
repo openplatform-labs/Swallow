@@ -249,10 +249,10 @@ impl Twilio {
         Ok(self)
     }
 
-    pub(crate) fn status_callback(&self, job: uuid::Uuid) -> Option<String> {
+    pub(crate) fn status_callback(&self, job: uuid::Uuid, dispatch: uuid::Uuid) -> Option<String> {
         self.status_callback_base
             .as_ref()
-            .map(|base| format!("{base}/jobs/{job}"))
+            .map(|base| format!("{base}/jobs/{job}/attempts/{dispatch}"))
     }
 
     pub fn endpoint(&self) -> &str {

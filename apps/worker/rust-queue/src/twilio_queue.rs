@@ -9,12 +9,14 @@ use uuid::Uuid;
 
 pub const JOB_KIND: &str = "experimental_twilio_sms";
 pub const MIGRATION: &str = include_str!("../migrations/0041_experimental_twilio_attempts.sql");
+pub const DISPATCH_ID_MIGRATION: &str =
+    include_str!("../migrations/0055_twilio_attempt_identity.sql");
 
 fn valid_phone(value: Option<&str>) -> Option<&str> {
     value.filter(|v| !v.trim().is_empty())
 }
 
-fn apply_status_callback(sms: &mut Sms, provider: &Twilio, job: Uuid) {
+fn apply_status_callback(sms: &mut Sms, provider: &Twilio, job: Uuid, dispatch: Uuid) {
     let explicit_callback = sms
         .provider_data
         .get("_passthrough")
@@ -27,7 +29,7 @@ fn apply_status_callback(sms: &mut Sms, provider: &Twilio, job: Uuid) {
             .get("statusCallback")
             .and_then(serde_json::Value::as_str)
             .is_some();
-    if !explicit_callback && let Some(callback) = provider.status_callback(job) {
+    if !explicit_callback && let Some(callback) = provider.status_callback(job, dispatch) {
         sms.provider_data
             .insert("statusCallback".into(), callback.into());
     }
@@ -200,13 +202,19 @@ pub async fn process_one(
         sms.content = option("content").unwrap_or(&content).to_owned();
         sms.from = option("from").map(str::to_owned);
     }
-    apply_status_callback(&mut sms, provider, job.id);
-    let inserted = tx.execute("INSERT INTO novu_rust_twilio_attempts(job_id,environment_id,state) VALUES ($1,$2,'dispatching') ON CONFLICT(job_id) DO NOTHING", &[&job.id,&job.environment_id]).await?;
+    let dispatch = Uuid::new_v4();
+    let inserted = tx.execute("INSERT INTO novu_rust_twilio_attempts(job_id,environment_id,state,dispatch_id) VALUES ($1,$2,'dispatching',$3) ON CONFLICT(job_id) DO NOTHING", &[&job.id,&job.environment_id,&dispatch]).await?;
     if inserted == 0 {
         tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='sms attempt already exists',lease_token=NULL,lease_until=NULL WHERE id=$1", &[&job.id]).await?;
         tx.commit().await?;
         return Ok(true);
     }
+    tx.execute(
+        "INSERT INTO novu_rust_twilio_dispatch_ids(id,job_id,environment_id) VALUES ($1,$2,$3)",
+        &[&dispatch, &job.id, &job.environment_id],
+    )
+    .await?;
+    apply_status_callback(&mut sms, provider, job.id, dispatch);
     tx.execute("UPDATE novu_rust_sms_messages SET delivery_state='dispatching' WHERE environment_id=$1 AND sms_job_id=$2", &[&environment,&job.id]).await?;
     tx.commit().await?;
     let (state, status, provider_id, diagnostic) = match provider.send(&sms).await {
@@ -320,31 +328,32 @@ mod tests {
             .with_status_callback(base, "env-a")
             .unwrap();
         let job = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let dispatch = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
         let mut sms = Sms {
             to: "+456".into(),
             content: "hello".into(),
             ..Default::default()
         };
-        apply_status_callback(&mut sms, &provider, job);
+        apply_status_callback(&mut sms, &provider, job, dispatch);
         assert_eq!(
             request_body(&config(), &sms)
                 .unwrap()
                 .status_callback
                 .unwrap(),
-            format!("{base}/jobs/{job}")
+            format!("{base}/jobs/{job}/attempts/{dispatch}")
         );
         sms.provider_data =
             serde_json::json!({"statusCallback":"https://explicit.example/callback"})
                 .as_object()
                 .unwrap()
                 .clone();
-        apply_status_callback(&mut sms, &provider, job);
+        apply_status_callback(&mut sms, &provider, job, dispatch);
         assert_eq!(
             request_body(&config(), &sms).unwrap().status_callback,
             Some("https://explicit.example/callback")
         );
         sms.provider_data = serde_json::json!({"_passthrough":{"body":{"statusCallback":"https://override.example/callback"}}}).as_object().unwrap().clone();
-        apply_status_callback(&mut sms, &provider, job);
+        apply_status_callback(&mut sms, &provider, job, dispatch);
         assert_eq!(
             request_body(&config(), &sms).unwrap().status_callback,
             Some("https://override.example/callback")
@@ -458,11 +467,12 @@ mod tests {
         let url = std::env::var("TEST_DATABASE_URL").unwrap();
         let (mut db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
         tokio::spawn(async move { driver.await.unwrap() });
-        db.batch_execute("DROP TABLE IF EXISTS novu_rust_twilio_attempts,novu_queue_jobs CASCADE")
+        db.batch_execute("DROP TABLE IF EXISTS novu_rust_twilio_dispatch_ids,novu_rust_twilio_attempts,novu_queue_jobs CASCADE")
             .await
             .unwrap();
         db.batch_execute(crate::MIGRATION).await.unwrap();
         db.batch_execute(MIGRATION).await.unwrap();
+        db.batch_execute(DISPATCH_ID_MIGRATION).await.unwrap();
         db.batch_execute(crate::in_app::SMS_MESSAGES_MIGRATION)
             .await
             .unwrap();
@@ -489,7 +499,7 @@ mod tests {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut data = Vec::new();
                 let mut buffer = [0; 4096];
-                loop {
+                let captured_dispatch = loop {
                     let n = socket.read(&mut buffer).await.unwrap();
                     assert!(n > 0);
                     data.extend_from_slice(&buffer[..n]);
@@ -507,22 +517,24 @@ mod tests {
                             let form: std::collections::HashMap<String, String> =
                                 serde_urlencoded::from_bytes(&data[pos + 4..pos + 4 + length])
                                     .unwrap();
-                            assert_eq!(
-                                form.get("StatusCallback").unwrap(),
-                                &format!(
-                                    "https://events.example.test/webhooks/organizations/org/environments/test/sms/twilio/jobs/{id}"
-                                )
+                            let callback = form.get("StatusCallback").unwrap();
+                            let prefix = format!(
+                                "https://events.example.test/webhooks/organizations/org/environments/test/sms/twilio/jobs/{id}/attempts/"
                             );
-                            break;
+                            let dispatch =
+                                Uuid::parse_str(callback.strip_prefix(&prefix).unwrap()).unwrap();
+                            assert_ne!(dispatch, Uuid::nil());
+                            break dispatch;
                         }
                     }
-                }
+                };
                 let body = if malformed {
                     "{}"
                 } else {
                     r#"{"sid":"SM123","date_created":"Wed, 28 Oct 2026 10:00:00 +0000"}"#
                 };
                 socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                captured_dispatch
             });
             let provider = Twilio::test_origin(
                 Config {
@@ -539,8 +551,10 @@ mod tests {
             .with_status_callback("https://events.example.test/webhooks/organizations/org/environments/test/sms/twilio", "test")
             .unwrap();
             assert!(process_one(&mut db, "test", &provider).await.unwrap());
-            server.await.unwrap();
+            let captured_dispatch = server.await.unwrap();
             let row = db.query_one("SELECT a.state,j.status,a.provider_message_id FROM novu_rust_twilio_attempts a JOIN novu_queue_jobs j ON j.id=a.job_id WHERE a.job_id=$1", &[&id]).await.unwrap();
+            let count: i64 = db.query_one("SELECT count(*) FROM novu_rust_twilio_dispatch_ids d JOIN novu_rust_twilio_attempts a ON a.dispatch_id=d.id AND a.job_id=d.job_id AND a.environment_id=d.environment_id WHERE d.job_id=$1 AND d.id=$2", &[&id,&captured_dispatch]).await.unwrap().get(0);
+            assert_eq!(count, 1);
             assert_eq!(row.get::<_, String>(0), expected);
             let delivery_state: String = db
                 .query_one(

@@ -100,6 +100,7 @@ pub async fn receive(
         headers,
         raw,
         None,
+        None,
     )
     .await
 }
@@ -127,6 +128,35 @@ pub async fn receive_job(
         headers,
         raw,
         Some(id),
+        None,
+    )
+    .await
+}
+
+pub async fn receive_dispatch(
+    State(db): State<Arc<Client>>,
+    Extension(config): Extension<Arc<Option<Config>>>,
+    Path((organization, environment, job, dispatch)): Path<(String, String, String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> StatusCode {
+    let (Ok(job_id), Ok(dispatch_id)) = (Uuid::parse_str(&job), Uuid::parse_str(&dispatch)) else {
+        return StatusCode::UNAUTHORIZED;
+    };
+    if job_id.to_string() != job || dispatch_id.to_string() != dispatch {
+        return StatusCode::UNAUTHORIZED;
+    }
+    receive_inner(
+        db,
+        config,
+        organization,
+        environment,
+        uri,
+        headers,
+        raw,
+        Some(job_id),
+        Some(dispatch_id),
     )
     .await
 }
@@ -141,11 +171,16 @@ async fn receive_inner(
     headers: HeaderMap,
     raw: Bytes,
     job: Option<Uuid>,
+    dispatch: Option<Uuid>,
 ) -> StatusCode {
     let Some(config) = config.as_ref() else {
         return StatusCode::UNAUTHORIZED;
     };
-    let suffix = job.map(|id| format!("/jobs/{id}")).unwrap_or_default();
+    let suffix = match (job, dispatch) {
+        (Some(job), Some(dispatch)) => format!("/jobs/{job}/attempts/{dispatch}"),
+        (Some(job), None) => format!("/jobs/{job}"),
+        _ => String::new(),
+    };
     let expected_path = format!("{}{}", config.public_path, suffix);
     let expected_url = format!("{}{}", config.public_url, suffix);
     if environment != config.environment
@@ -218,7 +253,14 @@ async fn receive_inner(
     {
         return StatusCode::BAD_REQUEST;
     }
-    if let Some(job) = job {
+    if let (Some(job), Some(dispatch)) = (job, dispatch) {
+        let rows = db.execute("INSERT INTO novu_rust_twilio_delivery_events(environment_id,account_sid,message_sid,status,error_code,job_id,dispatch_id) SELECT e.id,$3,$4,$5,$6,j.id,d.id FROM novu_rust_environments e JOIN novu_queue_jobs j ON j.environment_id=e.id AND j.id=$7 AND j.kind='experimental_twilio_sms' JOIN novu_rust_twilio_dispatch_ids d ON d.job_id=j.id AND d.environment_id=e.id AND d.id=$8 WHERE e.id=$1 AND e.organization_id=$2 ON CONFLICT(environment_id,account_sid,message_sid,status,error_code) DO UPDATE SET job_id=EXCLUDED.job_id,dispatch_id=EXCLUDED.dispatch_id WHERE (novu_rust_twilio_delivery_events.job_id IS NULL OR novu_rust_twilio_delivery_events.job_id=EXCLUDED.job_id) AND (novu_rust_twilio_delivery_events.dispatch_id IS NULL OR novu_rust_twilio_delivery_events.dispatch_id=EXCLUDED.dispatch_id)", &[&environment,&organization,&account,&message,&status,&error,&job,&dispatch]).await;
+        match rows {
+            Ok(0) => StatusCode::NOT_FOUND,
+            Ok(_) => StatusCode::NO_CONTENT,
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    } else if let Some(job) = job {
         let rows=db.execute("INSERT INTO novu_rust_twilio_delivery_events(environment_id,account_sid,message_sid,status,error_code,job_id) SELECT e.id,$3,$4,$5,$6,j.id FROM novu_rust_environments e JOIN novu_queue_jobs j ON j.environment_id=e.id AND j.id=$7 AND j.kind='experimental_twilio_sms' WHERE e.id=$1 AND e.organization_id=$2 AND (EXISTS(SELECT 1 FROM novu_rust_twilio_attempts a WHERE a.job_id=j.id AND a.environment_id=e.id) OR EXISTS(SELECT 1 FROM novu_rust_delivery_reconciliations r WHERE r.job_id=j.id AND r.environment_id=e.id AND r.target_index IS NULL AND r.decision='retry')) ON CONFLICT(environment_id,account_sid,message_sid,status,error_code) DO UPDATE SET job_id=EXCLUDED.job_id WHERE novu_rust_twilio_delivery_events.job_id IS NULL OR novu_rust_twilio_delivery_events.job_id=EXCLUDED.job_id", &[&environment,&organization,&account,&message,&status,&error,&job]).await;
         match rows {
             Ok(0) => StatusCode::NOT_FOUND,

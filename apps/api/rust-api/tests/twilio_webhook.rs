@@ -61,8 +61,10 @@ async fn signed_status_events_are_scoped_deduplicated_and_private() {
         novu_postgres_queue::in_app::SMS_MESSAGES_MIGRATION,
         include_str!("../migrations/0005_twilio_webhooks.sql"),
         include_str!("../migrations/0006_twilio_webhook_job_link.sql"),
+        include_str!("../migrations/0007_twilio_dispatch_identity.sql"),
         include_str!("../../../worker/rust-queue/migrations/0041_experimental_twilio_attempts.sql"),
         novu_postgres_queue::reconciliation::MIGRATION,
+        novu_postgres_queue::twilio_queue::DISPATCH_ID_MIGRATION,
     ] {
         db.batch_execute(migration).await.unwrap();
     }
@@ -202,8 +204,10 @@ async fn signed_job_callbacks_bind_evidence_without_changing_attempt_state() {
         novu_postgres_queue::MIGRATION,
         include_str!("../migrations/0005_twilio_webhooks.sql"),
         include_str!("../migrations/0006_twilio_webhook_job_link.sql"),
+        include_str!("../migrations/0007_twilio_dispatch_identity.sql"),
         include_str!("../../../worker/rust-queue/migrations/0041_experimental_twilio_attempts.sql"),
         novu_postgres_queue::reconciliation::MIGRATION,
+        novu_postgres_queue::twilio_queue::DISPATCH_ID_MIGRATION,
     ] {
         db.batch_execute(migration).await.unwrap();
     }
@@ -350,7 +354,7 @@ async fn signed_job_callbacks_bind_evidence_without_changing_attempt_state() {
     retry_db.batch_execute("COMMIT").await.unwrap();
     // After commit it sees the retry audit even before a new attempt exists.
     assert_eq!(
-        post(router, &path, BODY, &sig, form).await,
+        post(router.clone(), &path, BODY, &sig, form).await,
         StatusCode::NO_CONTENT
     );
     let row = db
@@ -358,4 +362,109 @@ async fn signed_job_callbacks_bind_evidence_without_changing_attempt_state() {
         .await
         .unwrap();
     assert_eq!(row.get::<_, uuid::Uuid>(0), job);
+    // A dispatch remains valid after the current attempt is removed by retry.
+    let dispatch = uuid::Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
+    let second_dispatch = uuid::Uuid::new_v4();
+    db.execute("INSERT INTO novu_rust_twilio_dispatch_ids(id,job_id,environment_id) VALUES ($1,$2,'env-a'),($3,$2,'env-a')", &[&dispatch,&job,&second_dispatch]).await.unwrap();
+    let dispatch_path = format!("{path}/attempts/{dispatch}");
+    let dispatch_signature = "5O0nox9+3HMMACVPV2xPvSfX+kc="; // Twilio Node SDK 4.20.0
+    assert_eq!(
+        post(
+            router.clone(),
+            &dispatch_path,
+            BODY,
+            dispatch_signature,
+            form
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        post(
+            router.clone(),
+            &dispatch_path,
+            BODY,
+            dispatch_signature,
+            form
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let assigned: uuid::Uuid = db
+        .query_one(
+            "SELECT dispatch_id FROM novu_rust_twilio_delivery_events WHERE job_id=$1",
+            &[&job],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(assigned, dispatch);
+    let signed_for = |id: uuid::Uuid| {
+        let input = format!(
+            "{URL}/jobs/{job}/attempts/{id}AccountSidAC{}ExtraaExtrazMessageSidSM{}MessageStatusdeliveredTo+15555555555",
+            "1".repeat(32),
+            "2".repeat(32)
+        );
+        STANDARD.encode(
+            hmac::sign(
+                &hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, b"test-secret"),
+                input.as_bytes(),
+            )
+            .as_ref(),
+        )
+    };
+    let second_path = format!("{path}/attempts/{second_dispatch}");
+    assert_eq!(
+        post(router.clone(), &second_path, BODY, dispatch_signature, form).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        post(
+            router.clone(),
+            &second_path,
+            BODY,
+            &signed_for(second_dispatch),
+            form
+        )
+        .await,
+        StatusCode::NOT_FOUND
+    );
+    let cross_input = format!(
+        "{URL}/jobs/{other}/attempts/{dispatch}AccountSidAC{}ExtraaExtrazMessageSidSM{}MessageStatusdeliveredTo+15555555555",
+        "1".repeat(32),
+        "4".repeat(32)
+    );
+    let cross_signature = STANDARD.encode(
+        hmac::sign(
+            &hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, b"test-secret"),
+            cross_input.as_bytes(),
+        )
+        .as_ref(),
+    );
+    assert_eq!(
+        post(
+            router.clone(),
+            &format!("{other_path}/attempts/{dispatch}"),
+            &BODY.replace(
+                "SM22222222222222222222222222222222",
+                "SM44444444444444444444444444444444"
+            ),
+            &cross_signature,
+            form
+        )
+        .await,
+        StatusCode::NOT_FOUND
+    );
+    let missing_dispatch = uuid::Uuid::new_v4();
+    assert_eq!(
+        post(
+            router,
+            &format!("{path}/attempts/{missing_dispatch}"),
+            BODY,
+            &signed_for(missing_dispatch),
+            form
+        )
+        .await,
+        StatusCode::NOT_FOUND
+    );
 }

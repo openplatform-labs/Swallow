@@ -65,11 +65,11 @@ pub async fn sms_evidence(client: &Client, environment: &str, job: Uuid) -> Resu
     {
         return Err("SMS job not found".into());
     }
-    let rows = client.query("SELECT message_sid,status,error_code,received_at::text FROM novu_rust_twilio_delivery_events WHERE environment_id=$1 AND job_id=$2 ORDER BY received_at,message_sid,status,error_code LIMIT 101", &[&environment,&job]).await?;
+    let rows = client.query("SELECT message_sid,status,error_code,received_at::text,dispatch_id FROM novu_rust_twilio_delivery_events WHERE environment_id=$1 AND job_id=$2 ORDER BY received_at,message_sid,status,error_code LIMIT 101", &[&environment,&job]).await?;
     if rows.len() > 100 {
         return Err("more than 100 SMS events; query the evidence table directly".into());
     }
-    Ok(rows.into_iter().map(|r| json!({"providerMessageId":r.get::<_,String>(0),"status":r.get::<_,String>(1),"errorCode":r.get::<_,String>(2),"receivedAt":r.get::<_,String>(3)})).collect())
+    Ok(rows.into_iter().map(|r| json!({"providerMessageId":r.get::<_,String>(0),"status":r.get::<_,String>(1),"errorCode":r.get::<_,String>(2),"receivedAt":r.get::<_,String>(3),"dispatchId":r.get::<_,Option<Uuid>>(4).map(|id|id.to_string())})).collect())
 }
 
 /// Resolve an unknown attempt after an operator independently verifies its outcome.
