@@ -70,7 +70,7 @@ API 마이그레이션 `0004_sendgrid_webhooks.sql`은 환경별 SendGrid 공개
 
 ## 수행한 검증
 
-- 관리 API의 개별 읽음·읽지 않음·보관·보관 해제·삭제를 원본과 비교해 context 키의 정확 일치, 순서 변경 및 불일치 시 404를 확인했다. 상태 변경 시각은 각 서버에서 독립 생성하므로 형식만 검증했다. 관리 API의 스누즈·해제 context는 같은 조회 조건을 적용하지만 원본과 비교하지 않았다. [비교 테스트](apps/api/rust-api/tests/reference_count_severity_compare.py).
+- 관리 API의 개별 읽음·읽지 않음·보관·보관 해제·삭제를 원본과 비교해 context 키의 정확 일치, 순서 변경 및 불일치 시 404를 확인했다. 상태 변경 시각은 각 서버에서 독립 생성하므로 형식만 검증했다. 추가로 관리 API의 스누즈·해제에 context를 지정해 불일치 404, 순서가 다른 정확 일치의 성공, 스누즈 시각 저장과 해제 상태를 비교했다. context가 있는 예약 작업의 자동 만료·복구와 이벤트는 비교하지 않았다. [비교 테스트](apps/api/rust-api/tests/reference_count_severity_compare.py).
 
 - 관리 API의 일괄 읽음·확인·보관·읽음 후 보관·삭제에 context 필터를 적용해 원본과 저장 상태를 비교했다. 하나라도 겹치는 context, 빈 배열과 확인 ID 목록의 교집합을 확인했다. 빈 배열은 모든 context를 대상으로 하므로 주의해야 한다. 잘못된 context 입력의 오류 DTO와 이벤트·웹훅은 비교하지 않았다. [비교 테스트](apps/api/rust-api/tests/reference_notification_bulk_compare.py).
 

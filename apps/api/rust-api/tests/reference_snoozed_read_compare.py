@@ -185,3 +185,25 @@ if os.environ.get('NOVU_TEST_UNSNOOZE_DELIVERY') == '1':
         assert item['readAt'] is None and item['deliveredAt'][:2] == stamps and len(item['deliveredAt']) == 3, item
         assert item['createdAt'] == item['deliveredAt'][-1], item
     print('scheduled_unsnooze_worker_and_history: match')
+
+# Context-scoped management snooze and unsnooze must not modify a different
+# context, and exact matching is order independent.
+tx=prefix+'-2'
+ref_id=mongo_eval(f'print(db.getSiblingDB("novu-db").messages.findOne({{transactionId:"{tx}"}})._id.toString());')
+rust_id=pg_eval(f"SELECT internal_id FROM novu_rust_in_app_messages WHERE transaction_id='{tx}'")
+mongo_eval(f'db.getSiblingDB("novu-db").messages.updateOne({{transactionId:"{tx}"}},{{$set:{{contextKeys:["tenant:a","team:b"]}}}});')
+pg_eval(f"UPDATE novu_rust_in_app_messages SET context_keys=ARRAY['tenant:a','team:b'] WHERE transaction_id='{tx}'")
+future=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(minutes=5)).isoformat(timespec='milliseconds').replace('+00:00','Z')
+for base,notification_id in ((reference,ref_id),(rust,rust_id)):
+    route=path+'/'+notification_id
+    wrong='?'+urllib.parse.urlencode([('contextKeys','tenant:a')])
+    exact='?'+urllib.parse.urlencode([('contextKeys','team:b'),('contextKeys','tenant:a')])
+    status,result=request(base,'PATCH',route+'/snooze'+wrong,{'snoozeUntil':future})
+    assert status==404,(base,status,result)
+    status,result=request(base,'PATCH',route+'/snooze'+exact,{'snoozeUntil':future})
+    assert status==200 and result['data']['isSnoozed'] and result['data']['snoozedUntil']==future,(base,status,result)
+    status,result=request(base,'PATCH',route+'/unsnooze'+wrong)
+    assert status==404,(base,status,result)
+    status,result=request(base,'PATCH',route+'/unsnooze'+exact)
+    assert status==200 and not result['data']['isSnoozed'],(base,status,result)
+print('management snooze and unsnooze exact context: match')
