@@ -2811,7 +2811,7 @@ async fn trigger_api_contract_inner() {
         json!({"contextKeys":["x"]}),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(status, StatusCode::NO_CONTENT);
     let metadata = json!({"id":"64a000000000000000000004","identifier":"names","name":"Names","critical":false,"tags":[],"severity":"none","payloadAsData":true});
     worker.execute("UPDATE novu_rust_workflows SET inbox_metadata=$1 WHERE environment_id='env-a' AND identifier='names'", &[&metadata]).await.unwrap();
     let (status, _) = request(app.clone(), Some("ApiKey test-key"), json!({"name":"names", "to":{"subscriberId":"seen-user","firstName":"Jane"}, "transactionId":"seen-workflow"})).await;

@@ -89,6 +89,11 @@ if [[ "${NOVU_TEST_INAPP_IDENTITY_ONLY:-0}" == 1 ]]; then
   python3 tests/reference_in_app_identity_compare.py
   exit 0
 fi
+if [[ "${NOVU_TEST_BULK_CONTEXT_ONLY:-0}" == 1 ]]; then
+  export NOVU_TEST_ENVIRONMENT_ID=64a000000000000000000002
+  python3 tests/reference_notification_bulk_compare.py
+  exit 0
+fi
 if [[ "${NOVU_TEST_SEVERITY_ONLY:-0}" == 1 ]]; then
   python3 tests/reference_count_severity_compare.py
   exit 0

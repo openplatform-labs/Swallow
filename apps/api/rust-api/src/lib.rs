@@ -1093,7 +1093,7 @@ async fn delete_all_notifications_for(
             }
         }
     };
-    let Some(groups) = notification_tags(&body, false) else {
+    let Some(groups) = notification_tags(&body, false, context_keys.is_none()) else {
         return error_at(
             StatusCode::NOT_IMPLEMENTED,
             "Notification filters not implemented",
@@ -1101,6 +1101,18 @@ async fn delete_all_notifications_for(
             &path,
         )
         .into_response();
+    };
+    let context_keys = match body_context_keys(&body, context_keys) {
+        Ok(keys) => keys,
+        Err(()) => {
+            return error_at(
+                StatusCode::NOT_IMPLEMENTED,
+                "Notification filters not implemented",
+                "Not Implemented",
+                &path,
+            )
+            .into_response();
+        }
     };
     let (_, data_filter) = match parse_inbox_data(body.get("data").and_then(Value::as_str), &path) {
         Ok(value) => value,
@@ -1523,7 +1535,7 @@ async fn mark_notifications_seen_for(
         )
         .into_response();
     };
-    let Some(groups) = notification_tags(&body, true) else {
+    let Some(groups) = notification_tags(&body, true, context_keys.is_none()) else {
         return error_at(
             StatusCode::NOT_IMPLEMENTED,
             "Notification filters not implemented",
@@ -1531,6 +1543,18 @@ async fn mark_notifications_seen_for(
             &path,
         )
         .into_response();
+    };
+    let context_keys = match body_context_keys(&body, context_keys) {
+        Ok(keys) => keys,
+        Err(()) => {
+            return error_at(
+                StatusCode::NOT_IMPLEMENTED,
+                "Notification filters not implemented",
+                "Not Implemented",
+                &path,
+            )
+            .into_response();
+        }
     };
     let ids: Option<Vec<String>> = match fields.get("notificationIds") {
         None | Some(Value::Null) => None,
@@ -1645,7 +1669,7 @@ async fn update_all_notifications_for(
             }
         }
     };
-    let Some(groups) = notification_tags(&body, false) else {
+    let Some(groups) = notification_tags(&body, false, context_keys.is_none()) else {
         return error_at(
             StatusCode::NOT_IMPLEMENTED,
             "Notification filters not implemented",
@@ -1653,6 +1677,18 @@ async fn update_all_notifications_for(
             &path,
         )
         .into_response();
+    };
+    let context_keys = match body_context_keys(&body, context_keys) {
+        Ok(keys) => keys,
+        Err(()) => {
+            return error_at(
+                StatusCode::NOT_IMPLEMENTED,
+                "Notification filters not implemented",
+                "Not Implemented",
+                &path,
+            )
+            .into_response();
+        }
     };
     let (_, data_filter) = match parse_inbox_data(body.get("data").and_then(Value::as_str), &path) {
         Ok(value) => value,
@@ -1830,12 +1866,34 @@ async fn count_notifications_for(
     (StatusCode::OK, Json(json!({"data": result})))
 }
 
-fn notification_tags(body: &Value, allow_ids: bool) -> Option<Value> {
+// Management bulk operations accept contextKeys in the body. Subscriber
+// session context remains authoritative and cannot be overridden by the body.
+fn body_context_keys(
+    body: &Value,
+    session: Option<Vec<String>>,
+) -> Result<Option<Vec<String>>, ()> {
+    if session.is_some() {
+        return Ok(session);
+    }
+    match body.get("contextKeys") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(keys)) => keys
+            .iter()
+            .map(|key| key.as_str().map(str::to_owned).ok_or(()))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        Some(_) => Err(()),
+    }
+}
+
+fn notification_tags(body: &Value, allow_ids: bool, allow_context: bool) -> Option<Value> {
     let fields = body.as_object()?;
-    if fields
-        .keys()
-        .any(|key| key != "tags" && key != "data" && !(allow_ids && key == "notificationIds"))
-    {
+    if fields.keys().any(|key| {
+        key != "tags"
+            && key != "data"
+            && !(allow_ids && key == "notificationIds")
+            && !(allow_context && key == "contextKeys")
+    }) {
         return None;
     }
     if fields

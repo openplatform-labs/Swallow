@@ -77,3 +77,37 @@ for name, sub, auth in [('missing_subscriber', 'missing', 'valid'), ('missing_au
     left, right = (request(base, 'POST', f'/v2/subscribers/{sub}/notifications/read', {}, auth) for base in (reference, rust))
     assert left == right, (name, left, right)
     print(f'{name}: match')
+
+# Context filters use overlap for management bulk operations, not exact match.
+def reset_context_fixture():
+    js=f'''const d=db.getSiblingDB("novu-db");for (const [s,keys] of [["a",["tenant:a"]],["b",["tenant:a","team:b"]],["c",["team:b"]]]) d.messages.updateOne({{transactionId:"{marker}-"+s}},{{$set:{{read:true,seen:false,archived:false,contextKeys:keys}}}});'''
+    sql=f"UPDATE novu_rust_in_app_messages SET is_read=true,is_seen=false,is_archived=false,context_keys=CASE right(transaction_id,1) WHEN 'a' THEN ARRAY['tenant:a'] WHEN 'b' THEN ARRAY['tenant:a','team:b'] ELSE ARRAY['team:b'] END WHERE transaction_id LIKE '{marker}-%'"
+    subprocess.check_call(['docker','exec',mongo,'mongosh','--quiet','--eval',js],stdout=subprocess.DEVNULL)
+    subprocess.check_call(['docker','exec',postgres,'psql','-U','postgres','-d','novu_compat','-v','ON_ERROR_STOP=1','-c',sql],stdout=subprocess.DEVNULL)
+
+def context_state():
+    js=f'''const d=db.getSiblingDB("novu-db");print(JSON.stringify(d.messages.find({{transactionId:{{$regex:"^{marker}-"}}}}).sort({{transactionId:1}}).toArray().map(x=>({{transactionId:x.transactionId,read:x.read,seen:x.seen,archived:x.archived}}))));'''
+    sql=f"SELECT coalesce(json_agg(json_build_object('transactionId',transaction_id,'read',is_read,'seen',is_seen,'archived',is_archived) ORDER BY transaction_id),'[]'::json)::text FROM novu_rust_in_app_messages WHERE transaction_id LIKE '{marker}-%'"
+    return (json.loads(subprocess.check_output(['docker','exec',mongo,'mongosh','--quiet','--eval',js],text=True)),json.loads(subprocess.check_output(['docker','exec',postgres,'psql','-U','postgres','-d','novu_compat','-At','-c',sql],text=True)))
+
+for action,keys,expected in [('read',['tenant:a'],[True,True,False]),('seen',['tenant:a'],[True,True,False]),('archive',['team:b'],[False,True,True]),('read-archive',['tenant:a'],[True,True,False]),('seen',[],[True,True,True])]:
+    reset_context_fixture()
+    for base in (reference,rust): assert request(base,'POST',f'/v2/subscribers/{subscriber}/notifications/{action}',{'contextKeys':keys})==(204,None)
+    left,right=context_state()
+    assert left==right,(action,keys,left,right)
+    field='archived' if action in ('archive','read-archive') else 'seen'
+    assert [row[field] for row in left]==expected,(action,keys,left)
+    print(f'bulk {action} context overlap: match')
+reset_context_fixture()
+js=f'''const d=db.getSiblingDB("novu-db");print(JSON.stringify(d.messages.find({{transactionId:{{$in:["{marker}-b","{marker}-c"]}}}}).sort({{transactionId:1}}).toArray().map(m=>String(m._id))));'''
+sql=f"SELECT json_agg(internal_id ORDER BY transaction_id)::text FROM novu_rust_in_app_messages WHERE transaction_id IN ('{marker}-b','{marker}-c')"
+ids=[json.loads(subprocess.check_output(['docker','exec',mongo,'mongosh','--quiet','--eval',js],text=True)),json.loads(subprocess.check_output(['docker','exec',postgres,'psql','-U','postgres','-d','novu_compat','-At','-c',sql],text=True))]
+for base,selected in zip((reference,rust),ids): assert request(base,'POST',f'/v2/subscribers/{subscriber}/notifications/seen',{'contextKeys':['tenant:a'],'notificationIds':selected})==(204,None)
+left,right=context_state()
+assert left==right and [row['seen'] for row in left]==[False,True,False],(left,right)
+print('bulk seen IDs and context intersection: match')
+reset_context_fixture()
+for base in (reference,rust): assert request(base,'POST',f'/v2/subscribers/{subscriber}/notifications/delete',{'contextKeys':['tenant:a']})==(204,None)
+left,right=context_state()
+assert left==right and [row['transactionId'] for row in left]==[f'{marker}-c'],(left,right)
+print('bulk delete context overlap: match')
