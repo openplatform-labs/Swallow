@@ -100,3 +100,32 @@ for params, expected in [([('createdGte','1704067200001')], ['severity-6']), ([(
     assert left==right,(params,left,right)
     assert [item['transactionId'] for item in left['data']]==expected,(params,left)
 print('notification list inclusive millisecond date bounds: match')
+
+# The DTO transforms query strings with parseInt(value, 10).
+import urllib.error
+for params, expected_status, expected_filter in [
+    ([('createdGte','123junk')],200,123), ([('createdGte','1e3')],200,1),
+    ([('createdGte','0x10')],200,0), ([('createdGte','+12.5')],200,12),
+    ([('createdGte','-1')],200,-1), ([('createdGte','abc')],422,None),
+    ([('createdGte','  ')],422,None), ([('createdLte','no')],422,None),
+    ([('createdGte','bad'),('createdLte','bad')],422,None),
+]:
+    path='/v2/subscribers/alice/notifications?'+urllib.parse.urlencode(params)
+    def date_request(base):
+        req=urllib.request.Request(base+path,headers={'Authorization':'ApiKey '+os.environ['NOVU_TEST_API_KEY']})
+        try: response=urllib.request.urlopen(req,timeout=10)
+        except urllib.error.HTTPError as error: response=error
+        with response: status,body=response.status,json.load(response)
+        if status>=400: assert body.pop('timestamp').endswith('Z')
+        else:
+            for item in body['data']:
+                for field in ('readAt','firstSeenAt'):
+                    if item.get(field) is not None:
+                        assert item[field].endswith('Z')
+                        item[field]='<timestamp>'
+        return status,body
+    left,right=(date_request(os.environ[name]) for name in ('NOVU_REFERENCE_URL','NOVU_RUST_URL'))
+    assert left==right,(params,left,right)
+    assert left[0]==expected_status,(params,left)
+    if expected_status==200: assert left[1]['filter']['createdGte']==expected_filter
+print('notification date decimal-prefix parsing and validation errors: match')

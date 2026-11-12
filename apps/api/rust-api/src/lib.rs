@@ -1293,10 +1293,20 @@ async fn list_notifications_for(
         }
     }
     let mut created_bounds = [None, None];
+    let mut date_errors = Vec::new();
     for (index, key) in ["createdGte", "createdLte"].iter().enumerate() {
         if let Some(value) = query.get(*key).filter(|value| !value.is_empty()) {
-            let Ok(timestamp) = value.parse::<i64>() else {
-                return unsupported();
+            let timestamp = match parse_date_integer(value) {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    date_errors.push(if index == 0 {
+                        "createdGte must be an integer number"
+                    } else {
+                        "createdLte must be an integer number"
+                    });
+                    continue;
+                }
+                Err(()) => return unsupported(),
             };
             // JavaScript Date accepts milliseconds in this range. Novu keeps
             // zero in the response but treats it as no database bound.
@@ -1308,6 +1318,11 @@ async fn list_notifications_for(
                 created_bounds[index] = Some(timestamp);
             }
         }
+    }
+    if !date_errors.is_empty() {
+        let mut response = validation_error(date_errors);
+        response.1.0["path"] = json!(path);
+        return response;
     }
     let subscriber = match db.query_opt("SELECT internal_id, profile FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2", &[&environment_id, &subscriber_id]).await {
         Ok(Some(row)) => row,
@@ -1364,6 +1379,26 @@ async fn list_notifications_for(
         StatusCode::OK,
         Json(json!({"data":data, "hasMore":has_more, "filter":filter})),
     )
+}
+
+// Match the decimal-prefix behavior of JavaScript parseInt(value, 10).
+// An overflow remains unsupported instead of wrapping or rounding an i64.
+fn parse_date_integer(value: &str) -> Result<Option<i64>, ()> {
+    let value = value.trim_start();
+    let (negative, digits) = if let Some(rest) = value.strip_prefix('-') {
+        (true, rest)
+    } else if let Some(rest) = value.strip_prefix('+') {
+        (false, rest)
+    } else {
+        (false, value)
+    };
+    let prefix = digits.bytes().take_while(u8::is_ascii_digit).count();
+    if prefix == 0 {
+        return Ok(None);
+    }
+    let number = digits[..prefix].parse::<i128>().map_err(|_| ())?;
+    let signed = if negative { -number } else { number };
+    i64::try_from(signed).map(Some).map_err(|_| ())
 }
 
 fn notification_dto(row: &tokio_postgres::Row, to: &Value) -> Option<Value> {
