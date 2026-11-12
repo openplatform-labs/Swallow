@@ -558,29 +558,27 @@ async fn process_one_inner(
                 .and_then(|v| v.get("routed"))
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false)
-        {
-            if let (Some(context), Some(token)) = (
+            && let (Some(context), Some(token)) = (
                 prepared_context.as_ref(),
                 messages[index]
                     .pointer("/message/token")
                     .and_then(serde_json::Value::as_str)
                     .filter(|v| !v.is_empty()),
-            ) {
-                if let (Some(subscriber_id), Some(internal_id), Some(integration_id)) = (
-                    context
-                        .get("subscriber_id")
-                        .and_then(serde_json::Value::as_str),
-                    context
-                        .get("subscriber_internal_id")
-                        .and_then(serde_json::Value::as_str),
-                    target_metadata
-                        .unwrap_or(context)
-                        .get("integration_internal_id")
-                        .and_then(serde_json::Value::as_str),
-                ) {
-                    tx.execute("WITH target AS MATERIALIZED (SELECT environment_id,subscriber_id FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2 AND internal_id=$3 FOR UPDATE), removed AS (UPDATE novu_rust_fcm_devices d SET device_tokens=array_remove(d.device_tokens,$5) FROM target WHERE d.environment_id=target.environment_id AND d.subscriber_id=target.subscriber_id AND d.integration_internal_id=$4 RETURNING 1) UPDATE novu_rust_subscribers s SET updated_at=now() FROM target WHERE s.environment_id=target.environment_id AND s.subscriber_id=target.subscriber_id AND EXISTS(SELECT 1 FROM removed)",&[&environment,&subscriber_id,&internal_id,&integration_id,&token]).await?;
-                }
-            }
+            )
+            && let (Some(subscriber_id), Some(internal_id), Some(integration_id)) = (
+                context
+                    .get("subscriber_id")
+                    .and_then(serde_json::Value::as_str),
+                context
+                    .get("subscriber_internal_id")
+                    .and_then(serde_json::Value::as_str),
+                target_metadata
+                    .unwrap_or(context)
+                    .get("integration_internal_id")
+                    .and_then(serde_json::Value::as_str),
+            )
+        {
+            tx.execute("WITH target AS MATERIALIZED (SELECT environment_id,subscriber_id FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2 AND internal_id=$3 FOR UPDATE), removed AS (UPDATE novu_rust_fcm_devices d SET device_tokens=array_remove(d.device_tokens,$5) FROM target WHERE d.environment_id=target.environment_id AND d.subscriber_id=target.subscriber_id AND d.integration_internal_id=$4 RETURNING 1) UPDATE novu_rust_subscribers s SET updated_at=now() FROM target WHERE s.environment_id=target.environment_id AND s.subscriber_id=target.subscriber_id AND EXISTS(SELECT 1 FROM removed)",&[&environment,&subscriber_id,&internal_id,&integration_id,&token]).await?;
         }
         if prepared_context.is_some() {
             let end = history_index.saturating_add(group_size);
@@ -852,6 +850,9 @@ mod tests {
             .await
             .unwrap();
         db.batch_execute("ALTER TABLE novu_rust_push_messages ADD COLUMN IF NOT EXISTS delivery_state text NOT NULL DEFAULT 'not_attempted'").await.unwrap();
+        db.batch_execute(crate::reconciliation::MIGRATION)
+            .await
+            .unwrap();
         let payload = json!({"title":"Hi","content":"Hello","targets":["a","b","c"]});
         let other = Uuid::new_v4();
         let id = Uuid::new_v4();
@@ -987,5 +988,32 @@ mod tests {
             "failed"
         );
         assert!(!process_one(&mut db, "test", &provider).await.unwrap());
+        crate::reconciliation::resolve(
+            &mut db,
+            "test",
+            recovery,
+            Some(0),
+            "retry",
+            "fixture-operator",
+            "provider confirmed no request",
+        )
+        .await
+        .unwrap();
+        let (provider, server) = mock(vec![200]).await;
+        assert!(process_one(&mut db, "test", &provider).await.unwrap());
+        assert_eq!(server.await.unwrap(), ["a"]);
+        let rows = db
+            .query(
+                "SELECT state FROM novu_rust_fcm_attempts WHERE job_id=$1 ORDER BY target_index",
+                &[&recovery],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.get::<_, String>(0))
+                .collect::<Vec<_>>(),
+            ["accepted", "accepted", "accepted"]
+        );
     }
 }

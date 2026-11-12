@@ -19,7 +19,11 @@ API, 인앱·SendGrid·Twilio·FCM 워커 및 WS의 조회·이벤트 연결은 
 
 [0053 마이그레이션](apps/worker/rust-queue/migrations/0053_delivery_state.sql)은 실험 이메일·SMS·푸시 이력에 `delivery_state`를 추가한다. `not_attempted`, `dispatching`, 멀티캐스트의 `in_progress`, provider `accepted`·`rejected`, 결과 `unknown`을 구분한다. `accepted`는 provider 접수이며 실제 수신이 아니다. 기존 원본 호환 `status`의 `sent` 의미는 바꾸지 않으므로 운영 판단에는 두 필드를 함께 확인해야 한다. 외부 요청 중 임대가 만료되면 복구가 이력을 `unknown`으로 갱신한다. 기존 이력은 연결된 단일 발송 시도에서 상태를 이관하고, 시도 기록이 없거나 복수 대상 그룹의 과거 결과를 확정할 수 없으면 `unknown`으로 남긴다.
 
-이 필드는 현재 PostgreSQL 이력에만 있으며 완전한 메시지 API나 운영 화면에는 노출되지 않는다. provider 웹훅·실제 수신 확인, 결과 불명 알림·운영자 확인과 안전한 재처리 절차는 미구현이다. 불명 상태는 자동 재발송하지 않으므로 발송 누락 가능성도 남는다. 채널별 이력 상태 갱신과 FCM 그룹 집계에 DB 작업이 추가된다.
+이 필드는 현재 PostgreSQL 이력에만 있으며 완전한 메시지 API나 운영 화면에는 노출되지 않는다. provider 웹훅·실제 수신 확인과 결과 불명 알림은 미구현이다. 불명 상태는 자동 재발송하지 않으므로 발송 누락 가능성도 남는다. 채널별 이력 상태 갱신과 FCM 그룹 집계에 DB 작업이 추가된다.
+
+[0054 마이그레이션](apps/worker/rust-queue/migrations/0054_delivery_reconciliation.sql)과 `delivery-reconcile` 도구는 환경별 불명 시도 최대 100건을 조회하고, 운영자가 provider 측 증거를 확인한 뒤 재시도 또는 접수 확인을 기록한다. 작업 잠금과 트랜잭션으로 중복 결정과 다른 환경 변경을 차단하고 DB 사용자·운영자 이름·사유·이전 HTTP 상태를 감사 테이블에 저장한다. 예를 들어 `cargo run --bin delivery-reconcile -- list ENV`, `cargo run --bin delivery-reconcile -- retry ENV JOB - OPERATOR TICKET`을 사용하며 FCM은 `-` 대신 대상 인덱스를 지정한다. `accepted`는 `retry` 대신 전달한다. TLS 연결 설정과 0054까지의 마이그레이션이 필요하다.
+
+`retry`는 **외부 provider가 접수하지 않았음을 독립적으로 확인한 경우에만** 사용한다. 실제로는 접수된 요청을 재시도하면 중복 발송될 수 있다. `accepted` 역시 실제 수신이 아니라 운영자가 확인한 provider 접수다. 자동 판정, provider 조회·웹훅, 100건을 넘는 목록 페이지네이션, 운영자 인증·역할별 권한 및 감사 위변조 방지는 미구현이다. 운영자 이름은 입력값이므로 DB 접근 권한과 감사 테이블의 수정·삭제 권한을 별도로 제한해야 한다. 사유에는 개인정보·비밀을 넣지 않는다. 재시도 시 이메일·SMS는 현재 프로필·설정을 재검증하고 내용을 다시 렌더링하므로 이전 시도와 내용이 달라질 수 있다. 독립 수동 FCM 작업의 접수 확인은 전체 작업을 자동 완료하지 못할 수 있다.
 
 ## 구현된 범위
 

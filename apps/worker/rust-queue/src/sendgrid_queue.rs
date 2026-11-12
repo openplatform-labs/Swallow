@@ -440,6 +440,9 @@ mod tests {
             .await
             .unwrap();
         db.batch_execute("ALTER TABLE novu_rust_email_messages ADD COLUMN IF NOT EXISTS delivery_state text NOT NULL DEFAULT 'not_attempted'").await.unwrap();
+        db.batch_execute(crate::reconciliation::MIGRATION)
+            .await
+            .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/v3/mail/send", listener.local_addr().unwrap());
         let provider = Sendgrid::test_endpoint(
@@ -684,6 +687,42 @@ mod tests {
             .get::<_, String>(0),
             "unknown"
         );
+        assert!(!process_one(&mut db, "env-a", &provider).await.unwrap());
+        crate::reconciliation::resolve(
+            &mut db,
+            "env-a",
+            post,
+            None,
+            "retry",
+            "fixture-operator",
+            "provider confirmed no request",
+        )
+        .await
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v3/mail/send", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 8192];
+            assert!(socket.read(&mut buf).await.unwrap() > 0);
+            socket.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nX-Message-Id: retry-receipt\r\nConnection: close\r\n\r\n").await.unwrap();
+        });
+        let provider = Sendgrid::test_endpoint(
+            Config {
+                api_key: "SG.fixture".into(),
+                from: "sender@example.test".into(),
+                sender_name: "Sender".into(),
+                region: Region::Global,
+            },
+            &endpoint,
+        )
+        .unwrap();
+        assert!(process_one(&mut db, "env-a", &provider).await.unwrap());
+        server.await.unwrap();
+        let row=db.query_one("SELECT j.status,a.state,m.delivery_state FROM novu_queue_jobs j JOIN novu_rust_sendgrid_attempts a ON a.job_id=j.id JOIN novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1", &[&post]).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), "completed");
+        assert_eq!(row.get::<_, String>(1), "accepted");
+        assert_eq!(row.get::<_, String>(2), "accepted");
         assert!(!process_one(&mut db, "env-a", &provider).await.unwrap());
     }
 }

@@ -502,11 +502,10 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
                         || value.as_array().is_some_and(|items| !items.is_empty())
                 })
             })
-        }) {
-            if let Some(fields) = push_provider_data.as_object_mut() {
-                for key in ["token", "topic", "condition", "tokens"] {
-                    fields.remove(key);
-                }
+        }) && let Some(fields) = push_provider_data.as_object_mut()
+        {
+            for key in ["token", "topic", "condition", "tokens"] {
+                fields.remove(key);
             }
         }
         merge_provider_layer(&mut push_provider_data, layer);
