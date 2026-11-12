@@ -50,6 +50,28 @@ pub async fn email_evidence(client: &Client, environment: &str, job: Uuid) -> Re
     Ok(rows.into_iter().map(|r|json!({"event":r.get::<_,String>(0),"eventCount":r.get::<_,i64>(1),"recipientCount":r.get::<_,i64>(2),"latestEventTimestamp":r.get::<_,Option<i64>>(3)})).collect())
 }
 
+/// Show signed Twilio evidence explicitly bound to this job, without phone numbers.
+pub async fn sms_evidence(client: &Client, environment: &str, job: Uuid) -> Result<Vec<Value>> {
+    if environment.is_empty() {
+        return Err("environment is required".into());
+    }
+    if client
+        .query_opt(
+            "SELECT 1 FROM novu_queue_jobs WHERE environment_id=$1 AND id=$2 AND kind=$3",
+            &[&environment, &job, &crate::twilio_queue::JOB_KIND],
+        )
+        .await?
+        .is_none()
+    {
+        return Err("SMS job not found".into());
+    }
+    let rows = client.query("SELECT message_sid,status,error_code,received_at::text FROM novu_rust_twilio_delivery_events WHERE environment_id=$1 AND job_id=$2 ORDER BY received_at,message_sid,status,error_code LIMIT 101", &[&environment,&job]).await?;
+    if rows.len() > 100 {
+        return Err("more than 100 SMS events; query the evidence table directly".into());
+    }
+    Ok(rows.into_iter().map(|r| json!({"providerMessageId":r.get::<_,String>(0),"status":r.get::<_,String>(1),"errorCode":r.get::<_,String>(2),"receivedAt":r.get::<_,String>(3)})).collect())
+}
+
 /// Resolve an unknown attempt after an operator independently verifies its outcome.
 /// `retry` asserts non-acceptance and can cause duplicates if that assertion is wrong.
 pub async fn resolve(

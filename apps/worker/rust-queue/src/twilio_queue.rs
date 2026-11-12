@@ -14,6 +14,25 @@ fn valid_phone(value: Option<&str>) -> Option<&str> {
     value.filter(|v| !v.trim().is_empty())
 }
 
+fn apply_status_callback(sms: &mut Sms, provider: &Twilio, job: Uuid) {
+    let explicit_callback = sms
+        .provider_data
+        .get("_passthrough")
+        .and_then(|v| v.get("body"))
+        .and_then(|v| v.get("statusCallback"))
+        .and_then(serde_json::Value::as_str)
+        .is_some()
+        || sms
+            .provider_data
+            .get("statusCallback")
+            .and_then(serde_json::Value::as_str)
+            .is_some();
+    if !explicit_callback && let Some(callback) = provider.status_callback(job) {
+        sms.provider_data
+            .insert("statusCallback".into(), callback.into());
+    }
+}
+
 async fn claim(client: &Client, environment: &str) -> Result<Option<ClaimedJob>, Error> {
     let token = Uuid::new_v4();
     let lease = Duration::from_secs(60).as_secs_f64();
@@ -181,6 +200,7 @@ pub async fn process_one(
         sms.content = option("content").unwrap_or(&content).to_owned();
         sms.from = option("from").map(str::to_owned);
     }
+    apply_status_callback(&mut sms, provider, job.id);
     let inserted = tx.execute("INSERT INTO novu_rust_twilio_attempts(job_id,environment_id,state) VALUES ($1,$2,'dispatching') ON CONFLICT(job_id) DO NOTHING", &[&job.id,&job.environment_id]).await?;
     if inserted == 0 {
         tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='sms attempt already exists',lease_token=NULL,lease_until=NULL WHERE id=$1", &[&job.id]).await?;
@@ -264,6 +284,73 @@ pub async fn recover_expired(client: &mut Client, environment: &str) -> Result<u
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn callback_is_job_bound_and_respects_overrides() {
+        use super::*;
+        use crate::twilio::{Config, Region, request_body};
+        let config = || Config {
+            account_sid: "AC1".into(),
+            auth_token: "secret".into(),
+            api_key_sid: None,
+            api_key_secret: None,
+            from: "+123".into(),
+            region: Region::Us,
+        };
+        let base = "https://events.example.test/webhooks/organizations/org-a/environments/env-a/sms/twilio";
+        assert!(
+            Twilio::new(config())
+                .unwrap()
+                .with_status_callback(base, "other")
+                .is_err()
+        );
+        assert!(
+            Twilio::new(config())
+                .unwrap()
+                .with_status_callback(&base.replace("https:", "http:"), "env-a")
+                .is_err()
+        );
+        assert!(
+            Twilio::new(config())
+                .unwrap()
+                .with_status_callback(&format!("{base}?x=1"), "env-a")
+                .is_err()
+        );
+        let provider = Twilio::new(config())
+            .unwrap()
+            .with_status_callback(base, "env-a")
+            .unwrap();
+        let job = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let mut sms = Sms {
+            to: "+456".into(),
+            content: "hello".into(),
+            ..Default::default()
+        };
+        apply_status_callback(&mut sms, &provider, job);
+        assert_eq!(
+            request_body(&config(), &sms)
+                .unwrap()
+                .status_callback
+                .unwrap(),
+            format!("{base}/jobs/{job}")
+        );
+        sms.provider_data =
+            serde_json::json!({"statusCallback":"https://explicit.example/callback"})
+                .as_object()
+                .unwrap()
+                .clone();
+        apply_status_callback(&mut sms, &provider, job);
+        assert_eq!(
+            request_body(&config(), &sms).unwrap().status_callback,
+            Some("https://explicit.example/callback")
+        );
+        sms.provider_data = serde_json::json!({"_passthrough":{"body":{"statusCallback":"https://override.example/callback"}}}).as_object().unwrap().clone();
+        apply_status_callback(&mut sms, &provider, job);
+        assert_eq!(
+            request_body(&config(), &sms).unwrap().status_callback,
+            Some("https://override.example/callback")
+        );
+    }
+
     use super::*;
     use crate::twilio::{Config, Region};
     use serde_json::json;
@@ -400,9 +487,36 @@ mod tests {
             let origin = format!("http://{}", listener.local_addr().unwrap());
             let server = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
+                let mut data = Vec::new();
                 let mut buffer = [0; 4096];
-                let n = socket.read(&mut buffer).await.unwrap();
-                assert!(n > 0);
+                loop {
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    assert!(n > 0);
+                    data.extend_from_slice(&buffer[..n]);
+                    if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&data[..pos]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .and_then(|v| v.parse::<usize>().ok())
+                            })
+                            .unwrap();
+                        if data.len() >= pos + 4 + length {
+                            let form: std::collections::HashMap<String, String> =
+                                serde_urlencoded::from_bytes(&data[pos + 4..pos + 4 + length])
+                                    .unwrap();
+                            assert_eq!(
+                                form.get("StatusCallback").unwrap(),
+                                &format!(
+                                    "https://events.example.test/webhooks/organizations/org/environments/test/sms/twilio/jobs/{id}"
+                                )
+                            );
+                            break;
+                        }
+                    }
+                }
                 let body = if malformed {
                     "{}"
                 } else {
@@ -421,6 +535,8 @@ mod tests {
                 },
                 &origin,
             )
+            .unwrap()
+            .with_status_callback("https://events.example.test/webhooks/organizations/org/environments/test/sms/twilio", "test")
             .unwrap();
             assert!(process_one(&mut db, "test", &provider).await.unwrap());
             server.await.unwrap();

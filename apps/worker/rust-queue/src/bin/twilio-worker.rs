@@ -16,7 +16,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok("eu") => Region::Eu,
         _ => return Err("invalid NOVU_TWILIO_REGION".into()),
     };
-    let provider = Twilio::new(Config {
+    let mut provider = Twilio::new(Config {
         account_sid: std::env::var("NOVU_TWILIO_ACCOUNT_SID")?,
         auth_token: std::env::var("NOVU_TWILIO_AUTH_TOKEN").unwrap_or_default(),
         api_key_sid: std::env::var("NOVU_TWILIO_API_KEY_SID").ok(),
@@ -24,6 +24,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         from: std::env::var("NOVU_TWILIO_FROM")?,
         region,
     })?;
+    if let Ok(base) = std::env::var("NOVU_TWILIO_STATUS_CALLBACK_BASE_URL") {
+        provider = provider.with_status_callback(&base, &environment)?;
+    }
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let (mut db, connection) = config.connect(tls).await?;
     tokio::spawn(async move {

@@ -33,6 +33,16 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     ))
     .await
     .unwrap();
+    db.batch_execute(include_str!(
+        "../../../api/rust-api/migrations/0005_twilio_webhooks.sql"
+    ))
+    .await
+    .unwrap();
+    db.batch_execute(include_str!(
+        "../../../api/rust-api/migrations/0006_twilio_webhook_job_link.sql"
+    ))
+    .await
+    .unwrap();
     let email = Uuid::new_v4();
     let sms = Uuid::new_v4();
     let push = Uuid::new_v4();
@@ -78,6 +88,23 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     assert_eq!(evidence,json!([{"event":"deferred","eventCount":1,"recipientCount":1,"latestEventTimestamp":102},{"event":"delivered","eventCount":2,"recipientCount":2,"latestEventTimestamp":101}]).as_array().unwrap().clone());
     assert!(
         reconciliation::email_evidence(&db, "tenant-b", email)
+            .await
+            .is_err()
+    );
+    db.execute("INSERT INTO novu_rust_twilio_delivery_events(environment_id,account_sid,message_sid,status,job_id) VALUES ('tenant-a','ACfixture','SMfixture','delivered',$1)", &[&sms]).await.unwrap();
+    let sms_events = reconciliation::sms_evidence(&db, "tenant-a", sms)
+        .await
+        .unwrap();
+    assert_eq!(sms_events.len(), 1);
+    assert_eq!(sms_events[0]["providerMessageId"], "SMfixture");
+    assert_eq!(sms_events[0]["status"], "delivered");
+    assert!(
+        reconciliation::sms_evidence(&db, "tenant-b", sms)
+            .await
+            .is_err()
+    );
+    assert!(
+        reconciliation::sms_evidence(&db, "tenant-a", email)
             .await
             .is_err()
     );
@@ -227,6 +254,19 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     );
     let from_cli: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(from_cli, evidence);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .args(["sms-evidence", "tenant-a", &sms.to_string()])
+        .env("DATABASE_URL", &url)
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let from_cli: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(from_cli, sms_events);
     let bulk = Uuid::new_v4();
     queue::enqueue(
         &db,

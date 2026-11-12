@@ -8,6 +8,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use ring::hmac;
 use std::{collections::HashMap, sync::Arc};
 use tokio_postgres::Client;
+use uuid::Uuid;
 
 /// One explicitly configured Twilio account and its public HTTPS callback URL.
 /// Keep the auth token out of logs and of the database.
@@ -90,11 +91,65 @@ pub async fn receive(
     headers: HeaderMap,
     raw: Bytes,
 ) -> StatusCode {
+    receive_inner(
+        db,
+        config,
+        organization,
+        environment,
+        uri,
+        headers,
+        raw,
+        None,
+    )
+    .await
+}
+
+pub async fn receive_job(
+    State(db): State<Arc<Client>>,
+    Extension(config): Extension<Arc<Option<Config>>>,
+    Path((organization, environment, job)): Path<(String, String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> StatusCode {
+    let Ok(id) = Uuid::parse_str(&job) else {
+        return StatusCode::UNAUTHORIZED;
+    };
+    if id.to_string() != job {
+        return StatusCode::UNAUTHORIZED;
+    }
+    receive_inner(
+        db,
+        config,
+        organization,
+        environment,
+        uri,
+        headers,
+        raw,
+        Some(id),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn receive_inner(
+    db: Arc<Client>,
+    config: Arc<Option<Config>>,
+    organization: String,
+    environment: String,
+    uri: Uri,
+    headers: HeaderMap,
+    raw: Bytes,
+    job: Option<Uuid>,
+) -> StatusCode {
     let Some(config) = config.as_ref() else {
         return StatusCode::UNAUTHORIZED;
     };
+    let suffix = job.map(|id| format!("/jobs/{id}")).unwrap_or_default();
+    let expected_path = format!("{}{}", config.public_path, suffix);
+    let expected_url = format!("{}{}", config.public_url, suffix);
     if environment != config.environment
-        || uri.path() != config.public_path
+        || uri.path() != expected_path
         || uri.query().is_some()
         || raw.len() > 65_536
     {
@@ -133,7 +188,7 @@ pub async fn receive(
         return StatusCode::UNAUTHORIZED;
     };
     let key = hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, &config.auth_token);
-    if hmac::verify(&key, &signed_data(&config.public_url, &fields), &signature).is_err() {
+    if hmac::verify(&key, &signed_data(&expected_url, &fields), &signature).is_err() {
         return StatusCode::UNAUTHORIZED;
     }
     let one = |name: &str| -> Option<&str> {
@@ -163,8 +218,17 @@ pub async fn receive(
     {
         return StatusCode::BAD_REQUEST;
     }
-    match db.execute("INSERT INTO novu_rust_twilio_delivery_events(environment_id,account_sid,message_sid,status,error_code) SELECT e.id,$3,$4,$5,$6 FROM novu_rust_environments e WHERE e.id=$1 AND e.organization_id=$2 ON CONFLICT DO NOTHING", &[&environment,&organization,&account,&message,&status,&error]).await {
-        Ok(_) => StatusCode::NO_CONTENT,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    if let Some(job) = job {
+        let rows=db.execute("INSERT INTO novu_rust_twilio_delivery_events(environment_id,account_sid,message_sid,status,error_code,job_id) SELECT e.id,$3,$4,$5,$6,j.id FROM novu_rust_environments e JOIN novu_queue_jobs j ON j.environment_id=e.id AND j.id=$7 AND j.kind='experimental_twilio_sms' JOIN novu_rust_twilio_attempts a ON a.job_id=j.id AND a.environment_id=e.id WHERE e.id=$1 AND e.organization_id=$2 ON CONFLICT(environment_id,account_sid,message_sid,status,error_code) DO UPDATE SET job_id=EXCLUDED.job_id WHERE novu_rust_twilio_delivery_events.job_id IS NULL OR novu_rust_twilio_delivery_events.job_id=EXCLUDED.job_id", &[&environment,&organization,&account,&message,&status,&error,&job]).await;
+        match rows {
+            Ok(0) => StatusCode::NOT_FOUND,
+            Ok(_) => StatusCode::NO_CONTENT,
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    } else {
+        match db.execute("INSERT INTO novu_rust_twilio_delivery_events(environment_id,account_sid,message_sid,status,error_code) SELECT e.id,$3,$4,$5,$6 FROM novu_rust_environments e WHERE e.id=$1 AND e.organization_id=$2 ON CONFLICT DO NOTHING", &[&environment,&organization,&account,&message,&status,&error]).await {
+            Ok(_) => StatusCode::NO_CONTENT,
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
     }
 }

@@ -202,6 +202,7 @@ pub struct Twilio {
     http: Client,
     endpoint: String,
     config: Config,
+    status_callback_base: Option<String>,
 }
 impl Twilio {
     pub fn new(config: Config) -> Result<Self, SendError> {
@@ -210,6 +211,48 @@ impl Twilio {
             Region::Eu => "https://api.dublin.ie1.twilio.com",
         };
         Self::with_origin(config, origin)
+    }
+
+    /// Enable job-specific callbacks. This URL must match the API's configured public URL.
+    pub fn with_status_callback(
+        mut self,
+        base: &str,
+        environment: &str,
+    ) -> Result<Self, SendError> {
+        let url = reqwest::Url::parse(base).map_err(|_| SendError::InvalidConfiguration)?;
+        let suffix = format!("/environments/{environment}/sms/twilio");
+        let prefix = url
+            .path()
+            .strip_suffix(&suffix)
+            .ok_or(SendError::InvalidConfiguration)?;
+        if url.scheme() != "https"
+            || url.username() != ""
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || url.as_str() != base
+            || environment.is_empty()
+            || !environment
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            || !prefix.starts_with("/webhooks/organizations/")
+            || prefix
+                .trim_start_matches("/webhooks/organizations/")
+                .is_empty()
+            || prefix
+                .trim_start_matches("/webhooks/organizations/")
+                .contains('/')
+        {
+            return Err(SendError::InvalidConfiguration);
+        }
+        self.status_callback_base = Some(base.to_owned());
+        Ok(self)
+    }
+
+    pub(crate) fn status_callback(&self, job: uuid::Uuid) -> Option<String> {
+        self.status_callback_base
+            .as_ref()
+            .map(|base| format!("{base}/jobs/{job}"))
     }
 
     pub fn endpoint(&self) -> &str {
@@ -250,6 +293,7 @@ impl Twilio {
             http,
             endpoint,
             config,
+            status_callback_base: None,
         })
     }
 
