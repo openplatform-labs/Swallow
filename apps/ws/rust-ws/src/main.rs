@@ -251,17 +251,24 @@ fn verify(token: &str, secret: &[u8]) -> Option<Claims> {
     })
 }
 
-async fn connect(db: &Database, id: Uuid, claims: &Claims) -> Result<(), tokio_postgres::Error> {
+async fn connect(db: &Database, id: Uuid, claims: &Claims) -> Result<bool, tokio_postgres::Error> {
     let mut client = db.lock().await?;
     let tx = client.transaction().await?;
-    tx.query_opt(
+    let subscriber = tx.query_opt(
         "SELECT 1 FROM novu_rust_subscribers WHERE environment_id=$1 AND internal_id=$2 FOR UPDATE",
         &[&claims.environment_id, &claims.id],
     )
     .await?;
+    if subscriber.is_none()
+        && std::env::var("NOVU_ALLOW_RECREATED_SUBSCRIBER").as_deref() != Ok("true")
+    {
+        tx.rollback().await?;
+        return Ok(false);
+    }
     tx.execute("INSERT INTO novu_rust_ws_connections(id,environment_id,subscriber_internal_id) VALUES ($1,$2,$3)", &[&id,&claims.environment_id,&claims.id]).await?;
     tx.execute("UPDATE novu_rust_subscribers SET is_online=true,updated_at=now() WHERE environment_id=$1 AND internal_id=$2", &[&claims.environment_id,&claims.id]).await?;
-    tx.commit().await
+    tx.commit().await?;
+    Ok(true)
 }
 
 async fn disconnect(
@@ -408,13 +415,19 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     return;
                 };
                 let id = Uuid::new_v4();
-                if connect(&db, id, &claims).await.is_err() {
-                    // COMMIT may have succeeded even when its acknowledgement was lost.
-                    // Deleting this unique ID is harmless if the transaction rolled back.
-                    let update_presence = verify(&token, &secret).is_some();
-                    tokio::spawn(retry_disconnect(db.clone(), id, claims, update_presence));
-                    socket.disconnect().ok();
-                    return;
+                match connect(&db, id, &claims).await {
+                    Ok(true) => (),
+                    Ok(false) => {
+                        socket.disconnect().ok();
+                        return;
+                    }
+                    Err(_) => {
+                        // A lost COMMIT acknowledgement may mean the row exists.
+                        let update_presence = verify(&token, &secret).is_some();
+                        tokio::spawn(retry_disconnect(db.clone(), id, claims, update_presence));
+                        socket.disconnect().ok();
+                        return;
+                    }
                 }
                 socket.extensions.insert(claims.clone());
                 socket.join(claims.id.clone());

@@ -1,0 +1,38 @@
+const path = require('path');
+const {spawnSync} = require('child_process');
+const assert = require('assert/strict');
+const root = process.env.NOVU_REFERENCE_SOURCE;
+const {io} = require(path.join(root,'node_modules/.pnpm/socket.io-client@4.8.3/node_modules/socket.io-client'));
+const jwt = require(path.join(root,'node_modules/.pnpm/jsonwebtoken@9.0.3/node_modules/jsonwebtoken'));
+const env='64a000000000000000000002', oldId='64a000000000000000000020', newId='64a000000000000000000021';
+const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+function sql(query) {
+  const result=spawnSync('docker',['exec',process.env.PG_CONTAINER,'psql','-v','ON_ERROR_STOP=1','-U','postgres','-d','novu_ws_test','-At','-c',query],{encoding:'utf8'});
+  assert.equal(result.status,0,result.stderr); return result.stdout.trim();
+}
+function token(id,environmentId=env) { return jwt.sign({_id:id,environmentId,organizationId:'64a000000000000000000003',subscriberId:'strict-user',aud:'widget_user'},process.env.JWT_SECRET,{expiresIn:'1h'}); }
+async function socketState(auth,accepted) {
+  const socket=io(process.env.STRICT_WS_URL,{transports:['websocket'],reconnection:false,timeout:2000,query:{token:auth}});
+  let connected=false,disconnected=false;
+  socket.on('connect',()=>{connected=true});
+  socket.on('disconnect',()=>{disconnected=true});
+  socket.on('connect_error',()=>{disconnected=true});
+  for(let i=0;i<50 && !(accepted ? connected : disconnected);i++) await wait(100);
+  if(accepted) {
+    assert(connected,'valid identity did not connect');
+    await wait(300);
+    assert(!disconnected,'valid identity was disconnected');
+  } else assert(disconnected,'stale identity remained connected');
+  socket.disconnect();
+  await wait(250);
+}
+(async()=>{
+  sql(`INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id) VALUES ('${env}','strict-user','${oldId}')`);
+  await socketState(token(oldId),true);
+  sql(`DELETE FROM novu_rust_subscribers WHERE environment_id='${env}' AND subscriber_id='strict-user'; INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id) VALUES ('${env}','strict-user','${newId}')`);
+  await socketState(token(oldId),false);
+  await socketState(token(newId,'64a000000000000000000012'),false);
+  await socketState(token(newId),true);
+  assert.equal(sql(`SELECT count(*) FROM novu_rust_ws_connections WHERE subscriber_internal_id IN ('${oldId}','${newId}')`),'0');
+  console.log('strict WS identity: current accepted; deleted and cross-environment rejected');
+})().catch(error=>{console.error(error);process.exitCode=1});
