@@ -142,4 +142,30 @@ for name,txn,expected in scenarios:
         if original_count==expected and rust_count==expected: break
         time.sleep(.25)
     assert original_count==rust_count==expected,(name,original_count,rust_count,expected)
+    source=mongo_exec(f'const n=db.getSiblingDB("novu-db").notifications.findOne({{transactionId:"{txn}"}}); print(JSON.stringify({{id:n._id,organization:n._organizationId,workflow:n._templateId,subscriber:n._subscriberId,to:n.to,payload:n.payload??{{}},channels:n.channels,tags:n.tags,severity:n.severity,critical:n.critical,contextKeys:n.contextKeys??[]}}));')
+    stored=pg_exec(f"SELECT json_build_object('id',internal_id,'organization',organization_id,'workflow',workflow_internal_id,'subscriber',subscriber_internal_id,'to',recipient,'payload',payload,'channels',channels,'tags',tags,'severity',severity,'critical',critical,'contextKeys',context_keys)::text FROM novu_rust_notifications WHERE environment_id='64a000000000000000000002' AND transaction_id='{txn}'")
+    original,actual=json.loads(source),json.loads(stored)
+    for item in (original,actual):
+        assert len(item.pop('id'))==24
+        assert len(item.pop('subscriber'))==24
+    assert original==actual,(name,original,actual)
 print('queued workflow active/draft, inactive step and empty steps: match')
+print('per-recipient notification fields and no-step records: match')
+# Verify message-to-notification identity, then the reference's historical
+# notification retention after subscriber deletion.
+active_tx=scenarios[0][1]
+source_link=mongo_exec(f'''const d=db.getSiblingDB("novu-db"),n=d.notifications.findOne({{transactionId:"{active_tx}"}}),m=d.messages.findOne({{transactionId:"{active_tx}"}});print(!!n && !!m && m._notificationId.equals(n._id));''')
+rust_link=pg_exec(f"SELECT count(*) FROM novu_rust_in_app_messages m JOIN novu_rust_notifications n ON n.internal_id=m.notification_internal_id AND n.environment_id=m.environment_id WHERE m.environment_id='64a000000000000000000002' AND m.transaction_id='{active_tx}' AND n.transaction_id=m.transaction_id")
+assert source_link=='true' and rust_link=='1',(source_link,rust_link)
+before_source=int(mongo_exec('print(db.getSiblingDB("novu-db").notifications.countDocuments({"to.subscriberId":"queue-severity-user"}))'))
+before_rust=int(pg_exec("SELECT count(*) FROM novu_rust_notifications WHERE environment_id='64a000000000000000000002' AND subscriber_id='queue-severity-user'"))
+assert before_source==before_rust and before_source>0,(before_source,before_rust)
+for base in (os.environ['NOVU_REFERENCE_URL'],os.environ['NOVU_RUST_URL']):
+    req=urllib.request.Request(base+'/v2/subscribers/queue-severity-user',method='DELETE',headers={'Authorization':'ApiKey '+os.environ['NOVU_TEST_API_KEY']})
+    with urllib.request.urlopen(req,timeout=10) as response: assert response.status in (200,204),response.status
+after_source=int(mongo_exec('print(db.getSiblingDB("novu-db").notifications.countDocuments({"to.subscriberId":"queue-severity-user"}))'))
+after_rust=int(pg_exec("SELECT count(*) FROM novu_rust_notifications WHERE environment_id='64a000000000000000000002' AND subscriber_id='queue-severity-user'"))
+assert after_source==before_source and after_rust==before_rust,(before_source,after_source,before_rust,after_rust)
+assert mongo_exec(f'print(db.getSiblingDB("novu-db").messages.countDocuments({{transactionId:"{active_tx}"}}))')=='0'
+assert pg_exec(f"SELECT count(*) FROM novu_rust_in_app_messages WHERE environment_id='64a000000000000000000002' AND transaction_id='{active_tx}'")=='0'
+print('message notification linkage and subscriber deletion retention: match')

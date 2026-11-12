@@ -76,6 +76,10 @@ async function mutation(base,method,endpoint,body) {
   for(const field of ['transactionId','content','channel','read','seen','archived','tags','_environmentId','_organizationId','_subscriberId','_templateId','cta','providerId','deviceTokens','contextKeys','__v','payload']) assert.deepEqual(right[field],left[field],field);
   assert.equal(right._subscriberId,claims._id);
   assert.match(right._id,/^[0-9a-f]{24}$/);
+  assert.match(left._notificationId,/^[0-9a-f]{24}$/);
+  assert.match(right._notificationId,/^[0-9a-f]{24}$/);
+  const linked = spawnSync('docker',['exec',process.env.NOVU_RUST_PG_CONTAINER,'psql','-At','-v','ON_ERROR_STOP=1','-U','postgres','-d','novu_compat','-c',`SELECT count(*) FROM novu_rust_notifications WHERE environment_id='${claims.environmentId}' AND internal_id='${right._notificationId}' AND transaction_id='${transactionId}'`],{encoding:'utf8'});
+  assert.equal(linked.status,0,linked.stderr); assert.equal(linked.stdout.trim(),'1');
   for(let i=0;i<30 && !sdkEvents.length;i++) await wait(100);
   assert.equal(sdkEvents[0]?.id,right._id); assert.equal(sdkEvents[0]?.body,right.content);
   assert.equal(sdkEvents[0]?.transactionId,transactionId); assert.equal(sdkEvents[0]?.channelType,'in_app');

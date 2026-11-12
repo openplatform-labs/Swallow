@@ -2538,7 +2538,7 @@ async fn trigger(
     let context_entries = parsed_context
         .map(|context| context.entries)
         .unwrap_or_else(|| json!([]));
-    let row = match db.query_opt("SELECT active, has_steps, in_app_content, inbox_metadata FROM novu_rust_workflows WHERE environment_id = $1 AND identifier = $2", &[&environment_id, &name]).await {
+    let row = match db.query_opt("SELECT active, has_steps, in_app_content, inbox_metadata, (SELECT organization_id FROM novu_rust_environments WHERE id=$1) FROM novu_rust_workflows WHERE environment_id = $1 AND identifier = $2", &[&environment_id, &name]).await {
         Ok(Some(row)) => row,
         Ok(None) => return error(StatusCode::UNPROCESSABLE_ENTITY, "workflow_not_found", "Unprocessable Entity"),
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error", "Internal Server Error"),
@@ -2629,7 +2629,8 @@ async fn trigger(
                 "Not Implemented",
             );
         }
-        let data = json!({"workflow": name, "transactionId": txn, "recipients": recipients, "topicKeys": topic_keys, "topicExclusions": topic_exclusions, "actor": actor, "content": content, "payload": payload, "tags": tags, "contextKeys": context_keys, "severity": severity, "severityOverride": override_severity});
+        let organization_id: Option<String> = row.get(4);
+        let data = json!({"organizationId": organization_id, "workflow": name, "transactionId": txn, "recipients": recipients, "topicKeys": topic_keys, "topicExclusions": topic_exclusions, "actor": actor, "content": content, "payload": payload, "tags": tags, "contextKeys": context_keys, "severity": severity, "severityOverride": override_severity});
         // The ledger and queue entry are inserted atomically. This provisional deduplication
         // policy is not yet equivalent to Novu's tier-dependent retention behaviour.
         let result = db.execute("WITH accepted AS (INSERT INTO novu_rust_trigger_transactions (environment_id, transaction_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING 1), contexts AS (INSERT INTO novu_rust_contexts (environment_id,context_key,data) SELECT $1, entry->>'key', COALESCE(NULLIF(entry->'data','null'::jsonb),'{}'::jsonb) FROM accepted CROSS JOIN jsonb_array_elements($6::jsonb) entry ON CONFLICT (environment_id,context_key) DO UPDATE SET data=CASE WHEN EXISTS (SELECT 1 FROM jsonb_array_elements($6::jsonb) element WHERE element->>'key'=EXCLUDED.context_key AND element->'data' <> 'null'::jsonb) THEN EXCLUDED.data ELSE novu_rust_contexts.data END, updated_at=CASE WHEN EXISTS (SELECT 1 FROM jsonb_array_elements($6::jsonb) element WHERE element->>'key'=EXCLUDED.context_key AND element->'data' <> 'null'::jsonb) AND novu_rust_contexts.data IS DISTINCT FROM EXCLUDED.data THEN now() ELSE novu_rust_contexts.updated_at END RETURNING 1) INSERT INTO novu_queue_jobs (id, environment_id, kind, payload) SELECT $3, $1, $4, $5 FROM accepted", &[&environment_id, &txn, &Uuid::new_v4(), &novu_rust_contracts::EXPERIMENTAL_IN_APP_JOB_KIND, &data, &context_entries]).await;

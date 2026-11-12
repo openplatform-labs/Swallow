@@ -437,6 +437,9 @@ async fn trigger_api_contract() {
     db.batch_execute(novu_postgres_queue::in_app::IN_APP_STEP_ACTIVE_MIGRATION)
         .await
         .unwrap();
+    db.batch_execute(novu_postgres_queue::in_app::NOTIFICATIONS_MIGRATION)
+        .await
+        .unwrap();
     let old = db.query_one("SELECT internal_id,identifier,updated_at=created_at FROM novu_rust_topic_subscribers WHERE environment_id='legacy-env'", &[]).await.unwrap();
     let old_id: String = old.get(0);
     assert_eq!(old_id.len(), 24);

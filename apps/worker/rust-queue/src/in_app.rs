@@ -88,6 +88,8 @@ pub const MESSAGE_SEVERITY_MIGRATION: &str =
     include_str!("../migrations/0032_experimental_message_severity.sql");
 pub const IN_APP_STEP_ACTIVE_MIGRATION: &str =
     include_str!("../migrations/0033_experimental_in_app_step_active.sql");
+pub const NOTIFICATIONS_MIGRATION: &str =
+    include_str!("../migrations/0034_experimental_notifications.sql");
 pub const JOB_KIND: &str = novu_rust_contracts::EXPERIMENTAL_IN_APP_JOB_KIND;
 pub const UNSNOOZE_JOB_KIND: &str = "experimental-in-app-unsnooze";
 type WorkerResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -300,9 +302,11 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
     }
     // The reference's first workflow worker resolves the trigger identifier
     // after enqueue. Older queued jobs retain their previous semantics.
-    let (workflow_metadata, content, tags, step_active) = if data.get("severityOverride").is_some()
+    let (workflow_metadata, content, tags, step_active, workflow_internal_id) = if data
+        .get("severityOverride")
+        .is_some()
     {
-        let row = tx.query_opt("SELECT inbox_metadata->>'severity',in_app_content,inbox_metadata->'tags',has_steps,in_app_step_active FROM novu_rust_workflows WHERE environment_id=$1 AND identifier=$2", &[&job.environment_id, &workflow]).await?
+        let row = tx.query_opt("SELECT inbox_metadata->>'severity',in_app_content,inbox_metadata->'tags',has_steps,in_app_step_active,inbox_metadata->>'id' FROM novu_rust_workflows WHERE environment_id=$1 AND identifier=$2", &[&job.environment_id, &workflow]).await?
             .ok_or(InvalidJob("workflow no longer exists"))?;
         let step_active = row.get::<_, bool>(3) && row.get::<_, bool>(4);
         let current_content = match row.get::<_, Option<String>>(1) {
@@ -319,9 +323,10 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
             current_content,
             current_tags,
             step_active,
+            row.get::<_, Option<String>>(5),
         )
     } else {
-        (None, queued_content, queued_tags, true)
+        (None, queued_content, queued_tags, true, None)
     };
     let severity = severity_override
         .map(str::to_owned)
@@ -416,11 +421,6 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         let fields = serde_json::Value::Object(fields);
         let seconds = u32::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?;
         let row = tx.query_one("INSERT INTO novu_rust_subscribers (environment_id, subscriber_id, profile, internal_id) VALUES ($1, $2, $3, novu_rust_new_objectid()) ON CONFLICT (environment_id, subscriber_id) DO UPDATE SET updated_at = CASE WHEN novu_rust_subscribers.profile IS DISTINCT FROM novu_rust_subscribers.profile || EXCLUDED.profile THEN now() ELSE novu_rust_subscribers.updated_at END, profile = novu_rust_subscribers.profile || EXCLUDED.profile RETURNING profile, internal_id", &[&job.environment_id, &subscriber, &fields]).await?;
-        if !step_active {
-            // The reference still creates the subscriber/notification but no
-            // in-app job when the single step is missing or inactive.
-            continue;
-        }
         let subscriber_internal_id: String = row.get(1);
         let mut profile: serde_json::Value = row.get(0);
         profile
@@ -445,6 +445,16 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         // The subscriber upsert holds its row lock. Preference updates acquire
         // the same lock, so the channel decision is serialized with updates.
         let preference = tx.query_one("SELECT w.read_only,w.all_enabled,w.in_app_enabled,(p.channels->>'in_app')::boolean,(sp.channels->>'in_app')::boolean FROM (SELECT 1) singleton LEFT JOIN novu_rust_workflow_preferences w ON w.environment_id=$1 AND w.workflow_identifier=$3 LEFT JOIN novu_rust_subscriber_preferences p ON p.environment_id=$1 AND p.subscriber_id=$2 LEFT JOIN novu_rust_subscriber_workflow_preferences sp ON sp.environment_id=$1 AND sp.subscriber_id=$2 AND sp.workflow_identifier=$3", &[&job.environment_id,&subscriber,&workflow]).await?;
+        let critical = preference.get::<_, Option<bool>>(0).unwrap_or(false);
+        let channels: Vec<&str> = if step_active { vec!["in_app"] } else { vec![] };
+        let organization_id = data
+            .get("organizationId")
+            .and_then(serde_json::Value::as_str);
+        let notification = tx.query_one("INSERT INTO novu_rust_notifications (job_id,environment_id,organization_id,subscriber_id,subscriber_internal_id,workflow_identifier,workflow_internal_id,transaction_id,recipient,payload,channels,tags,severity,critical,context_keys) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT (job_id,subscriber_internal_id) DO UPDATE SET job_id=EXCLUDED.job_id RETURNING internal_id", &[&job.id,&job.environment_id,&organization_id,&subscriber,&subscriber_internal_id,&workflow,&workflow_internal_id,&transaction_id,&recipient,&payload,&channels,&tags,&severity,&critical,&context_keys]).await?;
+        let notification_id: String = notification.get(0);
+        if !step_active {
+            continue;
+        }
         let channel_enabled = novu_rust_contracts::preference::in_app_enabled(
             preference.get(0),
             preference.get(1),
@@ -466,7 +476,7 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         .map_err(|_| InvalidJob("unsupported template or input"))?;
         let message_random = Uuid::new_v4().simple().to_string();
         let message_internal_id = format!("{seconds:08x}{}", &message_random[..16]);
-        let inserted = tx.query_opt("INSERT INTO novu_rust_in_app_messages (id, internal_id, environment_id, subscriber_id, workflow_identifier, transaction_id, content, payload, delivered_at, tags, context_keys, severity, severity_present) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), $9, $10, $11, true) ON CONFLICT (environment_id, subscriber_id, workflow_identifier, transaction_id) DO NOTHING RETURNING internal_id", &[&Uuid::new_v4(), &message_internal_id, &job.environment_id, &subscriber, &workflow, &transaction_id, &rendered_content, &message_payload, &tags, &context_keys, &severity]).await?;
+        let inserted = tx.query_opt("INSERT INTO novu_rust_in_app_messages (id, internal_id, environment_id, subscriber_id, workflow_identifier, transaction_id, content, payload, delivered_at, tags, context_keys, severity, severity_present, notification_internal_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), $9, $10, $11, true, $12) ON CONFLICT (environment_id, subscriber_id, workflow_identifier, transaction_id) DO NOTHING RETURNING internal_id", &[&Uuid::new_v4(), &message_internal_id, &job.environment_id, &subscriber, &workflow, &transaction_id, &rendered_content, &message_payload, &tags, &context_keys, &severity, &notification_id]).await?;
         if inserted.is_some() {
             tx.query_one("SELECT novu_rust_emit_ws_event($1,$2,$3,'notification_received',jsonb_build_object('messageId',$4::text))", &[&job.environment_id,&subscriber_internal_id,&context_keys,&message_internal_id]).await?;
         }

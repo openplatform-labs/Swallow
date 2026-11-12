@@ -56,6 +56,7 @@ async fn worker_recovers_expired_jobs_and_isolates_invalid_jobs() {
         in_app::WS_BEST_EFFORT_MIGRATION,
         in_app::MESSAGE_SEVERITY_MIGRATION,
         in_app::IN_APP_STEP_ACTIVE_MIGRATION,
+        in_app::NOTIFICATIONS_MIGRATION,
     ] {
         db.batch_execute(migration).await.unwrap();
     }
@@ -151,6 +152,18 @@ async fn worker_recovers_expired_jobs_and_isolates_invalid_jobs() {
         .unwrap();
     assert_eq!(row.get::<_, String>(0), "failed");
     assert_eq!(row.get::<_, String>(1), "unsupported template or input");
+    let notifications: i64 = db
+        .query_one(
+            "SELECT count(*) FROM novu_rust_notifications WHERE job_id=$1",
+            &[&bad],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        notifications, 0,
+        "failed batch must roll back notification records"
+    );
     let status: String = db
         .query_one(
             "SELECT status FROM novu_queue_jobs WHERE id=$1",
@@ -388,6 +401,16 @@ async fn worker_recovers_expired_jobs_and_isolates_invalid_jobs() {
         assert_eq!(row.get::<_, String>(2), expected_content);
         assert_eq!(row.get::<_, serde_json::Value>(3), expected_tags);
     }
+    let cancelled_id = Uuid::new_v4();
+    let cancelled = json!({"workflow":"test","transactionId":"notification-cancelled","content":"ok","payload":{},"recipients":["blocked"]});
+    enqueue(&db, cancelled_id, "env-a", in_app::JOB_KIND, &cancelled)
+        .await
+        .unwrap();
+    assert!(in_app::process_one(&mut second_client).await.unwrap());
+    let row=db.query_one("SELECT n.channels,(SELECT count(*) FROM novu_rust_in_app_messages m WHERE m.environment_id=n.environment_id AND m.transaction_id=n.transaction_id),(SELECT status FROM novu_rust_in_app_step_outcomes o WHERE o.job_id=n.job_id) FROM novu_rust_notifications n WHERE n.job_id=$1",&[&cancelled_id]).await.unwrap();
+    assert_eq!(row.get::<_, Vec<String>>(0), vec!["in_app"]);
+    assert_eq!(row.get::<_, i64>(1), 0);
+    assert_eq!(row.get::<_, String>(2), "canceled");
     db.execute("DELETE FROM novu_rust_workflows WHERE environment_id='env-a' AND identifier='severity-compat'", &[]).await.unwrap();
     for (transaction, override_value) in [
         ("deleted-workflow", serde_json::Value::Null),
