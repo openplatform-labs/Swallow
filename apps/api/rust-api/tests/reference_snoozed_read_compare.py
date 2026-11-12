@@ -170,21 +170,38 @@ if os.environ.get('NOVU_TEST_UNSNOOZE_DELIVERY') == '1':
         endpoint = (path + '/' if credential is None else '/v1/inbox/notifications/') + notification_id + '/snooze'
         status, result = request(base,'PATCH',endpoint,{'snoozeUntil':stamp},auth=credential)
         assert status == 200 and result['data']['isSnoozed'] and result['data']['snoozedUntil'] == stamp, (base,status,result)
+    # Schedule a second message in a nonempty context in the same delay window.
+    ctx_tx=prefix+'-2'
+    ctx_ref=mongo_eval(f'print(db.getSiblingDB("novu-db").messages.findOne({{transactionId:"{ctx_tx}"}})._id.toString());')
+    ctx_rust=pg_eval(f"SELECT internal_id FROM novu_rust_in_app_messages WHERE transaction_id='{ctx_tx}'")
+    mongo_eval(f'db.getSiblingDB("novu-db").messages.updateOne({{transactionId:"{ctx_tx}"}},{{$set:{{contextKeys:["tenant:a","team:b"]}}}});')
+    pg_eval(f"UPDATE novu_rust_in_app_messages SET context_keys=ARRAY['tenant:a','team:b'] WHERE transaction_id='{ctx_tx}'")
+    ctx_query='?'+urllib.parse.urlencode([('contextKeys','team:b'),('contextKeys','tenant:a')])
+    for base, notification_id in ((reference,ctx_ref),(rust,ctx_rust)):
+        status,result=request(base,'PATCH',path+'/'+notification_id+'/snooze'+ctx_query,{'snoozeUntil':stamp})
+        assert status==200 and result['data']['isSnoozed'],(base,status,result)
     deadline = time.monotonic() + 105
     while time.monotonic() < deadline:
         items = []
+        contextual_items = []
         for base in (reference,rust):
             status, body = request(base,'GET',path)
             assert status == 200, (base,status,body)
             items.append(next(item for item in body['data'] if item['transactionId'] == tx))
-        if all(not item['isSnoozed'] for item in items): break
+            contextual_items.append(next(item for item in body['data'] if item['transactionId'] == ctx_tx))
+        if all(not item['isSnoozed'] for item in items+contextual_items): break
         time.sleep(1)
     else: raise AssertionError(('automatic unsnooze timed out',items))
     for item in items:
         assert not item['isRead'] and item['isSeen'] and not item['isArchived'], item
         assert item['readAt'] is None and item['deliveredAt'][:2] == stamps and len(item['deliveredAt']) == 3, item
         assert item['createdAt'] == item['deliveredAt'][-1], item
+    for item in contextual_items:
+        assert not item['isRead'] and item['isSeen'] and not item['isArchived'] and not item['isSnoozed'],item
+        assert item['readAt'] is None and len(item['deliveredAt']) == 2,item
+        assert item['createdAt'] == item['deliveredAt'][-1],item
     print('scheduled_unsnooze_worker_and_history: match')
+    print('scheduled_unsnooze_nonempty_context: match')
 
 # Context-scoped management snooze and unsnooze must not modify a different
 # context, and exact matching is order independent.
