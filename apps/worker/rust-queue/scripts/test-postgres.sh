@@ -25,3 +25,5 @@ TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_queue_test" \
   cargo test --locked --lib sendgrid_queue::tests::email_attempt_recovery_and_tenant_isolation -- --ignored
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_queue_test" \
   cargo test --locked --lib twilio_queue::tests::sms_attempt_recovery_and_tenant_isolation -- --ignored
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_queue_test" \
+  cargo test --locked --lib fcm_queue::tests::multicast_attempts_recovery_and_tenant_isolation -- --ignored

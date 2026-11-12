@@ -13,7 +13,8 @@ base64 = "0.22"
 jsonlogic = "0.5.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 uuid = { version = "1", features = ["v4"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "io-util", "sync"] }
 css-inline = { version = "0.18.0", default-features = false }
 serde_urlencoded = "0.7"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+ring = "0.17"

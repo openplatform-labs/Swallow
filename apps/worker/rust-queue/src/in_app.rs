@@ -147,6 +147,11 @@ pub const SMS_MESSAGES_MIGRATION: &str =
     include_str!("../migrations/0043_experimental_sms_messages.sql");
 pub const SMS_STEP_ID_MIGRATION: &str =
     include_str!("../migrations/0044_experimental_sms_step_id.sql");
+pub const PUSH_STEP_MIGRATION: &str = include_str!("../migrations/0046_experimental_push_step.sql");
+pub const FCM_CREDENTIALS_MIGRATION: &str =
+    include_str!("../migrations/0047_experimental_fcm_credentials.sql");
+pub const PUSH_MESSAGES_MIGRATION: &str =
+    include_str!("../migrations/0048_experimental_push_messages.sql");
 pub const JOB_KIND: &str = novu_rust_contracts::EXPERIMENTAL_IN_APP_JOB_KIND;
 pub const UNSNOOZE_JOB_KIND: &str = "experimental-in-app-unsnooze";
 type WorkerResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -374,8 +379,9 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         email_step_id,
         sms_step,
         sms_step_id,
+        push_step,
     ) = if data.get("severityOverride").is_some() {
-        let row = tx.query_opt("SELECT inbox_metadata->>'severity',in_app_content,inbox_metadata->'tags',has_steps,in_app_step_active,inbox_metadata->>'id',email_subject,email_html,email_step_active,email_step_id,sms_content,sms_step_active,sms_step_id FROM novu_rust_workflows WHERE environment_id=$1 AND identifier=$2", &[&job.environment_id, &workflow]).await?
+        let row = tx.query_opt("SELECT inbox_metadata->>'severity',in_app_content,inbox_metadata->'tags',has_steps,in_app_step_active,inbox_metadata->>'id',email_subject,email_html,email_step_active,email_step_id,sms_content,sms_step_active,sms_step_id,push_title,push_content,push_step_active FROM novu_rust_workflows WHERE environment_id=$1 AND identifier=$2", &[&job.environment_id, &workflow]).await?
             .ok_or(InvalidJob("workflow no longer exists"))?;
         let has_steps = row.get::<_, bool>(3);
         let email_subject: Option<String> = row.get(6);
@@ -384,6 +390,16 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         let sms_content: Option<String> = row.get(10);
         let sms_configured = sms_content.is_some();
         let sms_step = sms_content.filter(|_| has_steps && row.get::<_, bool>(11));
+        let push_title: Option<String> = row.get(13);
+        let push_content: Option<String> = row.get(14);
+        let push_configured = push_title.is_some() && push_content.is_some();
+        let push_step = match (push_title, push_content) {
+            (Some(title), Some(content)) if has_steps && row.get::<_, bool>(15) => {
+                Some((title, content))
+            }
+            (None, None) | (Some(_), Some(_)) => None,
+            _ => return Err(InvalidJob("invalid push step").into()),
+        };
         let email_step = match (email_subject, email_html) {
             (Some(subject), Some(html)) if has_steps && row.get::<_, bool>(8) => {
                 Some((subject, html))
@@ -394,7 +410,7 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         let step_active = has_steps
             && row.get::<_, bool>(4)
             && (row.get::<_, Option<String>>(1).is_some()
-                || (!email_configured && !sms_configured));
+                || (!email_configured && !sms_configured && !push_configured));
         let current_content = match row.get::<_, Option<String>>(1) {
             Some(content) => content,
             None if !step_active => String::new(),
@@ -414,6 +430,7 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
             row.get::<_, Option<String>>(9),
             sms_step,
             row.get::<_, Option<String>>(12),
+            push_step,
         )
     } else {
         (
@@ -421,6 +438,7 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
             queued_content,
             queued_tags,
             true,
+            None,
             None,
             None,
             None,
@@ -649,11 +667,29 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         if sms_step.is_some() {
             channels.push("sms");
         }
+        if push_step.is_some() {
+            channels.push("push");
+        }
         let organization_id = data
             .get("organizationId")
             .and_then(serde_json::Value::as_str);
         let notification = tx.query_one("INSERT INTO novu_rust_notifications (job_id,environment_id,organization_id,subscriber_id,subscriber_internal_id,workflow_identifier,workflow_internal_id,transaction_id,recipient,payload,channels,tags,severity,critical,context_keys) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT (job_id,subscriber_internal_id) DO UPDATE SET job_id=EXCLUDED.job_id RETURNING internal_id", &[&job.id,&job.environment_id,&organization_id,&subscriber,&subscriber_internal_id,&workflow,&workflow_internal_id,&transaction_id,&recipient,&payload,&channels,&tags,&severity,&critical,&context_keys]).await?;
         let notification_id: String = notification.get(0);
+        if let Some((push_title, push_content)) = push_step.as_ref() {
+            let push_job_id = Uuid::new_v4();
+            let push_payload = serde_json::json!({"workflow_context":{"subscriber_id":subscriber,"subscriber_internal_id":subscriber_internal_id,"notification_internal_id":notification_id,"transaction_id":transaction_id,"workflow_identifier":workflow,"workflow_internal_id":workflow_internal_id,"title_template":push_title,"content_template":push_content,"payload":payload,"context_keys":context_keys,"actor":actor_profile}});
+            tx.execute(
+                "INSERT INTO novu_queue_jobs(id,environment_id,kind,payload) VALUES ($1,$2,$3,$4)",
+                &[
+                    &push_job_id,
+                    &job.environment_id,
+                    &crate::fcm_queue::JOB_KIND,
+                    &push_payload,
+                ],
+            )
+            .await?;
+            tx.execute("INSERT INTO novu_rust_push_step_outcomes(job_id,environment_id,subscriber_id,subscriber_internal_id,workflow_identifier,transaction_id,status,push_job_id) VALUES ($1,$2,$3,$4,$5,$6,'queued',$7)",&[&job.id,&job.environment_id,&subscriber,&subscriber_internal_id,&workflow,&transaction_id,&push_job_id]).await?;
+        }
         if let Some(sms_content) = sms_step.as_ref() {
             let sms_job_id = Uuid::new_v4();
             let message_id: String = tx

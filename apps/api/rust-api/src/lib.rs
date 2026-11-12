@@ -3,6 +3,7 @@ mod contexts;
 mod inbox_context;
 mod inbox_data;
 mod preferences;
+mod subscriber_credentials;
 mod subscriber_jwt;
 mod subscriber_subscriptions;
 mod subscribers_list;
@@ -84,6 +85,15 @@ pub fn router_with_session_keys(
 ) -> Router {
     Router::new()
         .route("/v1/events/trigger", post(trigger))
+        .route(
+            "/v1/subscribers/{subscriber_id}/credentials",
+            axum::routing::put(subscriber_credentials::update)
+                .patch(subscriber_credentials::update),
+        )
+        .route(
+            "/v1/subscribers/{subscriber_id}/credentials/{provider_id}",
+            axum::routing::delete(subscriber_credentials::delete),
+        )
         .route(
             "/v1/subscribers/{subscriber_id}/online-status",
             axum::routing::patch(update_online_status),
@@ -1969,7 +1979,16 @@ async fn update_online_status(
     };
     let row = db.query_opt("WITH changed AS (UPDATE novu_rust_subscribers SET is_online=$3,last_online_at=CASE WHEN $3 THEN last_online_at ELSE now() END,updated_at=now() WHERE environment_id=$1 AND subscriber_id=$2 RETURNING *) SELECT changed.internal_id,changed.profile,e.organization_id,to_char(changed.created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),to_char(changed.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),changed.is_online,to_char(changed.last_online_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS last_online_at FROM changed JOIN novu_rust_environments e ON e.id=changed.environment_id", &[&environment_id,&subscriber_id,&online]).await;
     match row {
-        Ok(Some(row)) => subscriber_entity_response(row, &subscriber_id, &environment_id),
+        Ok(Some(row)) => {
+            subscriber_credentials::attach(
+                &db,
+                &environment_id,
+                &subscriber_id,
+                subscriber_entity_response(row, &subscriber_id, &environment_id),
+                &path,
+            )
+            .await
+        }
         Ok(None) => error_at(
             StatusCode::NOT_FOUND,
             "Subscriber not found",
@@ -2025,7 +2044,7 @@ async fn get_subscriber_v1(
             {
                 response.1.0["data"]["topics"] = json!(topics);
             }
-            response
+            subscriber_credentials::attach(&db, &env, &subscriber_id, response, &path).await
         }
         Ok(None) => error_at(
             StatusCode::NOT_FOUND,
@@ -2073,7 +2092,14 @@ async fn get_subscriber(
             );
         }
     };
-    subscriber_response(row, &subscriber_id, &environment_id, false)
+    subscriber_credentials::attach(
+        &db,
+        &environment_id,
+        &subscriber_id,
+        subscriber_response(row, &subscriber_id, &environment_id, false),
+        &path,
+    )
+    .await
 }
 
 async fn delete_subscriber(
@@ -2308,8 +2334,19 @@ async fn create_subscriber(
     let result = db.query_opt("WITH changed AS (INSERT INTO novu_rust_subscribers (environment_id, subscriber_id, internal_id, profile) VALUES ($1, $2, novu_rust_new_objectid(), $3) ON CONFLICT (environment_id, subscriber_id) DO UPDATE SET profile = novu_rust_subscribers.profile || EXCLUDED.profile, updated_at = CASE WHEN novu_rust_subscribers.profile IS DISTINCT FROM novu_rust_subscribers.profile || EXCLUDED.profile THEN now() ELSE novu_rust_subscribers.updated_at END WHERE NOT $4 RETURNING *) SELECT changed.internal_id, changed.profile, e.organization_id, to_char(changed.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(changed.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), changed.is_online, to_char(changed.last_online_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS last_online_at FROM changed JOIN novu_rust_environments e ON e.id = changed.environment_id", &[&environment_id, &subscriber_id, &profile, &fail_if_exists]).await;
     match result {
         Ok(Some(row)) => {
-            let (_, body) = subscriber_response(row, subscriber_id, &environment_id, false);
-            (StatusCode::CREATED, body)
+            let response = subscriber_credentials::attach(
+                &db,
+                &environment_id,
+                subscriber_id,
+                subscriber_response(row, subscriber_id, &environment_id, false),
+                &path,
+            )
+            .await;
+            if response.0 == StatusCode::OK {
+                (StatusCode::CREATED, response.1)
+            } else {
+                response
+            }
         }
         Ok(None) => error_at(
             StatusCode::CONFLICT,
@@ -2399,12 +2436,21 @@ async fn patch_subscriber(
     // use case, return the old updatedAt in this PATCH response; GET sees the new one.
     let result = db.query_opt("WITH old AS MATERIALIZED (SELECT * FROM novu_rust_subscribers WHERE environment_id = $1 AND subscriber_id = $2 FOR UPDATE), updated AS (UPDATE novu_rust_subscribers s SET profile = old.profile || $3::jsonb, updated_at = CASE WHEN old.profile IS DISTINCT FROM old.profile || $3::jsonb THEN now() ELSE old.updated_at END FROM old WHERE s.environment_id = old.environment_id AND s.subscriber_id = old.subscriber_id RETURNING s.internal_id, s.profile, s.environment_id, s.is_online, s.last_online_at, old.created_at, old.updated_at) SELECT updated.internal_id, updated.profile, e.organization_id, to_char(updated.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), to_char(updated.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), updated.is_online, to_char(updated.last_online_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS last_online_at FROM updated JOIN novu_rust_environments e ON e.id = updated.environment_id", &[&environment_id, &subscriber_id, &body]).await;
     match result {
-        Ok(Some(row)) => subscriber_response(
-            row,
-            &subscriber_id,
-            &environment_id,
-            fields.contains_key("data"),
-        ),
+        Ok(Some(row)) => {
+            subscriber_credentials::attach(
+                &db,
+                &environment_id,
+                &subscriber_id,
+                subscriber_response(
+                    row,
+                    &subscriber_id,
+                    &environment_id,
+                    fields.contains_key("data"),
+                ),
+                &path,
+            )
+            .await
+        }
         Ok(None) => error_at(
             StatusCode::NOT_FOUND,
             &format!("Subscriber {subscriber_id} was not found"),
@@ -2708,7 +2754,7 @@ async fn trigger(
     let context_entries = parsed_context
         .map(|context| context.entries)
         .unwrap_or_else(|| json!([]));
-    let row = match db.query_opt("SELECT active, has_steps, in_app_content, inbox_metadata, (SELECT organization_id FROM novu_rust_environments WHERE id=$1), email_subject, email_html, sms_content FROM novu_rust_workflows WHERE environment_id = $1 AND identifier = $2", &[&environment_id, &name]).await {
+    let row = match db.query_opt("SELECT active, has_steps, in_app_content, inbox_metadata, (SELECT organization_id FROM novu_rust_environments WHERE id=$1), email_subject, email_html, sms_content, push_title, push_content FROM novu_rust_workflows WHERE environment_id = $1 AND identifier = $2", &[&environment_id, &name]).await {
         Ok(Some(row)) => row,
         Ok(None) => return error(StatusCode::UNPROCESSABLE_ENTITY, "workflow_not_found", "Unprocessable Entity"),
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error", "Internal Server Error"),
@@ -2744,8 +2790,12 @@ async fn trigger(
         let email_subject: Option<String> = row.get(5);
         let email_html: Option<String> = row.get(6);
         let sms_content: Option<String> = row.get(7);
+        let push_title: Option<String> = row.get(8);
+        let push_content: Option<String> = row.get(9);
         let content = if content.is_none()
-            && ((email_subject.is_some() && email_html.is_some()) || sms_content.is_some())
+            && ((email_subject.is_some() && email_html.is_some())
+                || sms_content.is_some()
+                || (push_title.is_some() && push_content.is_some()))
         {
             Some(String::new())
         } else {

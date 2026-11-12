@@ -744,6 +744,7 @@ dependencies = [
  "jsonlogic",
  "novu-rust-contracts",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "serde_urlencoded",

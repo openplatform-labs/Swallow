@@ -1,4 +1,7 @@
 //! PostgreSQL queue primitives for the Rust rewrite. This is not yet a Novu-compatible worker.
+pub mod fcm;
+pub mod fcm_queue;
+pub mod google_oauth;
 pub mod in_app;
 pub mod sendgrid;
 pub mod sendgrid_queue;

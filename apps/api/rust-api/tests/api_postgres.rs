@@ -481,6 +481,15 @@ async fn trigger_api_contract_inner() {
     db.batch_execute(novu_postgres_queue::in_app::SMS_STEP_ID_MIGRATION)
         .await
         .unwrap();
+    db.batch_execute(novu_postgres_queue::in_app::PUSH_STEP_MIGRATION)
+        .await
+        .unwrap();
+    db.batch_execute(novu_postgres_queue::in_app::FCM_CREDENTIALS_MIGRATION)
+        .await
+        .unwrap();
+    db.batch_execute(novu_postgres_queue::in_app::PUSH_MESSAGES_MIGRATION)
+        .await
+        .unwrap();
     let old = db.query_one("SELECT internal_id,identifier,updated_at=created_at FROM novu_rust_topic_subscribers WHERE environment_id='legacy-env'", &[]).await.unwrap();
     let old_id: String = old.get(0);
     assert_eq!(old_id.len(), 24);
@@ -4281,6 +4290,7 @@ async fn trigger_api_contract_inner() {
     assert_eq!(remaining["data"][0]["count"], 0);
     worker.execute("INSERT INTO novu_rust_in_app_messages (id, environment_id, subscriber_id, workflow_identifier, transaction_id, content, payload) SELECT md5('counter-fixture-' || n)::uuid, 'env-a', 'counter', 'fixture', 'bulk-' || n, 'x', '{}'::jsonb FROM generate_series(1, 110) AS n", &[]).await.unwrap();
     Box::pin(email_workflow_contract(app.clone(), &mut worker)).await;
+    Box::pin(fcm_credentials_contract(app.clone(), &mut worker)).await;
     let (_, count) = count_notifications(app, Some("ApiKey test-key"), "counter", "[{}]").await;
     assert_eq!(count["data"][0]["count"], 100);
     worker.execute("INSERT INTO novu_rust_in_app_messages (id,internal_id,environment_id,subscriber_id,workflow_identifier,transaction_id,content,payload,tags) VALUES ('00000000-0000-4000-8000-000000000031','64a000000000000000000131','env-a','seen-user','names','jwt-delete-1','a','{}'::jsonb,'[\"red\"]'::jsonb),('00000000-0000-4000-8000-000000000032','64a000000000000000000132','env-a','seen-user','names','jwt-delete-2','b','{}'::jsonb,'[\"blue\"]'::jsonb)", &[]).await.unwrap();
@@ -4324,6 +4334,56 @@ async fn trigger_api_contract_inner() {
     assert_eq!(status, StatusCode::NO_CONTENT);
     let count: i64 = worker.query_one("SELECT count(*) FROM novu_rust_in_app_messages WHERE environment_id='env-a' AND subscriber_id='seen-user'", &[]).await.unwrap().get(0);
     assert_eq!(count, 0);
+}
+
+async fn fcm_credentials_contract(app: axum::Router, db: &mut tokio_postgres::Client) {
+    db.batch_execute("INSERT INTO novu_rust_fcm_integrations(environment_id,internal_id,identifier) VALUES ('env-a','integration-test','fcm-test'); INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES ('env-a','fcm-concurrent',novu_rust_new_objectid(),'{}'::jsonb)").await.unwrap();
+    let path = "/v1/subscribers/fcm-concurrent/credentials";
+    let initial = json!({"providerId":"fcm","credentials":{"deviceTokens":["initial"]}});
+    let (status, _) =
+        inbox_mutate(app.clone(), "PUT", path, Some("ApiKey test-key"), initial).await;
+    assert_eq!(status, StatusCode::OK);
+    let (second, driver) =
+        tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(), NoTls)
+            .await
+            .unwrap();
+    tokio::spawn(async move { driver.await.unwrap() });
+    let second_app = novu_rust_api::router(Arc::new(second));
+    let one = json!({"providerId":"fcm","credentials":{"deviceTokens":["one"]}});
+    let two = json!({"providerId":"fcm","credentials":{"deviceTokens":["two"]}});
+    let (a, b) = tokio::join!(
+        inbox_mutate(app.clone(), "PATCH", path, Some("ApiKey test-key"), one),
+        inbox_mutate(second_app, "PATCH", path, Some("ApiKey test-key"), two)
+    );
+    assert_eq!(a.0, StatusCode::OK);
+    assert_eq!(b.0, StatusCode::OK);
+    let tokens:Vec<String>=db.query_one("SELECT device_tokens FROM novu_rust_fcm_devices WHERE environment_id='env-a' AND subscriber_id='fcm-concurrent'",&[]).await.unwrap().get(0);
+    assert_eq!(tokens.len(), 3);
+    for token in ["initial", "one", "two"] {
+        assert!(tokens.iter().any(|v| v == token));
+    }
+    let overflow: Vec<String> = (0..101).map(|i| format!("device-{i}")).collect();
+    let (status, _) = inbox_mutate(
+        app.clone(),
+        "PUT",
+        path,
+        Some("ApiKey test-key"),
+        json!({"providerId":"fcm","credentials":{"deviceTokens":overflow}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let after:Vec<String>=db.query_one("SELECT device_tokens FROM novu_rust_fcm_devices WHERE environment_id='env-a' AND subscriber_id='fcm-concurrent'",&[]).await.unwrap().get(0);
+    assert_eq!(tokens, after);
+    let (status, _) = inbox_mutate(
+        app,
+        "DELETE",
+        "/v2/subscribers/fcm-concurrent",
+        Some("ApiKey test-key"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(db.query_opt("SELECT 1 FROM novu_rust_fcm_devices WHERE environment_id='env-a' AND subscriber_id='fcm-concurrent'",&[]).await.unwrap().is_none());
 }
 
 async fn email_workflow_contract(app: axum::Router, worker: &mut tokio_postgres::Client) {

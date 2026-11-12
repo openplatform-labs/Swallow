@@ -15,7 +15,7 @@ async fn postgres_queue_contract() {
         std::env::var("TEST_DATABASE_URL").expect("set TEST_DATABASE_URL to a disposable database");
     let (mut db, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move { connection.await.unwrap() });
-    db.batch_execute("DROP TABLE IF EXISTS novu_rust_in_app_step_outcomes, novu_rust_email_step_outcomes, novu_rust_email_messages, novu_rust_sms_step_outcomes, novu_rust_sms_messages, novu_queue_jobs")
+    db.batch_execute("DROP TABLE IF EXISTS novu_rust_in_app_step_outcomes, novu_rust_email_step_outcomes, novu_rust_email_messages, novu_rust_sms_step_outcomes, novu_rust_sms_messages, novu_rust_push_step_outcomes, novu_rust_push_messages, novu_queue_jobs")
         .await
         .unwrap();
     db.batch_execute(MIGRATION).await.unwrap();

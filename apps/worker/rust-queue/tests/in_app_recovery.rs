@@ -65,6 +65,9 @@ async fn worker_recovers_expired_jobs_and_isolates_invalid_jobs() {
         in_app::SMS_STEP_MIGRATION,
         in_app::SMS_MESSAGES_MIGRATION,
         in_app::SMS_STEP_ID_MIGRATION,
+        in_app::PUSH_STEP_MIGRATION,
+        in_app::FCM_CREDENTIALS_MIGRATION,
+        in_app::PUSH_MESSAGES_MIGRATION,
     ] {
         db.batch_execute(migration).await.unwrap();
     }
