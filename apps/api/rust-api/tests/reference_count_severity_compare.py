@@ -60,3 +60,24 @@ for response in (left,right):
 assert left==right,(left,right)
 assert left[1]['data']['severity']=='high' and left[1]['data']['workflow']['severity']=='high'
 print('severity individual read response: match')
+
+# Management list uses exact, order-independent context-key matching. The
+# response filter intentionally omits contextKeys, as in the original API.
+subprocess.run(['docker','exec',mongo,'mongosh','--quiet','--eval', '''const d=db.getSiblingDB("novu-db"); d.messages.updateOne({transactionId:"severity-4"},{$set:{contextKeys:["tenant:a"]}}); d.messages.updateOne({transactionId:"severity-6"},{$set:{contextKeys:["tenant:a","team:b"]}});'''],check=True,stdout=subprocess.DEVNULL)
+subprocess.run(['docker','exec',postgres,'psql','-v','ON_ERROR_STOP=1','-U','postgres','-d','novu_compat','-c', "UPDATE novu_rust_in_app_messages SET context_keys=CASE transaction_id WHEN 'severity-4' THEN ARRAY['tenant:a'] WHEN 'severity-6' THEN ARRAY['tenant:a','team:b'] ELSE context_keys END WHERE transaction_id IN ('severity-4','severity-6')"],check=True,stdout=subprocess.DEVNULL)
+for params, expected in [([('contextKeys','tenant:a')], ['severity-4']), ([('contextKeys','team:b'),('contextKeys','tenant:a')], ['severity-6']), ([('contextKeys','tenant:a'),('contextKeys','tenant:a')], ['severity-6']), ([('contextKeys','tenant:missing')], []), ([('contextKeys','tenant:a'),('severity','low')], ['severity-4'])]:
+    path='/v2/subscribers/alice/notifications?'+urllib.parse.urlencode(params)
+    def get_context_list(base):
+        req=urllib.request.Request(base+path,headers={'Authorization':'ApiKey '+os.environ['NOVU_TEST_API_KEY']})
+        with urllib.request.urlopen(req,timeout=10) as response: return json.load(response)
+    left,right=(get_context_list(os.environ[name]) for name in ('NOVU_REFERENCE_URL','NOVU_RUST_URL'))
+    for response in (left,right):
+        for item in response['data']:
+            for field in ('readAt','firstSeenAt'):
+                if item.get(field) is not None:
+                    assert item[field].endswith('Z')
+                    item[field]='<timestamp>'
+    assert left==right,(params,left,right)
+    assert [item['transactionId'] for item in left['data']]==expected,(params,left)
+    assert 'contextKeys' not in left['filter'],left
+print('notification list exact context-key filters: match')

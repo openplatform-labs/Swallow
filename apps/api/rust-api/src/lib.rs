@@ -1195,8 +1195,11 @@ async fn list_notifications_for(
     let mut query = HashMap::new();
     let mut tags = Vec::new();
     let mut severities = Vec::new();
+    let mut requested_context_keys = Vec::new();
     for (key, value) in pairs {
-        if key == "tags" {
+        if key == "contextKeys" && context_keys.is_none() {
+            requested_context_keys.push(value);
+        } else if key == "tags" {
             tags.push(value);
         } else if key == "severity" {
             severities.push(value);
@@ -1204,6 +1207,11 @@ async fn list_notifications_for(
             return unsupported();
         }
     }
+    let context_keys = if requested_context_keys.is_empty() {
+        context_keys
+    } else {
+        Some(requested_context_keys)
+    };
     if tags.len() > 100 {
         return unsupported();
     }
