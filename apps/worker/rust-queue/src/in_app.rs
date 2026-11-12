@@ -655,6 +655,10 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         subscriber_ids.push(id);
     }
     tx.query("SELECT pg_advisory_xact_lock(hashtext($1), lock_key) FROM (SELECT DISTINCT hashtext(subscriber_id) AS lock_key FROM unnest($2::text[]) AS subscriber_id ORDER BY lock_key OFFSET 0) AS ordered_locks", &[&job.environment_id, &subscriber_ids]).await?;
+    let snapshots = data
+        .get("recipientIdentitySnapshot")
+        .and_then(serde_json::Value::as_object);
+    let mut created_actor_identity = None;
     let mut actor_profile = if let (Some(actor), Some(actor_id)) = (actor.as_ref(), actor_id) {
         let mut fields = actor
             .as_object()
@@ -662,7 +666,23 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
             .clone();
         fields.remove("subscriberId");
         let fields = serde_json::Value::Object(fields);
-        let row = tx.query_one("INSERT INTO novu_rust_subscribers (environment_id,subscriber_id,profile,internal_id) VALUES ($1,$2,$3,novu_rust_new_objectid()) ON CONFLICT (environment_id,subscriber_id) DO UPDATE SET updated_at=CASE WHEN novu_rust_subscribers.profile IS DISTINCT FROM novu_rust_subscribers.profile || EXCLUDED.profile THEN now() ELSE novu_rust_subscribers.updated_at END,profile=novu_rust_subscribers.profile || EXCLUDED.profile RETURNING profile", &[&job.environment_id,&actor_id,&fields]).await?;
+        // A direct recipient can also be the actor. Apply the same identity
+        // fence before updating that actor, and reuse any identity we create.
+        let expected = if crate::allow_recreated_subscriber() {
+            None
+        } else {
+            snapshots.and_then(|map| map.get(actor_id))
+        };
+        let row = match expected {
+            Some(serde_json::Value::String(id)) => tx.query_opt("UPDATE novu_rust_subscribers SET updated_at=CASE WHEN profile IS DISTINCT FROM profile || $3::jsonb THEN now() ELSE updated_at END,profile=profile || $3::jsonb WHERE environment_id=$1 AND subscriber_id=$2 AND internal_id=$4 RETURNING profile,internal_id", &[&job.environment_id,&actor_id,&fields,&id]).await?,
+            Some(serde_json::Value::Null) => tx.query_opt("INSERT INTO novu_rust_subscribers (environment_id,subscriber_id,profile,internal_id) VALUES ($1,$2,$3,novu_rust_new_objectid()) ON CONFLICT (environment_id,subscriber_id) DO NOTHING RETURNING profile,internal_id", &[&job.environment_id,&actor_id,&fields]).await?,
+            Some(_) => return Err(InvalidJob("invalid subscriber identity snapshot").into()),
+            None => Some(tx.query_one("INSERT INTO novu_rust_subscribers (environment_id,subscriber_id,profile,internal_id) VALUES ($1,$2,$3,novu_rust_new_objectid()) ON CONFLICT (environment_id,subscriber_id) DO UPDATE SET updated_at=CASE WHEN novu_rust_subscribers.profile IS DISTINCT FROM novu_rust_subscribers.profile || EXCLUDED.profile THEN now() ELSE novu_rust_subscribers.updated_at END,profile=novu_rust_subscribers.profile || EXCLUDED.profile RETURNING profile,internal_id", &[&job.environment_id,&actor_id,&fields]).await?),
+        };
+        let row = row.ok_or(InvalidJob("subscriber identity changed"))?;
+        if matches!(expected, Some(serde_json::Value::Null)) {
+            created_actor_identity = Some(serde_json::Value::String(row.get(1)));
+        }
         let mut profile: serde_json::Value = row.get(0);
         profile
             .as_object_mut()
@@ -686,9 +706,6 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         }
     }
     let resolved_context = serde_json::Value::Object(resolved_context);
-    let snapshots = data
-        .get("recipientIdentitySnapshot")
-        .and_then(serde_json::Value::as_object);
     let mut identity_changed = false;
     for recipient in recipients {
         let mut fields = recipient
@@ -708,9 +725,16 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         let expected = if crate::allow_recreated_subscriber() {
             None
         } else {
-            snapshots
+            let snapshot = snapshots
                 .and_then(|map| map.get(&subscriber))
-                .or(topic_identity.as_ref())
+                .or(topic_identity.as_ref());
+            if actor_id == Some(subscriber.as_str())
+                && matches!(snapshot, Some(serde_json::Value::Null))
+            {
+                created_actor_identity.as_ref().or(snapshot)
+            } else {
+                snapshot
+            }
         };
         let row = match expected {
             Some(serde_json::Value::String(id)) => tx.query_opt("UPDATE novu_rust_subscribers SET updated_at=CASE WHEN profile IS DISTINCT FROM profile || $3::jsonb THEN now() ELSE updated_at END,profile=profile || $3::jsonb WHERE environment_id=$1 AND subscriber_id=$2 AND internal_id=$4 RETURNING profile,internal_id", &[&job.environment_id,&subscriber,&fields,&id]).await?,

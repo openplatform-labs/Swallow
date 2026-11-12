@@ -444,4 +444,53 @@ async fn worker_recovers_expired_jobs_and_isolates_invalid_jobs() {
         assert_eq!(row.get::<_, String>(0), "failed");
         assert_eq!(row.get::<_, i64>(1), 0);
     }
+
+    // Strict mode fences actor updates when the actor is also a direct recipient.
+    db.batch_execute("INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES ('env-a','actor-replaced','new-identity','{\"firstName\":\"New\"}'),('env-a','actor-existing','existing-identity','{}')").await.unwrap();
+    let replaced = Uuid::new_v4();
+    let created = Uuid::new_v4();
+    let existing = Uuid::new_v4();
+    for (id, subscriber, snapshot) in [
+        (replaced, "actor-replaced", json!("old-identity")),
+        (created, "actor-created", serde_json::Value::Null),
+        (existing, "actor-existing", json!("existing-identity")),
+    ] {
+        let job = json!({"workflow":"test","transactionId":id.to_string(),"content":"Hello {{subscriber.firstName}}","payload":{},"recipients":[{"subscriberId":subscriber,"firstName":"Recipient"}],"actor":{"subscriberId":subscriber,"firstName":"Actor"},"recipientIdentitySnapshot":{subscriber:snapshot}});
+        enqueue(&db, id, "env-a", in_app::JOB_KIND, &job)
+            .await
+            .unwrap();
+    }
+    let mut strict_worker = Worker(
+        Command::new(env!("CARGO_BIN_EXE_in-app-worker"))
+            .env("DATABASE_URL", &url)
+            .env("NOVU_ALLOW_RECREATED_SUBSCRIBER", "false")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    for _ in 0..100 {
+        assert!(strict_worker.0.try_wait().unwrap().is_none());
+        let complete: i64 = db.query_one("SELECT count(*) FROM novu_queue_jobs WHERE id=ANY($1) AND status IN ('completed','failed')", &[&vec![replaced,created,existing]]).await.unwrap().get(0);
+        if complete == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    for (id, expected) in [
+        (replaced, "failed"),
+        (created, "completed"),
+        (existing, "completed"),
+    ] {
+        let row = db
+            .query_one("SELECT status FROM novu_queue_jobs WHERE id=$1", &[&id])
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, String>(0), expected);
+    }
+    let row=db.query_one("SELECT profile->>'firstName',(SELECT count(*) FROM novu_rust_in_app_messages WHERE transaction_id=$1) FROM novu_rust_subscribers WHERE environment_id='env-a' AND subscriber_id='actor-replaced'", &[&replaced.to_string()]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "New");
+    assert_eq!(row.get::<_, i64>(1), 0);
+    let row=db.query_one("SELECT count(*) FROM novu_rust_in_app_messages m JOIN novu_rust_subscribers s ON s.environment_id=m.environment_id AND s.internal_id=m.subscriber_internal_id WHERE m.transaction_id=ANY($1) AND m.content='Hello Recipient'", &[&vec![created.to_string(),existing.to_string()]]).await.unwrap();
+    assert_eq!(row.get::<_, i64>(0), 2);
 }
