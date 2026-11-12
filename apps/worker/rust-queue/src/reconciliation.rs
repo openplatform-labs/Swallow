@@ -71,7 +71,7 @@ pub async fn email_dispatch_evidence(
     {
         return Err("email job not found".into());
     }
-    let rows = client.query("SELECT e.dispatch_id,e.event_type,count(*),count(DISTINCT e.recipient_hash),max(e.event_timestamp) FROM novu_rust_sendgrid_delivery_events e JOIN novu_rust_email_messages m ON m.environment_id=e.environment_id AND m.internal_id=e.message_internal_id WHERE m.environment_id=$1 AND m.email_job_id=$2 GROUP BY e.dispatch_id,e.event_type ORDER BY e.dispatch_id NULLS FIRST,e.event_type LIMIT 101", &[&environment,&job]).await?;
+    let rows = client.query("SELECT CASE WHEN e.dispatch_proof_verified THEN e.dispatch_id ELSE NULL END AS verified_dispatch,e.event_type,count(*),count(DISTINCT e.recipient_hash),max(e.event_timestamp) FROM novu_rust_sendgrid_delivery_events e JOIN novu_rust_email_messages m ON m.environment_id=e.environment_id AND m.internal_id=e.message_internal_id WHERE m.environment_id=$1 AND m.email_job_id=$2 GROUP BY verified_dispatch,e.event_type ORDER BY verified_dispatch NULLS FIRST,e.event_type LIMIT 101", &[&environment,&job]).await?;
     if rows.len() > 100 {
         return Err(
             "more than 100 email evidence groups; query the evidence table directly".into(),
@@ -153,7 +153,7 @@ pub async fn resolve(
     if kind == crate::sendgrid_queue::JOB_KIND && decision == "retry" {
         // Any recipient event means that SendGrid accepted at least part of
         // this request. Retrying the full request could duplicate delivery.
-        let evidence: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_sendgrid_delivery_events e JOIN novu_rust_email_messages m ON m.environment_id=e.environment_id AND m.internal_id=e.message_internal_id WHERE m.environment_id=$1 AND m.email_job_id=$2 AND ($3::uuid IS NULL OR e.dispatch_id IS NULL OR e.dispatch_id=$3))", &[&environment,&job,&retry_dispatch]).await?.get(0);
+        let evidence: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_sendgrid_delivery_events e JOIN novu_rust_email_messages m ON m.environment_id=e.environment_id AND m.internal_id=e.message_internal_id WHERE m.environment_id=$1 AND m.email_job_id=$2 AND ($3::uuid IS NULL OR NOT e.dispatch_proof_verified OR e.dispatch_id IS NULL OR e.dispatch_id=$3))", &[&environment,&job,&retry_dispatch]).await?.get(0);
         if evidence {
             tx.rollback().await?;
             return Err("email retry refused: authenticated provider callback already exists; inspect evidence".into());

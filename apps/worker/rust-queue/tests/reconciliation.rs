@@ -45,6 +45,14 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     db.batch_execute(queue::sendgrid_queue::DISPATCH_ID_MIGRATION)
         .await
         .unwrap();
+    let legacy_registry = Uuid::new_v4();
+    db.execute("INSERT INTO novu_rust_sendgrid_dispatch_ids(id,job_id,environment_id) VALUES ($1,$2,'legacy')", &[&legacy_registry,&legacy_email]).await.unwrap();
+    db.batch_execute(queue::sendgrid_queue::DISPATCH_PROOF_MIGRATION)
+        .await
+        .unwrap();
+    db.batch_execute(queue::sendgrid_queue::DISPATCH_PROOF_MIGRATION)
+        .await
+        .unwrap();
     let legacy_dispatch: Option<Uuid> = db
         .query_one(
             "SELECT dispatch_id FROM novu_rust_sendgrid_attempts WHERE job_id=$1",
@@ -54,6 +62,15 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
         .unwrap()
         .get(0);
     assert_eq!(legacy_dispatch, None);
+    let old_hash: Option<String> = db
+        .query_one(
+            "SELECT proof_hash FROM novu_rust_sendgrid_dispatch_ids WHERE id=$1",
+            &[&legacy_registry],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(old_hash, None);
     // The new migration must preserve old decisions and be safely re-runnable.
     let legacy_job = Uuid::new_v4();
     queue::enqueue(
@@ -86,6 +103,19 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     ))
     .await
     .unwrap();
+    db.execute("INSERT INTO novu_rust_sendgrid_delivery_events(environment_id,event_id,message_internal_id,event_type,event_timestamp,recipient_hash,dispatch_id) VALUES ('legacy','old-proof','missing','processed',1,'hash',$1)", &[&legacy_registry]).await.unwrap();
+    db.batch_execute(include_str!(
+        "../../../api/rust-api/migrations/0009_sendgrid_dispatch_proof.sql"
+    ))
+    .await
+    .unwrap();
+    db.batch_execute(include_str!(
+        "../../../api/rust-api/migrations/0009_sendgrid_dispatch_proof.sql"
+    ))
+    .await
+    .unwrap();
+    let verified: bool = db.query_one("SELECT dispatch_proof_verified FROM novu_rust_sendgrid_delivery_events WHERE environment_id='legacy' AND event_id='old-proof'", &[]).await.unwrap().get(0);
+    assert!(!verified);
     db.batch_execute(include_str!(
         "../../../api/rust-api/migrations/0005_twilio_webhooks.sql"
     ))
@@ -140,6 +170,7 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     .unwrap();
     db.execute("INSERT INTO novu_rust_email_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,subject,status,email_job_id,delivery_state) VALUES ('email','tenant-a','s','s','n','w','t','subject','error',$1,'unknown')", &[&email]).await.unwrap();
     db.batch_execute("INSERT INTO novu_rust_sendgrid_delivery_events(environment_id,event_id,message_internal_id,event_type,event_timestamp,recipient_hash) VALUES ('tenant-a','e1','email','delivered',100,'hash-a'),('tenant-a','e2','email','delivered',101,'hash-b'),('tenant-a','e3','email','deferred',102,'hash-a'),('tenant-b','cross','email','delivered',103,'hash-c')").await.unwrap();
+    db.execute("UPDATE novu_rust_sendgrid_delivery_events SET dispatch_id=$1 WHERE environment_id='tenant-a' AND event_id='e1'", &[&Uuid::new_v4()]).await.unwrap();
     let evidence = reconciliation::email_evidence(&db, "tenant-a", email)
         .await
         .unwrap();
@@ -265,7 +296,7 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     let prior_dispatch = Uuid::new_v4();
     db.execute("INSERT INTO novu_rust_sendgrid_attempts(job_id,environment_id,state,dispatch_id) VALUES ($1,'tenant-a','unknown',$2)", &[&email_retry,&retry_dispatch]).await.unwrap();
     db.execute("INSERT INTO novu_rust_email_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,subject,status,email_job_id,delivery_state) VALUES ('email-retry','tenant-a','s','s','n','w','t','subject','error',$1,'unknown')", &[&email_retry]).await.unwrap();
-    db.execute("INSERT INTO novu_rust_sendgrid_delivery_events(environment_id,event_id,message_internal_id,event_type,event_timestamp,recipient_hash,dispatch_id) VALUES ('tenant-a','earlier-email','email-retry','delivered',104,'hash',$1)", &[&prior_dispatch]).await.unwrap();
+    db.execute("INSERT INTO novu_rust_sendgrid_delivery_events(environment_id,event_id,message_internal_id,event_type,event_timestamp,recipient_hash,dispatch_id,dispatch_proof_verified) VALUES ('tenant-a','earlier-email','email-retry','delivered',104,'hash',$1,true)", &[&prior_dispatch]).await.unwrap();
     let grouped = reconciliation::email_dispatch_evidence(&db, "tenant-a", email_retry)
         .await
         .unwrap();

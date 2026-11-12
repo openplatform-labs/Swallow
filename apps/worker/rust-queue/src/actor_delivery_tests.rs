@@ -65,6 +65,7 @@ async fn changed_actor_is_rejected_by_all_channels() {
         crate::in_app::PUSH_STEP_ID_MIGRATION,
         crate::sendgrid_queue::MIGRATION,
         crate::sendgrid_queue::DISPATCH_ID_MIGRATION,
+        crate::sendgrid_queue::DISPATCH_PROOF_MIGRATION,
         crate::twilio_queue::MIGRATION,
         crate::twilio_queue::DISPATCH_ID_MIGRATION,
         crate::fcm_queue::MIGRATION,
@@ -91,6 +92,11 @@ async fn changed_actor_is_rejected_by_all_channels() {
     .unwrap();
     db.batch_execute(include_str!(
         "../../../api/rust-api/migrations/0008_sendgrid_dispatch_identity.sql"
+    ))
+    .await
+    .unwrap();
+    db.batch_execute(include_str!(
+        "../../../api/rust-api/migrations/0009_sendgrid_dispatch_proof.sql"
     ))
     .await
     .unwrap();
