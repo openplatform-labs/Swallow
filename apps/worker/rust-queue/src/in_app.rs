@@ -666,12 +666,17 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
             .clone();
         fields.remove("subscriberId");
         let fields = serde_json::Value::Object(fields);
-        // A direct recipient can also be the actor. Apply the same identity
-        // fence before updating that actor, and reuse any identity we create.
+        // Fence actor updates against the trigger-time identity. A direct
+        // recipient can share the actor identity snapshot from older jobs.
         let expected = if crate::allow_recreated_subscriber() {
             None
         } else {
-            snapshots.and_then(|map| map.get(actor_id))
+            Some(
+                snapshots
+                    .and_then(|map| map.get(actor_id))
+                    .or_else(|| data.get("actorIdentitySnapshot"))
+                    .ok_or(InvalidJob("actor identity snapshot missing"))?,
+            )
         };
         let row = match expected {
             Some(serde_json::Value::String(id)) => tx.query_opt("UPDATE novu_rust_subscribers SET updated_at=CASE WHEN profile IS DISTINCT FROM profile || $3::jsonb THEN now() ELSE updated_at END,profile=profile || $3::jsonb WHERE environment_id=$1 AND subscriber_id=$2 AND internal_id=$4 RETURNING profile,internal_id", &[&job.environment_id,&actor_id,&fields,&id]).await?,

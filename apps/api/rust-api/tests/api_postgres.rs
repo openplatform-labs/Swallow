@@ -1846,6 +1846,8 @@ async fn trigger_api_contract_inner() {
     db.execute("UPDATE novu_rust_workflows SET in_app_content='{{actor.firstName}} -> {{subscriber.subscriberId}}' WHERE environment_id='env-a' AND identifier='inbox'",&[]).await.unwrap();
     let (status, _) = request(app.clone(), Some("ApiKey test-key"),json!({"name":"inbox","to":{"type":"Topic","topicKey":"beta"},"actor":{"subscriberId":"topic-b","firstName":"Actor"},"transactionId":"topic-actor"})).await;
     assert_eq!(status, StatusCode::CREATED);
+    let row = db.query_one("SELECT payload->>'actorIdentitySnapshot', (SELECT internal_id FROM novu_rust_subscribers WHERE environment_id='env-a' AND subscriber_id='topic-b') FROM novu_queue_jobs WHERE payload->>'transactionId'='topic-actor'", &[]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), row.get::<_, String>(1));
     assert!(
         novu_postgres_queue::in_app::process_one(&mut topic_worker)
             .await

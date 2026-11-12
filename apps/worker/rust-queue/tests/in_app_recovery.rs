@@ -460,6 +460,27 @@ async fn worker_recovers_expired_jobs_and_isolates_invalid_jobs() {
             .await
             .unwrap();
     }
+    let actor_replaced = Uuid::new_v4();
+    let actor_new = Uuid::new_v4();
+    let actor_legacy = Uuid::new_v4();
+    for (id, actor, snapshot) in [
+        (
+            actor_replaced,
+            "actor-replaced",
+            Some(json!("old-identity")),
+        ),
+        (actor_new, "separate-new", Some(serde_json::Value::Null)),
+        (actor_legacy, "legacy-actor", None),
+    ] {
+        let recipient = format!("recipient-{id}");
+        let mut job = json!({"workflow":"test","transactionId":id.to_string(),"content":"Hello {{actor.firstName}}","payload":{},"recipients":[{"subscriberId":recipient}],"actor":{"subscriberId":actor,"firstName":"Actor"},"recipientIdentitySnapshot":{recipient:null}});
+        if let Some(snapshot) = snapshot {
+            job["actorIdentitySnapshot"] = snapshot;
+        }
+        enqueue(&db, id, "env-a", in_app::JOB_KIND, &job)
+            .await
+            .unwrap();
+    }
     let mut strict_worker = Worker(
         Command::new(env!("CARGO_BIN_EXE_in-app-worker"))
             .env("DATABASE_URL", &url)
@@ -471,8 +492,8 @@ async fn worker_recovers_expired_jobs_and_isolates_invalid_jobs() {
     );
     for _ in 0..100 {
         assert!(strict_worker.0.try_wait().unwrap().is_none());
-        let complete: i64 = db.query_one("SELECT count(*) FROM novu_queue_jobs WHERE id=ANY($1) AND status IN ('completed','failed')", &[&vec![replaced,created,existing]]).await.unwrap().get(0);
-        if complete == 3 {
+        let complete: i64 = db.query_one("SELECT count(*) FROM novu_queue_jobs WHERE id=ANY($1) AND status IN ('completed','failed')", &[&vec![replaced,created,existing,actor_replaced,actor_new,actor_legacy]]).await.unwrap().get(0);
+        if complete == 6 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -481,6 +502,9 @@ async fn worker_recovers_expired_jobs_and_isolates_invalid_jobs() {
         (replaced, "failed"),
         (created, "completed"),
         (existing, "completed"),
+        (actor_replaced, "failed"),
+        (actor_new, "completed"),
+        (actor_legacy, "failed"),
     ] {
         let row = db
             .query_one("SELECT status FROM novu_queue_jobs WHERE id=$1", &[&id])
