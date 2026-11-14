@@ -29,5 +29,5 @@ rsa = { version = "0.9", default-features = false, features = ["pem", "std"] }
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
-novu-postgres-queue = { path = "../../worker/rust-queue" }
+novu-postgres-queue = { path = "../../worker/rust-queue", features = ["test-mocks"] }
 http-body-util = "0.1"

@@ -84,6 +84,10 @@ env -u NOVU_RESEND_WEBHOOK_SECRET_FILE -u NOVU_RESEND_WEBHOOK_LOCK_RETRY_JOBS TE
 
 NOVU_RESEND_WEBHOOK_LOCK_RETRY_JOBS=invalid cargo test --locked --test resend_webhook invalid_retry_lock_policy_rejects_startup -- --ignored
 
+docker exec "$name" createdb -U postgres novu_resend_lost_response_test
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_resend_lost_response_test" \
+  cargo test --locked --test resend_lost_response -- --ignored
+
 # The final case pauses and restarts this disposable container.
 docker exec "$name" createdb -U postgres novu_api_reconnect_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_api_reconnect_test" TEST_PG_CONTAINER="$name" \
