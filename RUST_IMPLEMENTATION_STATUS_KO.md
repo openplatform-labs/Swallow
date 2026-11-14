@@ -217,6 +217,9 @@ API 0020은 새 `bounce` 이벤트의 `type`이 `bounce` 또는 `blocked`일 때
 
 워커 0097과 선택적으로 실행하는 `sendgrid-projection-worker`는 현재 발송 시도의 증명값이 확인된 서명 웹훅과 정확히 일치하는 수신자 스냅샷을 연결해 수신자별 결과와 작업·이메일 메시지의 별도 `sendgrid_delivery_result`를 갱신한다. 영구 반송·dropped는 실패, 일시 blocked는 대기, 전달과 영구 실패의 상충은 conflicting으로 처리한다. 수신자별 결과가 혼합되면 partial이며 수신자 중 미확정이 있거나 미연결 이벤트, 중복 주소, bounce 유형 부재, 스냅샷 부재 등은 unknown으로 남긴다. 이전 발송·검증되지 않은 증거는 현재 결과에 적용하지 않는다. 발송 시도와 기존 작업 상태는 바꾸지 않으며 자동 재발송도 하지 않는다. 전달은 수신 서버의 접수 보고이며 읽음을 의미하지 않는다. 워커는 환경별로 전체 이력을 반복 순회하고 완료 heartbeat를 남긴다. 잠긴 작업은 건너뛸 수 있고 부하·장기 장애와 실제 SendGrid 웹훅은 미검증이다. API 0020과 워커 0096·0097을 먼저 적용하고 DB 권한 및 heartbeat 감시를 별도로 구성해야 한다. 합성 서명 웹훅의 실제 HTTP 수신부터 DB 갱신, 환경 격리·상충·불명·DB 재연결을 Docker PostgreSQL에서 검증했다. 이 별도 결과 열은 원본 Novu 상태 API와 동등하다고 검증된 기능이 아니다.
 
+SendGrid의 수동 재시도 결정은 기존 발송 시도를 삭제하고 작업·메시지의 `sendgrid_delivery_result`를 같은 트랜잭션에서 `unknown`으로 초기화한다. 이전 시도의 전달 결과가 새로운 시도의 결과나 정상 감시 상태로 남지 않도록 한다. 작업·감사·상태 변경은 함께 커밋되며, 기존 웹훅 증거가 재시도를 차단하는 경우에는 값을 바꾸지 않는다. 워커 0097을 먼저 적용하고 구버전 운영 도구를 교체해야 이 동작이 보장된다. 기존 기록 중 이미 재시도됐으나 잘못된 값이 남은 작업은 소급 정리하지 않는다. 수신자별 결과는 집계기가 다음에 처리할 때 갱신되며 실시간성·실제 공급자 장애 및 모든 경합은 미검증이다. Docker PostgreSQL에서 경쟁 재시도 중 한 결정만 성공하고 두 결과 필드가 함께 초기화되는지 확인한다.
+
+
 워커 0098은 선택형 SendGrid 감시를 제공한다. `delivery-reconcile check-sendgrid ENV GRACE_SECONDS HEARTBEAT_MAX_SECONDS`는 유예기간이 지난 미전달 작업 또는 집계기 heartbeat 부재·지연 시 종료 코드 2를 반환하며 `check-sendgrid-metrics`는 집계 지표를 출력한다. 전달 실패·일부 전달·불명도 미전달로 집계한다. `send-delivery-alert`에서 `SWALLOW_ALERT_SENDGRID_GRACE_SECONDS`와 `SWALLOW_ALERT_SENDGRID_HEARTBEAT_MAX_SECONDS`를 모두 설정하면 기존 Slack·이메일 경보에 이 조건을 포함하고, 둘 다 생략하면 사용하지 않는다. 범위 제한 계정에는 `public.novu_rust_sendgrid_health(text,integer,integer)` 실행 권한과 해당 환경의 `alert_view` 권한이 필요하다. 스케줄러, 목적지와 명령 오류·미실행 감시는 운영자가 구성해야 한다. heartbeat는 잠긴 행까지 처리했다는 증거가 아니며 실서비스 경보 연동과 부하는 미검증이다.
 
 

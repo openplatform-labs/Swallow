@@ -115,6 +115,12 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     assert_eq!(row.get::<_, Option<Uuid>>(0), None);
     assert!(row.get::<_, i64>(1) > 0);
     db.batch_execute("DROP TABLE IF EXISTS novu_rust_sendgrid_delivery_events,novu_rust_sendgrid_webhook_keys,novu_rust_environments CASCADE; CREATE TABLE novu_rust_environments(id text PRIMARY KEY,organization_id text NOT NULL); INSERT INTO novu_rust_environments VALUES ('tenant-a','org-a'),('tenant-b','org-b'),('tenant-queue','org-a'),('tenant-resend','org-a')").await.unwrap();
+    db.batch_execute(queue::sendgrid_queue::RECIPIENT_MIGRATION)
+        .await
+        .unwrap();
+    db.batch_execute(queue::sendgrid_projection::MIGRATION)
+        .await
+        .unwrap();
     db.batch_execute(include_str!(
         "../../../api/rust-api/migrations/0004_sendgrid_webhooks.sql"
     ))
@@ -653,6 +659,13 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     assert_eq!(grouped[0]["dispatchId"], prior_dispatch.to_string());
     // A message ID collision from another environment does not block retry.
     db.batch_execute("INSERT INTO novu_rust_sendgrid_delivery_events(environment_id,event_id,message_internal_id,event_type,event_timestamp,recipient_hash) VALUES ('tenant-b','cross-retry','email-retry','delivered',104,'hash')").await.unwrap();
+    db.execute(
+        "UPDATE novu_queue_jobs SET sendgrid_delivery_result='delivered' WHERE id=$1",
+        &[&email_retry],
+    )
+    .await
+    .unwrap();
+    db.execute("UPDATE novu_rust_email_messages SET sendgrid_delivery_result='delivered' WHERE email_job_id=$1", &[&email_retry]).await.unwrap();
     let (mut other, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move {
         connection.await.unwrap();
@@ -682,6 +695,9 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     assert_eq!(row.get::<_, String>(0), "pending");
     assert_eq!(row.get::<_, i64>(1), 0);
     assert_eq!(row.get::<_, String>(2), "not_attempted");
+    let projected = db.query_one("SELECT j.sendgrid_delivery_result,m.sendgrid_delivery_result FROM novu_queue_jobs j JOIN novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1", &[&email_retry]).await.unwrap();
+    assert_eq!(projected.get::<_, String>(0), "unknown");
+    assert_eq!(projected.get::<_, String>(1), "unknown");
     let retry_recorded: Option<Uuid> = db.query_one("SELECT retry_dispatch_id FROM novu_rust_delivery_reconciliations WHERE job_id=$1 AND decision='retry'", &[&email_retry]).await.unwrap().get(0);
     assert_eq!(retry_recorded, Some(retry_dispatch));
     reconciliation::resolve(

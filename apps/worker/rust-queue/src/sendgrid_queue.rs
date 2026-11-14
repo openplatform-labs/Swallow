@@ -559,6 +559,9 @@ mod tests {
             .unwrap();
         db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision) VALUES ('env-a',session_user,'retry'),('env-a',session_user,'accepted') ON CONFLICT DO NOTHING", &[]).await.unwrap();
         db.batch_execute("CREATE TABLE IF NOT EXISTS novu_rust_environments(id text PRIMARY KEY, organization_id text NOT NULL); INSERT INTO novu_rust_environments VALUES ('env-a','org') ON CONFLICT DO NOTHING").await.unwrap();
+        db.batch_execute(crate::sendgrid_projection::MIGRATION)
+            .await
+            .unwrap();
         db.batch_execute(include_str!(
             "../../../api/rust-api/migrations/0004_sendgrid_webhooks.sql"
         ))
