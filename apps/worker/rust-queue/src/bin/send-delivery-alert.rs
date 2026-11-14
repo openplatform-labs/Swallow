@@ -426,6 +426,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     let mut error = configuration_error
         || observation_error
+        || sendgrid_check_failed
         || failed_jobs_check_failed
         || channel_policy_check_failed
         || failed_checks.iter().any(|failed| *failed);

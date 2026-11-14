@@ -480,6 +480,42 @@ async fn alert_reservations_fence_concurrency_and_ambiguous_recovery() {
     let log = String::from_utf8(partial.stderr).unwrap();
     assert!(log.contains("Resend health check failed"));
     assert!(log.contains("Slack alert requires operator review"));
+    // A failed SendGrid check must report a command failure even when the
+    // durable alert is blocked for review, allowing an external scheduler to
+    // distinguish a broken check from a delivery requiring review.
+    let check_sendgrid_failure = |target: &str| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"))
+            .args(["env-a", "300", "120", "60"])
+            .env("DATABASE_URL", &url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env(
+                "SWALLOW_ALERT_SLACK_WEBHOOK",
+                "https://hooks.slack.com/services/A/B/C",
+            )
+            .env_remove("SWALLOW_ALERT_SLACK_WEBHOOK_FILE")
+            .env_remove("SWALLOW_ALERT_EMAIL_TO")
+            .env("SWALLOW_ALERT_SLACK_TARGET_ID", target)
+            .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
+            .env("SWALLOW_ALERT_ATTEMPTS_ENABLED", "false")
+            .env_remove("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS")
+            .env("SWALLOW_ALERT_SENDGRID_GRACE_SECONDS", "300")
+            .env("SWALLOW_ALERT_SENDGRID_HEARTBEAT_MAX_SECONDS", "120")
+            .output()
+            .unwrap()
+    };
+    let sendgrid_failure = check_sendgrid_failure("check");
+    assert_eq!(sendgrid_failure.status.code(), Some(1));
+    let log = String::from_utf8(sendgrid_failure.stderr).unwrap();
+    assert!(log.contains("SendGrid health check failed"), "{log}");
+    assert!(
+        log.contains("Slack alert requires operator review"),
+        "{log}"
+    );
+    a.execute("INSERT INTO novu_rust_alert_delivery_slots(environment_id,channel,target_id,state,last_started_at) VALUES ('env-a','slack','cooling-sendgrid','accepted',clock_timestamp())", &[]).await.unwrap();
+    let cooled = check_sendgrid_failure("cooling-sendgrid");
+    assert_eq!(cooled.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&cooled.stderr).contains("SendGrid health check failed"));
+    assert!(String::from_utf8_lossy(&cooled.stdout).contains("CoolingDown"));
     // A failed attempts check likewise must not suppress the queue result.
     a.batch_execute("DROP TABLE novu_rust_fcm_attempts")
         .await
