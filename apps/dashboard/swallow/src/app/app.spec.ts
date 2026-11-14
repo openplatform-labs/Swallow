@@ -24,13 +24,14 @@ describe('Swallow console', () => {
 
   it('reads and writes workflow and email provider using scoped operator JWT', async () => {
     const data={workflowIdentifier:'welcome',channel:'email',title:'title',content:'old',active:true};
-    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data}))).mockResolvedValueOnce(new Response(JSON.stringify({data:{...data,content:'new'}}))).mockResolvedValueOnce(new Response(JSON.stringify({data:{workflowIdentifier:'welcome',provider:'sendgrid'}}))).mockResolvedValueOnce(new Response(JSON.stringify({data:{workflowIdentifier:'welcome',provider:'resend'}})));
+    const ack=async (_url:unknown,init?:RequestInit)=>new Response(JSON.stringify({recorded:true,replayed:false,requestId:JSON.parse(init?.body as string).requestId}));
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data}))).mockImplementationOnce(ack).mockResolvedValueOnce(new Response(JSON.stringify({data:{workflowIdentifier:'welcome',provider:'sendgrid'}}))).mockImplementationOnce(ack);
     const app=TestBed.createComponent(App).componentInstance;app.setSection('workflows');app.workflowAuthMode='jwt';app.workflowEnvironment='env-a';app.workflowIdentifier='welcome';app.workflowKey='aaa.bbb.ccc';
     await app.loadWorkflow();expect(app.workflowStatus()).toBe('loaded');app.workflowContent='new';app.workflowReason='ticket';app.workflowConfirmed=true;await app.saveWorkflow();expect(app.workflowStatus()).toBe('saved');
     const read=new URL(fetchMock.mock.calls[0][0] as string),write=new URL(fetchMock.mock.calls[1][0] as string);expect(read.searchParams.get('resource')).toBe('email');expect(write.searchParams.toString()).toBe('environmentId=env-a');expect(fetchMock.mock.calls[1][1]?.headers).toEqual({Authorization:'Bearer aaa.bbb.ccc','Content-Type':'application/json'});
-    expect(JSON.parse(fetchMock.mock.calls[1][1]?.body as string)).toEqual({workflow:'welcome',resource:'email',expected:{title:'title',content:'old',active:true},desired:{title:'title',content:'new',active:true},reason:'ticket'});
+    expect(JSON.parse(fetchMock.mock.calls[1][1]?.body as string)).toEqual({requestId:expect.any(String),workflow:'welcome',resource:'email',expected:{title:'title',content:'old',active:true},desired:{title:'title',content:'new',active:true},reason:'ticket'});
     await app.loadProvider();app.providerChoice='resend';app.providerReason='ticket';app.providerConfirmed=true;await app.saveProvider();expect(app.providerStatus()).toBe('saved');
-    expect(JSON.parse(fetchMock.mock.calls[3][1]?.body as string)).toEqual({workflow:'welcome',resource:'email-provider',expected:{provider:'sendgrid'},desired:{provider:'resend'},reason:'ticket'});
+    expect(JSON.parse(fetchMock.mock.calls[3][1]?.body as string)).toEqual({requestId:expect.any(String),workflow:'welcome',resource:'email-provider',expected:{provider:'sendgrid'},desired:{provider:'resend'},reason:'ticket'});
   });
 
   it('requires a reason for JWT workflow changes', async () => {
@@ -38,11 +39,27 @@ describe('Swallow console', () => {
     const app=TestBed.createComponent(App).componentInstance;app.workflowAuthMode='jwt';app.workflowEnvironment='env-a';app.workflowIdentifier='welcome';app.workflowChannel='sms';app.workflowKey='aaa.bbb.ccc';await app.loadWorkflow();app.workflowConfirmed=true;await app.saveWorkflow();expect(fetchMock).toHaveBeenCalledTimes(1);expect(app.workflowMessage()).toContain('사유');
   });
 
+  it('retains an uncertain JWT workflow request, looks it up and retries only with the original token', async () => {
+    const data={workflowIdentifier:'welcome',channel:'email',title:'title',content:'old',active:true};
+    const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data}))).mockRejectedValueOnce(new TypeError('lost response'));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('workflows');app.workflowAuthMode='jwt';app.workflowEnvironment='env-a';app.workflowIdentifier='welcome';app.workflowKey='aaa.bbb.ccc';await app.loadWorkflow();app.workflowContent='new';app.workflowReason='ticket';app.workflowConfirmed=true;await app.saveWorkflow();
+    expect(app.workflowStatus()).toBe('unknown');const id=app.workflowRequestId;expect(id).toBeTruthy();const original=mock.mock.calls[1][1]?.body;
+    app.workflowKey='different.token.value';app.clearWorkflow();app.workflowRetryConfirmed=true;await app.retryWorkflowRequest();expect(mock).toHaveBeenCalledTimes(2);expect(app.workflowRetryMessage()).toContain('같은 토큰');
+    mock.mockResolvedValueOnce(new Response(JSON.stringify({found:true,requestId:id,workflow:'welcome',resource:'email',reason:'ticket',createdAt:'today'})));await app.lookupWorkflowRequest();expect(app.workflowRequestStatus()).toBe('found');
+    app.workflowKey='aaa.bbb.ccc';app.clearWorkflow();mock.mockResolvedValueOnce(new Response(JSON.stringify({recorded:true,replayed:true,requestId:id})));app.workflowRetryConfirmed=true;await app.retryWorkflowRequest();
+    expect(mock.mock.calls[3][1]?.body).toBe(original);expect(app.workflowRetryStatus()).toBe('recorded');expect(app.workflowRetrySnapshot()).toBeNull();
+  });
+
+  it('keeps the workflow request uncertain when lookup finds no committed record', async () => {
+    vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({found:false})));
+    const app=TestBed.createComponent(App).componentInstance;app.workflowAuthMode='jwt';app.workflowEnvironment='env-a';app.workflowKey='aaa.bbb.ccc';app.workflowRequestId='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';await app.lookupWorkflowRequest();expect(app.workflowRequestStatus()).toBe('missing');
+  });
+
   it('uses the correct JWT payload for SMS, push and Slack steps', async () => {
     const fetchMock=vi.spyOn(globalThis,'fetch');const app=TestBed.createComponent(App).componentInstance;app.workflowAuthMode='jwt';app.workflowEnvironment='env-a';app.workflowIdentifier='welcome';app.workflowKey='aaa.bbb.ccc';
     for(const channel of ['sms','push','slack'] as const){
       app.workflowChannel=channel;const current=channel==='slack'?{content:'old',active:true}:{title:channel==='sms'?null:'title',content:'old',active:true};
-      const data={workflowIdentifier:'welcome',...(channel==='slack'?{}:{channel}),...current};fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({data}))).mockResolvedValueOnce(new Response(JSON.stringify({data:{...data,content:'new'}})));
+      const data={workflowIdentifier:'welcome',...(channel==='slack'?{}:{channel}),...current};fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({data}))).mockImplementationOnce(async (_url,init)=>new Response(JSON.stringify({recorded:true,replayed:false,requestId:JSON.parse(init?.body as string).requestId})));
       await app.loadWorkflow();app.workflowContent='new';app.workflowReason='ticket';app.workflowConfirmed=true;await app.saveWorkflow();expect(app.workflowStatus()).toBe('saved');
       const payload=JSON.parse(fetchMock.mock.calls.at(-1)![1]?.body as string);expect(payload.resource).toBe(channel);expect(payload.expected).toEqual(current);expect(payload.desired).toEqual({...current,content:'new'});
     }
@@ -63,7 +80,8 @@ describe('Swallow console', () => {
     const data={workflowIdentifier:'welcome',channel:'email',title:'title',content:'old',active:true};let finish!:(response:Response)=>void;
     vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data}))).mockReturnValueOnce(new Promise(done=>{finish=done;}));
     const fixture=TestBed.createComponent(App);const app=fixture.componentInstance;app.oidcIssuer='https://issuer.test';app.oidcClientId='console';app.oidcEnvironment='env-a';await app.prepareOidc();await app.signInOidc();app.useOidc('workflows');app.workflowIdentifier='welcome';await app.loadWorkflow();app.workflowReason='ticket';app.workflowConfirmed=true;
-    const pending=app.saveWorkflow();vi.advanceTimersByTime(2000);expect(app.workflowStatus()).toBe('saving');expect(app.workflowKey).toBe('');finish(new Response(JSON.stringify({data})));await pending;
+    const internal=app as unknown as {credentialFingerprint:(key:string)=>Promise<string>};vi.spyOn(internal,'credentialFingerprint').mockResolvedValue('hash');
+    const pending=app.saveWorkflow();await Promise.resolve();expect(finish).toBeDefined();vi.advanceTimersByTime(2000);expect(app.workflowStatus()).toBe('saving');expect(app.workflowKey).toBe('');finish(new Response(JSON.stringify({recorded:true,replayed:false,requestId:app.workflowRequestId})));await pending;
     expect(app.workflowStatus()).toBe('saved');expect(app.workflowContent).toBe('');fixture.destroy();
   });
 

@@ -9,6 +9,9 @@ type AlertSlot = { channel: string; targetId: string; state: string; lastStarted
 type AlertCursor = { channel: string; targetId: string };
 type ResendResult = { jobId:string; jobStatus:string; result:string; attemptState:string|null; providerIdKnown:boolean; providerIdAmbiguous:boolean; autoCorrelated:boolean; autoCorrelationConflict:boolean; autoCorrelatedAt:string|null; lastCompletedScanAt:string|null };
 type WorkflowChannel = 'email'|'sms'|'push'|'slack';
+type WorkflowResource = WorkflowChannel|'email-provider';
+type WorkflowChangeRequest = {requestId:string;workflow:string;resource:WorkflowResource;expected:unknown;desired:unknown;reason:string};
+type WorkflowRetrySnapshot = {origin:string;environment:string;keyHash:string;body:WorkflowChangeRequest};
 type WorkflowAudit = {id:string;issuer:string;subject:string;clientId:string;databasePrincipal:string;reason:string;recordedAt:string;previousActive:boolean|null;newActive:boolean|null;previousTitleBytes:number|null;newTitleBytes:number|null;previousContentBytes:number|null;newContentBytes:number|null;previousProvider:string|null;newProvider:string|null};
 type DecisionHistory = { id: string; decision: string; reason: string; createdAt: string };
 type DecisionRequest = { requestId: string; channel: string; targetId: string; attemptId: string; decision: string; reason: string; createdAt: string };
@@ -72,6 +75,16 @@ export class App implements OnDestroy {
   private workflowAuditHistory:(string|null)[]=[null];
   private workflowAuditSequence=0;
   private workflowAuditAbort:AbortController|null=null;
+  workflowRequestId='';
+  workflowRequestResource:WorkflowResource='email';
+  readonly workflowRequestStatus=signal<'idle'|'loading'|'found'|'missing'|'error'>('idle');
+  readonly workflowRequestRecord=signal<{workflow:string;resource:string;reason:string;createdAt:string}|null>(null);
+  private workflowRequestSequence=0;
+  private workflowRequestAbort:AbortController|null=null;
+  readonly workflowRetrySnapshot=signal<WorkflowRetrySnapshot|null>(null);
+  readonly workflowRetryStatus=signal<'idle'|'unknown'|'retrying'|'recorded'>('idle');
+  readonly workflowRetryMessage=signal('');
+  workflowRetryConfirmed=false;
   readonly subscribers = signal<Subscriber[]>([]);
   readonly subscriberStatus = signal<'idle' | 'loading' | 'loaded' | 'error'>('idle');
   readonly subscriberError = signal('');
@@ -177,6 +190,7 @@ export class App implements OnDestroy {
 
   ngOnDestroy(): void {
     this.clearWorkflow(true);
+    this.forgetWorkflowRequest();
     this.oidcSequence++;
     if (this.oidcExpiryTimer !== null) clearTimeout(this.oidcExpiryTimer);
     this.oidcExpiryTimer = null;
@@ -210,6 +224,7 @@ export class App implements OnDestroy {
       this.workflowKey='';this.workflowReason='';this.providerReason='';this.workflowSequence++;this.workflowAbort?.abort();this.workflowAbort=null;
       this.providerSequence++;this.providerAbort?.abort();this.providerAbort=null;
       this.clearWorkflowAudit();
+      this.clearWorkflowRequestLookup();
       if(this.workflowStatus()!=='saving'){this.workflowStatus.set('idle');this.workflowMessage.set('');this.workflowExpected=null;this.workflowTitle='';this.workflowContent='';this.workflowHasContent=false;this.workflowConfirmed=false;}
       if(this.providerStatus()!=='saving'){this.providerStatus.set('idle');this.providerMessage.set('');this.providerExpected=null;this.providerConfirmed=false;}
     }
@@ -223,12 +238,12 @@ export class App implements OnDestroy {
   }
 
   resetOidc(): void {
-    if (this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving') return;
+    if (this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     if (this.oidcExpiryTimer !== null) clearTimeout(this.oidcExpiryTimer);
     this.oidcExpiryTimer=null;
     this.oidcSequence++; this.oidcPrepared = null; this.oidcSession = null;
     this.oidcStatus.set('idle'); this.oidcSubject.set('');
-    this.forgetKey(); this.forgetAlertKey(); this.clearPermissions(true);this.clearWorkflow(true);
+    this.forgetKey(); this.forgetAlertKey(); this.clearPermissions(true);this.clearWorkflow(true);this.forgetWorkflowRequest();
   }
 
   async prepareOidc(): Promise<void> {
@@ -253,7 +268,7 @@ export class App implements OnDestroy {
 
   useOidc(section: 'subscribers' | 'alerts' | 'workflows'): void {
     this.expireOidcIfNeeded();
-    if (!this.oidcSession || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving') return;
+    if (!this.oidcSession || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     const session=this.oidcSession;
     this.setSection(section);
     if (section === 'subscribers') { this.forgetKey(); this.credentialMode='jwt'; this.subscriberEnvironment=session.environmentId; this.apiKey=session.token; }
@@ -440,6 +455,7 @@ export class App implements OnDestroy {
 
   clearWorkflow(clearKey=false): void {
     this.clearWorkflowAudit();
+    this.clearWorkflowRequestLookup();
     this.workflowSequence++;this.workflowAbort?.abort();this.workflowAbort=null;
     this.workflowStatus.set('idle');this.workflowMessage.set('');this.workflowTitle='';this.workflowContent='';this.workflowHasContent=false;this.workflowActive=false;this.workflowConfirmed=false;
     this.workflowExpected=null;
@@ -500,6 +516,59 @@ export class App implements OnDestroy {
   private workflowAuthorization():string {return `${this.workflowAuthMode==='jwt'?'Bearer':'ApiKey'} ${this.workflowKey.trim()}`;}
   private validWorkflowReason(reason:string):boolean {return !!reason.trim() && !reason.includes('\0') && new TextEncoder().encode(reason.trim()).length<=1000;}
 
+  clearWorkflowRequestLookup():void {this.workflowRequestSequence++;this.workflowRequestAbort?.abort();this.workflowRequestAbort=null;this.workflowRequestStatus.set('idle');this.workflowRequestRecord.set(null);}
+  forgetWorkflowRequest():void {if(this.workflowRetryStatus()==='retrying')return;this.clearWorkflowRequestLookup();this.workflowRetrySnapshot.set(null);this.workflowRetryStatus.set('idle');this.workflowRetryMessage.set('');this.workflowRetryConfirmed=false;this.workflowRequestId='';}
+
+  private async submitJwtWorkflow(body:Omit<WorkflowChangeRequest,'requestId'>):Promise<'saved'|'rejected'|'unknown'|'unavailable'> {
+    if(this.workflowRetrySnapshot())return 'unavailable';
+    this.workflowRetryStatus.set('idle');this.workflowRequestId='';this.clearWorkflowRequestLookup();
+    const key=this.workflowKey.trim(), environment=this.workflowEnvironment.trim();let origin:string,requestId:string,keyHash:string;
+    try {origin=this.validatedOrigin();requestId=crypto.randomUUID();keyHash=await this.credentialFingerprint(key);}catch{return 'unavailable';}
+    this.expireOidcIfNeeded();if(this.workflowKey.trim()!==key||this.workflowAuthMode!=='jwt'||!this.validJwt(key))return 'unavailable';
+    const snapshot:WorkflowRetrySnapshot={origin,environment,keyHash,body:{...body,requestId}};
+    this.workflowRetrySnapshot.set(snapshot);this.workflowRetryStatus.set('unknown');this.workflowRetryMessage.set('');this.workflowRequestId=requestId;this.workflowRequestResource=body.resource;this.clearWorkflowRequestLookup();
+    try {
+      const response=await fetch(`${origin}/v1/experimental/operator/workflow-v2?${new URLSearchParams({environmentId:environment})}`,{method:'PUT',headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},body:JSON.stringify(snapshot.body),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
+      this.expireOidcIfNeeded();
+      if(!response.ok){if([400,401,403,404,409].includes(response.status)){this.workflowRetrySnapshot.set(null);this.workflowRetryStatus.set('idle');return 'rejected';}return 'unknown';}
+      const value:unknown=await response.json();this.expireOidcIfNeeded();
+      if(typeof value!=='object'||value===null||!('recorded' in value)||value.recorded!==true||!('replayed' in value)||typeof value.replayed!=='boolean'||!('requestId' in value)||value.requestId!==requestId)throw new Error('invalid response');
+      this.workflowRetrySnapshot.set(null);this.workflowRetryStatus.set('recorded');return 'saved';
+    } catch {this.expireOidcIfNeeded();return 'unknown';}
+  }
+
+  async retryWorkflowRequest():Promise<void> {
+    this.expireOidcIfNeeded();const snapshot=this.workflowRetrySnapshot(),key=this.workflowKey.trim();
+    if(!snapshot||this.workflowRetryStatus()!=='unknown'||!this.workflowRetryConfirmed||this.workflowAuthMode!=='jwt'||!this.validJwt(key))return;
+    this.workflowRetryStatus.set('retrying');this.workflowRetryMessage.set('');
+    try {
+      const fingerprint=await this.credentialFingerprint(key);this.expireOidcIfNeeded();
+      if(this.workflowKey.trim()!==key||fingerprint!==snapshot.keyHash||this.validatedOrigin()!==snapshot.origin||this.workflowEnvironment.trim()!==snapshot.environment){this.workflowRetryMessage.set('원래 요청과 같은 토큰, 환경과 API 주소가 필요합니다.');return;}
+      const response=await fetch(`${snapshot.origin}/v1/experimental/operator/workflow-v2?${new URLSearchParams({environmentId:snapshot.environment})}`,{method:'PUT',headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},body:JSON.stringify(snapshot.body),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
+      this.expireOidcIfNeeded();if(!response.ok)throw new Error('retry unavailable');const value:unknown=await response.json();this.expireOidcIfNeeded();
+      if(typeof value!=='object'||value===null||!('recorded' in value)||value.recorded!==true||!('replayed' in value)||typeof value.replayed!=='boolean'||!('requestId' in value)||value.requestId!==snapshot.body.requestId)throw new Error('invalid response');
+      this.workflowRetrySnapshot.set(null);this.workflowRetryStatus.set('recorded');
+      if(this.workflowIdentifier.trim()===snapshot.body.workflow){if(snapshot.body.resource==='email-provider'&&this.providerStatus()==='unknown')this.providerStatus.set('saved');else if(snapshot.body.resource!=='email-provider'&&this.workflowStatus()==='unknown')this.workflowStatus.set('saved');}
+    } catch {this.expireOidcIfNeeded();this.workflowRetryMessage.set('결과가 여전히 불명확합니다. 요청 조회와 현재 설정을 확인하세요.');}
+    finally {this.workflowRetryConfirmed=false;if(this.workflowRetryStatus()==='retrying')this.workflowRetryStatus.set('unknown');}
+  }
+
+  async lookupWorkflowRequest():Promise<void> {
+    this.expireOidcIfNeeded();if(this.workflowStatus()==='saving'||this.providerStatus()==='saving'||this.workflowRetryStatus()==='retrying')return;
+    this.clearWorkflowRequestLookup();const sequence=this.workflowRequestSequence,key=this.workflowKey.trim(),environment=this.workflowEnvironment.trim(),id=this.workflowRequestId.trim(),resource=this.workflowRequestResource;
+    if(this.workflowAuthMode!=='jwt'||!this.validJwt(key)||!this.validEnvironment(environment)||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)||!['email','sms','push','slack','email-provider'].includes(resource)){this.workflowRequestStatus.set('error');return;}
+    const controller=new AbortController();this.workflowRequestAbort=controller;this.workflowRequestStatus.set('loading');
+    try {
+      const params=new URLSearchParams({environmentId:environment,resource,requestId:id});const response=await fetch(`${this.validatedOrigin()}/v1/experimental/operator/workflow-request?${params}`,{headers:{Authorization:`Bearer ${key}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      if(!response.ok)throw new Error('lookup failed');const value:unknown=await response.json();this.expireOidcIfNeeded();if(sequence!==this.workflowRequestSequence)return;
+      if(typeof value!=='object'||value===null||!('found' in value)||typeof value.found!=='boolean')throw new Error('invalid response');
+      if(!value.found){this.workflowRequestStatus.set('missing');return;}
+      if(!('requestId' in value)||typeof value.requestId!=='string'||value.requestId.toLowerCase()!==id.toLowerCase()||!('workflow' in value)||typeof value.workflow!=='string'||!('resource' in value)||value.resource!==resource||!('reason' in value)||typeof value.reason!=='string'||!('createdAt' in value)||typeof value.createdAt!=='string')throw new Error('invalid response');
+      this.workflowRequestRecord.set({workflow:value.workflow,resource,reason:value.reason,createdAt:value.createdAt});this.workflowRequestStatus.set('found');
+    } catch {this.expireOidcIfNeeded();if(sequence===this.workflowRequestSequence)this.workflowRequestStatus.set('error');}
+    finally {if(sequence===this.workflowRequestSequence)this.workflowRequestAbort=null;}
+  }
+
   async loadProvider():Promise<void> {
     this.expireOidcIfNeeded();
     if(this.workflowStatus()==='saving'||this.providerStatus()==='saving')return;
@@ -525,9 +594,15 @@ export class App implements OnDestroy {
     if(this.workflowAuthMode==='jwt'&&!this.validWorkflowReason(this.providerReason)){this.providerMessage.set('변경 사유를 1,000바이트 이내로 입력하세요.');return;}
     let endpoint:string;try {endpoint=this.providerEndpoint(true);}catch{this.providerStatus.set('error');this.providerMessage.set('워크플로 식별자와 인증을 확인하세요.');return;}
     const identifier=this.workflowIdentifier.trim(),choice=this.providerChoice,expected=this.providerExpected;
-    const payload=this.workflowAuthMode==='jwt'?{workflow:identifier,resource:'email-provider',expected:{provider:expected},desired:{provider:choice},reason:this.providerReason.trim()}:{provider:choice,expected};
+    const payload={provider:choice,expected};
     this.providerStatus.set('saving');this.providerMessage.set('');
     try {
+      if(this.workflowAuthMode==='jwt'){
+        const result=await this.submitJwtWorkflow({workflow:identifier,resource:'email-provider',expected:{provider:expected},desired:{provider:choice},reason:this.providerReason.trim()});
+        this.providerStatus.set(result==='saved'?'saved':result==='unknown'?'unknown':'error');
+        if(result!=='saved')this.providerMessage.set(result==='unknown'?'변경 결과가 불명입니다. 요청 ID를 보관하고 처리 상태를 확인하세요.':result==='unavailable'?'요청을 준비하지 못했습니다. 인증 또는 기존 불명 요청을 확인하세요.':'변경이 거절됐습니다. 설정과 권한을 다시 확인하세요.');
+        return;
+      }
       const response=await fetch(endpoint,{method:'PUT',headers:{Authorization:this.workflowAuthorization(),'Content-Type':'application/json'},body:JSON.stringify(payload),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
       this.expireOidcIfNeeded();
       if(!response.ok){this.providerStatus.set([400,401,403,404,409].includes(response.status)?'error':'unknown');this.providerMessage.set(response.status===409?'설정이 변경되었거나 접근 권한을 확인할 수 없습니다. 다시 조회하세요.':this.providerStatus()==='error'?'공급자 변경이 거절됐습니다. 권한과 서버 버전을 확인하세요.':'변경 결과가 불명입니다. 재시도 전에 현재 설정과 감사 기록을 확인하세요.');return;}
@@ -581,9 +656,15 @@ export class App implements OnDestroy {
     const content=this.workflowHasContent?this.workflowContent:null;
     const expected=channel==='slack'?{content:this.workflowExpected.content,active:this.workflowExpected.active}:this.workflowExpected;
     const desired=channel==='slack'?{content,active:this.workflowActive}:{title:this.workflowHasContent&&(channel==='email'||channel==='push')?this.workflowTitle:null,content,active:this.workflowActive};
-    const body=this.workflowAuthMode==='jwt'?{workflow:identifier,resource:channel,expected,desired,reason:this.workflowReason.trim()}:{...desired,expected};
+    const body={...desired,expected};
     this.workflowStatus.set('saving');this.workflowMessage.set('');
     try {
+      if(this.workflowAuthMode==='jwt'){
+        const result=await this.submitJwtWorkflow({workflow:identifier,resource:channel,expected,desired,reason:this.workflowReason.trim()});
+        this.workflowStatus.set(result==='saved'?'saved':result==='unknown'?'unknown':'error');
+        if(result!=='saved')this.workflowMessage.set(result==='unknown'?'변경 결과가 불명입니다. 요청 ID를 보관하고 처리 상태를 확인하세요.':result==='unavailable'?'요청을 준비하지 못했습니다. 인증 또는 기존 불명 요청을 확인하세요.':'변경이 거절됐습니다. 설정과 권한을 다시 확인하세요.');
+        return;
+      }
       const response=await fetch(endpoint,{method:'PUT',headers:{Authorization:this.workflowAuthorization(),'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
       this.expireOidcIfNeeded();
       if(!response.ok){this.workflowStatus.set([400,401,403,404,409].includes(response.status)?'error':'unknown');this.workflowMessage.set(response.status===409?'설정이 변경되었거나 접근 권한을 확인할 수 없습니다. 다시 조회해 주세요.':this.workflowStatus()==='error'?'변경이 거절되었습니다. 입력과 쓰기 권한 및 서버 버전을 확인해 주세요.':'변경 결과를 확인할 수 없습니다. 재시도 전에 현재 설정과 감사 기록을 확인하세요.');return;}
@@ -593,8 +674,8 @@ export class App implements OnDestroy {
   }
 
   setSection(next: Section): void {
-    if (this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving') return;
-    if (this.section()==='workflows' && next!=='workflows') this.clearWorkflow(true);
+    if (this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
+    if (this.section()==='workflows' && next!=='workflows') {this.clearWorkflow(true);this.forgetWorkflowRequest();}
     if (this.section() === 'subscribers' && next !== 'subscribers') this.forgetKey();
     if (this.section() === 'alerts' && next !== 'alerts') this.forgetAlertKey();
     if (this.section() === 'settings' && next !== 'settings') {this.clearPermissions(true);this.clearPermissionChange();}

@@ -32,6 +32,7 @@ GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_result(text,text,
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_jobs(text,text,text,text,bigint,uuid) TO ui_resend_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_read(text,text,text,text,bigint,text,text),public.novu_rust_operator_jwt_workflow_write(text,text,text,text,bigint,text,text,jsonb,jsonb,text) TO ui_resend_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_audit_read(text,text,text,text,bigint,text,text,uuid) TO ui_resend_fixture;
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_write_v2(text,text,text,text,bigint,uuid,text,text,jsonb,jsonb,text),public.novu_rust_operator_jwt_workflow_request_read(text,text,text,text,bigint,text,uuid) TO ui_resend_fixture;
 GRANT SELECT ON public.novu_rust_users,public.novu_rust_api_keys,public.novu_rust_workflows TO ui_resend_fixture;
 GRANT UPDATE(email_subject,email_html,email_step_active,sms_content,sms_step_active,push_title,push_content,push_step_active,chat_content,chat_step_active) ON public.novu_rust_workflows TO ui_resend_fixture;
 GRANT INSERT ON public.novu_rust_channel_workflow_audit,public.novu_rust_slack_workflow_audit TO ui_resend_fixture;
