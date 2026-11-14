@@ -386,4 +386,71 @@ async fn signed_events_update_current_recipient_and_job_results() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(reconnected && worker.0.try_wait().unwrap().is_none());
+    drop(worker);
+    // A strict heartbeat must not advance when a locked row is skipped.
+    db.execute(
+        "DELETE FROM novu_rust_sendgrid_projection_heartbeat WHERE environment_id='env-a'",
+        &[],
+    )
+    .await
+    .unwrap();
+    let lock = db.transaction().await.unwrap();
+    lock.query_one(
+        "SELECT 1 FROM novu_queue_jobs WHERE id=$1 FOR UPDATE",
+        &[&job],
+    )
+    .await
+    .unwrap();
+    let (observer, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move { driver.await.unwrap() });
+    for (setting, value) in [
+        ("NOVU_SENDGRID_PROJECTION_REQUIRE_FULL_SCAN", "invalid"),
+        ("NOVU_SENDGRID_PROJECTION_SCAN_INTERVAL_SECONDS", "0"),
+        ("NOVU_SENDGRID_PROJECTION_SCAN_INTERVAL_SECONDS", "301"),
+    ] {
+        let output = Command::new(std::env::var("TEST_SENDGRID_PROJECTION_BIN").unwrap())
+            .env("DATABASE_URL", &url)
+            .env("NOVU_SENDGRID_ENVIRONMENT_ID", "env-a")
+            .env_remove("NOVU_SENDGRID_PROJECTION_REQUIRE_FULL_SCAN")
+            .env_remove("NOVU_SENDGRID_PROJECTION_SCAN_INTERVAL_SECONDS")
+            .env(setting, value)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+    }
+    let log_path = std::env::temp_dir().join(format!("swallow-projection-{}.log", Uuid::new_v4()));
+    let log = std::fs::File::create(&log_path).unwrap();
+    let mut strict = Worker(
+        Command::new(std::env::var("TEST_SENDGRID_PROJECTION_BIN").unwrap())
+            .env("DATABASE_URL", &url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("NOVU_SENDGRID_ENVIRONMENT_ID", "env-a")
+            .env("NOVU_SENDGRID_PROJECTION_REQUIRE_FULL_SCAN", "true")
+            .env("NOVU_SENDGRID_PROJECTION_SCAN_INTERVAL_SECONDS", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log))
+            .spawn()
+            .unwrap(),
+    );
+    let mut observed_skip = false;
+    for _ in 0..100 {
+        if std::fs::read_to_string(&log_path)
+            .unwrap()
+            .contains("projection scan skipped jobs")
+        {
+            observed_skip = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(observed_skip && strict.0.try_wait().unwrap().is_none());
+    assert!(!observer.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_sendgrid_projection_heartbeat WHERE environment_id='env-a')", &[]).await.unwrap().get::<_,bool>(0));
+    lock.rollback().await.unwrap();
+    let mut complete = false;
+    for _ in 0..100 {
+        if observer.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_sendgrid_projection_heartbeat WHERE environment_id='env-a')", &[]).await.unwrap().get::<_,bool>(0) { complete=true; break; }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(complete && strict.0.try_wait().unwrap().is_none());
+    std::fs::remove_file(log_path).unwrap();
 }
