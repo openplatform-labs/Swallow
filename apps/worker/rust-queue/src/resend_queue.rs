@@ -100,12 +100,16 @@ pub async fn process_one(
     let key = format!("swallow/{}", job.id);
     let (state, code, id, diagnostic) = match provider.send(&email, Some(&key)).await {
         Ok(id) => ("accepted", None, Some(id), None),
-        Err(SendError::Provider(code)) if code >= 500 || code == 409 => (
-            "unknown",
-            Some(i32::from(code)),
-            None,
-            Some("Resend outcome unknown"),
-        ),
+        Err(SendError::Provider(code))
+            if !(400..500).contains(&code) || [408, 409].contains(&code) =>
+        {
+            (
+                "unknown",
+                Some(i32::from(code)),
+                None,
+                Some("Resend outcome unknown"),
+            )
+        }
         Err(SendError::Provider(code)) => (
             "rejected",
             Some(i32::from(code)),
@@ -594,6 +598,8 @@ mod tests {
         // pre-dispatch job requeued above.
         for (status, body, expected) in [
             (500, "{}", "unknown"),
+            (302, "{}", "unknown"),
+            (408, "{}", "unknown"),
             (409, "{}", "unknown"),
             (429, "{}", "rejected"),
             (200, "{}", "unknown"),

@@ -22,6 +22,10 @@ Slack 워커는 PostgreSQL 연결 실패나 처리 오류·시간 초과 뒤 2�
 
 수동 `delivery-reconcile slack-resolve ENV JOB retry|accepted OPERATOR REASON`은 해당 환경과 DB 로그인에 별도로 부여한 `slack_retry` 또는 `slack_accepted` 권한을 잠금 아래 확인하고 감사 기록과 상태 변경을 원자적으로 수행한다. 기존 이메일·SMS·푸시 및 운영 경보 권한과 별개다. accepted는 불명 상태에서만 가능하며 제공자 ID가 없는 운영자 확인이다. retry는 불명·거절에 가능하나 미접수를 독립적으로 확인하지 않으면 중복될 수 있다. 0071은 0067·0068 이후 적용하며 Slack 권한을 부여한 후 구버전 권한 제약 마이그레이션을 재적용하지 않는다. DB 직접 쓰기·감사 위변조는 별도 제한이 필요하다. Docker PostgreSQL·모의 HTTP에서 동시 선점, 발송 전후 복구·늦은 응답, 환경 격리·감시·권한·감사를 검증한다. 기준 원본의 채널·사용자 대상과 customData 덮어쓰기 등 세 요청을 모의 HTTP로 비교했으며 실제 Slack 발송, 워크플로 종단 간 비교, 모든 오류와 운영 HA는 미검증이다.
 
+## Resend 발송 응답 판정
+
+Resend 발송 워커는 HTTP 408·409, 리디렉션 등 4xx가 아닌 실패 응답, 5xx 및 전송 오류를 접수 여부가 불명확한 `unknown`으로 기록한다. 408·409 이외의 4xx는 `rejected`로 기록한다. 리디렉션은 따라가지 않고, 어느 경우에도 자동으로 재발송하지 않는다. 기존에 잘못 `rejected`로 기록된 이력은 자동 변경하지 않으므로 재처리 전에 공급자 기록을 확인해야 한다. Docker PostgreSQL과 모의 HTTP에서 302·408·409·429·500 응답과 불완전한 성공 응답의 상태 및 자동 재발송 부재를 검증한다. 실제 Resend에서 이 오류들을 발생시킨 검증은 하지 않았다.
+
 ## Inbox 알림 action
 
 워커 0059 마이그레이션은 인앱 메시지에 CTA JSON을 저장한다. API는 이미 저장된 primary·secondary 버튼에 대해 구독자 관리 API 및 Inbox 세션의 complete·revert를 지원하고 읽지 않은 메시지는 읽음·확인 상태로 바꾼다. 버튼, redirect 및 완료 상태를 제한적으로 DTO에 표시한다. 이 변경의 배포 전에는 0059를 먼저 적용해야 한다. 기존 행은 빈 CTA로 남으며 MongoDB에서 이전하지 않는다.
