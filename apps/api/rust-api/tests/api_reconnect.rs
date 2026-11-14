@@ -65,6 +65,31 @@ fn put_status(port: u16) -> Option<u16> {
         .ok()?;
     std::str::from_utf8(&out.stdout).ok()?.parse().ok()
 }
+fn health(port: u16, path: &str) -> Option<u16> {
+    let output = Command::new("curl")
+        .args([
+            "--max-time",
+            "3",
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            &format!("http://127.0.0.1:{port}{path}"),
+        ])
+        .output()
+        .ok()?;
+    std::str::from_utf8(&output.stdout).ok()?.parse().ok()
+}
+async fn await_health(port: u16, path: &str, expected: u16) {
+    for _ in 0..100 {
+        if health(port, path) == Some(expected) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("health path {path} did not return {expected}");
+}
 async fn await_status(port: u16, expected: u16) {
     let mut last = None;
     for _ in 0..200 {
@@ -75,6 +100,17 @@ async fn await_status(port: u16, expected: u16) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("API did not return expected HTTP status {expected}; last={last:?}");
+}
+#[test]
+fn invalid_health_endpoint_configuration_is_rejected() {
+    let status = Command::new(env!("CARGO_BIN_EXE_novu-rust-api"))
+        .env("DATABASE_URL", "postgresql://localhost/unused")
+        .env("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED", "yes")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!status.success());
 }
 #[tokio::test]
 #[ignore = "pauses and restarts a disposable PostgreSQL container"]
@@ -110,7 +146,10 @@ async fn api_reconnects_without_replaying_requests() {
     .unwrap();
     let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = socket.local_addr().unwrap().port();
+    let second_socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let second_port = second_socket.local_addr().unwrap().port();
     drop(socket);
+    drop(second_socket);
     assert!(
         Command::new("docker")
             .args(["pause", &container])
@@ -120,27 +159,50 @@ async fn api_reconnects_without_replaying_requests() {
             .success()
     );
     let initially_paused = Paused(container.clone());
-    let child = Command::new(env!("CARGO_BIN_EXE_novu-rust-api"))
-        .env("DATABASE_URL", &url)
-        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
-        .env("LISTEN_ADDR", format!("127.0.0.1:{port}"))
-        .env("SWALLOW_API_DB_HEALTH_INTERVAL_SECONDS", "1")
-        .env("SWALLOW_API_DB_HEALTH_TIMEOUT_SECONDS", "2")
-        .env_remove("JWT_SECRET")
-        .env_remove("JWT_SECRET_FILE")
-        .env_remove("INBOX_HMAC_KEYS_JSON")
-        .env_remove("NOVU_RESEND_WEBHOOK_SECRET")
-        .env_remove("NOVU_RESEND_WEBHOOK_SECRET_FILE")
-        .env_remove("NOVU_TWILIO_WEBHOOK_AUTH_TOKEN")
-        .env_remove("NOVU_TWILIO_WEBHOOK_AUTH_TOKEN_FILE")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut server = Server(child);
+    let start = |port: u16, enabled: bool| {
+        let child = Command::new(env!("CARGO_BIN_EXE_novu-rust-api"))
+            .env("DATABASE_URL", &url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("LISTEN_ADDR", format!("127.0.0.1:{port}"))
+            .env(
+                "SWALLOW_API_HEALTH_ENDPOINTS_ENABLED",
+                if enabled { "true" } else { "false" },
+            )
+            .env("SWALLOW_API_DB_HEALTH_INTERVAL_SECONDS", "1")
+            .env("SWALLOW_API_DB_HEALTH_TIMEOUT_SECONDS", "2")
+            .env_remove("JWT_SECRET")
+            .env_remove("JWT_SECRET_FILE")
+            .env_remove("INBOX_HMAC_KEYS_JSON")
+            .env_remove("NOVU_RESEND_WEBHOOK_SECRET")
+            .env_remove("NOVU_RESEND_WEBHOOK_SECRET_FILE")
+            .env_remove("NOVU_TWILIO_WEBHOOK_AUTH_TOKEN")
+            .env_remove("NOVU_TWILIO_WEBHOOK_AUTH_TOKEN_FILE")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        Server(child)
+    };
+    let mut server = start(port, true);
+    let mut second = start(second_port, true);
+    await_health(port, "/health/live", 200).await;
+    await_health(port, "/health/ready", 503).await;
+    await_health(second_port, "/health/live", 200).await;
+    await_health(second_port, "/health/ready", 503).await;
     await_status(port, 503).await;
     drop(initially_paused);
     await_status(port, 200).await;
+    await_status(second_port, 200).await;
+    await_health(port, "/health/ready", 200).await;
+    await_health(second_port, "/health/ready", 200).await;
+    let disabled_socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let disabled_port = disabled_socket.local_addr().unwrap().port();
+    drop(disabled_socket);
+    let disabled = start(disabled_port, false);
+    await_status(disabled_port, 200).await;
+    await_health(disabled_port, "/health/live", 404).await;
+    await_health(disabled_port, "/health/ready", 404).await;
+    drop(disabled);
     assert!(
         Command::new("docker")
             .args(["pause", &container])
@@ -150,10 +212,17 @@ async fn api_reconnects_without_replaying_requests() {
             .success()
     );
     let paused = Paused(container.clone());
+    await_health(port, "/health/ready", 503).await;
     await_status(port, 503).await;
+    await_status(second_port, 503).await;
+    await_health(port, "/health/live", 200).await;
+    await_health(second_port, "/health/ready", 503).await;
     assert_eq!(put_status(port), Some(503));
     drop(paused);
     await_status(port, 200).await;
+    await_status(second_port, 200).await;
+    await_health(port, "/health/ready", 200).await;
+    await_health(second_port, "/health/ready", 200).await;
     let row=db.query_one("SELECT email_provider,(SELECT count(*) FROM public.novu_rust_workflow_provider_audit) FROM novu_rust_workflows WHERE environment_id='e' AND identifier='w'", &[]).await.unwrap();
     assert_eq!(row.get::<_, String>(0), "sendgrid");
     assert_eq!(row.get::<_, i64>(1), 0);
@@ -166,5 +235,9 @@ async fn api_reconnects_without_replaying_requests() {
             .success()
     );
     await_status(port, 200).await;
+    await_status(second_port, 200).await;
+    await_health(port, "/health/ready", 200).await;
+    await_health(second_port, "/health/ready", 200).await;
     assert!(server.0.try_wait().unwrap().is_none());
+    assert!(second.0.try_wait().unwrap().is_none());
 }

@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     extract::{Request, State},
-    http::StatusCode,
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
 };
 use std::{
@@ -11,12 +11,22 @@ use std::{
 };
 use tower::ServiceExt;
 
-type SharedRouter = Arc<RwLock<Option<Router>>>;
+#[derive(Clone)]
+struct Connected {
+    router: Router,
+    db: Arc<tokio_postgres::Client>,
+}
 
-async fn forward(State(shared): State<SharedRouter>, request: Request) -> Response {
-    let router = shared.read().ok().and_then(|guard| guard.clone());
-    match router {
-        Some(router) => match router.oneshot(request).await {
+#[derive(Clone)]
+struct ApiState {
+    current: Arc<RwLock<Option<Connected>>>,
+    timeout: Duration,
+}
+
+async fn forward(State(shared): State<ApiState>, request: Request) -> Response {
+    let current = shared.current.read().ok().and_then(|guard| guard.clone());
+    match current {
+        Some(current) => match current.router.oneshot(request).await {
             Ok(response) => response,
             Err(never) => match never {},
         },
@@ -26,6 +36,49 @@ async fn forward(State(shared): State<SharedRouter>, request: Request) -> Respon
         )
             .into_response(),
     }
+}
+
+async fn live() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({"status":"live"})),
+    )
+        .into_response()
+}
+
+async fn ready(State(shared): State<ApiState>) -> Response {
+    let current = shared.current.read().ok().and_then(|guard| guard.clone());
+    let ready = if let Some(current) = current {
+        let query_ok = matches!(
+            tokio::time::timeout(shared.timeout, current.db.simple_query("SELECT 1")).await,
+            Ok(Ok(_))
+        );
+        let still_current = shared
+            .current
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .as_ref()
+                    .map(|active| Arc::ptr_eq(&active.db, &current.db))
+            })
+            .unwrap_or(false);
+        query_ok && still_current
+    } else {
+        false
+    };
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({"status":if ready {"ready"} else {"not_ready"}})),
+    )
+        .into_response()
 }
 
 fn duration_env(name: &str, default: u64) -> Result<Duration, Box<dyn Error + Send + Sync>> {
@@ -46,9 +99,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let (config, tls) = novu_rust_contracts::postgres::configure(&url)?;
     let interval = duration_env("SWALLOW_API_DB_HEALTH_INTERVAL_SECONDS", 10)?;
     let timeout = duration_env("SWALLOW_API_DB_HEALTH_TIMEOUT_SECONDS", 30)?;
+    let health_endpoints = match std::env::var("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid health endpoint setting".into()),
+    };
     let runtime = novu_rust_api::RuntimeConfig::from_env();
-    let shared: SharedRouter = Arc::new(RwLock::new(None));
-    let manager_state = shared.clone();
+    let shared = ApiState {
+        current: Arc::new(RwLock::new(None)),
+        timeout,
+    };
+    let manager_state = shared.current.clone();
     tokio::spawn(async move {
         loop {
             let (db, connection) =
@@ -63,7 +124,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             let db = Arc::new(db);
             let mut driver = tokio::spawn(connection);
             if let Ok(mut guard) = manager_state.write() {
-                *guard = Some(runtime.router(db.clone()));
+                *guard = Some(Connected {
+                    router: runtime.router(db.clone()),
+                    db: db.clone(),
+                });
             }
             loop {
                 tokio::select! {
@@ -83,6 +147,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     });
     let address = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into());
     let listener = tokio::net::TcpListener::bind(&address).await?;
-    axum::serve(listener, Router::new().fallback(forward).with_state(shared)).await?;
+    let mut app = Router::new().fallback(forward);
+    if health_endpoints {
+        app = app
+            .route("/health/live", axum::routing::get(live))
+            .route("/health/ready", axum::routing::get(ready));
+    }
+    axum::serve(listener, app.with_state(shared)).await?;
     Ok(())
 }
