@@ -683,3 +683,6 @@ WS의 `NOVU_WS_ENABLE_HEALTH_ENDPOINTS=true`는 `GET /health/live`와 `GET /heal
 
 
 운영 경보 메일은 `SWALLOW_ALERT_EMAIL_PROVIDER=resend|sendgrid`로 선택한다. 기본은 기존 Resend이며 `send-delivery-alert`와 `send-database-alert` 모두에 적용된다. SendGrid 선택 시 `SWALLOW_ALERT_EMAIL_TO`, `NOVU_SENDGRID_FROM`, `NOVU_SENDGRID_API_KEY` 또는 `NOVU_SENDGRID_API_KEY_FILE`을 설정하고 `NOVU_SENDGRID_SENDER_NAME`, `NOVU_SENDGRID_REGION=global|eu`를 선택할 수 있다. 대상 또는 공급자 변경 시 새 비밀 아닌 대상 ID를 쓰고 모든 발송 프로세스의 설정을 일치시켜야 한다. ID는 실제 주소나 공급자의 권한 검증이 아니라 쿨다운과 시도 슬롯의 식별자다. SendGrid도 기존 DB 예약·권한·쿨다운·불명 결과 운영자 확인을 사용하며 독립 DB 경보의 비조정 대체 방식에도 적용된다. SendGrid에는 Resend 멱등성 키가 없고 공급자 접수는 수신을 보장하지 않는다. 재시도 판단을 잘못하면 중복될 수 있다. 모의 HTTP와 Docker PostgreSQL에서 접수·429 거절·500 불명, 불명 후 자동 재발송 차단, 제한 로그인·쿨다운·선택 설정 및 비조정 대체 전송을 확인한다. 실제 SendGrid 경보 수신·웹훅 연결 및 원본 비교는 미검증이다.
+
+
+독립 DB 경보의 `send-uncoordinated` 대체 전송에서 `SWALLOW_DB_ALERT_FALLBACK_DELIVERY=parallel`을 선택하면 Slack과 선택된 메일 공급자 요청을 동시에 시작하며 각 요청에 별도 시간 제한이 적용된다. 기본 `sequential`은 Slack 완료 또는 시간 초과 후 메일을 시작한다. 잘못된 값은 대체 방식 선택 여부와 관계없이 시작 시 거절한다. 병렬 실행은 두 번째 경로 지연을 줄일 수 있지만 동시 외부 요청이 늘고 명령은 두 결과를 모두 기다린다. 상태 DB를 사용하지 않는 기존 중복·감사 부재·결과 불명 한계는 그대로이며 정상적인 DB 예약 경로는 여전히 순차 발송한다. 로컬 모의 서버에서 Slack 응답을 보류해 두 방식의 이메일 시작 순서를 검증했고 실제 공급자와 동시 발송 중 프로세스 종료는 미검증이다.

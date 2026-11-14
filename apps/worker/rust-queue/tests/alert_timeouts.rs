@@ -101,3 +101,34 @@ fn both_alert_commands_select_email_provider_before_connecting() {
         );
     }
 }
+
+#[test]
+fn database_alert_rejects_invalid_fallback_delivery_policy() {
+    let output = Command::new(env!("CARGO_BIN_EXE_send-database-alert"))
+        .args(["env", "db", "60"])
+        .env("SWALLOW_DB_ALERT_FALLBACK_DELIVERY", "invalid")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid fallback delivery policy"));
+    for policy in ["sequential", "parallel"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_send-database-alert"))
+            .args(["env", "db", "60"])
+            .env("SWALLOW_DB_ALERT_FALLBACK_DELIVERY", policy)
+            .env(
+                "SWALLOW_ALERT_SLACK_WEBHOOK",
+                "https://hooks.slack.com/services/A/B/C",
+            )
+            .env_remove("SWALLOW_ALERT_SLACK_WEBHOOK_FILE")
+            .env_remove("SWALLOW_ALERT_EMAIL_TO")
+            .env("DATABASE_URL", "not-a-database-url")
+            .env("SWALLOW_DB_PROBE_URL", "not-a-database-url")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("invalid monitor database configuration")
+        );
+    }
+}

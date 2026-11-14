@@ -729,30 +729,39 @@ pub async fn send_uncoordinated_selected(
     slack: Option<&SlackWebhook>,
     email: Option<(&AlertEmailProvider, &str)>,
     timeout: Duration,
+    parallel: bool,
 ) -> (
     Option<Result<(), AlertError>>,
     Option<Result<(), AlertError>>,
 ) {
     let key = format!("swallow-db-fallback/{}", Uuid::new_v4());
-    let slack_result = if let Some(provider) = slack {
-        Some(
-            tokio::time::timeout(timeout, provider.send(alert))
-                .await
-                .unwrap_or(Err(AlertError::Unknown)),
-        )
-    } else {
-        None
+    let slack_send = async {
+        if let Some(provider) = slack {
+            Some(
+                tokio::time::timeout(timeout, provider.send(alert))
+                    .await
+                    .unwrap_or(Err(AlertError::Unknown)),
+            )
+        } else {
+            None
+        }
     };
-    let email_result = if let Some((provider, to)) = email {
-        Some(
-            tokio::time::timeout(timeout, send_selected_email(provider, to, alert, &key))
-                .await
-                .unwrap_or(Err(AlertError::Unknown)),
-        )
-    } else {
-        None
+    let email_send = async {
+        if let Some((provider, to)) = email {
+            Some(
+                tokio::time::timeout(timeout, send_selected_email(provider, to, alert, &key))
+                    .await
+                    .unwrap_or(Err(AlertError::Unknown)),
+            )
+        } else {
+            None
+        }
     };
-    (slack_result, email_result)
+    if parallel {
+        tokio::join!(slack_send, email_send)
+    } else {
+        (slack_send.await, email_send.await)
+    }
 }
 
 /// Best-effort fallback, deliberately without durable coordination or automatic retry.
@@ -1352,6 +1361,7 @@ mod tests {
             Some(&slack),
             Some((&email, "ops@example.test")),
             Duration::from_secs(2),
+            false,
         )
         .await;
         assert_eq!(result, (Some(Err(AlertError::Unknown)), Some(Ok(()))));
@@ -1362,6 +1372,115 @@ mod tests {
                 .unwrap()
                 .contains("Swallow delivery alert")
         );
+    }
+
+    #[tokio::test]
+    async fn fallback_parallel_policy_starts_email_while_slack_is_stalled() {
+        for parallel in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint =
+                Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+            let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let slack_server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                assert!(stream.read(&mut buf).await.unwrap() > 0);
+                seen_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await
+                    .unwrap();
+            });
+            let slack = SlackWebhook::with_endpoint(endpoint).unwrap();
+            let (url, mut email_server) = mock_server("202 Accepted", "").await;
+            let email = AlertEmailProvider::Sendgrid(
+                crate::sendgrid::Sendgrid::test_endpoint(
+                    crate::sendgrid::Config {
+                        api_key: "fixture-key".into(),
+                        from: "from@example.test".into(),
+                        sender_name: String::new(),
+                        region: crate::sendgrid::Region::Global,
+                    },
+                    url.as_str(),
+                )
+                .unwrap(),
+            );
+            let operation = tokio::spawn(async move {
+                send_uncoordinated_selected(
+                    &alert(),
+                    Some(&slack),
+                    Some((&email, "ops@example.test")),
+                    Duration::from_secs(3),
+                    parallel,
+                )
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(1), seen_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            let early = tokio::time::timeout(Duration::from_millis(250), &mut email_server).await;
+            if parallel {
+                assert!(early.unwrap().unwrap().contains("Swallow delivery alert"));
+            } else {
+                assert!(
+                    early.is_err(),
+                    "sequential mode sent email before Slack completed"
+                );
+            }
+            release_tx.send(()).unwrap();
+            slack_server.await.unwrap();
+            if !parallel {
+                assert!(
+                    email_server
+                        .await
+                        .unwrap()
+                        .contains("Swallow delivery alert")
+                );
+            }
+            assert_eq!(operation.await.unwrap(), (Some(Ok(())), Some(Ok(()))));
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_fallback_keeps_email_success_when_slack_times_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let stalled = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            assert!(stream.read(&mut buf).await.unwrap() > 0);
+            std::future::pending::<()>().await;
+        });
+        let slack = SlackWebhook::with_endpoint(endpoint).unwrap();
+        let (url, server) = mock_server("202 Accepted", "").await;
+        let email = AlertEmailProvider::Sendgrid(
+            crate::sendgrid::Sendgrid::test_endpoint(
+                crate::sendgrid::Config {
+                    api_key: "fixture-key".into(),
+                    from: "from@example.test".into(),
+                    sender_name: String::new(),
+                    region: crate::sendgrid::Region::Global,
+                },
+                url.as_str(),
+            )
+            .unwrap(),
+        );
+        let result = send_uncoordinated_selected(
+            &alert(),
+            Some(&slack),
+            Some((&email, "ops@example.test")),
+            Duration::from_millis(500),
+            true,
+        )
+        .await;
+        assert_eq!(result, (Some(Err(AlertError::Unknown)), Some(Ok(()))));
+        server.await.unwrap();
+        stalled.abort();
     }
 
     #[tokio::test]

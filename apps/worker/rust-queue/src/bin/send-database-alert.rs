@@ -64,6 +64,11 @@ async fn main() -> Result<()> {
         Ok("report-only") | Err(std::env::VarError::NotPresent) => StateFailureMode::ReportOnly,
         _ => return Err("invalid state database failure mode".into()),
     };
+    let parallel_fallback = match std::env::var("SWALLOW_DB_ALERT_FALLBACK_DELIVERY").as_deref() {
+        Ok("parallel") => true,
+        Ok("sequential") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid fallback delivery policy".into()),
+    };
     let scoped = flag("SWALLOW_ALERT_SCOPED_DELIVERY", false)?;
     let mut bad_config = false;
     let slack = match slack() {
@@ -161,6 +166,7 @@ async fn main() -> Result<()> {
                 slack.as_ref(),
                 email.as_ref().map(|(to, provider)| (provider, to.as_str())),
                 operation_timeout,
+                parallel_fallback,
             )
             .await;
             for (channel, outcome) in [("Slack", result.0), ("email", result.1)] {
