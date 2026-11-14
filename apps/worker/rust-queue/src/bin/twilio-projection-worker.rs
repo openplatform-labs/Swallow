@@ -17,6 +17,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if !(1..=300).contains(&timeout_seconds) {
         return Err("projection database timeout must be 1-300 seconds".into());
     }
+    let require_full_scan =
+        match std::env::var("NOVU_TWILIO_PROJECTION_REQUIRE_FULL_SCAN").as_deref() {
+            Ok("true") => true,
+            Ok("false") | Err(std::env::VarError::NotPresent) => false,
+            _ => return Err("invalid full scan policy".into()),
+        };
+    let scan_seconds: u64 = match std::env::var("NOVU_TWILIO_PROJECTION_SCAN_INTERVAL_SECONDS") {
+        Ok(value) => value.parse()?,
+        Err(std::env::VarError::NotPresent) => 30,
+        Err(_) => return Err("invalid scan interval".into()),
+    };
+    if !(1..=300).contains(&scan_seconds) {
+        return Err("scan interval must be 1-300 seconds".into());
+    }
     let timeout = Duration::from_secs(timeout_seconds);
     let (config, tls) = novu_rust_contracts::postgres::configure(&database_url)?;
     loop {
@@ -71,6 +85,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         loop {
             let scan = async {
                 let mut after = None;
+                let mut skipped = false;
                 loop {
                     let jobs = tokio::time::timeout(
                         timeout,
@@ -82,14 +97,19 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     }
                     after = jobs.last().copied();
                     for job in jobs {
-                        tokio::time::timeout(
+                        let processed = tokio::time::timeout(
                             timeout,
                             twilio_projection::project(&mut db, &environment, job),
                         )
                         .await??;
+                        skipped |= !processed;
                     }
                 }
-                tokio::time::timeout(timeout, db.execute("INSERT INTO novu_rust_twilio_projection_heartbeat(environment_id,last_completed_at) VALUES ($1,clock_timestamp()) ON CONFLICT(environment_id) DO UPDATE SET last_completed_at=EXCLUDED.last_completed_at", &[&environment])).await??;
+                if !require_full_scan || !skipped {
+                    tokio::time::timeout(timeout, db.execute("INSERT INTO novu_rust_twilio_projection_heartbeat(environment_id,last_completed_at) VALUES ($1,clock_timestamp()) ON CONFLICT(environment_id) DO UPDATE SET last_completed_at=EXCLUDED.last_completed_at", &[&environment])).await??;
+                } else {
+                    eprintln!("projection scan skipped jobs; heartbeat not advanced");
+                }
                 Ok::<(), Box<dyn Error + Send + Sync>>(())
             };
             let failed = tokio::select! {
@@ -101,7 +121,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             }
             tokio::select! {
                 _ = &mut driver => break,
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {},
+                _ = tokio::time::sleep(Duration::from_secs(scan_seconds)) => {},
             }
         }
         driver.abort();
