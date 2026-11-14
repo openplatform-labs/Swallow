@@ -326,6 +326,26 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
             .get::<_, String>(0),
         "failed"
     );
+    // Repeating the same failure after a state transition must invalidate its acknowledgement.
+    db.execute(
+        "UPDATE novu_queue_jobs SET status='pending' WHERE id=$1",
+        &[&failed],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE novu_queue_jobs SET status='failed' WHERE id=$1",
+        &[&failed],
+    )
+    .await
+    .unwrap();
+    assert_eq!(failure_alert().status.code(), Some(2));
+    assert!(
+        reconciliation::acknowledge_failed_queue(&actor, "a", failed, "operator", "recurred")
+            .await
+            .unwrap()
+    );
+    assert_eq!(failure_alert().status.code(), Some(0));
     db.execute(
         "UPDATE novu_queue_jobs SET attempts=attempts+1 WHERE id=$1",
         &[&failed],
@@ -352,7 +372,7 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
     )
     .await
     .unwrap();
-    let row=db.query_one("SELECT database_session_user FROM novu_rust_queue_failure_acknowledgements WHERE job_id=$1",&[&failed]).await.unwrap();
+    let row=db.query_one("SELECT database_session_user FROM novu_rust_queue_failure_acknowledgements WHERE job_id=$1 ORDER BY created_at LIMIT 1",&[&failed]).await.unwrap();
     assert_eq!(row.get::<_, String>(0), role);
     db.execute("DELETE FROM novu_rust_delivery_operator_grants WHERE database_principal=$1 AND decision='alert_view'",&[&role]).await.unwrap();
     assert_eq!(scoped_monitor("a").status.code(), Some(1));
