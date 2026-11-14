@@ -60,6 +60,14 @@ fn original_firebase_http_conversion() {
             multicast: false,
             message: json!({"token":"android-a","android":{"notification":{"title":"Hello","body":"World","icon":"bell","sound":"default","color":"#AAbbCC","tag":"tag","clickAction":"OPEN","channelId":"orders","bodyLocKey":"BODY","bodyLocArgs":["one"],"titleLocKey":"TITLE","titleLocArgs":["two"],"imageUrl":"https://example.test/img.png","localOnly":true,"priority":"high","visibility":"public","proxy":"allow","vibrateTimingsMillis":[0,1501],"defaultVibrateTimings":true,"defaultSound":false,"defaultLightSettings":true,"notificationCount":3}}}),
         },
+        Plan {
+            multicast: false,
+            message: json!({"token":"led-a","android":{"notification":{"lightSettings":{"color":"#FF0080","lightOnDurationMillis":1001,"lightOffDurationMillis":0}}}}),
+        },
+        Plan {
+            multicast: false,
+            message: json!({"token":"led-b","android":{"notification":{"lightSettings":{"color":"#11223344","lightOnDurationMillis":0,"lightOffDurationMillis":2500}}}}),
+        },
     ];
     for (index, plan) in plans.iter().enumerate() {
         assert_eq!(wire_messages(plan).unwrap(), vec![original[index].clone()]);

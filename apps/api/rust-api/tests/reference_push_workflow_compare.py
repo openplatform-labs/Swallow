@@ -226,6 +226,7 @@ for label, override in ([] if os.environ.get('NOVU_TEST_PUSH_ROUTING_CASES_ONLY'
     ('apns-options', {'fcm':{'apns':{'headers':{'apns-priority':'10'},'payload':{'aps':{'alert':'Hello','badge':2,'sound':'default'},'custom':'value'}}}}),
     ('apns-provider', {'providers':{'fcm':{'apns':{'headers':{'apns-push-type':'alert'},'payload':{'aps':{'alert':'Hello'}}}}}}),
     ('android-notification', {'fcm':{'android':{'notification':{'title':'Android title','body':'Android body','icon':'bell','sound':'default','color':'#aabbcc'}}}}),
+    ('android-led', {'fcm':{'android':{'notification':{'lightSettings':{'color':'#11223344','lightOnDurationMillis':1001,'lightOffDurationMillis':2500}}}}}),
 
     ('notification-data', {'fcm':{'data':{'custom':'value'}}}),
     ('data-only', {'fcm':{'type':'data','data':{'custom':'value','title':'ignored'}}}),
@@ -269,6 +270,10 @@ for label, override in ([] if os.environ.get('NOVU_TEST_PUSH_ROUTING_CASES_ONLY'
         for message in (original,actual):
             message_id=message['data'].pop('__nvMessageId')
             assert message_id=='custom-message-id' if label=='message-id-data' else re.fullmatch('[0-9a-f]{24}',message_id)
+        if label=='android-led':
+            validator=Path(__file__).resolve().parents[3]/'worker'/'rust-queue'/'tests'/'reference_fcm_validate.cjs'
+            validated=subprocess.run(['node',str(validator)],input=json.dumps(original),text=True,capture_output=True,check=True)
+            original=json.loads(validated.stdout)
         assert original==actual,(label,original,actual)
     for _ in range(30):
         history=json.loads(run('docker','exec',mongo,'mongosh','--quiet','--eval',f'''const d=db.getSiblingDB("novu-db");print(JSON.stringify(d.messages.find({{transactionId:"{txn}"}}).toArray().map(m=>m.deviceTokens)));'''))

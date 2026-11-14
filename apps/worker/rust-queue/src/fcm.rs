@@ -451,6 +451,55 @@ fn android_duration(value: &Value) -> Result<Value, SendError> {
     }))
 }
 
+fn android_light_settings(value: &Value) -> Result<Value, SendError> {
+    let fields = value.as_object().ok_or(SendError::UnsupportedMessage)?;
+    if fields.keys().any(|key| {
+        !["color", "lightOnDurationMillis", "lightOffDurationMillis"].contains(&key.as_str())
+    }) {
+        return Err(SendError::UnsupportedMessage);
+    }
+    let color = fields
+        .get("color")
+        .and_then(Value::as_str)
+        .ok_or(SendError::UnsupportedMessage)?;
+    let bytes = color.as_bytes();
+    if ![7, 9].contains(&bytes.len())
+        || bytes[0] != b'#'
+        || !bytes[1..].iter().all(u8::is_ascii_hexdigit)
+    {
+        return Err(SendError::UnsupportedMessage);
+    }
+    let color_byte = |i: usize| -> Result<Value, SendError> {
+        let digits =
+            std::str::from_utf8(&bytes[i..i + 2]).map_err(|_| SendError::UnsupportedMessage)?;
+        let component =
+            u8::from_str_radix(digits, 16).map_err(|_| SendError::UnsupportedMessage)?;
+        Ok(match component {
+            0 => json!(0),
+            255 => json!(1),
+            other => json!(f64::from(other) / 255.0),
+        })
+    };
+    let alpha = if bytes.len() == 9 {
+        color_byte(7)?
+    } else {
+        json!(1)
+    };
+    let on = android_duration(
+        fields
+            .get("lightOnDurationMillis")
+            .ok_or(SendError::UnsupportedMessage)?,
+    )?;
+    let off = android_duration(
+        fields
+            .get("lightOffDurationMillis")
+            .ok_or(SendError::UnsupportedMessage)?,
+    )?;
+    Ok(
+        json!({"color":{"red":color_byte(1)?,"green":color_byte(3)?,"blue":color_byte(5)?,"alpha":alpha},"light_on_duration":on,"light_off_duration":off}),
+    )
+}
+
 fn android_notification(value: &Value) -> Result<Value, SendError> {
     let fields = value.as_object().ok_or(SendError::UnsupportedMessage)?;
     for (args, key) in [
@@ -569,6 +618,7 @@ fn android_notification(value: &Value) -> Result<Value, SendError> {
                     .ok_or(SendError::UnsupportedMessage)?;
                 ("proxy", Value::String(v.to_uppercase()))
             }
+            "lightSettings" => ("light_settings", android_light_settings(value)?),
             "vibrateTimingsMillis" => {
                 let values = value
                     .as_array()
@@ -1142,6 +1192,9 @@ mod tests {
             json!({"android":{"notification":{"vibrateTimingsMillis":[-1]}}}),
             json!({"android":{"notification":{"notificationCount":-1}}}),
             json!({"android":{"notification":{"lightSettings":{}}}}),
+            json!({"android":{"notification":{"lightSettings":{"color":"#abcxyz","lightOnDurationMillis":1,"lightOffDurationMillis":2}}}}),
+            json!({"android":{"notification":{"lightSettings":{"color":"#123456","lightOnDurationMillis":-1,"lightOffDurationMillis":2}}}}),
+            json!({"android":{"notification":{"lightSettings":{"color":"#123456","lightOnDurationMillis":1,"lightOffDurationMillis":1.5}}}}),
             json!({"android":{"ttl":1.5}}),
             json!({"android":{"data":{"x":1}}}),
             json!({"android":{"directBootOk":"yes"}}),

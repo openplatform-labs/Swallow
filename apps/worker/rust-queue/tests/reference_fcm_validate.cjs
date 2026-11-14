@@ -1,0 +1,10 @@
+const path = require('path');
+const fs = require('fs');
+const { createRequire } = require('module');
+const root = process.env.NOVU_REFERENCE_SOURCE;
+const reference = createRequire(path.join(root, 'packages/providers/dist/cjs/lib/push/fcm/fcm.provider.js'));
+const entry = reference.resolve('firebase-admin/messaging');
+const { validateMessage } = require(path.join(path.dirname(entry), 'messaging-internal.js'));
+const message = JSON.parse(fs.readFileSync(0, 'utf8'));
+validateMessage(message);
+process.stdout.write(JSON.stringify(message));

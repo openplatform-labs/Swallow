@@ -5,9 +5,9 @@
 
 ### Android 알림 표시 옵션
 
-FCM의 `overrides.fcm.android.notification`과 provider override에서 제목·본문·아이콘·사운드·색상·태그·ticker, 클릭 동작과 채널 ID, 본문·제목 현지화 키와 인수, 이미지, 우선순위·공개 범위·proxy, 진동 패턴·기본 옵션과 알림 수를 지원한다. Firebase Admin SDK와 같이 해당 필드명을 wire 형식으로 바꾸고 정수 밀리초 진동 길이를 초 단위로 변환한다. 이미지 URL은 http/https로 제한한다. `lightSettings`, `eventTimestamp`, 그 밖의 미지원 필드, 소수 밀리초 및 잘못된 입력은 거절한다. API는 객체 수준만 검사하므로 잘못된 옵션이 접수 후 발송 단계에서 실패할 수 있다.
+FCM의 `overrides.fcm.android.notification`과 provider override에서 제목·본문·아이콘·사운드·색상·태그·ticker, 클릭 동작과 채널 ID, 본문·제목 현지화 키와 인수, 이미지, 우선순위·공개 범위·proxy, 진동 패턴·기본 옵션과 알림 수를 지원한다. Firebase Admin SDK와 같이 해당 필드명을 wire 형식으로 바꾸고 정수 밀리초 진동 길이를 초 단위로 변환한다. 이미지 URL은 http/https로 제한한다. `lightSettings`는 `#RRGGBB` 또는 `#RRGGBBAA` 색상과 정수 밀리초 점등·소등 시간을 Firebase SDK 형식의 RGBA·초 단위 시간으로 변환한다. `eventTimestamp`, 그 밖의 미지원 필드, 소수 밀리초 및 잘못된 입력은 거절한다. API는 객체 수준만 검사하므로 잘못된 옵션이 접수 후 발송 단계에서 실패할 수 있다.
 
-고정 Firebase Admin SDK의 여러 설정을 포함한 요청 변환과 무효 입력을 비교했다. 고정 원본 Novu와 Rust API·워크플로·워커에서 Android 알림 설정 한 사례의 모의 요청과 이력을 비교했다. 실제 Android 기기 표시·모든 옵션·운영 부하는 미검증이다. 제공자 접수는 기기 표시를 보장하지 않는다.
+고정 Firebase Admin SDK의 여러 설정을 포함한 요청 변환과 무효 입력을 비교했다. 고정 원본 Novu와 Rust API·워크플로·워커에서 Android 알림 설정과 LED 옵션의 모의 요청 및 이력을 비교했다. LED 요청은 원본 SDK 변환을 적용한 후 비교했다. 실제 Android 기기 표시·모든 옵션·운영 부하는 미검증이다. 제공자 접수는 기기 표시를 보장하지 않는다.
 
 ### FCM을 통한 iOS APNs 옵션
 
