@@ -107,6 +107,12 @@ for case in cases:
                             assert status==503,status
                         finally:
                             run('docker','exec',pg,'psql','-v','ON_ERROR_STOP=1','-U','postgres','-d','novu_compat','-c','ALTER TABLE novu_rust_fcm_devices ENABLE TRIGGER novu_rust_fcm_device_cleanup_generation')
+                        run('docker','exec',pg,'psql','-v','ON_ERROR_STOP=1','-U','postgres','-d','novu_compat','-c','ALTER FUNCTION public.novu_rust_assert_fcm_registration_guard() RENAME TO novu_rust_assert_fcm_guard_temporarily_missing')
+                        try:
+                            status,_=request(base,'PUT','/v1/subscribers/'+subscriber+'/credentials',{'providerId':'fcm','credentials':{'deviceTokens':[token]}})
+                            assert status==503,status
+                        finally:
+                            run('docker','exec',pg,'psql','-v','ON_ERROR_STOP=1','-U','postgres','-d','novu_compat','-c','ALTER FUNCTION public.novu_rust_assert_fcm_guard_temporarily_missing() RENAME TO novu_rust_assert_fcm_registration_guard')
                         run('docker','exec',pg,'psql','-v','ON_ERROR_STOP=1','-U','postgres','-d','novu_compat','-c',"CREATE FUNCTION public.test_fcm_skip_update() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$; CREATE TRIGGER zz_test_fcm_skip_update BEFORE UPDATE ON novu_rust_fcm_devices FOR EACH ROW EXECUTE FUNCTION public.test_fcm_skip_update()")
                         try:
                             status,_=request(base,'PUT','/v1/subscribers/'+subscriber+'/credentials',{'providerId':'fcm','credentials':{'deviceTokens':[token]}})
