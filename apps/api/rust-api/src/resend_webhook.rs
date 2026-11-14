@@ -129,7 +129,16 @@ pub async fn receive(
     }
     // A replay must match the complete signed payload, not just its ID and type.
     let fingerprint = digest::digest(&digest::SHA256, &raw);
-    match db.execute("INSERT INTO novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type,payload_fingerprint) SELECT e.id,$3,$4,$5,$6 FROM novu_rust_environments e WHERE e.id=$1 AND e.organization_id=$2 ON CONFLICT(environment_id,event_id) DO UPDATE SET event_id=EXCLUDED.event_id WHERE novu_rust_resend_delivery_events.email_id=EXCLUDED.email_id AND novu_rust_resend_delivery_events.event_type=EXCLUDED.event_type AND (novu_rust_resend_delivery_events.payload_fingerprint IS NULL OR novu_rust_resend_delivery_events.payload_fingerprint=EXCLUDED.payload_fingerprint)", &[&environment,&organization,&id,&email,&kind,&fingerprint.as_ref()]).await {
+    let recipient_hash = value
+        .pointer("/data/to")
+        .and_then(Value::as_array)
+        .filter(|v| v.len() == 1)
+        .and_then(|v| v[0].as_str())
+        .filter(|v| !v.is_empty() && v.len() <= 320)
+        .map(|address| {
+            STANDARD.encode(digest::digest(&digest::SHA256, address.as_bytes()).as_ref())
+        });
+    match db.execute("INSERT INTO novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type,payload_fingerprint,recipient_hash) SELECT e.id,$3,$4,$5,$6,$7 FROM novu_rust_environments e WHERE e.id=$1 AND e.organization_id=$2 ON CONFLICT(environment_id,event_id) DO UPDATE SET event_id=EXCLUDED.event_id WHERE novu_rust_resend_delivery_events.email_id=EXCLUDED.email_id AND novu_rust_resend_delivery_events.event_type=EXCLUDED.event_type AND (novu_rust_resend_delivery_events.payload_fingerprint IS NULL OR novu_rust_resend_delivery_events.payload_fingerprint=EXCLUDED.payload_fingerprint)", &[&environment,&organization,&id,&email,&kind,&fingerprint.as_ref(),&recipient_hash]).await {
         Ok(1)=>StatusCode::NO_CONTENT,
         Ok(_)=>StatusCode::CONFLICT,
         Err(_)=>StatusCode::INTERNAL_SERVER_ERROR,

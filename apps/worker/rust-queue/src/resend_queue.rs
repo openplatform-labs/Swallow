@@ -10,6 +10,13 @@ use uuid::Uuid;
 
 pub const JOB_KIND: &str = "experimental_resend_email";
 pub const MIGRATION: &str = include_str!("../migrations/0060_resend_attempts.sql");
+pub const RECIPIENT_MIGRATION: &str = include_str!("../migrations/0062_resend_recipients.sql");
+
+/// Exact byte matching is conservative: provider normalization may prevent correlation.
+pub fn recipient_hash(address: &str) -> String {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    STANDARD.encode(ring::digest::digest(&ring::digest::SHA256, address.as_bytes()).as_ref())
+}
 
 async fn claim(client: &Client, environment: &str) -> Result<Option<ClaimedJob>, Error> {
     let token = Uuid::new_v4();
@@ -69,6 +76,23 @@ pub async fn process_one(
         tx.commit().await?;
         return Ok(true);
     }
+    let mut recipients = Vec::new();
+    if email
+        .to
+        .len()
+        .saturating_add(email.cc.len())
+        .saturating_add(email.bcc.len())
+        <= 1000
+    {
+        for (kind, addresses) in [("to", &email.to), ("cc", &email.cc), ("bcc", &email.bcc)] {
+            for (index, address) in addresses.iter().enumerate() {
+                recipients.push(
+                    serde_json::json!({"kind":kind,"idx":index,"hash":recipient_hash(address)}),
+                );
+            }
+        }
+    }
+    tx.execute("INSERT INTO novu_rust_resend_recipients(job_id,environment_id,recipient_kind,recipient_index,recipient_hash) SELECT $1,$2,r.kind,r.idx,r.hash FROM jsonb_to_recordset($3::jsonb) AS r(kind text,idx integer,hash text)", &[&job.id,&environment,&serde_json::json!(recipients)]).await?;
     if email.message_id.is_some() {
         tx.execute("UPDATE novu_rust_email_messages SET delivery_state='dispatching' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
     }
@@ -463,6 +487,8 @@ mod tests {
         db.batch_execute(crate::MIGRATION).await.unwrap();
         db.batch_execute(MIGRATION).await.unwrap();
         db.batch_execute(MIGRATION).await.unwrap();
+        db.batch_execute(RECIPIENT_MIGRATION).await.unwrap();
+        db.batch_execute(RECIPIENT_MIGRATION).await.unwrap();
         db.batch_execute(crate::in_app::EMAIL_MESSAGES_MIGRATION)
             .await
             .unwrap();
@@ -472,7 +498,7 @@ mod tests {
         db.batch_execute("ALTER TABLE novu_rust_email_messages ADD COLUMN delivery_state text NOT NULL DEFAULT 'not_attempted'").await.unwrap();
         let id = Uuid::new_v4();
         let other = Uuid::new_v4();
-        let payload = json!({"to":["to@example.test"],"subject":"Hello","html":"Hi"});
+        let payload = json!({"to":["to@example.test"],"cc":["cc@example.test"],"bcc":["bcc@example.test"],"subject":"Hello","html":"Hi"});
         enqueue(&db, id, "env-a", JOB_KIND, &payload).await.unwrap();
         enqueue(&db, other, "env-b", JOB_KIND, &payload)
             .await
@@ -523,6 +549,18 @@ mod tests {
         assert_eq!(row.get::<_, String>(0), "completed");
         assert_eq!(row.get::<_, String>(1), "accepted");
         assert_eq!(row.get::<_, String>(2), "resend-id");
+        let recipients=db.query("SELECT recipient_kind,recipient_index,recipient_hash FROM novu_rust_resend_recipients WHERE job_id=$1 ORDER BY recipient_kind,recipient_index", &[&id]).await.unwrap();
+        assert_eq!(recipients.len(), 3);
+        for (row, kind, address) in recipients
+            .iter()
+            .zip(["bcc", "cc", "to"])
+            .zip(["bcc@example.test", "cc@example.test", "to@example.test"])
+            .map(|((row, kind), address)| (row, kind, address))
+        {
+            assert_eq!(row.get::<_, String>(0), kind);
+            assert_eq!(row.get::<_, i32>(1), 0);
+            assert_eq!(row.get::<_, String>(2), recipient_hash(address));
+        }
         assert_eq!(
             db.query_one("SELECT status FROM novu_queue_jobs WHERE id=$1", &[&other])
                 .await

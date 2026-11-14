@@ -139,8 +139,22 @@ pub async fn resend_evidence(client: &Client, environment: &str, job: Uuid) -> R
     }
     let row = client.query_opt("SELECT a.state,a.provider_message_id,COALESCE((SELECT jsonb_object_agg(event_type,n) FROM (SELECT e.event_type,count(*) n FROM novu_rust_resend_delivery_events e WHERE e.environment_id=j.environment_id AND e.email_id=a.provider_message_id GROUP BY e.event_type) counts),'{}'::jsonb) FROM novu_queue_jobs j JOIN novu_rust_resend_attempts a ON a.job_id=j.id AND a.environment_id=j.environment_id WHERE j.environment_id=$1 AND j.id=$2 AND j.kind=$3", &[&environment,&job,&crate::resend_queue::JOB_KIND]).await?.ok_or("current Resend attempt not found")?;
     let id: Option<String> = row.get(1);
+    let rows=client.query("SELECT r.recipient_kind,r.recipient_index, count(DISTINCT a2.job_id), COALESCE(bool_or(e.event_type='email.delivered'),false), COALESCE(bool_or(e.event_type='email.bounced'),false), COALESCE(bool_or(e.event_type='email.failed'),false), COALESCE(bool_or(e.event_type='email.suppressed'),false), COALESCE(bool_or(e.event_type='email.complained'),false) FROM novu_rust_resend_recipients r JOIN novu_rust_resend_attempts a ON a.job_id=r.job_id AND a.environment_id=r.environment_id LEFT JOIN novu_rust_resend_attempts a2 ON a2.environment_id=a.environment_id AND a2.provider_message_id=a.provider_message_id LEFT JOIN novu_rust_resend_delivery_events e ON e.environment_id=a.environment_id AND e.email_id=a.provider_message_id AND e.recipient_hash=r.recipient_hash WHERE r.environment_id=$1 AND r.job_id=$2 GROUP BY r.recipient_kind,r.recipient_index ORDER BY r.recipient_kind,r.recipient_index LIMIT 1001", &[&environment,&job]).await?;
+    if rows.len() > 1000 {
+        return Err("more than 1000 recipients; query the database directly".into());
+    }
+    let recipients:Vec<Value>=rows.into_iter().map(|r| {
+        let delivered:bool=r.get(3);
+        let bounced:bool=r.get(4);
+        let failed:bool=r.get(5);
+        let suppressed:bool=r.get(6);
+        let terminal_count=[delivered,bounced,failed,suppressed].into_iter().filter(|v|*v).count();
+        let result=if id.is_none() {"unlinked"} else if r.get::<_,i64>(2)!=1 {"ambiguous"} else if terminal_count>1 {"conflicting"} else if delivered {"delivered"} else if bounced {"bounced"} else if failed {"failed"} else if suppressed {"suppressed"} else {"pending"};
+        let complained=if id.is_some() && r.get::<_,i64>(2)==1 { Some(r.get::<_,bool>(7)) } else { None };
+        json!({"kind":r.get::<_,String>(0),"index":r.get::<_,i32>(1),"result":result,"complained":complained})
+    }).collect();
     Ok(
-        json!({"attemptState":row.get::<_,String>(0),"providerIdKnown":id.is_some(),"events":row.get::<_,Value>(2)}),
+        json!({"attemptState":row.get::<_,String>(0),"providerIdKnown":id.is_some(),"events":row.get::<_,Value>(2),"recipients":recipients}),
     )
 }
 

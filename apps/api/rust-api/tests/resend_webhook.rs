@@ -79,6 +79,19 @@ async fn signed_events_are_scoped_deduplicated_and_private() {
     db.batch_execute(include_str!("../migrations/0010_resend_webhooks.sql"))
         .await
         .unwrap();
+    db.batch_execute(novu_postgres_queue::resend_queue::RECIPIENT_MIGRATION)
+        .await
+        .unwrap();
+    db.batch_execute(include_str!(
+        "../migrations/0013_resend_event_recipient.sql"
+    ))
+    .await
+    .unwrap();
+    db.batch_execute(include_str!(
+        "../migrations/0013_resend_event_recipient.sql"
+    ))
+    .await
+    .unwrap();
     db.batch_execute(
         "INSERT INTO novu_rust_environments VALUES ('env-a','org-a'),('env-b','org-b')",
     )
@@ -232,11 +245,15 @@ async fn signed_events_are_scoped_deduplicated_and_private() {
     .await
     .unwrap();
     db.execute("INSERT INTO novu_rust_resend_attempts(job_id,environment_id,state) VALUES ($1,'env-a','unknown')", &[&job]).await.unwrap();
+    let hash = novu_postgres_queue::resend_queue::recipient_hash("private@example.test");
+    let hash_b = novu_postgres_queue::resend_queue::recipient_hash("other@example.test");
+    db.execute("INSERT INTO novu_rust_resend_recipients VALUES ($1,'env-a','to',0,$2),($1,'env-a','to',1,$3)", &[&job,&hash,&hash_b]).await.unwrap();
     let evidence = novu_postgres_queue::reconciliation::resend_evidence(&db, "env-a", job)
         .await
         .unwrap();
     assert_eq!(evidence["providerIdKnown"], false);
     assert_eq!(evidence["events"], serde_json::json!({}));
+    assert_eq!(evidence["recipients"][0]["result"], "unlinked");
     db.execute(
         "UPDATE novu_rust_resend_attempts SET provider_message_id='email-123' WHERE job_id=$1",
         &[&job],
@@ -248,6 +265,138 @@ async fn signed_events_are_scoped_deduplicated_and_private() {
         .unwrap();
     assert_eq!(evidence["providerIdKnown"], true);
     assert_eq!(evidence["events"], serde_json::json!({"email.delivered":1}));
+    assert_eq!(evidence["recipients"][0]["result"], "delivered");
+    assert_eq!(evidence["recipients"][1]["result"], "pending");
+    let bounced =
+        br#"{"type":"email.bounced","data":{"email_id":"email-123","to":["other@example.test"]}}"#;
+    assert_eq!(
+        call(
+            app.clone(),
+            path,
+            "msg_bounced",
+            &timestamp,
+            &signature(raw_secret, "msg_bounced", &timestamp, bounced),
+            bounced
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let evidence = novu_postgres_queue::reconciliation::resend_evidence(&db, "env-a", job)
+        .await
+        .unwrap();
+    assert_eq!(evidence["recipients"][0]["result"], "delivered");
+    assert_eq!(evidence["recipients"][1]["result"], "bounced");
+    let delayed = br#"{"type":"email.delivery_delayed","data":{"email_id":"email-123","to":["private@example.test"]}}"#;
+    assert_eq!(
+        call(
+            app.clone(),
+            path,
+            "msg_delayed",
+            &timestamp,
+            &signature(raw_secret, "msg_delayed", &timestamp, delayed),
+            delayed
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let evidence = novu_postgres_queue::reconciliation::resend_evidence(&db, "env-a", job)
+        .await
+        .unwrap();
+    assert_eq!(evidence["recipients"][0]["result"], "delivered");
+    let contradictory = br#"{"type":"email.bounced","data":{"email_id":"email-123","to":["private@example.test"]}}"#;
+    assert_eq!(
+        call(
+            app.clone(),
+            path,
+            "msg_conflict",
+            &timestamp,
+            &signature(raw_secret, "msg_conflict", &timestamp, contradictory),
+            contradictory
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let evidence = novu_postgres_queue::reconciliation::resend_evidence(&db, "env-a", job)
+        .await
+        .unwrap();
+    assert_eq!(evidence["recipients"][0]["result"], "conflicting");
+    let multi = br#"{"type":"email.delivered","data":{"email_id":"email-123","to":["other@example.test","private@example.test"]}}"#;
+    assert_eq!(
+        call(
+            app.clone(),
+            path,
+            "msg_multi",
+            &timestamp,
+            &signature(raw_secret, "msg_multi", &timestamp, multi),
+            multi
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let complaint = br#"{"type":"email.complained","data":{"email_id":"email-123","to":["other@example.test"]}}"#;
+    assert_eq!(
+        call(
+            app.clone(),
+            path,
+            "msg_complaint",
+            &timestamp,
+            &signature(raw_secret, "msg_complaint", &timestamp, complaint),
+            complaint
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let evidence = novu_postgres_queue::reconciliation::resend_evidence(&db, "env-a", job)
+        .await
+        .unwrap();
+    assert_eq!(evidence["recipients"][1]["result"], "bounced");
+    assert_eq!(evidence["recipients"][1]["complained"], true);
+    for (index, address, kind) in [
+        (2_i32, "failed@example.test", "failed"),
+        (3_i32, "suppressed@example.test", "suppressed"),
+    ] {
+        let recipient_hash = novu_postgres_queue::resend_queue::recipient_hash(address);
+        db.execute(
+            "INSERT INTO novu_rust_resend_recipients VALUES ($1,'env-a','to',$2,$3)",
+            &[&job, &index, &recipient_hash],
+        )
+        .await
+        .unwrap();
+        let event = serde_json::json!({"type": format!("email.{kind}"), "data":{"email_id":"email-123","to":[address]}}).to_string().into_bytes();
+        let event_id = format!("msg_{kind}");
+        assert_eq!(
+            call(
+                app.clone(),
+                path,
+                &event_id,
+                &timestamp,
+                &signature(raw_secret, &event_id, &timestamp, &event),
+                &event
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+        let evidence = novu_postgres_queue::reconciliation::resend_evidence(&db, "env-a", job)
+            .await
+            .unwrap();
+        assert_eq!(evidence["recipients"][index as usize]["result"], kind);
+    }
+    let job2 = uuid::Uuid::new_v4();
+    novu_postgres_queue::enqueue(
+        db.as_ref(),
+        job2,
+        "env-a",
+        novu_postgres_queue::resend_queue::JOB_KIND,
+        &serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO novu_rust_resend_attempts(job_id,environment_id,state,provider_message_id) VALUES ($1,'env-a','accepted','email-123')", &[&job2]).await.unwrap();
+    let evidence = novu_postgres_queue::reconciliation::resend_evidence(&db, "env-a", job)
+        .await
+        .unwrap();
+    assert_eq!(evidence["recipients"][0]["result"], "ambiguous");
+    assert!(evidence["recipients"][0]["complained"].is_null());
     assert!(
         novu_postgres_queue::reconciliation::resend_evidence(&db, "env-b", job)
             .await
