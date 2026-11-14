@@ -44,3 +44,7 @@ TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_actor_test" \
 docker exec "$name" createdb -U postgres novu_resend_workflow_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_resend_workflow_test" \
   NOVU_ALLOW_RECREATED_SUBSCRIBER=false cargo test --locked --lib resend_queue::tests::workflow_delivery_revalidates_subscriber -- --ignored
+
+docker exec "$name" createdb -U postgres novu_resend_alert_test
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_resend_alert_test" \
+  cargo test --locked --test resend_alert -- --ignored

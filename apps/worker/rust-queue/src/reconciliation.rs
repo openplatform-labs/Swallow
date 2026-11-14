@@ -161,9 +161,27 @@ pub async fn resend_evidence(client: &Client, environment: &str, job: Uuid) -> R
         let complained=if id.is_some() && r.get::<_,i64>(2)==1 { Some(r.get::<_,bool>(7)) } else { None };
         json!({"kind":r.get::<_,String>(0),"index":r.get::<_,i32>(1),"result":result,"complained":complained})
     }).collect();
+    let unmatched: i64 = client.query_one("SELECT count(*) FROM novu_rust_resend_delivery_events e WHERE e.environment_id=$1 AND e.email_id=$3 AND NOT EXISTS (SELECT 1 FROM novu_rust_resend_recipients r WHERE r.environment_id=$1 AND r.job_id=$2 AND r.recipient_hash=e.recipient_hash)", &[&environment,&job,&id]).await?.get(0);
     Ok(
-        json!({"attemptState":row.get::<_,String>(0),"providerIdKnown":id.is_some(),"events":row.get::<_,Value>(2),"recipients":recipients}),
+        json!({"attemptState":row.get::<_,String>(0),"providerIdKnown":id.is_some(),"events":row.get::<_,Value>(2),"unmatchedEvents":unmatched,"recipients":recipients}),
     )
+}
+
+/// A conservative, per-job alert: only a complete set of delivered recipients is healthy.
+pub fn resend_needs_attention(evidence: &Value) -> Result<bool> {
+    let recipients = evidence["recipients"]
+        .as_array()
+        .ok_or("invalid Resend evidence")?;
+    if recipients.is_empty()
+        || evidence["providerIdKnown"].as_bool() != Some(true)
+        || evidence["unmatchedEvents"].as_i64() != Some(0)
+    {
+        return Ok(true);
+    }
+    Ok(recipients.iter().any(|recipient| {
+        recipient["result"].as_str() != Some("delivered")
+            || recipient["complained"].as_bool() != Some(false)
+    }))
 }
 
 /// Show signed Twilio evidence explicitly bound to this job, without phone numbers.
@@ -404,4 +422,27 @@ pub async fn resolve(
     }
     tx.commit().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod resend_alert_tests {
+    use super::*;
+
+    #[test]
+    fn only_complete_unambiguous_delivery_is_healthy() {
+        let healthy = json!({"providerIdKnown":true,"unmatchedEvents":0,"recipients":[{"result":"delivered","complained":false}]});
+        assert!(!resend_needs_attention(&healthy).unwrap());
+        for evidence in [
+            json!({"providerIdKnown":false,"unmatchedEvents":0,"recipients":[{"result":"delivered","complained":false}]}),
+            json!({"providerIdKnown":true,"unmatchedEvents":1,"recipients":[{"result":"delivered","complained":false}]}),
+            json!({"providerIdKnown":true,"unmatchedEvents":0,"recipients":[]}),
+            json!({"providerIdKnown":true,"unmatchedEvents":0,"recipients":[{"result":"pending","complained":false}]}),
+            json!({"providerIdKnown":true,"unmatchedEvents":0,"recipients":[{"result":"conflicting","complained":false}]}),
+            json!({"providerIdKnown":true,"unmatchedEvents":0,"recipients":[{"result":"delivered","complained":true}]}),
+            json!({"providerIdKnown":true,"unmatchedEvents":0,"recipients":[{"result":"delivered","complained":null}]}),
+        ] {
+            assert!(resend_needs_attention(&evidence).unwrap());
+        }
+        assert!(resend_needs_attention(&json!({})).is_err());
+    }
 }

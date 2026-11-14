@@ -267,6 +267,7 @@ async fn signed_events_are_scoped_deduplicated_and_private() {
     assert_eq!(evidence["events"], serde_json::json!({"email.delivered":1}));
     assert_eq!(evidence["recipients"][0]["result"], "delivered");
     assert_eq!(evidence["recipients"][1]["result"], "pending");
+    assert!(novu_postgres_queue::reconciliation::resend_needs_attention(&evidence).unwrap());
     let bounced =
         br#"{"type":"email.bounced","data":{"email_id":"email-123","to":["other@example.test"]}}"#;
     assert_eq!(
@@ -351,6 +352,8 @@ async fn signed_events_are_scoped_deduplicated_and_private() {
         .unwrap();
     assert_eq!(evidence["recipients"][1]["result"], "bounced");
     assert_eq!(evidence["recipients"][1]["complained"], true);
+    assert_eq!(evidence["unmatchedEvents"], 1);
+    assert!(novu_postgres_queue::reconciliation::resend_needs_attention(&evidence).unwrap());
     for (index, address, kind) in [
         (2_i32, "failed@example.test", "failed"),
         (3_i32, "suppressed@example.test", "suppressed"),
