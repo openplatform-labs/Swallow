@@ -54,6 +54,7 @@ async fn run() -> Result<()> {
     if !(1..=60).contains(&seconds) {
         return Err("invalid database probe timeout".into());
     }
+    let probe_role = novu_postgres_queue::db_probe::Role::from_env()?;
     let operation_seconds: u64 = std::env::var("SWALLOW_DB_ALERT_OPERATION_TIMEOUT_SECONDS")
         .unwrap_or_else(|_| "30".into())
         .parse()?;
@@ -148,11 +149,10 @@ async fn run() -> Result<()> {
         let _driver = AbortOnDrop(tokio::spawn(async move {
             let _ = connection.await;
         }));
-        client.simple_query("SELECT 1").await?;
-        Ok::<(), tokio_postgres::Error>(())
+        novu_postgres_queue::db_probe::healthy(&client, probe_role).await
     })
     .await;
-    let probe_unhealthy = !matches!(probe, Ok(Ok(())));
+    let probe_unhealthy = !matches!(probe, Ok(Ok(true)));
     alert.database_probe = Some((args[1].clone(), probe_unhealthy));
     let mut delivery_config = (monitor_config.clone(), monitor_tls.clone());
     let monitor = tokio::time::timeout(

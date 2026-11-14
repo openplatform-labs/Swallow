@@ -48,6 +48,7 @@ standby_port=$(docker port "$standby" 5432/tcp | awk -F: '{print $NF}')
 export TEST_PRIMARY_CONTAINER="$primary" TEST_STANDBY_CONTAINER="$standby"
 export TEST_PRIMARY_URL="postgresql://postgres@127.0.0.1:$primary_port/postgres" TEST_STANDBY_URL="postgresql://postgres@127.0.0.1:$standby_port/postgres"
 export TEST_FAILOVER_URL="postgresql://postgres@127.0.0.1:$standby_port,127.0.0.1:$primary_port/postgres?target_session_attrs=read-write&connect_timeout=2"
+cargo test --locked --test postgres_probe_role -- --ignored
 if [[ "$scenario" == resend ]]; then
   cargo build --locked --bin resend-worker >/dev/null
   export TEST_RESEND_WORKER_BINARY="$(cd "$CARGO_TARGET_DIR" && pwd)/debug/resend-worker"

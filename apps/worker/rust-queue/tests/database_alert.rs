@@ -68,11 +68,12 @@ async fn target_outage_is_reported_using_independent_alert_database() {
     let mut backup_url = reqwest::Url::parse(&backup).unwrap();
     backup_url.set_username(&role).unwrap();
     backup_url.set_password(Some("db-alert-fixture")).unwrap();
-    let run = || {
+    let run = |probe_role: &str| {
         Command::new(env!("CARGO_BIN_EXE_send-database-alert"))
             .args(["monitor", "primary", "60"])
             .env("DATABASE_URL", role_url.as_str())
             .env("SWALLOW_DB_PROBE_URL", &probe)
+            .env("SWALLOW_DB_PROBE_ROLE", probe_role)
             .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
             .env("SWALLOW_DB_PROBE_TIMEOUT_SECONDS", "2")
             .env("SWALLOW_DB_ALERT_OPERATION_TIMEOUT_SECONDS", "1")
@@ -90,7 +91,7 @@ async fn target_outage_is_reported_using_independent_alert_database() {
             .output()
             .unwrap()
     };
-    let healthy = run();
+    let healthy = run("any");
     assert_eq!(
         healthy.status.code(),
         Some(0),
@@ -98,7 +99,12 @@ async fn target_outage_is_reported_using_independent_alert_database() {
         String::from_utf8_lossy(&healthy.stderr)
     );
     assert_eq!(db.query_one("SELECT last_condition_mask FROM novu_rust_alert_delivery_slots WHERE environment_id='monitor' AND target_id='db-primary'",&[]).await.unwrap().get::<_,i32>(0),0);
+    assert_eq!(run("writable-primary").status.code(), Some(0));
+    assert_eq!(run("invalid").status.code(), Some(1));
     db.execute("UPDATE novu_rust_alert_delivery_slots SET state='rejected' WHERE environment_id='monitor' AND target_id='db-primary'",&[]).await.unwrap();
+    let mismatched = run("standby");
+    assert_eq!(mismatched.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&mismatched.stderr).contains("requires operator review"));
     assert!(
         Command::new("docker")
             .args(["stop", "-t", "0", &container])
@@ -115,7 +121,7 @@ async fn target_outage_is_reported_using_independent_alert_database() {
     let tx = locker.transaction().await.unwrap();
     tx.query_one("SELECT target_id FROM novu_rust_alert_delivery_slots WHERE environment_id='monitor' AND target_id='db-primary' FOR UPDATE",&[]).await.unwrap();
     let started = std::time::Instant::now();
-    let locked = run();
+    let locked = run("any");
     assert_eq!(locked.status.code(), Some(1));
     assert!(started.elapsed() < std::time::Duration::from_secs(8));
     let log = String::from_utf8_lossy(&locked.stderr);
@@ -123,7 +129,7 @@ async fn target_outage_is_reported_using_independent_alert_database() {
     assert!(log.contains("dispatch failed or timed out"));
     tx.rollback().await.unwrap();
     db.execute("UPDATE novu_rust_alert_delivery_slots SET state='rejected' WHERE environment_id='monitor' AND target_id='db-primary'",&[]).await.unwrap();
-    let down = run();
+    let down = run("any");
     assert_eq!(
         down.status.code(),
         Some(2),
@@ -284,7 +290,7 @@ async fn target_outage_is_reported_using_independent_alert_database() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    let recovered = run();
+    let recovered = run("any");
     assert_eq!(
         recovered.status.code(),
         Some(0),
@@ -297,7 +303,7 @@ async fn target_outage_is_reported_using_independent_alert_database() {
     )
     .await
     .unwrap();
-    let denied = run();
+    let denied = run("any");
     assert_eq!(denied.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&denied.stderr).contains("observation failed"));
     let later_failure = Command::new(env!("CARGO_BIN_EXE_send-database-alert"))
