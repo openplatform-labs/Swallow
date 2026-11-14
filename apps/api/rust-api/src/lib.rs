@@ -66,9 +66,9 @@ fn generate_transaction_id() -> Option<String> {
 }
 
 pub fn router(db: Arc<Client>) -> Router {
-    let secret = std::env::var("JWT_SECRET")
+    let secret = novu_rust_contracts::secret::from_env("JWT_SECRET", "JWT_SECRET_FILE")
         .ok()
-        .filter(|s| !s.is_empty())
+        .flatten()
         .map(String::into_bytes);
     let keys = std::env::var("INBOX_HMAC_KEYS_JSON")
         .ok()

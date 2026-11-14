@@ -19,7 +19,9 @@ rust_worker_pid=''
 rust_pid=''
 rust_ws_pid=''
 reference_ws_pid=''
+secret_file=''
 cleanup() {
+  if [[ -n "$secret_file" ]]; then rm -f "$secret_file"; fi
   if [[ -n "$rust_ws_pid" ]]; then kill "$rust_ws_pid" >/dev/null 2>&1 || true; wait "$rust_ws_pid" 2>/dev/null || true; fi
   if [[ -n "$reference_ws_pid" ]]; then kill "$reference_ws_pid" >/dev/null 2>&1 || true; wait "$reference_ws_pid" 2>/dev/null || true; fi
   if [[ -n "$rust_worker_pid" ]]; then kill -CONT "$rust_worker_pid" >/dev/null 2>&1 || true; kill "$rust_worker_pid" >/dev/null 2>&1 || true; wait "$rust_worker_pid" 2>/dev/null || true; fi
@@ -72,7 +74,10 @@ postgres_port=$(docker port "$postgres" 5432/tcp); postgres_port=${postgres_port
 rust_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/private/tmp/swallow-create-target}
 cargo build --locked --offline >/dev/null
-DATABASE_URL="postgresql://postgres@127.0.0.1:$postgres_port/novu_compat" LISTEN_ADDR="127.0.0.1:$rust_port" JWT_SECRET=local-compat-test-secret "$CARGO_TARGET_DIR/debug/novu-rust-api" >/dev/null 2>&1 &
+secret_file=$(mktemp)
+chmod 600 "$secret_file"
+printf %s local-compat-test-secret > "$secret_file"
+env -u JWT_SECRET JWT_SECRET_FILE="$secret_file" DATABASE_URL="postgresql://postgres@127.0.0.1:$postgres_port/novu_compat" LISTEN_ADDR="127.0.0.1:$rust_port" "$CARGO_TARGET_DIR/debug/novu-rust-api" >/dev/null 2>&1 &
 rust_pid=$!
 for ((i=0;i<90;i++)); do
   code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: ApiKey compat-key' "http://127.0.0.1:$reference_port/v2/subscribers/alice" || true)

@@ -30,6 +30,8 @@ WS 마이그레이션 `0003_connection_leases.sql`을 적용하면 기본 안전
 
 ## PostgreSQL 연결 보안
 
+API와 WS는 Inbox JWT 비밀을 `JWT_SECRET` 또는 `JWT_SECRET_FILE` 중 하나로 제공받을 수 있다. 파일은 시작 시 한 번 읽고 최대 16 KiB, 끝의 한 줄바꿈을 제거하며 파일과 환경 변수를 동시에 설정하면 실패 처리한다. 잘못된 설정에서 API는 Inbox 세션 발급·JWT 인증을 비활성화하지만 다른 API는 계속 실행되고, WS는 시작하지 않는다. 기존 환경 변수 값도 같은 크기·형식 검증과 줄바꿈 처리의 영향을 받는다. API와 WS는 같은 비밀을 사용해야 하며 파일 권한과 배포, 무중단 회전·비밀 관리 서비스는 구현 범위 밖이다. 임시 파일의 값으로 원본 대비 API Inbox action과 WS 인증·전달 사례를 비교한다.
+
 Resend 워커의 `NOVU_RESEND_API_KEY_FILE`과 API 웹훅의 `NOVU_RESEND_WEBHOOK_SECRET_FILE`은 각각 시크릿 파일 경로를 받아 시작 시 한 번 읽는다. 기존 직접 환경 변수와 같은 시크릿의 파일 경로를 동시에 설정하면 거절한다. 읽기·형식 오류는 워커 시작 실패 또는 웹훅 인증 실패로 처리하고 파일 경로와 값을 오류에 출력하지 않는다. 끝의 한 줄바꿈만 제거하며 16 KiB를 초과하거나 여러 줄인 값은 거절한다. 파일 권한·마운트·접근 통제는 배포자가 관리해야 한다. 자동 재읽기·무중단 회전, 외부 비밀 관리 시스템 및 다른 채널의 시크릿 관리는 아직 구현되지 않았다.
 
 API, 인앱·SendGrid·Twilio·FCM 워커 및 WS의 조회·이벤트 연결은 기본적으로 서버 인증서와 호스트명을 검증하는 TLS를 요구한다. 공개 신뢰 루트를 사용하며 사설 CA는 `NOVU_POSTGRES_CA_FILE`에 PEM 파일 경로를 지정해 추가한다. `DATABASE_URL`의 `sslmode=disable`만으로 TLS를 끌 수 없다. 일회용 로컬 테스트에서만 `NOVU_POSTGRES_ALLOW_INSECURE=true`를 명시하면 평문으로 연결한다. 이 변수는 TLS를 강제로 끄므로 운영에서 설정하지 않는다.

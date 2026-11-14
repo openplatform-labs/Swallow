@@ -518,10 +518,9 @@ async fn start_event_listener(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let database_url = std::env::var("DATABASE_URL")?;
-    let secret = std::env::var("JWT_SECRET")?.into_bytes();
-    if secret.is_empty() {
-        return Err("JWT_SECRET must not be empty".into());
-    }
+    let secret = novu_rust_contracts::secret::from_env("JWT_SECRET", "JWT_SECRET_FILE")?
+        .ok_or("JWT secret is required")?
+        .into_bytes();
     let (mut query_config, tls) = novu_rust_contracts::postgres::configure(&database_url)?;
     query_config.application_name("novu-rust-ws-query");
     let client = Database::connect(&query_config, &tls).await?;

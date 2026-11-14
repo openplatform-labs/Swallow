@@ -1,3 +1,5 @@
+`JWT_SECRET_FILE` can supply the subscriber JWT secret from a mounted file instead of `JWT_SECRET`; configure exactly one. Invalid, missing, or conflicting sources fail WS startup. The file is read once, at most 16 KiB, with one trailing newline removed. The API and WS must share the same value; permissions, zero-downtime rotation, and external secret managers remain deployment responsibilities.
+
 # Experimental Rust Socket.IO service
 
 This prototype covers Socket.IO connections, presence and a limited in-app event path. It is not a production Novu WS service or a complete SDK-compatible replacement. It uses Socketioxide 0.18.9 (Rust 1.94 or newer), the experimental PostgreSQL API and worker schemas, worker migrations `0030_experimental_ws_events.sql` through `0034_experimental_notifications.sql`, and WS migrations `0001_connections.sql`, `0002_subscriber_revocation.sql` and `0003_connection_leases.sql`. Start it with `DATABASE_URL`, `JWT_SECRET`, and an optional `LISTEN_ADDR` (default `127.0.0.1:3002`). Apply migrations explicitly; the service does not run them itself.

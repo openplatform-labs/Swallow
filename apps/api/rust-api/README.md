@@ -1,3 +1,5 @@
+`JWT_SECRET_FILE` can provide the Inbox JWT signing secret from a mounted file instead of `JWT_SECRET`; set exactly one. The value is read at startup with a 16 KiB limit and a single trailing newline removed. If the sources conflict or the file is invalid, Inbox JWT authentication and session signing are disabled (other API routes still run). The same bytes must be configured in the WS service. File permissions, automatic rotation and managed secret integration remain deployment responsibilities.
+
 # Experimental Rust API
 
 `NOVU_RESEND_WEBHOOK_SECRET_FILE` can provide the Resend webhook secret from a mounted file instead of `NOVU_RESEND_WEBHOOK_SECRET`. If both are set or the file is invalid, the webhook is disabled and requests are rejected; the secret is read only at startup. File access control, rotation and managed secret integration remain deployment responsibilities.
