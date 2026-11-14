@@ -1,0 +1,183 @@
+//! Multiple real API database connections, one deliberately blocked.
+#![cfg(unix)]
+use sha2::{Digest, Sha256};
+use std::{
+    process::{Child, Command, Stdio},
+    time::{Duration, Instant},
+};
+use tokio_postgres::NoTls;
+struct Server(Child);
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+fn http(port: u16, path: &str, token: Option<&str>, max: &str) -> Option<u16> {
+    let mut command = Command::new("curl");
+    command.args([
+        "-s",
+        "--max-time",
+        max,
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code}",
+    ]);
+    if let Some(value) = token {
+        command.args(["-H", &format!("Authorization: SwallowConsole {value}")]);
+    }
+    let out = command
+        .arg(format!("http://127.0.0.1:{port}{path}"))
+        .output()
+        .ok()?;
+    std::str::from_utf8(&out.stdout).ok()?.parse().ok()
+}
+#[test]
+fn invalid_database_connection_counts_are_rejected() {
+    for count in ["0", "17", "bad"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_novu-rust-api"))
+            .env("DATABASE_URL", "postgres://localhost/unused")
+            .env("SWALLOW_API_DB_CONNECTIONS", count)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("invalid API database connection count")
+        );
+    }
+}
+#[tokio::test]
+#[ignore = "requires fully migrated disposable PostgreSQL and curl"]
+async fn one_locked_connection_does_not_block_every_request_or_readiness() {
+    let url = std::env::var("TEST_DATABASE_URL").unwrap();
+    let (mut db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    let (observer, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    db.batch_execute("INSERT INTO novu_rust_environments VALUES ('pool-env','org')")
+        .await
+        .unwrap();
+    let a = "d".repeat(64);
+    let b = "e".repeat(64);
+    for token in [&a, &b] {
+        let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+        db.execute("INSERT INTO novu_rust_console_credentials(token_hash,environment_id,expires_at) VALUES($1,'pool-env',clock_timestamp()+interval '1 hour')",&[&hash]).await.unwrap();
+        db.execute("INSERT INTO novu_rust_console_alert_grants SELECT credential_id FROM novu_rust_console_credentials WHERE token_hash=$1",&[&hash]).await.unwrap();
+    }
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    drop(socket);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_novu-rust-api"));
+    child
+        .env(
+            "DATABASE_URL",
+            format!("{url}?application_name=api_pool_test"),
+        )
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .env("LISTEN_ADDR", format!("127.0.0.1:{port}"))
+        .env("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED", "true")
+        .env("SWALLOW_API_DB_CONNECTIONS", "2")
+        .env("SWALLOW_API_DB_HEALTH_INTERVAL_SECONDS", "30")
+        .env("SWALLOW_API_DB_HEALTH_TIMEOUT_SECONDS", "2")
+        .env_remove("SWALLOW_API_STRICT_SECURITY_CONFIG")
+        .env_remove("SWALLOW_API_REQUIRED_SECURITY")
+        .env_remove("JWT_SECRET")
+        .env_remove("JWT_SECRET_FILE")
+        .env_remove("INBOX_HMAC_KEYS_JSON")
+        .env_remove("INBOX_HMAC_KEYS_JSON_FILE")
+        .env_remove("NOVU_RESEND_WEBHOOK_SECRET")
+        .env_remove("NOVU_RESEND_WEBHOOK_SECRET_FILE")
+        .env_remove("NOVU_TWILIO_WEBHOOK_AUTH_TOKEN")
+        .env_remove("NOVU_TWILIO_WEBHOOK_AUTH_TOKEN_FILE")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut server = Server(child.spawn().unwrap());
+    let mut connected = false;
+    for _ in 0..100 {
+        connected = observer
+            .query_one(
+                "SELECT count(*)=2 FROM pg_stat_activity WHERE application_name='api_pool_test'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if connected && http(port, "/health/ready", None, "1") == Some(200) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(connected);
+    assert_eq!(http(port, "/health/ready", None, "1"), Some(200));
+    let hash = format!("{:x}", Sha256::digest(a.as_bytes()));
+    let tx = db.transaction().await.unwrap();
+    tx.execute(
+        "UPDATE novu_rust_console_credentials SET enabled=true WHERE token_hash=$1",
+        &[&hash],
+    )
+    .await
+    .unwrap();
+    let mut pending = Command::new("curl")
+        .args([
+            "-s",
+            "--max-time",
+            "10",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "-H",
+            &format!("Authorization: SwallowConsole {a}"),
+            &format!("http://127.0.0.1:{port}/v1/experimental/console/alerts"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut blocked = false;
+    for _ in 0..100 {
+        blocked=observer.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='api_pool_test' AND wait_event_type='Lock')",&[]).await.unwrap().get(0);
+        if blocked {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(blocked);
+    let before = Instant::now();
+    assert_eq!(http(port, "/health/ready", None, "1"), Some(200));
+    assert!(before.elapsed() < Duration::from_secs(2));
+    let mut success = false;
+    for _ in 0..4 {
+        if http(port, "/v1/experimental/console/alerts", Some(&b), "1") == Some(200) {
+            success = true;
+            break;
+        }
+    }
+    assert!(success, "idle DB connection never handled a request");
+    assert!(pending.try_wait().unwrap().is_none());
+    tx.commit().await.unwrap();
+    assert_eq!(pending.wait_with_output().unwrap().stdout, b"200");
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &server.0.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    for _ in 0..100 {
+        if let Some(status) = server.0.try_wait().unwrap() {
+            assert!(status.success());
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("API did not shut down");
+}

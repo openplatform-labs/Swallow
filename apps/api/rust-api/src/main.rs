@@ -9,7 +9,7 @@ use std::{
     future::IntoFuture,
     sync::{
         Arc, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -24,7 +24,8 @@ struct Connected {
 
 #[derive(Clone)]
 struct ApiState {
-    current: Arc<RwLock<Option<Connected>>>,
+    connections: Arc<Vec<Arc<RwLock<Option<Connected>>>>>,
+    next: Arc<AtomicUsize>,
     timeout: Duration,
     draining: Arc<AtomicBool>,
 }
@@ -38,7 +39,14 @@ async fn forward(State(shared): State<ApiState>, request: Request) -> Response {
         )
             .into_response();
     }
-    let current = shared.current.read().ok().and_then(|guard| guard.clone());
+    let start = shared.next.fetch_add(1, Ordering::Relaxed) % shared.connections.len();
+    let current = (0..shared.connections.len()).find_map(|offset| {
+        shared.connections[(start + offset) % shared.connections.len()]
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .filter(|c| !c.db.is_closed())
+    });
     match current {
         Some(current) => match current.router.oneshot(request).await {
             Ok(response) => response,
@@ -62,28 +70,45 @@ async fn live() -> Response {
 }
 
 async fn ready(State(shared): State<ApiState>) -> Response {
-    let current = shared.current.read().ok().and_then(|guard| guard.clone());
-    let ready = if shared.draining.load(Ordering::Acquire) {
-        false
-    } else if let Some(current) = current {
-        let query_ok = matches!(
-            tokio::time::timeout(shared.timeout, current.db.simple_query("SELECT 1")).await,
-            Ok(Ok(_))
-        );
-        let still_current = shared
-            .current
-            .read()
-            .ok()
-            .and_then(|guard| {
-                guard
-                    .as_ref()
-                    .map(|active| Arc::ptr_eq(&active.db, &current.db))
-            })
-            .unwrap_or(false);
-        query_ok && still_current && !shared.draining.load(Ordering::Acquire)
-    } else {
-        false
-    };
+    let mut probes = tokio::task::JoinSet::new();
+    if !shared.draining.load(Ordering::Acquire) {
+        for slot in shared.connections.iter() {
+            let current = slot
+                .read()
+                .ok()
+                .and_then(|guard| guard.clone())
+                .filter(|c| !c.db.is_closed());
+            if let Some(current) = current {
+                let slot = slot.clone();
+                let timeout = shared.timeout;
+                probes.spawn(async move {
+                    let query_ok = matches!(
+                        tokio::time::timeout(timeout, current.db.simple_query("SELECT 1")).await,
+                        Ok(Ok(_))
+                    );
+                    let still_current = slot
+                        .read()
+                        .ok()
+                        .and_then(|guard| {
+                            guard
+                                .as_ref()
+                                .map(|active| Arc::ptr_eq(&active.db, &current.db))
+                        })
+                        .unwrap_or(false);
+                    query_ok && still_current
+                });
+            }
+        }
+    }
+    let mut ready = false;
+    while let Some(result) = probes.join_next().await {
+        if matches!(result, Ok(true)) {
+            ready = true;
+            break;
+        }
+    }
+    probes.abort_all();
+    ready &= !shared.draining.load(Ordering::Acquire);
     let status = if ready {
         StatusCode::OK
     } else {
@@ -206,6 +231,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let interval = duration_env("SWALLOW_API_DB_HEALTH_INTERVAL_SECONDS", 10)?;
     let timeout = duration_env("SWALLOW_API_DB_HEALTH_TIMEOUT_SECONDS", 30)?;
+    let connections: usize = match std::env::var("SWALLOW_API_DB_CONNECTIONS") {
+        Ok(value) => value
+            .parse()
+            .map_err(|_| "invalid API database connection count")?,
+        Err(std::env::VarError::NotPresent) => 1,
+        Err(_) => return Err("invalid API database connection count".into()),
+    };
+    if !(1..=16).contains(&connections) {
+        return Err("invalid API database connection count".into());
+    }
     let health_endpoints = match std::env::var("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED").as_deref() {
         Ok("true") => true,
         Ok("false") | Err(std::env::VarError::NotPresent) => false,
@@ -214,46 +249,56 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let runtime = novu_rust_api::RuntimeConfig::try_from_env()?;
     let cors = cors_from_env()?;
     let shared = ApiState {
-        current: Arc::new(RwLock::new(None)),
+        connections: Arc::new(
+            (0..connections)
+                .map(|_| Arc::new(RwLock::new(None)))
+                .collect(),
+        ),
+        next: Arc::new(AtomicUsize::new(0)),
         timeout,
         draining: Arc::new(AtomicBool::new(false)),
     };
-    let manager_state = shared.current.clone();
-    tokio::spawn(async move {
-        loop {
-            let (db, connection) =
-                match tokio::time::timeout(timeout, config.connect(tls.clone())).await {
-                    Ok(Ok(value)) => value,
-                    _ => {
-                        eprintln!("database unavailable; retrying");
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                        continue;
-                    }
-                };
-            let db = Arc::new(db);
-            let mut driver = tokio::spawn(connection);
-            if let Ok(mut guard) = manager_state.write() {
-                *guard = Some(Connected {
-                    router: runtime.router(db.clone()),
-                    db: db.clone(),
-                });
-            }
+    for slot in shared.connections.iter() {
+        let manager_state = slot.clone();
+        let config = config.clone();
+        let tls = tls.clone();
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
             loop {
-                tokio::select! {
-                    _ = &mut driver => break,
-                    _ = tokio::time::sleep(interval) => {
-                        if !matches!(tokio::time::timeout(timeout, db.simple_query("SELECT 1")).await, Ok(Ok(_))) { break; }
+                let (db, connection) =
+                    match tokio::time::timeout(timeout, config.connect(tls.clone())).await {
+                        Ok(Ok(value)) => value,
+                        _ => {
+                            eprintln!("database unavailable; retrying");
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            continue;
+                        }
+                    };
+                let db = Arc::new(db);
+                let mut driver = tokio::spawn(connection);
+                if let Ok(mut guard) = manager_state.write() {
+                    *guard = Some(Connected {
+                        router: runtime.router(db.clone()),
+                        db: db.clone(),
+                    });
+                }
+                loop {
+                    tokio::select! {
+                        _ = &mut driver => break,
+                        _ = tokio::time::sleep(interval) => {
+                            if !matches!(tokio::time::timeout(timeout, db.simple_query("SELECT 1")).await, Ok(Ok(_))) { break; }
+                        }
                     }
                 }
+                if let Ok(mut guard) = manager_state.write() {
+                    *guard = None;
+                }
+                driver.abort();
+                eprintln!("database connection lost; reconnecting");
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
-            if let Ok(mut guard) = manager_state.write() {
-                *guard = None;
-            }
-            driver.abort();
-            eprintln!("database connection lost; reconnecting");
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-    });
+        });
+    }
     let address = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into());
     let listener = tokio::net::TcpListener::bind(&address).await?;
     let mut app = Router::new().fallback(forward);
