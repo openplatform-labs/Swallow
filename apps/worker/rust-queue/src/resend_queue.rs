@@ -234,5 +234,71 @@ mod tests {
         let row=db.query_one("SELECT j.status,a.state FROM novu_queue_jobs j JOIN novu_rust_resend_attempts a ON a.job_id=j.id WHERE j.id=$1", &[&post]).await.unwrap();
         assert_eq!(row.get::<_, String>(0), "failed");
         assert_eq!(row.get::<_, String>(1), "unknown");
+
+        // Each test job has an isolated environment so it cannot consume the
+        // pre-dispatch job requeued above.
+        for (status, body, expected) in [
+            (500, "{}", "unknown"),
+            (409, "{}", "unknown"),
+            (429, "{}", "rejected"),
+            (200, "{}", "unknown"),
+        ] {
+            let job = Uuid::new_v4();
+            let environment = format!("env-{job}");
+            enqueue(&db, job, &environment, JOB_KIND, &payload)
+                .await
+                .unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/emails", listener.local_addr().unwrap());
+            let mock = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0; 4096];
+                assert!(socket.read(&mut buf).await.unwrap() > 0);
+                socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            });
+            let provider = Resend::test_endpoint(
+                Config {
+                    api_key: "re_test".into(),
+                    from: "from@example.test".into(),
+                    sender_name: String::new(),
+                },
+                &endpoint,
+            )
+            .unwrap();
+            assert!(process_one(&mut db, &environment, &provider).await.unwrap());
+            mock.await.unwrap();
+            let row = db.query_one("SELECT j.status,a.state,a.http_status FROM novu_queue_jobs j JOIN novu_rust_resend_attempts a ON a.job_id=j.id WHERE j.id=$1", &[&job]).await.unwrap();
+            assert_eq!(row.get::<_, String>(0), "failed");
+            assert_eq!(row.get::<_, String>(1), expected);
+            assert_eq!(
+                row.get::<_, Option<i32>>(2),
+                if status == 200 { None } else { Some(status) }
+            );
+            assert!(!process_one(&mut db, &environment, &provider).await.unwrap());
+        }
+        let job = Uuid::new_v4();
+        let environment = format!("env-{job}");
+        let unsupported = json!({"to":["to@example.test"],"subject":"Hello","html":"Hi","workflow_context":{"subscriber_internal_id":"old","subject_template":"Hello","html_template":"Hi","payload":{},"context":{},"actor":null,"overrides":{}}});
+        enqueue(&db, job, &environment, JOB_KIND, &unsupported)
+            .await
+            .unwrap();
+        let row = db
+            .query_one(
+                "SELECT count(*) FROM novu_rust_resend_attempts WHERE job_id=$1",
+                &[&job],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, i64>(0), 0);
+        // No listener is running; if the unsupported job is sent, the result
+        // would be unknown rather than the explicit pre-dispatch failure.
+        assert!(process_one(&mut db, &environment, &provider).await.unwrap());
+        let row = db.query_one("SELECT status,last_error,(SELECT count(*) FROM novu_rust_resend_attempts WHERE job_id=$1) FROM novu_queue_jobs WHERE id=$1", &[&job]).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), "failed");
+        assert_eq!(
+            row.get::<_, String>(1),
+            "Resend workflow jobs are unsupported"
+        );
+        assert_eq!(row.get::<_, i64>(2), 0);
     }
 }
