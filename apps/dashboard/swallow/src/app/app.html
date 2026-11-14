@@ -426,9 +426,9 @@
           @else if(grantRequestStatus() === 'error'){<p class="subscriber-error" role="alert">조회하지 못했습니다. 인증, 위임 변경 권한과 요청 ID를 확인하세요.</p>}
           @else if(grantRequestRecord(); as request){<p role="status">기록됨: {{ request.requestId }} · {{ request.createdAt }}<br>대상: {{ request.targetIssuer }} · {{ request.targetSubject }} · {{ request.targetClientId }}<br>{{ request.resource }} / {{ request.permission }}: {{ request.expected ? '허용' : '없음' }} → {{ request.desired ? '허용' : '없음' }}<br>사유: {{ request.reason }}<br>{{ request.changed ? '권한 변경됨' : '변경 없음' }}</p><p>보관한 원래 요청의 내용을 비교하세요.</p>}
         </div></section>
-        <section class="card decision-card"><div class="card-block"><div class="card-eyebrow">WORKFLOW GRANT AUDIT</div><h2>워크플로 권한 위임 이력</h2>
+        <section class="card decision-card"><div class="card-block"><div class="card-eyebrow">GRANT AUDIT</div><h2>워크플로·구독자 권한 위임 이력</h2>
           <p>별도의 위임 이력 조회 권한이 필요합니다. UUID 순으로 조회하므로 시간 순서가 아니며 페이지마다 조회 시점이 다릅니다.</p>
-          <button type="button" class="btn btn-outline" [disabled]="grantAuditStatus() === 'loading' || grantChangeStatus() === 'sending' || permissionChangeStatus() === 'sending'" (click)="loadGrantAudit()">위임 이력 조회</button>
+          <label for="grant-audit-scope">이력 종류</label><select id="grant-audit-scope" name="grantAuditScope" [(ngModel)]="grantAuditScope" (ngModelChange)="clearGrantAudit()" [disabled]="grantChangeStatus() === 'sending' || permissionChangeStatus() === 'sending'"><option value="workflow">워크플로 권한</option><option value="subscriber">구독자 권한</option></select><button type="button" class="btn btn-outline" [disabled]="grantAuditStatus() === 'loading' || grantChangeStatus() === 'sending' || permissionChangeStatus() === 'sending'" (click)="loadGrantAudit()">위임 이력 조회</button>
           @if(grantAuditStatus() === 'loading'){<p role="status">조회 중입니다.</p>}
           @else if(grantAuditStatus() === 'error'){<p class="subscriber-error" role="alert">조회하지 못했습니다. 인증과 별도 위임 이력 조회 권한을 확인하세요.</p>}
           @else if(grantAuditStatus() === 'loaded'){

@@ -40,6 +40,7 @@ GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_subscriber_profile_write
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_subscriber_create(text,text,text,text,bigint,uuid,text,jsonb,text),public.novu_rust_operator_jwt_subscriber_create_request_read(text,text,text,text,bigint,uuid) TO ui_resend_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_subscriber_delete(text,text,text,text,bigint,uuid,text,uuid,bigint,text),public.novu_rust_operator_jwt_subscriber_delete_request_read(text,text,text,text,bigint,uuid) TO ui_resend_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_subscriber_grant_read(text,text,text,text,bigint,text,text,text,text),public.novu_rust_operator_jwt_subscriber_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_subscriber_grant_request(text,text,text,text,bigint,uuid) TO ui_resend_fixture;
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_subscriber_grant_audit_read(text,text,text,text,bigint,uuid) TO ui_resend_fixture;
 GRANT SELECT ON public.novu_rust_users,public.novu_rust_api_keys,public.novu_rust_workflows,public.novu_rust_environments,public.novu_rust_fcm_devices TO ui_resend_fixture;
 GRANT SELECT,INSERT,UPDATE,DELETE ON public.novu_rust_subscribers TO ui_resend_fixture;
 GRANT SELECT,DELETE ON public.novu_rust_in_app_messages,public.novu_rust_subscription_preferences,public.novu_rust_email_messages,public.novu_rust_sms_messages,public.novu_rust_push_messages TO ui_resend_fixture;
@@ -62,6 +63,7 @@ INSERT INTO public.novu_rust_workflow_provider_permissions SELECT encode(sha256(
 INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname='ui_resend_fixture';
 INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
 INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES ('https://issuer.test','target-fixture','console','ui-fixture-env');
+INSERT INTO public.novu_rust_operator_jwt_subscriber_grant_audit_viewers VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
 INSERT INTO public.novu_rust_operator_jwt_subscriber_grant_admins VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env',true,true);
 INSERT INTO public.novu_rust_operator_jwt_subscriber_delete_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
 INSERT INTO public.novu_rust_operator_jwt_subscriber_create_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
