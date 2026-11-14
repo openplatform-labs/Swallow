@@ -158,6 +158,11 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
             .is_err()
     );
     db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'a',$1,'alert_view',oid FROM pg_roles WHERE rolname::text=$1",&[&role]).await.unwrap();
+    db.batch_execute(include_str!(
+        "../migrations/0140_resend_scoped_auto_result.sql"
+    ))
+    .await
+    .unwrap();
     db.batch_execute(&format!(
         "REVOKE EXECUTE ON FUNCTION public.novu_rust_sendgrid_result(text,uuid) FROM {role}"
     ))
@@ -211,6 +216,113 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
     assert_eq!(resend_result["result"], "unknown");
     assert_eq!(resend_result["providerIdKnown"], true);
     assert!(!resend_result.to_string().contains("secret"));
+    assert_eq!(resend_result["autoCorrelated"], false);
+    assert_eq!(resend_result["autoCorrelationConflict"], false);
+    assert!(resend_result["autoCorrelatedAt"].is_null());
+    let auto_job = Uuid::new_v4();
+    let tag = Uuid::new_v4();
+    queue::enqueue(
+        &db,
+        auto_job,
+        "a",
+        queue::resend_queue::JOB_KIND,
+        &json!({"private":"payload-secret"}),
+    )
+    .await
+    .unwrap();
+    db.execute("UPDATE novu_queue_jobs SET status='failed',last_error='Resend outcome unknown' WHERE id=$1", &[&auto_job]).await.unwrap();
+    db.execute("INSERT INTO novu_rust_resend_attempts(job_id,environment_id,state,correlation_id) VALUES ($1,'a','unknown',$2)", &[&auto_job,&tag]).await.unwrap();
+    db.execute(
+        "INSERT INTO novu_rust_resend_recipients VALUES ($1,'a','to',0,'private-hash')",
+        &[&auto_job],
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type,recipient_hash,correlation_id) VALUES ('a','auto-evidence','sensitive-provider-id','email.delivered','private-hash',$1)", &[&tag]).await.unwrap();
+    assert!(
+        queue::resend_projection::project_with_auto_correlation(&mut db, "a", auto_job, true)
+            .await
+            .unwrap()
+    );
+    let auto_result = reconciliation::scoped_channel_result(&actor, "a", auto_job, "resend")
+        .await
+        .unwrap();
+    assert_eq!(auto_result["result"], "delivered");
+    assert_eq!(auto_result["autoCorrelated"], true);
+    assert_eq!(auto_result["autoCorrelationConflict"], false);
+    assert!(auto_result["autoCorrelatedAt"].is_string());
+    let serialized = auto_result.to_string();
+    assert!(
+        !serialized.contains("sensitive-provider-id")
+            && !serialized.contains("private-hash")
+            && !serialized.contains(&tag.to_string())
+            && !serialized.contains("payload-secret")
+    );
+    assert!(
+        actor
+            .query(
+                "SELECT * FROM public.novu_rust_resend_auto_correlations",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    db.execute("INSERT INTO novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type,recipient_hash,correlation_id) VALUES ('a','conflict-auto','sensitive-provider-id','email.delivered','private-hash',$1)", &[&Uuid::new_v4()]).await.unwrap();
+    let auto_result = reconciliation::scoped_channel_result(&actor, "a", auto_job, "resend")
+        .await
+        .unwrap();
+    assert_eq!(auto_result["result"], "unknown");
+    assert_eq!(auto_result["autoCorrelated"], true);
+    assert_eq!(auto_result["autoCorrelationConflict"], true);
+    let direct_role = format!("direct_check_{}", Uuid::new_v4().simple());
+    db.batch_execute(&format!("CREATE ROLE {direct_role} LOGIN PASSWORD 'direct-fixture-password'; GRANT USAGE ON SCHEMA public TO {direct_role}; GRANT SELECT ON public.novu_queue_jobs,public.novu_rust_resend_attempts,public.novu_rust_resend_recipients,public.novu_rust_resend_delivery_events TO {direct_role}")).await.unwrap();
+    let mut direct_url = reqwest::Url::parse(&url).unwrap();
+    direct_url.set_username(&direct_role).unwrap();
+    direct_url
+        .set_password(Some("direct-fixture-password"))
+        .unwrap();
+    let direct_check = |mode: Option<&str>| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"));
+        cmd.args(["resend-check", "a", &auto_job.to_string()])
+            .env("DATABASE_URL", direct_url.as_str())
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env_remove("NOVU_RESEND_CHECK_AUTO_CORRELATION");
+        if let Some(mode) = mode {
+            cmd.env("NOVU_RESEND_CHECK_AUTO_CORRELATION", mode);
+        }
+        cmd.output().unwrap()
+    };
+    assert_eq!(direct_check(None).status.code(), Some(1));
+    db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'a',$1,'alert_view',oid FROM pg_roles WHERE rolname::text=$1", &[&direct_role]).await.unwrap();
+    let checked = direct_check(None);
+    assert_eq!(
+        checked.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let checked_json: serde_json::Value = serde_json::from_slice(&checked.stdout).unwrap();
+    assert_eq!(checked_json["evidence"]["autoCorrelationConflict"], true);
+    assert!(!String::from_utf8_lossy(&checked.stdout).contains("sensitive-provider-id"));
+    let evidence = Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .args(["resend-evidence", "a", &auto_job.to_string()])
+        .env("DATABASE_URL", direct_url.as_str())
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .env_remove("NOVU_RESEND_CHECK_AUTO_CORRELATION")
+        .output()
+        .unwrap();
+    assert_eq!(evidence.status.code(), Some(0));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&evidence.stdout).unwrap()["autoCorrelationConflict"],
+        true
+    );
+    db.batch_execute("REVOKE EXECUTE ON FUNCTION public.novu_rust_scoped_resend_auto_conflict(text,uuid) FROM PUBLIC").await.unwrap();
+    assert_eq!(direct_check(None).status.code(), Some(1));
+    db.batch_execute("GRANT EXECUTE ON FUNCTION public.novu_rust_scoped_resend_auto_conflict(text,uuid) TO PUBLIC").await.unwrap();
+    // Legacy behavior remains an explicit opt-out, rather than a silent default.
+    assert_eq!(direct_check(Some("false")).status.code(), Some(0));
+    db.execute("DELETE FROM novu_rust_delivery_operator_grants WHERE environment_id='a' AND database_principal=$1 AND decision='alert_view'", &[&direct_role]).await.unwrap();
+    assert_eq!(direct_check(None).status.code(), Some(1));
     let no_attempt = Uuid::new_v4();
     queue::enqueue(
         &db,
@@ -588,6 +700,18 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
             id.to_string()
         );
     }
+    let output = Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .args(["resend-result", "a", &auto_job.to_string()])
+        .env("DATABASE_URL", role_url.as_str())
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["autoCorrelated"], true);
+    assert_eq!(result["autoCorrelationConflict"], true);
+    assert_eq!(result["result"], "unknown");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("sensitive-provider-id"));
     let scoped_monitor = |environment: &str| {
         Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
             .args(["check", environment])

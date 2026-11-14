@@ -589,6 +589,35 @@ pub async fn resend_evidence_snapshot_with_auto(
     Ok(evidence)
 }
 
+/// Automatically use the scoped conflict function when the database has it.
+/// A missing permission is an error, never a silent fallback to legacy checks.
+pub async fn resend_evidence_snapshot_detect_auto(
+    client: &mut Client,
+    environment: &str,
+    job: Uuid,
+) -> Result<Value> {
+    // The scoped grant check takes a row lock, so this transaction cannot be read-only.
+    let tx = client
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+        .start()
+        .await?;
+    let mut evidence = resend_evidence(&tx, environment, job).await?;
+    let installed: bool = tx.query_one("SELECT pg_catalog.to_regprocedure('public.novu_rust_scoped_resend_auto_conflict(text,uuid)') IS NOT NULL", &[]).await?.get(0);
+    if installed {
+        let conflict: bool = tx
+            .query_one(
+                "SELECT public.novu_rust_scoped_resend_auto_conflict($1,$2)",
+                &[&environment, &job],
+            )
+            .await?
+            .get(0);
+        evidence["autoCorrelationConflict"] = json!(conflict);
+    }
+    tx.commit().await?;
+    Ok(evidence)
+}
+
 /// A conservative, per-job alert: only a complete set of delivered recipients is healthy.
 pub fn resend_needs_attention(evidence: &Value) -> Result<bool> {
     evidence["recipients"]
