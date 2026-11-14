@@ -12,6 +12,14 @@ API 프로세스는 PostgreSQL 접속이 끊기거나 연결 상태 조회가 �
 
 `SWALLOW_API_HEALTH_ENDPOINTS_ENABLED=true`로 `GET /health/live`와 `GET /health/ready`를 선택적으로 노출할 수 있다. 기본값은 비활성화이며 true 또는 false만 허용한다. 인증 없는 live는 DB가 없어도 HTTP 프로세스가 응답하면 200이고, ready는 현재 연결에서 SELECT 1이 성공할 때만 200, 실패·미연결이면 503이다. 이전 연결의 늦은 응답이 교체된 연결의 준비 상태를 성공으로 표시하지 않도록 현재 연결을 다시 확인한다. 두 응답은 캐시를 금지한다. 조회는 같은 API DB 연결을 사용하고 ready 요청마다 쿼리 1회가 추가되므로 호출 간격과 시간 제한을 운영자가 조정한다. 이는 연결만 확인하며 마이그레이션·권한·웹훅 설정·provider 또는 실제 요청의 정상 처리를 보증하지 않는다. 필요하면 ingress에서 경로 접근을 제한한다. Docker PostgreSQL을 일시 정지·재시작하는 동안 두 API 프로세스의 생존·준비 상태와 복구, 기능 비활성화를 검증한다. 로드밸런서·지속 부하·DB 자동 승격·운영 TLS 및 전체 HA는 미검증이다.
 
+## 실험 Slack 채팅 발송
+
+`slack-worker`는 `experimental_slack_chat` 종류의 독립 PostgreSQL 작업을 Slack `chat.postMessage`로 발송한다. 워커 0070·0071까지 적용하고 환경별 `NOVU_SLACK_ENVIRONMENT_ID`, `DATABASE_URL`, `NOVU_SLACK_BOT_TOKEN` 또는 `NOVU_SLACK_BOT_TOKEN_FILE`을 설정한다. 토큰은 시작 시 읽고 작업·시도 테이블에 저장하지 않는다. 작업 payload는 `{"channel":"C123","text":"hello","blocks":[]}` 형식이며 blocks는 선택이다. 작업 생성자에게 환경과 대상에 대한 인가 책임이 있고 텍스트·대상은 DB에 저장되므로 접근을 보호해야 한다. **아직 워크플로 실행, 구독자 자격증명·삭제·수신 설정, 원본 채팅 관리 API에 연결되지 않았다.** 풍부한 카드 렌더링, provider override, webhook 대상과 전체 원본 계약도 미구현이다. 운영용이 아닌 격리 평가 경로다.
+
+발송 전 시도를 기록하고 60초 임대로 중복 선점과 늦은 응답을 차단한다. 시도 전 임대 만료는 재대기하고 시도 후 만료·네트워크 오류·5xx·불완전한 응답 등은 결과 불명으로 남겨 자동 재발송하지 않는다. Slack 응답은 HTTP 성공뿐 아니라 본문의 ok와 channel·ts를 확인한다. 일부 명확한 오류와 408·409를 제외한 HTTP 4xx는 거절로, 그 밖의 불명 오류는 unknown으로 기록한다. 공급자 접수는 사람이 읽었다는 뜻이 아니다. 결과는 `delivery-reconcile check-slack ENV`로 점검하고 `SWALLOW_ALERT_SLACK_JOBS_ENABLED=true`를 설정하면 기존 운영 경보에 포함한다. DB 오류·명령 미실행·워커 종료는 별도 감시해야 한다.
+
+수동 `delivery-reconcile slack-resolve ENV JOB retry|accepted OPERATOR REASON`은 해당 환경과 DB 로그인에 별도로 부여한 `slack_retry` 또는 `slack_accepted` 권한을 잠금 아래 확인하고 감사 기록과 상태 변경을 원자적으로 수행한다. 기존 이메일·SMS·푸시 및 운영 경보 권한과 별개다. accepted는 불명 상태에서만 가능하며 제공자 ID가 없는 운영자 확인이다. retry는 불명·거절에 가능하나 미접수를 독립적으로 확인하지 않으면 중복될 수 있다. 0071은 0067·0068 이후 적용하며 Slack 권한을 부여한 후 구버전 권한 제약 마이그레이션을 재적용하지 않는다. DB 직접 쓰기·감사 위변조는 별도 제한이 필요하다. Docker PostgreSQL·모의 HTTP에서 동시 선점, 발송 전후 복구·늦은 응답, 환경 격리·감시·권한·감사를 검증한다. 기준 원본의 채널·사용자 대상 두 기본 요청을 모의 HTTP로 비교했으며 실제 Slack 발송, 워크플로 종단 간 비교, 모든 오류와 운영 HA는 미검증이다.
+
 ## Inbox 알림 action
 
 워커 0059 마이그레이션은 인앱 메시지에 CTA JSON을 저장한다. API는 이미 저장된 primary·secondary 버튼에 대해 구독자 관리 API 및 Inbox 세션의 complete·revert를 지원하고 읽지 않은 메시지는 읽음·확인 상태로 바꾼다. 버튼, redirect 및 완료 상태를 제한적으로 DTO에 표시한다. 이 변경의 배포 전에는 0059를 먼저 적용해야 한다. 기존 행은 빈 CTA로 남으며 MongoDB에서 이전하지 않는다.

@@ -54,6 +54,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     });
     let resend_enabled = env_bool("SWALLOW_ALERT_RESEND_ENABLED", true)?;
     let attempts_enabled = env_bool("SWALLOW_ALERT_ATTEMPTS_ENABLED", false)?;
+    let slack_jobs_enabled = env_bool("SWALLOW_ALERT_SLACK_JOBS_ENABLED", false)?;
     let twilio_grace = env_optional_i32("SWALLOW_ALERT_TWILIO_GRACE_SECONDS")?;
     let twilio_heartbeat = env_optional_i32("SWALLOW_ALERT_TWILIO_HEARTBEAT_MAX_SECONDS")?;
     let twilio_thresholds = match (twilio_grace, twilio_heartbeat) {
@@ -66,7 +67,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Err(std::env::VarError::NotPresent) => None,
         Err(_) => return Err("invalid queue wait threshold".into()),
     };
-    if !resend_enabled && !attempts_enabled && queue_wait.is_none() && twilio_thresholds.is_none() {
+    if !resend_enabled
+        && !attempts_enabled
+        && !slack_jobs_enabled
+        && queue_wait.is_none()
+        && twilio_thresholds.is_none()
+    {
         return Err("no alert checks configured".into());
     }
     if (resend_enabled && (!(1..=86_400).contains(&grace) || !(1..=86_400).contains(&heartbeat)))
@@ -76,7 +82,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     {
         return Err("invalid alert check threshold (1-86400 seconds)".into());
     }
-    let mut failed_checks = [false; 4];
+    let mut failed_checks = [false; 5];
     let resend = if resend_enabled {
         let result = reconciliation::resend_health(&db, &args[0], grace, heartbeat).await;
         let values = result.ok().and_then(|health| {
@@ -141,11 +147,31 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     } else {
         None
     };
+    let slack_attempts = if slack_jobs_enabled {
+        let result = novu_postgres_queue::slack_queue::health(&db, &args[0]).await;
+        let values = result.ok().and_then(|health| {
+            Some((
+                health["unknownAttempts"].as_u64()?,
+                health["rejectedAttempts"].as_u64()?,
+                health["strandedDispatches"].as_u64()?,
+            ))
+        });
+        if values.is_none() {
+            failed_checks[4] = true;
+            eprintln!("Slack chat health check failed");
+        }
+        values
+    } else {
+        None
+    };
     let unhealthy = failed_checks.iter().any(|failed| *failed)
         || resend.is_some_and(|(overdue, stale)| overdue > 0 || stale)
         || queue.is_some_and(|(overdue, expired)| overdue > 0 || expired > 0)
         || attempts.is_some_and(|(unknown, stranded)| unknown > 0 || stranded > 0)
-        || twilio.is_some_and(|(overdue, stale)| overdue > 0 || stale);
+        || twilio.is_some_and(|(overdue, stale)| overdue > 0 || stale)
+        || slack_attempts.is_some_and(|(unknown, rejected, stranded)| {
+            unknown > 0 || rejected > 0 || stranded > 0
+        });
     let (overdue, stale) = resend.unwrap_or((0, false));
     let alert = Alert {
         environment: args[0].clone(),
@@ -155,6 +181,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         queue,
         attempts,
         twilio,
+        slack_attempts,
         failed_checks,
     };
     alert.text().map_err(|_| "invalid alert environment")?;

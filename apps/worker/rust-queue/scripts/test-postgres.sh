@@ -68,6 +68,14 @@ docker exec "$name" createdb -U postgres novu_grant_lock_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_grant_lock_test" \
   cargo test --locked --test operator_grant_lock -- --ignored
 
+docker exec "$name" createdb -U postgres novu_slack_cli_test
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_slack_cli_test" \
+  cargo test --locked --test slack_cli -- --ignored
+
+docker exec "$name" createdb -U postgres novu_slack_test
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_slack_test" \
+  cargo test --locked --lib slack_queue::tests::queue_fences_concurrency_and_recovers_uncertain_attempts -- --ignored
+
 docker exec "$name" createdb -U postgres novu_twilio_projection_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_twilio_projection_test" \
   cargo test --locked --test twilio_projection -- --ignored
