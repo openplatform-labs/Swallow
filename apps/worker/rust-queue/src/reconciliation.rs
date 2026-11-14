@@ -238,7 +238,11 @@ pub async fn sms_evidence(client: &Client, environment: &str, job: Uuid) -> Resu
 
 /// Classify authenticated callbacks for the current identified SMS attempt.
 /// Conflicting or unfamiliar evidence is intentionally never resolved.
-pub async fn sms_delivery(client: &Client, environment: &str, job: Uuid) -> Result<Value> {
+pub async fn sms_delivery<C: tokio_postgres::GenericClient + Sync>(
+    client: &C,
+    environment: &str,
+    job: Uuid,
+) -> Result<Value> {
     if environment.trim().is_empty() {
         return Err("environment is required".into());
     }
@@ -246,10 +250,11 @@ pub async fn sms_delivery(client: &Client, environment: &str, job: Uuid) -> Resu
         "SELECT a.state,a.dispatch_id,count(e.message_sid),count(DISTINCT e.message_sid), \
          COALESCE(bool_or(e.status='delivered'),false), \
          COALESCE(bool_or(e.status IN ('failed','undelivered','canceled')),false), \
-         COALESCE(bool_or(e.status NOT IN ('accepted','scheduled','queued','sending','sent','delivered','failed','undelivered','canceled')),false) \
+         COALESCE(bool_or(e.status NOT IN ('accepted','scheduled','queued','sending','sent','delivered','failed','undelivered','canceled')),false), \
+         COALESCE(bool_or(e.message_sid <> a.provider_message_id),false), count(DISTINCT e.account_sid), a.provider_message_id \
          FROM novu_queue_jobs j JOIN novu_rust_twilio_attempts a ON a.job_id=j.id AND a.environment_id=j.environment_id \
          LEFT JOIN novu_rust_twilio_delivery_events e ON e.job_id=j.id AND e.environment_id=j.environment_id AND e.dispatch_id=a.dispatch_id \
-         WHERE j.environment_id=$1 AND j.id=$2 AND j.kind=$3 GROUP BY a.state,a.dispatch_id",
+         WHERE j.environment_id=$1 AND j.id=$2 AND j.kind=$3 GROUP BY a.state,a.dispatch_id,a.provider_message_id",
         &[&environment, &job, &crate::twilio_queue::JOB_KIND],
     ).await?.ok_or("current SMS attempt not found")?;
     let attempt: String = row.get(0);
@@ -259,9 +264,22 @@ pub async fn sms_delivery(client: &Client, environment: &str, job: Uuid) -> Resu
     let delivered: bool = row.get(4);
     let failed: bool = row.get(5);
     let unrecognized: bool = row.get(6);
+    let mismatched: bool = row.get(7);
+    let accounts: i64 = row.get(8);
+    let provider_id: Option<String> = row.get(9);
+    let duplicate = if let Some(id) = provider_id.as_ref().filter(|id| !id.is_empty()) {
+        client.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_twilio_attempts WHERE environment_id=$1 AND provider_message_id=$2 AND job_id<>$3)", &[&environment,&id,&job]).await?.get::<_, bool>(0)
+    } else {
+        false
+    };
     let state = if dispatch.is_none() || event_count == 0 {
         "unavailable"
-    } else if message_count != 1 || (delivered && failed) {
+    } else if message_count != 1
+        || accounts != 1
+        || mismatched
+        || duplicate
+        || (delivered && failed)
+    {
         "conflict"
     } else if unrecognized {
         "unrecognized"
@@ -273,7 +291,7 @@ pub async fn sms_delivery(client: &Client, environment: &str, job: Uuid) -> Resu
         "pending"
     };
     Ok(
-        json!({"attemptState":attempt,"providerState":state,"eventCount":event_count,"messageCount":message_count}),
+        json!({"attemptState":attempt,"providerState":state,"eventCount":event_count,"messageCount":message_count,"providerIdKnown":provider_id.is_some_and(|id| !id.is_empty())}),
     )
 }
 
@@ -384,7 +402,8 @@ pub async fn resolve(
                 &[&environment, &job],
             )
             .await?;
-            tx.execute("UPDATE novu_rust_sms_messages SET delivery_state='not_attempted',status='sent',error_id=NULL,error_text=NULL,identifier=NULL WHERE environment_id=$1 AND sms_job_id=$2", &[&environment,&job]).await?;
+            tx.execute("UPDATE novu_queue_jobs SET twilio_delivery_result=NULL WHERE environment_id=$1 AND id=$2", &[&environment,&job]).await?;
+            tx.execute("UPDATE novu_rust_sms_messages SET twilio_delivery_result=NULL,delivery_state='not_attempted',status='sent',error_id=NULL,error_text=NULL,identifier=NULL WHERE environment_id=$1 AND sms_job_id=$2", &[&environment,&job]).await?;
         }
         (crate::sendgrid_queue::JOB_KIND, None, "accepted") => {
             tx.execute("UPDATE novu_rust_sendgrid_attempts SET state='accepted',updated_at=clock_timestamp() WHERE environment_id=$1 AND job_id=$2", &[&environment,&job]).await?;

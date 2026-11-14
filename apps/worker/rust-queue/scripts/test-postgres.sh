@@ -64,6 +64,10 @@ docker exec "$name" createdb -U postgres novu_grant_lock_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_grant_lock_test" \
   cargo test --locked --test operator_grant_lock -- --ignored
 
+docker exec "$name" createdb -U postgres novu_twilio_projection_test
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_twilio_projection_test" \
+  cargo test --locked --test twilio_projection -- --ignored
+
 # This final test restarts the disposable database container.
 docker exec "$name" createdb -U postgres novu_resend_reconnect_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_resend_reconnect_test" TEST_PG_CONTAINER="$name" \

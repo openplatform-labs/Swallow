@@ -24,6 +24,7 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
         queue::resend_projection::MIGRATION,
         queue::in_app::EMAIL_PROVIDER_RESULT_MIGRATION,
         queue::in_app::SMS_MESSAGES_MIGRATION,
+        queue::twilio_projection::MIGRATION,
         queue::in_app::PUSH_MESSAGES_MIGRATION,
         queue::in_app::DELIVERY_STATE_MIGRATION,
         reconciliation::MIGRATION,
@@ -390,7 +391,7 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
         .unwrap();
     assert_eq!(
         result,
-        json!({"attemptState":"unknown","providerState":"delivered","eventCount":1,"messageCount":1})
+        json!({"attemptState":"unknown","providerState":"delivered","eventCount":1,"messageCount":1,"providerIdKnown":false})
     );
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
         .args(["sms-delivery", "tenant-a", &sms.to_string()])
@@ -830,6 +831,13 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     let old_dispatch = Uuid::new_v4();
     db.execute("INSERT INTO novu_rust_twilio_dispatch_ids(id,job_id,environment_id) VALUES ($1,$2,'tenant-a')", &[&old_dispatch,&sms_retry]).await.unwrap();
     db.execute("INSERT INTO novu_rust_twilio_attempts(job_id,environment_id,state,dispatch_id) VALUES ($1,'tenant-a','unknown',$2)", &[&sms_retry,&old_dispatch]).await.unwrap();
+    db.execute(
+        "UPDATE novu_queue_jobs SET twilio_delivery_result='unknown' WHERE id=$1",
+        &[&sms_retry],
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO novu_rust_sms_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,status,sms_job_id,twilio_delivery_result) VALUES ('sms-retry-message','tenant-a','s','s','n','w','t','sent',$1,'unknown')", &[&sms_retry]).await.unwrap();
     // A callback for a different dispatch (or environment) cannot block a retry.
     let unrelated_dispatch = Uuid::new_v4();
     db.execute("INSERT INTO novu_rust_twilio_delivery_events(environment_id,account_sid,message_sid,status,job_id,dispatch_id) VALUES ('tenant-a','ACfixture','SMother','delivered',$1,$2),('tenant-b','ACfixture','SMcross','delivered',$1,$3)", &[&sms_retry,&unrelated_dispatch,&old_dispatch]).await.unwrap();
@@ -848,6 +856,9 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     assert_eq!(row.get::<_, String>(0), "pending");
     assert_eq!(row.get::<_, i64>(1), 0);
     assert_eq!(row.get::<_, i64>(2), 1);
+    let cleared = db.query_one("SELECT j.twilio_delivery_result,m.twilio_delivery_result FROM novu_queue_jobs j JOIN novu_rust_sms_messages m ON m.sms_job_id=j.id WHERE j.id=$1", &[&sms_retry]).await.unwrap();
+    assert!(cleared.get::<_, Option<String>>(0).is_none());
+    assert!(cleared.get::<_, Option<String>>(1).is_none());
     let recorded: Uuid = db.query_one("SELECT retry_dispatch_id FROM novu_rust_delivery_reconciliations WHERE job_id=$1 AND decision='retry'", &[&sms_retry]).await.unwrap().get(0);
     assert_eq!(recorded, old_dispatch);
     let retained: bool = db.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_twilio_dispatch_ids WHERE id=$1 AND job_id=$2 AND environment_id='tenant-a')", &[&old_dispatch,&sms_retry]).await.unwrap().get(0);

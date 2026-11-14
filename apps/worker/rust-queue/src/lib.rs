@@ -11,6 +11,7 @@ pub mod resend_queue;
 pub mod sendgrid;
 pub mod sendgrid_queue;
 pub mod twilio;
+pub mod twilio_projection;
 pub mod twilio_queue;
 
 use serde_json::Value;
