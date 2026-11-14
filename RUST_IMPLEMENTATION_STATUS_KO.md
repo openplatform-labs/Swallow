@@ -116,7 +116,7 @@ API 마이그레이션 `0006`·`0007`과 워커 마이그레이션 `0056`까지 
 
 ## 수행한 검증
 
-- 2026-11-14 [격리된 실발송 테스트](apps/worker/rust-queue/scripts/test-resend-live.sh)는 Docker PostgreSQL에 워크플로 트리거 작업을 직접 넣고 Rust 인앱 워커→Resend 워커→실제 Resend API의 성공 응답을 확인했다. 큐 작업, 발송 시도와 이메일 이력의 상태가 `completed`/`accepted`/`accepted`로 기록됐다. API HTTP 트리거, 관리 API, 웹훅, 원본 Novu와 메일함 수신 여부는 이 시험에서 확인하지 않았다. 실행할 때마다 새 이메일 한 건을 발송한다.
+- 2026-11-14 [격리된 실발송 테스트](apps/worker/rust-queue/scripts/test-resend-live.sh)는 Docker PostgreSQL에 워크플로 트리거 작업을 직접 넣고 Rust 인앱 워커→Resend 워커→실제 Resend API의 성공 응답을 확인했다. 큐 작업, 발송 시도와 이메일 이력의 상태가 `completed`/`accepted`/`accepted`로 기록됐다. 사용자가 지정 메일함에서 해당 테스트 메일과 본문 수신을 확인했다. API HTTP 트리거, 관리 API, 웹훅과 원본 Novu는 이 시험에서 확인하지 않았다. 실행할 때마다 새 이메일 한 건을 발송한다.
 
 - 2026-11-14 검증된 다른 발신 도메인으로 사용자가 지정한 수신자에게 [실제 Resend 어댑터 발송 테스트](apps/worker/rust-queue/src/resend.rs)를 재실행해 API가 성공 응답과 이메일 ID를 반환했다. 사용자가 지정 메일함의 수신과 본문을 확인했다. 워크플로 경유 실발송·웹훅 및 원본과의 종단 간 비교는 확인하지 않았다. 노출된 테스트 키는 교체해야 한다.
 
