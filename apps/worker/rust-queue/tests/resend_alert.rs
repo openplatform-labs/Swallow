@@ -111,6 +111,39 @@ async fn resend_check_exits_for_unmatched_and_missing_evidence() {
     db.execute("INSERT INTO novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type,recipient_hash) VALUES ('env','event1','id','email.delivered','hash')", &[]).await.unwrap();
     let healthy = check();
     assert_eq!(healthy.status.code(), Some(0));
+    db.execute(
+        "UPDATE novu_rust_resend_attempts SET state='unknown' WHERE job_id=$1",
+        &[&job],
+    )
+    .await
+    .unwrap();
+    let uncertain = check();
+    assert_eq!(uncertain.status.code(), Some(2));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&uncertain.stdout).unwrap()["needsAttention"],
+        true
+    );
+    assert!(
+        queue::resend_projection::project(&mut db, "env", job)
+            .await
+            .unwrap()
+    );
+    let result: String = db
+        .query_one(
+            "SELECT resend_delivery_result FROM novu_queue_jobs WHERE id=$1",
+            &[&job],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(result, "unknown");
+    db.execute(
+        "UPDATE novu_rust_resend_attempts SET state='accepted' WHERE job_id=$1",
+        &[&job],
+    )
+    .await
+    .unwrap();
+    assert_eq!(check().status.code(), Some(0));
     let mut worker = std::process::Command::new(env!("CARGO_BIN_EXE_resend-projection-worker"))
         .env("DATABASE_URL", &url)
         .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")

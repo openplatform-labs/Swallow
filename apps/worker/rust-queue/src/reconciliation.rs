@@ -550,19 +550,10 @@ pub async fn resend_evidence<C: tokio_postgres::GenericClient + Sync>(
 
 /// A conservative, per-job alert: only a complete set of delivered recipients is healthy.
 pub fn resend_needs_attention(evidence: &Value) -> Result<bool> {
-    let recipients = evidence["recipients"]
+    evidence["recipients"]
         .as_array()
         .ok_or("invalid Resend evidence")?;
-    if recipients.is_empty()
-        || evidence["providerIdKnown"].as_bool() != Some(true)
-        || evidence["unmatchedEvents"].as_i64() != Some(0)
-    {
-        return Ok(true);
-    }
-    Ok(recipients.iter().any(|recipient| {
-        recipient["result"].as_str() != Some("delivered")
-            || recipient["complained"].as_bool() != Some(false)
-    }))
+    Ok(crate::resend_projection::classify(evidence) != "delivered")
 }
 
 /// Show signed Twilio evidence explicitly bound to this job, without phone numbers.
@@ -866,9 +857,19 @@ mod resend_alert_tests {
 
     #[test]
     fn only_complete_unambiguous_delivery_is_healthy() {
-        let healthy = json!({"providerIdKnown":true,"unmatchedEvents":0,"recipients":[{"result":"delivered","complained":false}]});
+        let healthy = json!({"attemptState":"accepted","providerIdKnown":true,"unmatchedEvents":0,"recipients":[{"result":"delivered","complained":false}]});
         assert!(!resend_needs_attention(&healthy).unwrap());
-        for evidence in [
+        for state in [
+            json!("unknown"),
+            json!("dispatching"),
+            json!("rejected"),
+            json!(null),
+        ] {
+            let mut evidence = healthy.clone();
+            evidence["attemptState"] = state;
+            assert!(resend_needs_attention(&evidence).unwrap());
+        }
+        for mut evidence in [
             json!({"providerIdKnown":false,"unmatchedEvents":0,"recipients":[{"result":"delivered","complained":false}]}),
             json!({"providerIdKnown":true,"unmatchedEvents":1,"recipients":[{"result":"delivered","complained":false}]}),
             json!({"providerIdKnown":true,"unmatchedEvents":0,"recipients":[]}),
@@ -877,6 +878,7 @@ mod resend_alert_tests {
             json!({"providerIdKnown":true,"unmatchedEvents":0,"recipients":[{"result":"delivered","complained":true}]}),
             json!({"providerIdKnown":true,"unmatchedEvents":0,"recipients":[{"result":"delivered","complained":null}]}),
         ] {
+            evidence["attemptState"] = json!("accepted");
             assert!(resend_needs_attention(&evidence).unwrap());
         }
         assert!(resend_needs_attention(&json!({})).is_err());
