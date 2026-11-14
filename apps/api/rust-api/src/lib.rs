@@ -2567,8 +2567,9 @@ async fn set_workflow_email_provider(
             &path,
         );
     };
-    // Hold matching grant, key and user row locks through the SQL statement.
-    let result=db.query_opt("WITH authorized AS MATERIALIZED (SELECT public.novu_rust_lock_workflow_provider_grant($4,$1,'write') AS allowed) UPDATE novu_rust_workflows w SET email_provider=$3 FROM authorized a WHERE a.allowed AND w.environment_id=$1 AND w.identifier=$2 RETURNING w.email_provider", &[&environment,&workflow,&provider,&hash]).await;
+    // Hold matching authorization locks; update and audit commit atomically.
+    let audit_id = uuid::Uuid::new_v4();
+    let result=db.query_opt("WITH authorized AS MATERIALIZED (SELECT public.novu_rust_lock_workflow_provider_grant($4,$1,'write') AS allowed), target AS MATERIALIZED (SELECT w.environment_id,w.identifier,w.email_provider AS previous,k.user_id FROM authorized a JOIN novu_rust_workflows w ON w.environment_id=$1 AND w.identifier=$2 JOIN novu_rust_api_keys k ON k.key_hash=$4 WHERE a.allowed FOR UPDATE OF w), updated AS (UPDATE novu_rust_workflows w SET email_provider=$3 FROM target t WHERE w.environment_id=t.environment_id AND w.identifier=t.identifier RETURNING w.email_provider,t.previous,t.user_id), audited AS (INSERT INTO public.novu_rust_workflow_provider_audit(id,environment_id,workflow_identifier,api_key_hash,user_id,previous_provider,new_provider) SELECT $5,$1,$2,$4,u.user_id,u.previous,u.email_provider FROM updated u RETURNING 1) SELECT u.email_provider FROM updated u CROSS JOIN audited", &[&environment,&workflow,&provider,&hash,&audit_id]).await;
     match result {
         Ok(Some(row)) => (
             StatusCode::OK,

@@ -70,6 +70,7 @@ async fn authorized_change_and_revocation_are_serialized() {
         include_str!("../../../worker/rust-queue/migrations/0061_workflow_email_provider.sql"),
         include_str!("../migrations/0011_workflow_provider_permissions.sql"),
         include_str!("../migrations/0014_workflow_provider_auth_lock.sql"),
+        include_str!("../migrations/0015_workflow_provider_audit.sql"),
     ] {
         admin.batch_execute(sql).await.unwrap();
     }
@@ -121,6 +122,48 @@ async fn authorized_change_and_revocation_are_serialized() {
             .is_err()
     );
     admin.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_lock_workflow_provider_grant(text,text,text) TO {role}")).await.unwrap();
+    // The API role cannot write audit rows yet: the attempted update must roll back.
+    let app = novu_rust_api::router(Arc::new(actor));
+    assert_eq!(put(app.clone()).await, StatusCode::INTERNAL_SERVER_ERROR);
+    let provider: String = admin.query_one("SELECT email_provider FROM novu_rust_workflows WHERE environment_id='e' AND identifier='w'", &[]).await.unwrap().get(0);
+    assert_eq!(provider, "sendgrid");
+    let audit_count: i64 = admin
+        .query_one(
+            "SELECT count(*) FROM public.novu_rust_workflow_provider_audit",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(audit_count, 0);
+    admin
+        .batch_execute(&format!(
+            "GRANT INSERT ON public.novu_rust_workflow_provider_audit TO {role}"
+        ))
+        .await
+        .unwrap();
+    // Recreate the restricted session to retain the backend PID for lock tests.
+    drop(app);
+    let actor = connect(&url).await;
+    actor
+        .batch_execute(&format!("SET SESSION AUTHORIZATION {role}"))
+        .await
+        .unwrap();
+    assert!(
+        actor
+            .query(
+                "SELECT * FROM public.novu_rust_workflow_provider_audit",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        actor
+            .execute("DELETE FROM public.novu_rust_workflow_provider_audit", &[])
+            .await
+            .is_err()
+    );
     let pid: i32 = actor
         .query_one("SELECT pg_backend_pid()", &[])
         .await
@@ -147,6 +190,26 @@ async fn authorized_change_and_revocation_are_serialized() {
     assert_eq!(change.await.unwrap(), StatusCode::OK);
     assert_eq!(revoke.await.unwrap(), 1);
     assert_eq!(put(app.clone()).await, StatusCode::FORBIDDEN);
+    let row = admin.query_one("SELECT environment_id,workflow_identifier,api_key_hash,user_id,previous_provider,new_provider FROM public.novu_rust_workflow_provider_audit", &[]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "e");
+    assert_eq!(row.get::<_, String>(1), "w");
+    assert_eq!(row.get::<_, String>(2), hash);
+    assert_eq!(row.get::<_, String>(3), "u");
+    assert_eq!(row.get::<_, String>(4), "sendgrid");
+    assert_eq!(row.get::<_, String>(5), "resend");
+    // Every authorized PUT is audited, including an unchanged value.
+    admin
+        .execute(
+            "INSERT INTO novu_rust_workflow_provider_permissions VALUES ($1,'write')",
+            &[&hash],
+        )
+        .await
+        .unwrap();
+    assert_eq!(put(app.clone()).await, StatusCode::OK);
+    let noop:i64=admin.query_one("SELECT count(*) FROM public.novu_rust_workflow_provider_audit WHERE previous_provider='resend' AND new_provider='resend'", &[]).await.unwrap().get(0);
+    assert_eq!(noop, 1);
+    admin.execute("DELETE FROM novu_rust_workflow_provider_permissions WHERE key_hash=$1 AND permission='write'", &[&hash]).await.unwrap();
+
     // If revocation has locked the grant before the mutation, the mutation must
     // wait and then reject after commit, even if its initial read saw the grant.
     admin
