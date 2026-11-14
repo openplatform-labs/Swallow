@@ -7,6 +7,12 @@ use std::{error::Error, time::Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    novu_postgres_queue::shutdown::run_until_signal(run).await
+}
+
+async fn run(
+    stop: novu_postgres_queue::shutdown::Stop,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let environment = std::env::var("NOVU_TWILIO_ENVIRONMENT_ID")?;
     if environment.is_empty() {
         return Err("NOVU_TWILIO_ENVIRONMENT_ID must not be empty".into());
@@ -47,6 +53,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     };
     let timeout = Duration::from_secs(timeout);
     loop {
+        if stop.requested() {
+            return Ok(());
+        }
         let connection = tokio::time::timeout(timeout, config.connect(tls.clone())).await;
         if let Ok(Ok((mut db, driver))) = connection {
             let task = tokio::spawn(driver);
@@ -79,11 +88,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         task.abort();
                         let _ = task.await;
                         eprintln!("SMS workflow policy registration failed; reconnecting");
-                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        stop.wait(Duration::from_secs(2)).await;
                         continue;
                     }
                 }
                 loop {
+                    if stop.requested() {
+                        break;
+                    }
                     if tokio::time::Instant::now() >= recovery {
                         if !matches!(
                             tokio::time::timeout(
@@ -97,6 +109,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         }
                         recovery = tokio::time::Instant::now() + Duration::from_secs(5);
                     }
+                    if stop.requested() {
+                        break;
+                    }
                     match tokio::time::timeout(
                         timeout,
                         twilio_queue::process_one_with_step_policy(
@@ -109,7 +124,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     .await
                     {
                         Ok(Ok(true)) => {}
-                        Ok(Ok(false)) => tokio::time::sleep(Duration::from_secs(1)).await,
+                        Ok(Ok(false)) => stop.wait(Duration::from_secs(1)).await,
                         _ => break,
                     }
                 }
@@ -119,7 +134,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             task.abort();
             let _ = task.await;
         }
+        if stop.requested() {
+            return Ok(());
+        }
         eprintln!("Twilio worker database operation stopped; reconnecting");
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        stop.wait(Duration::from_secs(2)).await;
     }
 }

@@ -13,6 +13,7 @@ pub mod resend_queue;
 pub mod sendgrid;
 pub mod sendgrid_projection;
 pub mod sendgrid_queue;
+pub mod shutdown;
 pub mod slack;
 pub mod slack_queue;
 pub mod slack_webhook;
