@@ -17,6 +17,7 @@ fn fail(status: StatusCode, message: &str, path: &str) -> ApiError {
         StatusCode::BAD_REQUEST => "Bad Request",
         StatusCode::FORBIDDEN => "Forbidden",
         StatusCode::NOT_FOUND => "Not Found",
+        StatusCode::CONFLICT => "Conflict",
         _ => "Internal Server Error",
     };
     error_at(status, message, label, path)
@@ -86,10 +87,11 @@ pub(super) async fn put(
         Ok(v) => v,
         Err(_) => return fail(StatusCode::BAD_REQUEST, "Invalid JSON", &path),
     };
-    let Some(object) = input
-        .as_object()
-        .filter(|v| v.len() == 2 && v.contains_key("content") && v.contains_key("active"))
-    else {
+    let Some(object) = input.as_object().filter(|v| {
+        (v.len() == 2 || (v.len() == 3 && v.contains_key("expected")))
+            && v.contains_key("content")
+            && v.contains_key("active")
+    }) else {
         return fail(StatusCode::BAD_REQUEST, "Invalid chat step", &path);
     };
     let content: Option<&str> = match &object["content"] {
@@ -100,10 +102,40 @@ pub(super) async fn put(
     let Some(active) = object["active"].as_bool() else {
         return fail(StatusCode::BAD_REQUEST, "Invalid chat step", &path);
     };
+    let (conditional, expected_content, expected_active) = match object.get("expected") {
+        None => (false, None, None),
+        Some(Value::Object(e))
+            if e.len() == 2 && e.contains_key("content") && e.contains_key("active") =>
+        {
+            let content = match &e["content"] {
+                Value::Null => None,
+                Value::String(s) if s.len() <= 40000 && !s.contains('\0') => Some(s.as_str()),
+                _ => return fail(StatusCode::BAD_REQUEST, "Invalid expected step", &path),
+            };
+            match e["active"].as_bool() {
+                Some(a) => (true, content, Some(a)),
+                None => return fail(StatusCode::BAD_REQUEST, "Invalid expected step", &path),
+            }
+        }
+        _ => return fail(StatusCode::BAD_REQUEST, "Invalid expected step", &path),
+    };
     let id = Uuid::new_v4();
-    let sql = "WITH auth AS MATERIALIZED (SELECT public.novu_rust_lock_slack_workflow_grant($1,$2,'write') AS ok), target AS MATERIALIZED (SELECT w.environment_id,w.identifier,w.chat_step_active AS previous_active,octet_length(w.chat_content) AS previous_bytes,k.user_id FROM public.novu_rust_workflows w JOIN public.novu_rust_api_keys k ON k.key_hash=$1 CROSS JOIN auth a WHERE a.ok AND w.environment_id=$2 AND w.identifier=$3 FOR UPDATE OF w), updated AS (UPDATE public.novu_rust_workflows w SET chat_content=$4,chat_step_active=$5 FROM target t WHERE w.environment_id=t.environment_id AND w.identifier=t.identifier RETURNING w.chat_content,w.chat_step_active,t.previous_active,t.previous_bytes,t.user_id), audited AS (INSERT INTO public.novu_rust_slack_workflow_audit(id,environment_id,workflow_identifier,api_key_hash,user_id,previous_active,new_active,previous_content_bytes,new_content_bytes) SELECT $6,$2,$3,$1,u.user_id,u.previous_active,u.chat_step_active,u.previous_bytes,octet_length(u.chat_content) FROM updated u RETURNING 1) SELECT u.chat_content,u.chat_step_active FROM updated u CROSS JOIN audited";
+    let sql = "WITH auth AS MATERIALIZED (SELECT public.novu_rust_lock_slack_workflow_grant($1,$2,'write') AS ok), target AS MATERIALIZED (SELECT w.environment_id,w.identifier,w.chat_step_active AS previous_active,octet_length(w.chat_content) AS previous_bytes,k.user_id FROM public.novu_rust_workflows w JOIN public.novu_rust_api_keys k ON k.key_hash=$1 CROSS JOIN auth a WHERE a.ok AND w.environment_id=$2 AND w.identifier=$3 AND (NOT $7::boolean OR (w.chat_content IS NOT DISTINCT FROM $8::text AND w.chat_step_active IS NOT DISTINCT FROM $9::boolean)) FOR UPDATE OF w), updated AS (UPDATE public.novu_rust_workflows w SET chat_content=$4,chat_step_active=$5 FROM target t WHERE w.environment_id=t.environment_id AND w.identifier=t.identifier RETURNING w.chat_content,w.chat_step_active,t.previous_active,t.previous_bytes,t.user_id), audited AS (INSERT INTO public.novu_rust_slack_workflow_audit(id,environment_id,workflow_identifier,api_key_hash,user_id,previous_active,new_active,previous_content_bytes,new_content_bytes) SELECT $6,$2,$3,$1,u.user_id,u.previous_active,u.chat_step_active,u.previous_bytes,octet_length(u.chat_content) FROM updated u RETURNING 1) SELECT u.chat_content,u.chat_step_active FROM updated u CROSS JOIN audited";
     match db
-        .query_opt(sql, &[&hash, &env, &workflow, &content, &active, &id])
+        .query_opt(
+            sql,
+            &[
+                &hash,
+                &env,
+                &workflow,
+                &content,
+                &active,
+                &id,
+                &conditional,
+                &expected_content,
+                &expected_active,
+            ],
+        )
         .await
     {
         Ok(Some(row)) => (
@@ -111,6 +143,11 @@ pub(super) async fn put(
             Json(
                 json!({"data":{"workflowIdentifier":workflow,"content":row.get::<_,Option<String>>(0),"active":row.get::<_,bool>(1)}}),
             ),
+        ),
+        Ok(None) if conditional => fail(
+            StatusCode::CONFLICT,
+            "Workflow changed, missing or permission revoked",
+            &path,
         ),
         Ok(None) => fail(
             StatusCode::NOT_FOUND,

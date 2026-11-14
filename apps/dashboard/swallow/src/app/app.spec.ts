@@ -16,7 +16,7 @@ describe('Swallow console', () => {
       await app.loadWorkflow();expect(app.workflowStatus()).toBe('loaded');app.workflowContent='new';app.workflowConfirmed=true;await app.saveWorkflow();expect(app.workflowStatus()).toBe('saved');
       const calls=fetchMock.mock.calls.slice(-2);expect((calls[0][0] as string)).toContain(channel==='slack'?'/slack-step':`/channel-steps/${channel}`);
       expect(calls[1][1]?.headers).toEqual({Authorization:'ApiKey test-key','Content-Type':'application/json'});
-      expect(JSON.parse(calls[1][1]?.body as string)).toEqual(channel==='slack'?{content:'new',active:true}:{title:channel==='sms'?null:'title',content:'new',active:true});
+      expect(JSON.parse(calls[1][1]?.body as string)).toEqual(channel==='slack'?{content:'new',active:true,expected:{content:'old',active:true}}:{title:channel==='sms'?null:'title',content:'new',active:true,expected:{title:channel==='sms'?null:'title',content:'old',active:true}});
     }
     app.setSection('overview');expect(app.workflowKey).toBe('');expect(app.workflowContent).toBe('');
   });
@@ -27,6 +27,12 @@ describe('Swallow console', () => {
     const app=TestBed.createComponent(App).componentInstance;app.setSection('workflows');app.workflowIdentifier='welcome';app.workflowKey='key';await app.loadWorkflow();await app.saveWorkflow();expect(fetchMock).toHaveBeenCalledTimes(1);
     app.workflowConfirmed=true;const pending=app.saveWorkflow();app.setSection('overview');expect(app.section()).toBe('workflows');finish(new Response('',{status:500}));await pending;
     expect(app.workflowStatus()).toBe('unknown');expect(app.workflowMessage()).toContain('감사');expect(app.workflowConfirmed).toBe(false);
+  });
+
+  it('rejects a stale workflow edit and requires a fresh read', async () => {
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:{workflowIdentifier:'welcome',channel:'email',title:'title',content:'old',active:true}}))).mockResolvedValueOnce(new Response('',{status:409}));
+    const app=TestBed.createComponent(App).componentInstance;app.workflowIdentifier='welcome';app.workflowKey='key';await app.loadWorkflow();app.workflowConfirmed=true;await app.saveWorkflow();
+    expect(app.workflowStatus()).toBe('error');expect(app.workflowMessage()).toContain('다시 조회');await app.saveWorkflow();expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it('does not apply an outdated workflow read after credentials change', async () => {
