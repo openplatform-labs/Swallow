@@ -276,6 +276,71 @@ describe('Swallow console', () => {
     expect(app.lookupId).toBe('preserved-lookup');expect(app.decisionStatus()).toBe('unknown');expect(app.decisionRequestId()).toBe('preserved-request');fixture.destroy();
   });
 
+  it('discards permission reads after delayed OIDC expiry while preserving the stored request ID', async () => {
+    vi.useFakeTimers();vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));
+    vi.spyOn(OperatorOidc.prototype,'signIn').mockImplementation(async()=>({token:'aaa.bbb.ccc',subject:'alice',environmentId:'env-a',expiresAt:Math.floor(Date.now()/1000)+2}));
+    let finish!:(response:Response)=>void;const fetchMock=vi.spyOn(globalThis,'fetch');
+    for(const mode of ['identity','audit','request'] as const){
+      vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));const fixture=TestBed.createComponent(App);const app=fixture.componentInstance;
+      app.oidcIssuer='https://issuer.test';app.oidcClientId='console';app.oidcEnvironment='env-a';await app.prepareOidc();await app.signInOidc();app.setSection('settings');app.useOidcForPermissions();
+      app.permissionIssuer='https://issuer.test';app.permissionSubject='alice';app.permissionClient='console';app.permissionRequestId='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
+      fetchMock.mockReturnValueOnce(new Promise(done=>{finish=done;}));
+      const pending=mode==='request'?app.lookupPermissionRequest():app.loadPermissions(mode);
+      vi.setSystemTime(new Date('2026-01-01T00:00:03Z'));
+      finish(new Response(JSON.stringify(mode==='identity'?{found:false}:mode==='audit'?{data:[],next:null}:{found:false})));await pending;
+      expect(app.oidcStatus()).toBe('expired');expect(app.permissionKey).toBe('');expect(app.permissionStatus()).toBe('idle');expect(app.permissionRequestStatus()).toBe('idle');expect(app.permissionRequestId).toBe('1889f88e-c0a3-4ab5-b861-2fdc1f26f254');fixture.destroy();
+    }
+  });
+
+  it('does not submit a permission change if the OIDC token expires during credential hashing', async () => {
+    vi.useFakeTimers();vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));
+    vi.spyOn(OperatorOidc.prototype,'signIn').mockResolvedValue({token:'aaa.bbb.ccc',subject:'alice',environmentId:'env-a',expiresAt:Math.floor(Date.now()/1000)+2});
+    const fetchMock=vi.spyOn(globalThis,'fetch');const fixture=TestBed.createComponent(App);const app=fixture.componentInstance;
+    app.oidcIssuer='https://issuer.test';app.oidcClientId='console';app.oidcEnvironment='env-a';await app.prepareOidc();await app.signInOidc();app.setSection('settings');app.useOidcForPermissions();
+    app.permissionIssuer='https://issuer.test';app.permissionSubject='alice';app.permissionClient='console';app.permissionStatus.set('missing');app.permissionReason='ticket';app.permissionConfirmed=true;
+    let finish!:(hash:string)=>void;const internal=app as unknown as {credentialFingerprint:(key:string)=>Promise<string>};vi.spyOn(internal,'credentialFingerprint').mockReturnValue(new Promise(done=>{finish=done;}));
+    const pending=app.changePermissions();vi.setSystemTime(new Date('2026-01-01T00:00:03Z'));finish('hash');await pending;
+    expect(fetchMock).not.toHaveBeenCalled();expect(app.permissionKey).toBe('');expect(app.permissionChangeStatus()).toBe('unavailable');expect(app.permissionChange()).toBeNull();fixture.destroy();
+  });
+
+  it('does not send an alert decision when OIDC expires during credential hashing', async () => {
+    vi.useFakeTimers();vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));
+    vi.spyOn(OperatorOidc.prototype,'signIn').mockResolvedValue({token:'aaa.bbb.ccc',subject:'alice',environmentId:'env-a',expiresAt:Math.floor(Date.now()/1000)+2});
+    const fetchMock=vi.spyOn(globalThis,'fetch');const fixture=TestBed.createComponent(App);const app=fixture.componentInstance;
+    app.oidcIssuer='https://issuer.test';app.oidcClientId='console';app.oidcEnvironment='env-a';await app.prepareOidc();await app.signInOidc();app.useOidc('alerts');
+    app.selectedAlert.set({channel:'slack',targetId:'ops',state:'unknown',lastStartedAt:null,attemptId:'1889f88e-c0a3-4ab5-b861-2fdc1f26f254'});app.decisionReason='ticket';app.decisionConfirmed=true;app.useOidcForDecision('decision');
+    let finish!:(hash:string)=>void;const internal=app as unknown as {credentialFingerprint:(key:string)=>Promise<string>};vi.spyOn(internal,'credentialFingerprint').mockReturnValue(new Promise(done=>{finish=done;}));
+    const pending=app.resolveAlert();vi.setSystemTime(new Date('2026-01-01T00:00:03Z'));finish('hash');await pending;
+    expect(fetchMock).not.toHaveBeenCalled();expect(app.decisionStatus()).toBe('unavailable');expect(app.decisionRequestId()).toBeNull();fixture.destroy();
+  });
+
+  it('retains the result and request ID of a permission change already sent before expiry', async () => {
+    vi.useFakeTimers();vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));
+    vi.spyOn(OperatorOidc.prototype,'signIn').mockResolvedValue({token:'aaa.bbb.ccc',subject:'alice',environmentId:'env-a',expiresAt:Math.floor(Date.now()/1000)+2});
+    let finish!:(response:Response)=>void;vi.spyOn(globalThis,'fetch').mockReturnValue(new Promise(done=>{finish=done;}));
+    const fixture=TestBed.createComponent(App);const app=fixture.componentInstance;app.oidcIssuer='https://issuer.test';app.oidcClientId='console';app.oidcEnvironment='env-a';await app.prepareOidc();await app.signInOidc();app.setSection('settings');app.useOidcForPermissions();
+    app.permissionIssuer='https://issuer.test';app.permissionSubject='alice';app.permissionClient='console';app.permissionStatus.set('missing');app.permissionReason='ticket';app.permissionConfirmed=true;
+    const internal=app as unknown as {credentialFingerprint:(key:string)=>Promise<string>};vi.spyOn(internal,'credentialFingerprint').mockResolvedValue('hash');
+    const pending=app.changePermissions();await Promise.resolve();expect(finish).toBeDefined();const requestId=app.permissionChange()?.body.requestId;expect(requestId).toBeTruthy();
+    vi.advanceTimersByTime(2000);expect(app.permissionKey).toBe('');finish(new Response(JSON.stringify({changed:true,replayed:false})));await pending;
+    expect(app.permissionChangeStatus()).toBe('recorded');expect(app.permissionChange()?.body.requestId).toBe(requestId);fixture.destroy();
+  });
+
+  it('retains an uncertain alert decision without retrying after OIDC expires during hashing', async () => {
+    vi.useFakeTimers();vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));
+    vi.spyOn(OperatorOidc.prototype,'signIn').mockResolvedValue({token:'aaa.bbb.ccc',subject:'alice',environmentId:'env-a',expiresAt:Math.floor(Date.now()/1000)+2});
+    const fetchMock=vi.spyOn(globalThis,'fetch');const fixture=TestBed.createComponent(App);const app=fixture.componentInstance;app.oidcIssuer='https://issuer.test';app.oidcClientId='console';app.oidcEnvironment='env-a';await app.prepareOidc();await app.signInOidc();app.useOidc('alerts');
+    const id='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';app.decisionStatus.set('unknown');app.decisionRequestId.set(id);app.retrySnapshot.set({origin:'http://127.0.0.1:3000',endpoint:'/retry',scheme:'Bearer',requestId:id,channel:'slack',targetId:'ops',attemptId:id,decision:'retry',reason:'ticket',keyHash:'hash'});app.useOidcForDecision('retry');app.retryConfirmed=true;
+    let finish!:(hash:string)=>void;const internal=app as unknown as {credentialFingerprint:(key:string)=>Promise<string>};vi.spyOn(internal,'credentialFingerprint').mockReturnValue(new Promise(done=>{finish=done;}));
+    const pending=app.retryDecision();vi.setSystemTime(new Date('2026-01-01T00:00:03Z'));finish('hash');await pending;
+    expect(fetchMock).not.toHaveBeenCalled();expect(app.decisionStatus()).toBe('unknown');expect(app.decisionRequestId()).toBe(id);expect(app.retrySnapshot()?.requestId).toBe(id);fixture.destroy();
+  });
+
   it('checks expiry before applying a session even if the browser delayed its timer', async () => {
     vi.useFakeTimers();vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
     vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));

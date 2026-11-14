@@ -192,7 +192,7 @@ export class App implements OnDestroy {
     if (this.decisionKey===session.token) this.decisionKey='';
     if (this.retryKey===session.token) this.retryKey='';
     if (this.lookupKey===session.token) { this.lookupKey=''; this.clearRequestLookup(); }
-    if (this.permissionKey===session.token) this.clearPermissions(true);
+    if (this.permissionKey===session.token) { this.permissionKey=''; this.clearPermissions(); }
     return true;
   }
 
@@ -283,12 +283,13 @@ export class App implements OnDestroy {
       const response=await fetch(`${this.validatedOrigin()}/v1/experimental/operator/permissions/request?${params}`,{headers:{Authorization:`Bearer ${key}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
       if(!response.ok)throw new Error('request unavailable');
       const value:unknown=await response.json();if(typeof value!=='object'||value===null||!('found' in value)||typeof value.found!=='boolean')throw new Error('invalid response');
+      this.expireOidcIfNeeded();
       if(sequence!==this.permissionRequestSequence)return;
       if(!value.found){this.permissionRequestStatus.set('missing');return;}
       const r=value as Record<string,unknown>;
       if(typeof r['requestId']!=='string'||r['requestId'].toLowerCase()!==requestId.toLowerCase()||['targetIssuer','targetSubject','targetClientId','reason','createdAt'].some(k=>typeof r[k]!=='string')||typeof r['changed']!=='boolean'||!(r['expected']===null||this.isPermissionFlags(r['expected']))||!this.isPermissionFlags(r['desired']))throw new Error('invalid response');
       this.permissionRequestRecord.set({requestId:r['requestId'],targetIssuer:r['targetIssuer'] as string,targetSubject:r['targetSubject'] as string,targetClientId:r['targetClientId'] as string,expected:r['expected'] as PermissionFlags|null,desired:r['desired'],reason:r['reason'] as string,changed:r['changed'],createdAt:r['createdAt'] as string});this.permissionRequestStatus.set('found');
-    } catch {if(sequence===this.permissionRequestSequence)this.permissionRequestStatus.set('error');}
+    } catch {this.expireOidcIfNeeded();if(sequence===this.permissionRequestSequence)this.permissionRequestStatus.set('error');}
     finally {if(sequence===this.permissionRequestSequence)this.permissionRequestAbort=null;}
   }
 
@@ -319,6 +320,7 @@ export class App implements OnDestroy {
       if (!response.ok) throw new Error('request failed');
       const body:unknown=await response.json();
       if (typeof body!=='object'||body===null) throw new Error('invalid response');
+      this.expireOidcIfNeeded();if(sequence!==this.permissionSequence)return;
       if (mode==='identity') {
         if (!('found' in body)||typeof body.found!=='boolean') throw new Error('invalid response');
         if (!body.found) {if(sequence===this.permissionSequence){this.permissionDesired={enabled:false,subscriberRead:false,alertRead:false,alertRetry:false,alertAccepted:false};this.permissionStatus.set('missing');}return;}
@@ -339,7 +341,7 @@ export class App implements OnDestroy {
         if(sequence!==this.permissionSequence)return;
         this.permissionAudit.set(rows);this.permissionNext.set(body.next as string|null);this.permissionStatus.set('audit');
       }
-    } catch {if(sequence===this.permissionSequence)this.permissionStatus.set('error');}
+    } catch {this.expireOidcIfNeeded();if(sequence===this.permissionSequence)this.permissionStatus.set('error');}
     finally {if(sequence===this.permissionSequence)this.permissionAbort=null;}
   }
 
@@ -362,6 +364,7 @@ export class App implements OnDestroy {
     this.permissionChangeStatus.set('sending');this.permissionChangeMessage.set('');
     try {
       let keyHash:string;try {keyHash=await this.credentialFingerprint(key);} catch {this.permissionChangeStatus.set('unavailable');return;}
+      this.expireOidcIfNeeded();if(this.permissionKey.trim()!==key){this.permissionChangeStatus.set('unavailable');return;}
       const snapshot={origin,environment:this.permissionEnvironment.trim(),keyHash,body};this.permissionChange.set(snapshot);
       const response=await fetch(`${origin}/v1/experimental/operator/permissions?${new URLSearchParams({environmentId:snapshot.environment})}`,{method:'PUT',headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
       if(!response.ok){this.permissionChangeStatus.set([400,401,403].includes(response.status)?'rejected':'unknown');return;}
@@ -376,7 +379,8 @@ export class App implements OnDestroy {
     if(!snapshot||this.permissionChangeStatus()!=='unknown'||!this.validJwt(key)||(mode==='retry'&&!this.permissionRecoveryConfirmed))return;
     this.permissionChangeStatus.set('sending');this.permissionChangeMessage.set('');
     try {
-      if(this.validatedOrigin()!==snapshot.origin || this.permissionEnvironment.trim()!==snapshot.environment || await this.credentialFingerprint(key)!==snapshot.keyHash) {this.permissionChangeMessage.set('원래 요청과 같은 인증, 환경 및 API 주소가 필요합니다.');return;}
+      const keyHash=await this.credentialFingerprint(key);this.expireOidcIfNeeded();
+      if(this.validatedOrigin()!==snapshot.origin || this.permissionEnvironment.trim()!==snapshot.environment || this.permissionKey.trim()!==key || keyHash!==snapshot.keyHash) {this.permissionChangeMessage.set('원래 요청과 같은 인증, 환경 및 API 주소가 필요합니다.');return;}
       const params=new URLSearchParams({environmentId:snapshot.environment});
       if(mode==='lookup')params.set('requestId',snapshot.body.requestId);
       const response=await fetch(`${snapshot.origin}/v1/experimental/operator/permissions${mode==='lookup'?'/request':''}?${params}`,{method:mode==='lookup'?'GET':'PUT',headers:mode==='lookup'?{Authorization:`Bearer ${key}`}:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},...(mode==='retry'?{body:JSON.stringify(snapshot.body)}:{}),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
@@ -694,7 +698,8 @@ export class App implements OnDestroy {
     if (!snapshot || this.decisionStatus() !== 'unknown' || !this.retryConfirmed || !this.validAlertKey(key)) return;
     this.decisionStatus.set('sending'); this.retryError.set('');
     try {
-      if (await this.credentialFingerprint(key) !== snapshot.keyHash || this.validatedOrigin() !== snapshot.origin) {
+      const keyHash=await this.credentialFingerprint(key);this.expireOidcIfNeeded();
+      if (keyHash !== snapshot.keyHash || this.retryKey.trim()!==key || this.validatedOrigin() !== snapshot.origin) {
         this.retryError.set('원래 요청과 같은 인증과 API 주소가 필요합니다.');
         this.decisionStatus.set('unknown'); return;
       }
@@ -830,6 +835,8 @@ export class App implements OnDestroy {
       if (requestId) {
         try {
           const keyHash = await this.credentialFingerprint(key);
+          this.expireOidcIfNeeded();
+          if(this.decisionKey.trim()!==key){this.decisionRequestId.set(null);this.lookupId='';this.decisionStatus.set('unavailable');return;}
           this.retrySnapshot.set({origin, endpoint, scheme, ...payload, requestId, keyHash});
         } catch { this.decisionRequestId.set(null); this.lookupId = ''; this.decisionStatus.set('unavailable'); return; }
       }
