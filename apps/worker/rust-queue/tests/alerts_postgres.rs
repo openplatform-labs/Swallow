@@ -291,4 +291,66 @@ async fn alert_reservations_fence_concurrency_and_ambiguous_recovery() {
         run("missing", Some("60"), "false", "false").status.code(),
         Some(1)
     );
+    a.execute("INSERT INTO novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES ('env-a','email','check','rejected')", &[]).await.unwrap();
+    let both = |environment: &str, slack_url: &str, slack_id: &str, email_key: &str| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"))
+            .args([environment, "300", "120", "60"])
+            .env("DATABASE_URL", &url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
+            .env("SWALLOW_ALERT_ATTEMPTS_ENABLED", "false")
+            .env("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS", "60")
+            .env("SWALLOW_ALERT_SLACK_WEBHOOK", slack_url)
+            .env_remove("SWALLOW_ALERT_SLACK_WEBHOOK_FILE")
+            .env("SWALLOW_ALERT_SLACK_TARGET_ID", slack_id)
+            .env("SWALLOW_ALERT_EMAIL_TO", "ops@example.test")
+            .env("SWALLOW_ALERT_EMAIL_TARGET_ID", "check")
+            .env("NOVU_RESEND_API_KEY", email_key)
+            .env_remove("NOVU_RESEND_API_KEY_FILE")
+            .env("NOVU_RESEND_FROM", "from@example.test")
+            .output()
+            .unwrap()
+    };
+    let output = both(
+        "env-a",
+        "https://bad.invalid/secret-marker",
+        "check",
+        "fixture-key",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let log = String::from_utf8(output.stderr).unwrap();
+    assert!(log.contains("Slack alert configuration failed"));
+    assert!(log.contains("email alert requires operator review"));
+    assert!(!log.contains("secret-marker") && !log.contains("fixture-key"));
+    let output = both(
+        "env-a",
+        "https://hooks.slack.com/services/A/B/C",
+        "bad id",
+        "fixture-key",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let log = String::from_utf8(output.stderr).unwrap();
+    assert!(log.contains("Slack alert dispatch failed"));
+    assert!(log.contains("email alert requires operator review"));
+    let output = both(
+        "env-a",
+        "https://hooks.slack.com/services/A/B/C",
+        "check",
+        "",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let log = String::from_utf8(output.stderr).unwrap();
+    assert!(log.contains("email alert configuration failed"));
+    assert!(log.contains("Slack alert requires operator review"));
+    assert_eq!(
+        both(
+            "env-b",
+            "https://bad.invalid/secret-marker",
+            "check",
+            "fixture-key"
+        )
+        .status
+        .code(),
+        Some(1)
+    );
 }

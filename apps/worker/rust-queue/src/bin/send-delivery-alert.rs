@@ -21,31 +21,27 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if !(60..=86_400).contains(&cooldown) {
         return Err("invalid cooldown (60-86400 seconds)".into());
     }
-    let slack = novu_rust_contracts::secret::from_env(
-        "SWALLOW_ALERT_SLACK_WEBHOOK",
-        "SWALLOW_ALERT_SLACK_WEBHOOK_FILE",
-    )?
-    .map(|s| SlackWebhook::new(&s))
-    .transpose()
-    .map_err(|_| "invalid Slack configuration")?;
-    let email_to = std::env::var("SWALLOW_ALERT_EMAIL_TO").ok();
-    let email = if let Some(to) = email_to {
-        let provider = Resend::new(Config {
-            api_key: novu_rust_contracts::secret::from_env(
-                "NOVU_RESEND_API_KEY",
-                "NOVU_RESEND_API_KEY_FILE",
-            )?
-            .ok_or("Resend API key is required")?,
-            from: std::env::var("NOVU_RESEND_FROM")?,
-            sender_name: std::env::var("NOVU_RESEND_SENDER_NAME").unwrap_or_default(),
-        })
-        .map_err(|_| "invalid email configuration")?;
-        Some((to, provider))
-    } else {
-        None
+    // A broken destination must not suppress a second configured destination.
+    // Never print provider configuration or the underlying error: it may contain secrets.
+    let mut configuration_error = false;
+    let slack = match slack_config() {
+        Ok(value) => value,
+        Err(_) => {
+            eprintln!("Slack alert configuration failed");
+            configuration_error = true;
+            None
+        }
+    };
+    let email = match email_config() {
+        Ok(value) => value,
+        Err(_) => {
+            eprintln!("email alert configuration failed");
+            configuration_error = true;
+            None
+        }
     };
     if slack.is_none() && email.is_none() {
-        return Err("no alert destination configured".into());
+        return Err("no usable alert destination configured".into());
     }
     let slack_id =
         std::env::var("SWALLOW_ALERT_SLACK_TARGET_ID").unwrap_or_else(|_| "default".into());
@@ -118,31 +114,44 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     };
     alert.text().map_err(|_| "invalid alert environment")?;
     if !unhealthy {
+        if configuration_error {
+            std::process::exit(1);
+        }
         println!("{{\"status\":\"healthy\"}}");
         return Ok(());
     }
-    let mut failed = false;
+    let mut error = configuration_error;
+    let mut needs_review = false;
     if let Some(provider) = slack {
-        let result =
-            alerts::dispatch_slack(&mut db, &slack_id, cooldown, &alert, &provider).await?;
-        if result == Dispatch::NeedsReview {
-            failed = true;
-            eprintln!("Slack alert requires operator review");
-        } else {
-            println!("Slack alert: {result:?}");
+        match alerts::dispatch_slack(&mut db, &slack_id, cooldown, &alert, &provider).await {
+            Ok(Dispatch::NeedsReview) => {
+                needs_review = true;
+                eprintln!("Slack alert requires operator review");
+            }
+            Ok(result) => println!("Slack alert: {result:?}"),
+            Err(_) => {
+                error = true;
+                eprintln!("Slack alert dispatch failed");
+            }
         }
     }
     if let Some((to, provider)) = email {
-        let result =
-            alerts::dispatch_email(&mut db, &email_id, cooldown, &alert, &provider, &to).await?;
-        if result == Dispatch::NeedsReview {
-            failed = true;
-            eprintln!("email alert requires operator review");
-        } else {
-            println!("email alert: {result:?}");
+        match alerts::dispatch_email(&mut db, &email_id, cooldown, &alert, &provider, &to).await {
+            Ok(Dispatch::NeedsReview) => {
+                needs_review = true;
+                eprintln!("email alert requires operator review");
+            }
+            Ok(result) => println!("email alert: {result:?}"),
+            Err(_) => {
+                error = true;
+                eprintln!("email alert dispatch failed");
+            }
         }
     }
-    if failed {
+    if error {
+        std::process::exit(1);
+    }
+    if needs_review {
         std::process::exit(2);
     }
     Ok(())
@@ -155,4 +164,32 @@ fn env_bool(name: &str, default: bool) -> Result<bool, Box<dyn Error + Send + Sy
         Err(std::env::VarError::NotPresent) => Ok(default),
         _ => Err(format!("{name} must be true or false").into()),
     }
+}
+
+fn slack_config() -> Result<Option<SlackWebhook>, Box<dyn Error + Send + Sync>> {
+    Ok(novu_rust_contracts::secret::from_env(
+        "SWALLOW_ALERT_SLACK_WEBHOOK",
+        "SWALLOW_ALERT_SLACK_WEBHOOK_FILE",
+    )?
+    .map(|s| SlackWebhook::new(&s).map_err(|_| "invalid Slack configuration"))
+    .transpose()?)
+}
+
+fn email_config() -> Result<Option<(String, Resend)>, Box<dyn Error + Send + Sync>> {
+    let to = match std::env::var("SWALLOW_ALERT_EMAIL_TO") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(_) => return Err("invalid email recipient".into()),
+    };
+    let provider = Resend::new(Config {
+        api_key: novu_rust_contracts::secret::from_env(
+            "NOVU_RESEND_API_KEY",
+            "NOVU_RESEND_API_KEY_FILE",
+        )?
+        .ok_or("Resend API key is required")?,
+        from: std::env::var("NOVU_RESEND_FROM")?,
+        sender_name: std::env::var("NOVU_RESEND_SENDER_NAME").unwrap_or_default(),
+    })
+    .map_err(|_| "invalid email configuration")?;
+    Ok(Some((to, provider)))
 }
