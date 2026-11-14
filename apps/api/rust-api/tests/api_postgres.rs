@@ -3575,6 +3575,25 @@ async fn trigger_api_contract_inner() {
     let (_, fetched) = get_subscriber(app.clone(), Some("ApiKey test-key"), "timezone-user").await;
     assert_eq!(fetched["data"]["timezone"], Value::Null);
     let claims = json!({"environmentId":"env-a","subscriberId":"seen-user","aud":"widget_user","contextKeys":[],"exp":4102444800u64});
+    let exp_required = novu_rust_api::router_with_subscriber_secret_and_exp_policy(db.clone(), Some(secret.to_vec()), true);
+    let no_exp = json!({"environmentId":"env-a","subscriberId":"seen-user","aud":"widget_user","contextKeys":[]});
+    let no_exp_bearer = format!("Bearer {}", subscriber_token(no_exp.clone(), secret));
+    if std::env::var_os("TEST_JWT_EXP_RUNTIME_CONFIG").is_some() {
+        let configured = novu_rust_api::RuntimeConfig::try_from_env().unwrap().router(db.clone());
+        assert_eq!(inbox_get(configured.clone(), "/v1/inbox/notifications", Some(&no_exp_bearer)).await.0, StatusCode::UNAUTHORIZED);
+        let valid = format!("Bearer {}", subscriber_token(claims.clone(), secret));
+        assert_eq!(inbox_get(configured, "/v1/inbox/notifications", Some(&valid)).await.0, StatusCode::OK);
+    }
+    assert_eq!(inbox_get(inbox_app.clone(), "/v1/inbox/notifications", Some(&no_exp_bearer)).await.0, StatusCode::OK);
+    assert_eq!(inbox_get(exp_required.clone(), "/v1/inbox/notifications", Some(&no_exp_bearer)).await.0, StatusCode::UNAUTHORIZED);
+    for value in [Value::Null, json!("4102444800"), json!(1)] {
+        let mut malformed = no_exp.clone();
+        malformed["exp"] = value;
+        let bearer = format!("Bearer {}", subscriber_token(malformed, secret));
+        assert_eq!(inbox_get(exp_required.clone(), "/v1/inbox/notifications", Some(&bearer)).await.0, StatusCode::UNAUTHORIZED);
+    }
+    let valid = format!("Bearer {}", subscriber_token(claims.clone(), secret));
+    assert_eq!(inbox_get(exp_required, "/v1/inbox/notifications", Some(&valid)).await.0, StatusCode::OK);
     let token = subscriber_token(claims.clone(), secret);
     let bearer = format!("Bearer {token}");
     let (status, list) =

@@ -6,11 +6,17 @@ const wait = ms => new Promise(r => setTimeout(r,ms));
 const tokenPart=x=>Buffer.from(JSON.stringify(x)).toString('base64url');
 const body=tokenPart({alg:'HS256',typ:'JWT'})+'.'+tokenPart({_id:'subscriber-id',environmentId:'env-a',aud:'widget_user',exp:Math.floor(Date.now()/1000)+300});
 const token=body+'.'+createHmac('sha256',process.env.JWT_SECRET).update(body).digest('base64url');
+const noExpBody=tokenPart({alg:'HS256',typ:'JWT'})+'.'+tokenPart({_id:'subscriber-id',environmentId:'env-a',aud:'widget_user'});
+const noExpToken=noExpBody+'.'+createHmac('sha256',process.env.JWT_SECRET).update(noExpBody).digest('base64url');
+function tokenWithExp(exp) {
+  const body=tokenPart({alg:'HS256',typ:'JWT'})+'.'+tokenPart({_id:'subscriber-id',environmentId:'env-a',aud:'widget_user',exp});
+  return body+'.'+createHmac('sha256',process.env.JWT_SECRET).update(body).digest('base64url');
+}
 function sql(query) { const out=spawnSync('docker',['exec',process.env.PG_CONTAINER,'psql','-q','-v','ON_ERROR_STOP=1','-U','postgres','-d','novu_ws_gap','-At','-c',query],{encoding:'utf8'});assert.equal(out.status,0,out.stderr);return out.stdout.trim(); }
-async function open(port) {
+async function open(port, credential=token) {
   let messages=[];let closed=false;
   const ws=new WebSocket(`ws://127.0.0.1:${port}/socket.io/?EIO=4&transport=websocket`);
-  ws.addEventListener('message',e=>{const data=String(e.data);messages.push(data);if(data.startsWith('0'))ws.send('40'+JSON.stringify({token}));if(data==='2')ws.send('3');});
+  ws.addEventListener('message',e=>{const data=String(e.data);messages.push(data);if(data.startsWith('0'))ws.send('40'+JSON.stringify({token:credential}));if(data==='2')ws.send('3');});
   ws.addEventListener('close',()=>{closed=true});
   for(let i=0;i<100&&!messages.some(x=>x.startsWith('40'))&&!closed;i++)await wait(25);
   assert(messages.some(x=>x.startsWith('40')),'Socket.IO connect timeout');
@@ -18,6 +24,18 @@ async function open(port) {
 }
 async function until(fn,message,timeout=4000){for(let i=0;i<timeout/25;i++){if(fn())return;await wait(25);}throw Error(message);}
 (async()=>{
+  const noExpGuarded=await open(process.env.GUARDED_PORT,noExpToken);
+  await until(()=>noExpGuarded.messages.some(x=>x.startsWith('41'))||noExpGuarded.closed,'expiry-required socket accepted a token without exp');
+  noExpGuarded.ws.close();
+  for(const exp of [null,'4102444800',1]) {
+    const invalid=await open(process.env.GUARDED_PORT,tokenWithExp(exp));
+    await until(()=>invalid.messages.some(x=>x.startsWith('41'))||invalid.closed,'expiry-required socket accepted invalid exp');
+    invalid.ws.close();
+  }
+  const noExpLegacy=await open(process.env.LEGACY_PORT,noExpToken);
+  await wait(200);
+  assert(!noExpLegacy.closed&&!noExpLegacy.messages.some(x=>x.startsWith('41')),'default rejected a token without exp');
+  noExpLegacy.ws.close();
   const guarded=await open(process.env.GUARDED_PORT), legacy=await open(process.env.LEGACY_PORT);
   await wait(200);
   assert.equal(sql("SELECT count(*) FROM pg_stat_activity WHERE application_name='novu-rust-ws-listener'"),'3');

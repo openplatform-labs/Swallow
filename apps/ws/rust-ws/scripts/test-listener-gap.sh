@@ -8,15 +8,17 @@ trap cleanup EXIT
 port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'; }
 pg_port=$(port); export GUARDED_PORT=$(port) LEGACY_PORT=$(port) IMMEDIATE_PORT=$(port) JWT_SECRET=gap-fixture-secret PG_CONTAINER="$name"
 docker run -d --name "$name" -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_DB=novu_ws_gap -p "127.0.0.1:$pg_port:5432" postgres:17-alpine >/dev/null
-for ((i=0;i<60;i++)); do docker exec "$name" pg_isready -q -U postgres -d novu_ws_gap && break; sleep 1; done
+for ((i=0;i<60;i++)); do docker exec "$name" psql -q -U postgres -d novu_ws_gap -c 'SELECT 1' >/dev/null 2>&1 && break; sleep 1; done
+docker exec "$name" psql -q -v ON_ERROR_STOP=1 -U postgres -d novu_ws_gap -c 'SELECT 1' >/dev/null
 for file in ../../worker/rust-queue/migrations/0002_experimental_in_app.sql ../../worker/rust-queue/migrations/0014_experimental_subscriber_objectid.sql ../../worker/rust-queue/migrations/0019_experimental_subscriber_online.sql migrations/0001_connections.sql migrations/0002_subscriber_revocation.sql migrations/0003_connection_leases.sql ../../worker/rust-queue/migrations/0030_experimental_ws_events.sql; do docker exec -i "$name" psql -q -v ON_ERROR_STOP=1 -U postgres -d novu_ws_gap < "$file" >/dev/null; done
 docker exec "$name" psql -q -v ON_ERROR_STOP=1 -U postgres -d novu_ws_gap -c "INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id) VALUES ('env-a','subscriber','subscriber-id')"
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/private/tmp/swallow-create-target} CARGO_INCREMENTAL=0 NOVU_POSTGRES_ALLOW_INSECURE=true
 cargo build --locked --offline >/dev/null
+if SWALLOW_INBOX_REQUIRE_JWT_EXP=invalid "$CARGO_TARGET_DIR/debug/novu-rust-ws" >/dev/null 2>&1; then echo 'invalid JWT expiration policy accepted' >&2; exit 1; fi
 if DATABASE_URL="postgresql://postgres@127.0.0.1:$pg_port/novu_ws_gap" NOVU_WS_DISCONNECT_ON_EVENT_GAP=true NOVU_WS_EVENT_LOOKUP_RECOVERY=invalid "$CARGO_TARGET_DIR/debug/novu-rust-ws" >/dev/null 2>&1; then echo 'invalid recovery mode accepted' >&2; exit 1; fi
 if DATABASE_URL="postgresql://postgres@127.0.0.1:$pg_port/novu_ws_gap" NOVU_WS_DISCONNECT_ON_EVENT_GAP=false NOVU_WS_EVENT_LOOKUP_RECOVERY=probe "$CARGO_TARGET_DIR/debug/novu-rust-ws" >/dev/null 2>&1; then echo 'probe without gap disconnection accepted' >&2; exit 1; fi
-DATABASE_URL="postgresql://postgres@127.0.0.1:$pg_port/novu_ws_gap" LISTEN_ADDR="127.0.0.1:$GUARDED_PORT" NOVU_WS_DISCONNECT_ON_EVENT_GAP=true NOVU_WS_EVENT_LOOKUP_RECOVERY=probe NOVU_WS_ENABLE_HEALTH_ENDPOINTS=true "$CARGO_TARGET_DIR/debug/novu-rust-ws" >/dev/null 2>&1 & guarded_pid=$!
-DATABASE_URL="postgresql://postgres@127.0.0.1:$pg_port/novu_ws_gap" LISTEN_ADDR="127.0.0.1:$LEGACY_PORT" NOVU_WS_DISCONNECT_ON_EVENT_GAP=false "$CARGO_TARGET_DIR/debug/novu-rust-ws" >/dev/null 2>&1 & legacy_pid=$!
+DATABASE_URL="postgresql://postgres@127.0.0.1:$pg_port/novu_ws_gap" LISTEN_ADDR="127.0.0.1:$GUARDED_PORT" NOVU_WS_DISCONNECT_ON_EVENT_GAP=true NOVU_WS_EVENT_LOOKUP_RECOVERY=probe NOVU_WS_ENABLE_HEALTH_ENDPOINTS=true SWALLOW_INBOX_REQUIRE_JWT_EXP=true "$CARGO_TARGET_DIR/debug/novu-rust-ws" >/dev/null 2>&1 & guarded_pid=$!
+env -u SWALLOW_INBOX_REQUIRE_JWT_EXP DATABASE_URL="postgresql://postgres@127.0.0.1:$pg_port/novu_ws_gap" LISTEN_ADDR="127.0.0.1:$LEGACY_PORT" NOVU_WS_DISCONNECT_ON_EVENT_GAP=false "$CARGO_TARGET_DIR/debug/novu-rust-ws" >/dev/null 2>&1 & legacy_pid=$!
 env -u NOVU_WS_EVENT_LOOKUP_RECOVERY DATABASE_URL="postgresql://postgres@127.0.0.1:$pg_port/novu_ws_gap" LISTEN_ADDR="127.0.0.1:$IMMEDIATE_PORT" NOVU_WS_DISCONNECT_ON_EVENT_GAP=true "$CARGO_TARGET_DIR/debug/novu-rust-ws" >/dev/null 2>&1 & immediate_pid=$!
 for ((i=0;i<60;i++)); do if curl -fsS "http://127.0.0.1:$GUARDED_PORT/socket.io/?EIO=4&transport=polling" >/dev/null 2>&1 && curl -fsS "http://127.0.0.1:$LEGACY_PORT/socket.io/?EIO=4&transport=polling" >/dev/null 2>&1 && curl -fsS "http://127.0.0.1:$IMMEDIATE_PORT/socket.io/?EIO=4&transport=polling" >/dev/null 2>&1; then break; fi; sleep 0.2; done
 node tests/listener_gap.cjs

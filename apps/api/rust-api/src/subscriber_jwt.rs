@@ -46,7 +46,7 @@ pub fn verify_hmac(keys: &[String], subscriber_id: &str, hash: &str) -> bool {
     })
 }
 
-pub fn verify(token: &str, secret: &[u8], now: u64) -> Option<Claims> {
+pub fn verify(token: &str, secret: &[u8], now: u64, require_exp: bool) -> Option<Claims> {
     if secret.is_empty() || token.len() > 16_384 {
         return None;
     }
@@ -65,6 +65,9 @@ pub fn verify(token: &str, secret: &[u8], now: u64) -> Option<Claims> {
     mac.verify_slice(&signature).ok()?;
     let payload: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
     if payload.get("aud")?.as_str()? != "widget_user" {
+        return None;
+    }
+    if require_exp && payload.get("exp").is_none() {
         return None;
     }
     if let Some(exp) = payload.get("exp")

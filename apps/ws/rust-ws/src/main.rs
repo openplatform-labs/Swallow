@@ -364,7 +364,7 @@ async fn resolve_counts(
     ))
 }
 
-fn verify(token: &str, secret: &[u8]) -> Option<Claims> {
+fn verify(token: &str, secret: &[u8], require_exp: bool) -> Option<Claims> {
     if secret.is_empty() || token.len() > 16_384 {
         return None;
     }
@@ -380,6 +380,9 @@ fn verify(token: &str, secret: &[u8]) -> Option<Claims> {
         .ok()?;
     let payload: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
     if payload.get("aud")?.as_str()? != "widget_user" {
+        return None;
+    }
+    if require_exp && payload.get("exp").is_none() {
         return None;
     }
     let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
@@ -534,6 +537,11 @@ async fn start_event_listener(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let require_jwt_exp = match std::env::var("SWALLOW_INBOX_REQUIRE_JWT_EXP").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("SWALLOW_INBOX_REQUIRE_JWT_EXP must be true or false".into()),
+    };
     let health_enabled = match std::env::var("NOVU_WS_ENABLE_HEALTH_ENDPOINTS").as_deref() {
         Ok("true") => true,
         Ok("false") | Err(std::env::VarError::NotPresent) => false,
@@ -737,7 +745,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     socket.disconnect().ok();
                     return;
                 };
-                let Some(claims) = verify(&token, &secret) else {
+                let Some(claims) = verify(&token, &secret, require_jwt_exp) else {
                     socket.disconnect().ok();
                     return;
                 };
@@ -750,8 +758,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     }
                     Err(_) => {
                         // A lost COMMIT acknowledgement may mean the row exists.
-                        let update_presence =
-                            !compatibility_mode() || verify(&token, &secret).is_some();
+                        let update_presence = !compatibility_mode()
+                            || verify(&token, &secret, require_jwt_exp).is_some();
                         tokio::spawn(retry_disconnect(
                             db.clone(),
                             id,
@@ -776,8 +784,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     let token = cleanup_token.clone();
                     let secret = cleanup_secret.clone();
                     async move {
-                        let update_presence =
-                            !compatibility_mode() || verify(&token, &secret).is_some();
+                        let update_presence = !compatibility_mode()
+                            || verify(&token, &secret, require_jwt_exp).is_some();
                         tokio::spawn(retry_disconnect(
                             db,
                             id,
@@ -795,7 +803,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 }
                 if !socket.connected() {
                     let update_presence =
-                        !compatibility_mode() || verify(&token, &secret).is_some();
+                        !compatibility_mode() || verify(&token, &secret, require_jwt_exp).is_some();
                     tokio::spawn(retry_disconnect(
                         db,
                         id,

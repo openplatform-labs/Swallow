@@ -46,6 +46,8 @@ pub const SNOOZE_POLICY_MIGRATION: &str =
 
 #[derive(Clone, Default)]
 struct InboxHmacKeys(HashMap<String, Vec<String>>);
+#[derive(Clone, Copy)]
+struct InboxJwtPolicy(bool);
 
 /// Matches the reference's txn_ + 4-byte Unix-seconds hex + 12 base36 characters.
 fn generate_transaction_id() -> Option<String> {
@@ -75,6 +77,7 @@ pub struct RuntimeConfig {
     keys: HashMap<String, Vec<String>>,
     twilio: Option<twilio_webhook::Config>,
     resend: Option<resend_webhook::Config>,
+    require_jwt_exp: bool,
 }
 impl RuntimeConfig {
     pub fn from_env() -> Self {
@@ -88,6 +91,11 @@ impl RuntimeConfig {
             )
         };
         let strict = match std::env::var("SWALLOW_API_STRICT_SECURITY_CONFIG").as_deref() {
+            Ok("true") => true,
+            Ok("false") | Err(std::env::VarError::NotPresent) => false,
+            _ => return Err(invalid()),
+        };
+        let require_jwt_exp = match std::env::var("SWALLOW_INBOX_REQUIRE_JWT_EXP").as_deref() {
             Ok("true") => true,
             Ok("false") | Err(std::env::VarError::NotPresent) => false,
             _ => return Err(invalid()),
@@ -183,15 +191,17 @@ impl RuntimeConfig {
             keys,
             twilio,
             resend,
+            require_jwt_exp,
         })
     }
     pub fn router(&self, db: Arc<Client>) -> Router {
-        router_with_webhook_configs(
+        router_with_webhook_configs_and_jwt_policy(
             db,
             self.secret.clone(),
             self.keys.clone(),
             self.twilio.clone(),
             self.resend.clone(),
+            self.require_jwt_exp,
         )
     }
 }
@@ -202,6 +212,15 @@ pub fn router(db: Arc<Client>) -> Router {
 
 pub fn router_with_subscriber_secret(db: Arc<Client>, secret: Option<Vec<u8>>) -> Router {
     router_with_session_keys(db, secret, HashMap::new())
+}
+
+/// Construct a router with a subscriber JWT expiration requirement.
+pub fn router_with_subscriber_secret_and_exp_policy(
+    db: Arc<Client>,
+    secret: Option<Vec<u8>>,
+    require_exp: bool,
+) -> Router {
+    router_with_webhook_configs_and_jwt_policy(db, secret, HashMap::new(), None, None, require_exp)
 }
 
 pub fn router_with_session_keys(
@@ -227,6 +246,17 @@ pub fn router_with_webhook_configs(
     keys: HashMap<String, Vec<String>>,
     twilio: Option<twilio_webhook::Config>,
     resend: Option<resend_webhook::Config>,
+) -> Router {
+    router_with_webhook_configs_and_jwt_policy(db, secret, keys, twilio, resend, false)
+}
+
+fn router_with_webhook_configs_and_jwt_policy(
+    db: Arc<Client>,
+    secret: Option<Vec<u8>>,
+    keys: HashMap<String, Vec<String>>,
+    twilio: Option<twilio_webhook::Config>,
+    resend: Option<resend_webhook::Config>,
+    require_jwt_exp: bool,
 ) -> Router {
     Router::new()
         .route(
@@ -400,6 +430,7 @@ pub fn router_with_webhook_configs(
         )
         .with_state(db)
         .layer(Extension(Arc::new(secret)))
+        .layer(Extension(InboxJwtPolicy(require_jwt_exp)))
         .layer(Extension(Arc::new(InboxHmacKeys(keys))))
         .layer(Extension(Arc::new(twilio)))
         .layer(Extension(Arc::new(resend)))
@@ -409,6 +440,7 @@ async fn authenticate_inbox(
     db: &Client,
     headers: &HeaderMap,
     secret: &Option<Vec<u8>>,
+    require_exp: bool,
     path: &str,
 ) -> Result<subscriber_jwt::Claims, (StatusCode, Json<Value>)> {
     let unauthorized = || {
@@ -433,8 +465,13 @@ async fn authenticate_inbox(
         .duration_since(UNIX_EPOCH)
         .map_err(|_| unauthorized())?
         .as_secs();
-    let claims = subscriber_jwt::verify(token, secret.as_deref().ok_or_else(unauthorized)?, now)
-        .ok_or_else(unauthorized)?;
+    let claims = subscriber_jwt::verify(
+        token,
+        secret.as_deref().ok_or_else(unauthorized)?,
+        now,
+        require_exp,
+    )
+    .ok_or_else(unauthorized)?;
     let exists = db
         .query_opt(
             "SELECT internal_id FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2",
@@ -461,12 +498,13 @@ async fn authenticate_inbox(
 async fn inbox_notifications(
     State(db): State<Arc<Client>>,
     Extension(secret): Extension<Arc<Option<Vec<u8>>>>,
+    Extension(policy): Extension<InboxJwtPolicy>,
     headers: HeaderMap,
     OriginalUri(uri): OriginalUri,
     Query(pairs): Query<Vec<(String, String)>>,
 ) -> (StatusCode, Json<Value>) {
     let path = uri.to_string();
-    let claims = match authenticate_inbox(&db, &headers, &secret, &path).await {
+    let claims = match authenticate_inbox(&db, &headers, &secret, policy.0, &path).await {
         Ok(claims) => claims,
         Err(response) => return response,
     };
@@ -484,12 +522,13 @@ async fn inbox_notifications(
 async fn inbox_count(
     State(db): State<Arc<Client>>,
     Extension(secret): Extension<Arc<Option<Vec<u8>>>>,
+    Extension(policy): Extension<InboxJwtPolicy>,
     headers: HeaderMap,
     OriginalUri(uri): OriginalUri,
     Query(query): Query<HashMap<String, String>>,
 ) -> (StatusCode, Json<Value>) {
     let path = uri.to_string();
-    let claims = match authenticate_inbox(&db, &headers, &secret, &path).await {
+    let claims = match authenticate_inbox(&db, &headers, &secret, policy.0, &path).await {
         Ok(claims) => claims,
         Err(response) => return response,
     };
@@ -779,12 +818,14 @@ async fn inbox_session(
 async fn inbox_mark(
     State(db): State<Arc<Client>>,
     Extension(secret): Extension<Arc<Option<Vec<u8>>>>,
+    Extension(policy): Extension<InboxJwtPolicy>,
     headers: HeaderMap,
     Path((notification_id, action)): Path<(String, String)>,
     OriginalUri(uri): OriginalUri,
     body: Bytes,
 ) -> Response {
-    let claims = match authenticate_inbox(&db, &headers, &secret, &uri.to_string()).await {
+    let claims = match authenticate_inbox(&db, &headers, &secret, policy.0, &uri.to_string()).await
+    {
         Ok(claims) => claims,
         Err(response) => return response.into_response(),
     };
@@ -855,11 +896,13 @@ async fn inbox_mark(
 async fn inbox_delete(
     State(db): State<Arc<Client>>,
     Extension(secret): Extension<Arc<Option<Vec<u8>>>>,
+    Extension(policy): Extension<InboxJwtPolicy>,
     headers: HeaderMap,
     Path((notification_id, action)): Path<(String, String)>,
     OriginalUri(uri): OriginalUri,
 ) -> Response {
-    let claims = match authenticate_inbox(&db, &headers, &secret, &uri.to_string()).await {
+    let claims = match authenticate_inbox(&db, &headers, &secret, policy.0, &uri.to_string()).await
+    {
         Ok(claims) => claims,
         Err(response) => return response.into_response(),
     };
@@ -880,11 +923,13 @@ async fn inbox_delete(
 async fn inbox_bulk(
     State(db): State<Arc<Client>>,
     Extension(secret): Extension<Arc<Option<Vec<u8>>>>,
+    Extension(policy): Extension<InboxJwtPolicy>,
     headers: HeaderMap,
     OriginalUri(uri): OriginalUri,
     bytes: Bytes,
 ) -> Response {
-    let claims = match authenticate_inbox(&db, &headers, &secret, &uri.to_string()).await {
+    let claims = match authenticate_inbox(&db, &headers, &secret, policy.0, &uri.to_string()).await
+    {
         Ok(claims) => claims,
         Err(response) => return response.into_response(),
     };
