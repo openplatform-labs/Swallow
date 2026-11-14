@@ -24,6 +24,9 @@ async fn alert_reservations_fence_concurrency_and_ambiguous_recovery() {
     a.batch_execute(novu_postgres_queue::reconciliation::OPERATOR_GRANTS_MIGRATION)
         .await
         .unwrap();
+    a.batch_execute(novu_postgres_queue::reconciliation::OPERATOR_GRANT_LOCK_MIGRATION)
+        .await
+        .unwrap();
     a.batch_execute(alerts::MIGRATION).await.unwrap();
     a.batch_execute(alerts::MIGRATION).await.unwrap();
     a.batch_execute(alerts::RESOLUTION_MIGRATION).await.unwrap();

@@ -88,6 +88,9 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     db.batch_execute(reconciliation::OPERATOR_GRANTS_MIGRATION)
         .await
         .unwrap();
+    db.batch_execute(reconciliation::OPERATOR_GRANT_LOCK_MIGRATION)
+        .await
+        .unwrap();
     db.batch_execute(reconciliation::OPERATOR_GRANTS_MIGRATION)
         .await
         .unwrap();
@@ -543,7 +546,7 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     .unwrap_err();
     assert!(denied.to_string().contains("permission denied"));
     db.execute("INSERT INTO novu_rust_delivery_operator_grants VALUES ('tenant-a',session_user,'retry'),('tenant-resend',session_user,'retry'),('tenant-resend',session_user,'accepted')", &[]).await.unwrap();
-    db.batch_execute("CREATE ROLE swallow_fixture_operator NOLOGIN; GRANT SELECT ON novu_rust_delivery_operator_grants TO swallow_fixture_operator; GRANT SELECT,UPDATE ON novu_queue_jobs TO swallow_fixture_operator; INSERT INTO novu_rust_delivery_operator_grants VALUES ('tenant-a','swallow_fixture_operator','accepted')").await.unwrap();
+    db.batch_execute("CREATE ROLE swallow_fixture_operator NOLOGIN; GRANT EXECUTE ON FUNCTION public.novu_rust_lock_operator_grant(text,text) TO swallow_fixture_operator; GRANT SELECT,UPDATE ON novu_queue_jobs TO swallow_fixture_operator; INSERT INTO novu_rust_delivery_operator_grants VALUES ('tenant-a','swallow_fixture_operator','accepted')").await.unwrap();
     let (mut restricted, restricted_driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move { restricted_driver.await.unwrap() });
     restricted

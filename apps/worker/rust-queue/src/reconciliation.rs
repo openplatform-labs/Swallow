@@ -8,6 +8,8 @@ pub const RETRY_DISPATCH_MIGRATION: &str =
     include_str!("../migrations/0056_retry_dispatch_identity.sql");
 pub const OPERATOR_GRANTS_MIGRATION: &str =
     include_str!("../migrations/0064_delivery_operator_grants.sql");
+pub const OPERATOR_GRANT_LOCK_MIGRATION: &str =
+    include_str!("../migrations/0068_lock_operator_grants.sql");
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Count unresolved and stranded attempts for one environment in one snapshot.
@@ -297,7 +299,13 @@ pub async fn resolve(
         return Err("invalid reconciliation parameters".into());
     }
     let tx = client.transaction().await?;
-    let allowed: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_delivery_operator_grants WHERE environment_id=$1 AND database_principal=session_user AND decision=$2)", &[&environment,&decision]).await?.get(0);
+    let allowed: bool = tx
+        .query_one(
+            "SELECT public.novu_rust_lock_operator_grant($1,$2)",
+            &[&environment, &decision],
+        )
+        .await?
+        .get(0);
     if !allowed {
         return Err("reconciliation permission denied".into());
     }

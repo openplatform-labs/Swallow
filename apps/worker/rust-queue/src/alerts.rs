@@ -49,7 +49,13 @@ pub async fn reserve(
     {
         return Err("environment not found".into());
     }
-    let allowed:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_delivery_operator_grants WHERE environment_id=$1 AND database_principal=session_user AND decision='alert_send')", &[&environment]).await?.get(0);
+    let allowed: bool = tx
+        .query_one(
+            "SELECT public.novu_rust_lock_operator_grant($1,'alert_send')",
+            &[&environment],
+        )
+        .await?
+        .get(0);
     if !allowed {
         return Err("alert send permission denied".into());
     }
@@ -128,7 +134,13 @@ pub async fn resolve(
     }
     let permission = format!("alert_{decision}");
     let tx = db.transaction().await?;
-    let allowed:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_delivery_operator_grants WHERE environment_id=$1 AND database_principal=session_user AND decision=$2)", &[&environment,&permission]).await?.get(0);
+    let allowed: bool = tx
+        .query_one(
+            "SELECT public.novu_rust_lock_operator_grant($1,$2)",
+            &[&environment, &permission],
+        )
+        .await?
+        .get(0);
     if !allowed {
         return Err("alert resolution permission denied".into());
     }
@@ -607,6 +619,7 @@ mod tests {
             crate::resend_projection::HEARTBEAT_MIGRATION,
             crate::reconciliation::MIGRATION,
             crate::reconciliation::OPERATOR_GRANTS_MIGRATION,
+            crate::reconciliation::OPERATOR_GRANT_LOCK_MIGRATION,
             MIGRATION,
             RESOLUTION_MIGRATION,
         ] {
