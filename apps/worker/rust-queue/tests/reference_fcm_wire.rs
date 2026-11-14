@@ -56,6 +56,10 @@ fn original_firebase_http_conversion() {
             multicast: false,
             message: json!({"token":"ios-b","apns":{"payload":{"aps":{"alert":"Hi","sound":"default","contentAvailable":false,"mutableContent":true}},"headers":{"apns-push-type":"alert"}}}),
         },
+        Plan {
+            multicast: false,
+            message: json!({"token":"android-a","android":{"notification":{"title":"Hello","body":"World","icon":"bell","sound":"default","color":"#AAbbCC","tag":"tag","clickAction":"OPEN","channelId":"orders","bodyLocKey":"BODY","bodyLocArgs":["one"],"titleLocKey":"TITLE","titleLocArgs":["two"],"imageUrl":"https://example.test/img.png","localOnly":true,"priority":"high","visibility":"public","proxy":"allow","vibrateTimingsMillis":[0,1501],"defaultVibrateTimings":true,"defaultSound":false,"defaultLightSettings":true,"notificationCount":3}}}),
+        },
     ];
     for (index, plan) in plans.iter().enumerate() {
         assert_eq!(wire_messages(plan).unwrap(), vec![original[index].clone()]);

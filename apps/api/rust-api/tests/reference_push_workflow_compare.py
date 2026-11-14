@@ -225,6 +225,7 @@ for label, override in ([] if os.environ.get('NOVU_TEST_PUSH_ROUTING_CASES_ONLY'
     ('platform-provider', {'providers':{'fcm':{'android':{'priority':'normal'},'webpush':{'headers':{'TTL':'60'}},'fcmOptions':{'analyticsLabel':'other'}}}}),
     ('apns-options', {'fcm':{'apns':{'headers':{'apns-priority':'10'},'payload':{'aps':{'alert':'Hello','badge':2,'sound':'default'},'custom':'value'}}}}),
     ('apns-provider', {'providers':{'fcm':{'apns':{'headers':{'apns-push-type':'alert'},'payload':{'aps':{'alert':'Hello'}}}}}}),
+    ('android-notification', {'fcm':{'android':{'notification':{'title':'Android title','body':'Android body','icon':'bell','sound':'default','color':'#aabbcc'}}}}),
 
     ('notification-data', {'fcm':{'data':{'custom':'value'}}}),
     ('data-only', {'fcm':{'type':'data','data':{'custom':'value','title':'ignored'}}}),

@@ -437,6 +437,160 @@ fn apns_config(value: &Value) -> Result<Value, SendError> {
     Ok(Value::Object(config))
 }
 
+fn android_duration(value: &Value) -> Result<Value, SendError> {
+    let millis = value
+        .as_u64()
+        .filter(|n| *n <= 9_007_199_254_740_991)
+        .ok_or(SendError::UnsupportedMessage)?;
+    let seconds = millis / 1000;
+    let nanos = (millis % 1000) * 1_000_000;
+    Ok(Value::String(if nanos == 0 {
+        format!("{seconds}s")
+    } else {
+        format!("{seconds}.{nanos:09}s")
+    }))
+}
+
+fn android_notification(value: &Value) -> Result<Value, SendError> {
+    let fields = value.as_object().ok_or(SendError::UnsupportedMessage)?;
+    for (args, key) in [
+        ("bodyLocArgs", "bodyLocKey"),
+        ("titleLocArgs", "titleLocKey"),
+    ] {
+        if fields
+            .get(args)
+            .and_then(Value::as_array)
+            .is_some_and(|v| !v.is_empty())
+            && fields
+                .get(key)
+                .and_then(Value::as_str)
+                .is_none_or(|s| s.is_empty())
+        {
+            return Err(SendError::UnsupportedMessage);
+        }
+    }
+    let mut result = Map::new();
+    for (key, value) in fields {
+        let (wire, converted) = match key.as_str() {
+            "title" | "body" | "icon" | "sound" | "tag" | "ticker" => (
+                key.as_str(),
+                value
+                    .as_str()
+                    .map(|_| value.clone())
+                    .ok_or(SendError::UnsupportedMessage)?,
+            ),
+            "color" => {
+                let color = value.as_str().ok_or(SendError::UnsupportedMessage)?;
+                if color.len() != 7
+                    || !color.starts_with('#')
+                    || !color.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit)
+                {
+                    return Err(SendError::UnsupportedMessage);
+                }
+                ("color", value.clone())
+            }
+            "clickAction" | "bodyLocKey" | "titleLocKey" | "channelId" => (
+                match key.as_str() {
+                    "clickAction" => "click_action",
+                    "bodyLocKey" => "body_loc_key",
+                    "titleLocKey" => "title_loc_key",
+                    _ => "channel_id",
+                },
+                value
+                    .as_str()
+                    .map(|_| value.clone())
+                    .ok_or(SendError::UnsupportedMessage)?,
+            ),
+            "bodyLocArgs" | "titleLocArgs" => (
+                if key == "bodyLocArgs" {
+                    "body_loc_args"
+                } else {
+                    "title_loc_args"
+                },
+                value
+                    .as_array()
+                    .filter(|v| v.iter().all(Value::is_string))
+                    .map(|_| value.clone())
+                    .ok_or(SendError::UnsupportedMessage)?,
+            ),
+            "imageUrl" => {
+                if !value
+                    .as_str()
+                    .and_then(|v| reqwest::Url::parse(v).ok())
+                    .is_some_and(|u| {
+                        ["http", "https"].contains(&u.scheme()) && u.host_str().is_some()
+                    })
+                {
+                    return Err(SendError::UnsupportedMessage);
+                }
+                ("image", value.clone())
+            }
+            "localOnly" | "defaultVibrateTimings" | "defaultSound" | "defaultLightSettings" => (
+                match key.as_str() {
+                    "localOnly" => "local_only",
+                    "defaultVibrateTimings" => "default_vibrate_timings",
+                    "defaultSound" => "default_sound",
+                    _ => "default_light_settings",
+                },
+                value
+                    .as_bool()
+                    .map(|_| value.clone())
+                    .ok_or(SendError::UnsupportedMessage)?,
+            ),
+            "notificationCount" => (
+                "notification_count",
+                value
+                    .as_u64()
+                    .filter(|n| *n <= i32::MAX as u64)
+                    .map(|_| value.clone())
+                    .ok_or(SendError::UnsupportedMessage)?,
+            ),
+            "priority" => {
+                let v = value
+                    .as_str()
+                    .filter(|v| ["min", "low", "default", "high", "max"].contains(v))
+                    .ok_or(SendError::UnsupportedMessage)?;
+                (
+                    "notification_priority",
+                    Value::String(format!("PRIORITY_{}", v.to_uppercase())),
+                )
+            }
+            "visibility" => {
+                let v = value
+                    .as_str()
+                    .filter(|v| ["private", "public", "secret"].contains(v))
+                    .ok_or(SendError::UnsupportedMessage)?;
+                ("visibility", Value::String(v.to_uppercase()))
+            }
+            "proxy" => {
+                let v = value
+                    .as_str()
+                    .filter(|v| ["allow", "deny", "if_priority_lowered"].contains(v))
+                    .ok_or(SendError::UnsupportedMessage)?;
+                ("proxy", Value::String(v.to_uppercase()))
+            }
+            "vibrateTimingsMillis" => {
+                let values = value
+                    .as_array()
+                    .filter(|v| !v.is_empty())
+                    .ok_or(SendError::UnsupportedMessage)?;
+                (
+                    "vibrate_timings",
+                    Value::Array(
+                        values
+                            .iter()
+                            .map(android_duration)
+                            .collect::<Result<Vec<_>, _>>()?,
+                    ),
+                )
+            }
+            _ => return Err(SendError::UnsupportedMessage),
+        };
+        result.insert(wire.to_owned(), converted);
+    }
+    Ok(Value::Object(result))
+}
+
 // Preserve the selected Firebase Admin SDK fields and their HTTP conversion.
 fn platform_config(name: &str, value: &Value) -> Result<Value, SendError> {
     let source = value.as_object().ok_or(SendError::UnsupportedMessage)?;
@@ -446,25 +600,14 @@ fn platform_config(name: &str, value: &Value) -> Result<Value, SendError> {
             ("android", "collapseKey") => "collapse_key",
             ("android", "restrictedPackageName") => "restricted_package_name",
             ("android", "directBootOk") => "direct_boot_ok",
-            ("android", "priority" | "ttl" | "data") => key,
+            ("android", "priority" | "ttl" | "data" | "notification") => key,
             ("webpush", "headers" | "data" | "notification" | "fcmOptions") => key,
             ("fcmOptions", "analyticsLabel") => key,
             _ => return Err(SendError::UnsupportedMessage),
         };
         let converted = match (name, key.as_str()) {
-            ("android", "ttl") => {
-                let millis = value
-                    .as_u64()
-                    .filter(|n| *n <= 9_007_199_254_740_991)
-                    .ok_or(SendError::UnsupportedMessage)?;
-                let seconds = millis / 1000;
-                let nanos = (millis % 1000) * 1_000_000;
-                Value::String(if nanos == 0 {
-                    format!("{seconds}s")
-                } else {
-                    format!("{seconds}.{nanos:09}s")
-                })
-            }
+            ("android", "ttl") => android_duration(value)?,
+            ("android", "notification") => android_notification(value)?,
             ("android", "directBootOk") if value.is_boolean() => value.clone(),
             ("android", "priority") if matches!(value.as_str(), Some("normal" | "high")) => {
                 value.clone()
@@ -993,6 +1136,12 @@ mod tests {
         );
         for invalid in [
             json!({"android":{"ttl":-1}}),
+            json!({"android":{"notification":{"bodyLocArgs":["x"]}}}),
+            json!({"android":{"notification":{"color":"#zzzzzz"}}}),
+            json!({"android":{"notification":{"imageUrl":"bad url"}}}),
+            json!({"android":{"notification":{"vibrateTimingsMillis":[-1]}}}),
+            json!({"android":{"notification":{"notificationCount":-1}}}),
+            json!({"android":{"notification":{"lightSettings":{}}}}),
             json!({"android":{"ttl":1.5}}),
             json!({"android":{"data":{"x":1}}}),
             json!({"android":{"directBootOk":"yes"}}),
@@ -1024,7 +1173,7 @@ mod tests {
             title: "Hi".into(),
             content: "Hello".into(),
             targets: vec!["a".into()],
-            provider_data: json!({"android":{"notification":{"channelId":"unsupported"}}})
+            provider_data: json!({"android":{"notification":{"lightSettings":{}}}})
                 .as_object()
                 .unwrap()
                 .clone(),
