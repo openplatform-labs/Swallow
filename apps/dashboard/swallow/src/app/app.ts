@@ -32,6 +32,7 @@ export class App {
   readonly previousCursor = signal<string | null>(null);
   apiOrigin = 'http://127.0.0.1:3000';
   apiKey = '';
+  credentialMode: 'restricted' | 'api-key' = 'restricted';
   subscriberName = '';
   private subscriberRequestId = 0;
   private subscriberAbort: AbortController | null = null;
@@ -98,17 +99,19 @@ export class App {
     try {
       const origin = this.validatedOrigin();
       const key = this.apiKey.trim();
-      if (!key || /[^\x21-\x7e]/.test(key)) throw new Error('API 키를 확인해 주세요.');
+      if (this.credentialMode === 'restricted' ? !/^[0-9a-f]{64}$/.test(key) : !key || /[^\x21-\x7e]/.test(key)) throw new Error('인증 값을 확인해 주세요.');
       const params = new URLSearchParams({ limit: '20' });
       const name = this.subscriberName.trim();
       if (name) params.set('name', name);
       if (direction && cursor) params.set(direction, cursor);
-      const response = await fetch(`${origin}/v2/subscribers?${params}`, {
-        method: 'GET', headers: { Authorization: `ApiKey ${key}` },
+      const endpoint = this.credentialMode === 'restricted' ? '/v1/experimental/console/subscribers' : '/v2/subscribers';
+      const scheme = this.credentialMode === 'restricted' ? 'SwallowConsole' : 'ApiKey';
+      const response = await fetch(`${origin}${endpoint}?${params}`, {
+        method: 'GET', headers: { Authorization: `${scheme} ${key}` },
         cache: 'no-store', credentials: 'omit', redirect: 'error',
         signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10000)]),
       });
-      if (response.status === 401 || response.status === 403) throw new Error('API 키의 인증 또는 권한을 확인해 주세요.');
+      if (response.status === 401 || response.status === 403) throw new Error('인증 값 또는 권한을 확인해 주세요.');
       if (!response.ok) throw new Error('구독자 목록을 가져오지 못했습니다.');
       const data: unknown = await response.json();
       if (typeof data !== 'object' || data === null || !('data' in data) || !Array.isArray(data.data) ||
@@ -131,7 +134,7 @@ export class App {
     } catch (error: unknown) {
       if (id !== this.subscriberRequestId) return;
       this.subscriberStatus.set('error');
-      this.subscriberError.set(error instanceof Error && (error.message.startsWith('주소') || error.message.startsWith('원격') || error.message.startsWith('API ') || error.message.startsWith('구독자')) ? error.message : '서버에 연결할 수 없습니다.');
+      this.subscriberError.set(error instanceof Error && (error.message.startsWith('주소') || error.message.startsWith('원격') || error.message.startsWith('API ') || error.message.startsWith('구독자') || error.message.startsWith('인증')) ? error.message : '서버에 연결할 수 없습니다.');
     } finally {
       if (id === this.subscriberRequestId) this.subscriberAbort = null;
     }

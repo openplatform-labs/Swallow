@@ -35,9 +35,19 @@ describe('Swallow console', () => {
     expect(app.status()).toBe('unchecked');
   });
 
+  it('uses the separate read-only credential by default', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[],next:null,previous:null}),{status:200}));
+    const app = TestBed.createComponent(App).componentInstance;
+    app.apiKey = 'a'.repeat(64);
+    await app.loadSubscribers();
+    expect(app.subscriberStatus()).toBe('loaded');
+    expect(fetchMock).toHaveBeenCalledWith('http://127.0.0.1:3000/v1/experimental/console/subscribers?limit=20',expect.objectContaining({headers:{Authorization:`SwallowConsole ${'a'.repeat(64)}`}}));
+  });
+
   it('loads only display fields and sends the API key without cookies or redirect following', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[{subscriberId:'alice',firstName:'Alice',email:'a@example.test',channels:[{credentials:{deviceTokens:['secret']}}]}],next:'next',previous:null}),{status:200}));
     const app = TestBed.createComponent(App).componentInstance;
+    app.credentialMode = 'api-key';
     app.apiKey = 'fixture-key';
     await app.loadSubscribers();
     expect(app.subscriberStatus()).toBe('loaded');
@@ -54,6 +64,7 @@ describe('Swallow console', () => {
       .mockResolvedValueOnce(new Response(JSON.stringify({data:[{subscriberId:'second'}],next:null,previous:'cursor-prev'}),{status:200}))
       .mockResolvedValueOnce(new Response(JSON.stringify({data:[{subscriberId:'first'}],next:'cursor-next',previous:null}),{status:200}));
     const app = TestBed.createComponent(App).componentInstance;
+    app.credentialMode = 'api-key';
     app.apiKey = 'fixture-key';
     await app.loadSubscribers();
     await app.loadSubscribers('after');
@@ -67,6 +78,7 @@ describe('Swallow console', () => {
   it('clears rows and reports authorization failures', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response('',{status:401}));
     const app = TestBed.createComponent(App).componentInstance;
+    app.credentialMode = 'api-key';
     app.apiKey = 'fixture-key';
     await app.loadSubscribers();
     expect(app.subscriberStatus()).toBe('error');
@@ -78,6 +90,7 @@ describe('Swallow console', () => {
     let resolve!: (response: Response) => void;
     vi.spyOn(globalThis, 'fetch').mockReturnValueOnce(new Promise<Response>((done) => { resolve = done; }));
     const app = TestBed.createComponent(App).componentInstance;
+    app.credentialMode = 'api-key';
     app.apiKey = 'first-key';
     const pending = app.loadSubscribers();
     app.apiKey = 'second-key';
