@@ -22,6 +22,7 @@ async fn restricted_operator_can_only_make_authorized_atomic_decisions() {
         include_str!("../migrations/0072_operator_grant_management.sql"),
         include_str!("../migrations/0073_operator_role_identity.sql"),
         alerts::RESOLVE_FUNCTION_MIGRATION,
+        include_str!("../migrations/0087_alert_view_permission.sql"),
     ] {
         admin.batch_execute(sql).await.unwrap();
     }
@@ -29,8 +30,14 @@ async fn restricted_operator_can_only_make_authorized_atomic_decisions() {
         .batch_execute(alerts::RESOLVE_FUNCTION_MIGRATION)
         .await
         .unwrap();
+    admin
+        .batch_execute(include_str!("../migrations/0087_alert_view_permission.sql"))
+        .await
+        .unwrap();
+    admin.execute("INSERT INTO novu_rust_operator_grant_admins(environment_id,database_principal,principal_oid) SELECT 'a',session_user,oid FROM pg_roles WHERE rolname=session_user",&[]).await.unwrap();
+    admin.query_one("SELECT public.novu_rust_manage_operator_grant('a',session_user::text,'alert_view','grant','test')",&[]).await.unwrap();
     let operator = format!("alert_operator_{}", Uuid::new_v4().simple());
-    admin.batch_execute(&format!("CREATE ROLE {operator} LOGIN; GRANT USAGE ON SCHEMA public TO {operator}; GRANT EXECUTE ON FUNCTION public.novu_rust_resolve_alert(text,text,text,text,text,text) TO {operator}")).await.unwrap();
+    admin.batch_execute(&format!("CREATE ROLE {operator} LOGIN; GRANT USAGE ON SCHEMA public TO {operator}; GRANT EXECUTE ON FUNCTION public.novu_rust_resolve_alert(text,text,text,text,text,text) TO {operator}; GRANT EXECUTE ON FUNCTION public.novu_rust_alert_health(text),public.novu_rust_alert_status(text) TO {operator}")).await.unwrap();
     let (mut actor, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move {
         let _ = driver.await;
@@ -51,6 +58,51 @@ async fn restricted_operator_can_only_make_authorized_atomic_decisions() {
         admin.execute("INSERT INTO novu_rust_alert_delivery_slots(environment_id,channel,target_id,state,attempt_id) VALUES ($1,$2,$3,$4,$5)",&[&env,&channel,&target,&state,&id]).await.unwrap();
         admin.execute("INSERT INTO novu_rust_alert_delivery_attempts(id,environment_id,channel,target_id,state) VALUES ($1,$2,$3,$4,$5)",&[&id,&env,&channel,&target,&state]).await.unwrap();
     }
+    admin.execute("INSERT INTO novu_rust_alert_delivery_slots(environment_id,channel,target_id,state,lease_until) VALUES ('a','email','expired','dispatching',clock_timestamp()-interval '1 second')",&[]).await.unwrap();
+    assert!(alerts::scoped_health(&actor, "a").await.is_err());
+    assert!(alerts::scoped_status(&actor, "a").await.is_err());
+    assert!(admin.query_one("SELECT public.novu_rust_manage_operator_grant('a',$1,'alert_view','grant','view test')",&[&operator]).await.unwrap().get::<_,bool>(0));
+    assert_eq!(
+        alerts::scoped_health(&actor, "a").await.unwrap(),
+        alerts::health(&admin, "a").await.unwrap()
+    );
+    assert_eq!(
+        alerts::scoped_status(&actor, "a").await.unwrap(),
+        alerts::status(&admin, "a").await.unwrap()
+    );
+    assert_eq!(
+        alerts::scoped_health(&actor, "a").await.unwrap()["expired"],
+        1
+    );
+    admin.execute("INSERT INTO novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) SELECT 'a','email','bulk'||i,'idle' FROM generate_series(1,101) i",&[]).await.unwrap();
+    assert!(alerts::scoped_status(&actor, "a").await.is_err());
+    assert!(alerts::status(&admin, "a").await.is_err());
+    admin.execute("DELETE FROM novu_rust_alert_delivery_slots WHERE environment_id='a' AND target_id LIKE 'bulk%'",&[]).await.unwrap();
+    assert!(alerts::scoped_health(&actor, "b").await.is_err());
+    assert!(alerts::scoped_status(&actor, "b").await.is_err());
+    assert!(
+        actor
+            .query("SELECT * FROM public.novu_rust_alert_delivery_slots", &[])
+            .await
+            .is_err()
+    );
+    for command in ["alert-status", "check-alert-delivery"] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+            .args([command, "a"])
+            .env("DATABASE_URL", &url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("SWALLOW_ALERT_STATUS_SCOPED_ACCESS", "true")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if command == "alert-status" { 0 } else { 2 })
+        );
+        assert!(!output.stdout.is_empty());
+    }
+    assert!(admin.query_one("SELECT public.novu_rust_manage_operator_grant('a',$1,'alert_view','revoke','view test')",&[&operator]).await.unwrap().get::<_,bool>(0));
+    assert!(alerts::scoped_health(&actor, "a").await.is_err());
+    assert!(alerts::scoped_status(&actor, "a").await.is_err());
     assert!(
         alerts::resolve(
             &mut actor, "a", "slack", "first", "retry", "operator", "ticket"

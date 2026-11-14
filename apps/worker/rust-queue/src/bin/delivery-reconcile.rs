@@ -183,7 +183,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             std::process::exit(2);
         }
     } else if args.len() == 2 && args[0] == "check-alert-delivery" {
-        let health = novu_postgres_queue::alerts::health(&db, &args[1]).await?;
+        let health = if alert_scoped_access()? {
+            novu_postgres_queue::alerts::scoped_health(&db, &args[1]).await?
+        } else {
+            novu_postgres_queue::alerts::health(&db, &args[1]).await?
+        };
         println!("{}", serde_json::to_string(&health)?);
         if ["unknown", "rejected", "expired"]
             .iter()
@@ -192,10 +196,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             std::process::exit(2);
         }
     } else if args.len() == 2 && args[0] == "alert-status" {
-        println!(
-            "{}",
-            serde_json::to_string(&novu_postgres_queue::alerts::status(&db, &args[1]).await?)?
-        );
+        let status = if alert_scoped_access()? {
+            novu_postgres_queue::alerts::scoped_status(&db, &args[1]).await?
+        } else {
+            novu_postgres_queue::alerts::status(&db, &args[1]).await?
+        };
+        println!("{}", serde_json::to_string(&status)?);
     } else if args.len() == 7 && args[0] == "alert-resolve" {
         novu_postgres_queue::alerts::resolve(
             &mut db, &args[1], &args[2], &args[3], &args[4], &args[5], &args[6],
@@ -320,4 +326,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         return Err("invalid reconciliation command".into());
     }
     Ok(())
+}
+
+fn alert_scoped_access() -> Result<bool, Box<dyn Error + Send + Sync>> {
+    match std::env::var("SWALLOW_ALERT_STATUS_SCOPED_ACCESS").as_deref() {
+        Ok("true") => Ok(true),
+        Ok("false") | Err(std::env::VarError::NotPresent) => Ok(false),
+        _ => Err("invalid alert status scoped access setting".into()),
+    }
 }

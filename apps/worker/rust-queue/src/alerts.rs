@@ -200,6 +200,32 @@ pub async fn health(db: &PgClient, environment: &str) -> DbResult<serde_json::Va
     )
 }
 
+/// Authorized environment-scoped aggregate without direct table access.
+pub async fn scoped_health(db: &PgClient, environment: &str) -> DbResult<serde_json::Value> {
+    let row = db
+        .query_one(
+            "SELECT * FROM public.novu_rust_alert_health($1)",
+            &[&environment],
+        )
+        .await?;
+    Ok(
+        json!({"unknown":row.get::<_,i64>(0),"rejected":row.get::<_,i64>(1),"expired":row.get::<_,i64>(2)}),
+    )
+}
+/// Authorized destination metadata; retains the existing 100-destination limit.
+pub async fn scoped_status(db: &PgClient, environment: &str) -> DbResult<Vec<serde_json::Value>> {
+    let rows = db
+        .query(
+            "SELECT * FROM public.novu_rust_alert_status($1)",
+            &[&environment],
+        )
+        .await?;
+    if rows.len() > 100 {
+        return Err("more than 100 alert destinations".into());
+    }
+    Ok(rows.into_iter().map(|r|json!({"channel":r.get::<_,String>(0),"targetId":r.get::<_,String>(1),"state":r.get::<_,String>(2),"attemptId":r.get::<_,Option<Uuid>>(3).map(|v|v.to_string()),"lastStartedAt":r.get::<_,Option<String>>(4)})).collect())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum AlertError {
     InvalidConfiguration,
