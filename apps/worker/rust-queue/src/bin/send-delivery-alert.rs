@@ -4,7 +4,7 @@ use novu_postgres_queue::{
     reconciliation,
     resend::{Config, Resend},
 };
-use std::error::Error;
+use std::{error::Error, time::Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -15,6 +15,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 .into(),
         );
     }
+    let operation_seconds: u64 = match std::env::var("SWALLOW_ALERT_OPERATION_TIMEOUT_SECONDS") {
+        Ok(value) => value
+            .parse()
+            .map_err(|_| "invalid alert operation timeout")?,
+        Err(std::env::VarError::NotPresent) => 30,
+        Err(_) => return Err("invalid alert operation timeout".into()),
+    };
+    if !(1..=300).contains(&operation_seconds) {
+        return Err("invalid alert operation timeout".into());
+    }
+    let operation_timeout = Duration::from_secs(operation_seconds);
     let on_new_condition = match std::env::var("SWALLOW_ALERT_COOLDOWN_POLICY").as_deref() {
         Ok("new-condition") => true,
         Ok("destination") | Err(std::env::VarError::NotPresent) => false,
@@ -53,10 +64,22 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let email_id =
         std::env::var("SWALLOW_ALERT_EMAIL_TARGET_ID").unwrap_or_else(|_| "default".into());
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
-    let (mut db, connection) = config.connect(tls).await?;
+    let (mut db, connection) = tokio::time::timeout(operation_timeout, config.connect(tls))
+        .await
+        .map_err(|_| "alert database connection timed out")??;
     tokio::spawn(async move {
         let _ = connection.await;
     });
+    let statement_timeout = format!("{}ms", operation_timeout.as_millis());
+    tokio::time::timeout(
+        operation_timeout,
+        db.query_one(
+            "SELECT set_config('statement_timeout',$1,false)",
+            &[&statement_timeout],
+        ),
+    )
+    .await
+    .map_err(|_| "alert database setup timed out")??;
     let scoped_delivery = env_bool("SWALLOW_ALERT_SCOPED_DELIVERY", false)?;
     let scoped_checks = env_bool("SWALLOW_ALERT_CHECK_SCOPED_ACCESS", false)?;
     let resend_enabled = env_bool("SWALLOW_ALERT_RESEND_ENABLED", true)?;
@@ -94,12 +117,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     let mut failed_checks = [false; 5];
     let resend = if resend_enabled {
-        let result = if scoped_checks {
-            reconciliation::scoped_provider_health(&db, &args[0], "resend", grace, heartbeat).await
-        } else {
-            reconciliation::resend_health(&db, &args[0], grace, heartbeat).await
-        };
-        let values = result.ok().and_then(|health| {
+        let result = tokio::time::timeout(operation_timeout, async {
+            if scoped_checks {
+                reconciliation::scoped_provider_health(&db, &args[0], "resend", grace, heartbeat)
+                    .await
+            } else {
+                reconciliation::resend_health(&db, &args[0], grace, heartbeat).await
+            }
+        })
+        .await;
+        let values = result.ok().and_then(Result::ok).and_then(|health| {
             Some((
                 health["overdueUndelivered"].as_u64()?,
                 health["projectorStale"].as_bool()?,
@@ -114,12 +141,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         None
     };
     let queue = if let Some(wait) = queue_wait {
-        let result = if scoped_checks {
-            reconciliation::scoped_queue_health(&db, &args[0], wait).await
-        } else {
-            reconciliation::queue_health(&db, &args[0], wait).await
-        };
-        let values = result.ok().and_then(|health| {
+        let result = tokio::time::timeout(operation_timeout, async {
+            if scoped_checks {
+                reconciliation::scoped_queue_health(&db, &args[0], wait).await
+            } else {
+                reconciliation::queue_health(&db, &args[0], wait).await
+            }
+        })
+        .await;
+        let values = result.ok().and_then(Result::ok).and_then(|health| {
             Some((
                 health["overdueJobs"].as_u64()?,
                 health["expiredLeases"].as_u64()?,
@@ -134,12 +164,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         None
     };
     let attempts = if attempts_enabled {
-        let result = if scoped_checks {
-            reconciliation::scoped_health(&db, &args[0]).await
-        } else {
-            reconciliation::health(&db, &args[0]).await
-        };
-        let values = result.ok().and_then(|health| {
+        let result = tokio::time::timeout(operation_timeout, async {
+            if scoped_checks {
+                reconciliation::scoped_health(&db, &args[0]).await
+            } else {
+                reconciliation::health(&db, &args[0]).await
+            }
+        })
+        .await;
+        let values = result.ok().and_then(Result::ok).and_then(|health| {
             Some((
                 health["unknownAttempts"].as_u64()?,
                 health["strandedDispatches"].as_u64()?,
@@ -154,12 +187,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         None
     };
     let twilio = if let Some((grace, heartbeat)) = twilio_thresholds {
-        let result = if scoped_checks {
-            reconciliation::scoped_provider_health(&db, &args[0], "twilio", grace, heartbeat).await
-        } else {
-            reconciliation::twilio_health(&db, &args[0], grace, heartbeat).await
-        };
-        let values = result.ok().and_then(|health| {
+        let result = tokio::time::timeout(operation_timeout, async {
+            if scoped_checks {
+                reconciliation::scoped_provider_health(&db, &args[0], "twilio", grace, heartbeat)
+                    .await
+            } else {
+                reconciliation::twilio_health(&db, &args[0], grace, heartbeat).await
+            }
+        })
+        .await;
+        let values = result.ok().and_then(Result::ok).and_then(|health| {
             Some((
                 health["overdueUndelivered"].as_u64()?,
                 health["projectorStale"].as_bool()?,
@@ -174,12 +211,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         None
     };
     let slack_attempts = if slack_jobs_enabled {
-        let result = if env_bool("SWALLOW_ALERT_SLACK_SCOPED_ACCESS", false)? {
-            novu_postgres_queue::slack_queue::scoped_health(&db, &args[0]).await
-        } else {
-            novu_postgres_queue::slack_queue::health(&db, &args[0]).await
-        };
-        let values = result.ok().and_then(|health| {
+        let scoped_slack = env_bool("SWALLOW_ALERT_SLACK_SCOPED_ACCESS", false)?;
+        let result = tokio::time::timeout(operation_timeout, async {
+            if scoped_slack {
+                novu_postgres_queue::slack_queue::scoped_health(&db, &args[0]).await
+            } else {
+                novu_postgres_queue::slack_queue::health(&db, &args[0]).await
+            }
+        })
+        .await;
+        let values = result.ok().and_then(Result::ok).and_then(|health| {
             Some((
                 health["unknownAttempts"].as_u64()?,
                 health["rejectedAttempts"].as_u64()?,
@@ -202,8 +243,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     };
     let mut failed_jobs_check_failed = false;
     let failed_jobs = if failed_jobs_enabled {
-        match reconciliation::failed_queue_count(&db, &args[0]).await {
-            Ok(count) if count >= 0 => Some(count as u64),
+        match tokio::time::timeout(
+            operation_timeout,
+            reconciliation::failed_queue_count(&db, &args[0]),
+        )
+        .await
+        {
+            Ok(Ok(count)) if count >= 0 => Some(count as u64),
             _ => {
                 failed_jobs_check_failed = true;
                 eprintln!("failed jobs health check failed");
@@ -251,16 +297,21 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             ("email", email_id.as_str(), email.is_some()),
         ] {
             if enabled
-                && alerts::observe_conditions(
-                    &db,
-                    &args[0],
-                    channel,
-                    target,
-                    alert.condition_mask(),
-                    alert.observed_condition_mask(),
+                && !matches!(
+                    tokio::time::timeout(
+                        operation_timeout,
+                        alerts::observe_conditions(
+                            &db,
+                            &args[0],
+                            channel,
+                            target,
+                            alert.condition_mask(),
+                            alert.observed_condition_mask(),
+                        )
+                    )
+                    .await,
+                    Ok(Ok(()))
                 )
-                .await
-                .is_err()
             {
                 observation_error = true;
                 eprintln!("{channel} alert observation failed");
@@ -280,46 +331,52 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         || failed_checks.iter().any(|failed| *failed);
     let mut needs_review = false;
     if let Some(provider) = slack {
-        match alerts::dispatch_slack_with_options(
-            &mut db,
-            &slack_id,
-            cooldown,
-            &alert,
-            &provider,
-            on_new_condition,
-            scoped_delivery,
+        match tokio::time::timeout(
+            operation_timeout,
+            alerts::dispatch_slack_with_options(
+                &mut db,
+                &slack_id,
+                cooldown,
+                &alert,
+                &provider,
+                on_new_condition,
+                scoped_delivery,
+            ),
         )
         .await
         {
-            Ok(Dispatch::NeedsReview) => {
+            Ok(Ok(Dispatch::NeedsReview)) => {
                 needs_review = true;
                 eprintln!("Slack alert requires operator review");
             }
-            Ok(result) => println!("Slack alert: {result:?}"),
-            Err(_) => {
+            Ok(Ok(result)) => println!("Slack alert: {result:?}"),
+            _ => {
                 error = true;
                 eprintln!("Slack alert dispatch failed");
             }
         }
     }
     if let Some((to, provider)) = email {
-        match alerts::dispatch_email_with_options(
-            &mut db,
-            &email_id,
-            cooldown,
-            &alert,
-            &provider,
-            &to,
-            (on_new_condition, scoped_delivery),
+        match tokio::time::timeout(
+            operation_timeout,
+            alerts::dispatch_email_with_options(
+                &mut db,
+                &email_id,
+                cooldown,
+                &alert,
+                &provider,
+                &to,
+                (on_new_condition, scoped_delivery),
+            ),
         )
         .await
         {
-            Ok(Dispatch::NeedsReview) => {
+            Ok(Ok(Dispatch::NeedsReview)) => {
                 needs_review = true;
                 eprintln!("email alert requires operator review");
             }
-            Ok(result) => println!("email alert: {result:?}"),
-            Err(_) => {
+            Ok(Ok(result)) => println!("email alert: {result:?}"),
+            _ => {
                 error = true;
                 eprintln!("email alert dispatch failed");
             }

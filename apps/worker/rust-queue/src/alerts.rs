@@ -1380,6 +1380,35 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let (url, second_server) = mock_server("200 OK", r#"{"id":"after-timeout"}"#).await;
+        let second_email = Resend::test_endpoint(
+            crate::resend::Config {
+                api_key: "fixture-key".into(),
+                from: "from@example.test".into(),
+                sender_name: String::new(),
+            },
+            url.as_str(),
+        )
+        .unwrap();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                dispatch_email_with_options(
+                    &mut restricted,
+                    "after-slack-timeout",
+                    60,
+                    &alert,
+                    &second_email,
+                    "ops@example.test",
+                    (true, true),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            Dispatch::Accepted
+        );
+        second_server.await.unwrap();
         assert_eq!(db.query_one("SELECT state FROM novu_rust_alert_delivery_slots WHERE environment_id='env-a' AND target_id='stalled'",&[]).await.unwrap().get::<_,String>(0),"dispatching");
         db.execute("UPDATE novu_rust_alert_delivery_slots SET lease_until=clock_timestamp()-interval '1 second' WHERE environment_id='env-a' AND target_id='stalled'",&[]).await.unwrap();
         assert_eq!(

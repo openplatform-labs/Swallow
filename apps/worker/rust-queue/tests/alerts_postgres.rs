@@ -413,6 +413,62 @@ async fn alert_reservations_fence_concurrency_and_ambiguous_recovery() {
         Some(1)
     );
     assert_eq!(run("env-a", None, "yes", "false").status.code(), Some(1));
+    for value in ["0", "301", "invalid"] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"))
+            .args(["env-a", "300", "120", "60"])
+            .env("SWALLOW_ALERT_OPERATION_TIMEOUT_SECONDS", value)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+    }
+    // One blocked check must time out and still reach the independent durable
+    // alert path rather than leaving a scheduled process hung indefinitely.
+    let locked = b.transaction().await.unwrap();
+    locked
+        .batch_execute("LOCK TABLE novu_queue_jobs IN ACCESS EXCLUSIVE MODE")
+        .await
+        .unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"))
+        .args(["env-a", "300", "120", "60"])
+        .env("DATABASE_URL", &url)
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .env(
+            "SWALLOW_ALERT_SLACK_WEBHOOK",
+            "https://hooks.slack.com/services/A/B/C",
+        )
+        .env_remove("SWALLOW_ALERT_SLACK_WEBHOOK_FILE")
+        .env_remove("SWALLOW_ALERT_EMAIL_TO")
+        .env("SWALLOW_ALERT_SLACK_TARGET_ID", "check")
+        .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
+        .env("SWALLOW_ALERT_ATTEMPTS_ENABLED", "false")
+        .env("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS", "60")
+        .env("SWALLOW_ALERT_OPERATION_TIMEOUT_SECONDS", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let finished = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    if finished.is_err() {
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().unwrap();
+    locked.commit().await.unwrap();
+    assert!(finished.is_ok(), "alert command did not time out");
+    assert_eq!(output.status.code(), Some(1));
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert!(log.contains("queue health check failed"), "{log}");
+    assert!(
+        log.contains("Slack alert requires operator review"),
+        "{log}"
+    );
     assert_eq!(
         run("missing", Some("60"), "false", "false").status.code(),
         Some(1)
