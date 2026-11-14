@@ -115,7 +115,9 @@ async fn synchronous_failover_during_resend_dispatch_preserves_unknown() {
         );
         let body: Value = serde_json::from_slice(&bytes[body_start..]).unwrap();
         assert_eq!(body["to"][0], "receiver@example.test");
-        seen_tx.send(()).unwrap();
+        assert_eq!(body["tags"][0]["name"], "swallow_dispatch");
+        let tag = Uuid::parse_str(body["tags"][0]["value"].as_str().unwrap()).unwrap();
+        seen_tx.send(tag).unwrap();
         release_rx.await.unwrap();
         let response = r#"{"id":"fixture-accepted"}"#;
         socket
@@ -141,12 +143,59 @@ async fn synchronous_failover_during_resend_dispatch_preserves_unknown() {
     let primary_db = connect(&primary_url).await;
     let running = tokio::spawn(async move {
         let mut client = primary_db;
-        resend_queue::process_one(&mut client, "resend-ha", &provider).await
+        resend_queue::process_one_with_correlation(
+            &mut client,
+            "resend-ha",
+            &provider,
+            false,
+            crate::email_step_policy::Policy::Snapshot,
+            true,
+        )
+        .await
     });
-    tokio::time::timeout(Duration::from_secs(10), seen_rx)
+    let sent_tag = tokio::time::timeout(Duration::from_secs(10), seen_rx)
         .await
         .unwrap()
         .unwrap();
+    // Seed a different ambiguous delivery and resolve it from synthetic tagged
+    // evidence before failover. A late collision after promotion must still
+    // invalidate both replicated projections.
+    let auto_job = Uuid::new_v4();
+    let auto_tag = Uuid::new_v4();
+    enqueue(
+        &db,
+        auto_job,
+        "resend-ha",
+        resend_queue::JOB_KIND,
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    db.execute("UPDATE public.novu_queue_jobs SET status='failed',last_error='Resend outcome unknown' WHERE id=$1",&[&auto_job]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_resend_attempts(job_id,environment_id,state,correlation_id) VALUES ($1,'resend-ha','unknown',$2)",&[&auto_job,&auto_tag]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_resend_recipients VALUES ($1,'resend-ha','to',0,'fixture-hash')",&[&auto_job]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_email_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,subject,status,email_job_id,delivery_state) VALUES ($1,'resend-ha','alice','64a000000000000000000054','fixture-notification','resend-ha-workflow','auto-ha','subject','error',$2,'unknown')",&[&auto_job.to_string(),&auto_job]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type,recipient_hash,correlation_id) VALUES ('resend-ha','auto-before-failover','auto-provider','email.delivered','fixture-hash',$1)",&[&auto_tag]).await.unwrap();
+    assert!(
+        crate::resend_projection::project_with_auto_correlation(
+            &mut db,
+            "resend-ha",
+            auto_job,
+            true
+        )
+        .await
+        .unwrap()
+    );
+    let row=db.query_one("SELECT j.resend_delivery_result,m.resend_delivery_result,(SELECT count(*) FROM public.novu_rust_resend_auto_correlations WHERE job_id=j.id) FROM public.novu_queue_jobs j JOIN public.novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1",&[&auto_job]).await.unwrap();
+    assert_eq!(
+        row.get::<_, Option<String>>(0).as_deref(),
+        Some("delivered")
+    );
+    assert_eq!(
+        row.get::<_, Option<String>>(1).as_deref(),
+        Some("delivered")
+    );
+    assert_eq!(row.get::<_, i64>(2), 1);
     let replica = connect(&standby_url).await;
     let mut replicated = false;
     for _ in 0..100 {
@@ -158,7 +207,8 @@ async fn synchronous_failover_during_resend_dispatch_preserves_unknown() {
             .await
             .unwrap()
             .map(|r| r.get(0));
-        if state.as_deref() == Some("dispatching") {
+        let auto_replayed:bool=replica.query_one("SELECT EXISTS(SELECT 1 FROM public.novu_queue_jobs j JOIN public.novu_rust_email_messages m ON m.email_job_id=j.id JOIN public.novu_rust_resend_auto_correlations c ON c.job_id=j.id WHERE j.id=$1 AND j.resend_delivery_result='delivered' AND m.resend_delivery_result='delivered')",&[&auto_job]).await.unwrap().get(0);
+        if state.as_deref() == Some("dispatching") && auto_replayed {
             replicated = true;
             break;
         }
@@ -191,7 +241,13 @@ async fn synchronous_failover_during_resend_dispatch_preserves_unknown() {
             .unwrap()
             .success()
     );
-    let promoted = connect(&standby_url).await;
+    let mut promoted = connect(&standby_url).await;
+    promoted.execute("INSERT INTO public.novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type,recipient_hash,correlation_id) VALUES ('resend-ha','auto-after-failover','different-provider','email.delivered','fixture-hash',$1)",&[&auto_tag]).await.unwrap();
+    let row=promoted.query_one("SELECT j.resend_delivery_result,m.resend_delivery_result,public.novu_rust_resend_auto_evidence_conflicts('resend-ha',j.id),(SELECT count(*) FROM public.novu_rust_resend_auto_correlations c WHERE c.job_id=j.id) FROM public.novu_queue_jobs j JOIN public.novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1",&[&auto_job]).await.unwrap();
+    assert_eq!(row.get::<_, Option<String>>(0).as_deref(), Some("unknown"));
+    assert_eq!(row.get::<_, Option<String>>(1).as_deref(), Some("unknown"));
+    assert!(row.get::<_, bool>(2));
+    assert_eq!(row.get::<_, i64>(3), 1);
     let row=promoted.query_one("SELECT j.status,a.state,m.delivery_state FROM public.novu_queue_jobs j JOIN public.novu_rust_resend_attempts a ON a.job_id=j.id JOIN public.novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1",&[&job]).await.unwrap();
     assert_eq!(row.get::<_, String>(0), "running");
     assert_eq!(row.get::<_, String>(1), "dispatching");
@@ -243,6 +299,49 @@ async fn synchronous_failover_during_resend_dispatch_preserves_unknown() {
         connections.load(Ordering::SeqCst),
         0,
         "worker attempted another external request"
+    );
+    let stored_tag: Uuid = promoted
+        .query_one(
+            "SELECT correlation_id FROM public.novu_rust_resend_attempts WHERE job_id=$1",
+            &[&job],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(stored_tag, sent_tag);
+    let recipient:String=promoted.query_one("SELECT recipient_hash FROM public.novu_rust_resend_recipients WHERE job_id=$1 AND recipient_kind='to' AND recipient_index=0",&[&job]).await.unwrap().get(0);
+    promoted.execute("INSERT INTO public.novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type,recipient_hash,correlation_id) VALUES ('resend-ha','dispatch-after-failover','fixture-accepted','email.delivered',$1,$2)",&[&recipient,&sent_tag]).await.unwrap();
+    assert!(
+        crate::resend_projection::project_with_auto_correlation(
+            &mut promoted,
+            "resend-ha",
+            job,
+            true
+        )
+        .await
+        .unwrap()
+    );
+    let row=promoted.query_one("SELECT j.status,j.resend_delivery_result,a.state,a.provider_message_id,m.delivery_state,m.resend_delivery_result,(SELECT count(*) FROM public.novu_rust_resend_auto_correlations c WHERE c.job_id=j.id) FROM public.novu_queue_jobs j JOIN public.novu_rust_resend_attempts a ON a.job_id=j.id JOIN public.novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1",&[&job]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "completed");
+    assert_eq!(
+        row.get::<_, Option<String>>(1).as_deref(),
+        Some("delivered")
+    );
+    assert_eq!(row.get::<_, String>(2), "accepted");
+    assert_eq!(
+        row.get::<_, Option<String>>(3).as_deref(),
+        Some("fixture-accepted")
+    );
+    assert_eq!(row.get::<_, String>(4), "accepted");
+    assert_eq!(
+        row.get::<_, Option<String>>(5).as_deref(),
+        Some("delivered")
+    );
+    assert_eq!(row.get::<_, i64>(6), 1);
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        0,
+        "automatic correlation must not resend"
     );
     proxy_task.abort();
 }
