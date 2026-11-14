@@ -53,6 +53,7 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
             .env_remove("NOVU_FCM_INTEGRATIONS_FILE")
             .env_remove("SWALLOW_FCM_ALLOW_SHARED_PROVIDER")
             .env_remove("SWALLOW_FCM_INVALID_TOKEN_POLICY")
+            .env_remove("SWALLOW_FCM_TOKEN_CLEANUP_GUARD")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         c
@@ -89,6 +90,20 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
         .output()
         .unwrap();
     assert!(!mismatched_mode.status.success());
+    let mismatched_cleanup = command("guard-env", "project-a", "fixture-token")
+        .env("SWALLOW_FCM_TOKEN_CLEANUP_GUARD", "version")
+        .output()
+        .unwrap();
+    assert!(!mismatched_cleanup.status.success());
+    let invalid_cleanup = command("guard-env", "project-a", "fixture-token")
+        .env("SWALLOW_FCM_TOKEN_CLEANUP_GUARD", "invalid")
+        .output()
+        .unwrap();
+    assert!(!invalid_cleanup.status.success());
+    assert!(
+        String::from_utf8_lossy(&invalid_cleanup.stderr)
+            .contains("invalid FCM token cleanup guard")
+    );
     let mismatched_policy = command("guard-env", "project-a", "fixture-token")
         .env("SWALLOW_FCM_INVALID_TOKEN_POLICY", "unregistered")
         .output()
@@ -138,6 +153,7 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
     let mut changed = Worker(
         command("guard-env", "project-b", "fixture-token-three")
             .env("SWALLOW_FCM_INVALID_TOKEN_POLICY", "unregistered")
+            .env("SWALLOW_FCM_TOKEN_CLEANUP_GUARD", "version")
             .spawn()
             .unwrap(),
     );
@@ -153,6 +169,7 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
     let mut matching = Worker(
         command("guard-env", "project-b", "fixture-token")
             .env("SWALLOW_FCM_INVALID_TOKEN_POLICY", "unregistered")
+            .env("SWALLOW_FCM_TOKEN_CLEANUP_GUARD", "version")
             .spawn()
             .unwrap(),
     );

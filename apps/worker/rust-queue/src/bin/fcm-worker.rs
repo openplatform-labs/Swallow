@@ -1,6 +1,6 @@
 //! Experimental environment-scoped FCM worker; not a full Novu worker.
 use novu_postgres_queue::{
-    fcm::{Fcm, InvalidTokenPolicy},
+    fcm::{Fcm, InvalidTokenPolicy, TokenCleanupGuard},
     fcm_queue,
 };
 use std::{
@@ -82,6 +82,7 @@ fn build_integrations(raw: &str) -> Result<HashMap<String, Fcm>, Box<dyn Error +
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let invalid_token_policy = InvalidTokenPolicy::from_env()?;
+    let cleanup_guard = TokenCleanupGuard::from_env()?;
     let environment = std::env::var("NOVU_FCM_ENVIRONMENT_ID")?;
     if environment.is_empty() {
         return Err("NOVU_FCM_ENVIRONMENT_ID must not be empty".into());
@@ -114,11 +115,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         };
         (Some(provider), None)
     };
-    let provider = provider.map(|p| p.with_invalid_token_policy(invalid_token_policy));
+    let provider = provider.map(|p| {
+        p.with_invalid_token_policy(invalid_token_policy)
+            .with_token_cleanup_guard(cleanup_guard)
+    });
     let integrations = integrations.map(|items| {
         items
             .into_iter()
-            .map(|(id, p)| (id, p.with_invalid_token_policy(invalid_token_policy)))
+            .map(|(id, p)| {
+                (
+                    id,
+                    p.with_invalid_token_policy(invalid_token_policy)
+                        .with_token_cleanup_guard(cleanup_guard),
+                )
+            })
             .collect::<HashMap<_, _>>()
     });
     if shared_provider && integrations.is_some() {
@@ -150,6 +160,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let mut routing = serde_json::json!({"mode":mode,"projects":projects});
         if invalid_token_policy == InvalidTokenPolicy::Unregistered {
             routing["invalidTokenPolicy"] = serde_json::json!("unregistered");
+        }
+        if cleanup_guard == TokenCleanupGuard::Version {
+            routing["tokenCleanupGuard"] = serde_json::json!("version");
         }
         let value = serde_json::to_vec(&routing)?;
         Some(

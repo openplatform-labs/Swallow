@@ -510,6 +510,41 @@ async fn process_one_inner(
         .await?;
         return Ok(true);
     };
+    let guarded_cleanup =
+        selected_provider.token_cleanup_guard() == fcm::TokenCleanupGuard::Version;
+    let cleanup_generation = if guarded_cleanup
+        && std::env::var("IS_EXPIRED_TOKENS_REMOVAL_ENABLED").as_deref() == Ok("true")
+        && !target_metadata
+            .and_then(|v| v.get("routed"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    {
+        if let (Some(context), Some(integration), Some(token)) = (
+            prepared_context.as_ref(),
+            integration_id,
+            messages[index]
+                .pointer("/message/token")
+                .and_then(serde_json::Value::as_str)
+                .filter(|v| !v.is_empty()),
+        ) {
+            if let (Some(subscriber), Some(internal)) = (
+                context
+                    .get("subscriber_id")
+                    .and_then(serde_json::Value::as_str),
+                context
+                    .get("subscriber_internal_id")
+                    .and_then(serde_json::Value::as_str),
+            ) {
+                tx.query_opt("SELECT d.cleanup_generation FROM public.novu_rust_fcm_devices d JOIN public.novu_rust_subscribers s ON s.environment_id=d.environment_id AND s.subscriber_id=d.subscriber_id WHERE d.environment_id=$1 AND d.subscriber_id=$2 AND s.internal_id=$3 AND d.integration_internal_id=$4 AND $5=ANY(d.device_tokens) FOR SHARE OF d", &[&environment,&subscriber,&internal,&integration,&token]).await?.map(|row| row.get::<_,Uuid>(0))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     if let Some(context) = prepared_context.as_ref() {
         let string = |key: &str| context.get(key).and_then(serde_json::Value::as_str);
         let tokens = target_metadata
@@ -624,8 +659,13 @@ async fn process_one_inner(
                     .get("integration_internal_id")
                     .and_then(serde_json::Value::as_str),
             )
+            && (!guarded_cleanup || cleanup_generation.is_some())
         {
-            tx.execute("WITH target AS MATERIALIZED (SELECT environment_id,subscriber_id FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2 AND internal_id=$3 FOR UPDATE), removed AS (UPDATE novu_rust_fcm_devices d SET device_tokens=array_remove(d.device_tokens,$5) FROM target WHERE d.environment_id=target.environment_id AND d.subscriber_id=target.subscriber_id AND d.integration_internal_id=$4 RETURNING 1) UPDATE novu_rust_subscribers s SET updated_at=now() FROM target WHERE s.environment_id=target.environment_id AND s.subscriber_id=target.subscriber_id AND EXISTS(SELECT 1 FROM removed)",&[&environment,&subscriber_id,&internal_id,&integration_id,&token]).await?;
+            if guarded_cleanup {
+                tx.execute("WITH target AS MATERIALIZED (SELECT environment_id,subscriber_id FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2 AND internal_id=$3 FOR UPDATE), removed AS (UPDATE novu_rust_fcm_devices d SET device_tokens=array_remove(d.device_tokens,$5) FROM target WHERE d.environment_id=target.environment_id AND d.subscriber_id=target.subscriber_id AND d.integration_internal_id=$4 AND d.cleanup_generation=$6 RETURNING 1) UPDATE novu_rust_subscribers s SET updated_at=now() FROM target WHERE s.environment_id=target.environment_id AND s.subscriber_id=target.subscriber_id AND EXISTS(SELECT 1 FROM removed)",&[&environment,&subscriber_id,&internal_id,&integration_id,&token,&cleanup_generation]).await?;
+            } else {
+                tx.execute("WITH target AS MATERIALIZED (SELECT environment_id,subscriber_id FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2 AND internal_id=$3 FOR UPDATE), removed AS (UPDATE novu_rust_fcm_devices d SET device_tokens=array_remove(d.device_tokens,$5) FROM target WHERE d.environment_id=target.environment_id AND d.subscriber_id=target.subscriber_id AND d.integration_internal_id=$4 RETURNING 1) UPDATE novu_rust_subscribers s SET updated_at=now() FROM target WHERE s.environment_id=target.environment_id AND s.subscriber_id=target.subscriber_id AND EXISTS(SELECT 1 FROM removed)",&[&environment,&subscriber_id,&internal_id,&integration_id,&token]).await?;
+            }
         }
         if prepared_context.is_some() {
             let end = history_index.saturating_add(group_size);
@@ -712,26 +752,70 @@ mod tests {
                 .unwrap();
         tokio::spawn(async move { connection.await.unwrap() });
         db.batch_execute("INSERT INTO novu_rust_environments(id,organization_id) VALUES ('test','org'),('other','org'); INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id) VALUES ('test','alice','subscriber'),('other','alice','other-subscriber'); INSERT INTO novu_rust_fcm_integrations(environment_id,internal_id,identifier) VALUES ('test','integration','fcm'),('other','integration','fcm'); INSERT INTO novu_rust_fcm_devices(environment_id,subscriber_id,integration_internal_id,device_tokens) VALUES ('test','alice','integration',ARRAY['token']),('other','alice','integration',ARRAY['token'])").await.unwrap();
+        let initial: Uuid = db.query_one("SELECT cleanup_generation FROM novu_rust_fcm_devices WHERE environment_id='test' AND subscriber_id='alice'", &[]).await.unwrap().get(0);
+        db.batch_execute(include_str!(
+            "../migrations/0118_fcm_device_cleanup_generation.sql"
+        ))
+        .await
+        .unwrap();
+        assert_eq!(initial, db.query_one("SELECT cleanup_generation FROM novu_rust_fcm_devices WHERE environment_id='test' AND subscriber_id='alice'", &[]).await.unwrap().get::<_,Uuid>(0));
         let structured = r#"{"error":{"details":[{"@type":"type.googleapis.com/google.firebase.fcm.v1.FcmError","errorCode":"UNREGISTERED"}]}}"#;
-        for (policy, status, body, removed) in [
+        for (policy, guard, mutation, status, body, removed) in [
             (
                 fcm::InvalidTokenPolicy::Reference,
+                fcm::TokenCleanupGuard::Reference,
+                "none",
                 404,
                 "Requested entity was not found.",
                 true,
             ),
             (
                 fcm::InvalidTokenPolicy::Unregistered,
+                fcm::TokenCleanupGuard::Reference,
+                "none",
                 404,
                 "Requested entity was not found.",
                 false,
             ),
-            (fcm::InvalidTokenPolicy::Unregistered, 404, structured, true),
             (
                 fcm::InvalidTokenPolicy::Unregistered,
+                fcm::TokenCleanupGuard::Version,
+                "none",
+                404,
+                structured,
+                true,
+            ),
+            (
+                fcm::InvalidTokenPolicy::Unregistered,
+                fcm::TokenCleanupGuard::Version,
+                "none",
                 500,
                 structured,
                 false,
+            ),
+            (
+                fcm::InvalidTokenPolicy::Unregistered,
+                fcm::TokenCleanupGuard::Version,
+                "update",
+                404,
+                structured,
+                false,
+            ),
+            (
+                fcm::InvalidTokenPolicy::Unregistered,
+                fcm::TokenCleanupGuard::Version,
+                "recreate",
+                404,
+                structured,
+                false,
+            ),
+            (
+                fcm::InvalidTokenPolicy::Unregistered,
+                fcm::TokenCleanupGuard::Reference,
+                "update",
+                404,
+                structured,
+                true,
             ),
         ] {
             db.execute("UPDATE novu_rust_fcm_devices SET device_tokens=ARRAY['token'] WHERE environment_id='test' AND subscriber_id='alice'", &[]).await.unwrap();
@@ -742,11 +826,26 @@ mod tests {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut buf = vec![0u8; 8192];
                 assert!(socket.read(&mut buf).await.unwrap() > 0);
+                if mutation != "none" {
+                    let (db, connection) = tokio_postgres::connect(
+                        &std::env::var("TEST_DATABASE_URL").unwrap(),
+                        NoTls,
+                    )
+                    .await
+                    .unwrap();
+                    tokio::spawn(async move { connection.await.unwrap() });
+                    match mutation {
+                        "update" => db.batch_execute("UPDATE novu_rust_fcm_devices SET device_tokens=ARRAY['token','new-token'] WHERE environment_id='test' AND subscriber_id='alice'").await.unwrap(),
+                        "recreate" => db.batch_execute("BEGIN; DELETE FROM novu_rust_fcm_devices WHERE environment_id='test' AND subscriber_id='alice'; INSERT INTO novu_rust_fcm_devices(environment_id,subscriber_id,integration_internal_id,device_tokens) VALUES ('test','alice','integration',ARRAY['token']); COMMIT").await.unwrap(),
+                        _ => unreachable!(),
+                    }
+                }
                 socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
             });
             let provider = Fcm::with_origin("demo", "fixture".into(), &origin)
                 .unwrap()
-                .with_invalid_token_policy(policy);
+                .with_invalid_token_policy(policy)
+                .with_token_cleanup_guard(guard);
             let id = Uuid::new_v4();
             let message_id = Uuid::new_v4().simple().to_string();
             let payload = json!({"prepared_messages":[{"message":{"token":"token","notification":{"title":"hi","body":"body"},"data":{}}}],"prepared_context":{"subscriber_id":"alice","subscriber_internal_id":"subscriber","notification_internal_id":"notification","workflow_identifier":"workflow","transaction_id":id.to_string(),"title":"hi","content":"body","target_metadata":[{"integration_internal_id":"integration","message_id":message_id,"device_tokens":["token"]}]}});
@@ -756,7 +855,10 @@ mod tests {
             assert!(process_one(&mut db, "test", &provider).await.unwrap());
             server.await.unwrap();
             let tokens: Vec<String> = db.query_one("SELECT device_tokens FROM novu_rust_fcm_devices WHERE environment_id='test' AND subscriber_id='alice'", &[]).await.unwrap().get(0);
-            assert_eq!(tokens.is_empty(), removed);
+            assert_eq!(!tokens.contains(&"token".to_string()), removed);
+            if mutation == "update" {
+                assert!(tokens.contains(&"new-token".to_string()));
+            }
             assert_eq!(
                 db.query_one(
                     "SELECT state FROM novu_rust_fcm_attempts WHERE job_id=$1",
@@ -885,13 +987,29 @@ mod tests {
                 std::fs::write(path, serde_json::to_vec(&authorizations).unwrap()).unwrap();
             }
         });
-        let provider = Fcm::with_origin("demo", "fixture".into(), &origin).unwrap();
+        let guard = match std::env::var("TEST_PUSH_CLEANUP_GUARD").as_deref() {
+            Ok("version") => fcm::TokenCleanupGuard::Version,
+            Ok("reference") | Err(std::env::VarError::NotPresent) => {
+                fcm::TokenCleanupGuard::Reference
+            }
+            _ => panic!("invalid test cleanup guard"),
+        };
+        let provider = Fcm::with_origin("demo", "fixture".into(), &origin)
+            .unwrap()
+            .with_token_cleanup_guard(guard);
         let integrations: Option<HashMap<String, Fcm>> =
             std::env::var("TEST_PUSH_INTEGRATIONS").ok().map(|raw| {
                 let tokens: HashMap<String, String> = serde_json::from_str(&raw).unwrap();
                 tokens
                     .into_iter()
-                    .map(|(id, token)| (id, Fcm::with_origin("demo", token, &origin).unwrap()))
+                    .map(|(id, token)| {
+                        (
+                            id,
+                            Fcm::with_origin("demo", token, &origin)
+                                .unwrap()
+                                .with_token_cleanup_guard(guard),
+                        )
+                    })
                     .collect()
             });
         for _ in 0..count.max(1) {

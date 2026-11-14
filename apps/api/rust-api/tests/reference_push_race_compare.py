@@ -49,7 +49,10 @@ INSERT INTO novu_rust_workflows(environment_id,identifier,active,has_steps,push_
 INSERT INTO novu_rust_fcm_integrations(environment_id,internal_id,identifier,active) VALUES ('64a000000000000000000002','64a000000000000000000063','fixture-fcm',true);
 ''')
 
-for case in ('change_tokens','remove_token','readd_token','recreate_subscriber','delete_subscriber'):
+all_cases=('change_tokens','remove_token','readd_token','same_tokens','recreate_subscriber','delete_subscriber')
+cases=os.environ.get('TEST_PUSH_RACE_CASES',','.join(all_cases)).split(',')
+assert cases and all(case in all_cases for case in cases),cases
+for case in cases:
     suffix=uuid.uuid4().hex
     subscriber='push-race-'+suffix
     token='device-invalid-barrier-'+suffix
@@ -96,6 +99,7 @@ for case in ('change_tokens','remove_token','readd_token','recreate_subscriber',
             for index,base in enumerate(bases):
                 if case=='change_tokens':tokens(base,subscriber,[good,token])
                 elif case=='remove_token':tokens(base,subscriber,[good])
+                elif case=='same_tokens':tokens(base,subscriber,[token])
                 elif case=='readd_token':
                     tokens(base,subscriber,[])
                     tokens(base,subscriber,[token,good])
@@ -137,5 +141,9 @@ for case in ('change_tokens','remove_token','readd_token','recreate_subscriber',
             assert status==404,(base,status,body)
         else:
             expected=[token,good] if case=='recreate_subscriber' else [good]
+            if case=='same_tokens': expected=[]
+            if os.environ.get('TEST_PUSH_CLEANUP_GUARD')=='version' and base==bases[1]:
+                if case=='change_tokens': expected=[good,token]
+                if case=='readd_token': expected=[token,good]
             assert status==200 and body['data']['channels'][0]['credentials']['deviceTokens']==expected,(case,base,status,body,expected)
-    print(case+': in-flight invalid-token cleanup matched')
+    print(case+': in-flight invalid-token cleanup verified')

@@ -411,6 +411,21 @@ pub enum InvalidTokenPolicy {
     Reference,
     Unregistered,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenCleanupGuard {
+    Reference,
+    Version,
+}
+impl TokenCleanupGuard {
+    pub fn from_env() -> Result<Self, &'static str> {
+        match std::env::var("SWALLOW_FCM_TOKEN_CLEANUP_GUARD").as_deref() {
+            Ok("reference") | Err(std::env::VarError::NotPresent) => Ok(Self::Reference),
+            Ok("version") => Ok(Self::Version),
+            _ => Err("invalid FCM token cleanup guard"),
+        }
+    }
+}
 impl InvalidTokenPolicy {
     pub fn from_env() -> Result<Self, &'static str> {
         match std::env::var("SWALLOW_FCM_INVALID_TOKEN_POLICY").as_deref() {
@@ -446,11 +461,19 @@ pub struct Fcm {
     auth: Auth,
     project_id: String,
     invalid_token_policy: InvalidTokenPolicy,
+    token_cleanup_guard: TokenCleanupGuard,
 }
 impl Fcm {
     pub fn with_invalid_token_policy(mut self, policy: InvalidTokenPolicy) -> Self {
         self.invalid_token_policy = policy;
         self
+    }
+    pub fn with_token_cleanup_guard(mut self, guard: TokenCleanupGuard) -> Self {
+        self.token_cleanup_guard = guard;
+        self
+    }
+    pub fn token_cleanup_guard(&self) -> TokenCleanupGuard {
+        self.token_cleanup_guard
     }
     pub fn project_id(&self) -> &str {
         &self.project_id
@@ -498,6 +521,7 @@ impl Fcm {
             auth: Auth::Bearer(access_token),
             project_id: project_id.to_owned(),
             invalid_token_policy: InvalidTokenPolicy::Reference,
+            token_cleanup_guard: TokenCleanupGuard::Reference,
         })
     }
     /// One request per target, each attempted once. Failures may be ambiguous.
