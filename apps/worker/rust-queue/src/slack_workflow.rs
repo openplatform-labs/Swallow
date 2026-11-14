@@ -15,6 +15,37 @@ pub const MIGRATION: &str = include_str!("../migrations/0078_slack_workflow.sql"
 pub type Providers = HashMap<(String, String), Slack>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndpointPolicy {
+    Current,
+    Snapshot,
+}
+impl EndpointPolicy {
+    pub fn from_env() -> Result<Self, &'static str> {
+        match std::env::var("NOVU_SLACK_WORKFLOW_ENDPOINT_POLICY").as_deref() {
+            Ok("current") | Err(std::env::VarError::NotPresent) => Ok(Self::Current),
+            Ok("snapshot") => Ok(Self::Snapshot),
+            _ => Err("invalid Slack workflow endpoint policy"),
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Snapshot => "snapshot",
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointSnapshot {
+    pub endpoint_id: Uuid,
+    pub endpoint_type: String,
+    pub endpoint: Value,
+    pub integration: String,
+    pub connection: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepPolicy {
     Snapshot,
     Active,
@@ -50,6 +81,8 @@ pub struct Context {
     pub context_keys: Vec<String>,
     pub actor: Option<Value>,
     pub actor_internal_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_snapshot: Option<Vec<EndpointSnapshot>>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -176,10 +209,18 @@ pub async fn fanout_one_with_policy(
     environment: &str,
     policy: StepPolicy,
 ) -> Result<bool, Error> {
+    fanout_one_with_policies(db, environment, policy, EndpointPolicy::Current).await
+}
+pub async fn fanout_one_with_policies(
+    db: &mut Client,
+    environment: &str,
+    policy: StepPolicy,
+    endpoint_policy: EndpointPolicy,
+) -> Result<bool, Error> {
     let Some(job) = claim(db, environment, FANOUT_KIND).await? else {
         return Ok(false);
     };
-    let ctx: Context = match serde_json::from_value(job.payload.clone()) {
+    let mut ctx: Context = match serde_json::from_value(job.payload.clone()) {
         Ok(v) => v,
         Err(_) => {
             crate::fail(db, job.id, job.lease_token, "invalid Slack workflow job").await?;
@@ -217,16 +258,87 @@ pub async fn fanout_one_with_policy(
         tx.commit().await?;
         return Ok(true);
     }
-    let endpoints=tx.query("SELECT internal_id,endpoint_type,endpoint,integration_identifier,connection_identifier FROM novu_rust_slack_channel_endpoints WHERE environment_id=$1 AND subscriber_internal_id=$2 AND context_keys @> $3 AND context_keys <@ $3 AND cardinality(context_keys)=cardinality($3) ORDER BY created_at,internal_id",&[&environment,&ctx.subscriber_internal_id,&ctx.context_keys]).await?;
-    if endpoints.is_empty() {
-        terminal(&tx, &job, "cancelled", Some("no Slack endpoints")).await?;
+    // A snapshot is needed only for the parent. Do not clone the full list
+    // into each child, which would produce quadratic payload work.
+    let captured_snapshot = ctx.endpoint_snapshot.take();
+    let captured = if endpoint_policy == EndpointPolicy::Snapshot {
+        let Some(snapshot) = captured_snapshot.as_ref() else {
+            terminal(&tx, &job, "failed", Some("Slack endpoint snapshot missing")).await?;
+            tx.commit().await?;
+            return Ok(true);
+        };
+        let map: HashMap<Uuid, &EndpointSnapshot> =
+            snapshot.iter().map(|e| (e.endpoint_id, e)).collect();
+        if snapshot.len() > 1000 || map.len() != snapshot.len() {
+            terminal(&tx, &job, "failed", Some("invalid Slack endpoint snapshot")).await?;
+            tx.commit().await?;
+            return Ok(true);
+        }
+        Some(map)
+    } else {
+        None
+    };
+    let query = if captured.is_some() {
+        "SELECT internal_id,endpoint_type,endpoint,integration_identifier,connection_identifier FROM novu_rust_slack_channel_endpoints WHERE environment_id=$1 AND subscriber_internal_id=$2 AND context_keys @> $3 AND context_keys <@ $3 AND cardinality(context_keys)=cardinality($3) ORDER BY created_at,internal_id LIMIT 1001"
+    } else {
+        "SELECT internal_id,endpoint_type,endpoint,integration_identifier,connection_identifier FROM novu_rust_slack_channel_endpoints WHERE environment_id=$1 AND subscriber_internal_id=$2 AND context_keys @> $3 AND context_keys <@ $3 AND cardinality(context_keys)=cardinality($3) ORDER BY created_at,internal_id"
+    };
+    let endpoints = tx
+        .query(
+            query,
+            &[&environment, &ctx.subscriber_internal_id, &ctx.context_keys],
+        )
+        .await?;
+    if captured.is_some() && endpoints.len() > 1000 {
+        terminal(&tx, &job, "failed", Some("too many Slack endpoints")).await?;
         tx.commit().await?;
         return Ok(true);
     }
+    if captured.is_some() && !live(&tx, &job).await? {
+        tx.rollback().await?;
+        return Ok(true);
+    }
+    if endpoints.is_empty() {
+        let changed = captured.as_ref().is_some_and(|s| !s.is_empty());
+        terminal(
+            &tx,
+            &job,
+            if changed { "failed" } else { "cancelled" },
+            Some(if changed {
+                "Slack endpoint snapshot changed"
+            } else {
+                "no Slack endpoints"
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(true);
+    }
+    let mut matched = 0usize;
+    let mut changed = false;
     for row in endpoints {
         let id: Uuid = row.get(0);
         let kind: String = row.get(1);
         let endpoint: Value = row.get(2);
+        let integration: String = row.get(3);
+        let connection: Option<String> = row.get(4);
+        if let Some(snapshot) = captured.as_ref() {
+            let current = EndpointSnapshot {
+                endpoint_id: id,
+                endpoint_type: kind.clone(),
+                endpoint: endpoint.clone(),
+                integration: integration.clone(),
+                connection: connection.clone(),
+            };
+            if snapshot
+                .get(&id)
+                .is_none_or(|original| **original != current)
+            {
+                changed = true;
+                continue;
+            }
+            matched += 1;
+        }
         let Some(target) = endpoint
             .get(if kind == "slack_channel" {
                 "channelId"
@@ -241,8 +353,8 @@ pub async fn fanout_one_with_policy(
             context: ctx.clone(),
             endpoint_id: id,
             target: target.to_owned(),
-            integration: row.get(3),
-            connection: row.get(4),
+            integration,
+            connection,
         };
         let payload = serde_json::to_value(delivery).expect("serializable Slack workflow context");
         let child = Uuid::new_v4();
@@ -253,7 +365,18 @@ pub async fn fanout_one_with_policy(
         .await?;
         tx.execute("INSERT INTO novu_rust_slack_workflow_fanout(parent_job_id,environment_id,endpoint_internal_id,delivery_job_id) VALUES ($1,$2,$3,$4)",&[&job.id,&environment,&id,&child]).await?;
     }
-    terminal(&tx, &job, "completed", None).await?;
+    if captured.is_some() && !live(&tx, &job).await? {
+        tx.rollback().await?;
+        return Ok(true);
+    }
+    if captured
+        .as_ref()
+        .is_some_and(|snapshot| changed || matched != snapshot.len())
+    {
+        terminal(&tx, &job, "failed", Some("Slack endpoint snapshot changed")).await?;
+    } else {
+        terminal(&tx, &job, "completed", None).await?;
+    }
     tx.commit().await?;
     Ok(true)
 }
@@ -528,6 +651,7 @@ mod tests {
             context_keys: vec![],
             actor: None,
             actor_internal_id: None,
+            endpoint_snapshot: None,
         };
         let payload = serde_json::to_value(&ctx).unwrap();
         // A committed edit prevents an unchanged-policy fanout, while the
@@ -739,8 +863,9 @@ mod tests {
             Slack::test_endpoint("fixture-token".into(), &url).unwrap(),
         );
         let policy = StepPolicy::from_env().unwrap();
+        let endpoint_policy = EndpointPolicy::from_env().unwrap();
         assert!(
-            fanout_one_with_policy(&mut db, "64a000000000000000000002", policy)
+            fanout_one_with_policies(&mut db, "64a000000000000000000002", policy, endpoint_policy)
                 .await
                 .unwrap()
         );
@@ -798,6 +923,7 @@ mod tests {
             context_keys: vec![],
             actor: None,
             actor_internal_id: None,
+            endpoint_snapshot: None,
         };
         let parent = Uuid::new_v4();
         crate::enqueue(

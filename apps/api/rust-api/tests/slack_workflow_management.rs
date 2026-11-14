@@ -293,6 +293,297 @@ async fn slack_step_management_is_authorized_audited_and_connected_to_fanout() {
         .unwrap()
     );
     assert_eq!(setup.query_one("SELECT last_error FROM public.novu_queue_jobs WHERE environment_id='a' AND kind=$1", &[&novu_postgres_queue::slack_workflow::DELIVERY_KIND]).await.unwrap().get::<_,Option<String>>(0).as_deref(), Some("Slack workflow step disabled"));
+    // Snapshot endpoint identity when the trigger is processed, then add a
+    // destination before fanout. Only the original may produce a child.
+    assert_eq!(
+        call(
+            app.clone(),
+            "PUT",
+            path,
+            "a-key",
+            json!({"content":"Hello {{subscriber.firstName}}","active":true})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(
+            app.clone(),
+            "POST",
+            "/v1/events/trigger",
+            "a-key",
+            json!({"name":"workflow","to":"alice","transactionId":"t-3","payload":{}})
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    assert!(
+        novu_postgres_queue::in_app::process_one_with_slack_snapshot(
+            &mut setup,
+            Duration::from_secs(60),
+            true
+        )
+        .await
+        .unwrap()
+    );
+    let snapshot_job: uuid::Uuid = setup
+        .query_one(
+            "SELECT id FROM public.novu_queue_jobs WHERE kind=$1 AND status='pending'",
+            &[&novu_postgres_queue::slack_workflow::FANOUT_KIND],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    setup.batch_execute("INSERT INTO public.novu_rust_slack_channel_endpoints(environment_id,identifier,subscriber_id,subscriber_internal_id,integration_identifier,endpoint_type,endpoint) VALUES ('a','added','alice','alice-id','main','slack_channel','{\"channelId\":\"C999\"}')").await.unwrap();
+    assert!(
+        novu_postgres_queue::slack_workflow::fanout_one_with_policies(
+            &mut setup,
+            "a",
+            novu_postgres_queue::slack_workflow::StepPolicy::Active,
+            novu_postgres_queue::slack_workflow::EndpointPolicy::Snapshot
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(
+        setup
+            .query_one(
+                "SELECT status,last_error FROM public.novu_queue_jobs WHERE id=$1",
+                &[&snapshot_job]
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(1),
+        "Slack endpoint snapshot changed"
+    );
+    assert_eq!(setup.query_one("SELECT count(*) FROM public.novu_queue_jobs WHERE kind=$1 AND payload->>'target'='C999'", &[&novu_postgres_queue::slack_workflow::DELIVERY_KIND]).await.unwrap().get::<_,i64>(0),0);
+    let child: Value = setup
+        .query_one(
+            "SELECT payload FROM public.novu_queue_jobs WHERE kind=$1 AND status='pending'",
+            &[&novu_postgres_queue::slack_workflow::DELIVERY_KIND],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(child["target"], "C123");
+    assert!(child["context"].get("endpoint_snapshot").is_none());
+    // Reusing an endpoint identifier (even with the same target) changes its
+    // internal identity, so the old snapshot cannot authorize the new row.
+    assert_eq!(
+        call(
+            app.clone(),
+            "POST",
+            "/v1/events/trigger",
+            "a-key",
+            json!({"name":"workflow","to":"alice","transactionId":"t-4","payload":{}})
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    assert!(
+        novu_postgres_queue::in_app::process_one_with_slack_snapshot(
+            &mut setup,
+            Duration::from_secs(60),
+            true
+        )
+        .await
+        .unwrap()
+    );
+    let recreated_job: uuid::Uuid = setup
+        .query_one(
+            "SELECT id FROM public.novu_queue_jobs WHERE kind=$1 AND status='pending'",
+            &[&novu_postgres_queue::slack_workflow::FANOUT_KIND],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    setup.batch_execute("DELETE FROM public.novu_rust_slack_channel_endpoints WHERE environment_id='a'; INSERT INTO public.novu_rust_slack_channel_endpoints(environment_id,identifier,subscriber_id,subscriber_internal_id,integration_identifier,endpoint_type,endpoint) VALUES ('a','endpoint','alice','alice-id','main','slack_channel','{\"channelId\":\"C123\"}')").await.unwrap();
+    assert!(
+        novu_postgres_queue::slack_workflow::fanout_one_with_policies(
+            &mut setup,
+            "a",
+            novu_postgres_queue::slack_workflow::StepPolicy::Active,
+            novu_postgres_queue::slack_workflow::EndpointPolicy::Snapshot
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(
+        setup
+            .query_one(
+                "SELECT last_error FROM public.novu_queue_jobs WHERE id=$1",
+                &[&recreated_job]
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        "Slack endpoint snapshot changed"
+    );
+    assert_eq!(
+        setup
+            .query_one(
+                "SELECT count(*) FROM public.novu_queue_jobs WHERE kind=$1",
+                &[&novu_postgres_queue::slack_workflow::DELIVERY_KIND]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        2
+    );
+    assert!(
+        novu_postgres_queue::slack_queue::health(&setup, "a")
+            .await
+            .unwrap()["preDispatchFailures"]
+            .as_i64()
+            .unwrap()
+            >= 2
+    );
+    // A legacy fanout without a snapshot is rejected in strict mode.
+    assert_eq!(
+        call(
+            app.clone(),
+            "POST",
+            "/v1/events/trigger",
+            "a-key",
+            json!({"name":"workflow","to":"alice","transactionId":"t-5","payload":{}})
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    assert!(
+        novu_postgres_queue::in_app::process_one(&mut setup)
+            .await
+            .unwrap()
+    );
+    let legacy: uuid::Uuid = setup
+        .query_one(
+            "SELECT id FROM public.novu_queue_jobs WHERE kind=$1 AND status='pending'",
+            &[&novu_postgres_queue::slack_workflow::FANOUT_KIND],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        novu_postgres_queue::slack_workflow::fanout_one_with_policies(
+            &mut setup,
+            "a",
+            novu_postgres_queue::slack_workflow::StepPolicy::Active,
+            novu_postgres_queue::slack_workflow::EndpointPolicy::Snapshot
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(
+        setup
+            .query_one(
+                "SELECT last_error FROM public.novu_queue_jobs WHERE id=$1",
+                &[&legacy]
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        "Slack endpoint snapshot missing"
+    );
+    // A subscriber-serialized endpoint insertion committed before the trigger
+    // worker obtains that subscriber lock is included in the snapshot.
+    assert_eq!(
+        call(
+            app.clone(),
+            "POST",
+            "/v1/events/trigger",
+            "a-key",
+            json!({"name":"workflow","to":"alice","transactionId":"t-6","payload":{}})
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    let (mut writer, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    let tx = writer.transaction().await.unwrap();
+    tx.query_one("SELECT 1 FROM public.novu_rust_subscribers WHERE environment_id='a' AND subscriber_id='alice' FOR UPDATE",&[]).await.unwrap();
+    tx.execute("INSERT INTO public.novu_rust_slack_channel_endpoints(environment_id,identifier,subscriber_id,subscriber_internal_id,integration_identifier,endpoint_type,endpoint) VALUES ('a','before-snapshot','alice','alice-id','main','slack_channel','{\"channelId\":\"C777\"}')",&[]).await.unwrap();
+    let (mut snapshot_worker, driver) = tokio_postgres::connect(
+        &format!("{url}?application_name=slack_snapshot_worker"),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    let pending = tokio::spawn(async move {
+        novu_postgres_queue::in_app::process_one_with_slack_snapshot(
+            &mut snapshot_worker,
+            Duration::from_secs(60),
+            true,
+        )
+        .await
+    });
+    let mut waiting = false;
+    for _ in 0..100 {
+        if setup.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='slack_snapshot_worker' AND wait_event_type='Lock')",&[]).await.unwrap().get::<_,bool>(0){waiting=true;break;}
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(waiting && !pending.is_finished());
+    tx.commit().await.unwrap();
+    assert!(pending.await.unwrap().unwrap());
+    let snapshot:Value=setup.query_one("SELECT payload->'endpoint_snapshot' FROM public.novu_queue_jobs WHERE kind=$1 AND status='pending'", &[&novu_postgres_queue::slack_workflow::FANOUT_KIND]).await.unwrap().get(0);
+    assert_eq!(snapshot.as_array().unwrap().len(), 2);
+    assert!(
+        snapshot
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["endpoint"]["channelId"] == "C777")
+    );
+    // The snapshot bound rejects the trigger atomically instead of emitting a
+    // partial destination set when an unexpectedly large fanout is encountered.
+    setup.batch_execute("INSERT INTO public.novu_rust_slack_channel_endpoints(environment_id,identifier,subscriber_id,subscriber_internal_id,integration_identifier,endpoint_type,endpoint) SELECT 'a','mass-'||i,'alice','alice-id','main','slack_channel',jsonb_build_object('channelId','C'||i) FROM generate_series(1,999) i").await.unwrap();
+    assert_eq!(
+        call(
+            app.clone(),
+            "POST",
+            "/v1/events/trigger",
+            "a-key",
+            json!({"name":"workflow","to":"alice","transactionId":"t-7","payload":{}})
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    assert!(
+        novu_postgres_queue::in_app::process_one_with_slack_snapshot(
+            &mut setup,
+            Duration::from_secs(60),
+            true
+        )
+        .await
+        .unwrap()
+    );
+    let failed=setup.query_one("SELECT status,last_error FROM public.novu_queue_jobs WHERE kind=$1 AND payload->>'transactionId'='t-7'", &[&novu_postgres_queue::in_app::JOB_KIND]).await.unwrap();
+    assert_eq!(failed.get::<_, String>(0), "failed");
+    assert_eq!(
+        failed.get::<_, String>(1),
+        "too many Slack endpoints for snapshot"
+    );
+    assert_eq!(
+        setup
+            .query_one(
+                "SELECT count(*) FROM public.novu_rust_notifications WHERE transaction_id='t-7'",
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
     // Pause the HTTP write on the workflow row after it acquires the grant.
     let (mut holder, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move {

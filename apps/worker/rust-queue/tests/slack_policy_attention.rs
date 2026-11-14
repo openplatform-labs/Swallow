@@ -47,6 +47,7 @@ async fn policy_cancellations_are_selectively_monitored_and_acknowledged() {
         context_keys: vec![],
         actor: None,
         actor_internal_id: None,
+        endpoint_snapshot: None,
     };
     let job = Uuid::new_v4();
     queue::enqueue(

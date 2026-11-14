@@ -275,10 +275,17 @@ pub async fn process_one(client: &mut Client) -> WorkerResult<bool> {
 /// Process at most one job with a caller-selected lease. Expired jobs remain
 /// eligible for the queue's explicit recovery policy; stale writes roll back.
 pub async fn process_one_with_lease(client: &mut Client, lease: Duration) -> WorkerResult<bool> {
+    process_one_with_slack_snapshot(client, lease, false).await
+}
+pub async fn process_one_with_slack_snapshot(
+    client: &mut Client,
+    lease: Duration,
+    snapshot_slack_endpoints: bool,
+) -> WorkerResult<bool> {
     let Some(job) = crate::claim(client, JOB_KIND, lease).await? else {
         return Ok(false);
     };
-    match Box::pin(process_claimed(client, &job)).await {
+    match Box::pin(process_claimed(client, &job, snapshot_slack_endpoints)).await {
         Ok(()) => Ok(true),
         Err(error) if error.downcast_ref::<LeaseLost>().is_some() => Ok(true),
         Err(error) if error.downcast_ref::<InvalidJob>().is_some() => {
@@ -292,7 +299,11 @@ pub async fn process_one_with_lease(client: &mut Client, lease: Duration) -> Wor
     }
 }
 
-async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> WorkerResult<()> {
+async fn process_claimed(
+    client: &mut Client,
+    job: &crate::ClaimedJob,
+    snapshot_slack_endpoints: bool,
+) -> WorkerResult<()> {
     let data = &job.payload;
     if !crate::allow_recreated_subscriber()
         && data
@@ -838,7 +849,27 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         let notification_id: String = notification.get(0);
         if let Some(chat_content) = chat_step.as_ref() {
             let chat_job_id = Uuid::new_v4();
-            let chat_payload = serde_json::json!({"subscriber_id":subscriber,"subscriber_internal_id":subscriber_internal_id,"workflow_identifier":workflow,"workflow_internal_id":workflow_internal_id,"content_template":chat_content,"payload":payload,"context_keys":context_keys,"actor":actor_profile,"actor_internal_id":actor_internal_id});
+            let mut chat_payload = serde_json::json!({"subscriber_id":subscriber,"subscriber_internal_id":subscriber_internal_id,"workflow_identifier":workflow,"workflow_internal_id":workflow_internal_id,"content_template":chat_content,"payload":payload,"context_keys":context_keys,"actor":actor_profile,"actor_internal_id":actor_internal_id});
+            if snapshot_slack_endpoints {
+                // Subscriber row is held above. API inserts also acquire that lock;
+                // share-lock existing endpoint rows against concurrent edits/deletes.
+                let rows=tx.query("SELECT internal_id,endpoint_type,endpoint,integration_identifier,connection_identifier FROM public.novu_rust_slack_channel_endpoints WHERE environment_id=$1 AND subscriber_internal_id=$2 AND context_keys @> $3 AND context_keys <@ $3 AND cardinality(context_keys)=cardinality($3) ORDER BY created_at,internal_id FOR SHARE LIMIT 1001", &[&job.environment_id,&subscriber_internal_id,&context_keys]).await?;
+                if rows.len() > 1000 {
+                    return Err(InvalidJob("too many Slack endpoints for snapshot").into());
+                }
+                let endpoints: Vec<_> = rows
+                    .into_iter()
+                    .map(|r| crate::slack_workflow::EndpointSnapshot {
+                        endpoint_id: r.get(0),
+                        endpoint_type: r.get(1),
+                        endpoint: r.get(2),
+                        integration: r.get(3),
+                        connection: r.get(4),
+                    })
+                    .collect();
+                chat_payload["endpoint_snapshot"] =
+                    serde_json::to_value(endpoints).expect("Slack snapshots serialize");
+            }
             tx.execute(
                 "INSERT INTO novu_queue_jobs(id,environment_id,kind,payload) VALUES ($1,$2,$3,$4)",
                 &[

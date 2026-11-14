@@ -26,6 +26,7 @@ async fn workers_reject_different_maps_without_disclosing_tokens() {
         novu_postgres_queue::slack_queue::MIGRATION,
         novu_postgres_queue::slack_workflow::MIGRATION,
         include_str!("../migrations/0113_slack_workflow_policy.sql"),
+        include_str!("../migrations/0115_slack_endpoint_policy.sql"),
     ] {
         db.batch_execute(sql).await.unwrap();
     }
@@ -36,6 +37,7 @@ async fn workers_reject_different_maps_without_disclosing_tokens() {
             .env("NOVU_SLACK_ENVIRONMENT_ID", "env")
             .env("NOVU_SLACK_WORKFLOW_TOKENS", tokens)
             .env_remove("NOVU_SLACK_WORKFLOW_STEP_POLICY")
+            .env_remove("NOVU_SLACK_WORKFLOW_ENDPOINT_POLICY")
             .env_remove("NOVU_SLACK_WORKFLOW_TOKENS_FILE")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -74,7 +76,13 @@ async fn workers_reject_different_maps_without_disclosing_tokens() {
         .output()
         .unwrap();
     assert!(!mismatch.status.success());
-    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("step policies"));
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("workflow policies"));
+    let endpoint_mismatch = command(r#"{"main":{"":"fixture-secret","conn":"fixture-two"}}"#)
+        .env("NOVU_SLACK_WORKFLOW_ENDPOINT_POLICY", "snapshot")
+        .output()
+        .unwrap();
+    assert!(!endpoint_mismatch.status.success());
+    assert!(String::from_utf8_lossy(&endpoint_mismatch.stderr).contains("workflow policies"));
     let invalid = command(r#"{"main":{"":"fixture-secret"}}"#)
         .env("NOVU_SLACK_WORKFLOW_STEP_POLICY", "invalid")
         .output()
@@ -105,4 +113,23 @@ async fn workers_reject_different_maps_without_disclosing_tokens() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(selected && active.0.try_wait().unwrap().is_none());
+    active.0.kill().unwrap();
+    active.0.wait().unwrap();
+    db.execute("UPDATE novu_rust_slack_workflow_worker_config SET endpoint_policy=NULL WHERE environment_id='env'", &[]).await.unwrap();
+    let mut snapshot = Worker(
+        command(r#"{"main":{"":"fixture-secret","conn":"fixture-two"}}"#)
+            .env("NOVU_SLACK_WORKFLOW_STEP_POLICY", "active")
+            .env("NOVU_SLACK_WORKFLOW_ENDPOINT_POLICY", "snapshot")
+            .spawn()
+            .unwrap(),
+    );
+    let mut selected = false;
+    for _ in 0..100 {
+        selected=db.query_one("SELECT endpoint_policy='snapshot' FROM novu_rust_slack_workflow_worker_config WHERE environment_id='env'", &[]).await.unwrap().get::<_,Option<bool>>(0)==Some(true);
+        if selected {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(selected && snapshot.0.try_wait().unwrap().is_none());
 }

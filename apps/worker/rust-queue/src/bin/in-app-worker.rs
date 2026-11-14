@@ -4,6 +4,11 @@ use std::{error::Error, time::Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let slack_snapshot = match std::env::var("NOVU_SLACK_SNAPSHOT_ENDPOINTS").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("NOVU_SLACK_SNAPSHOT_ENDPOINTS must be true or false".into()),
+    };
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let timeout = match std::env::var("NOVU_IN_APP_DB_TIMEOUT_SECONDS") {
         Ok(value) => value
@@ -50,7 +55,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         Ok(Ok(false)) => {}
                         _ => break,
                     }
-                    match tokio::time::timeout(timeout, in_app::process_one(&mut db)).await {
+                    match tokio::time::timeout(
+                        timeout,
+                        in_app::process_one_with_slack_snapshot(
+                            &mut db,
+                            Duration::from_secs(60),
+                            slack_snapshot,
+                        ),
+                    )
+                    .await
+                    {
                         Ok(Ok(true)) => {}
                         Ok(Ok(false)) => tokio::time::sleep(Duration::from_secs(1)).await,
                         _ => break,
