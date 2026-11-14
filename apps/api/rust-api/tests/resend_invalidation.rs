@@ -85,6 +85,7 @@ async fn events_invalidate_only_matching_results_and_serialize_with_projector() 
             "../../../worker/rust-queue/migrations/0136_resend_correlation_webhook_lock.sql"
         ),
         include_str!("../../../worker/rust-queue/migrations/0137_resend_auto_correlation.sql"),
+        include_str!("../../../worker/rust-queue/migrations/0138_resend_auto_projection_guard.sql"),
     ] {
         db.batch_execute(sql).await.unwrap();
     }
@@ -527,4 +528,26 @@ async fn events_invalidate_only_matching_results_and_serialize_with_projector() 
     assert_eq!(row.get::<_, String>(4), "accepted");
     assert_eq!(row.get::<_, String>(5), "delivered");
     assert_eq!(row.get::<_, i64>(6), 1);
+    assert_eq!(
+        event(
+            app.clone(),
+            secret,
+            "evt-post-auto",
+            "email.delivered",
+            "race-provider-id"
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let row=db.query_one("SELECT j.resend_delivery_result,m.resend_delivery_result FROM novu_queue_jobs j JOIN novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1", &[&race_job]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "unknown");
+    assert_eq!(row.get::<_, String>(1), "unknown");
+    assert!(
+        novu_postgres_queue::resend_projection::project(&mut db, "env-a", race_job)
+            .await
+            .unwrap()
+    );
+    let row=db.query_one("SELECT j.resend_delivery_result,m.resend_delivery_result FROM novu_queue_jobs j JOIN novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1", &[&race_job]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "unknown");
+    assert_eq!(row.get::<_, String>(1), "unknown");
 }

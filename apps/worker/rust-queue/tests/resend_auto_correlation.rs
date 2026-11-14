@@ -50,9 +50,13 @@ async fn ambiguous_evidence_is_not_accepted_and_audit_is_atomic() {
         "ALTER TABLE novu_rust_delivery_reconciliations ADD COLUMN retry_provider_message_id text",
         include_str!("../migrations/0134_resend_correlation.sql"),
         include_str!("../migrations/0137_resend_auto_correlation.sql"),
+        include_str!("../migrations/0138_resend_auto_projection_guard.sql"),
     ] {
         db.batch_execute(sql).await.unwrap();
     }
+    db.batch_execute(include_str!("../migrations/0138_resend_auto_projection_guard.sql"))
+        .await
+        .unwrap();
     let mut blocked = Vec::new();
     let tag = Uuid::new_v4();
     let id = job(&db, tag).await;
@@ -188,7 +192,131 @@ async fn ambiguous_evidence_is_not_accepted_and_audit_is_atomic() {
         .get::<_, i64>(0),
         1
     );
+    // A callback that inserts while a legacy projector holds the job lock
+    // must invalidate its result once that transaction commits.
+    let (observer, observer_driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        observer_driver.await.unwrap();
+    });
+    let callback_url = format!(
+        "{url}{}application_name=auto_guard_callback",
+        if url.contains('?') { "&" } else { "?" }
+    );
+    let (callback_db, callback_driver) =
+        tokio_postgres::connect(&callback_url, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        callback_driver.await.unwrap();
+    });
+    let tx = db.transaction().await.unwrap();
+    tx.query_one(
+        "SELECT id FROM novu_queue_jobs WHERE id=$1 FOR UPDATE",
+        &[&id],
+    )
+    .await
+    .unwrap();
+    let callback = tokio::spawn(async move {
+        event(
+            &callback_db,
+            "env",
+            Some(tag),
+            "late-other-id",
+            Some("hash"),
+        )
+        .await;
+    });
+    let mut waiting = false;
+    for _ in 0..100 {
+        if observer.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='auto_guard_callback' AND wait_event_type='Lock')", &[]).await.unwrap().get::<_,bool>(0) {waiting=true;break;}
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(waiting && !callback.is_finished());
+    tx.execute(
+        "UPDATE novu_queue_jobs SET resend_delivery_result='delivered' WHERE id=$1",
+        &[&id],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    callback.await.unwrap();
+    let row=db.query_one("SELECT j.resend_delivery_result,m.resend_delivery_result FROM novu_queue_jobs j JOIN novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1", &[&id]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "unknown");
+    assert_eq!(row.get::<_, String>(1), "unknown");
+    q::resend_projection::project(&mut db, "env", id)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.query_one(
+            "SELECT resend_delivery_result FROM novu_queue_jobs WHERE id=$1",
+            &[&id]
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0),
+        "unknown"
+    );
+    db.execute("DELETE FROM novu_rust_resend_delivery_events WHERE environment_id='env' AND email_id='late-other-id'", &[]).await.unwrap();
+    q::resend_projection::project_with_auto_correlation(&mut db, "env", id, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.query_one(
+            "SELECT resend_delivery_result FROM novu_queue_jobs WHERE id=$1",
+            &[&id]
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0),
+        "delivered"
+    );
+    event(&db, "other", Some(tag), "valid", Some("hash")).await;
+    assert_eq!(
+        db.query_one(
+            "SELECT resend_delivery_result FROM novu_queue_jobs WHERE id=$1",
+            &[&id]
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0),
+        "delivered"
+    );
     event(&db, "env", Some(Uuid::new_v4()), "valid", Some("hash")).await;
+    let row=db.query_one("SELECT j.resend_delivery_result,m.resend_delivery_result FROM novu_queue_jobs j JOIN novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1", &[&id]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "unknown");
+    assert_eq!(row.get::<_, String>(1), "unknown");
+    // Even a legacy projector must not restore delivered while evidence conflicts.
+    q::resend_projection::project(&mut db, "env", id)
+        .await
+        .unwrap();
+    let row=db.query_one("SELECT j.resend_delivery_result,m.resend_delivery_result FROM novu_queue_jobs j JOIN novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1", &[&id]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "unknown");
+    assert_eq!(row.get::<_, String>(1), "unknown");
+    let role = format!("auto_guard_{}", Uuid::new_v4().simple());
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT SELECT(id),UPDATE(resend_delivery_result) ON novu_queue_jobs TO {role}; GRANT SELECT(email_job_id),UPDATE(resend_delivery_result) ON novu_rust_email_messages TO {role}")).await.unwrap();
+    let (limited, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        driver.await.unwrap();
+    });
+    limited
+        .batch_execute(&format!("SET SESSION AUTHORIZATION {role}"))
+        .await
+        .unwrap();
+    assert!(
+        limited
+            .query("SELECT * FROM novu_rust_resend_auto_correlations", &[])
+            .await
+            .is_err()
+    );
+    limited
+        .execute(
+            "UPDATE novu_queue_jobs SET resend_delivery_result='delivered' WHERE id=$1",
+            &[&id],
+        )
+        .await
+        .unwrap();
+    limited.execute("UPDATE novu_rust_email_messages SET resend_delivery_result='delivered' WHERE email_job_id=$1", &[&id]).await.unwrap();
+    let row=db.query_one("SELECT j.resend_delivery_result,m.resend_delivery_result FROM novu_queue_jobs j JOIN novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1", &[&id]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "unknown");
+    assert_eq!(row.get::<_, String>(1), "unknown");
     q::resend_projection::project_with_auto_correlation(&mut db, "env", id, true)
         .await
         .unwrap();
@@ -214,7 +342,24 @@ async fn ambiguous_evidence_is_not_accepted_and_audit_is_atomic() {
         serde_json::from_slice::<serde_json::Value>(&check.stdout).unwrap()["evidence"]["autoCorrelationConflict"],
         true
     );
+    db.execute("DELETE FROM novu_rust_resend_delivery_events WHERE environment_id='env' AND email_id='valid' AND correlation_id<>$1", &[&tag]).await.unwrap();
+    q::resend_projection::project_with_auto_correlation(&mut db, "env", id, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.query_one(
+            "SELECT resend_delivery_result FROM novu_queue_jobs WHERE id=$1",
+            &[&id]
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0),
+        "delivered"
+    );
     db.execute("DELETE FROM novu_rust_resend_delivery_events WHERE environment_id='env' AND email_id='valid'", &[]).await.unwrap();
+    let row=db.query_one("SELECT j.resend_delivery_result,m.resend_delivery_result FROM novu_queue_jobs j JOIN novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1", &[&id]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "unknown");
+    assert_eq!(row.get::<_, String>(1), "unknown");
     q::resend_projection::project_with_auto_correlation(&mut db, "env", id, true)
         .await
         .unwrap();
