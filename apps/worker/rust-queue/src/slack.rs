@@ -11,6 +11,8 @@ pub struct Message {
     pub text: String,
     #[serde(default)]
     pub blocks: Option<Value>,
+    #[serde(default, rename = "customData")]
+    pub custom_data: Option<serde_json::Map<String, Value>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -31,18 +33,31 @@ impl fmt::Display for SendError {
 impl std::error::Error for SendError {}
 
 pub fn request_body(message: &Message) -> Result<Value, SendError> {
-    if message.channel.is_empty()
-        || message.channel.len() > 255
-        || message.channel.contains(['\r', '\n', '\0'])
-        || message.text.len() > 40_000
-        || message.text.contains('\0')
-        || message.blocks.as_ref().is_some_and(|v| !v.is_array())
-    {
-        return Err(SendError::Invalid);
-    }
     let mut body = json!({"channel":message.channel,"text":message.text});
     if let Some(blocks) = &message.blocks {
         body["blocks"] = blocks.clone();
+    }
+    if let Some(custom_data) = &message.custom_data {
+        body.as_object_mut()
+            .ok_or(SendError::Invalid)?
+            .extend(custom_data.clone());
+    }
+    let channel = body
+        .get("channel")
+        .and_then(Value::as_str)
+        .ok_or(SendError::Invalid)?;
+    let text = body
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or(SendError::Invalid)?;
+    if channel.is_empty()
+        || channel.len() > 255
+        || channel.contains(['\r', '\n', '\0'])
+        || text.len() > 40_000
+        || text.contains('\0')
+        || body.get("blocks").is_some_and(|v| !v.is_array())
+    {
+        return Err(SendError::Invalid);
     }
     if serde_json::to_vec(&body)
         .map_err(|_| SendError::Invalid)?
@@ -190,6 +205,7 @@ mod tests {
             channel: "C123".into(),
             text: "hi".into(),
             blocks: None,
+            custom_data: None,
         };
         for (status, body, expected) in [
             (
@@ -237,5 +253,30 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn validates_effective_custom_data_after_overrides() {
+        let mut message = Message {
+            channel: "C123".into(),
+            text: "original".into(),
+            blocks: None,
+            custom_data: json!({"channel":"C999","text":"custom","thread_ts":"1.2"})
+                .as_object()
+                .cloned(),
+        };
+        assert_eq!(
+            request_body(&message).unwrap(),
+            json!({"channel":"C999","text":"custom","thread_ts":"1.2"})
+        );
+        for invalid in [
+            json!({"channel":"C\n999"}),
+            json!({"channel":null}),
+            json!({"text":false}),
+            json!({"blocks":{}}),
+        ] {
+            message.custom_data = invalid.as_object().cloned();
+            assert_eq!(request_body(&message), Err(SendError::Invalid));
+        }
     }
 }

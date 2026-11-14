@@ -273,7 +273,7 @@ mod tests {
             id,
             "a",
             JOB_KIND,
-            &json!({"channel":"C123","text":"hello"}),
+            &json!({"channel":"C123","text":"hello","customData":{"channel":"C999","thread_ts":"1.2"}}),
         )
         .await
         .unwrap();
@@ -285,6 +285,11 @@ mod tests {
         });
         let request = received.await.unwrap();
         assert!(request.contains("fixture-token"));
+        let (_, body) = request.split_once("\r\n\r\n").unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            json!({"channel":"C999","text":"hello","thread_ts":"1.2"})
+        );
         let (unused, _, _, unused_server) = mock().await;
         let other = Slack::test_endpoint("fixture-other".into(), &unused).unwrap();
         assert!(!process_one(&mut b, "a", &other).await.unwrap());

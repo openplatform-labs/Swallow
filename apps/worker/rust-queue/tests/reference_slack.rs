@@ -23,11 +23,19 @@ fn slack_app_core_wire_matches_original() {
             channel: "C123".into(),
             text: "Hello & 한글".into(),
             blocks: None,
+            custom_data: None,
         },
         Message {
             channel: "U456".into(),
             text: "line 1\nline 2".into(),
             blocks: Some(json!([{"type":"section","text":{"type":"mrkdwn","text":"*Hello*"}}])),
+            custom_data: None,
+        },
+        Message {
+            channel: "C123".into(),
+            text: "original".into(),
+            blocks: None,
+            custom_data: json!({"channel":"C999","text":"custom","thread_ts":"1.2","unfurl_links":false,"metadata":{"event_type":"notice","event_payload":{"id":1}}}).as_object().cloned(),
         },
     ];
     for (case, expected) in cases.iter().zip(original) {
