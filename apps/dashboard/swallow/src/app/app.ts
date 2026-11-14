@@ -11,7 +11,7 @@ type DecisionHistory = { id: string; decision: string; reason: string; createdAt
 type DecisionRequest = { requestId: string; channel: string; targetId: string; attemptId: string; decision: string; reason: string; createdAt: string };
 type RetrySnapshot = { origin: string; endpoint: string; scheme: 'Bearer' | 'SwallowConsole'; requestId: string; channel: string; targetId: string; attemptId: string; decision: string; reason: string; keyHash: string };
 type PermissionIdentity = { issuer:string; subject:string; clientId:string; enabled:boolean; subscriberRead:boolean; alertRead:boolean; alertRetry:boolean; alertAccepted:boolean };
-type PermissionAudit = { id:string; recordedAt:string; issuer:string; subject:string; clientId:string; actor:string; reason:string; previous:string; current:string };
+type PermissionAudit = { id:string; recordedAt:string; issuer:string; subject:string; clientId:string; actor:string; jwtIssuer:string|null; jwtSubject:string|null; jwtClientId:string|null; requestId:string|null; reason:string; previous:string; current:string };
 type Section = 'overview' | 'workflows' | 'subscribers' | 'channels' | 'activity' | 'alerts' | 'settings';
 
 @Component({
@@ -235,7 +235,8 @@ export class App implements OnDestroy {
         const rows:PermissionAudit[]=body.data.map((row:unknown)=>{
           if(typeof row!=='object'||row===null)throw new Error('invalid row');const r=row as Record<string,unknown>;
           if(['id','recordedAt','issuer','subject','clientId','actor','reason'].some(k=>typeof r[k]!=='string')||!/^\d+$/.test(r['id'] as string)||!('previous' in r)||!('current' in r))throw new Error('invalid row');
-          return {id:r['id'] as string,recordedAt:r['recordedAt'] as string,issuer:r['issuer'] as string,subject:r['subject'] as string,clientId:r['clientId'] as string,actor:r['actor'] as string,reason:r['reason'] as string,previous:JSON.stringify(r['previous']),current:JSON.stringify(r['current'])};
+          const optional=(key:string):string|null => typeof r[key]==='string' ? r[key] as string : null;
+          return {id:r['id'] as string,recordedAt:r['recordedAt'] as string,issuer:r['issuer'] as string,subject:r['subject'] as string,clientId:r['clientId'] as string,actor:r['actor'] as string,jwtIssuer:optional('jwtIssuer'),jwtSubject:optional('jwtSubject'),jwtClientId:optional('jwtClientId'),requestId:optional('requestId'),reason:r['reason'] as string,previous:JSON.stringify(r['previous']),current:JSON.stringify(r['current'])};
         });
         if(sequence!==this.permissionSequence)return;
         this.permissionAudit.set(rows);this.permissionNext.set(body.next as string|null);this.permissionStatus.set('audit');

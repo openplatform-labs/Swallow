@@ -16,10 +16,10 @@ describe('Swallow console', () => {
   });
 
   it('handles audit pagination and independently rejected audit access', async () => {
-    const row={id:'9007199254740993',recordedAt:'2026-01-01',issuer:'https://issuer.test',subject:'alice',clientId:'console',actor:'admin',reason:'ticket',previous:null,current:{enabled:true}};
+    const row={id:'9007199254740993',recordedAt:'2026-01-01',issuer:'https://issuer.test',subject:'alice',clientId:'console',actor:'api-db',jwtIssuer:'https://issuer.test',jwtSubject:'admin',jwtClientId:'console',requestId:'request-id',reason:'ticket',previous:null,current:{enabled:true}};
     const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[row],next:'9007199254740993'}),{status:200})).mockResolvedValueOnce(new Response(JSON.stringify({data:[],next:null}),{status:200})).mockResolvedValueOnce(new Response('',{status:401}));
     const app=TestBed.createComponent(App).componentInstance;app.permissionEnvironment='env-a';app.permissionKey='aaa.bbb.ccc';
-    await app.loadPermissions('audit');expect(app.permissionAudit()[0].id).toBe(row.id);expect(app.permissionNext()).toBe(row.id);
+    await app.loadPermissions('audit');expect(app.permissionAudit()[0].id).toBe(row.id);expect(app.permissionAudit()[0].jwtSubject).toBe('admin');expect(app.permissionNext()).toBe(row.id);
     await app.loadPermissions('audit',true);expect(new URL(fetchMock.mock.calls[1][0] as string).searchParams.get('before')).toBe(row.id);expect(app.permissionAudit()).toEqual([]);
     await app.loadPermissions('audit');expect(app.permissionStatus()).toBe('error');expect(app.permissionAudit()).toEqual([]);
   });

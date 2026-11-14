@@ -162,7 +162,7 @@
           <button type="button" class="btn btn-outline" [disabled]="permissionStatus() === 'loading'" (click)="loadPermissions('audit')">최근 이력 조회</button>
           @if (permissionStatus() === 'audit') {
             @if (permissionAudit().length === 0) {<p>조회된 이력이 없습니다.</p>} @else {
-              <div class="table-wrap"><table class="table"><thead><tr><th>기록</th><th>주체</th><th>변경 관리자</th><th>사유</th><th>변경 전·후</th></tr></thead><tbody>@for (row of permissionAudit(); track row.id) {<tr><td>{{ row.id }}<br>{{ row.recordedAt }}</td><td>{{ row.issuer }}<br>{{ row.subject }} · {{ row.clientId }}</td><td>{{ row.actor }}</td><td>{{ row.reason }}</td><td><details><summary>상세 보기</summary><p>이전: {{ row.previous }}</p><p>변경: {{ row.current }}</p></details></td></tr>}</tbody></table></div>
+              <div class="table-wrap"><table class="table"><thead><tr><th>기록</th><th>주체</th><th>변경 관리자</th><th>사유</th><th>변경 전·후</th></tr></thead><tbody>@for (row of permissionAudit(); track row.id) {<tr><td>{{ row.id }}<br>{{ row.recordedAt }}</td><td>{{ row.issuer }}<br>{{ row.subject }} · {{ row.clientId }}</td><td>DB: {{ row.actor }}@if (row.jwtSubject) {<br>JWT: {{ row.jwtIssuer }} / {{ row.jwtSubject }} / {{ row.jwtClientId }}<br>요청 ID: {{ row.requestId }}}</td><td>{{ row.reason }}</td><td><details><summary>상세 보기</summary><p>이전: {{ row.previous }}</p><p>변경: {{ row.current }}</p></details></td></tr>}</tbody></table></div>
             }
             <button type="button" class="btn btn-sm btn-outline" [disabled]="!permissionNext()" (click)="loadPermissions('audit',true)">다음 이력</button>
           }
