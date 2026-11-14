@@ -165,6 +165,7 @@ pub const PUSH_STEP_ID_MIGRATION: &str =
     include_str!("../migrations/0052_experimental_push_step_id.sql");
 pub const DELIVERY_STATE_MIGRATION: &str = include_str!("../migrations/0053_delivery_state.sql");
 pub const JOB_KIND: &str = novu_rust_contracts::EXPERIMENTAL_IN_APP_JOB_KIND;
+pub const ATTACHMENT_JOB_KIND: &str = novu_rust_contracts::EXPERIMENTAL_ATTACHMENT_JOB_KIND;
 pub const UNSNOOZE_JOB_KIND: &str = "experimental-in-app-unsnooze";
 type WorkerResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -282,7 +283,18 @@ pub async fn process_one_with_slack_snapshot(
     lease: Duration,
     snapshot_slack_endpoints: bool,
 ) -> WorkerResult<bool> {
-    let Some(job) = crate::claim(client, JOB_KIND, lease).await? else {
+    let token = Uuid::new_v4();
+    let seconds = lease.as_secs_f64();
+    let kinds = [JOB_KIND, ATTACHMENT_JOB_KIND];
+    let row = client.query_opt("WITH candidate AS (SELECT id FROM novu_queue_jobs WHERE status='pending' AND kind=ANY($3::text[]) AND available_at<=now() ORDER BY available_at,created_at,id FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE novu_queue_jobs j SET status='running',attempts=j.attempts+1,lease_token=$1,lease_until=now()+$2*interval '1 second' FROM candidate WHERE j.id=candidate.id RETURNING j.id,j.environment_id,j.kind,j.payload,j.attempts", &[&token,&seconds,&&kinds[..]]).await?;
+    let Some(job) = row.map(|r| crate::ClaimedJob {
+        id: r.get(0),
+        environment_id: r.get(1),
+        kind: r.get(2),
+        payload: r.get(3),
+        attempts: r.get(4),
+        lease_token: token,
+    }) else {
         return Ok(false);
     };
     match Box::pin(process_claimed(client, &job, snapshot_slack_endpoints)).await {

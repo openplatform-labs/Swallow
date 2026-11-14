@@ -60,6 +60,16 @@ async fn run(
                         ) {
                             break;
                         }
+                        if !matches!(
+                            tokio::time::timeout(
+                                timeout,
+                                requeue_expired(&db, in_app::ATTACHMENT_JOB_KIND)
+                            )
+                            .await,
+                            Ok(Ok(_))
+                        ) {
+                            break;
+                        }
                         recovery = tokio::time::Instant::now() + Duration::from_secs(5);
                     }
                     if stop.requested() {

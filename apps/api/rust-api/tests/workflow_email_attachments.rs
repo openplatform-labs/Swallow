@@ -36,6 +36,21 @@ async fn trigger_preserves_bounded_attachments_for_both_email_providers() {
             router.clone().oneshot(req).await.unwrap().status(),
             StatusCode::CREATED
         );
+        let row=db.query_one("SELECT kind FROM public.novu_queue_jobs WHERE environment_id='attachment-env' AND payload->>'transactionId'=$1", &[&format!("attachment-{provider}")]).await.unwrap();
+        assert_eq!(
+            row.get::<_, String>(0),
+            novu_postgres_queue::in_app::ATTACHMENT_JOB_KIND
+        );
+        assert!(
+            novu_postgres_queue::claim(
+                &db,
+                novu_postgres_queue::in_app::JOB_KIND,
+                std::time::Duration::from_secs(60)
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
         assert!(
             novu_postgres_queue::in_app::process_one(&mut db)
                 .await
