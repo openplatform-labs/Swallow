@@ -1,5 +1,5 @@
 //! Experimental Socket.IO connection and PostgreSQL event fan-out service.
-use axum::Router;
+use axum::{Router, http::StatusCode, routing::get};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Value, json};
@@ -13,7 +13,7 @@ use std::{
     future::poll_fn,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -534,6 +534,11 @@ async fn start_event_listener(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let health_enabled = match std::env::var("NOVU_WS_ENABLE_HEALTH_ENDPOINTS").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("NOVU_WS_ENABLE_HEALTH_ENDPOINTS must be true or false".into()),
+    };
     let active_presence = match std::env::var("NOVU_WS_PRESENCE_POLICY").as_deref() {
         Ok("active") => true,
         Ok("reference") | Err(std::env::VarError::NotPresent) => false,
@@ -562,6 +567,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let listener_generation = Arc::new(AtomicU64::new(0));
     let (event_tx, mut event_rx) = mpsc::channel::<ListenerEvent>(1024);
     let initial_listener = start_event_listener(&database_url, event_tx.clone()).await?;
+    let listener_ready = Arc::new(AtomicBool::new(true));
+    let listener_ready_task = listener_ready.clone();
     let listener_generation_task = listener_generation.clone();
     let listener_io = io.clone();
     tokio::spawn(async move {
@@ -569,6 +576,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         loop {
             let (_client, driver) = listener;
             let _ = driver.await;
+            listener_ready_task.store(false, Ordering::SeqCst);
             if disconnect_on_gap {
                 listener_generation_task.fetch_add(1, Ordering::SeqCst);
                 disconnect_all(&listener_io);
@@ -578,6 +586,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 match start_event_listener(&database_url, event_tx.clone()).await {
                     Ok(reconnected) => {
                         listener = reconnected;
+                        listener_ready_task.store(true, Ordering::SeqCst);
                         if disconnect_on_gap {
                             listener_generation_task.fetch_add(1, Ordering::SeqCst);
                         }
@@ -640,6 +649,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             }
         });
     }
+    let health_db = db.clone();
     io.ns(
         "/",
         move |socket: SocketRef, TryData(auth): TryData<Value>| {
@@ -737,7 +747,33 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             }
         },
     );
-    let app = Router::new().layer(layer);
+    let mut app = Router::new().layer(layer);
+    if health_enabled {
+        app = app
+            .route("/health/live", get(|| async { StatusCode::NO_CONTENT }))
+            .route(
+                "/health/ready",
+                get(move || {
+                    let db = health_db.clone();
+                    let listener_ready = listener_ready.clone();
+                    async move {
+                        if !listener_ready.load(Ordering::SeqCst) {
+                            return StatusCode::SERVICE_UNAVAILABLE;
+                        }
+                        let probe =
+                            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                                db.lock().await?.simple_query("SELECT 1").await
+                            })
+                            .await;
+                        if matches!(probe, Ok(Ok(_))) && listener_ready.load(Ordering::SeqCst) {
+                            StatusCode::NO_CONTENT
+                        } else {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        }
+                    }
+                }),
+            );
+    }
     let address = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:3002".into());
     let listener = tokio::net::TcpListener::bind(address).await?;
     axum::serve(listener, app).await?;
