@@ -323,6 +323,16 @@ async fn trigger_api_contract_inner() {
     ))
     .await
     .unwrap();
+    db.batch_execute(include_str!(
+        "../migrations/0014_workflow_provider_auth_lock.sql"
+    ))
+    .await
+    .unwrap();
+    db.batch_execute(include_str!(
+        "../migrations/0014_workflow_provider_auth_lock.sql"
+    ))
+    .await
+    .unwrap();
     db.batch_execute(novu_rust_api::INBOX_SESSION_MIGRATION)
         .await
         .unwrap();

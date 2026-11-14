@@ -2512,11 +2512,11 @@ async fn get_workflow_email_provider(
     OriginalUri(uri): OriginalUri,
 ) -> (StatusCode, Json<Value>) {
     let path = uri.to_string();
-    let (environment, _) = match provider_management_access(&db, &headers, &path, "read").await {
+    let (environment, hash) = match provider_management_access(&db, &headers, &path, "read").await {
         Ok(v) => v,
         Err(e) => return e,
     };
-    match db.query_opt("SELECT email_provider FROM novu_rust_workflows WHERE environment_id=$1 AND identifier=$2", &[&environment,&workflow]).await {
+    match db.query_opt("WITH authorized AS MATERIALIZED (SELECT public.novu_rust_lock_workflow_provider_grant($3,$1,'read') AS allowed) SELECT w.email_provider FROM authorized a JOIN novu_rust_workflows w ON w.environment_id=$1 AND w.identifier=$2 WHERE a.allowed", &[&environment,&workflow,&hash]).await {
         Ok(Some(row)) => (StatusCode::OK,Json(json!({"data":{"workflowIdentifier":workflow,"provider":row.get::<_,String>(0)}}))),
         Ok(None) => error_at(StatusCode::NOT_FOUND,"Workflow not found","Not Found",&path),
         Err(_) => error_at(StatusCode::INTERNAL_SERVER_ERROR,"Internal server error","Internal Server Error",&path),
@@ -2567,9 +2567,8 @@ async fn set_workflow_email_provider(
             &path,
         );
     };
-    // Recheck the grant and key in the mutation itself to avoid applying a
-    // change after a grant has already been revoked.
-    let result=db.query_opt("UPDATE novu_rust_workflows w SET email_provider=$3 WHERE w.environment_id=$1 AND w.identifier=$2 AND EXISTS(SELECT 1 FROM novu_rust_workflow_provider_permissions p JOIN novu_rust_api_keys k ON k.key_hash=p.key_hash WHERE p.key_hash=$4 AND p.permission='write' AND k.enabled AND k.environment_id=$1) RETURNING w.email_provider", &[&environment,&workflow,&provider,&hash]).await;
+    // Hold matching grant, key and user row locks through the SQL statement.
+    let result=db.query_opt("WITH authorized AS MATERIALIZED (SELECT public.novu_rust_lock_workflow_provider_grant($4,$1,'write') AS allowed) UPDATE novu_rust_workflows w SET email_provider=$3 FROM authorized a WHERE a.allowed AND w.environment_id=$1 AND w.identifier=$2 RETURNING w.email_provider", &[&environment,&workflow,&provider,&hash]).await;
     match result {
         Ok(Some(row)) => (
             StatusCode::OK,

@@ -21,6 +21,10 @@ port=$(docker port "$name" 5432/tcp)
 port=${port##*:}
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_api_test" \
   cargo test --locked --test api_postgres -- --ignored
+docker exec "$name" createdb -U postgres novu_provider_auth_test
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_provider_auth_test" \
+  cargo test --locked --test provider_auth_race -- --ignored
+
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_api_test" \
   cargo test --locked --test sendgrid_webhook -- --ignored
 

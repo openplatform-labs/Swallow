@@ -41,6 +41,7 @@ async fn signed_events_are_scoped_idempotent_and_private() {
         novu_postgres_queue::reconciliation::MIGRATION,
         novu_postgres_queue::reconciliation::RETRY_DISPATCH_MIGRATION,
         novu_postgres_queue::reconciliation::OPERATOR_GRANTS_MIGRATION,
+        novu_postgres_queue::reconciliation::OPERATOR_GRANT_LOCK_MIGRATION,
         include_str!("../migrations/0004_sendgrid_webhooks.sql"),
         include_str!("../migrations/0008_sendgrid_dispatch_identity.sql"),
         include_str!("../migrations/0009_sendgrid_dispatch_proof.sql"),

@@ -72,6 +72,7 @@ async fn signed_status_events_are_scoped_deduplicated_and_private() {
         novu_postgres_queue::reconciliation::MIGRATION,
         novu_postgres_queue::reconciliation::RETRY_DISPATCH_MIGRATION,
         novu_postgres_queue::reconciliation::OPERATOR_GRANTS_MIGRATION,
+        novu_postgres_queue::reconciliation::OPERATOR_GRANT_LOCK_MIGRATION,
         novu_postgres_queue::twilio_queue::DISPATCH_ID_MIGRATION,
     ] {
         db.batch_execute(migration).await.unwrap();
@@ -227,6 +228,7 @@ async fn signed_job_callbacks_bind_evidence_without_changing_attempt_state() {
         novu_postgres_queue::reconciliation::MIGRATION,
         novu_postgres_queue::reconciliation::RETRY_DISPATCH_MIGRATION,
         novu_postgres_queue::reconciliation::OPERATOR_GRANTS_MIGRATION,
+        novu_postgres_queue::reconciliation::OPERATOR_GRANT_LOCK_MIGRATION,
         novu_postgres_queue::twilio_queue::DISPATCH_ID_MIGRATION,
     ] {
         db.batch_execute(migration).await.unwrap();
