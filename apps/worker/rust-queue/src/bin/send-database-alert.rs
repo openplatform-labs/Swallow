@@ -80,7 +80,7 @@ async fn run() -> Result<()> {
     };
     let scoped = flag("SWALLOW_ALERT_SCOPED_DELIVERY", false)?;
     let mut bad_config = false;
-    let slack = match slack() {
+    let mut slack = match slack() {
         Ok(v) => v,
         Err(_) => {
             bad_config = true;
@@ -88,7 +88,7 @@ async fn run() -> Result<()> {
             None
         }
     };
-    let email = match alerts::email_from_env() {
+    let mut email = match alerts::email_from_env() {
         Ok(v) => v,
         Err(_) => {
             bad_config = true;
@@ -99,6 +99,7 @@ async fn run() -> Result<()> {
     if slack.is_none() && email.is_none() {
         return Err("no usable alert destination configured".into());
     }
+    let binding_key = alerts::binding_key_from_env()?;
     let mut alert = Alert {
         environment: args[0].clone(),
         overdue_undelivered: 0,
@@ -175,6 +176,9 @@ async fn run() -> Result<()> {
                 .map_err(|_| "secondary database connection failed")?
         }
         _ if fallback == StateFailureMode::Uncoordinated => {
+            if binding_key.is_some() {
+                return Err("destination binding unavailable in uncoordinated fallback".into());
+            }
             alert.alert_store_unavailable = true;
             eprintln!("monitor database connection failed; sending uncoordinated alerts");
             let result = alerts::send_uncoordinated_selected(
@@ -206,6 +210,41 @@ async fn run() -> Result<()> {
     let _monitor_driver = AbortOnDrop(tokio::spawn(async move {
         let _ = connection.await;
     }));
+    if let Some(key) = &binding_key {
+        if let Some(provider) = &slack
+            && !matches!(
+                tokio::time::timeout(
+                    operation_timeout,
+                    alerts::bind_slack_destination(&db, &args[0], &slack_id, key, provider)
+                )
+                .await,
+                Ok(Ok(true))
+            )
+        {
+            bad_config = true;
+            slack = None;
+            eprintln!("Slack alert destination binding failed");
+        }
+        if let Some((recipient, provider)) = &email
+            && !matches!(
+                tokio::time::timeout(
+                    operation_timeout,
+                    alerts::bind_email_destination(
+                        &db, &args[0], &email_id, key, provider, recipient
+                    )
+                )
+                .await,
+                Ok(Ok(true))
+            )
+        {
+            bad_config = true;
+            email = None;
+            eprintln!("email alert destination binding failed");
+        }
+        if slack.is_none() && email.is_none() {
+            return Err("no bound alert destination available".into());
+        }
+    }
     let unhealthy = probe_unhealthy || primary_unavailable;
     let mut error = bad_config || primary_unavailable;
     if on_new {

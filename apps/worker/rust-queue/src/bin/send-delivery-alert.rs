@@ -48,7 +48,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     // A broken destination must not suppress a second configured destination.
     // Never print provider configuration or the underlying error: it may contain secrets.
     let mut configuration_error = false;
-    let slack = match slack_config() {
+    let mut slack = match slack_config() {
         Ok(value) => value,
         Err(_) => {
             eprintln!("Slack alert configuration failed");
@@ -56,7 +56,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
             None
         }
     };
-    let email = match alerts::email_from_env() {
+    let mut email = match alerts::email_from_env() {
         Ok(value) => value,
         Err(_) => {
             eprintln!("email alert configuration failed");
@@ -67,6 +67,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     if slack.is_none() && email.is_none() {
         return Err("no usable alert destination configured".into());
     }
+    let binding_key = alerts::binding_key_from_env()?;
     let slack_id =
         std::env::var("SWALLOW_ALERT_SLACK_TARGET_ID").unwrap_or_else(|_| "default".into());
     let email_id =
@@ -88,6 +89,41 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     )
     .await
     .map_err(|_| "alert database setup timed out")??;
+    if let Some(key) = &binding_key {
+        if let Some(provider) = &slack
+            && !matches!(
+                tokio::time::timeout(
+                    operation_timeout,
+                    alerts::bind_slack_destination(&db, &args[0], &slack_id, key, provider)
+                )
+                .await,
+                Ok(Ok(true))
+            )
+        {
+            configuration_error = true;
+            slack = None;
+            eprintln!("Slack alert destination binding failed");
+        }
+        if let Some((recipient, provider)) = &email
+            && !matches!(
+                tokio::time::timeout(
+                    operation_timeout,
+                    alerts::bind_email_destination(
+                        &db, &args[0], &email_id, key, provider, recipient
+                    )
+                )
+                .await,
+                Ok(Ok(true))
+            )
+        {
+            configuration_error = true;
+            email = None;
+            eprintln!("email alert destination binding failed");
+        }
+        if slack.is_none() && email.is_none() {
+            return Err("no bound alert destination available".into());
+        }
+    }
     let scoped_delivery = env_bool("SWALLOW_ALERT_SCOPED_DELIVERY", false)?;
     let scoped_checks = env_bool("SWALLOW_ALERT_CHECK_SCOPED_ACCESS", false)?;
     let resend_enabled = env_bool("SWALLOW_ALERT_RESEND_ENABLED", true)?;

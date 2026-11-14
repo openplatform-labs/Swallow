@@ -171,3 +171,34 @@ fn both_alert_commands_reject_invalid_shutdown_grace() {
         }
     }
 }
+
+#[test]
+fn binding_does_not_silently_bypass_checks_in_uncoordinated_fallback() {
+    let output = Command::new(env!("CARGO_BIN_EXE_send-database-alert"))
+        .args(["env", "database", "60"])
+        .env("DATABASE_URL", "postgres://postgres@127.0.0.1:1/postgres")
+        .env(
+            "SWALLOW_DB_PROBE_URL",
+            "postgres://postgres@127.0.0.1:1/postgres",
+        )
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .env("SWALLOW_DB_PROBE_TIMEOUT_SECONDS", "1")
+        .env("SWALLOW_DB_ALERT_STATE_FAILURE_MODE", "send-uncoordinated")
+        .env(
+            "SWALLOW_ALERT_SLACK_WEBHOOK",
+            "https://hooks.slack.com/services/A/B/C",
+        )
+        .env_remove("SWALLOW_ALERT_SLACK_WEBHOOK_FILE")
+        .env_remove("SWALLOW_ALERT_EMAIL_TO")
+        .env(
+            "SWALLOW_ALERT_BINDING_KEY",
+            "fixture-binding-key-0123456789abcdef0123456789",
+        )
+        .env_remove("SWALLOW_ALERT_BINDING_KEY_FILE")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("destination binding unavailable in uncoordinated fallback"));
+    assert!(!stderr.contains("fixture-binding-key"));
+}

@@ -21,6 +21,12 @@ async fn destinations_have_independent_slots_and_failures_do_not_suppress_others
     let slack = dir.join("slack-secret");
     let key = dir.join("email-secret");
     let config = dir.join("config.json");
+    let binding_key = dir.join("binding-key");
+    std::fs::write(
+        &binding_key,
+        "fixture-binding-key-0123456789abcdef0123456789",
+    )
+    .unwrap();
     std::fs::write(&slack, "https://hooks.slack.com/services/A/B/C").unwrap();
     std::fs::write(&key, "fixture-secret-key").unwrap();
     let write = |targets: serde_json::Value| {
@@ -42,6 +48,8 @@ async fn destinations_have_independent_slots_and_failures_do_not_suppress_others
             .env("DATABASE_URL", &url)
             .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
             .env("SWALLOW_ALERT_FANOUT_CONCURRENCY", concurrency)
+            .env("SWALLOW_ALERT_BINDING_KEY_FILE", &binding_key)
+            .env_remove("SWALLOW_ALERT_BINDING_KEY")
             .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
             .env("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS", "60")
             .env(
@@ -94,6 +102,25 @@ async fn destinations_have_independent_slots_and_failures_do_not_suppress_others
             assert!(!text.contains(secret));
         }
     }
+    let bound: i64 = db.query_one("SELECT count(*) FROM public.novu_rust_alert_destination_bindings WHERE environment_id='fanout-env'", &[]).await.unwrap().get(0);
+    assert_eq!(bound, 4);
+    std::fs::write(&slack, "https://hooks.slack.com/services/A/B/Changed").unwrap();
+    for mode in ["delivery", "database"] {
+        let out = run(mode, "4");
+        assert_eq!(out.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("slack ops-a: failed"));
+        assert!(String::from_utf8_lossy(&out.stdout).contains("email mail-b: attention"));
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("Changed"));
+    }
+    std::fs::write(&slack, "https://hooks.slack.com/services/A/B/C").unwrap();
+    let mut changed_email = targets.as_array().unwrap().clone();
+    changed_email[1]["to"] = serde_json::json!("someone-else@example.test");
+    write(serde_json::json!(changed_email));
+    let out = run("delivery", "4");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("email mail-a: failed"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("slack ops-b: attention"));
+    write(targets.clone());
     let mut broken = targets.as_array().unwrap().clone();
     broken[1]["api_key_file"] = serde_json::json!(dir.join("missing"));
     write(serde_json::json!(broken));

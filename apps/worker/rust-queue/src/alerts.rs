@@ -624,6 +624,99 @@ pub fn email_from_env() -> DbResult<Option<(String, AlertEmailProvider)>> {
     };
     Ok(Some((to, provider)))
 }
+/// The same secret must be configured on every cooperating sender.
+pub fn binding_key_from_env() -> DbResult<Option<ring::hmac::Key>> {
+    let value = novu_rust_contracts::secret::from_env(
+        "SWALLOW_ALERT_BINDING_KEY",
+        "SWALLOW_ALERT_BINDING_KEY_FILE",
+    )?;
+    match value {
+        Some(value) if value.len() >= 32 => Ok(Some(ring::hmac::Key::new(
+            ring::hmac::HMAC_SHA256,
+            value.as_bytes(),
+        ))),
+        Some(_) => Err("alert binding key must contain at least 32 bytes".into()),
+        None => Ok(None),
+    }
+}
+fn destination_fingerprint(
+    key: &ring::hmac::Key,
+    channel: &str,
+    provider: &str,
+    destination: &str,
+) -> String {
+    let mut context = ring::hmac::Context::with_key(key);
+    for part in ["swallow-alert-binding-v1", channel, provider, destination] {
+        context.update(&(part.len() as u64).to_be_bytes());
+        context.update(part.as_bytes());
+    }
+    context
+        .sign()
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+pub async fn bind_slack_destination(
+    db: &PgClient,
+    environment: &str,
+    target: &str,
+    key: &ring::hmac::Key,
+    provider: &SlackWebhook,
+) -> DbResult<bool> {
+    bind_destination(
+        db,
+        environment,
+        "slack",
+        target,
+        &destination_fingerprint(key, "slack", "webhook", provider.endpoint.as_str()),
+    )
+    .await
+}
+pub async fn bind_email_destination(
+    db: &PgClient,
+    environment: &str,
+    target: &str,
+    key: &ring::hmac::Key,
+    provider: &AlertEmailProvider,
+    recipient: &str,
+) -> DbResult<bool> {
+    if recipient.is_empty()
+        || recipient.len() > 320
+        || recipient.contains(['\r', '\n', '<', '>'])
+        || !recipient.contains('@')
+    {
+        return Err("invalid alert recipient".into());
+    }
+    let name = match provider {
+        AlertEmailProvider::Resend(_) => "resend",
+        AlertEmailProvider::Sendgrid(_) => "sendgrid",
+    };
+    bind_destination(
+        db,
+        environment,
+        "email",
+        target,
+        &destination_fingerprint(key, "email", name, recipient),
+    )
+    .await
+}
+async fn bind_destination(
+    db: &PgClient,
+    environment: &str,
+    channel: &str,
+    target: &str,
+    fingerprint: &str,
+) -> DbResult<bool> {
+    Ok(db
+        .query_one(
+            "SELECT public.novu_rust_bind_alert_destination($1,$2,$3,$4)",
+            &[&environment, &channel, &target, &fingerprint],
+        )
+        .await?
+        .get(0))
+}
+
 impl SlackWebhook {
     /// Webhook URL is a credential and must never be printed or persisted here.
     pub fn new(url: &str) -> Result<Self, AlertError> {
