@@ -3,6 +3,12 @@
 > 기준: 원본 Novu 커밋 `895388f37efe9e06de0aa333e5727303e6ad6853` · 작성: 2026-11-12.
 > **현재 구현은 실험용이며 Novu와 100% 호환되지 않는다. 운영에 사용하거나 기존 Novu의 대체품으로 배포하지 않는다.**
 
+### 경보 수동 판정의 발송 시도 확인 (워커 0131)
+
+기존 `alert-resolve`는 대상 슬롯의 현재 상태만 검사하므로 운영자가 이전 시도를 검토한 사이 새 시도가 생기면 다른 시도를 판정할 수 있다. 새 `alert-resolve-v2 ENV CHANNEL TARGET ATTEMPT_ID retry|accepted OPERATOR REASON`은 `alert-status`에서 확인한 시도 ID를 전달하고, 권한과 대상 행 잠금 아래 현재 ID와 일치할 때만 기존 감사·상태 변경을 수행한다. 이전 시도나 이미 판정된 상태는 거절한다. Slack·이메일에 적용되며 기존 `alert_retry` 또는 `alert_accepted` 환경 권한과 `public.novu_rust_resolve_alert_v2(text,text,text,uuid,text,text,text)`의 별도 EXECUTE가 필요하다.
+
+호환성을 위해 이전 명령과 함수는 남아 있고 시도 ID를 검사하지 않는다. 새 CLI 및 함수를 배포한 뒤 제한 운영자의 이전 함수 EXECUTE와 직접 테이블 권한을 회수해야 이 보호가 강제된다. `accepted`는 운영자 주장이지 실제 전달 확인이 아니며 재시도는 중복될 수 있다. 응답 유실은 결과 불명이므로 상태와 감사를 대조한다. DB 특권자·공유 로그인·감사 위변조 및 공급자의 실제 결과 확인은 별도 문제다. Docker PostgreSQL과 제한 로그인에서 오래된 ID, 동시 판정, 권한·환경 격리, 감사 실패 롤백과 양 채널의 판정을 검증했다. 실제 Slack·메일 수신 및 전체 HA는 미검증이다. 상세 권한과 절차는 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
 ### 콘솔 인증 교체의 선택적 유예 (API 0034)
 
 즉시 회수하는 `rotate` 외에 `rotate-overlap ENV 기존_ID 새_인증_초 유예_초 새_파일 사유`를 선택할 수 있다. 유예는 1–86400초이며 기존 인증 만료 시각을 DB 시계 기준 현재 시각과 유예의 합 또는 원래 만료 시각 중 더 이른 값으로 줄인다. 새 인증 발급·기존 만료 변경·연결 감사는 한 트랜잭션이다. `rotation-audit-v2 ENV [AFTER_ID]`와 교체 결과에서 기존 인증 만료 시각을 확인할 수 있다. 기존 감사 명령은 유예 시각을 표시하지 않는다. 동일 기존 ID는 한 번만 교체되며 구버전 즉시 교체 명령도 이 제약을 받는다.
