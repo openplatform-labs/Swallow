@@ -9,6 +9,7 @@ pub mod resend;
 pub mod resend_projection;
 pub mod resend_queue;
 pub mod sendgrid;
+pub mod sendgrid_projection;
 pub mod sendgrid_queue;
 pub mod slack;
 pub mod slack_queue;

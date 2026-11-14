@@ -213,7 +213,10 @@ SMS `retry`는 같은 시도의 인증된 Twilio 콜백이 이미 있으면 큐�
 
 API 0020은 새 `bounce` 이벤트의 `type`이 `bounce` 또는 `blocked`일 때 이를 함께 저장한다. SendGrid는 전자를 영구 거절, 후자를 일시 차단으로 구분한다. 타입이 없거나 다른 값이면 null로 남기며 과거 이벤트의 타입은 복구할 수 없다. [SendGrid 이벤트 문서](https://www.twilio.com/docs/sendgrid/for-developers/tracking-events/event)를 기준으로 한다. 워커 0096과 `NOVU_SENDGRID_DISPATCH_TRACKING=true`를 사용하면 각 발송 시도 직전에 to·cc·bcc의 순서와 주소의 정확한 바이트 SHA-256 해시를 시도 ID별로 저장한다. 수신 주소 자체는 이 테이블에 쓰지 않지만 해시는 사전 대입으로 추정할 수 있으므로 접근 통제가 필요하다. 합계가 1,000개를 넘으면 스냅샷을 저장하지 않으며 발송 자체의 기존 동작은 바꾸지 않는다. 추적을 끈 발송과 과거 시도는 소급 복구하지 않는다. API 0020 및 워커 0096을 각각 적용한 뒤 관련 프로세스를 교체해야 한다. 원본 주소와 웹훅 주소의 표기 차이는 자동 보정하지 않는다.
 
-추적을 켠 워커 DB 로그인에는 새 수신자 테이블에 대한 INSERT 권한도 필요하다. 웹훅 API에 열 단위 INSERT 권한을 사용한다면 새 `bounce_type` 열도 허용해야 한다. Docker PostgreSQL·모의 SendGrid에서 수신자 유형별 스냅샷과 서명된 hard·soft·타입 없는 bounce 이벤트를 검증한다. 이 변경만으로는 수신자별 전달 결과 집계·작업 상태 자동 갱신이나 실제 SendGrid 웹훅 수신을 제공하지 않는다.
+추적을 켠 워커 DB 로그인에는 새 수신자 테이블에 대한 INSERT 권한도 필요하다. 웹훅 API에 열 단위 INSERT 권한을 사용한다면 새 `bounce_type` 열도 허용해야 한다. Docker PostgreSQL·모의 SendGrid에서 수신자 유형별 스냅샷과 서명된 hard·soft·타입 없는 bounce 이벤트를 검증한다. 0097의 별도 집계 기능은 아래에 기술하며 실제 SendGrid 웹훅 수신은 아직 검증하지 않았다.
+
+워커 0097과 선택적으로 실행하는 `sendgrid-projection-worker`는 현재 발송 시도의 증명값이 확인된 서명 웹훅과 정확히 일치하는 수신자 스냅샷을 연결해 수신자별 결과와 작업·이메일 메시지의 별도 `sendgrid_delivery_result`를 갱신한다. 영구 반송·dropped는 실패, 일시 blocked는 대기, 전달과 영구 실패의 상충은 conflicting으로 처리한다. 수신자별 결과가 혼합되면 partial이며 수신자 중 미확정이 있거나 미연결 이벤트, 중복 주소, bounce 유형 부재, 스냅샷 부재 등은 unknown으로 남긴다. 이전 발송·검증되지 않은 증거는 현재 결과에 적용하지 않는다. 발송 시도와 기존 작업 상태는 바꾸지 않으며 자동 재발송도 하지 않는다. 전달은 수신 서버의 접수 보고이며 읽음을 의미하지 않는다. 워커는 환경별로 전체 이력을 반복 순회하고 완료 heartbeat를 남긴다. 잠긴 작업은 건너뛸 수 있고 부하·장기 장애와 실제 SendGrid 웹훅은 미검증이다. API 0020과 워커 0096·0097을 먼저 적용하고 DB 권한 및 heartbeat 감시를 별도로 구성해야 한다. 합성 서명 웹훅의 실제 HTTP 수신부터 DB 갱신, 환경 격리·상충·불명·DB 재연결을 Docker PostgreSQL에서 검증했다. 이 별도 결과 열은 원본 Novu 상태 API와 동등하다고 검증된 기능이 아니다.
+
 
 API 마이그레이션 `0004_sendgrid_webhooks.sql`은 환경별 SendGrid 공개키와 최소 이벤트 이력을 만든다. `POST /webhooks/organizations/{organizationId}/environments/{environmentId}/email/sendgrid`는 원본 바이트와 timestamp에 대한 ECDSA P-256 서명을 필수 검증하고 환경·조직을 확인한다. 활성 공개키는 `novu_rust_sendgrid_webhook_keys`에 SendGrid가 제공한 Base64 DER 공개키로 수동 등록한다. 하나의 활성 공개키를 두 환경이 공유하지 못한다. 같은 `sg_event_id`는 환경별로 한 번만 기록하고 다른 환경의 메시지 ID는 무시한다. 이메일 주소 원문과 이벤트 본문은 저장하지 않지만 주소의 SHA-256 해시는 추측될 수 있는 개인정보이므로 DB 접근을 제한해야 한다.
 

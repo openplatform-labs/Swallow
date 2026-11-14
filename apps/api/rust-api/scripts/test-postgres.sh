@@ -42,6 +42,12 @@ TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_fcm_integration_
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_api_test" \
   cargo test --locked --test sendgrid_webhook -- --ignored
 
+docker exec "$name" createdb -U postgres novu_sendgrid_projection_test
+cargo build --locked --manifest-path ../../worker/rust-queue/Cargo.toml --bin sendgrid-projection-worker --target-dir "$PWD/target/sendgrid-projection-test"
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_sendgrid_projection_test" \
+  TEST_SENDGRID_PROJECTION_BIN="$PWD/target/sendgrid-projection-test/debug/sendgrid-projection-worker" \
+  cargo test --locked --test sendgrid_projection -- --ignored
+
 env -u NOVU_TWILIO_WEBHOOK_AUTH_TOKEN TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_api_test" TEST_TWILIO_FILE_CONFIG=1 \
   SWALLOW_API_STRICT_SECURITY_CONFIG=true SWALLOW_API_REQUIRED_SECURITY=twilio-webhook \
   NOVU_TWILIO_WEBHOOK_ENVIRONMENT_ID=env-a NOVU_TWILIO_WEBHOOK_ACCOUNT_SID=AC11111111111111111111111111111111 \
