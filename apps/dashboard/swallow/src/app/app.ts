@@ -4,6 +4,8 @@ import { ClrAlertModule } from '@clr/angular/emphasis/alert';
 import { OperatorOidc, type PreparedOidc, type VerifiedSession } from './operator-oidc';
 
 type ConnectionState = 'unchecked' | 'checking' | 'ready' | 'unavailable';
+type SubscriberProfile = {firstName:string;lastName:string;email:string;phone:string};
+type SubscriberEditSnapshot = {id:string;generation:string;revision:string;profile:SubscriberProfile};
 type Subscriber = { id: string; firstName: string; lastName: string; email: string };
 type AlertSlot = { channel: string; targetId: string; state: string; lastStartedAt: string | null; attemptId?: string | null };
 type AlertCursor = { channel: string; targetId: string };
@@ -157,6 +159,15 @@ export class App implements OnDestroy {
   createEmail='';
   createPhone='';
   createConfirmed=false;
+  subscriberEditId='';
+  subscriberEditProfile:SubscriberProfile={firstName:'',lastName:'',email:'',phone:''};
+  subscriberEditConfirmed=false;
+  subscriberDeleteConfirmation='';
+  readonly subscriberEditStatus=signal<'idle'|'loading'|'loaded'|'saving'|'saved'|'deleted'|'conflict'|'unknown'|'error'>('idle');
+  readonly subscriberEditMessage=signal('');
+  readonly subscriberEditSnapshot=signal<SubscriberEditSnapshot|null>(null);
+  private subscriberEditSequence=0;
+  private subscriberEditAbort:AbortController|null=null;
   readonly createStatus=signal<'idle'|'sending'|'created'|'rejected'|'unknown'>('idle');
   readonly createMessage=signal('');
   readonly createdSubscriberId=signal('');
@@ -239,6 +250,7 @@ export class App implements OnDestroy {
     this.clearResend();
     this.clearResendJobs();
     this.clearPermissions(true);
+    this.resetSubscriberEdit(true);
   }
 
   private expireOidcIfNeeded(): boolean {
@@ -277,7 +289,7 @@ export class App implements OnDestroy {
   }
 
   resetOidc(): void {
-    if (this.createStatus()==='sending' || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
+    if ((this.createStatus()==='sending' || this.subscriberEditStatus()==='saving') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     if (this.oidcExpiryTimer !== null) clearTimeout(this.oidcExpiryTimer);
     this.oidcExpiryTimer=null;
     this.oidcSequence++; this.oidcPrepared = null; this.oidcSession = null;
@@ -307,7 +319,7 @@ export class App implements OnDestroy {
 
   useOidc(section: 'subscribers' | 'alerts' | 'workflows'): void {
     this.expireOidcIfNeeded();
-    if (!this.oidcSession || this.createStatus()==='sending' || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
+    if (!this.oidcSession || (this.createStatus()==='sending' || this.subscriberEditStatus()==='saving') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     const session=this.oidcSession;
     this.setSection(section);
     if (section === 'subscribers') { this.forgetKey(); this.credentialMode='jwt'; this.subscriberEnvironment=session.environmentId; this.apiKey=session.token; }
@@ -843,7 +855,7 @@ export class App implements OnDestroy {
   }
 
   setSection(next: Section): void {
-    if (this.createStatus()==='sending' || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
+    if ((this.createStatus()==='sending' || this.subscriberEditStatus()==='saving') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     if (this.section()==='workflows' && next!=='workflows') {this.clearWorkflow(true);this.forgetWorkflowRequest();}
     if (this.section() === 'subscribers' && next !== 'subscribers') this.forgetKey();
     if (this.section() === 'alerts' && next !== 'alerts') this.forgetAlertKey();
@@ -875,8 +887,8 @@ export class App implements OnDestroy {
   }
 
   forgetKey(): void {
-    if(this.createStatus()==='sending')return;
-    this.resetCreateSubscriber();
+    if(this.createStatus()==='sending'||this.subscriberEditStatus()==='saving')return;
+    this.resetSubscriberEdit(true);this.resetCreateSubscriber();
     this.apiKey = '';
     this.clearSubscribers();
   }
@@ -1270,13 +1282,57 @@ export class App implements OnDestroy {
     }
   }
 
+  resetSubscriberEdit(clearId=false):void {
+    if(this.subscriberEditStatus()==='saving')return;
+    this.subscriberEditSequence++;this.subscriberEditAbort?.abort();this.subscriberEditAbort=null;
+    this.subscriberEditSnapshot.set(null);this.subscriberEditStatus.set('idle');this.subscriberEditMessage.set('');this.subscriberEditProfile={firstName:'',lastName:'',email:'',phone:''};this.subscriberEditConfirmed=false;this.subscriberDeleteConfirmation='';if(clearId)this.subscriberEditId='';
+  }
+  async loadSubscriberEdit():Promise<void> {
+    if(this.subscriberEditStatus()==='saving'||this.createStatus()==='sending'||this.credentialMode!=='api-key')return;
+    this.resetSubscriberEdit();const sequence=this.subscriberEditSequence,id=this.subscriberEditId.trim(),key=this.apiKey.trim();
+    const controller=new AbortController();this.subscriberEditAbort=controller;this.subscriberEditStatus.set('loading');
+    try {
+      if(!id||new TextEncoder().encode(id).length>512||id.includes('\0')||!key||/[^\x21-\x7e]/.test(key))throw new Error('invalid input');
+      const response=await fetch(`${this.validatedOrigin()}/v1/experimental/subscribers/${encodeURIComponent(id)}`,{headers:{Authorization:`ApiKey ${key}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      if(!response.ok)throw new Error('request failed');const value:unknown=await response.json();
+      if(typeof value!=='object'||value===null||!('data' in value)||typeof value.data!=='object'||value.data===null)throw new Error('invalid response');
+      const row=value.data as Record<string,unknown>;if(row['subscriberId']!==id||typeof row['generation']!=='string'||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(row['generation'])||typeof row['revision']!=='string'||!/^(0|[1-9][0-9]*)$/.test(row['revision'])||typeof row['profile']!=='object'||row['profile']===null||Array.isArray(row['profile']))throw new Error('invalid response');
+      const profile=row['profile'] as Record<string,unknown>,fields=['firstName','lastName','email','phone'] as const;
+      if(fields.some(k=>profile[k]!==undefined&&profile[k]!==null&&typeof profile[k]!=='string'))throw new Error('invalid profile');
+      const normalized:SubscriberProfile={firstName:(profile['firstName'] as string|null|undefined)??'',lastName:(profile['lastName'] as string|null|undefined)??'',email:(profile['email'] as string|null|undefined)??'',phone:(profile['phone'] as string|null|undefined)??''};
+      if(sequence!==this.subscriberEditSequence)return;
+      this.subscriberEditSnapshot.set({id,generation:row['generation'],revision:row['revision'],profile:normalized});this.subscriberEditProfile={...normalized};this.subscriberEditStatus.set('loaded');
+    }catch{if(sequence===this.subscriberEditSequence){this.subscriberEditStatus.set('error');this.subscriberEditMessage.set('구독자를 조회하지 못했습니다. ID, 인증 및 API 상태를 확인하세요.');}}
+    finally{if(sequence===this.subscriberEditSequence)this.subscriberEditAbort=null;}
+  }
+  canEditSubscriber():boolean {
+    const snapshot=this.subscriberEditSnapshot();return this.credentialMode==='api-key'&&this.subscriberEditStatus()==='loaded'&&this.createStatus()!=='sending'&&!!snapshot&&this.subscriberEditConfirmed&&(Object.keys(snapshot.profile) as (keyof SubscriberProfile)[]).some(k=>this.subscriberEditProfile[k]!==snapshot.profile[k]);
+  }
+  canDeleteSubscriber():boolean {
+    const snapshot=this.subscriberEditSnapshot();return this.credentialMode==='api-key'&&this.subscriberEditStatus()==='loaded'&&this.createStatus()!=='sending'&&!!snapshot&&this.subscriberDeleteConfirmation===snapshot.id;
+  }
+  async changeSubscriberEdit(deleting:boolean):Promise<void> {
+    const snapshot=this.subscriberEditSnapshot();if(!snapshot||(deleting?!this.canDeleteSubscriber():!this.canEditSubscriber()))return;
+    const key=this.apiKey.trim();let origin:string;try{origin=this.validatedOrigin();if(!key||/[^\x21-\x7e]/.test(key))throw new Error('invalid key');}catch{this.subscriberEditStatus.set('error');this.subscriberEditMessage.set('API 주소와 인증을 확인하세요.');return;}
+    const profile:Record<string,string|null>={};for(const k of Object.keys(snapshot.profile) as (keyof SubscriberProfile)[])if(this.subscriberEditProfile[k]!==snapshot.profile[k])profile[k]=this.subscriberEditProfile[k]||null;
+    const body=deleting?{generation:snapshot.generation,revision:snapshot.revision}:{generation:snapshot.generation,revision:snapshot.revision,profile};
+    this.subscriberEditStatus.set('saving');this.subscriberEditMessage.set('');
+    try {
+      const response=await fetch(`${origin}/v1/experimental/subscribers/${encodeURIComponent(snapshot.id)}`,{method:deleting?'DELETE':'PATCH',headers:{Authorization:`ApiKey ${key}`,'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
+      if(!response.ok){if(response.status===409||response.status===404){this.subscriberEditStatus.set('conflict');this.subscriberEditMessage.set('조회한 구독자가 변경되었거나 삭제됐습니다. 다시 조회하세요.');}else if([400,401,403].includes(response.status)){this.subscriberEditStatus.set('error');this.subscriberEditMessage.set('요청이 거절됐습니다. 입력과 인증을 확인하세요.');}else{this.subscriberEditStatus.set('unknown');this.subscriberEditMessage.set('결과를 확인할 수 없습니다. 다시 조회해 상태를 확인하세요.');}return;}
+      const value:unknown=await response.json();if(typeof value!=='object'||value===null||!('data' in value)||typeof value.data!=='object'||value.data===null||!('subscriberId' in value.data)||value.data.subscriberId!==snapshot.id||(deleting&&(!('deleted' in value.data)||value.data.deleted!==true))||(!deleting&&(!('generation' in value.data)||value.data.generation!==snapshot.generation||!('revision' in value.data)||typeof value.data.revision!=='string'||!/^(0|[1-9][0-9]*)$/.test(value.data.revision))))throw new Error('invalid response');
+      this.subscriberEditStatus.set(deleting?'deleted':'saved');this.clearSubscribers();
+    }catch{this.subscriberEditStatus.set('unknown');this.subscriberEditMessage.set('결과를 확인할 수 없습니다. 다시 조회해 상태를 확인하세요.');}
+    finally{this.subscriberEditConfirmed=false;this.subscriberDeleteConfirmation='';}
+  }
+
   resetCreateSubscriber():void {
     if(this.createStatus()==='sending')return;
     this.createSubscriberId='';this.createFirstName='';this.createLastName='';this.createEmail='';this.createPhone='';this.createConfirmed=false;this.createdSubscriberId.set('');this.createMessage.set('');this.createStatus.set('idle');
   }
   canCreateSubscriber():boolean {
     const id=this.createSubscriberId.trim(),key=this.apiKey.trim();
-    return this.credentialMode==='api-key'&&this.createStatus()==='idle'&&this.createConfirmed&&!!id&&new TextEncoder().encode(id).length<=512&&!id.includes('\0')&&!!key&&!/[^\x21-\x7e]/.test(key);
+    return this.credentialMode==='api-key'&&this.createStatus()==='idle'&&this.subscriberEditStatus()!=='saving'&&this.createConfirmed&&!!id&&new TextEncoder().encode(id).length<=512&&!id.includes('\0')&&!!key&&!/[^\x21-\x7e]/.test(key);
   }
   async createSubscriber():Promise<void> {
     if(!this.canCreateSubscriber())return;
