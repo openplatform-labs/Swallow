@@ -4,7 +4,7 @@ import { ClrAlertModule } from '@clr/angular/emphasis/alert';
 
 type ConnectionState = 'unchecked' | 'checking' | 'ready' | 'unavailable';
 type Subscriber = { id: string; firstName: string; lastName: string; email: string };
-type AlertSlot = { channel: string; targetId: string; state: string; lastStartedAt: string | null };
+type AlertSlot = { channel: string; targetId: string; state: string; lastStartedAt: string | null; attemptId?: string | null };
 type AlertCursor = { channel: string; targetId: string };
 type Section = 'overview' | 'workflows' | 'subscribers' | 'channels' | 'activity' | 'alerts' | 'settings';
 
@@ -134,7 +134,8 @@ export class App {
       if (typeof body !== 'object' || body === null || !('data' in body) || !Array.isArray(body.data) || !('hasMore' in body) || typeof body.hasMore !== 'boolean' || body.data.length > 100 || !('next' in body) || !(body.next === null || (typeof body.next === 'object' && 'channel' in body.next && typeof body.next.channel === 'string' && 'targetId' in body.next && typeof body.next.targetId === 'string')) || (body.hasMore !== (body.next !== null))) throw new Error('API 응답 형식을 확인해 주세요.');
       const rows: AlertSlot[] = body.data.map((row: unknown) => {
         if (typeof row !== 'object' || row === null || !('channel' in row) || typeof row.channel !== 'string' || !('targetId' in row) || typeof row.targetId !== 'string' || !('state' in row) || typeof row.state !== 'string' || !('lastStartedAt' in row) || !(typeof row.lastStartedAt === 'string' || row.lastStartedAt === null)) throw new Error('API 응답 형식을 확인해 주세요.');
-        return { channel: row.channel, targetId: row.targetId, state: row.state, lastStartedAt: row.lastStartedAt };
+        if ('attemptId' in row && row.attemptId !== null && (typeof row.attemptId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(row.attemptId))) throw new Error('API 응답 형식을 확인해 주세요.');
+        return { channel: row.channel, targetId: row.targetId, state: row.state, lastStartedAt: row.lastStartedAt, ...('attemptId' in row ? { attemptId: row.attemptId as string | null } : {}) };
       });
       if (id !== this.alertRequestId) return;
       this.alertSlots.set(rows);

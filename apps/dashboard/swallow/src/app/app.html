@@ -49,7 +49,7 @@
           @else if (alertStatus() === 'loading') {<p aria-live="polite">상태를 불러오는 중입니다.</p>}
           @else if (alertStatus() === 'idle') {<p>인증 값을 입력하고 조회해 주세요.</p>}
           @else if (alertSlots().length === 0) {<p>조회된 경보 대상이 없습니다.</p>}
-          @else {<div class="table-wrap"><table class="table"><thead><tr><th>채널</th><th>대상 ID</th><th>상태</th><th>최근 시도</th></tr></thead><tbody>@for (slot of alertSlots(); track slot.channel + ':' + slot.targetId) {<tr><td>{{ slot.channel }}</td><td>{{ slot.targetId }}</td><td>{{ slot.state }}</td><td>{{ slot.lastStartedAt || '—' }}</td></tr>}</tbody></table></div>}
+          @else {<div class="table-wrap"><table class="table"><thead><tr><th>채널</th><th>대상 ID</th><th>상태</th><th>발송 시도 ID</th><th>최근 시도</th></tr></thead><tbody>@for (slot of alertSlots(); track slot.channel + ':' + slot.targetId) {<tr><td>{{ slot.channel }}</td><td>{{ slot.targetId }}</td><td>{{ slot.state }}</td><td>{{ slot.attemptId === undefined ? "API 업데이트 필요" : slot.attemptId || "—" }}</td><td>{{ slot.lastStartedAt || '—' }}</td></tr>}</tbody></table></div>}
           @if (alertStatus() === 'loaded') {<div class="pagination"><span>{{ alertPage() }}페이지 · 조회 시점의 결과</span><button class="btn btn-sm btn-outline" (click)="loadAlerts()" [disabled]="alertPage() === 1">처음</button><button class="btn btn-sm btn-outline" (click)="loadAlerts('previous')" [disabled]="alertPage() === 1">이전</button><button class="btn btn-sm btn-outline" (click)="loadAlerts('next')" [disabled]="!alertsHaveMore()">다음</button></div>}
         </div></section>
       } @else {

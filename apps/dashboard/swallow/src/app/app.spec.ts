@@ -115,6 +115,36 @@ describe('Swallow console', () => {
     expect(app.alertSlots()).toEqual([]);
   });
 
+  it('shows attempt identifiers and rejects malformed ones', async () => {
+    const id = '1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
+    const body = (attemptId: unknown) => ({data:[{channel:'slack',targetId:'ops',state:'unknown',lastStartedAt:null,attemptId}],hasMore:false,next:null});
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify(body(id)),{status:200})).mockResolvedValueOnce(new Response(JSON.stringify(body('bad-id')),{status:200}));
+    const fixture = TestBed.createComponent(App);
+    const app = fixture.componentInstance;
+    app.setSection('alerts');
+    app.alertKey = 'a'.repeat(64);
+    await app.loadAlerts();
+    fixture.detectChanges();
+    expect(app.alertSlots()[0].attemptId).toBe(id);
+    expect(fixture.nativeElement.textContent).toContain(id);
+    await app.loadAlerts();
+    expect(app.alertStatus()).toBe('error');
+    expect(app.alertSlots()).toEqual([]);
+  });
+
+  it('distinguishes absent attempts from an older API response', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[{channel:'email',targetId:'one',state:'idle',lastStartedAt:null,attemptId:null},{channel:'slack',targetId:'two',state:'unknown',lastStartedAt:null}],hasMore:false,next:null}),{status:200}));
+    const fixture = TestBed.createComponent(App);
+    const app = fixture.componentInstance;
+    app.setSection('alerts');
+    app.alertKey = 'a'.repeat(64);
+    await app.loadAlerts();
+    fixture.detectChanges();
+    expect(app.alertSlots()[0].attemptId).toBeNull();
+    expect(app.alertSlots()[1].attemptId).toBeUndefined();
+    expect(fixture.nativeElement.textContent).toContain('API 업데이트 필요');
+  });
+
   it('requests the next alert page and can return to the first', async () => {
     const first = {data:[{channel:'email',targetId:'ops',state:'accepted',lastStartedAt:null}],hasMore:true,next:{channel:'email',targetId:'ops'}};
     const second = {data:[{channel:'slack',targetId:'ops',state:'unknown',lastStartedAt:null}],hasMore:false,next:null};

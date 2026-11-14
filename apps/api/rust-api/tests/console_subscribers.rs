@@ -127,9 +127,13 @@ async fn scoped_console_credentials_do_not_grant_api_key_access() {
         StatusCode::UNAUTHORIZED
     );
     db.batch_execute("INSERT INTO public.novu_rust_console_alert_grants(credential_id) SELECT credential_id FROM public.novu_rust_console_credentials WHERE environment_id IN ('ca','cb'); INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) SELECT 'ca','slack','target-'||lpad(n::text,3,'0'),'unknown' FROM generate_series(1,101) n; INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES ('cb','email','other-env','rejected')").await.unwrap();
+    let attempt = uuid::Uuid::new_v4();
+    db.execute("UPDATE public.novu_rust_alert_delivery_slots SET attempt_id=$1 WHERE environment_id='ca' AND target_id='target-001'", &[&attempt]).await.unwrap();
     let (status, alerts) = call(app.clone(), alert_path, "SwallowConsole", &token_a).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(alerts["data"].as_array().unwrap().len(), 100);
+    assert_eq!(alerts["data"][0]["attemptId"], attempt.to_string());
+    assert_eq!(alerts["data"][1]["attemptId"], Value::Null);
     assert_eq!(alerts["hasMore"], true);
     assert_eq!(alerts["next"]["channel"], "slack");
     assert_eq!(alerts["next"]["targetId"], "target-100");
@@ -179,9 +183,9 @@ async fn scoped_console_credentials_do_not_grant_api_key_access() {
     );
 
     assert!(!alerts.to_string().contains("other-env"));
-    assert!(!alerts.to_string().contains("attemptId"));
     let (_, other_alerts) = call(app.clone(), alert_path, "SwallowConsole", &token_b).await;
     assert_eq!(other_alerts["data"][0]["targetId"], "other-env");
+    assert!(!other_alerts.to_string().contains(&attempt.to_string()));
     assert_eq!(
         call(app.clone(), alert_path, "ApiKey", &token_a).await.0,
         StatusCode::UNAUTHORIZED
