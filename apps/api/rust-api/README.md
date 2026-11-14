@@ -1,3 +1,5 @@
+Trigger payload email attachments have bounded experimental support for Resend and SendGrid. See the worker README for formats, limits, deployment ordering, PostgreSQL storage and retention risks, and exact comparison scope. The API rejects invalid or unsupported attachment inputs with 501; provider-specific restrictions can still fail later. File bytes are held in workflow and per-recipient queue payloads, not encrypted or automatically purged.
+
 `console-credential` is an optional Unix operator CLI for the environment-scoped 0026–0031 functions. Build with `cargo build --locked --bin console-credential`; configure `DATABASE_URL` and the same TLS settings as the API, then run:
 
 ```text

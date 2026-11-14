@@ -234,6 +234,95 @@ mod tests {
     use tokio_postgres::NoTls;
 
     #[tokio::test]
+    #[ignore = "requires the workflow_email_attachments API fixture and loopback"]
+    async fn workflow_email_attachments_reach_both_mock_providers() {
+        let (mut db, driver) =
+            tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(), NoTls)
+                .await
+                .unwrap();
+        tokio::spawn(async move { driver.await.unwrap() });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/send", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for provider in ["resend", "sendgrid"] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0u8; 4096];
+                let body_start = loop {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..pos]);
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .and_then(|v| v.parse().ok())
+                            })
+                            .unwrap();
+                        if bytes.len() >= pos + 4 + length {
+                            break pos + 4;
+                        }
+                    }
+                };
+                let body: serde_json::Value = serde_json::from_slice(&bytes[body_start..]).unwrap();
+                assert_eq!(body["attachments"][0]["content"], "aGVsbG8=");
+                assert_eq!(body["attachments"][1]["content"], "AAH/");
+                if provider == "resend" {
+                    assert_eq!(body["attachments"][1]["content_id"], "logo");
+                } else {
+                    assert_eq!(body["attachments"][1]["disposition"], "inline");
+                }
+                let response = if provider == "resend" {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{\"id\":\"mock-resend\"}"
+                } else {
+                    "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nX-Message-Id: mock-sendgrid\r\nConnection: close\r\n\r\n"
+                };
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let resend = Resend::test_endpoint(
+            Config {
+                api_key: "fixture".into(),
+                from: "sender@example.test".into(),
+                sender_name: "Sender".into(),
+            },
+            &endpoint,
+        )
+        .unwrap();
+        assert!(
+            process_one(&mut db, "attachment-env", &resend)
+                .await
+                .unwrap()
+        );
+        let sendgrid = crate::sendgrid::Sendgrid::test_endpoint(
+            crate::sendgrid::Config {
+                api_key: "fixture".into(),
+                from: "sender@example.test".into(),
+                sender_name: "Sender".into(),
+                region: crate::sendgrid::Region::Global,
+            },
+            &endpoint,
+        )
+        .unwrap();
+        assert!(
+            crate::sendgrid_queue::process_one(&mut db, "attachment-env", &sendgrid)
+                .await
+                .unwrap()
+        );
+        server.await.unwrap();
+        let statuses=db.query("SELECT status FROM public.novu_queue_jobs WHERE environment_id='attachment-env' AND kind IN ('experimental_resend_email','experimental_sendgrid_email') ORDER BY kind",&[]).await.unwrap();
+        assert_eq!(statuses.len(), 2);
+        assert!(
+            statuses
+                .iter()
+                .all(|row| row.get::<_, String>(0) == "completed")
+        );
+    }
+
+    #[tokio::test]
     #[ignore = "requires differential PostgreSQL and loopback access"]
     async fn capture_reference_resend_workflow() {
         let (mut db, driver) =
