@@ -6,6 +6,40 @@ import { OperatorOidc } from './operator-oidc';
 describe('Swallow console', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
+  it('reviews a specific operator identity and clears credentials and results on leaving settings', async () => {
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValue(new Response(JSON.stringify({found:true,identity:{issuer:'https://issuer.test',subject:'alice',client_id:'console',environment_id:'env-a',enabled:true,subscriber_read:true,alert_read:false,alert_retry:false,alert_accepted:false}}),{status:200}));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('settings');app.permissionEnvironment='env-a';app.permissionKey='aaa.bbb.ccc';app.permissionIssuer='https://issuer.test';app.permissionSubject='alice';app.permissionClient='console';
+    await app.loadPermissions('identity');expect(app.permissionStatus()).toBe('identity');expect(app.permissionIdentity()?.subscriberRead).toBe(true);
+    const url=new URL(fetchMock.mock.calls[0][0] as string);expect(url.pathname).toBe('/v1/experimental/operator/permissions');expect(url.searchParams.get('issuer')).toBe('https://issuer.test');
+    expect(fetchMock.mock.calls[0][1]).toEqual(expect.objectContaining({headers:{Authorization:'Bearer aaa.bbb.ccc'},credentials:'omit',redirect:'error'}));
+    app.setSection('overview');expect(app.permissionKey).toBe('');expect(app.permissionIdentity()).toBeNull();
+  });
+
+  it('handles audit pagination and independently rejected audit access', async () => {
+    const row={id:'9007199254740993',recordedAt:'2026-01-01',issuer:'https://issuer.test',subject:'alice',clientId:'console',actor:'admin',reason:'ticket',previous:null,current:{enabled:true}};
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[row],next:'9007199254740993'}),{status:200})).mockResolvedValueOnce(new Response(JSON.stringify({data:[],next:null}),{status:200})).mockResolvedValueOnce(new Response('',{status:401}));
+    const app=TestBed.createComponent(App).componentInstance;app.permissionEnvironment='env-a';app.permissionKey='aaa.bbb.ccc';
+    await app.loadPermissions('audit');expect(app.permissionAudit()[0].id).toBe(row.id);expect(app.permissionNext()).toBe(row.id);
+    await app.loadPermissions('audit',true);expect(new URL(fetchMock.mock.calls[1][0] as string).searchParams.get('before')).toBe(row.id);expect(app.permissionAudit()).toEqual([]);
+    await app.loadPermissions('audit');expect(app.permissionStatus()).toBe('error');expect(app.permissionAudit()).toEqual([]);
+  });
+
+  it('discards an in-flight permission response when the environment changes', async () => {
+    let finish!:(response:Response)=>void;vi.spyOn(globalThis,'fetch').mockReturnValueOnce(new Promise(done=>{finish=done;}));
+    const app=TestBed.createComponent(App).componentInstance;app.permissionEnvironment='env-a';app.permissionKey='aaa.bbb.ccc';
+    const pending=app.loadPermissions('audit');app.permissionEnvironment='env-b';app.clearPermissions();finish(new Response(JSON.stringify({data:[],next:null}),{status:200}));await pending;
+    expect(app.permissionStatus()).toBe('idle');expect(app.permissionAudit()).toEqual([]);
+  });
+
+  it('clears the login token from permission review when that session expires', async () => {
+    vi.useFakeTimers();vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));
+    vi.spyOn(OperatorOidc.prototype,'signIn').mockResolvedValue({token:'aaa.bbb.ccc',subject:'alice',environmentId:'env-a',expiresAt:Math.floor(Date.now()/1000)+2});
+    const fixture=TestBed.createComponent(App);const app=fixture.componentInstance;app.oidcIssuer='https://issuer.test';app.oidcClientId='console';app.oidcEnvironment='env-a';
+    await app.prepareOidc();await app.signInOidc();app.setSection('settings');app.useOidcForPermissions();expect(app.permissionKey).toBe('aaa.bbb.ccc');expect(app.permissionEnvironment).toBe('env-a');
+    vi.advanceTimersByTime(2000);expect(app.permissionKey).toBe('');expect(app.permissionStatus()).toBe('idle');expect(app.oidcStatus()).toBe('expired');fixture.destroy();
+  });
+
   it('uses the selected login for authorized alert decisions and request lookup without copying the token', async () => {
     vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));
     vi.spyOn(OperatorOidc.prototype,'signIn').mockResolvedValue({token:'aaa.bbb.ccc',subject:'alice',environmentId:'env-a',expiresAt:Math.floor(Date.now()/1000)+600});

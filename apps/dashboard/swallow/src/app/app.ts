@@ -10,6 +10,8 @@ type AlertCursor = { channel: string; targetId: string };
 type DecisionHistory = { id: string; decision: string; reason: string; createdAt: string };
 type DecisionRequest = { requestId: string; channel: string; targetId: string; attemptId: string; decision: string; reason: string; createdAt: string };
 type RetrySnapshot = { origin: string; endpoint: string; scheme: 'Bearer' | 'SwallowConsole'; requestId: string; channel: string; targetId: string; attemptId: string; decision: string; reason: string; keyHash: string };
+type PermissionIdentity = { issuer:string; subject:string; clientId:string; enabled:boolean; subscriberRead:boolean; alertRead:boolean; alertRetry:boolean; alertAccepted:boolean };
+type PermissionAudit = { id:string; recordedAt:string; issuer:string; subject:string; clientId:string; actor:string; reason:string; previous:string; current:string };
 type Section = 'overview' | 'workflows' | 'subscribers' | 'channels' | 'activity' | 'alerts' | 'settings';
 
 @Component({
@@ -96,12 +98,24 @@ export class App implements OnDestroy {
   private oidcSequence = 0;
   private oidcExpiryTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly oidc = new OperatorOidc();
+  permissionEnvironment = '';
+  permissionKey = '';
+  permissionIssuer = '';
+  permissionSubject = '';
+  permissionClient = '';
+  readonly permissionStatus = signal<'idle'|'loading'|'identity'|'missing'|'audit'|'error'>('idle');
+  readonly permissionIdentity = signal<PermissionIdentity|null>(null);
+  readonly permissionAudit = signal<PermissionAudit[]>([]);
+  readonly permissionNext = signal<string|null>(null);
+  private permissionSequence = 0;
+  private permissionAbort: AbortController|null = null;
 
   ngOnDestroy(): void {
     this.oidcSequence++;
     if (this.oidcExpiryTimer !== null) clearTimeout(this.oidcExpiryTimer);
     this.oidcExpiryTimer = null;
     this.oidcSession = null;
+    this.clearPermissions(true);
   }
 
   private expireOidcIfNeeded(): boolean {
@@ -115,6 +129,7 @@ export class App implements OnDestroy {
     if (this.decisionKey===session.token) this.decisionKey='';
     if (this.retryKey===session.token) this.retryKey='';
     if (this.lookupKey===session.token) this.lookupKey='';
+    if (this.permissionKey===session.token) this.clearPermissions(true);
     return true;
   }
 
@@ -130,7 +145,7 @@ export class App implements OnDestroy {
     this.oidcExpiryTimer=null;
     this.oidcSequence++; this.oidcPrepared = null; this.oidcSession = null;
     this.oidcStatus.set('idle'); this.oidcSubject.set('');
-    this.forgetKey(); this.forgetAlertKey();
+    this.forgetKey(); this.forgetAlertKey(); this.clearPermissions(true);
   }
 
   async prepareOidc(): Promise<void> {
@@ -174,6 +189,61 @@ export class App implements OnDestroy {
     else { this.clearRequestLookup(); this.lookupKey=this.oidcSession.token; }
   }
 
+  useOidcForPermissions(): void {
+    this.expireOidcIfNeeded();
+    if (!this.oidcSession || this.decisionStatus()==='sending') return;
+    const session=this.oidcSession;
+    this.clearPermissions(true);this.permissionEnvironment=session.environmentId;this.permissionKey=session.token;
+  }
+
+  clearPermissions(clearKey = false): void {
+    this.permissionSequence++;this.permissionAbort?.abort();this.permissionAbort=null;
+    this.permissionStatus.set('idle');this.permissionIdentity.set(null);this.permissionAudit.set([]);this.permissionNext.set(null);
+    if (clearKey) this.permissionKey='';
+  }
+
+  async loadPermissions(mode:'identity'|'audit', next=false): Promise<void> {
+    this.expireOidcIfNeeded();
+    const cursor=next ? this.permissionNext() : null;
+    if (next && (!cursor || mode!=='audit')) return;
+    this.clearPermissions();const sequence=this.permissionSequence;
+    const controller=new AbortController();this.permissionAbort=controller;this.permissionStatus.set('loading');
+    try {
+      const origin=this.validatedOrigin();const key=this.permissionKey.trim();const env=this.permissionEnvironment.trim();
+      if (!this.validJwt(key) || !this.validEnvironment(env)) throw new Error('invalid credentials');
+      const params=new URLSearchParams({environmentId:env});
+      if (mode==='identity') {
+        const issuer=this.permissionIssuer.trim(), subject=this.permissionSubject.trim(), client=this.permissionClient.trim();
+        const bytes=(s:string)=>new TextEncoder().encode(s).length;
+        if (!issuer || bytes(issuer)>2048 || !subject || bytes(subject)>1024 || !client || bytes(client)>1024) throw new Error('invalid identity');
+        params.set('issuer',issuer);params.set('subject',subject);params.set('clientId',client);
+      } else if (cursor) { if (!/^[1-9]\d*$/.test(cursor)) throw new Error('invalid cursor');params.set('before',cursor); }
+      const response=await fetch(`${origin}/v1/experimental/operator/permissions${mode==='audit'?'/audit':''}?${params}`,{headers:{Authorization:`Bearer ${key}`},credentials:'omit',redirect:'error',cache:'no-store',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      if (!response.ok) throw new Error('request failed');
+      const body:unknown=await response.json();
+      if (typeof body!=='object'||body===null) throw new Error('invalid response');
+      if (mode==='identity') {
+        if (!('found' in body)||typeof body.found!=='boolean') throw new Error('invalid response');
+        if (!body.found) {if(sequence===this.permissionSequence)this.permissionStatus.set('missing');return;}
+        if (!('identity' in body)||typeof body.identity!=='object'||body.identity===null) throw new Error('invalid response');
+        const i=body.identity as Record<string,unknown>;
+        if (i['issuer']!==this.permissionIssuer.trim()||i['subject']!==this.permissionSubject.trim()||i['client_id']!==this.permissionClient.trim()||i['environment_id']!==env || ['enabled','subscriber_read','alert_read','alert_retry','alert_accepted'].some(k=>typeof i[k]!=='boolean')) throw new Error('invalid response');
+        if(sequence!==this.permissionSequence)return;
+        this.permissionIdentity.set({issuer:i['issuer'] as string,subject:i['subject'] as string,clientId:i['client_id'] as string,enabled:i['enabled'] as boolean,subscriberRead:i['subscriber_read'] as boolean,alertRead:i['alert_read'] as boolean,alertRetry:i['alert_retry'] as boolean,alertAccepted:i['alert_accepted'] as boolean});this.permissionStatus.set('identity');
+      } else {
+        if (!('data' in body)||!Array.isArray(body.data)||body.data.length>50||!('next' in body)||!(body.next===null||(typeof body.next==='string'&&/^[1-9]\d*$/.test(body.next)))) throw new Error('invalid response');
+        const rows:PermissionAudit[]=body.data.map((row:unknown)=>{
+          if(typeof row!=='object'||row===null)throw new Error('invalid row');const r=row as Record<string,unknown>;
+          if(['id','recordedAt','issuer','subject','clientId','actor','reason'].some(k=>typeof r[k]!=='string')||!/^\d+$/.test(r['id'] as string)||!('previous' in r)||!('current' in r))throw new Error('invalid row');
+          return {id:r['id'] as string,recordedAt:r['recordedAt'] as string,issuer:r['issuer'] as string,subject:r['subject'] as string,clientId:r['clientId'] as string,actor:r['actor'] as string,reason:r['reason'] as string,previous:JSON.stringify(r['previous']),current:JSON.stringify(r['current'])};
+        });
+        if(sequence!==this.permissionSequence)return;
+        this.permissionAudit.set(rows);this.permissionNext.set(body.next as string|null);this.permissionStatus.set('audit');
+      }
+    } catch {if(sequence===this.permissionSequence)this.permissionStatus.set('error');}
+    finally {if(sequence===this.permissionSequence)this.permissionAbort=null;}
+  }
+
   private validJwt(key: string): boolean {
     return key.length <= 16384 && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(key);
   }
@@ -192,6 +262,7 @@ export class App implements OnDestroy {
     if (this.decisionStatus() === 'sending') return;
     if (this.section() === 'subscribers' && next !== 'subscribers') this.forgetKey();
     if (this.section() === 'alerts' && next !== 'alerts') this.forgetAlertKey();
+    if (this.section() === 'settings' && next !== 'settings') this.clearPermissions(true);
     this.section.set(next);
   }
 
