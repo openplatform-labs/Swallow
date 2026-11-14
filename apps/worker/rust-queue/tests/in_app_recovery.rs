@@ -520,4 +520,55 @@ async fn worker_recovers_expired_jobs_and_isolates_invalid_jobs() {
     assert_eq!(row.get::<_, i64>(1), 0);
     let row=db.query_one("SELECT count(*) FROM novu_rust_in_app_messages m JOIN novu_rust_subscribers s ON s.environment_id=m.environment_id AND s.internal_id=m.subscriber_internal_id WHERE m.transaction_id=ANY($1) AND m.content='Hello Recipient'", &[&vec![created.to_string(),existing.to_string()]]).await.unwrap();
     assert_eq!(row.get::<_, i64>(0), 2);
+
+    // Pause a topic job after expansion but before it locks the subscriber.
+    // Reusing the external ID must not deliver the old expansion to its new owner.
+    db.batch_execute("INSERT INTO novu_rust_topics(environment_id,topic_key,internal_id,name) VALUES ('env-a','race-topic','topic-id','Race'); INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES ('env-a','topic-race','topic-old','{}'); INSERT INTO novu_rust_topic_subscribers(environment_id,topic_key,subscriber_id,identifier) VALUES ('env-a','race-topic','topic-race','old-subscription')").await.unwrap();
+    let lock = blocker.transaction().await.unwrap();
+    lock.query_one(
+        "SELECT pg_advisory_xact_lock(hashtext($1),hashtext($2))",
+        &[&"env-a", &"topic-race"],
+    )
+    .await
+    .unwrap();
+    let topic_job = Uuid::new_v4();
+    let payload = json!({"workflow":"test","transactionId":topic_job.to_string(),"content":"old notification","payload":{},"recipients":[],"topicKeys":["race-topic"],"recipientIdentitySnapshot":{}});
+    enqueue(&db, topic_job, "env-a", in_app::JOB_KIND, &payload)
+        .await
+        .unwrap();
+    let mut blocked = false;
+    for _ in 0..100 {
+        assert!(strict_worker.0.try_wait().unwrap().is_none());
+        let row = db.query_one("SELECT status='running' AND EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted) FROM novu_queue_jobs WHERE id=$1", &[&topic_job]).await.unwrap();
+        if row.get::<_, bool>(0) {
+            blocked = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(blocked, "topic worker did not reach the identity lock");
+    db.batch_execute("DELETE FROM novu_rust_subscribers WHERE environment_id='env-a' AND subscriber_id='topic-race'; INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES ('env-a','topic-race','topic-new','{\"firstName\":\"New owner\"}'); INSERT INTO novu_rust_topic_subscribers(environment_id,topic_key,subscriber_id,identifier) VALUES ('env-a','race-topic','topic-race','new-subscription')").await.unwrap();
+    lock.commit().await.unwrap();
+    let mut failed = false;
+    for _ in 0..100 {
+        assert!(strict_worker.0.try_wait().unwrap().is_none());
+        let status: String = db
+            .query_one(
+                "SELECT status FROM novu_queue_jobs WHERE id=$1",
+                &[&topic_job],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if status == "failed" {
+            failed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(failed, "changed topic identity was not rejected");
+    let row = db.query_one("SELECT internal_id,profile->>'firstName',(SELECT count(*) FROM novu_rust_in_app_messages WHERE transaction_id=$1) FROM novu_rust_subscribers WHERE environment_id='env-a' AND subscriber_id='topic-race'", &[&topic_job.to_string()]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "topic-new");
+    assert_eq!(row.get::<_, String>(1), "New owner");
+    assert_eq!(row.get::<_, i64>(2), 0);
 }
