@@ -8,6 +8,7 @@ type AlertSlot = { channel: string; targetId: string; state: string; lastStarted
 type AlertCursor = { channel: string; targetId: string };
 type DecisionHistory = { id: string; decision: string; reason: string; createdAt: string };
 type DecisionRequest = { requestId: string; channel: string; targetId: string; attemptId: string; decision: string; reason: string; createdAt: string };
+type RetrySnapshot = { origin: string; requestId: string; channel: string; targetId: string; attemptId: string; decision: string; reason: string; keyHash: string };
 type Section = 'overview' | 'workflows' | 'subscribers' | 'channels' | 'activity' | 'alerts' | 'settings';
 
 @Component({
@@ -45,6 +46,10 @@ export class App {
   readonly decisionStatus = signal<'idle' | 'sending' | 'recorded' | 'rejected' | 'unknown' | 'unavailable'>('idle');
   decisionProtocol: 'idempotent' | 'legacy' = 'idempotent';
   readonly decisionRequestId = signal<string | null>(null);
+  readonly retrySnapshot = signal<RetrySnapshot | null>(null);
+  retryKey = '';
+  retryConfirmed = false;
+  readonly retryError = signal('');
   lookupKey = '';
   lookupId = '';
   readonly lookupStatus = signal<'idle' | 'loading' | 'found' | 'not-found' | 'error'>('idle');
@@ -143,7 +148,45 @@ export class App {
     this.lookupAbort = null;
     this.lookupResult.set(null);
     this.lookupStatus.set('idle');
-    if (clearInputs) { this.lookupKey = ''; this.lookupId = ''; this.decisionRequestId.set(null); }
+    if (clearInputs) { this.lookupKey = ''; this.lookupId = ''; this.decisionRequestId.set(null); this.clearRetry(); }
+  }
+
+  clearRetry(): void {
+    if (this.decisionStatus() === 'sending') return;
+    this.retrySnapshot.set(null); this.retryKey = ''; this.retryConfirmed = false; this.retryError.set('');
+  }
+
+  private async credentialFingerprint(key: string): Promise<string> {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(key));
+    return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+  }
+
+  async retryDecision(): Promise<void> {
+    const snapshot = this.retrySnapshot();
+    const key = this.retryKey.trim();
+    if (!snapshot || this.decisionStatus() !== 'unknown' || !this.retryConfirmed || !/^[0-9a-f]{64}$/.test(key)) return;
+    this.decisionStatus.set('sending'); this.retryError.set('');
+    try {
+      if (await this.credentialFingerprint(key) !== snapshot.keyHash || this.validatedOrigin() !== snapshot.origin) {
+        this.retryError.set('원래 요청과 같은 인증과 API 주소가 필요합니다.');
+        this.decisionStatus.set('unknown'); return;
+      }
+      const {origin, keyHash: _keyHash, ...body} = snapshot;
+      const response = await fetch(`${origin}/v1/experimental/console/alerts/resolve-v2`, {
+        method: 'POST', headers: {Authorization: `SwallowConsole ${key}`, 'Content-Type': 'application/json'},
+        body: JSON.stringify(body), cache: 'no-store', credentials: 'omit', redirect: 'error', signal: AbortSignal.timeout(10000),
+      });
+      if (!response.ok) throw new Error('retry unavailable');
+      const result: unknown = await response.json();
+      if (typeof result !== 'object' || result === null || !('recorded' in result) || result.recorded !== true || !('replayed' in result) || typeof result.replayed !== 'boolean') throw new Error('invalid response');
+      this.decisionStatus.set('recorded');
+      this.retrySnapshot.set(null);
+    } catch {
+      this.decisionStatus.set('unknown');
+      this.retryError.set('결과가 여전히 불명확합니다. 원래 요청과 이 요청의 상태 및 감사를 확인하세요.');
+    } finally {
+      this.retryKey = ''; this.retryConfirmed = false;
+    }
   }
 
   async lookupDecisionRequest(): Promise<void> {
@@ -205,6 +248,7 @@ export class App {
 
   clearDecision(): void {
     if (this.decisionStatus() === 'sending') return;
+    this.clearRetry();
     this.selectedAlert.set(null);
     this.decisionKey = '';
     this.decisionReason = '';
@@ -241,11 +285,18 @@ export class App {
     } else {
       this.clearRequestLookup(true);
     }
+    const payload = { channel: slot.channel, targetId: slot.targetId, attemptId: slot.attemptId, decision: this.decision, reason, ...(requestId ? {requestId} : {}) };
     this.decisionStatus.set('sending');
     try {
+      if (requestId) {
+        try {
+          const keyHash = await this.credentialFingerprint(key);
+          this.retrySnapshot.set({origin, ...payload, requestId, keyHash});
+        } catch { this.decisionRequestId.set(null); this.lookupId = ''; this.decisionStatus.set('unavailable'); return; }
+      }
       const response = await fetch(`${origin}/v1/experimental/console/alerts/${requestId ? 'resolve-v2' : 'resolve'}`, {
         method: 'POST', headers: { Authorization: `SwallowConsole ${key}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ channel: slot.channel, targetId: slot.targetId, attemptId: slot.attemptId, decision: this.decision, reason, ...(requestId ? {requestId} : {}) }),
+        body: JSON.stringify(payload),
         cache: 'no-store', credentials: 'omit', redirect: 'error', signal: AbortSignal.timeout(10000),
       });
       if (response.ok) {
@@ -257,6 +308,7 @@ export class App {
     } catch {
       this.decisionStatus.set('unknown');
     } finally {
+      if (this.decisionStatus() !== 'unknown') this.retrySnapshot.set(null);
       this.clearHistory(true);
       this.historyChannel = slot.channel;
       this.historyTarget = slot.targetId;

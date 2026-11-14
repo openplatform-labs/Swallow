@@ -218,6 +218,61 @@ describe('Swallow console', () => {
     expect(app.lookupStatus()).toBe('not-found'); expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
+  it('replays only the identical ambiguous request with the original credential', async () => {
+    const attempt='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[{channel:'email',targetId:'ops',state:'unknown',lastStartedAt:null,attemptId:attempt}],hasMore:false,next:null}),{status:200})).mockRejectedValueOnce(new TypeError('network')).mockResolvedValueOnce(new Response(JSON.stringify({recorded:true,replayed:true}),{status:200}));
+    const app=TestBed.createComponent(App).componentInstance;
+    app.setSection('alerts'); app.alertKey='a'.repeat(64); await app.loadAlerts();
+    app.selectAlert(app.alertSlots()[0]); app.decisionKey='b'.repeat(64); app.decisionReason='investigation'; app.decisionConfirmed=true;
+    await app.resolveAlert();
+    expect(app.decisionStatus()).toBe('unknown');
+    app.retryKey='c'.repeat(64); app.retryConfirmed=true; await app.retryDecision();
+    expect(fetchMock).toHaveBeenCalledTimes(2); expect(app.decisionStatus()).toBe('unknown'); expect(app.retryKey).toBe('');
+    app.retryKey='b'.repeat(64); app.retryConfirmed=true; await app.retryDecision();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock.mock.calls[2][1]?.body).toBe(fetchMock.mock.calls[1][1]?.body);
+    expect(app.decisionStatus()).toBe('recorded'); expect(app.retrySnapshot()).toBeNull(); expect(app.retryKey).toBe('');
+  });
+
+  it('keeps an ambiguous result after a failed replay and clears it when leaving', async () => {
+    const attempt='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[{channel:'email',targetId:'ops',state:'unknown',lastStartedAt:null,attemptId:attempt}],hasMore:false,next:null}),{status:200})).mockRejectedValueOnce(new TypeError('network')).mockResolvedValueOnce(new Response('',{status:403}));
+    const app=TestBed.createComponent(App).componentInstance;
+    app.setSection('alerts'); app.alertKey='a'.repeat(64); await app.loadAlerts();
+    app.selectAlert(app.alertSlots()[0]); app.decisionKey='b'.repeat(64); app.decisionReason='investigation'; app.decisionConfirmed=true;
+    await app.resolveAlert(); app.retryKey='b'.repeat(64); app.retryConfirmed=true; await app.retryDecision();
+    expect(fetchMock).toHaveBeenCalledTimes(3); expect(app.decisionStatus()).toBe('unknown'); expect(app.retrySnapshot()).not.toBeNull();
+    app.setSection('overview'); expect(app.retrySnapshot()).toBeNull(); expect(app.retryKey).toBe('');
+  });
+
+  it('fails closed when credential fingerprinting is unavailable', async () => {
+    const attempt='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[{channel:'email',targetId:'ops',state:'unknown',lastStartedAt:null,attemptId:attempt}],hasMore:false,next:null}),{status:200}));
+    vi.spyOn(globalThis.crypto.subtle,'digest').mockRejectedValueOnce(new Error('unavailable'));
+    const app=TestBed.createComponent(App).componentInstance;
+    app.setSection('alerts'); app.alertKey='a'.repeat(64); await app.loadAlerts();
+    app.selectAlert(app.alertSlots()[0]); app.decisionKey='b'.repeat(64); app.decisionReason='investigation'; app.decisionConfirmed=true;
+    await app.resolveAlert();
+    expect(fetchMock).toHaveBeenCalledTimes(1); expect(app.decisionStatus()).toBe('unavailable');
+    expect(app.decisionRequestId()).toBeNull(); expect(app.retrySnapshot()).toBeNull(); expect(app.decisionKey).toBe('');
+  });
+
+  it('does not issue concurrent retries or allow leaving during a retry', async () => {
+    const attempt='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[{channel:'email',targetId:'ops',state:'unknown',lastStartedAt:null,attemptId:attempt}],hasMore:false,next:null}),{status:200})).mockRejectedValueOnce(new TypeError('network'));
+    let finish!: (response: Response) => void;
+    fetchMock.mockReturnValueOnce(new Promise<Response>(done => { finish=done; }));
+    const app=TestBed.createComponent(App).componentInstance;
+    app.setSection('alerts'); app.alertKey='a'.repeat(64); await app.loadAlerts();
+    app.selectAlert(app.alertSlots()[0]); app.decisionKey='b'.repeat(64); app.decisionReason='investigation'; app.decisionConfirmed=true;
+    await app.resolveAlert(); app.retryKey='b'.repeat(64); app.retryConfirmed=true;
+    const pending=app.retryDecision(); await app.retryDecision(); app.setSection('overview');
+    expect(app.section()).toBe('alerts');
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    finish(new Response(JSON.stringify({recorded:true,replayed:true}),{status:200})); await pending;
+    expect(app.decisionStatus()).toBe('recorded');
+  });
+
   it('does not downgrade or send when secure request IDs cannot be created', async () => {
     const attempt='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
     const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[{channel:'email',targetId:'ops',state:'unknown',lastStartedAt:null,attemptId:attempt}],hasMore:false,next:null}),{status:200}));

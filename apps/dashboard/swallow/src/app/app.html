@@ -55,8 +55,20 @@
         @if (decisionStatus() === 'recorded') { <p class="decision-result" role="status">판정을 기록했습니다. 현재 상태와 감사 기록을 다시 확인해 주세요. 실제 수신이 확인된 것은 아닙니다.</p> }
         @if (decisionStatus() === 'rejected') { <p class="decision-result subscriber-error" role="alert">요청이 거절되었습니다. 인증·권한과 최신 시도를 확인한 뒤 다시 조회해 주세요.</p> }
         @if (decisionStatus() === 'unknown') { <p class="decision-result subscriber-error" role="alert">결과를 확인할 수 없습니다. 재시도하기 전에 상태와 감사 기록을 확인해 주세요.</p> }
-        @if (decisionStatus() === 'unavailable') { <p class="decision-result subscriber-error" role="alert">이 브라우저에서 안전한 요청 ID를 생성할 수 없어 판정 요청을 보내지 않았습니다.</p> }
+        @if (decisionStatus() === 'unavailable') { <p class="decision-result subscriber-error" role="alert">이 브라우저에서 안전한 요청 ID 또는 인증 확인 정보를 생성할 수 없어 판정 요청을 보내지 않았습니다.</p> }
         @if (decisionRequestId(); as requestId) {<p class="decision-result" role="status">요청 ID: <strong>{{ requestId }}</strong> · 화면을 떠나거나 새로고침하기 전에 보관하세요.</p>}
+        @if (decisionStatus() === 'unknown') { @if (retrySnapshot(); as retry) {
+          <section class="card decision-card"><div class="card-block"><h2>같은 판정 요청 다시 제출</h2>
+            <p>같은 API 주소와 인증으로 원래 요청을 그대로 다시 보냅니다. 원래 요청이 처리 중이어도 서버가 같은 요청 ID로 중복 판정을 방지합니다. 기록 삭제·다른 DB로 장애 전환 시에는 보장되지 않습니다. 상태와 감사를 먼저 확인하세요.</p>
+            <p>{{ retry.channel }} · {{ retry.targetId }} · {{ retry.attemptId }}<br>판정: {{ retry.decision }} / 사유: {{ retry.reason }}<br>요청 ID: {{ retry.requestId }}</p>
+            <form class="decision-form" (ngSubmit)="retryDecision()">
+              <label for="retry-key">원래 판정 인증 값</label><input id="retry-key" name="retryKey" type="password" [(ngModel)]="retryKey" autocomplete="off" spellcheck="false" required>
+              <label class="decision-confirm"><input type="checkbox" name="retryConfirmed" [(ngModel)]="retryConfirmed"> 위 요청과 상태를 확인하고 같은 요청을 다시 제출합니다.</label>
+              <div><button type="submit" class="btn btn-outline" [disabled]="!retryConfirmed">같은 요청 다시 제출</button><button type="button" class="btn btn-outline" (click)="clearRetry()">재제출 정보 지우기</button></div>
+            </form>
+            @if (retryError()) {<p class="subscriber-error" role="alert">{{ retryError() }}</p>}
+          </div></section>
+        } }
         <section class="card decision-card"><div class="card-block">
           <div class="card-eyebrow">REQUEST STATUS</div><h2>판정 요청 결과 확인</h2>
           <p>요청 ID 방식으로 판정할 때 사용한 같은 인증과 요청 ID를 입력합니다. 조회 결과가 없어도 요청이 처리 중일 수 있으므로 실패로 단정하지 마세요.</p>
