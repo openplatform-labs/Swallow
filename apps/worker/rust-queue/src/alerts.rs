@@ -1032,5 +1032,83 @@ mod tests {
         );
         assert!(server.await.unwrap().contains("queue overdue jobs: 1"));
         assert_eq!(db.query_one("SELECT count(*) FROM novu_rust_alert_delivery_attempts WHERE target_id IN ('scoped-ops','scoped-email') AND state='accepted' AND sender_session_user=session_user AND sender_oid IS NOT NULL",&[]).await.unwrap().get::<_,i64>(0),2);
+        let role = format!("mock_sender_{}", Uuid::new_v4().simple());
+        db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_reserve_alert(text,text,text,integer,integer),public.novu_rust_finish_alert(text,text,text,uuid,text,integer) TO {role}")).await.unwrap();
+        db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision) VALUES ('env-a',$1,'alert_send')",&[&role]).await.unwrap();
+        let (mut restricted, driver) = tokio_postgres::connect(
+            &std::env::var("TEST_DATABASE_URL").unwrap(),
+            tokio_postgres::NoTls,
+        )
+        .await
+        .unwrap();
+        tokio::spawn(async move {
+            let _ = driver.await;
+        });
+        restricted
+            .batch_execute(&format!("SET SESSION AUTHORIZATION {role}"))
+            .await
+            .unwrap();
+        let (url, server) = mock_server("200 OK", "ok").await;
+        let slack = SlackWebhook::with_endpoint(url).unwrap();
+        assert_eq!(
+            dispatch_slack_with_options(
+                &mut restricted,
+                "limited-slack",
+                60,
+                &alert,
+                &slack,
+                true,
+                true
+            )
+            .await
+            .unwrap(),
+            Dispatch::Accepted
+        );
+        assert!(server.await.unwrap().contains("queue overdue jobs: 1"));
+        let (url, server) = mock_server("200 OK", r#"{"id":"limited"}"#).await;
+        let email = Resend::test_endpoint(
+            crate::resend::Config {
+                api_key: "fixture-key".into(),
+                from: "from@example.test".into(),
+                sender_name: String::new(),
+            },
+            url.as_str(),
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch_email_with_options(
+                &mut restricted,
+                "limited-email",
+                60,
+                &alert,
+                &email,
+                "ops@example.test",
+                (true, true)
+            )
+            .await
+            .unwrap(),
+            Dispatch::Accepted
+        );
+        assert!(server.await.unwrap().contains("queue overdue jobs: 1"));
+        assert!(
+            restricted
+                .query("SELECT * FROM public.novu_rust_alert_delivery_slots", &[])
+                .await
+                .is_err()
+        );
+        assert_eq!(db.query_one("SELECT count(*) FROM novu_rust_alert_delivery_attempts WHERE sender_session_user=$1 AND state='accepted'",&[&role]).await.unwrap().get::<_,i64>(0),2);
+        restricted
+            .batch_execute("RESET SESSION AUTHORIZATION")
+            .await
+            .unwrap();
+        db.execute(
+            "DELETE FROM novu_rust_delivery_operator_grants WHERE database_principal=$1",
+            &[&role],
+        )
+        .await
+        .unwrap();
+        db.batch_execute(&format!("DROP OWNED BY {role}; DROP ROLE {role}"))
+            .await
+            .unwrap();
     }
 }

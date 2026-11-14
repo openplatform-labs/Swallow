@@ -60,7 +60,7 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
     .await
     .unwrap();
     let role = format!("monitor_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_delivery_health(text),public.novu_rust_queue_health(text,integer),public.novu_rust_provider_health(text,text,integer,integer) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'scoped-fixture-password'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_delivery_health(text),public.novu_rust_queue_health(text,integer),public.novu_rust_provider_health(text,text,integer,integer),public.novu_rust_reserve_alert(text,text,text,integer,integer),public.novu_rust_finish_alert(text,text,text,uuid,text,integer) TO {role}")).await.unwrap();
     let (actor, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move {
         let _ = driver.await;
@@ -147,6 +147,53 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
         assert!(!String::from_utf8_lossy(&output.stdout).contains("hidden"));
     }
     db.execute("INSERT INTO novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES ('a','slack','ops','rejected')",&[]).await.unwrap();
+    db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'a',$1,'alert_send',oid FROM pg_roles WHERE rolname::text=$1",&[&role]).await.unwrap();
+    let mut role_url = reqwest::Url::parse(&url).unwrap();
+    role_url.set_username(&role).unwrap();
+    role_url
+        .set_password(Some("scoped-fixture-password"))
+        .unwrap();
+    let scoped_monitor = |environment: &str| {
+        Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+            .args(["check", environment])
+            .env("DATABASE_URL", role_url.as_str())
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("SWALLOW_MONITOR_SCOPED_ACCESS", "true")
+            .output()
+            .unwrap()
+    };
+    assert_eq!(scoped_monitor("a").status.code(), Some(2));
+    assert_eq!(scoped_monitor("b").status.code(), Some(1));
+    let run_limited_alert = || {
+        Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"))
+            .args(["a", "300", "120", "60"])
+            .env("DATABASE_URL", role_url.as_str())
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("SWALLOW_ALERT_CHECK_SCOPED_ACCESS", "true")
+            .env("SWALLOW_ALERT_SCOPED_DELIVERY", "true")
+            .env("SWALLOW_ALERT_ATTEMPTS_ENABLED", "true")
+            .env("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS", "300")
+            .env("SWALLOW_ALERT_TWILIO_GRACE_SECONDS", "300")
+            .env("SWALLOW_ALERT_TWILIO_HEARTBEAT_MAX_SECONDS", "120")
+            .env("SWALLOW_ALERT_SLACK_JOBS_ENABLED", "false")
+            .env(
+                "SWALLOW_ALERT_SLACK_WEBHOOK",
+                "https://hooks.slack.com/services/A/B/C",
+            )
+            .env("SWALLOW_ALERT_SLACK_TARGET_ID", "ops")
+            .env_remove("SWALLOW_ALERT_EMAIL_TO")
+            .env_remove("SWALLOW_ALERT_SLACK_WEBHOOK_FILE")
+            .output()
+            .unwrap()
+    };
+    let limited = run_limited_alert();
+    assert_eq!(
+        limited.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&limited.stderr)
+    );
+
     let alert = Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"))
         .args(["a", "300", "120", "60"])
         .env("DATABASE_URL", &url)
@@ -172,6 +219,12 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
         "{}",
         String::from_utf8_lossy(&alert.stderr)
     );
+    db.execute("DELETE FROM novu_rust_delivery_operator_grants WHERE database_principal=$1 AND decision='alert_view'",&[&role]).await.unwrap();
+    assert_eq!(scoped_monitor("a").status.code(), Some(1));
+    let denied = run_limited_alert();
+    assert_eq!(denied.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&denied.stderr);
+    assert!(text.contains("health check failed"));
     db.execute(
         "DELETE FROM novu_rust_delivery_operator_grants WHERE database_principal=$1",
         &[&role],
