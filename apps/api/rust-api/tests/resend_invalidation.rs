@@ -17,13 +17,18 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 async fn event(app: Router, secret: &[u8], id: &str, kind: &str, email: &str) -> StatusCode {
+    let tag = match id {
+        "evt-callback-first" => "96df49d1-0f4d-4bce-9290-666dd8fc908c",
+        "evt-prior-tag" => "5ba1d539-0dd9-4ca6-a370-4622a972bb43",
+        _ => "e93bc23b-d9c4-4df9-810f-e642a9659a60",
+    };
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs()
         .to_string();
     let body = serde_json::to_vec(
-        &json!({"type":kind,"data":{"email_id":email,"to":["one@example.test"],"tags":{"swallow_dispatch":"e93bc23b-d9c4-4df9-810f-e642a9659a60"}}}),
+        &json!({"type":kind,"data":{"email_id":email,"to":["one@example.test"],"tags":{"swallow_dispatch":tag}}}),
     )
     .unwrap();
     let mut signed = format!("{id}.{timestamp}.").into_bytes();
@@ -71,6 +76,11 @@ async fn events_invalidate_only_matching_results_and_serialize_with_projector() 
         novu_postgres_queue::reconciliation::OPERATOR_GRANT_LOCK_MIGRATION,
         "ALTER TABLE novu_rust_delivery_reconciliations ADD COLUMN retry_provider_message_id text",
         include_str!("../../../worker/rust-queue/migrations/0111_resend_webhook_job_lock.sql"),
+        include_str!("../../../worker/rust-queue/migrations/0134_resend_correlation.sql"),
+        include_str!("../../../worker/rust-queue/migrations/0135_resend_correlation_retry.sql"),
+        include_str!(
+            "../../../worker/rust-queue/migrations/0136_resend_correlation_webhook_lock.sql"
+        ),
     ] {
         db.batch_execute(sql).await.unwrap();
     }
@@ -119,7 +129,8 @@ async fn events_invalidate_only_matching_results_and_serialize_with_projector() 
         .unwrap()
         .with_retry_job_lock(true)
     }
-    .with_correlation_capture(true);
+    .with_correlation_capture(true)
+    .with_correlation_job_lock(true);
     let app = novu_rust_api::router_with_webhook_configs(
         Arc::new(webdb),
         None,
@@ -269,9 +280,50 @@ async fn events_invalidate_only_matching_results_and_serialize_with_projector() 
     tx.commit().await.unwrap();
     assert_eq!(waiting.await.unwrap(), StatusCode::NO_CONTENT);
     assert!(observer.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_resend_delivery_events WHERE environment_id='env-a' AND email_id='old-retry-id')", &[]).await.unwrap().get::<_,bool>(0));
+    // The previous provider ID can be absent; the audit tag still locks the job.
+    let retried_tag = Uuid::new_v4();
+    novu_postgres_queue::enqueue(
+        &db,
+        retried_tag,
+        "env-a",
+        novu_postgres_queue::resend_queue::JOB_KIND,
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO novu_rust_resend_attempts(job_id,environment_id,state,correlation_id) VALUES ($1,'env-a','unknown','5ba1d539-0dd9-4ca6-a370-4622a972bb43')", &[&retried_tag]).await.unwrap();
+    db.execute("INSERT INTO novu_rust_delivery_reconciliations(id,environment_id,job_id,decision,operator_name,reason) VALUES ($1,'env-a',$2,'retry','operator','ticket')", &[&Uuid::new_v4(),&retried_tag]).await.unwrap();
+    db.execute(
+        "DELETE FROM novu_rust_resend_attempts WHERE job_id=$1",
+        &[&retried_tag],
+    )
+    .await
+    .unwrap();
+    let tx = db.transaction().await.unwrap();
+    tx.query_one(
+        "SELECT id FROM novu_queue_jobs WHERE id=$1 FOR UPDATE",
+        &[&retried_tag],
+    )
+    .await
+    .unwrap();
+    let pending = tokio::spawn(event(
+        app.clone(),
+        secret,
+        "evt-prior-tag",
+        "email.delivered",
+        "no-known-id",
+    ));
+    let mut blocked = false;
+    for _ in 0..100 {
+        if observer.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='resend_invalidation_webhook' AND wait_event_type='Lock')", &[]).await.unwrap().get::<_,bool>(0) { blocked=true;break; }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(blocked && !pending.is_finished());
+    tx.commit().await.unwrap();
+    assert_eq!(pending.await.unwrap(), StatusCode::NO_CONTENT);
     // Restrict lock access to an explicitly granted API login; no direct queue read is needed.
     let role = format!("webhook_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT EXECUTE ON FUNCTION public.novu_rust_lock_resend_webhook_jobs(text,text) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT EXECUTE ON FUNCTION public.novu_rust_lock_resend_webhook_jobs(text,text),public.novu_rust_lock_resend_webhook_jobs_with_correlation(text,text,uuid) TO {role}")).await.unwrap();
     db.execute("INSERT INTO novu_rust_resend_webhook_lock_grants SELECT 'env-a',$1,oid FROM pg_roles WHERE rolname::text=$1", &[&role]).await.unwrap();
     let (restricted, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move { driver.await.unwrap() });
@@ -279,6 +331,10 @@ async fn events_invalidate_only_matching_results_and_serialize_with_projector() 
         .batch_execute(&format!("SET SESSION AUTHORIZATION {role}"))
         .await
         .unwrap();
+    assert_eq!(restricted.query_one("SELECT public.novu_rust_lock_resend_webhook_jobs_with_correlation('env-a','unrelated','5ba1d539-0dd9-4ca6-a370-4622a972bb43')", &[]).await.unwrap().get::<_,i32>(0),1);
+    assert!(restricted.query("SELECT public.novu_rust_lock_resend_webhook_jobs_with_correlation('env-b','unrelated','5ba1d539-0dd9-4ca6-a370-4622a972bb43')", &[]).await.is_err());
+    db.batch_execute(&format!("REVOKE EXECUTE ON FUNCTION public.novu_rust_lock_resend_webhook_jobs_with_correlation(text,text,uuid) FROM {role}")).await.unwrap();
+    assert!(restricted.query("SELECT public.novu_rust_lock_resend_webhook_jobs_with_correlation('env-a','unrelated','5ba1d539-0dd9-4ca6-a370-4622a972bb43')", &[]).await.is_err());
     assert_eq!(
         restricted
             .query_one(
@@ -386,7 +442,7 @@ async fn events_invalidate_only_matching_results_and_serialize_with_projector() 
     )
     .await
     .unwrap();
-    db.execute("INSERT INTO novu_rust_resend_attempts(job_id,environment_id,state,provider_message_id) VALUES ($1,'env-a','unknown','race-provider-id')", &[&race_job]).await.unwrap();
+    db.execute("INSERT INTO novu_rust_resend_attempts(job_id,environment_id,state,correlation_id) VALUES ($1,'env-a','unknown','96df49d1-0f4d-4bce-9290-666dd8fc908c')", &[&race_job]).await.unwrap();
     db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision) VALUES ('env-a',session_user,'retry')", &[]).await.unwrap();
     db.batch_execute("CREATE FUNCTION public.test_pause_resend_event() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.event_id='evt-callback-first' THEN PERFORM pg_advisory_xact_lock(762019); END IF; RETURN NEW; END $$; CREATE TRIGGER test_pause_resend_event BEFORE INSERT ON public.novu_rust_resend_delivery_events FOR EACH ROW EXECUTE FUNCTION public.test_pause_resend_event();").await.unwrap();
     let (blocker, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
@@ -439,11 +495,7 @@ async fn events_invalidate_only_matching_results_and_serialize_with_projector() 
         .await
         .unwrap();
     assert_eq!(callback.await.unwrap(), StatusCode::NO_CONTENT);
-    let error = retry.await.unwrap().unwrap_err().to_string();
-    assert!(
-        error.contains("authenticated provider callback already exists"),
-        "{error}"
-    );
+    assert!(retry.await.unwrap().is_err());
     assert_eq!(
         db.query_one(
             "SELECT count(*) FROM novu_rust_delivery_reconciliations WHERE job_id=$1",

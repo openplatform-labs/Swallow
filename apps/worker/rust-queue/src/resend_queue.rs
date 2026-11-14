@@ -79,6 +79,27 @@ pub async fn process_one_with_correlation(
     policy: crate::email_step_policy::Policy,
     correlation_enabled: bool,
 ) -> Result<bool, Error> {
+    process_one_with_correlation_guard(
+        client,
+        environment,
+        provider,
+        retry_guard,
+        policy,
+        correlation_enabled,
+        false,
+    )
+    .await
+}
+
+pub async fn process_one_with_correlation_guard(
+    client: &mut Client,
+    environment: &str,
+    provider: &Resend,
+    retry_guard: bool,
+    policy: crate::email_step_policy::Policy,
+    correlation_enabled: bool,
+    correlation_guard: bool,
+) -> Result<bool, Error> {
     let Some(job) = claim(client, environment).await? else {
         return Ok(false);
     };
@@ -95,6 +116,20 @@ pub async fn process_one_with_correlation(
     if !live(&tx, &job).await? {
         tx.rollback().await?;
         return Ok(true);
+    }
+    if correlation_guard {
+        let evidence = tx.query_opt("SELECT r.retry_correlation_id,r.retry_provider_message_id FROM (SELECT retry_correlation_id,retry_provider_message_id FROM novu_rust_delivery_reconciliations WHERE environment_id=$1 AND job_id=$2 AND target_index IS NULL AND decision='retry' ORDER BY decision_order DESC LIMIT 1) r WHERE r.retry_correlation_id IS NOT NULL AND EXISTS(SELECT 1 FROM novu_rust_resend_delivery_events e WHERE e.environment_id=$1 AND e.correlation_id=r.retry_correlation_id)", &[&environment,&job.id]).await?;
+        if let Some(evidence) = evidence {
+            let tag: Uuid = evidence.get(0);
+            let provider_id: Option<String> = evidence.get(1);
+            let inserted=tx.execute("INSERT INTO novu_rust_resend_attempts(job_id,environment_id,state,provider_message_id,correlation_id) VALUES ($1,$2,'unknown',$3,$4) ON CONFLICT(job_id) DO NOTHING", &[&job.id,&environment,&provider_id,&tag]).await?;
+            if inserted == 1 {
+                tx.execute("UPDATE novu_rust_email_messages SET delivery_state='unknown',status='error',error_id='mail_unexpected_error',error_text='Resend retry blocked by tagged callback',resend_delivery_result=NULL WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
+            }
+            tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='Resend retry blocked by tagged callback',lease_token=NULL,lease_until=NULL,resend_delivery_result=NULL WHERE id=$1 AND environment_id=$2", &[&job.id,&environment]).await?;
+            tx.commit().await?;
+            return Ok(true);
+        }
     }
     if retry_guard {
         let evidence = tx.query_opt("SELECT r.retry_provider_message_id FROM (SELECT retry_provider_message_id FROM novu_rust_delivery_reconciliations WHERE environment_id=$1 AND job_id=$2 AND target_index IS NULL AND decision='retry' ORDER BY decision_order DESC LIMIT 1) r WHERE r.retry_provider_message_id IS NOT NULL AND r.retry_provider_message_id<>'' AND EXISTS(SELECT 1 FROM novu_rust_resend_delivery_events e WHERE e.environment_id=$1 AND e.email_id=r.retry_provider_message_id)", &[&environment,&job.id]).await?;
@@ -422,6 +457,7 @@ mod tests {
             include_str!("../../../api/rust-api/migrations/0008_sendgrid_dispatch_identity.sql"),
             include_str!("../../../api/rust-api/migrations/0009_sendgrid_dispatch_proof.sql"),
             include_str!("../../../api/rust-api/migrations/0010_resend_webhooks.sql"),
+            include_str!("../../../api/rust-api/migrations/0047_resend_event_correlation.sql"),
             include_str!("../../../api/rust-api/migrations/0005_twilio_webhooks.sql"),
             include_str!("../../../api/rust-api/migrations/0006_twilio_webhook_job_link.sql"),
             include_str!("../../../api/rust-api/migrations/0007_twilio_dispatch_identity.sql"),
@@ -483,6 +519,7 @@ mod tests {
             include_str!("../../../api/rust-api/migrations/0008_sendgrid_dispatch_identity.sql"),
             include_str!("../../../api/rust-api/migrations/0009_sendgrid_dispatch_proof.sql"),
             include_str!("../../../api/rust-api/migrations/0010_resend_webhooks.sql"),
+            include_str!("../../../api/rust-api/migrations/0047_resend_event_correlation.sql"),
             include_str!("../../../api/rust-api/migrations/0005_twilio_webhooks.sql"),
             include_str!("../../../api/rust-api/migrations/0006_twilio_webhook_job_link.sql"),
             include_str!("../../../api/rust-api/migrations/0007_twilio_dispatch_identity.sql"),
@@ -720,6 +757,70 @@ mod tests {
         assert_eq!(result.get::<_, String>(2), "unknown");
         assert_eq!(result.get::<_, String>(3), "prior-provider-id");
         assert_eq!(result.get::<_, String>(4), "unknown");
+
+        // A callback after the retry decision can be correlated without any
+        // provider response ID; the guard must prevent a new HTTP request.
+        let tagged = Uuid::new_v4();
+        let tag = Uuid::new_v4();
+        enqueue(
+            &db,
+            tagged,
+            "env-a",
+            JOB_KIND,
+            &json!({"to":["to@example.test"],"subject":"Tag guard","html":"Hi"}),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "UPDATE novu_queue_jobs SET status='failed' WHERE id=$1",
+            &[&tagged],
+        )
+        .await
+        .unwrap();
+        db.execute("INSERT INTO novu_rust_resend_attempts(job_id,environment_id,state,correlation_id) VALUES ($1,'env-a','unknown',$2)", &[&tagged,&tag]).await.unwrap();
+        crate::reconciliation::resolve(
+            &mut db, "env-a", tagged, None, "retry", "operator", "ticket",
+        )
+        .await
+        .unwrap();
+        db.execute("INSERT INTO novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type,correlation_id) VALUES ('env-a','tag-late','unknown-id','email.delivered',$1)", &[&tag]).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider = Resend::test_endpoint(
+            Config {
+                api_key: "re_test".into(),
+                from: "from@example.test".into(),
+                sender_name: String::new(),
+            },
+            &format!("http://{}/emails", listener.local_addr().unwrap()),
+        )
+        .unwrap();
+        assert!(
+            process_one_with_correlation_guard(
+                &mut db,
+                "env-a",
+                &provider,
+                true,
+                crate::email_step_policy::Policy::Snapshot,
+                true,
+                true
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+        let row=db.query_one("SELECT j.status,j.last_error,a.state,a.correlation_id,a.provider_message_id FROM novu_queue_jobs j JOIN novu_rust_resend_attempts a ON a.job_id=j.id WHERE j.id=$1", &[&tagged]).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), "failed");
+        assert_eq!(
+            row.get::<_, String>(1),
+            "Resend retry blocked by tagged callback"
+        );
+        assert_eq!(row.get::<_, String>(2), "unknown");
+        assert_eq!(row.get::<_, Uuid>(3), tag);
+        assert!(row.get::<_, Option<String>>(4).is_none());
 
         // A disabled guard permits the prior behavior; an unrelated event never blocks.
         for (enabled, prior_id) in [

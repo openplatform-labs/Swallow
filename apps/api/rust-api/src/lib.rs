@@ -180,8 +180,20 @@ impl RuntimeConfig {
             Ok("true" | "false") | Err(std::env::VarError::NotPresent) => {}
             _ => return Err(invalid()),
         }
+        match std::env::var("NOVU_RESEND_WEBHOOK_LOCK_CORRELATION_JOBS").as_deref() {
+            Ok("true" | "false") | Err(std::env::VarError::NotPresent) => {}
+            _ => return Err(invalid()),
+        }
+        if std::env::var("NOVU_RESEND_WEBHOOK_LOCK_CORRELATION_JOBS").as_deref() == Ok("true")
+            && (std::env::var("NOVU_RESEND_WEBHOOK_LOCK_RETRY_JOBS").as_deref() != Ok("true")
+                || std::env::var("NOVU_RESEND_WEBHOOK_CAPTURE_CORRELATION").as_deref() != Ok("true")) {
+            return Err(invalid());
+        }
         let twilio = twilio_webhook::Config::from_env();
         let resend = resend_webhook::Config::from_env();
+        if std::env::var("NOVU_RESEND_WEBHOOK_LOCK_CORRELATION_JOBS").as_deref() == Ok("true") && resend.is_none() {
+            return Err(invalid());
+        }
         let is_set = |names: &[&str]| names.iter().any(|name| std::env::var_os(name).is_some());
         if (required.contains("twilio-webhook")
             || (strict

@@ -20,6 +20,9 @@ fn server() -> Command {
         .env_remove("NOVU_RESEND_WEBHOOK_ENVIRONMENT_ID")
         .env_remove("NOVU_RESEND_WEBHOOK_SECRET")
         .env_remove("NOVU_RESEND_WEBHOOK_SECRET_FILE")
+        .env_remove("NOVU_RESEND_WEBHOOK_LOCK_RETRY_JOBS")
+        .env_remove("NOVU_RESEND_WEBHOOK_CAPTURE_CORRELATION")
+        .env_remove("NOVU_RESEND_WEBHOOK_LOCK_CORRELATION_JOBS")
         .env_remove("NOVU_TWILIO_WEBHOOK_ENVIRONMENT_ID")
         .env_remove("NOVU_TWILIO_WEBHOOK_ACCOUNT_SID")
         .env_remove("NOVU_TWILIO_WEBHOOK_URL")
@@ -86,6 +89,35 @@ fn strict_and_required_security_settings_control_startup() {
         false,
     );
     check(&[("SWALLOW_API_STRICT_SECURITY_CONFIG", "yes")], false);
+    check(
+        &[("NOVU_RESEND_WEBHOOK_LOCK_CORRELATION_JOBS", "true")],
+        false,
+    );
+    check(
+        &[("NOVU_RESEND_WEBHOOK_LOCK_CORRELATION_JOBS", "bad")],
+        false,
+    );
+    check(
+        &[
+            ("NOVU_RESEND_WEBHOOK_LOCK_CORRELATION_JOBS", "true"),
+            ("NOVU_RESEND_WEBHOOK_LOCK_RETRY_JOBS", "true"),
+            ("NOVU_RESEND_WEBHOOK_CAPTURE_CORRELATION", "true"),
+        ],
+        false,
+    );
+    check(
+        &[
+            ("NOVU_RESEND_WEBHOOK_LOCK_CORRELATION_JOBS", "true"),
+            ("NOVU_RESEND_WEBHOOK_LOCK_RETRY_JOBS", "true"),
+            ("NOVU_RESEND_WEBHOOK_CAPTURE_CORRELATION", "true"),
+            ("NOVU_RESEND_WEBHOOK_ENVIRONMENT_ID", "env"),
+            (
+                "NOVU_RESEND_WEBHOOK_SECRET",
+                "whsec_MDEyMzQ1Njc4OWFiY2RlZg==",
+            ),
+        ],
+        true,
+    );
     check(
         &[
             ("SWALLOW_API_STRICT_SECURITY_CONFIG", "true"),

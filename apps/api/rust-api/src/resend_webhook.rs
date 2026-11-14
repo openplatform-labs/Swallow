@@ -19,6 +19,7 @@ pub struct Config {
     secret: Vec<u8>,
     lock_retry_jobs: bool,
     capture_correlation: bool,
+    lock_correlation_jobs: bool,
 }
 impl Config {
     pub fn new(environment: String, secret: &str) -> Option<Self> {
@@ -31,6 +32,7 @@ impl Config {
             secret: decoded,
             lock_retry_jobs: false,
             capture_correlation: false,
+            lock_correlation_jobs: false,
         })
     }
     pub fn with_retry_job_lock(mut self, enabled: bool) -> Self {
@@ -39,6 +41,10 @@ impl Config {
     }
     pub fn with_correlation_capture(mut self, enabled: bool) -> Self {
         self.capture_correlation = enabled;
+        self
+    }
+    pub fn with_correlation_job_lock(mut self, enabled: bool) -> Self {
+        self.lock_correlation_jobs = enabled;
         self
     }
     pub fn from_env() -> Option<Self> {
@@ -54,6 +60,15 @@ impl Config {
                 Ok("false") | Err(std::env::VarError::NotPresent) => false,
                 _ => return None,
             };
+        let lock_correlation_jobs =
+            match std::env::var("NOVU_RESEND_WEBHOOK_LOCK_CORRELATION_JOBS").as_deref() {
+                Ok("true") => true,
+                Ok("false") | Err(std::env::VarError::NotPresent) => false,
+                _ => return None,
+            };
+        if lock_correlation_jobs && (!lock_retry_jobs || !capture_correlation) {
+            return None;
+        }
         Some(
             Self::new(
                 std::env::var("NOVU_RESEND_WEBHOOK_ENVIRONMENT_ID").ok()?,
@@ -64,7 +79,8 @@ impl Config {
                 .ok()??,
             )?
             .with_retry_job_lock(lock_retry_jobs)
-            .with_correlation_capture(capture_correlation),
+            .with_correlation_capture(capture_correlation)
+            .with_correlation_job_lock(lock_correlation_jobs),
         )
     }
 }
@@ -94,6 +110,9 @@ pub async fn receive(
     let Some(config) = config.as_ref() else {
         return StatusCode::UNAUTHORIZED;
     };
+    if config.lock_correlation_jobs && (!config.lock_retry_jobs || !config.capture_correlation) {
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
     let header = |key: &str| headers.get(key).and_then(|h| h.to_str().ok());
     let (Some(id), Some(timestamp), Some(signatures)) = (
         header("svix-id"),
@@ -192,12 +211,18 @@ pub async fn receive(
                     .filter(|u| u.get_version_num() == 4 && u.to_string() == s)
                     .map(|u| u.to_string())
             });
-        let tagged_sql = sql
+        let mut tagged_sql = sql
             .replace(
                 "payload_fingerprint,recipient_hash)",
                 "payload_fingerprint,recipient_hash,correlation_id)",
             )
             .replace("$5,$6,$7 FROM", "$5,$6,$7,$8::text::uuid FROM");
+        if config.lock_correlation_jobs {
+            tagged_sql = tagged_sql.replace(
+                "novu_rust_lock_resend_webhook_jobs(id,$4)",
+                "novu_rust_lock_resend_webhook_jobs_with_correlation(id,$4,$8::text::uuid)",
+            );
+        }
         let mut tagged_params = params.to_vec();
         tagged_params.push(&correlation);
         db.execute(&tagged_sql, &tagged_params).await
