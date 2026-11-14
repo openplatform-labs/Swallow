@@ -69,6 +69,8 @@ API 마이그레이션 `0006`·`0007`과 워커 마이그레이션 `0056`까지 
 
 ## 구현된 범위
 
+- [Resend 이메일 어댑터](apps/worker/rust-queue/src/resend.rs)는 발신자·수신자·제목·HTML·텍스트·참조·숨은 참조·회신 주소와 선택적 idempotency 키를 [Resend 이메일 API](https://resend.com/docs/api-reference/emails/send-email)에 전송한다. 미지원 첨부·헤더·provider custom data는 무시하지 않고 거절한다. 로컬 모의 HTTP 서버에서 요청·키·응답 및 302·429·500을 검증했으며 성공 응답이 불완전하면 결과 불명으로 취급한다. 원본 Novu provider, 실제 Resend 계정과 수신은 비교하지 않았다. **아직 워크플로·큐·통합 관리 API·웹훅에 연결되지 않았으므로 제품에서 Resend를 선택해 발송할 수 없다.** Resend의 idempotency 키 보관 기간은 [24시간](https://resend.com/docs/dashboard/emails/idempotency-keys)이며 자동 재시도는 구현하지 않았다.
+
 - 제한적인 트리거 API: API 키 해시로 환경과 연결된 사용자를 조회하고, 워크플로 없음·비활성·단계 없음의 일부 응답을 처리한다. 트리거와 관리 API의 사용자 Bearer 인증은 구현되지 않아 거절한다.
 - 자동 트랜잭션 ID는 기준 소스의 `txn_` + 8자리 Unix 초 hex + 12자리 영숫자 형식을 따른다. 전체 서버 간 비교는 아직 수행하지 않았다.
 - PostgreSQL 작업 큐: 등록·지연·선점·임대·완료·실패·명시적 재시도/복구 및 대기 작업 취소의 기본 연산이 있다.
