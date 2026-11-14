@@ -9,6 +9,10 @@ PostgreSQL 큐에 남는 워크플로 첨부파일에 대해 운영자가 환경
 > 기준: 원본 Novu 커밋 `895388f37efe9e06de0aa333e5727303e6ad6853` · 작성: 2026-11-12.
 > **현재 구현은 실험용이며 Novu와 100% 호환되지 않는다. 운영에 사용하거나 기존 Novu의 대체품으로 배포하지 않는다.**
 
+### FCM 이벤트 시각의 워크플로 검증
+
+격리된 Docker PostgreSQL에서 Rust 트리거 HTTP 라우터 → 워크플로 처리 → FCM 큐 테스트 하네스 → 모의 FCM HTTP 요청을 실행했다. 유효한 시각은 UTC 밀리초로 전달되고 접수 시도가 한 건 기록됐으며, 잘못된 시각은 공급자 요청과 발송 시도 없이 푸시 단계 실패로 기록됐다. 이 검증은 실제 FCM이나 기기 수신, 원본 Novu 서버 전체와의 비교가 아니다. 재현 방법은 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
 ### FCM Android 알림 이벤트 시각
 
 Swallow 확장 `overrides.fcm.android.notification.eventTime`으로 RFC 3339 문자열을 선택하면 UTC 밀리초 정밀도의 FCM `event_time`으로 변환한다. 허용 범위와 예시는 [워커 README](apps/worker/rust-queue/README.md)를 참고한다. 원본 Firebase Admin Node SDK의 `eventTimestamp`는 JavaScript `Date` 객체를 요구하며 JSON 문자열을 거절하므로, 동일 입력 계약이라고 주장하지 않는다. 기존 JSON `eventTimestamp` 거절은 유지한다.
