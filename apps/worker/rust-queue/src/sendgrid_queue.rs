@@ -332,12 +332,16 @@ pub async fn process_one(
             receipt.id.map(|v| v.chars().take(1024).collect::<String>()),
             None,
         ),
-        Err(SendError::Provider(code)) if code >= 500 => (
-            "unknown",
-            Some(i32::from(code)),
-            None,
-            Some("email provider outcome unknown"),
-        ),
+        Err(SendError::Provider(code))
+            if !(400..500).contains(&code) || [408, 409].contains(&code) =>
+        {
+            (
+                "unknown",
+                Some(i32::from(code)),
+                None,
+                Some("email provider outcome unknown"),
+            )
+        }
         Err(SendError::Provider(code)) => (
             "rejected",
             Some(i32::from(code)),
@@ -558,7 +562,15 @@ mod tests {
         )
         .unwrap();
         let server = tokio::spawn(async move {
-            for response in [Some(202), Some(429), Some(500), None] {
+            for response in [
+                Some(202),
+                Some(429),
+                Some(302),
+                Some(408),
+                Some(409),
+                Some(500),
+                None,
+            ] {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut buf = Vec::new();
                 let mut tmp = [0; 4096];
@@ -615,6 +627,9 @@ mod tests {
         for (state, expected_status, code) in [
             ("accepted", "completed", None),
             ("rejected", "failed", Some(429_i32)),
+            ("unknown", "failed", Some(302_i32)),
+            ("unknown", "failed", Some(408_i32)),
+            ("unknown", "failed", Some(409_i32)),
             ("unknown", "failed", Some(500_i32)),
             ("unknown", "failed", None),
         ] {
