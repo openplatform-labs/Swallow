@@ -61,7 +61,18 @@ async fn restricted_operator_can_only_make_authorized_atomic_decisions() {
     admin.execute("INSERT INTO novu_rust_alert_delivery_slots(environment_id,channel,target_id,state,lease_until) VALUES ('a','email','expired','dispatching',clock_timestamp()-interval '1 second')",&[]).await.unwrap();
     assert!(alerts::scoped_health(&actor, "a").await.is_err());
     assert!(alerts::scoped_status(&actor, "a").await.is_err());
-    assert!(admin.query_one("SELECT public.novu_rust_manage_operator_grant('a',$1,'alert_view','grant','view test')",&[&operator]).await.unwrap().get::<_,bool>(0));
+    let grant = std::process::Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .args(["operator-grant", "a", &operator, "alert_view", "view test"])
+        .env("DATABASE_URL", &url)
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .output()
+        .unwrap();
+    assert!(grant.status.success());
+    assert_eq!(admin.query_one("SELECT count(*) FROM novu_rust_operator_grant_audit WHERE environment_id='a' AND target_session_user=$1 AND permission='alert_view' AND action='grant'",&[&operator]).await.unwrap().get::<_,i64>(0),1);
+    admin
+        .batch_execute(include_str!("../migrations/0087_alert_view_permission.sql"))
+        .await
+        .unwrap();
     assert_eq!(
         alerts::scoped_health(&actor, "a").await.unwrap(),
         alerts::health(&admin, "a").await.unwrap()
@@ -100,7 +111,13 @@ async fn restricted_operator_can_only_make_authorized_atomic_decisions() {
         );
         assert!(!output.stdout.is_empty());
     }
-    assert!(admin.query_one("SELECT public.novu_rust_manage_operator_grant('a',$1,'alert_view','revoke','view test')",&[&operator]).await.unwrap().get::<_,bool>(0));
+    let revoke = std::process::Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .args(["operator-revoke", "a", &operator, "alert_view", "view test"])
+        .env("DATABASE_URL", &url)
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .output()
+        .unwrap();
+    assert!(revoke.status.success());
     assert!(alerts::scoped_health(&actor, "a").await.is_err());
     assert!(alerts::scoped_status(&actor, "a").await.is_err());
     assert!(
