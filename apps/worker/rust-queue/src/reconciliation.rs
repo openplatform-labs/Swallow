@@ -260,6 +260,37 @@ pub async fn failed_queue_list(
         .await?;
     Ok(rows.into_iter().map(|r|json!({"jobId":r.get::<_,Uuid>(0).to_string(),"kind":r.get::<_,String>(1),"attempts":r.get::<_,i32>(2),"createdAt":r.get::<_,String>(3)})).collect())
 }
+/// List failure revisions for a fenced operator review.
+pub async fn failed_queue_list_v2(
+    client: &Client,
+    environment: &str,
+    after: Option<Uuid>,
+) -> Result<Vec<Value>> {
+    let rows = client
+        .query(
+            "SELECT * FROM public.novu_rust_failed_queue_list_v2($1,$2)",
+            &[&environment, &after],
+        )
+        .await?;
+    Ok(rows.into_iter().map(|r| json!({"jobId":r.get::<_,Uuid>(0).to_string(),"kind":r.get::<_,String>(1),"attempts":r.get::<_,i32>(2),"createdAt":r.get::<_,String>(3),"revision":r.get::<_,String>(4)})).collect())
+}
+/// Acknowledge only the failure revision the operator reviewed.
+pub async fn acknowledge_failed_queue_v2(
+    client: &Client,
+    environment: &str,
+    job: Uuid,
+    revision: i64,
+    operator: &str,
+    reason: &str,
+) -> Result<bool> {
+    Ok(client
+        .query_one(
+            "SELECT public.novu_rust_ack_failed_queue_v2($1,$2,$3,$4,$5)",
+            &[&environment, &job, &revision, &operator, &reason],
+        )
+        .await?
+        .get(0))
+}
 pub async fn acknowledge_failed_queue(
     client: &Client,
     environment: &str,

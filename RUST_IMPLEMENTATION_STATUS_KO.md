@@ -3,6 +3,12 @@
 > 기준: 원본 Novu 커밋 `895388f37efe9e06de0aa333e5727303e6ad6853` · 작성: 2026-11-12.
 > **현재 구현은 실험용이며 Novu와 100% 호환되지 않는다. 운영에 사용하거나 기존 Novu의 대체품으로 배포하지 않는다.**
 
+### 실패 작업 확인의 버전 경합 방지 (워커 0129)
+
+기존 `ack-failed-job`은 확인 시점의 실패를 기록하므로, 운영자가 목록을 본 후 같은 작업이 재실패하면 검토하지 않은 새 실패도 확인 처리할 수 있다. 0129는 선택형 `list-failed-jobs-v2 ENV [AFTER_JOB]`와 `ack-failed-job-v2 ENV JOB REVISION OPERATOR REASON`을 제공한다. 목록의 문자열 `revision`을 그대로 사용하면 DB가 권한과 실패 작업 행을 잠근 뒤 버전이 다를 때 거절한다. 동일 버전 중복 확인은 무변경으로 처리하며, 확인은 발송 결과의 성공이나 문제 해결을 뜻하지 않는다. 목록은 최대 100건의 환경별 비밀 없는 메타데이터이며 페이지 간 전체 스냅샷은 아니다. 작업이 이미 복구되었거나 버전이 바뀌었으면 다시 목록을 보고 조사해야 한다.
+
+0129 적용 후 목록 계정에 환경 `alert_view`와 `public.novu_rust_failed_queue_list_v2(text,uuid)` EXECUTE, 확인 계정에 `queue_ack`와 `public.novu_rust_ack_failed_queue_v2(text,uuid,bigint,text,text)` EXECUTE를 별도로 부여한다. 기존 함수와 권한은 유지되므로 버전 검사를 강제하려면 구버전 도구와 기존 `novu_rust_ack_failed_queue(text,uuid,text,text)` 실행 권한을 운영자가 정리해야 한다. 직접 DB 쓰기나 DB 관리자 권한은 이 검사를 우회할 수 있다. Docker PostgreSQL에서 제한 로그인·다른 환경 차단·직접 테이블 조회 거절, 실패 재발생과 잠금 경합, 실제 CLI, 중복 확인·권한 회수·페이지를 확인했다. 원본 Novu 기능이 아닌 Swallow 운영 확장이며 운영 환경의 배포와 부하는 미검증이다.
+
 ### FCM 대상 등록 재확인 선택 (워커 0128)
 
 `SWALLOW_PUSH_TARGET_POLICY=reference|registered`를 선택할 수 있다. 기본 `reference`는 준비된 대상을 그대로 사용한다. `registered`는 각 FCM 요청을 예약하기 직전 현재 구독자의 해당 활성 연동에 같은 기기 토큰이 등록되어 있는지 확인한다. 등록이 없어졌거나 연동이 비활성이면 그 대상만 `skipped/unregistered`로 기록하고 다른 대상은 계속 처리한다. 등록 정보나 토큰을 확인할 수 없는 독립 준비 작업·토픽·조건 대상은 `skipped/unverifiable`로 처리한다. 공급자 자격 증명이 없거나 준비 정보가 잘못된 경우에는 기존 오류 처리가 먼저 발생할 수 있다.
