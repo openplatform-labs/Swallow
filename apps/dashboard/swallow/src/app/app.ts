@@ -5,6 +5,9 @@ import { OperatorOidc, type PreparedOidc, type VerifiedSession } from './operato
 
 type ConnectionState = 'unchecked' | 'checking' | 'ready' | 'unavailable';
 type SubscriberProfile = {firstName:string;lastName:string;email:string;phone:string};
+type SubscriberProfileRequestBody = {requestId:string;subscriberId:string;generation:string;revision:string;profile:Record<string,string|null>;reason:string};
+type SubscriberProfileRetry = {origin:string;environment:string;keyHash:string;body:SubscriberProfileRequestBody};
+type SubscriberProfileRecord = {requestId:string;subscriberId:string;generation:string;previousRevision:string;revision:string;changed:boolean;fields:string[];reason:string;createdAt:string};
 type SubscriberEditSnapshot = {id:string;generation:string;revision:string;profile:SubscriberProfile};
 type Subscriber = { id: string; firstName: string; lastName: string; email: string };
 type AlertSlot = { channel: string; targetId: string; state: string; lastStartedAt: string | null; attemptId?: string | null };
@@ -159,6 +162,15 @@ export class App implements OnDestroy {
   createEmail='';
   createPhone='';
   createConfirmed=false;
+  readonly subscriberProfileRetry=signal<SubscriberProfileRetry|null>(null);
+  readonly subscriberProfileRetryStatus=signal<'idle'|'unknown'|'retrying'|'recorded'>('idle');
+  readonly subscriberProfileRetryMessage=signal('');
+  subscriberProfileRetryConfirmed=false;
+  subscriberProfileRequestId='';
+  readonly subscriberProfileRequestStatus=signal<'idle'|'loading'|'found'|'missing'|'error'>('idle');
+  readonly subscriberProfileRequestRecord=signal<SubscriberProfileRecord|null>(null);
+  private subscriberProfileRequestSequence=0;
+  private subscriberProfileRequestAbort:AbortController|null=null;
   subscriberEditId='';
   subscriberEditProfile:SubscriberProfile={firstName:'',lastName:'',email:'',phone:''};
   subscriberEditConfirmed=false;
@@ -251,7 +263,7 @@ export class App implements OnDestroy {
     this.clearResend();
     this.clearResendJobs();
     this.clearPermissions(true);
-    this.resetSubscriberEdit(true);
+    this.resetSubscriberEdit(true);this.forgetSubscriberProfileRequest();
   }
 
   private expireOidcIfNeeded(): boolean {
@@ -260,7 +272,7 @@ export class App implements OnDestroy {
     if (this.oidcExpiryTimer !== null) clearTimeout(this.oidcExpiryTimer);
     this.oidcExpiryTimer=null; this.oidcSession=null; this.oidcSubject.set(''); this.oidcStatus.set('expired');
     // Preserve decision outcome and request ID, including an in-flight or uncertain decision.
-    if (this.apiKey===session.token) { this.apiKey=''; this.clearSubscribers(); this.resetSubscriberEdit(); }
+    if (this.apiKey===session.token) { this.apiKey=''; this.clearSubscribers(); this.resetSubscriberEdit(); this.clearSubscriberProfileLookup(); }
     if (this.alertKey===session.token) {
       this.alertKey=''; this.clearResend(); this.clearResendJobs();
       this.alertRequestId++; this.alertAbort?.abort(); this.alertAbort=null;
@@ -290,7 +302,7 @@ export class App implements OnDestroy {
   }
 
   resetOidc(): void {
-    if ((this.createStatus()==='sending' || this.subscriberEditStatus()==='saving') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
+    if ((this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     if (this.oidcExpiryTimer !== null) clearTimeout(this.oidcExpiryTimer);
     this.oidcExpiryTimer=null;
     this.oidcSequence++; this.oidcPrepared = null; this.oidcSession = null;
@@ -320,7 +332,7 @@ export class App implements OnDestroy {
 
   useOidc(section: 'subscribers' | 'alerts' | 'workflows'): void {
     this.expireOidcIfNeeded();
-    if (!this.oidcSession || (this.createStatus()==='sending' || this.subscriberEditStatus()==='saving') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
+    if (!this.oidcSession || (this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     const session=this.oidcSession;
     this.setSection(section);
     if (section === 'subscribers') { this.forgetKey(); this.credentialMode='jwt'; this.subscriberEnvironment=session.environmentId; this.apiKey=session.token; }
@@ -856,7 +868,7 @@ export class App implements OnDestroy {
   }
 
   setSection(next: Section): void {
-    if ((this.createStatus()==='sending' || this.subscriberEditStatus()==='saving') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
+    if ((this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     if (this.section()==='workflows' && next!=='workflows') {this.clearWorkflow(true);this.forgetWorkflowRequest();}
     if (this.section() === 'subscribers' && next !== 'subscribers') this.forgetKey();
     if (this.section() === 'alerts' && next !== 'alerts') this.forgetAlertKey();
@@ -888,8 +900,8 @@ export class App implements OnDestroy {
   }
 
   forgetKey(): void {
-    if(this.createStatus()==='sending'||this.subscriberEditStatus()==='saving')return;
-    this.resetSubscriberEdit(true);this.resetCreateSubscriber();
+    if(this.createStatus()==='sending'||this.subscriberEditStatus()==='saving'||this.subscriberProfileRetryStatus()==='retrying')return;
+    this.resetSubscriberEdit(true);this.forgetSubscriberProfileRequest();this.resetCreateSubscriber();
     this.apiKey = '';
     this.clearSubscribers();
   }
@@ -1283,13 +1295,47 @@ export class App implements OnDestroy {
     }
   }
 
+  clearSubscriberProfileLookup(clearId=false):void {
+    this.subscriberProfileRequestSequence++;this.subscriberProfileRequestAbort?.abort();this.subscriberProfileRequestAbort=null;this.subscriberProfileRequestStatus.set('idle');this.subscriberProfileRequestRecord.set(null);if(clearId)this.subscriberProfileRequestId='';
+  }
+  forgetSubscriberProfileRequest():void {
+    if(this.subscriberProfileRetryStatus()==='retrying')return;
+    this.clearSubscriberProfileLookup(true);this.subscriberProfileRetry.set(null);this.subscriberProfileRetryStatus.set('idle');this.subscriberProfileRetryMessage.set('');this.subscriberProfileRetryConfirmed=false;
+  }
+  async lookupSubscriberProfileRequest():Promise<void> {
+    if(this.subscriberEditStatus()==='saving'||this.subscriberProfileRetryStatus()==='retrying'||this.credentialMode!=='jwt')return;
+    this.expireOidcIfNeeded();this.clearSubscriberProfileLookup();const sequence=this.subscriberProfileRequestSequence;
+    const key=this.apiKey.trim(),environment=this.subscriberEnvironment.trim(),requestId=this.subscriberProfileRequestId.trim();
+    if(!this.validJwt(key)||!this.validEnvironment(environment)||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId)){this.subscriberProfileRequestStatus.set('error');return;}
+    const controller=new AbortController();this.subscriberProfileRequestAbort=controller;this.subscriberProfileRequestStatus.set('loading');
+    try {
+      const params=new URLSearchParams({environmentId:environment,requestId});const response=await fetch(`${this.validatedOrigin()}/v1/experimental/operator/subscriber-profile-request?${params}`,{headers:{Authorization:`Bearer ${key}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      if(!response.ok)throw new Error('request failed');const value:unknown=await response.json();if(typeof value!=='object'||value===null||!('found' in value)||typeof value.found!=='boolean')throw new Error('invalid response');
+      this.expireOidcIfNeeded();if(sequence!==this.subscriberProfileRequestSequence)return;if(!value.found){this.subscriberProfileRequestStatus.set('missing');return;}
+      const r=value as Record<string,unknown>;if(typeof r['requestId']!=='string'||r['requestId'].toLowerCase()!==requestId.toLowerCase()||['subscriberId','generation','previousRevision','revision','reason','createdAt'].some(k=>typeof r[k]!=='string')||typeof r['changed']!=='boolean'||!Array.isArray(r['fields'])||r['fields'].some((f:unknown)=>typeof f!=='string'||!['firstName','lastName','email','phone'].includes(f)))throw new Error('invalid response');
+      this.subscriberProfileRequestRecord.set({requestId:r['requestId'],subscriberId:r['subscriberId'] as string,generation:r['generation'] as string,previousRevision:r['previousRevision'] as string,revision:r['revision'] as string,changed:r['changed'],fields:r['fields'] as string[],reason:r['reason'] as string,createdAt:r['createdAt'] as string});this.subscriberProfileRequestStatus.set('found');
+    }catch{this.expireOidcIfNeeded();if(sequence===this.subscriberProfileRequestSequence)this.subscriberProfileRequestStatus.set('error');}
+    finally{if(sequence===this.subscriberProfileRequestSequence)this.subscriberProfileRequestAbort=null;}
+  }
+  async retrySubscriberProfileRequest():Promise<void> {
+    this.expireOidcIfNeeded();const snapshot=this.subscriberProfileRetry(),key=this.apiKey.trim();
+    if(!snapshot||this.subscriberProfileRetryStatus()!=='unknown'||!this.subscriberProfileRetryConfirmed||this.credentialMode!=='jwt'||!this.validJwt(key))return;
+    this.subscriberProfileRetryStatus.set('retrying');this.subscriberProfileRetryMessage.set('');
+    try {
+      const hash=await this.credentialFingerprint(key);this.expireOidcIfNeeded();if(this.apiKey.trim()!==key||hash!==snapshot.keyHash||this.subscriberEnvironment.trim()!==snapshot.environment||this.validatedOrigin()!==snapshot.origin){this.subscriberProfileRetryMessage.set('원래 토큰, 환경과 API 주소가 필요합니다.');return;}
+      const response=await fetch(`${snapshot.origin}/v1/experimental/operator/subscriber-profile-v2?${new URLSearchParams({environmentId:snapshot.environment})}`,{method:'PATCH',headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},body:JSON.stringify(snapshot.body),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
+      if(!response.ok)throw new Error('request failed');const value:unknown=await response.json();if(typeof value!=='object'||value===null||!('requestId' in value)||value.requestId!==snapshot.body.requestId||!('subscriberId' in value)||value.subscriberId!==snapshot.body.subscriberId||!('generation' in value)||value.generation!==snapshot.body.generation||!('revision' in value)||typeof value.revision!=='string'||!('changed' in value)||typeof value.changed!=='boolean'||!('replayed' in value)||typeof value.replayed!=='boolean')throw new Error('invalid response');
+      this.subscriberProfileRetryStatus.set('recorded');this.subscriberEditStatus.set('saved');this.clearSubscribers();
+    }catch{this.subscriberProfileRetryMessage.set('재제출 결과가 불명확합니다. 요청 ID로 조회하세요.');}
+    finally{this.subscriberProfileRetryConfirmed=false;if(this.subscriberProfileRetryStatus()==='retrying')this.subscriberProfileRetryStatus.set('unknown');}
+  }
   resetSubscriberEdit(clearId=false):void {
     if(this.subscriberEditStatus()==='saving')return;
     this.subscriberEditSequence++;this.subscriberEditAbort?.abort();this.subscriberEditAbort=null;
     this.subscriberEditSnapshot.set(null);this.subscriberEditStatus.set('idle');this.subscriberEditMessage.set('');this.subscriberEditProfile={firstName:'',lastName:'',email:'',phone:''};this.subscriberEditConfirmed=false;this.subscriberEditReason='';this.subscriberDeleteConfirmation='';if(clearId)this.subscriberEditId='';
   }
   async loadSubscriberEdit():Promise<void> {
-    if(this.subscriberEditStatus()==='saving'||this.createStatus()==='sending'||!['api-key','jwt'].includes(this.credentialMode))return;
+    if(this.subscriberEditStatus()==='saving'||this.subscriberProfileRetryStatus()==='retrying'||this.createStatus()==='sending'||!['api-key','jwt'].includes(this.credentialMode))return;
     this.expireOidcIfNeeded();this.resetSubscriberEdit();const sequence=this.subscriberEditSequence,id=this.subscriberEditId.trim(),key=this.apiKey.trim();
     const controller=new AbortController();this.subscriberEditAbort=controller;this.subscriberEditStatus.set('loading');
     try {
@@ -1310,7 +1356,7 @@ export class App implements OnDestroy {
     finally{if(sequence===this.subscriberEditSequence)this.subscriberEditAbort=null;}
   }
   canEditSubscriber():boolean {
-    const snapshot=this.subscriberEditSnapshot();return ['api-key','jwt'].includes(this.credentialMode)&&this.subscriberEditStatus()==='loaded'&&this.createStatus()!=='sending'&&!!snapshot&&this.subscriberEditConfirmed&&(this.credentialMode!=='jwt'||(!!this.subscriberEditReason.trim()&&new TextEncoder().encode(this.subscriberEditReason.trim()).length<=1000))&&(Object.keys(snapshot.profile) as (keyof SubscriberProfile)[]).some(k=>this.subscriberEditProfile[k]!==snapshot.profile[k]);
+    const snapshot=this.subscriberEditSnapshot();return ['api-key','jwt'].includes(this.credentialMode)&&this.subscriberEditStatus()==='loaded'&&this.createStatus()!=='sending'&&!!snapshot&&this.subscriberEditConfirmed&&(this.credentialMode!=='jwt'||this.subscriberProfileRetryStatus()==='idle')&&(this.credentialMode!=='jwt'||(!!this.subscriberEditReason.trim()&&new TextEncoder().encode(this.subscriberEditReason.trim()).length<=1000))&&(Object.keys(snapshot.profile) as (keyof SubscriberProfile)[]).some(k=>this.subscriberEditProfile[k]!==snapshot.profile[k]);
   }
   canDeleteSubscriber():boolean {
     const snapshot=this.subscriberEditSnapshot();return this.credentialMode==='api-key'&&this.subscriberEditStatus()==='loaded'&&this.createStatus()!=='sending'&&!!snapshot&&this.subscriberDeleteConfirmation===snapshot.id;
@@ -1319,17 +1365,24 @@ export class App implements OnDestroy {
     const snapshot=this.subscriberEditSnapshot();if(!snapshot||(deleting?!this.canDeleteSubscriber():!this.canEditSubscriber()))return;
     this.expireOidcIfNeeded();const key=this.apiKey.trim(),jwt=this.credentialMode==='jwt',environment=this.subscriberEnvironment.trim();let origin:string;try{origin=this.validatedOrigin();if(jwt?(!this.validJwt(key)||!this.validEnvironment(environment)):(!key||/[^\x21-\x7e]/.test(key)))throw new Error('invalid key');}catch{this.subscriberEditStatus.set('error');this.subscriberEditMessage.set('API 주소와 인증을 확인하세요.');return;}
     const profile:Record<string,string|null>={};for(const k of Object.keys(snapshot.profile) as (keyof SubscriberProfile)[])if(this.subscriberEditProfile[k]!==snapshot.profile[k])profile[k]=this.subscriberEditProfile[k]||null;
-    const body=deleting?{generation:snapshot.generation,revision:snapshot.revision}:jwt?{subscriberId:snapshot.id,generation:snapshot.generation,revision:snapshot.revision,profile,reason:this.subscriberEditReason.trim()}:{generation:snapshot.generation,revision:snapshot.revision,profile};
+    let body:object=deleting?{generation:snapshot.generation,revision:snapshot.revision}:{generation:snapshot.generation,revision:snapshot.revision,profile};
     this.subscriberEditStatus.set('saving');this.subscriberEditMessage.set('');
     try {
-      const endpoint=jwt?`/v1/experimental/operator/subscriber-profile?${new URLSearchParams({environmentId:environment})}`:`/v1/experimental/subscribers/${encodeURIComponent(snapshot.id)}`;
+      if(jwt){
+        let requestId:string,keyHash:string;try{requestId=crypto.randomUUID();keyHash=await this.credentialFingerprint(key);}catch{this.subscriberEditStatus.set('error');this.subscriberEditMessage.set('안전한 요청 정보를 만들지 못해 전송하지 않았습니다.');return;}
+        this.expireOidcIfNeeded();if(this.apiKey.trim()!==key||this.subscriberEnvironment.trim()!==environment||this.validatedOrigin()!==origin){this.subscriberEditStatus.set('error');this.subscriberEditMessage.set('인증이 변경되어 요청을 전송하지 않았습니다.');return;}
+        const request:SubscriberProfileRequestBody={requestId,subscriberId:snapshot.id,generation:snapshot.generation,revision:snapshot.revision,profile,reason:this.subscriberEditReason.trim()};body=request;
+        this.subscriberProfileRetry.set({origin,environment,keyHash,body:request});this.subscriberProfileRequestId=requestId;
+      }
+      const endpoint=jwt?`/v1/experimental/operator/subscriber-profile-v2?${new URLSearchParams({environmentId:environment})}`:`/v1/experimental/subscribers/${encodeURIComponent(snapshot.id)}`;
       const response=await fetch(`${origin}${endpoint}`,{method:deleting?'DELETE':'PATCH',headers:{Authorization:`${jwt?'Bearer':'ApiKey'} ${key}`,'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
-      if(!response.ok){if(response.status===409||response.status===404){this.subscriberEditStatus.set('conflict');this.subscriberEditMessage.set('조회한 구독자가 변경되었거나 삭제됐습니다. 다시 조회하세요.');}else if([400,401,403].includes(response.status)){this.subscriberEditStatus.set('error');this.subscriberEditMessage.set('요청이 거절됐습니다. 입력과 인증을 확인하세요.');}else{this.subscriberEditStatus.set('unknown');this.subscriberEditMessage.set('결과를 확인할 수 없습니다. 다시 조회해 상태를 확인하세요.');}return;}
+      if(!response.ok){if(jwt&&[400,401,403,404,409].includes(response.status)){this.subscriberProfileRetry.set(null);this.subscriberProfileRetryStatus.set('idle');}else if(jwt)this.subscriberProfileRetryStatus.set('unknown');if(response.status===409||response.status===404){this.subscriberEditStatus.set('conflict');this.subscriberEditMessage.set('조회한 구독자가 변경되었거나 삭제됐습니다. 다시 조회하세요.');}else if([400,401,403].includes(response.status)){this.subscriberEditStatus.set('error');this.subscriberEditMessage.set('요청이 거절됐습니다. 입력과 인증을 확인하세요.');}else{this.subscriberEditStatus.set('unknown');this.subscriberEditMessage.set('결과를 확인할 수 없습니다. 다시 조회해 상태를 확인하세요.');}return;}
       const value:unknown=await response.json();if(typeof value!=='object'||value===null)throw new Error('invalid response');
       const result=jwt?value:('data' in value&&typeof value.data==='object'&&value.data!==null?value.data:null);
-      if(!result||!('subscriberId' in result)||result.subscriberId!==snapshot.id||(deleting&&(!('deleted' in result)||result.deleted!==true))||(!deleting&&(!('generation' in result)||result.generation!==snapshot.generation||!('revision' in result)||typeof result.revision!=='string'||!/^(0|[1-9][0-9]*)$/.test(result.revision)))||(jwt&&(!('changed' in result)||typeof result.changed!=='boolean')))throw new Error('invalid response');
+      if(!result||!('subscriberId' in result)||result.subscriberId!==snapshot.id||(deleting&&(!('deleted' in result)||result.deleted!==true))||(!deleting&&(!('generation' in result)||result.generation!==snapshot.generation||!('revision' in result)||typeof result.revision!=='string'||!/^(0|[1-9][0-9]*)$/.test(result.revision)))||(jwt&&(!('changed' in result)||typeof result.changed!=='boolean'||!('replayed' in result)||typeof result.replayed!=='boolean'||!('requestId' in result)||result.requestId!==this.subscriberProfileRetry()?.body.requestId)))throw new Error('invalid response');
+      if(jwt){this.subscriberProfileRetry.set(null);this.subscriberProfileRetryStatus.set('idle');}
       this.subscriberEditStatus.set(deleting?'deleted':'saved');this.clearSubscribers();
-    }catch{this.subscriberEditStatus.set('unknown');this.subscriberEditMessage.set('결과를 확인할 수 없습니다. 다시 조회해 상태를 확인하세요.');}
+    }catch{if(jwt&&this.subscriberProfileRetry())this.subscriberProfileRetryStatus.set('unknown');this.subscriberEditStatus.set('unknown');this.subscriberEditMessage.set('결과를 확인할 수 없습니다. 다시 조회해 상태를 확인하세요.');}
     finally{this.subscriberEditConfirmed=false;this.subscriberDeleteConfirmation='';this.subscriberEditReason='';}
   }
 

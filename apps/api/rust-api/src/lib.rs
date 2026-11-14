@@ -345,6 +345,8 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/operator/workflow-grants/request", get(operator_identity::workflow_grant_request))
         .route("/v1/experimental/operator/workflow-grants/audit", get(operator_identity::workflow_grant_audit))
         .route("/v1/experimental/operator/subscriber-profile", get(operator_identity::subscriber_profile_read).patch(operator_identity::subscriber_profile_write))
+        .route("/v1/experimental/operator/subscriber-profile-v2", axum::routing::patch(operator_identity::subscriber_profile_write))
+        .route("/v1/experimental/operator/subscriber-profile-request", get(operator_identity::subscriber_profile_request))
         .route("/v1/experimental/operator/alerts/resolve", post(operator_identity::resolve))
         .route("/v1/experimental/operator/alerts/request", get(operator_identity::decision_request))
         .route("/v1/experimental/operator/permissions", get(operator_identity::permission_identity).put(operator_identity::change_permissions))

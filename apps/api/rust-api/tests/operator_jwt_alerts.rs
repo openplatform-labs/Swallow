@@ -52,6 +52,7 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_workflow_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_workflow_grant_request(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_grant_audit_read(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_subscriber_profile_read(text,text,text,text,bigint,text),public.novu_rust_operator_jwt_subscriber_profile_write(text,text,text,text,bigint,text,uuid,bigint,jsonb,text) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_subscriber_profile_write_v2(text,text,text,text,bigint,uuid,text,uuid,bigint,jsonb,text),public.novu_rust_operator_jwt_subscriber_profile_request_read(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname::text=$1",&[&role]).await.unwrap();
     db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id,alert_read) VALUES('https://issuer.test','person','console','jwt-alert-a',true),('https://issuer.test','reader','console','jwt-alert-a',false); INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state,attempt_id) SELECT 'jwt-alert-a','slack','target-'||lpad(n::text,3,'0'),'unknown',gen_random_uuid() FROM generate_series(1,101) n; INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES('jwt-alert-b','email','private','unknown')").await.unwrap();
     db.batch_execute("WITH c AS (INSERT INTO public.novu_rust_console_credentials(token_hash,environment_id,expires_at,subscriber_read) VALUES(encode(sha256(convert_to(repeat('a',64),'UTF8')),'hex'),'jwt-alert-a',clock_timestamp()+interval '1 hour',false) RETURNING credential_id) INSERT INTO public.novu_rust_console_alert_grants SELECT credential_id FROM c").await.unwrap();
@@ -223,11 +224,83 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     );
     db.batch_execute("ALTER TABLE public.novu_rust_operator_jwt_subscriber_profile_audit DROP CONSTRAINT fixture_profile_audit_failure").await.unwrap();
     assert_eq!(db.query_one("SELECT profile->>'firstName' FROM public.novu_rust_subscribers WHERE environment_id='jwt-alert-a' AND subscriber_id='profile-fixture'",&[]).await.unwrap().get::<_,String>(0),"Bob");
+    let profile_v2 = |body: Value| {
+        Request::builder()
+            .method("PATCH")
+            .uri("/v1/experimental/operator/subscriber-profile-v2?environmentId=jwt-alert-a")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let lookup = |jwt: &str, id: Uuid| {
+        Request::builder().uri(format!("/v1/experimental/operator/subscriber-profile-request?environmentId=jwt-alert-a&requestId={id}")).header(header::AUTHORIZATION,format!("Bearer {jwt}")).body(Body::empty()).unwrap()
+    };
+    let id = Uuid::new_v4();
+    let profile_request = json!({"requestId":id.to_string(),"subscriberId":"profile-fixture","generation":generation,"revision":"1","profile":{"firstName":"Carol"},"reason":"ticket"});
+    let app2 = novu_rust_api::router(Arc::new(connect(&api_url).await)).layer(Extension(Arc::new(
+        AccessTokenVerifier::new("https://issuer.test", "swallow", &[("key", PUBLIC)]).unwrap(),
+    )));
+    let (a, b) = tokio::join!(
+        app.clone().oneshot(profile_v2(profile_request.clone())),
+        app2.oneshot(profile_v2(profile_request.clone()))
+    );
+    let a = a.unwrap();
+    let b = b.unwrap();
+    assert_eq!(a.status(), StatusCode::OK);
+    assert_eq!(b.status(), StatusCode::OK);
+    let a: Value =
+        serde_json::from_slice(&a.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let b: Value =
+        serde_json::from_slice(&b.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_ne!(a["replayed"], b["replayed"]);
+    assert_eq!(a["revision"], "2");
+    assert_eq!(b["revision"], "2");
+    let response = app.clone().oneshot(lookup(&token, id)).await.unwrap();
+    let recorded: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(recorded["found"], true);
+    assert_eq!(recorded["subscriberId"], "profile-fixture");
+    assert_eq!(recorded["revision"], "2");
+    assert!(!recorded.to_string().contains("Carol"));
+    let mut other = profile_request.clone();
+    other["profile"]["firstName"] = json!("Mallory");
+    assert_eq!(
+        app.clone()
+            .oneshot(profile_v2(other))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_operator_jwt_subscriber_profile_audit WHERE subscriber_id='profile-fixture' AND reason='ticket'",&[]).await.unwrap().get::<_,i64>(0),1);
+    db.batch_execute("ALTER TABLE public.novu_rust_operator_jwt_subscriber_profile_requests ADD CONSTRAINT fixture_profile_request_failure CHECK(false) NOT VALID").await.unwrap();
+    let fail = json!({"requestId":Uuid::new_v4().to_string(),"subscriberId":"profile-fixture","generation":generation,"revision":"2","profile":{"firstName":"Rollback"},"reason":"rollback"});
+    assert_eq!(
+        app.clone()
+            .oneshot(profile_v2(fail))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    db.batch_execute("ALTER TABLE public.novu_rust_operator_jwt_subscriber_profile_requests DROP CONSTRAINT fixture_profile_request_failure").await.unwrap();
+    assert_eq!(db.query_one("SELECT profile->>'firstName' FROM public.novu_rust_subscribers WHERE subscriber_id='profile-fixture'",&[]).await.unwrap().get::<_,String>(0),"Carol");
+    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_operator_jwt_subscriber_profile_audit WHERE reason='rollback'",&[]).await.unwrap().get::<_,i64>(0),0);
     db.batch_execute("DELETE FROM public.novu_rust_operator_jwt_subscriber_profile_grants WHERE subject='person' AND permission='write'").await.unwrap();
-    let revoked = json!({"subscriberId":"profile-fixture","generation":generation,"revision":"1","profile":{"phone":"123"},"reason":"ticket"});
+    let revoked = json!({"subscriberId":"profile-fixture","generation":generation,"revision":"2","profile":{"phone":"123"},"reason":"ticket"});
     assert_eq!(
         app.clone()
             .oneshot(profile_patch(&token, revoked))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    assert_eq!(
+        app.clone()
+            .oneshot(lookup(&token, id))
             .await
             .unwrap()
             .status(),

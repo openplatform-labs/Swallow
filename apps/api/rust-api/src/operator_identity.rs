@@ -32,6 +32,7 @@ enum Lookup {
     WorkflowGrantRequest,
     WorkflowGrantAudit,
     SubscriberProfileRead,
+    SubscriberProfileRequest,
 }
 
 fn authenticate(
@@ -185,6 +186,15 @@ pub(super) async fn workflow_grant_request(
     query(db, headers, uri, verifier, Lookup::WorkflowGrantRequest).await
 }
 
+pub(super) async fn subscriber_profile_request(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::SubscriberProfileRequest).await
+}
+
 pub(super) async fn subscriber_profile_read(
     State(db): State<Arc<Client>>,
     headers: HeaderMap,
@@ -197,6 +207,7 @@ pub(super) async fn subscriber_profile_read(
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SubscriberProfileWrite {
+    request_id: Option<String>,
     subscriber_id: String,
     generation: String,
     revision: String,
@@ -257,12 +268,36 @@ pub(super) async fn subscriber_profile_write(
         return failure(StatusCode::BAD_REQUEST, uri.path());
     }
     let env = params[0].1.as_ref();
-    match db.query_one("SELECT public.novu_rust_operator_jwt_subscriber_profile_write($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&input.subscriber_id,&generation,&revision,&input.profile,&input.reason]).await {
-        Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
-        Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
-        Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
-        Err(e) if e.code().is_some_and(|c|c.code()=="P4090")=>failure(StatusCode::CONFLICT,uri.path()),
-        Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path()),
+    let v2 = uri.path().ends_with("/subscriber-profile-v2");
+    let request = match (&input.request_id, v2) {
+        (Some(value), true) => match Uuid::parse_str(value) {
+            Ok(id) => Some(id),
+            Err(_) => return failure(StatusCode::BAD_REQUEST, uri.path()),
+        },
+        (None, false) => None,
+        _ => return failure(StatusCode::BAD_REQUEST, uri.path()),
+    };
+    let result = if let Some(request) = request {
+        db.query_one("SELECT public.novu_rust_operator_jwt_subscriber_profile_write_v2($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&input.subscriber_id,&generation,&revision,&input.profile,&input.reason]).await
+    } else {
+        db.query_one("SELECT public.novu_rust_operator_jwt_subscriber_profile_write($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&input.subscriber_id,&generation,&revision,&input.profile,&input.reason]).await
+    };
+    match result {
+        Ok(row) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(row.get::<_, serde_json::Value>(0)),
+        )
+            .into_response(),
+        Err(e) if e.code().is_some_and(|c| c.code() == "42501") => {
+            failure(StatusCode::UNAUTHORIZED, uri.path())
+        }
+        Err(e) if e.code().is_some_and(|c| c.code() == "22023") => {
+            failure(StatusCode::BAD_REQUEST, uri.path())
+        }
+        Err(e) if e.code().is_some_and(|c| c.code() == "P4090") => {
+            failure(StatusCode::CONFLICT, uri.path())
+        }
+        Err(_) => failure(StatusCode::INTERNAL_SERVER_ERROR, uri.path()),
     }
 }
 
@@ -551,6 +586,7 @@ async fn query(
         Lookup::WorkflowGrantRequest => &["environmentId", "requestId"],
         Lookup::WorkflowGrantAudit => &["environmentId", "after"],
         Lookup::SubscriberProfileRead => &["environmentId", "subscriberId"],
+        Lookup::SubscriberProfileRequest => &["environmentId", "requestId"],
     };
     if params.keys().any(|key| !allowed.contains(&key.as_str()))
         || params.get("limit").is_some_and(|limit| limit != "20")
@@ -567,6 +603,15 @@ async fn query(
         return failure(StatusCode::UNAUTHORIZED, "Unauthorized", "Unauthorized");
     };
     let result = match lookup {
+        Lookup::SubscriberProfileRequest => {
+            let Some(request) = params
+                .get("requestId")
+                .and_then(|s| Uuid::parse_str(s).ok())
+            else {
+                return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+            };
+            db.query_one("SELECT public.novu_rust_operator_jwt_subscriber_profile_request_read($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request]).await
+        }
         Lookup::SubscriberProfileRead => {
             let Some(subscriber) = params.get("subscriberId").filter(|s| !s.contains('\0')) else {
                 return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");

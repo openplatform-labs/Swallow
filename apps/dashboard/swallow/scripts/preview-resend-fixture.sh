@@ -36,6 +36,7 @@ GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_write_v2(text,t
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_workflow_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_workflow_grant_request(text,text,text,text,bigint,uuid) TO ui_resend_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_grant_audit_read(text,text,text,text,bigint,uuid) TO ui_resend_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_subscriber_profile_read(text,text,text,text,bigint,text),public.novu_rust_operator_jwt_subscriber_profile_write(text,text,text,text,bigint,text,uuid,bigint,jsonb,text) TO ui_resend_fixture;
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_subscriber_profile_write_v2(text,text,text,text,bigint,uuid,text,uuid,bigint,jsonb,text),public.novu_rust_operator_jwt_subscriber_profile_request_read(text,text,text,text,bigint,uuid) TO ui_resend_fixture;
 GRANT SELECT ON public.novu_rust_users,public.novu_rust_api_keys,public.novu_rust_workflows,public.novu_rust_environments,public.novu_rust_fcm_devices TO ui_resend_fixture;
 GRANT SELECT,INSERT,UPDATE,DELETE ON public.novu_rust_subscribers TO ui_resend_fixture;
 GRANT SELECT,DELETE ON public.novu_rust_in_app_messages,public.novu_rust_subscription_preferences,public.novu_rust_email_messages,public.novu_rust_sms_messages,public.novu_rust_push_messages TO ui_resend_fixture;
