@@ -30,6 +30,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Err(std::env::VarError::NotPresent) => 30,
         Err(_) => return Err("invalid Resend database timeout".into()),
     };
+    let retry_guard = match std::env::var("NOVU_RESEND_RETRY_EVIDENCE_GUARD").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid Resend retry evidence guard setting".into()),
+    };
     let timeout = Duration::from_secs(timeout);
     loop {
         let connection = tokio::time::timeout(timeout, config.connect(tls.clone())).await;
@@ -65,7 +70,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     }
                     match tokio::time::timeout(
                         timeout,
-                        resend_queue::process_one(&mut db, &environment, &provider),
+                        resend_queue::process_one_with_retry_guard(
+                            &mut db,
+                            &environment,
+                            &provider,
+                            retry_guard,
+                        ),
                     )
                     .await
                     {

@@ -350,6 +350,8 @@ async fn scoped_email_sms_decisions_are_authorized_atomic_and_fenced() {
             .get::<_, String>(0),
             "pending"
         );
+        let prior:Option<String>=db.query_one("SELECT retry_provider_message_id FROM novu_rust_delivery_reconciliations WHERE job_id=$1 AND decision='retry'", &[&blocked]).await.unwrap().get(0);
+        assert_eq!(prior.as_deref(), Some(provider.as_str()));
     }
     // FCM target/group state is compared to the existing implementation.
     let no_function = fcm_job(

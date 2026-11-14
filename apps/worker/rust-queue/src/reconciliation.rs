@@ -580,7 +580,12 @@ pub async fn resolve(
             return Err("SMS retry refused: authenticated provider callback already exists; inspect sms-evidence".into());
         }
     }
-    tx.execute("INSERT INTO novu_rust_delivery_reconciliations(id,environment_id,job_id,target_index,decision,operator_name,reason,previous_http_status,retry_dispatch_id,database_session_user) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,session_user)",&[&Uuid::new_v4(),&environment,&job,&target,&decision,&operator,&reason,&http_status,&retry_dispatch]).await?;
+    if kind == crate::resend_queue::JOB_KIND && decision == "retry" {
+        let provider_id: Option<String> = attempt.get(2);
+        tx.execute("INSERT INTO novu_rust_delivery_reconciliations(id,environment_id,job_id,target_index,decision,operator_name,reason,previous_http_status,retry_dispatch_id,retry_provider_message_id,database_session_user) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,session_user)",&[&Uuid::new_v4(),&environment,&job,&target,&decision,&operator,&reason,&http_status,&retry_dispatch,&provider_id]).await?;
+    } else {
+        tx.execute("INSERT INTO novu_rust_delivery_reconciliations(id,environment_id,job_id,target_index,decision,operator_name,reason,previous_http_status,retry_dispatch_id,database_session_user) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,session_user)",&[&Uuid::new_v4(),&environment,&job,&target,&decision,&operator,&reason,&http_status,&retry_dispatch]).await?;
+    }
     match (kind.as_str(), target, decision) {
         (crate::resend_queue::JOB_KIND, None, "retry") => {
             tx.execute(

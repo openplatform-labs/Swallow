@@ -41,6 +41,16 @@ pub async fn process_one(
     environment: &str,
     provider: &Resend,
 ) -> Result<bool, Error> {
+    process_one_with_retry_guard(client, environment, provider, false).await
+}
+
+/// Optionally recheck known prior Resend callback evidence before retry dispatch.
+pub async fn process_one_with_retry_guard(
+    client: &mut Client,
+    environment: &str,
+    provider: &Resend,
+    retry_guard: bool,
+) -> Result<bool, Error> {
     let Some(job) = claim(client, environment).await? else {
         return Ok(false);
     };
@@ -57,6 +67,19 @@ pub async fn process_one(
     if !live(&tx, &job).await? {
         tx.rollback().await?;
         return Ok(true);
+    }
+    if retry_guard {
+        let evidence = tx.query_opt("SELECT r.retry_provider_message_id FROM (SELECT retry_provider_message_id FROM novu_rust_delivery_reconciliations WHERE environment_id=$1 AND job_id=$2 AND target_index IS NULL AND decision='retry' ORDER BY decision_order DESC LIMIT 1) r WHERE r.retry_provider_message_id IS NOT NULL AND r.retry_provider_message_id<>'' AND EXISTS(SELECT 1 FROM novu_rust_resend_delivery_events e WHERE e.environment_id=$1 AND e.email_id=r.retry_provider_message_id)", &[&environment,&job.id]).await?;
+        if let Some(evidence) = evidence {
+            let provider_id: String = evidence.get(0);
+            let inserted = tx.execute("INSERT INTO novu_rust_resend_attempts(job_id,environment_id,state,provider_message_id) VALUES ($1,$2,'unknown',$3) ON CONFLICT(job_id) DO NOTHING", &[&job.id,&environment,&provider_id]).await?;
+            if inserted == 1 {
+                tx.execute("UPDATE novu_rust_email_messages SET delivery_state='unknown',status='error',error_id='mail_unexpected_error',error_text='Resend retry blocked by provider callback',resend_delivery_result=NULL WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
+            }
+            tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='Resend retry blocked by provider callback',lease_token=NULL,lease_until=NULL,resend_delivery_result=NULL WHERE id=$1 AND environment_id=$2", &[&job.id,&environment]).await?;
+            tx.commit().await?;
+            return Ok(true);
+        }
     }
     if !crate::sendgrid_queue::prepare_workflow_email(
         &tx,
@@ -501,6 +524,136 @@ mod tests {
         assert_eq!(row.get::<_, String>(0), "failed");
         assert_eq!(row.get::<_, String>(1), "subscriber identity changed");
         assert_eq!(row.get::<_, i64>(2), 0);
+
+        // Callback arriving after operator retry must be checked again before send.
+        let guarded = Uuid::new_v4();
+        enqueue(
+            &db,
+            guarded,
+            "env-a",
+            JOB_KIND,
+            &json!({"to":["to@example.test"],"subject":"Guard","html":"Hi"}),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "UPDATE novu_queue_jobs SET status='failed' WHERE id=$1",
+            &[&guarded],
+        )
+        .await
+        .unwrap();
+        db.execute("INSERT INTO novu_rust_resend_attempts(job_id,environment_id,state,provider_message_id) VALUES ($1,'env-a','unknown','prior-provider-id')", &[&guarded]).await.unwrap();
+        db.execute("INSERT INTO novu_rust_email_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,subject,status,email_job_id,delivery_state) VALUES ($1,'env-a','s','s','n','w','t','subject','error',$2,'unknown')", &[&guarded.to_string(),&guarded]).await.unwrap();
+        db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'env-a',session_user,'retry',oid FROM pg_roles WHERE rolname=session_user", &[]).await.unwrap();
+        crate::reconciliation::resolve(
+            &mut db, "env-a", guarded, None, "retry", "operator", "ticket",
+        )
+        .await
+        .unwrap();
+        db.execute("INSERT INTO novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type) VALUES ('env-a','late-event','prior-provider-id','email.delivered')", &[]).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider = Resend::test_endpoint(
+            Config {
+                api_key: "re_test".into(),
+                from: "from@example.test".into(),
+                sender_name: String::new(),
+            },
+            &format!("http://{}/emails", listener.local_addr().unwrap()),
+        )
+        .unwrap();
+        assert!(
+            process_one_with_retry_guard(&mut db, "env-a", &provider, true)
+                .await
+                .unwrap()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
+        let result=db.query_one("SELECT j.status,j.last_error,a.state,a.provider_message_id,m.delivery_state FROM novu_queue_jobs j JOIN novu_rust_resend_attempts a ON a.job_id=j.id JOIN novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1", &[&guarded]).await.unwrap();
+        assert_eq!(result.get::<_, String>(0), "failed");
+        assert_eq!(
+            result.get::<_, String>(1),
+            "Resend retry blocked by provider callback"
+        );
+        assert_eq!(result.get::<_, String>(2), "unknown");
+        assert_eq!(result.get::<_, String>(3), "prior-provider-id");
+        assert_eq!(result.get::<_, String>(4), "unknown");
+
+        // The legacy policy remains selectable; use only a local mock endpoint.
+        let unguarded = Uuid::new_v4();
+        enqueue(
+            &db,
+            unguarded,
+            "env-a",
+            JOB_KIND,
+            &json!({"to":["to@example.test"],"subject":"Unguarded","html":"Hi"}),
+        )
+        .await
+        .unwrap();
+        db.execute("INSERT INTO novu_rust_delivery_reconciliations(id,environment_id,job_id,decision,operator_name,reason,retry_provider_message_id) VALUES ($1,'env-a',$2,'retry','operator','test','prior-provider-id')", &[&Uuid::new_v4(),&unguarded]).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider = Resend::test_endpoint(
+            Config {
+                api_key: "re_test".into(),
+                from: "from@example.test".into(),
+                sender_name: String::new(),
+            },
+            &format!("http://{}/emails", listener.local_addr().unwrap()),
+        )
+        .unwrap();
+        let mock = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut buf = [0; 4096];
+            loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buf[..n]);
+                if let Some(pos) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..pos]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .and_then(|v| v.parse::<usize>().ok())
+                        })
+                        .unwrap();
+                    if bytes.len() >= pos + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let body = "{\"id\":\"mock-accepted\"}";
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        assert!(
+            process_one_with_retry_guard(&mut db, "env-a", &provider, false)
+                .await
+                .unwrap()
+        );
+        mock.await.unwrap();
+        assert_eq!(
+            db.query_one(
+                "SELECT status FROM novu_queue_jobs WHERE id=$1",
+                &[&unguarded]
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+            "completed"
+        );
     }
 
     #[tokio::test]

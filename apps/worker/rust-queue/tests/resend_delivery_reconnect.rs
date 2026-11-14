@@ -65,6 +65,22 @@ fn invalid_timeout_is_rejected_before_connecting() {
     }
 }
 
+#[test]
+fn invalid_retry_guard_is_rejected_before_connecting() {
+    let output = Command::new(env!("CARGO_BIN_EXE_resend-worker"))
+        .env("DATABASE_URL", "postgresql://localhost/unused")
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .env("NOVU_RESEND_ENVIRONMENT_ID", "env")
+        .env("NOVU_RESEND_API_KEY", "fixture-token")
+        .env("NOVU_RESEND_FROM", "from@example.test")
+        .env_remove("NOVU_RESEND_API_KEY_FILE")
+        .env("NOVU_RESEND_RETRY_EVIDENCE_GUARD", "invalid")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture-token"));
+}
+
 #[tokio::test]
 #[ignore = "restarts a disposable PostgreSQL container"]
 async fn workers_reconnect_and_preserve_uncertain_attempts() {

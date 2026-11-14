@@ -75,6 +75,7 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
         .get(0);
     assert_eq!(old_hash, None);
     // The new migration must preserve old decisions and be safely re-runnable.
+    db.batch_execute("ALTER TABLE novu_rust_delivery_reconciliations ADD COLUMN IF NOT EXISTS retry_provider_message_id text").await.unwrap();
     let legacy_job = Uuid::new_v4();
     queue::enqueue(
         &db,
