@@ -30,6 +30,7 @@ enum Lookup {
     WorkflowRequest,
     WorkflowGrantRead,
     WorkflowGrantRequest,
+    WorkflowGrantAudit,
 }
 
 fn authenticate(
@@ -181,6 +182,15 @@ pub(super) async fn workflow_grant_request(
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
 ) -> Response {
     query(db, headers, uri, verifier, Lookup::WorkflowGrantRequest).await
+}
+
+pub(super) async fn workflow_grant_audit(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::WorkflowGrantAudit).await
 }
 
 #[derive(serde::Deserialize)]
@@ -457,6 +467,7 @@ async fn query(
             "permission",
         ],
         Lookup::WorkflowGrantRequest => &["environmentId", "requestId"],
+        Lookup::WorkflowGrantAudit => &["environmentId", "after"],
     };
     if params.keys().any(|key| !allowed.contains(&key.as_str()))
         || params.get("limit").is_some_and(|limit| limit != "20")
@@ -473,6 +484,29 @@ async fn query(
         return failure(StatusCode::UNAUTHORIZED, "Unauthorized", "Unauthorized");
     };
     let result = match lookup {
+        Lookup::WorkflowGrantAudit => {
+            let after = match params.get("after") {
+                Some(value) => match Uuid::parse_str(value) {
+                    Ok(id) => Some(id),
+                    Err(_) => {
+                        return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+                    }
+                },
+                None => None,
+            };
+            db.query_one(
+                "SELECT public.novu_rust_operator_jwt_workflow_grant_audit_read($1,$2,$3,$4,$5,$6)",
+                &[
+                    &identity.issuer,
+                    &identity.subject,
+                    &identity.client_id,
+                    &env,
+                    &exp,
+                    &after,
+                ],
+            )
+            .await
+        }
         Lookup::WorkflowGrantRead => {
             let (Some(issuer), Some(subject), Some(client), Some(resource), Some(permission)) = (
                 params.get("targetIssuer"),

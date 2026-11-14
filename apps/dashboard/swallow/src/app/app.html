@@ -334,6 +334,17 @@
           @else if(grantRequestStatus() === 'error'){<p class="subscriber-error" role="alert">조회하지 못했습니다. 인증, 위임 변경 권한과 요청 ID를 확인하세요.</p>}
           @else if(grantRequestRecord(); as request){<p role="status">기록됨: {{ request.requestId }} · {{ request.createdAt }}<br>대상: {{ request.targetIssuer }} · {{ request.targetSubject }} · {{ request.targetClientId }}<br>{{ request.resource }} / {{ request.permission }}: {{ request.expected ? '허용' : '없음' }} → {{ request.desired ? '허용' : '없음' }}<br>사유: {{ request.reason }}<br>{{ request.changed ? '권한 변경됨' : '변경 없음' }}</p><p>보관한 원래 요청의 내용을 비교하세요.</p>}
         </div></section>
+        <section class="card decision-card"><div class="card-block"><div class="card-eyebrow">WORKFLOW GRANT AUDIT</div><h2>워크플로 권한 위임 이력</h2>
+          <p>별도의 위임 이력 조회 권한이 필요합니다. UUID 순으로 조회하므로 시간 순서가 아니며 페이지마다 조회 시점이 다릅니다.</p>
+          <button type="button" class="btn btn-outline" [disabled]="grantAuditStatus() === 'loading' || grantChangeStatus() === 'sending' || permissionChangeStatus() === 'sending'" (click)="loadGrantAudit()">위임 이력 조회</button>
+          @if(grantAuditStatus() === 'loading'){<p role="status">조회 중입니다.</p>}
+          @else if(grantAuditStatus() === 'error'){<p class="subscriber-error" role="alert">조회하지 못했습니다. 인증과 별도 위임 이력 조회 권한을 확인하세요.</p>}
+          @else if(grantAuditStatus() === 'loaded'){
+            @if(grantAuditRows().length === 0){<p>조회된 이력이 없습니다.</p>}
+            @else {<div class="table-wrap"><table class="table"><thead><tr><th>기록</th><th>변경자</th><th>대상</th><th>권한</th><th>사유</th></tr></thead><tbody>@for(row of grantAuditRows();track row.id){<tr><td>{{ row.recordedAt }}<br>요청: {{ row.requestId }}<br>기록: {{ row.id }}</td><td>{{ row.actorIssuer }}<br>{{ row.actorSubject }} · {{ row.actorClientId }}<br>DB: {{ row.databasePrincipal }}</td><td>{{ row.targetIssuer }}<br>{{ row.targetSubject }} · {{ row.targetClientId }}</td><td>{{ row.resource }} / {{ row.permission }}<br>{{ row.previous ? '허용' : '없음' }} → {{ row.current ? '허용' : '없음' }}</td><td>{{ row.reason }}</td></tr>}</tbody></table></div>}
+            <p>{{ grantAuditPage() }} 페이지</p><button type="button" class="btn btn-sm btn-outline" [disabled]="grantAuditPage() <= 1" (click)="loadGrantAudit('previous')">이전</button><button type="button" class="btn btn-sm btn-outline" [disabled]="!grantAuditNext()" (click)="loadGrantAudit('next')">다음</button>
+          }
+        </div></section>
         <section class="card decision-card"><div class="card-block"><div class="card-eyebrow">AUDIT</div><h2>권한 변경 이력</h2><p>페이지마다 조회 시점이 다르며 기록 ID 순서는 커밋 순서를 보장하지 않습니다.</p>
           <button type="button" class="btn btn-outline" [disabled]="permissionStatus() === 'loading' || (permissionChangeStatus() === 'sending' || grantChangeStatus() === 'sending')" (click)="loadPermissions('audit')">최근 이력 조회</button>
           @if (permissionStatus() === 'audit') {

@@ -21,6 +21,7 @@ type PermissionFlags = { enabled:boolean; subscriberRead:boolean; alertRead:bool
 type PermissionChange = { origin:string; environment:string; keyHash:string; body:{ requestId:string; targetIssuer:string; targetSubject:string; targetClientId:string; expected:PermissionFlags|null; desired:PermissionFlags; reason:string } };
 type GrantBody = {requestId:string;targetIssuer:string;targetSubject:string;targetClientId:string;resource:string;permission:string;expected:boolean;desired:boolean;reason:string};
 type GrantSnapshot = {origin:string;environment:string;keyHash:string;body:GrantBody};
+type GrantAudit = {id:string;actorIssuer:string;actorSubject:string;actorClientId:string;databasePrincipal:string;requestId:string;targetIssuer:string;targetSubject:string;targetClientId:string;resource:string;permission:string;previous:boolean;current:boolean;reason:string;recordedAt:string};
 type GrantRecord = GrantBody & {changed:boolean;createdAt:string};
 type PermissionRequestRecord = {requestId:string; targetIssuer:string; targetSubject:string; targetClientId:string; expected:PermissionFlags|null; desired:PermissionFlags; reason:string; changed:boolean; createdAt:string};
 type PermissionAudit = { id:string; recordedAt:string; issuer:string; subject:string; clientId:string; actor:string; jwtIssuer:string|null; jwtSubject:string|null; jwtClientId:string|null; requestId:string|null; reason:string; previous:string; current:string };
@@ -204,6 +205,13 @@ export class App implements OnDestroy {
   readonly grantChange=signal<GrantSnapshot|null>(null);
   readonly grantChanged=signal<boolean|null>(null);
   readonly grantMessage=signal('');
+  readonly grantAuditStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');
+  readonly grantAuditRows=signal<GrantAudit[]>([]);
+  readonly grantAuditNext=signal<string|null>(null);
+  readonly grantAuditPage=signal(1);
+  private grantAuditHistory:(string|null)[]=[null];
+  private grantAuditSequence=0;
+  private grantAuditAbort:AbortController|null=null;
   grantRequestId='';
   readonly grantRequestStatus=signal<'idle'|'loading'|'found'|'missing'|'error'>('idle');
   readonly grantRequestRecord=signal<GrantRecord|null>(null);
@@ -321,7 +329,7 @@ export class App implements OnDestroy {
     this.permissionSequence++;this.permissionAbort?.abort();this.permissionAbort=null;
     this.permissionStatus.set('idle');this.permissionIdentity.set(null);this.permissionAudit.set([]);this.permissionNext.set(null);
     this.clearPermissionRequest(clearKey);
-    this.clearGrantRead();this.clearGrantRequest(clearKey);
+    this.clearGrantRead();this.clearGrantRequest(clearKey);this.clearGrantAudit();
     if (clearKey) this.permissionKey='';
   }
 
@@ -352,6 +360,35 @@ export class App implements OnDestroy {
     finally {if(sequence===this.permissionRequestSequence)this.permissionRequestAbort=null;}
   }
 
+  clearGrantAudit():void {
+    this.grantAuditSequence++;this.grantAuditAbort?.abort();this.grantAuditAbort=null;this.grantAuditRows.set([]);this.grantAuditNext.set(null);this.grantAuditPage.set(1);this.grantAuditHistory=[null];this.grantAuditStatus.set('idle');
+  }
+  async loadGrantAudit(direction?:'next'|'previous'):Promise<void> {
+    this.expireOidcIfNeeded();if(this.grantChangeStatus()==='sending'||this.permissionChangeStatus()==='sending')return;
+    if(direction==='previous'&&this.grantAuditPage()<=1)return;
+    const cursor=direction==='next'?this.grantAuditNext():direction==='previous'?this.grantAuditHistory[this.grantAuditPage()-2]:null;
+    if((direction==='next'&&!cursor)||cursor===undefined)return;
+    const page=direction==='next'?this.grantAuditPage()+1:direction==='previous'?this.grantAuditPage()-1:1;
+    const sequence=++this.grantAuditSequence;this.grantAuditAbort?.abort();const controller=new AbortController();this.grantAuditAbort=controller;this.grantAuditRows.set([]);this.grantAuditNext.set(null);this.grantAuditStatus.set('loading');
+    try {
+      const key=this.permissionKey.trim(),environment=this.permissionEnvironment.trim();if(!this.validJwt(key)||!this.validEnvironment(environment))throw new Error('invalid input');
+      const params=new URLSearchParams({environmentId:environment});if(cursor)params.set('after',cursor);
+      const response=await fetch(`${this.validatedOrigin()}/v1/experimental/operator/workflow-grants/audit?${params}`,{headers:{Authorization:`Bearer ${key}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      if(!response.ok)throw new Error('request failed');const value:unknown=await response.json();
+      if(typeof value!=='object'||value===null)throw new Error('invalid response');const result=value as Record<string,unknown>;
+      if(!Array.isArray(result['data'])||result['data'].length>50||typeof result['hasMore']!=='boolean'||!(result['next']===null||typeof result['next']==='string'))throw new Error('invalid response');
+      const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      const rows:GrantAudit[]=result['data'].map((entry:unknown)=>{
+        if(typeof entry!=='object'||entry===null)throw new Error('invalid row');const r=entry as Record<string,unknown>;
+        if(['id','actorIssuer','actorSubject','actorClientId','databasePrincipal','requestId','targetIssuer','targetSubject','targetClientId','resource','permission','reason','recordedAt'].some(k=>typeof r[k]!=='string')||!uuid.test(r['id'] as string)||!uuid.test(r['requestId'] as string)||typeof r['previous']!=='boolean'||typeof r['current']!=='boolean'||!(/^(email|sms|push|slack|email-provider):(read|write)$/.test(`${r['resource']}:${r['permission']}`)||`${r['resource']}:${r['permission']}`==='audit:read'))throw new Error('invalid row');
+        return {id:r['id'] as string,actorIssuer:r['actorIssuer'] as string,actorSubject:r['actorSubject'] as string,actorClientId:r['actorClientId'] as string,databasePrincipal:r['databasePrincipal'] as string,requestId:r['requestId'] as string,targetIssuer:r['targetIssuer'] as string,targetSubject:r['targetSubject'] as string,targetClientId:r['targetClientId'] as string,resource:r['resource'] as string,permission:r['permission'] as string,previous:r['previous'],current:r['current'],reason:r['reason'] as string,recordedAt:r['recordedAt'] as string};
+      });
+      const ids=rows.map(r=>r.id.toLowerCase());if(ids.some((id,i)=>(i>0&&ids[i-1]>=id)||(!!cursor&&id<=cursor.toLowerCase()))||(result['hasMore']?rows.length!==50||typeof result['next']!=='string'||result['next'].toLowerCase()!==ids[ids.length-1]:result['next']!==null))throw new Error('invalid page');
+      this.expireOidcIfNeeded();if(sequence!==this.grantAuditSequence)return;
+      this.grantAuditRows.set(rows);this.grantAuditNext.set(result['next'] as string|null);this.grantAuditPage.set(page);this.grantAuditHistory=this.grantAuditHistory.slice(0,page-1);this.grantAuditHistory.push(cursor);this.grantAuditStatus.set('loaded');
+    }catch{this.expireOidcIfNeeded();if(sequence===this.grantAuditSequence)this.grantAuditStatus.set('error');}
+    finally{if(sequence===this.grantAuditSequence)this.grantAuditAbort=null;}
+  }
   clearGrantRead():void {
     this.grantSequence++;this.grantAbort?.abort();this.grantAbort=null;
     this.grantStatus.set('idle');this.grantValue.set(null);this.grantConfirmed=false;

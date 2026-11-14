@@ -6,6 +6,16 @@ import { OperatorOidc } from './operator-oidc';
 describe('Swallow console', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
+  it('pages delegated grant audit with separate credentials and clears it when credentials change', async () => {
+    const row=(n:number)=>({id:`00000000-0000-0000-0000-${n.toString().padStart(12,'0')}`,actorIssuer:'issuer',actorSubject:'alice',actorClientId:'console',databasePrincipal:'api',requestId:'11111111-1111-1111-1111-111111111111',targetIssuer:'issuer',targetSubject:'bob',targetClientId:'console',resource:'email',permission:'read',previous:false,current:true,reason:'ticket',recordedAt:'today',secret:'discard'});
+    const first=Array.from({length:50},(_,i)=>row(i+1)),second=[row(51)];const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:first,hasMore:true,next:first[49].id}))).mockResolvedValueOnce(new Response(JSON.stringify({data:second,hasMore:false,next:null}))).mockResolvedValueOnce(new Response(JSON.stringify({data:first,hasMore:true,next:first[49].id})));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('settings');app.permissionEnvironment='env-a';app.permissionKey='aaa.bbb.ccc';await app.loadGrantAudit();expect(app.grantAuditRows().length).toBe(50);expect(JSON.stringify(app.grantAuditRows())).not.toContain('discard');await app.loadGrantAudit('next');expect(app.grantAuditPage()).toBe(2);expect(new URL(mock.mock.calls[1][0] as string).searchParams.get('after')).toBe(first[49].id);await app.loadGrantAudit('previous');expect(app.grantAuditPage()).toBe(1);app.permissionKey='different.token.value';app.clearPermissions();expect(app.grantAuditRows()).toEqual([]);expect(app.grantAuditStatus()).toBe('idle');
+  });
+  it('discards a delayed audit response after credentials change and rejects unauthorized access', async () => {
+    let finish!:(response:Response)=>void;vi.spyOn(globalThis,'fetch').mockReturnValueOnce(new Promise(done=>finish=done)).mockResolvedValueOnce(new Response('',{status:401}));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('settings');app.permissionEnvironment='env-a';app.permissionKey='aaa.bbb.ccc';const pending=app.loadGrantAudit();app.permissionKey='other.token.value';app.clearPermissions();finish(new Response(JSON.stringify({data:[],hasMore:false,next:null})));await pending;expect(app.grantAuditStatus()).toBe('idle');await app.loadGrantAudit();expect(app.grantAuditStatus()).toBe('error');expect(app.grantAuditRows()).toEqual([]);
+  });
+
   it('reads and changes a delegated workflow grant with an expected state and reason', async () => {
     const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({targetExists:true,granted:false}))).mockImplementationOnce(async (_url,init)=>new Response(JSON.stringify({changed:true,replayed:false,requestId:JSON.parse(init?.body as string).requestId})));
     const app=TestBed.createComponent(App).componentInstance;app.setSection('settings');app.permissionEnvironment='env-a';app.permissionKey='aaa.bbb.ccc';app.permissionIssuer='https://issuer.test';app.permissionSubject='alice';app.permissionClient='console';app.grantKind='sms:write';
