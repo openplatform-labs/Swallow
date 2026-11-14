@@ -11,6 +11,8 @@ type DecisionHistory = { id: string; decision: string; reason: string; createdAt
 type DecisionRequest = { requestId: string; channel: string; targetId: string; attemptId: string; decision: string; reason: string; createdAt: string };
 type RetrySnapshot = { origin: string; endpoint: string; scheme: 'Bearer' | 'SwallowConsole'; requestId: string; channel: string; targetId: string; attemptId: string; decision: string; reason: string; keyHash: string };
 type PermissionIdentity = { issuer:string; subject:string; clientId:string; enabled:boolean; subscriberRead:boolean; alertRead:boolean; alertRetry:boolean; alertAccepted:boolean };
+type PermissionFlags = { enabled:boolean; subscriberRead:boolean; alertRead:boolean; alertRetry:boolean; alertAccepted:boolean };
+type PermissionChange = { origin:string; environment:string; keyHash:string; body:{ requestId:string; targetIssuer:string; targetSubject:string; targetClientId:string; expected:PermissionFlags|null; desired:PermissionFlags; reason:string } };
 type PermissionAudit = { id:string; recordedAt:string; issuer:string; subject:string; clientId:string; actor:string; jwtIssuer:string|null; jwtSubject:string|null; jwtClientId:string|null; requestId:string|null; reason:string; previous:string; current:string };
 type Section = 'overview' | 'workflows' | 'subscribers' | 'channels' | 'activity' | 'alerts' | 'settings';
 
@@ -109,6 +111,14 @@ export class App implements OnDestroy {
   readonly permissionNext = signal<string|null>(null);
   private permissionSequence = 0;
   private permissionAbort: AbortController|null = null;
+  permissionDesired:PermissionFlags = {enabled:false,subscriberRead:false,alertRead:false,alertRetry:false,alertAccepted:false};
+  permissionReason = '';
+  permissionConfirmed = false;
+  permissionRecoveryConfirmed = false;
+  readonly permissionChangeStatus=signal<'idle'|'sending'|'recorded'|'rejected'|'unknown'|'unavailable'>('idle');
+  readonly permissionChange=signal<PermissionChange|null>(null);
+  readonly permissionChangeChanged=signal<boolean|null>(null);
+  readonly permissionChangeMessage=signal('');
 
   ngOnDestroy(): void {
     this.oidcSequence++;
@@ -140,7 +150,7 @@ export class App implements OnDestroy {
   }
 
   resetOidc(): void {
-    if (this.decisionStatus() === 'sending') return;
+    if (this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending') return;
     if (this.oidcExpiryTimer !== null) clearTimeout(this.oidcExpiryTimer);
     this.oidcExpiryTimer=null;
     this.oidcSequence++; this.oidcPrepared = null; this.oidcSession = null;
@@ -191,7 +201,7 @@ export class App implements OnDestroy {
 
   useOidcForPermissions(): void {
     this.expireOidcIfNeeded();
-    if (!this.oidcSession || this.decisionStatus()==='sending') return;
+    if (!this.oidcSession || this.decisionStatus()==='sending' || this.permissionChangeStatus()==='sending') return;
     const session=this.oidcSession;
     this.clearPermissions(true);this.permissionEnvironment=session.environmentId;this.permissionKey=session.token;
   }
@@ -203,6 +213,7 @@ export class App implements OnDestroy {
   }
 
   async loadPermissions(mode:'identity'|'audit', next=false): Promise<void> {
+    if(this.permissionChangeStatus()==='sending')return;
     this.expireOidcIfNeeded();
     const cursor=next ? this.permissionNext() : null;
     if (next && (!cursor || mode!=='audit')) return;
@@ -224,12 +235,13 @@ export class App implements OnDestroy {
       if (typeof body!=='object'||body===null) throw new Error('invalid response');
       if (mode==='identity') {
         if (!('found' in body)||typeof body.found!=='boolean') throw new Error('invalid response');
-        if (!body.found) {if(sequence===this.permissionSequence)this.permissionStatus.set('missing');return;}
+        if (!body.found) {if(sequence===this.permissionSequence){this.permissionDesired={enabled:false,subscriberRead:false,alertRead:false,alertRetry:false,alertAccepted:false};this.permissionStatus.set('missing');}return;}
         if (!('identity' in body)||typeof body.identity!=='object'||body.identity===null) throw new Error('invalid response');
         const i=body.identity as Record<string,unknown>;
         if (i['issuer']!==this.permissionIssuer.trim()||i['subject']!==this.permissionSubject.trim()||i['client_id']!==this.permissionClient.trim()||i['environment_id']!==env || ['enabled','subscriber_read','alert_read','alert_retry','alert_accepted'].some(k=>typeof i[k]!=='boolean')) throw new Error('invalid response');
         if(sequence!==this.permissionSequence)return;
-        this.permissionIdentity.set({issuer:i['issuer'] as string,subject:i['subject'] as string,clientId:i['client_id'] as string,enabled:i['enabled'] as boolean,subscriberRead:i['subscriber_read'] as boolean,alertRead:i['alert_read'] as boolean,alertRetry:i['alert_retry'] as boolean,alertAccepted:i['alert_accepted'] as boolean});this.permissionStatus.set('identity');
+        this.permissionIdentity.set({issuer:i['issuer'] as string,subject:i['subject'] as string,clientId:i['client_id'] as string,enabled:i['enabled'] as boolean,subscriberRead:i['subscriber_read'] as boolean,alertRead:i['alert_read'] as boolean,alertRetry:i['alert_retry'] as boolean,alertAccepted:i['alert_accepted'] as boolean});
+        this.permissionDesired={enabled:i['enabled'] as boolean,subscriberRead:i['subscriber_read'] as boolean,alertRead:i['alert_read'] as boolean,alertRetry:i['alert_retry'] as boolean,alertAccepted:i['alert_accepted'] as boolean};this.permissionStatus.set('identity');
       } else {
         if (!('data' in body)||!Array.isArray(body.data)||body.data.length>50||!('next' in body)||!(body.next===null||(typeof body.next==='string'&&/^[1-9]\d*$/.test(body.next)))) throw new Error('invalid response');
         const rows:PermissionAudit[]=body.data.map((row:unknown)=>{
@@ -243,6 +255,62 @@ export class App implements OnDestroy {
       }
     } catch {if(sequence===this.permissionSequence)this.permissionStatus.set('error');}
     finally {if(sequence===this.permissionSequence)this.permissionAbort=null;}
+  }
+
+  clearPermissionChange(): void {
+    if(this.permissionChangeStatus()==='sending')return;
+    this.permissionChange.set(null);this.permissionChangeStatus.set('idle');this.permissionChangeChanged.set(null);this.permissionChangeMessage.set('');this.permissionReason='';this.permissionConfirmed=false;this.permissionRecoveryConfirmed=false;
+  }
+
+  canChangePermissions(): boolean {
+    const reason=this.permissionReason.trim();
+    return this.permissionChangeStatus()==='idle' && (this.permissionStatus()==='identity'||this.permissionStatus()==='missing') && this.permissionConfirmed && this.validJwt(this.permissionKey.trim()) && this.validEnvironment(this.permissionEnvironment.trim()) && !!reason && new TextEncoder().encode(reason).length<=1000;
+  }
+
+  async changePermissions(): Promise<void> {
+    this.expireOidcIfNeeded();if(!this.canChangePermissions())return;
+    const identity=this.permissionIdentity();const key=this.permissionKey.trim();let origin:string;let requestId:string;
+    try {origin=this.validatedOrigin();requestId=crypto.randomUUID();} catch {this.permissionChangeStatus.set('unavailable');return;}
+    const expected:PermissionFlags|null=identity?{enabled:identity.enabled,subscriberRead:identity.subscriberRead,alertRead:identity.alertRead,alertRetry:identity.alertRetry,alertAccepted:identity.alertAccepted}:null;
+    const body={requestId,targetIssuer:this.permissionIssuer.trim(),targetSubject:this.permissionSubject.trim(),targetClientId:this.permissionClient.trim(),expected,desired:{...this.permissionDesired},reason:this.permissionReason.trim()};
+    this.permissionChangeStatus.set('sending');this.permissionChangeMessage.set('');
+    try {
+      let keyHash:string;try {keyHash=await this.credentialFingerprint(key);} catch {this.permissionChangeStatus.set('unavailable');return;}
+      const snapshot={origin,environment:this.permissionEnvironment.trim(),keyHash,body};this.permissionChange.set(snapshot);
+      const response=await fetch(`${origin}/v1/experimental/operator/permissions?${new URLSearchParams({environmentId:snapshot.environment})}`,{method:'PUT',headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
+      if(!response.ok){this.permissionChangeStatus.set([400,401,403].includes(response.status)?'rejected':'unknown');return;}
+      const result:unknown=await response.json();if(typeof result!=='object'||result===null||!('changed' in result)||typeof result.changed!=='boolean'||!('replayed' in result)||typeof result.replayed!=='boolean')throw new Error('invalid response');
+      this.permissionChangeChanged.set(result.changed);this.permissionChangeStatus.set('recorded');
+    } catch {this.permissionChangeStatus.set('unknown');}
+    finally {this.permissionReason='';this.permissionConfirmed=false;this.clearPermissions();}
+  }
+
+  async recoverPermissionChange(mode:'lookup'|'retry'): Promise<void> {
+    this.expireOidcIfNeeded();const snapshot=this.permissionChange(), key=this.permissionKey.trim();
+    if(!snapshot||this.permissionChangeStatus()!=='unknown'||!this.validJwt(key)||(mode==='retry'&&!this.permissionRecoveryConfirmed))return;
+    this.permissionChangeStatus.set('sending');this.permissionChangeMessage.set('');
+    try {
+      if(this.validatedOrigin()!==snapshot.origin || this.permissionEnvironment.trim()!==snapshot.environment || await this.credentialFingerprint(key)!==snapshot.keyHash) {this.permissionChangeMessage.set('원래 요청과 같은 인증, 환경 및 API 주소가 필요합니다.');return;}
+      const params=new URLSearchParams({environmentId:snapshot.environment});
+      if(mode==='lookup')params.set('requestId',snapshot.body.requestId);
+      const response=await fetch(`${snapshot.origin}/v1/experimental/operator/permissions${mode==='lookup'?'/request':''}?${params}`,{method:mode==='lookup'?'GET':'PUT',headers:mode==='lookup'?{Authorization:`Bearer ${key}`}:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},...(mode==='retry'?{body:JSON.stringify(snapshot.body)}:{}),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
+      if(!response.ok)throw new Error('unavailable');
+      const result:unknown=await response.json();if(typeof result!=='object'||result===null)throw new Error('invalid response');
+      if(mode==='lookup') {
+        if(!('found' in result)||typeof result.found!=='boolean')throw new Error('invalid response');
+        if(!result.found){this.permissionChangeMessage.set('기록을 찾지 못했습니다. 원래 요청이 진행 중일 수 있으므로 실패로 단정하지 마세요.');return;}
+        if(!('requestId' in result)||result.requestId!==snapshot.body.requestId||!('targetIssuer' in result)||result.targetIssuer!==snapshot.body.targetIssuer||!('targetSubject' in result)||result.targetSubject!==snapshot.body.targetSubject||!('targetClientId' in result)||result.targetClientId!==snapshot.body.targetClientId||!('reason' in result)||result.reason!==snapshot.body.reason||!('expected' in result)||!this.samePermissionFlags(result.expected,snapshot.body.expected)||!('desired' in result)||!this.samePermissionFlags(result.desired,snapshot.body.desired)||!('changed' in result)||typeof result.changed!=='boolean')throw new Error('invalid response');
+      } else if(!('changed' in result)||typeof result.changed!=='boolean'||!('replayed' in result)||typeof result.replayed!=='boolean')throw new Error('invalid response');
+      this.permissionChangeChanged.set(result.changed as boolean);this.permissionChangeStatus.set('recorded');
+    } catch {this.permissionChangeMessage.set('결과가 여전히 불명확합니다. 원래 요청과 감사 기록을 확인하세요.');}
+    finally {this.permissionRecoveryConfirmed=false;if(this.permissionChangeStatus()==='sending')this.permissionChangeStatus.set('unknown');}
+  }
+
+  private samePermissionFlags(value:unknown,expected:PermissionFlags|null):boolean {
+    if(expected===null)return value===null;
+    if(typeof value!=='object'||value===null)return false;
+    const candidate=value as Record<string,unknown>;
+    return (Object.keys(expected) as (keyof PermissionFlags)[]).every(key=>candidate[key]===expected[key]);
   }
 
   private validJwt(key: string): boolean {
@@ -260,10 +328,10 @@ export class App implements OnDestroy {
   }
 
   setSection(next: Section): void {
-    if (this.decisionStatus() === 'sending') return;
+    if (this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending') return;
     if (this.section() === 'subscribers' && next !== 'subscribers') this.forgetKey();
     if (this.section() === 'alerts' && next !== 'alerts') this.forgetAlertKey();
-    if (this.section() === 'settings' && next !== 'settings') this.clearPermissions(true);
+    if (this.section() === 'settings' && next !== 'settings') {this.clearPermissions(true);this.clearPermissionChange();}
     this.section.set(next);
   }
 

@@ -6,6 +6,41 @@ import { OperatorOidc } from './operator-oidc';
 describe('Swallow console', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
+  it('changes a loaded identity using its observed state and keeps the request ID', async () => {
+    const old={issuer:'https://issuer.test',subject:'alice',client_id:'console',environment_id:'env-a',enabled:true,subscriber_read:true,alert_read:false,alert_retry:false,alert_accepted:false};
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({found:true,identity:old}),{status:200})).mockResolvedValueOnce(new Response(JSON.stringify({changed:true,replayed:false}),{status:200}));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('settings');app.permissionEnvironment='env-a';app.permissionKey='aaa.bbb.ccc';app.permissionIssuer=old.issuer;app.permissionSubject=old.subject;app.permissionClient=old.client_id;
+    await app.loadPermissions('identity');app.permissionDesired.alertRead=true;app.permissionReason='ticket';app.permissionConfirmed=true;await app.changePermissions();
+    expect(app.permissionChangeStatus()).toBe('recorded');expect(app.permissionChangeChanged()).toBe(true);
+    const sent=JSON.parse(fetchMock.mock.calls[1][1]?.body as string);expect(sent.expected.alertRead).toBe(false);expect(sent.desired.alertRead).toBe(true);expect(sent.requestId).toBe(app.permissionChange()?.body.requestId);
+  });
+
+  it('keeps an uncertain creation and only retries its exact request with the original credential', async () => {
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({found:false}),{status:200})).mockRejectedValueOnce(new TypeError('network')).mockResolvedValueOnce(new Response(JSON.stringify({changed:true,replayed:true}),{status:200}));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('settings');app.permissionEnvironment='env-a';app.permissionKey='aaa.bbb.ccc';app.permissionIssuer='https://issuer.test';app.permissionSubject='alice';app.permissionClient='console';
+    await app.loadPermissions('identity');app.permissionDesired.enabled=true;app.permissionReason='ticket';app.permissionConfirmed=true;await app.changePermissions();
+    expect(app.permissionChangeStatus()).toBe('unknown');expect(app.permissionChange()?.body.expected).toBeNull();
+    app.permissionKey='different.token.value';app.permissionRecoveryConfirmed=true;await app.recoverPermissionChange('retry');expect(app.permissionChangeStatus()).toBe('unknown');expect(fetchMock).toHaveBeenCalledTimes(2);
+    app.permissionKey='aaa.bbb.ccc';app.permissionRecoveryConfirmed=true;await app.recoverPermissionChange('retry');expect(app.permissionChangeStatus()).toBe('recorded');expect(fetchMock.mock.calls[2][1]?.body).toBe(fetchMock.mock.calls[1][1]?.body);
+  });
+
+  it('does not treat a lookup for different permission contents as the original request', async () => {
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({found:false}),{status:200})).mockRejectedValueOnce(new TypeError('network'));
+    const app=TestBed.createComponent(App).componentInstance;app.permissionEnvironment='env-a';app.permissionKey='aaa.bbb.ccc';app.permissionIssuer='https://issuer.test';app.permissionSubject='alice';app.permissionClient='console';
+    await app.loadPermissions('identity');app.permissionDesired.enabled=true;app.permissionReason='ticket';app.permissionConfirmed=true;await app.changePermissions();
+    const snapshot=app.permissionChange()!;fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({found:true,requestId:snapshot.body.requestId,targetIssuer:snapshot.body.targetIssuer,targetSubject:snapshot.body.targetSubject,targetClientId:snapshot.body.targetClientId,reason:snapshot.body.reason,expected:null,desired:{...snapshot.body.desired,alertRead:true},changed:true}),{status:200}));
+    await app.recoverPermissionChange('lookup');expect(app.permissionChangeStatus()).toBe('unknown');expect(app.permissionChangeMessage()).toContain('불명확');
+  });
+
+  it('keeps the request while a permission change is in flight', async () => {
+    let finish!:(response:Response)=>void;
+    vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({found:false}),{status:200})).mockImplementationOnce(()=>new Promise(done=>{finish=done;}));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('settings');app.permissionEnvironment='env-a';app.permissionKey='aaa.bbb.ccc';app.permissionIssuer='https://issuer.test';app.permissionSubject='alice';app.permissionClient='console';
+    await app.loadPermissions('identity');app.permissionDesired.enabled=true;app.permissionReason='ticket';app.permissionConfirmed=true;
+    const pending=app.changePermissions();await vi.waitFor(()=>expect(finish).toBeDefined());app.setSection('overview');app.clearPermissionChange();expect(app.section()).toBe('settings');expect(app.permissionChange()?.body.requestId).toBeTruthy();
+    finish(new Response(JSON.stringify({changed:true,replayed:false}),{status:200}));await pending;expect(app.permissionChangeStatus()).toBe('recorded');
+  });
+
   it('reviews a specific operator identity and clears credentials and results on leaving settings', async () => {
     const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValue(new Response(JSON.stringify({found:true,identity:{issuer:'https://issuer.test',subject:'alice',client_id:'console',environment_id:'env-a',enabled:true,subscriber_read:true,alert_read:false,alert_retry:false,alert_accepted:false}}),{status:200}));
     const app=TestBed.createComponent(App).componentInstance;app.setSection('settings');app.permissionEnvironment='env-a';app.permissionKey='aaa.bbb.ccc';app.permissionIssuer='https://issuer.test';app.permissionSubject='alice';app.permissionClient='console';
