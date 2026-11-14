@@ -1,4 +1,4 @@
-//! Experimental standalone Resend worker; use only with isolated fixtures.
+//! Experimental Resend worker; use only with isolated fixtures.
 use novu_postgres_queue::{
     resend::{Config, Resend},
     resend_queue,

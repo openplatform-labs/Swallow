@@ -1,4 +1,4 @@
-//! Standalone Resend queue. Workflow and subscriber identity handling are not wired.
+//! Resend queue with shared workflow email preparation.
 use crate::{
     ClaimedJob,
     resend::{Resend, SendError},
@@ -37,28 +37,30 @@ pub async fn process_one(
     let Some(job) = claim(client, environment).await? else {
         return Ok(false);
     };
-    let email: Email = match serde_json::from_value(job.payload.clone()) {
+    let mut email: Email = match serde_json::from_value(job.payload.clone()) {
         Ok(value) => value,
         Err(_) => {
             crate::fail(client, job.id, job.lease_token, "invalid Resend job").await?;
             return Ok(true);
         }
     };
-    // This path accepts only already-prepared standalone messages. It cannot
-    // safely evaluate a workflow, subscriber identity, or preferences.
-    if email.workflow_context.is_some() {
-        crate::fail(
-            client,
-            job.id,
-            job.lease_token,
-            "Resend workflow jobs are unsupported",
-        )
-        .await?;
-        return Ok(true);
-    }
     let tx = client.transaction().await?;
+    let subscriber =
+        crate::sendgrid_queue::lock_workflow_subscriber(&tx, environment, &email).await?;
     if !live(&tx, &job).await? {
         tx.rollback().await?;
+        return Ok(true);
+    }
+    if !crate::sendgrid_queue::prepare_workflow_email(
+        &tx,
+        environment,
+        &job,
+        &mut email,
+        subscriber,
+    )
+    .await?
+    {
+        tx.commit().await?;
         return Ok(true);
     }
     let inserted=tx.execute("INSERT INTO novu_rust_resend_attempts(job_id,environment_id,state) VALUES ($1,$2,'dispatching') ON CONFLICT(job_id) DO NOTHING", &[&job.id,&environment]).await?;
@@ -66,6 +68,9 @@ pub async fn process_one(
         tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='Resend attempt already exists',lease_token=NULL,lease_until=NULL WHERE id=$1 AND environment_id=$2", &[&job.id,&environment]).await?;
         tx.commit().await?;
         return Ok(true);
+    }
+    if email.message_id.is_some() {
+        tx.execute("UPDATE novu_rust_email_messages SET delivery_state='dispatching' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
     }
     tx.commit().await?;
     let key = format!("swallow/{}", job.id);
@@ -95,6 +100,9 @@ pub async fn process_one(
     }
     let updated=tx.execute("UPDATE novu_rust_resend_attempts SET state=$3,http_status=$4,provider_message_id=$5,updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$2 AND state='dispatching'", &[&job.id,&environment,&state,&code,&id]).await?;
     if updated == 1 {
+        if email.message_id.is_some() {
+            tx.execute("UPDATE novu_rust_email_messages SET delivery_state=$3,identifier=CASE WHEN $3='accepted' THEN $4 ELSE identifier END,status=CASE WHEN $3='accepted' THEN 'sent' ELSE 'error' END,error_id=CASE WHEN $3='accepted' THEN NULL ELSE 'mail_unexpected_error' END,error_text=CASE WHEN $3='accepted' THEN NULL ELSE $5 END WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id,&state,&id,&diagnostic]).await?;
+        }
         let status = if state == "accepted" {
             "completed"
         } else {
@@ -113,6 +121,7 @@ pub async fn recover_expired(client: &mut Client, environment: &str) -> Result<u
         let id: Uuid = row.get(0);
         let attempt=tx.execute("UPDATE novu_rust_resend_attempts SET state='unknown',updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$2 AND state='dispatching'", &[&id,&environment]).await?;
         if attempt == 1 {
+            tx.execute("UPDATE novu_rust_email_messages SET delivery_state='unknown' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&id]).await?;
             tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='Resend outcome unknown',lease_token=NULL,lease_until=NULL WHERE id=$1 AND environment_id=$2", &[&id,&environment]).await?;
         } else {
             let exists:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_resend_attempts WHERE job_id=$1 AND environment_id=$2)", &[&id,&environment]).await?.get(0);
@@ -142,17 +151,131 @@ mod tests {
     use tokio_postgres::NoTls;
 
     #[tokio::test]
+    #[ignore = "requires fresh disposable PostgreSQL and loopback"]
+    async fn workflow_delivery_revalidates_subscriber() {
+        let url = std::env::var("TEST_DATABASE_URL").unwrap();
+        let (mut db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+        tokio::spawn(async move { driver.await.unwrap() });
+        db.batch_execute("CREATE TABLE novu_rust_workflows (environment_id text, identifier text, in_app_content text, has_steps boolean NOT NULL DEFAULT true, PRIMARY KEY (environment_id, identifier))").await.unwrap();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut paths: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|v| v == "sql"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            db.batch_execute(&std::fs::read_to_string(path).unwrap())
+                .await
+                .unwrap();
+        }
+        db.batch_execute("INSERT INTO novu_rust_workflows(environment_id,identifier,email_subject,email_html,email_provider,in_app_step_active,inbox_metadata) VALUES ('env-a','hello','Hi {{subscriber.firstName}}','<p>Hello {{subscriber.firstName}}</p>','resend',false,'{\"id\":\"workflow-id\"}'); INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES ('env-a','recipient','old-id','{\"email\":\"to@example.test\",\"firstName\":\"Alice\"}')").await.unwrap();
+        let trigger = Uuid::new_v4();
+        let payload = json!({"workflow":"hello","transactionId":trigger.to_string(),"content":"","payload":{},"recipients":[{"subscriberId":"recipient"}],"recipientIdentitySnapshot":{"recipient":"old-id"},"severityOverride":null});
+        enqueue(&db, trigger, "env-a", crate::in_app::JOB_KIND, &payload)
+            .await
+            .unwrap();
+        assert!(crate::in_app::process_one(&mut db).await.unwrap());
+        let row = db
+            .query_one(
+                "SELECT id FROM novu_queue_jobs WHERE kind=$1 AND payload->>'transaction_id'=$2",
+                &[&JOB_KIND, &trigger.to_string()],
+            )
+            .await
+            .unwrap();
+        let email_job: Uuid = row.get(0);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/emails", listener.local_addr().unwrap());
+        let mock = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0; 4096];
+            loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                    let h = String::from_utf8_lossy(&bytes[..pos]);
+                    let len: usize = h
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .and_then(|v| v.parse().ok())
+                        })
+                        .unwrap();
+                    if bytes.len() >= pos + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let req = String::from_utf8(bytes).unwrap();
+            let body: serde_json::Value =
+                serde_json::from_str(req.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(body["to"], json!(["to@example.test"]));
+            assert_eq!(body["subject"], "Hi Alice");
+            assert!(body["html"].as_str().unwrap().contains("Hello Alice"));
+            let response = "{\"id\":\"resend-workflow-id\"}";
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).as_bytes()).await.unwrap();
+        });
+        let provider = Resend::test_endpoint(
+            Config {
+                api_key: "re_test".into(),
+                from: "from@example.test".into(),
+                sender_name: String::new(),
+            },
+            &endpoint,
+        )
+        .unwrap();
+        assert!(process_one(&mut db, "env-a", &provider).await.unwrap());
+        mock.await.unwrap();
+        let row=db.query_one("SELECT j.status,a.state,m.delivery_state,m.identifier FROM novu_queue_jobs j JOIN novu_rust_resend_attempts a ON a.job_id=j.id JOIN novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1", &[&email_job]).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), "completed");
+        assert_eq!(row.get::<_, String>(1), "accepted");
+        assert_eq!(row.get::<_, String>(2), "accepted");
+        assert_eq!(row.get::<_, String>(3), "resend-workflow-id");
+        let trigger2 = Uuid::new_v4();
+        let mut second = payload.clone();
+        second["transactionId"] = json!(trigger2.to_string());
+        enqueue(&db, trigger2, "env-a", crate::in_app::JOB_KIND, &second)
+            .await
+            .unwrap();
+        assert!(crate::in_app::process_one(&mut db).await.unwrap());
+        let job2: Uuid = db
+            .query_one(
+                "SELECT id FROM novu_queue_jobs WHERE kind=$1 AND payload->>'transaction_id'=$2",
+                &[&JOB_KIND, &trigger2.to_string()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        db.execute("UPDATE novu_rust_subscribers SET internal_id='new-id' WHERE environment_id='env-a' AND subscriber_id='recipient'",&[]).await.unwrap();
+        assert!(process_one(&mut db, "env-a", &provider).await.unwrap());
+        let row=db.query_one("SELECT status,last_error,(SELECT count(*) FROM novu_rust_resend_attempts WHERE job_id=$1) FROM novu_queue_jobs WHERE id=$1", &[&job2]).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), "failed");
+        assert_eq!(row.get::<_, String>(1), "subscriber identity changed");
+        assert_eq!(row.get::<_, i64>(2), 0);
+    }
+
+    #[tokio::test]
     #[ignore = "requires a disposable PostgreSQL database"]
     async fn standalone_dispatch_and_recovery() {
         let url = std::env::var("TEST_DATABASE_URL").unwrap();
         let (mut db, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
         tokio::spawn(async move { connection.await.unwrap() });
-        db.batch_execute("DROP TABLE IF EXISTS novu_rust_resend_attempts,novu_queue_jobs CASCADE")
+        db.batch_execute("DROP TABLE IF EXISTS novu_rust_resend_attempts,novu_rust_email_messages,novu_queue_jobs CASCADE")
             .await
             .unwrap();
         db.batch_execute(crate::MIGRATION).await.unwrap();
         db.batch_execute(MIGRATION).await.unwrap();
         db.batch_execute(MIGRATION).await.unwrap();
+        db.batch_execute(crate::in_app::EMAIL_MESSAGES_MIGRATION)
+            .await
+            .unwrap();
+        db.batch_execute(crate::in_app::EMAIL_PROVIDER_RESULT_MIGRATION)
+            .await
+            .unwrap();
+        db.batch_execute("ALTER TABLE novu_rust_email_messages ADD COLUMN delivery_state text NOT NULL DEFAULT 'not_attempted'").await.unwrap();
         let id = Uuid::new_v4();
         let other = Uuid::new_v4();
         let payload = json!({"to":["to@example.test"],"subject":"Hello","html":"Hi"});
@@ -278,7 +401,7 @@ mod tests {
         }
         let job = Uuid::new_v4();
         let environment = format!("env-{job}");
-        let unsupported = json!({"to":["to@example.test"],"subject":"Hello","html":"Hi","workflow_context":{"subscriber_internal_id":"old","subject_template":"Hello","html_template":"Hi","payload":{},"context":{},"actor":null,"overrides":{}}});
+        let unsupported = json!({"to":["to@example.test"],"subject":"Hello","html":"Hi","unrecognized_option":true});
         enqueue(&db, job, &environment, JOB_KIND, &unsupported)
             .await
             .unwrap();
@@ -295,10 +418,7 @@ mod tests {
         assert!(process_one(&mut db, &environment, &provider).await.unwrap());
         let row = db.query_one("SELECT status,last_error,(SELECT count(*) FROM novu_rust_resend_attempts WHERE job_id=$1) FROM novu_queue_jobs WHERE id=$1", &[&job]).await.unwrap();
         assert_eq!(row.get::<_, String>(0), "failed");
-        assert_eq!(
-            row.get::<_, String>(1),
-            "Resend workflow jobs are unsupported"
-        );
+        assert_eq!(row.get::<_, String>(1), "invalid Resend job");
         assert_eq!(row.get::<_, i64>(2), 0);
     }
 }

@@ -63,6 +63,7 @@ async fn changed_actor_is_rejected_by_all_channels() {
         crate::in_app::IN_APP_SUBSCRIBER_IDENTITY_MIGRATION,
         crate::in_app::MULTIPLE_FCM_CHANNELS_MIGRATION,
         crate::in_app::PUSH_STEP_ID_MIGRATION,
+        crate::in_app::WORKFLOW_EMAIL_PROVIDER_MIGRATION,
         crate::sendgrid_queue::MIGRATION,
         crate::sendgrid_queue::DISPATCH_ID_MIGRATION,
         crate::sendgrid_queue::DISPATCH_PROOF_MIGRATION,

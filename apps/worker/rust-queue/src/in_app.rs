@@ -72,6 +72,8 @@ impl std::fmt::Display for LeaseLost {
 impl Error for LeaseLost {}
 
 pub const MIGRATION: &str = include_str!("../migrations/0002_experimental_in_app.sql");
+pub const WORKFLOW_EMAIL_PROVIDER_MIGRATION: &str =
+    include_str!("../migrations/0061_workflow_email_provider.sql");
 pub const ACTION_CTA_MIGRATION: &str = include_str!("../migrations/0059_in_app_action_cta.sql");
 pub const STATE_MIGRATION: &str = include_str!("../migrations/0003_experimental_message_state.sql");
 pub const STATE_DATES_MIGRATION: &str =
@@ -414,12 +416,13 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         workflow_internal_id,
         email_step,
         email_step_id,
+        email_provider,
         sms_step,
         sms_step_id,
         push_step,
         push_step_id,
     ) = if data.get("severityOverride").is_some() {
-        let row = tx.query_opt("SELECT inbox_metadata->>'severity',in_app_content,inbox_metadata->'tags',has_steps,in_app_step_active,inbox_metadata->>'id',email_subject,email_html,email_step_active,email_step_id,sms_content,sms_step_active,sms_step_id,push_title,push_content,push_step_active,push_step_id FROM novu_rust_workflows WHERE environment_id=$1 AND identifier=$2", &[&job.environment_id, &workflow]).await?
+        let row = tx.query_opt("SELECT inbox_metadata->>'severity',in_app_content,inbox_metadata->'tags',has_steps,in_app_step_active,inbox_metadata->>'id',email_subject,email_html,email_step_active,email_step_id,sms_content,sms_step_active,sms_step_id,push_title,push_content,push_step_active,push_step_id,email_provider FROM novu_rust_workflows WHERE environment_id=$1 AND identifier=$2", &[&job.environment_id, &workflow]).await?
             .ok_or(InvalidJob("workflow no longer exists"))?;
         let has_steps = row.get::<_, bool>(3);
         let email_subject: Option<String> = row.get(6);
@@ -466,6 +469,7 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
             row.get::<_, Option<String>>(5),
             email_step,
             row.get::<_, Option<String>>(9),
+            row.get::<_, String>(17),
             sms_step,
             row.get::<_, Option<String>>(12),
             push_step,
@@ -480,6 +484,7 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
             None,
             None,
             None,
+            "sendgrid".to_owned(),
             None,
             None,
             None,
@@ -570,17 +575,17 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
     let mut merged_email_override = email_override.unwrap_or_default();
     let provider_layer = data
         .get("emailProviderOverrides")
-        .and_then(|v| v.get("sendgrid"));
+        .and_then(|v| v.get(&email_provider));
     let step_layer = email_step_id
         .as_deref()
         .and_then(|step| data.get("emailStepOverrides").and_then(|v| v.get(step)))
         .and_then(|v| v.get("providers"))
-        .and_then(|v| v.get("sendgrid"));
+        .and_then(|v| v.get(&email_provider));
     let mut raw_provider_headers = serde_json::Map::new();
     let mut provider_from_without_name = false;
     for layer in [provider_layer, step_layer].into_iter().flatten() {
         if let Some(fields) = layer.as_object() {
-            if fields.contains_key("from") {
+            if email_provider == "sendgrid" && fields.contains_key("from") {
                 provider_from_without_name = true;
             }
             if let Some(headers) = fields.get("headers").and_then(serde_json::Value::as_object) {
@@ -589,7 +594,11 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         }
     }
     for layer in [
-        data.get("emailFlatProviderOverride"),
+        if email_provider == "sendgrid" {
+            data.get("emailFlatProviderOverride")
+        } else {
+            None
+        },
         provider_layer,
         step_layer,
     ]
@@ -898,7 +907,11 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
                 &[
                     &email_job_id,
                     &job.environment_id,
-                    &crate::sendgrid_queue::JOB_KIND,
+                    &if email_provider == "resend" {
+                        crate::resend_queue::JOB_KIND
+                    } else {
+                        crate::sendgrid_queue::JOB_KIND
+                    },
                     &email_payload,
                 ],
             )

@@ -57,25 +57,12 @@ async fn lock_live(tx: &tokio_postgres::Transaction<'_>, job: &ClaimedJob) -> Re
         .get(0))
 }
 
-/// Handle one job for exactly this environment. No credential is stored in the job.
-pub async fn process_one(
-    client: &mut Client,
+// Acquire the subscriber lock before the queue row lock for both email providers.
+pub(crate) async fn lock_workflow_subscriber(
+    tx: &tokio_postgres::Transaction<'_>,
     environment: &str,
-    provider: &Sendgrid,
-) -> Result<bool, Error> {
-    let Some(job) = claim(client, environment, Duration::from_secs(60)).await? else {
-        return Ok(false);
-    };
-    let mut email: Email = match serde_json::from_value(job.payload.clone()) {
-        Ok(value) => value,
-        Err(_) => {
-            crate::fail(client, job.id, job.lease_token, "invalid email job").await?;
-            return Ok(true);
-        }
-    };
-    let tx = client.transaction().await?;
-    // Subscriber mutations lock this row first. Keep the same ordering before
-    // locking the job, so preference/delete cannot race with dispatch setup.
+    email: &Email,
+) -> Result<Option<tokio_postgres::Row>, Error> {
     let subscriber = if let Some(context) = &email.workflow_context {
         let id = email.subscriber_id.as_deref().unwrap_or("");
         let workflow = email.workflow_identifier.as_deref().unwrap_or("");
@@ -83,23 +70,17 @@ pub async fn process_one(
     } else {
         None
     };
-    if !lock_live(&tx, &job).await? {
-        tx.rollback().await?;
-        return Ok(true);
-    }
-    // Webhook insertion and this check serialize on the job row. Email
-    // events lack per-attempt IDs, so older linked evidence is conservative.
-    let evidence = tx.query_opt("SELECT r.retry_dispatch_id FROM (SELECT retry_dispatch_id FROM novu_rust_delivery_reconciliations WHERE environment_id=$1 AND job_id=$2 AND target_index IS NULL AND decision='retry' ORDER BY decision_order DESC LIMIT 1) r WHERE EXISTS(SELECT 1 FROM novu_rust_sendgrid_delivery_events e JOIN novu_rust_email_messages m ON m.environment_id=e.environment_id AND m.internal_id=e.message_internal_id WHERE m.environment_id=$1 AND m.email_job_id=$2 AND (r.retry_dispatch_id IS NULL OR NOT e.dispatch_proof_verified OR e.dispatch_id IS NULL OR e.dispatch_id=r.retry_dispatch_id))", &[&environment,&job.id]).await?;
-    if let Some(evidence) = evidence {
-        let dispatch: Option<Uuid> = evidence.get(0);
-        let inserted = tx.execute("INSERT INTO novu_rust_sendgrid_attempts(job_id,environment_id,state,dispatch_id) VALUES ($1,$2,'unknown',$3) ON CONFLICT(job_id) DO NOTHING", &[&job.id,&environment,&dispatch]).await?;
-        if inserted == 1 {
-            tx.execute("UPDATE novu_rust_email_messages SET delivery_state='unknown',status='error',error_id='mail_unexpected_error',error_text='email retry blocked by provider callback' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
-        }
-        tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='email retry blocked by provider callback',lease_token=NULL,lease_until=NULL WHERE id=$1 AND environment_id=$2", &[&job.id,&environment]).await?;
-        tx.commit().await?;
-        return Ok(true);
-    }
+    Ok(subscriber)
+}
+
+// Update workflow outcome under the same subscriber and queue locks.
+pub(crate) async fn prepare_workflow_email(
+    tx: &tokio_postgres::Transaction<'_>,
+    environment: &str,
+    job: &ClaimedJob,
+    email: &mut Email,
+    subscriber: Option<tokio_postgres::Row>,
+) -> Result<bool, Error> {
     if let Some(context) = email.workflow_context.take() {
         let skip = if let Some(row) = subscriber.as_ref() {
             if !crate::allow_recreated_subscriber()
@@ -130,8 +111,7 @@ pub async fn process_one(
             .await?;
             tx.execute("UPDATE novu_rust_email_step_outcomes SET status=$3,email_job_id=NULL WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id,&outcome]).await?;
             tx.execute("UPDATE novu_queue_jobs SET status=$2,last_error=$3,lease_token=NULL,lease_until=NULL WHERE id=$1", &[&job.id,&status,&diagnostic]).await?;
-            tx.commit().await?;
-            return Ok(true);
+            return Ok(false);
         }
         let mut profile: serde_json::Value = subscriber.as_ref().unwrap().get(0);
         if let Some(obj) = profile.as_object_mut() {
@@ -143,7 +123,7 @@ pub async fn process_one(
         // The original channel worker resolves actor and contexts at execution
         // time. Old jobs without context_keys retain their stored snapshot.
         let actor = match crate::resolve_actor(
-            &tx,
+            tx,
             environment,
             context.actor.as_ref(),
             context.actor_internal_id.as_deref(),
@@ -157,8 +137,7 @@ pub async fn process_one(
                 tx.execute("DELETE FROM novu_rust_email_messages WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
                 tx.execute("UPDATE novu_rust_email_step_outcomes SET status='failed',email_job_id=NULL WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
                 tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='actor identity changed or missing',lease_token=NULL,lease_until=NULL WHERE id=$1", &[&job.id]).await?;
-                tx.commit().await?;
-                return Ok(true);
+                return Ok(false);
             }
         };
         let resolved_context = if let Some(keys) = context.context_keys.as_ref() {
@@ -228,8 +207,7 @@ pub async fn process_one(
             tx.execute("UPDATE novu_rust_email_messages SET status='warning',email=NULL,error_id='mail_unexpected_error',error_text='Subscriber does not have an email address' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
             tx.execute("UPDATE novu_rust_email_step_outcomes SET status='missing_email',email_job_id=NULL WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
             tx.execute("UPDATE novu_queue_jobs SET status='cancelled',last_error='subscriber missing email',lease_token=NULL,lease_until=NULL WHERE id=$1", &[&job.id]).await?;
-            tx.commit().await?;
-            return Ok(true);
+            return Ok(false);
         }
         let render = |template: &str| {
             novu_rust_contracts::template::render_in_app_with_actor(
@@ -263,8 +241,7 @@ pub async fn process_one(
                 tx.execute("UPDATE novu_rust_email_messages SET status='error',error_id='mail_unexpected_error',error_text='unsupported email template or input' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
                 tx.execute("UPDATE novu_rust_email_step_outcomes SET status='failed',email_job_id=NULL WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
                 tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='unsupported email template or input',lease_token=NULL,lease_until=NULL WHERE id=$1", &[&job.id]).await?;
-                tx.commit().await?;
-                return Ok(true);
+                return Ok(false);
             }
         };
         email.to = to;
@@ -274,6 +251,48 @@ pub async fn process_one(
             .unwrap_or(&html)
             .to_owned();
         tx.execute("UPDATE novu_rust_email_messages SET email=$3 WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id,&address]).await?;
+    }
+    Ok(true)
+}
+
+/// Handle one job for exactly this environment. No credential is stored in the job.
+pub async fn process_one(
+    client: &mut Client,
+    environment: &str,
+    provider: &Sendgrid,
+) -> Result<bool, Error> {
+    let Some(job) = claim(client, environment, Duration::from_secs(60)).await? else {
+        return Ok(false);
+    };
+    let mut email: Email = match serde_json::from_value(job.payload.clone()) {
+        Ok(value) => value,
+        Err(_) => {
+            crate::fail(client, job.id, job.lease_token, "invalid email job").await?;
+            return Ok(true);
+        }
+    };
+    let tx = client.transaction().await?;
+    let subscriber = lock_workflow_subscriber(&tx, environment, &email).await?;
+    if !lock_live(&tx, &job).await? {
+        tx.rollback().await?;
+        return Ok(true);
+    }
+    // Webhook insertion and this check serialize on the job row. Email
+    // events lack per-attempt IDs, so older linked evidence is conservative.
+    let evidence = tx.query_opt("SELECT r.retry_dispatch_id FROM (SELECT retry_dispatch_id FROM novu_rust_delivery_reconciliations WHERE environment_id=$1 AND job_id=$2 AND target_index IS NULL AND decision='retry' ORDER BY decision_order DESC LIMIT 1) r WHERE EXISTS(SELECT 1 FROM novu_rust_sendgrid_delivery_events e JOIN novu_rust_email_messages m ON m.environment_id=e.environment_id AND m.internal_id=e.message_internal_id WHERE m.environment_id=$1 AND m.email_job_id=$2 AND (r.retry_dispatch_id IS NULL OR NOT e.dispatch_proof_verified OR e.dispatch_id IS NULL OR e.dispatch_id=r.retry_dispatch_id))", &[&environment,&job.id]).await?;
+    if let Some(evidence) = evidence {
+        let dispatch: Option<Uuid> = evidence.get(0);
+        let inserted = tx.execute("INSERT INTO novu_rust_sendgrid_attempts(job_id,environment_id,state,dispatch_id) VALUES ($1,$2,'unknown',$3) ON CONFLICT(job_id) DO NOTHING", &[&job.id,&environment,&dispatch]).await?;
+        if inserted == 1 {
+            tx.execute("UPDATE novu_rust_email_messages SET delivery_state='unknown',status='error',error_id='mail_unexpected_error',error_text='email retry blocked by provider callback' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
+        }
+        tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='email retry blocked by provider callback',lease_token=NULL,lease_until=NULL WHERE id=$1 AND environment_id=$2", &[&job.id,&environment]).await?;
+        tx.commit().await?;
+        return Ok(true);
+    }
+    if !prepare_workflow_email(&tx, environment, &job, &mut email, subscriber).await? {
+        tx.commit().await?;
+        return Ok(true);
     }
     if provider.tracks_dispatches()
         && (email.custom_data.contains_key(DISPATCH_ARGUMENT)

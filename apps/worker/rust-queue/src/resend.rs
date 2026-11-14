@@ -1,4 +1,4 @@
-//! Bounded Resend API adapter. Queue and workflow integration are separate.
+//! Bounded Resend API adapter used by the experimental email worker.
 use crate::sendgrid::Email;
 use reqwest::{Client, header};
 use serde_json::{Value, json};
@@ -259,5 +259,31 @@ mod tests {
             provider.send(&message(), Some("\ninvalid")).await,
             Err(SendError::InvalidMessage)
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "sends real email and requires explicit Resend credentials and recipient"]
+    async fn live_send() {
+        let config = Config {
+            api_key: std::env::var("NOVU_RESEND_API_KEY").expect("NOVU_RESEND_API_KEY is required"),
+            from: std::env::var("NOVU_RESEND_FROM").expect("NOVU_RESEND_FROM is required"),
+            sender_name: String::new(),
+        };
+        let recipient =
+            std::env::var("NOVU_RESEND_TEST_TO").expect("NOVU_RESEND_TEST_TO is required");
+        assert!(!recipient.trim().is_empty());
+        let email = Email {
+            to: vec![recipient],
+            subject: "Swallow Resend test".into(),
+            html: "<p>Swallow Resend test message.</p>".into(),
+            ..Default::default()
+        };
+        let provider = Resend::new(config).unwrap();
+        let idempotency_key = format!("swallow-live-test/{}", uuid::Uuid::new_v4());
+        let id = provider
+            .send(&email, Some(&idempotency_key))
+            .await
+            .expect("Resend API request failed");
+        assert!(!id.is_empty());
     }
 }

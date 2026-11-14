@@ -283,6 +283,7 @@ pub async fn resolve(
                 &[&environment, &job],
             )
             .await?;
+            tx.execute("UPDATE novu_rust_email_messages SET delivery_state='not_attempted',status='sent',error_id=NULL,error_text=NULL,identifier=NULL WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job]).await?;
         }
         (crate::resend_queue::JOB_KIND, None, "accepted") => {
             tx.execute("UPDATE novu_rust_resend_attempts SET state='accepted',updated_at=clock_timestamp() WHERE environment_id=$1 AND job_id=$2", &[&environment, &job]).await?;
@@ -293,6 +294,7 @@ pub async fn resolve(
                 &[&environment, &job],
             )
             .await?;
+            tx.execute("UPDATE novu_rust_email_messages SET delivery_state='accepted',status='sent',error_id=NULL,error_text=NULL WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job]).await?;
             tx.execute("UPDATE novu_rust_email_messages SET delivery_state='not_attempted',status='sent',error_id=NULL,error_text=NULL,identifier=NULL WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job]).await?;
         }
         (crate::twilio_queue::JOB_KIND, None, "retry") => {

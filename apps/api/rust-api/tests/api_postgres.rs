@@ -504,6 +504,9 @@ async fn trigger_api_contract_inner() {
     db.batch_execute(novu_postgres_queue::in_app::MULTIPLE_FCM_CHANNELS_MIGRATION)
         .await
         .unwrap();
+    db.batch_execute(novu_postgres_queue::in_app::WORKFLOW_EMAIL_PROVIDER_MIGRATION)
+        .await
+        .unwrap();
     db.batch_execute(novu_postgres_queue::in_app::PUSH_STEP_ID_MIGRATION)
         .await
         .unwrap();
@@ -4628,5 +4631,23 @@ async fn email_workflow_contract(app: axum::Router, worker: &mut tokio_postgres:
         !novu_postgres_queue::in_app::process_one(worker)
             .await
             .unwrap()
+    );
+    worker.execute("UPDATE novu_rust_workflows SET email_provider='resend' WHERE environment_id='env-a' AND identifier='email-only'", &[]).await.unwrap();
+    let (status, _) = request(app, Some("ApiKey test-key"), json!({"name":"email-only","to":{"subscriberId":"resend-recipient","email":"resend@example.test"},"payload":{"name":"Test"},"transactionId":"resend-workflow-api"})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(
+        novu_postgres_queue::in_app::process_one(worker)
+            .await
+            .unwrap()
+    );
+    let row = worker.query_one("SELECT kind,payload FROM novu_queue_jobs WHERE payload->>'transaction_id'='resend-workflow-api'", &[]).await.unwrap();
+    assert_eq!(
+        row.get::<_, String>(0),
+        novu_postgres_queue::resend_queue::JOB_KIND
+    );
+    let payload: Value = row.get(1);
+    assert_eq!(
+        payload["workflow_context"]["subject_template"],
+        "Hello {{subscriber.firstName}}"
     );
 }
