@@ -5,11 +5,12 @@ cd "$(dirname "$0")/.."
 export NOVU_ALLOW_RECREATED_SUBSCRIBER=true
 export NOVU_POSTGRES_ALLOW_INSECURE=true
 name="novu-rust-queue-test-$$"
+port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
 cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 # The container is disposable; access is limited to a random loopback port.
 docker run --rm -d --name "$name" -e POSTGRES_HOST_AUTH_METHOD=trust \
-  -e POSTGRES_DB=novu_queue_test -p 127.0.0.1::5432 postgres:17-alpine >/dev/null
+  -e POSTGRES_DB=novu_queue_test -p "127.0.0.1:${port}:5432" postgres:17-alpine >/dev/null
 for ((i=0; i<30; i++)); do
   if docker exec "$name" pg_isready -q -U postgres -d novu_queue_test; then
     break
@@ -20,8 +21,6 @@ for ((i=0; i<30; i++)); do
   fi
   sleep 1
 done
-port=$(docker port "$name" 5432/tcp)
-port=${port##*:}
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_queue_test" \
   cargo test --locked --test postgres --test in_app_recovery -- --ignored
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_queue_test" \
@@ -48,3 +47,8 @@ TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_resend_workflow_
 docker exec "$name" createdb -U postgres novu_resend_alert_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_resend_alert_test" \
   cargo test --locked --test resend_alert -- --ignored
+
+# This final test restarts the disposable database container.
+docker exec "$name" createdb -U postgres novu_resend_reconnect_test
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_resend_reconnect_test" TEST_PG_CONTAINER="$name" \
+  cargo test --locked --test resend_reconnect -- --ignored
