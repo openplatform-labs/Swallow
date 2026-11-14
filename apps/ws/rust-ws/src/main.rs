@@ -10,10 +10,10 @@ use socketioxide::{
 };
 use std::{
     error::Error,
-    future::poll_fn,
+    future::{IntoFuture, poll_fn},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -473,6 +473,34 @@ async fn retry_disconnect(
     }
 }
 
+// Track registration and cleanup across shutdown, including uncertain commits.
+struct Tracked(Arc<AtomicUsize>);
+impl Tracked {
+    fn new(count: Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count)
+    }
+}
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+fn spawn_cleanup(
+    count: Arc<AtomicUsize>,
+    db: Arc<Database>,
+    id: Uuid,
+    claims: Claims,
+    update_presence: bool,
+    active_presence: bool,
+) {
+    let guard = Tracked::new(count);
+    tokio::spawn(async move {
+        let _guard = guard;
+        retry_disconnect(db, id, claims, update_presence, active_presence).await;
+    });
+}
+
 // A dedicated listener connection is driven independently of query traffic.
 // LISTEN must be active before the server accepts sockets.
 async fn start_event_listener(
@@ -537,6 +565,23 @@ async fn start_event_listener(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let drain_seconds: u64 = match std::env::var("SWALLOW_WS_DRAIN_SECONDS") {
+        Ok(v) => v.parse().map_err(|_| "invalid WS drain setting")?,
+        Err(std::env::VarError::NotPresent) => 0,
+        Err(_) => return Err("invalid WS drain setting".into()),
+    };
+    let grace_seconds: u64 = match std::env::var("SWALLOW_WS_SHUTDOWN_GRACE_SECONDS") {
+        Ok(v) => v.parse().map_err(|_| "invalid WS shutdown grace")?,
+        Err(std::env::VarError::NotPresent) => 30,
+        Err(_) => return Err("invalid WS shutdown grace".into()),
+    };
+    if drain_seconds > 300 || !(1..=300).contains(&grace_seconds) {
+        return Err("invalid WS shutdown timing".into());
+    }
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let draining = Arc::new(AtomicBool::new(false));
+    let pending = Arc::new(AtomicUsize::new(0));
     let require_jwt_exp = match std::env::var("SWALLOW_INBOX_REQUIRE_JWT_EXP").as_deref() {
         Ok("true") => true,
         Ok("false") | Err(std::env::VarError::NotPresent) => false,
@@ -711,6 +756,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     let health_db = db.clone();
     let socket_event_generation = event_generation.clone();
+    let socket_draining = draining.clone();
+    let socket_pending = pending.clone();
     io.ns(
         "/",
         move |socket: SocketRef, TryData(auth): TryData<Value>| {
@@ -718,7 +765,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             let secret = secret.clone();
             let listener_generation = listener_generation.clone();
             let event_generation = socket_event_generation.clone();
+            let draining = socket_draining.clone();
+            let pending = socket_pending.clone();
+            let registration = Tracked::new(pending.clone());
             async move {
+                let _registration = registration;
+                if draining.load(Ordering::SeqCst) {
+                    socket.disconnect().ok();
+                    return;
+                }
                 let generation = listener_generation.load(Ordering::SeqCst);
                 let event_epoch = event_generation.load(Ordering::SeqCst);
                 if disconnect_on_gap
@@ -760,16 +815,31 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         // A lost COMMIT acknowledgement may mean the row exists.
                         let update_presence = !compatibility_mode()
                             || verify(&token, &secret, require_jwt_exp).is_some();
-                        tokio::spawn(retry_disconnect(
+                        spawn_cleanup(
+                            pending.clone(),
                             db.clone(),
                             id,
                             claims,
                             update_presence,
                             active_presence,
-                        ));
+                        );
                         socket.disconnect().ok();
                         return;
                     }
+                }
+                if draining.load(Ordering::SeqCst) {
+                    let update_presence =
+                        !compatibility_mode() || verify(&token, &secret, require_jwt_exp).is_some();
+                    spawn_cleanup(
+                        pending.clone(),
+                        db,
+                        id,
+                        claims,
+                        update_presence,
+                        active_presence,
+                    );
+                    socket.disconnect().ok();
+                    return;
                 }
                 socket.extensions.insert(ConnectionId(id));
                 socket.extensions.insert(claims.clone());
@@ -778,22 +848,23 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 let cleanup_claims = claims.clone();
                 let cleanup_token = token.clone();
                 let cleanup_secret = secret.clone();
+                let cleanup_pending = pending.clone();
                 socket.on_disconnect(move || {
                     let db = cleanup_db.clone();
                     let claims = cleanup_claims.clone();
                     let token = cleanup_token.clone();
                     let secret = cleanup_secret.clone();
-                    async move {
-                        let update_presence = !compatibility_mode()
-                            || verify(&token, &secret, require_jwt_exp).is_some();
-                        tokio::spawn(retry_disconnect(
-                            db,
-                            id,
-                            claims,
-                            update_presence,
-                            active_presence,
-                        ));
-                    }
+                    let update_presence =
+                        !compatibility_mode() || verify(&token, &secret, require_jwt_exp).is_some();
+                    spawn_cleanup(
+                        cleanup_pending.clone(),
+                        db,
+                        id,
+                        claims,
+                        update_presence,
+                        active_presence,
+                    );
+                    async {}
                 });
                 if disconnect_on_gap
                     && (listener_generation.load(Ordering::SeqCst) != generation
@@ -804,17 +875,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 if !socket.connected() {
                     let update_presence =
                         !compatibility_mode() || verify(&token, &secret, require_jwt_exp).is_some();
-                    tokio::spawn(retry_disconnect(
-                        db,
-                        id,
-                        claims,
-                        update_presence,
-                        active_presence,
-                    ));
+                    spawn_cleanup(pending, db, id, claims, update_presence, active_presence);
                 }
             }
         },
     );
+    let shutdown_db = health_db.clone();
+    let health_draining = draining.clone();
     let mut app = Router::new().layer(layer);
     if health_enabled {
         app = app
@@ -825,8 +892,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     let db = health_db.clone();
                     let listener_ready = listener_ready.clone();
                     let event_generation = event_generation.clone();
+                    let draining = health_draining.clone();
                     async move {
-                        if !listener_ready.load(Ordering::SeqCst)
+                        if draining.load(Ordering::SeqCst)
+                            || !listener_ready.load(Ordering::SeqCst)
                             || !event_generation.load(Ordering::SeqCst).is_multiple_of(2)
                         {
                             return StatusCode::SERVICE_UNAVAILABLE;
@@ -837,6 +906,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                             })
                             .await;
                         if matches!(probe, Ok(Ok(_)))
+                            && !draining.load(Ordering::SeqCst)
                             && listener_ready.load(Ordering::SeqCst)
                             && event_generation.load(Ordering::SeqCst).is_multiple_of(2)
                         {
@@ -850,6 +920,64 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     let address = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:3002".into());
     let listener = tokio::net::TcpListener::bind(address).await?;
-    axum::serve(listener, app).await?;
+    let failed = Arc::new(AtomicBool::new(false));
+    let failed_shutdown = failed.clone();
+    let (notice_tx, notice_rx) = tokio::sync::oneshot::channel();
+    let shutdown = async move {
+        #[cfg(unix)]
+        tokio::select! { _ = sigterm.recv() => {}, _ = tokio::signal::ctrl_c() => {} }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+        draining.store(true, Ordering::SeqCst);
+        if drain_seconds > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(drain_seconds)).await;
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(grace_seconds);
+        let result = tokio::time::timeout_at(deadline, async {
+            // The transport can close before socketioxide invokes an async
+            // disconnect callback. Schedule idempotent cleanup explicitly.
+            if let Some(namespace) = io.of("/") {
+                for socket in namespace.sockets() {
+                    if let (Some(ConnectionId(id)), Some(claims)) = (
+                        socket.extensions.get::<ConnectionId>(),
+                        socket.extensions.get::<Claims>(),
+                    ) {
+                        let update_presence = !compatibility_mode() || !token_expired(&claims);
+                        spawn_cleanup(
+                            pending.clone(),
+                            shutdown_db.clone(),
+                            id,
+                            claims,
+                            update_presence,
+                            active_presence,
+                        );
+                    }
+                }
+            }
+            io.close().await;
+            while pending.load(Ordering::SeqCst) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        if result.is_err() {
+            failed_shutdown.store(true, Ordering::SeqCst);
+        }
+        let _ = notice_tx.send(deadline);
+    };
+    let server = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .into_future();
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result?,
+        deadline = notice_rx => {
+            let deadline = deadline.map_err(|_| "WS shutdown coordination failed")?;
+            tokio::time::timeout_at(deadline, &mut server).await.map_err(|_| "WS shutdown timed out")??;
+        }
+    }
+    if failed.load(Ordering::SeqCst) {
+        return Err("WS cleanup timed out".into());
+    }
     Ok(())
 }
