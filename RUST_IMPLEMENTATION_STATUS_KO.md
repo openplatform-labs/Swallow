@@ -1,3 +1,9 @@
+## Resend 작업 목록 API (API 0049)
+
+운영자 JWT로 환경별 Resend 작업을 최대 20건씩 UUID 순서로 조회하는 실험 API를 추가했다. 단건 결과 권한과 별도의 목록 권한을 모두 필요로 하며, API DB 로그인에도 함수 실행 권한을 부여해야 한다. 응답은 기존 단건 조회와 동일하게 민감한 발송 정보를 제외한다. UUID 순서는 시간순이 아니며 페이지 사이에 데이터가 변경될 수 있다. 상세 권한과 배포 조건은 [API README](apps/api/rust-api/README.md)를 참고한다.
+
+Docker PostgreSQL 전체 마이그레이션과 서명된 테스트 JWT를 사용하여 권한 분리, 환경 격리, 두 페이지 조회와 민감 정보 제외를 검증했다. 현재 Angular 화면에서는 목록을 제공하지 않고 작업 UUID를 직접 입력해야 한다. 실제 IdP, 운영 부하·HA 및 원본 Novu와의 비교는 이 기능에 대해 검증하지 않았다.
+
 ## Resend 운영 화면의 실제 API 연결 검증
 
 Angular 브라우저에서 테스트 JWT를 사용해 실제 Rust API와 Docker PostgreSQL의 제한 DB 로그인으로 Resend 결과를 조회했다. 합성 충돌 이벤트 삽입 후 `unknown`과 충돌 안내가 표시되고, DB에서 조회 권한을 회수하면 재조회가 거절되며 이전 결과가 지워지는 것을 확인했다. 메뉴 이탈 시 토큰과 작업 ID도 지워졌다. 재현용 [격리된 테스트 환경 스크립트](apps/dashboard/swallow/scripts/preview-resend-fixture.sh)와 [실행 방법](apps/dashboard/swallow/README.md)을 추가했다.

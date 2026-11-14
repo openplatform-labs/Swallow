@@ -24,6 +24,7 @@ enum Lookup {
     PermissionAudit,
     PermissionChangeRequest,
     ResendResult,
+    ResendJobs,
 }
 
 fn authenticate(
@@ -127,6 +128,14 @@ pub(super) async fn resend_result(
 ) -> Response {
     query(db, headers, uri, verifier, Lookup::ResendResult).await
 }
+pub(super) async fn resend_jobs(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::ResendJobs).await
+}
 async fn query(
     db: Arc<Client>,
     headers: HeaderMap,
@@ -164,6 +173,7 @@ async fn query(
         Lookup::PermissionAudit => &["environmentId", "before"],
         Lookup::PermissionChangeRequest => &["environmentId", "requestId"],
         Lookup::ResendResult => &["environmentId", "jobId"],
+        Lookup::ResendJobs => &["environmentId", "after"],
     };
     if params.keys().any(|key| !allowed.contains(&key.as_str()))
         || params.get("limit").is_some_and(|limit| limit != "20")
@@ -180,6 +190,29 @@ async fn query(
         return failure(StatusCode::UNAUTHORIZED, "Unauthorized", "Unauthorized");
     };
     let result = match lookup {
+        Lookup::ResendJobs => {
+            let after = match params.get("after") {
+                None => None,
+                Some(value) => match Uuid::parse_str(value) {
+                    Ok(id) => Some(id),
+                    Err(_) => {
+                        return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+                    }
+                },
+            };
+            db.query_one(
+                "SELECT public.novu_rust_operator_jwt_resend_jobs($1,$2,$3,$4,$5,$6)",
+                &[
+                    &identity.issuer,
+                    &identity.subject,
+                    &identity.client_id,
+                    &env,
+                    &exp,
+                    &after,
+                ],
+            )
+            .await
+        }
         Lookup::ResendResult => {
             let Some(job) = params.get("jobId").and_then(|id| Uuid::parse_str(id).ok()) else {
                 return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
