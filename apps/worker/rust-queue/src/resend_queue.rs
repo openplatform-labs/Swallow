@@ -581,53 +581,57 @@ mod tests {
         assert_eq!(result.get::<_, String>(3), "prior-provider-id");
         assert_eq!(result.get::<_, String>(4), "unknown");
 
-        // The legacy policy remains selectable; use only a local mock endpoint.
-        let unguarded = Uuid::new_v4();
-        enqueue(
-            &db,
-            unguarded,
-            "env-a",
-            JOB_KIND,
-            &json!({"to":["to@example.test"],"subject":"Unguarded","html":"Hi"}),
-        )
-        .await
-        .unwrap();
-        db.execute("INSERT INTO novu_rust_delivery_reconciliations(id,environment_id,job_id,decision,operator_name,reason,retry_provider_message_id) VALUES ($1,'env-a',$2,'retry','operator','test','prior-provider-id')", &[&Uuid::new_v4(),&unguarded]).await.unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let provider = Resend::test_endpoint(
-            Config {
-                api_key: "re_test".into(),
-                from: "from@example.test".into(),
-                sender_name: String::new(),
-            },
-            &format!("http://{}/emails", listener.local_addr().unwrap()),
-        )
-        .unwrap();
-        let mock = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut bytes = Vec::new();
-            let mut buf = [0; 4096];
-            loop {
-                let n = socket.read(&mut buf).await.unwrap();
-                assert!(n > 0);
-                bytes.extend_from_slice(&buf[..n]);
-                if let Some(pos) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
-                    let headers = String::from_utf8_lossy(&bytes[..pos]);
-                    let length = headers
-                        .lines()
-                        .find_map(|line| {
-                            line.to_ascii_lowercase()
-                                .strip_prefix("content-length: ")
-                                .and_then(|v| v.parse::<usize>().ok())
-                        })
-                        .unwrap();
-                    if bytes.len() >= pos + 4 + length {
-                        break;
+        // A disabled guard permits the prior behavior; an unrelated event never blocks.
+        for (enabled, prior_id) in [
+            (false, "prior-provider-id"),
+            (true, "unrelated-provider-id"),
+        ] {
+            let unguarded = Uuid::new_v4();
+            enqueue(
+                &db,
+                unguarded,
+                "env-a",
+                JOB_KIND,
+                &json!({"to":["to@example.test"],"subject":"Unguarded","html":"Hi"}),
+            )
+            .await
+            .unwrap();
+            db.execute("INSERT INTO novu_rust_delivery_reconciliations(id,environment_id,job_id,decision,operator_name,reason,retry_provider_message_id) VALUES ($1,'env-a',$2,'retry','operator','test',$3)", &[&Uuid::new_v4(),&unguarded,&prior_id]).await.unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let provider = Resend::test_endpoint(
+                Config {
+                    api_key: "re_test".into(),
+                    from: "from@example.test".into(),
+                    sender_name: String::new(),
+                },
+                &format!("http://{}/emails", listener.local_addr().unwrap()),
+            )
+            .unwrap();
+            let mock = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0; 4096];
+                loop {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..pos]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .and_then(|v| v.parse::<usize>().ok())
+                            })
+                            .unwrap();
+                        if bytes.len() >= pos + 4 + length {
+                            break;
+                        }
                     }
                 }
-            }
-            let body = "{\"id\":\"mock-accepted\"}";
-            socket
+                let body = "{\"id\":\"mock-accepted\"}";
+                socket
                 .write_all(
                     format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -637,23 +641,27 @@ mod tests {
                 )
                 .await
                 .unwrap();
-        });
-        assert!(
-            process_one_with_retry_guard(&mut db, "env-a", &provider, false)
+            });
+            assert!(
+                process_one_with_retry_guard(&mut db, "env-a", &provider, enabled)
+                    .await
+                    .unwrap()
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(2), mock)
                 .await
                 .unwrap()
-        );
-        mock.await.unwrap();
-        assert_eq!(
-            db.query_one(
-                "SELECT status FROM novu_queue_jobs WHERE id=$1",
-                &[&unguarded]
-            )
-            .await
-            .unwrap()
-            .get::<_, String>(0),
-            "completed"
-        );
+                .unwrap();
+            assert_eq!(
+                db.query_one(
+                    "SELECT status FROM novu_queue_jobs WHERE id=$1",
+                    &[&unguarded]
+                )
+                .await
+                .unwrap()
+                .get::<_, String>(0),
+                "completed"
+            );
+        }
     }
 
     #[tokio::test]
