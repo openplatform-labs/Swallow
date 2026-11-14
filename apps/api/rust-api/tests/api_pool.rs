@@ -64,6 +64,20 @@ fn invalid_database_routing_is_rejected() {
         String::from_utf8_lossy(&output.stderr).contains("invalid API database routing policy")
     );
 }
+#[test]
+fn invalid_inflight_limits_are_rejected() {
+    for limit in ["-1", "1001", "bad"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_novu-rust-api"))
+            .env("DATABASE_URL", "postgres://localhost/unused")
+            .env("SWALLOW_API_MAX_INFLIGHT_PER_CONNECTION", limit)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("invalid API inflight limit"));
+    }
+}
 #[tokio::test]
 #[ignore = "requires fully migrated disposable PostgreSQL and curl"]
 async fn one_locked_connection_does_not_block_every_request_or_readiness() {
@@ -99,7 +113,11 @@ async fn one_locked_connection_does_not_block_every_request_or_readiness() {
         .env("LISTEN_ADDR", format!("127.0.0.1:{port}"))
         .env("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED", "true")
         .env("SWALLOW_API_DB_CONNECTIONS", "2")
-        .env("SWALLOW_API_DB_ROUTING", "least-inflight")
+        .env(
+            "SWALLOW_API_DB_ROUTING",
+            std::env::var("TEST_API_ROUTING").unwrap_or_else(|_| "least-inflight".into()),
+        )
+        .env("SWALLOW_API_MAX_INFLIGHT_PER_CONNECTION", "1")
         .env("SWALLOW_API_DB_HEALTH_INTERVAL_SECONDS", "30")
         .env("SWALLOW_API_DB_HEALTH_TIMEOUT_SECONDS", "2")
         .env_remove("SWALLOW_API_STRICT_SECURITY_CONFIG")
@@ -217,9 +235,32 @@ async fn one_locked_connection_does_not_block_every_request_or_readiness() {
         both_blocked,
         "concurrent requests did not use both connections"
     );
+    let busy = Command::new("curl")
+        .args([
+            "-s",
+            "-i",
+            "--max-time",
+            "1",
+            "-H",
+            &format!("Authorization: SwallowConsole {b}"),
+            &format!("http://127.0.0.1:{port}/v1/experimental/console/alerts"),
+        ])
+        .output()
+        .unwrap();
+    assert!(busy.status.success());
+    let response = String::from_utf8(busy.stdout).unwrap().to_ascii_lowercase();
+    assert!(response.contains("503 service unavailable"));
+    assert!(response.contains("retry-after: 1"));
+    assert!(response.contains("cache-control: no-store"));
+    assert!(response.contains("server busy"));
+    assert_eq!(http(port, "/health/live", None, "1"), Some(200));
     tx.commit().await.unwrap();
     assert_eq!(one.wait_with_output().unwrap().stdout, b"200");
     assert_eq!(two.wait_with_output().unwrap().stdout, b"200");
+    assert_eq!(
+        http(port, "/v1/experimental/console/alerts", Some(&b), "1"),
+        Some(200)
+    );
     assert!(
         Command::new("kill")
             .args(["-TERM", &server.0.id().to_string()])

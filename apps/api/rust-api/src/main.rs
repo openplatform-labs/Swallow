@@ -32,6 +32,12 @@ struct ActiveRequest {
     counts: Arc<Vec<AtomicUsize>>,
     slot: usize,
 }
+
+enum Selection {
+    Selected(Connected, ActiveRequest),
+    Busy,
+    Unavailable,
+}
 impl Drop for ActiveRequest {
     fn drop(&mut self) {
         self.counts[self.slot].fetch_sub(1, Ordering::Relaxed);
@@ -45,6 +51,7 @@ struct ApiState {
     inflight: Arc<Vec<AtomicUsize>>,
     selection: Arc<Mutex<()>>,
     routing: Routing,
+    max_inflight_per_connection: usize,
     timeout: Duration,
     draining: Arc<AtomicBool>,
 }
@@ -52,33 +59,49 @@ struct ApiState {
 impl ApiState {
     // Serialize selection and increments to avoid sending concurrent arrivals
     // to the same nominally idle connection. No lock is held across await.
-    fn select(&self) -> Option<(Connected, ActiveRequest)> {
-        let _selection = self.selection.lock().ok()?;
+    fn select(&self) -> Selection {
+        let Ok(_selection) = self.selection.lock() else {
+            return Selection::Unavailable;
+        };
         let len = self.connections.len();
         let start = self.next.fetch_add(1, Ordering::Relaxed) % len;
+        let mut connected = false;
         let available = (0..len).filter_map(|offset| {
             let index = (start + offset) % len;
-            self.connections[index]
+            let current = self.connections[index]
                 .read()
                 .ok()
                 .and_then(|guard| guard.clone())
-                .filter(|current| !current.db.is_closed())
-                .map(|current| (index, current))
+                .filter(|current| !current.db.is_closed())?;
+            connected = true;
+            if self.max_inflight_per_connection != 0
+                && self.inflight[index].load(Ordering::Relaxed) >= self.max_inflight_per_connection
+            {
+                return None;
+            }
+            Some((index, current))
         });
         let selected = match self.routing {
             Routing::RoundRobin => available.into_iter().next(),
-            Routing::LeastInflight => available
-                .into_iter()
-                .min_by_key(|(index, _)| self.inflight[*index].load(Ordering::Relaxed)),
-        }?;
+            Routing::LeastInflight => {
+                available.min_by_key(|(index, _)| self.inflight[*index].load(Ordering::Relaxed))
+            }
+        };
+        let Some(selected) = selected else {
+            return if connected {
+                Selection::Busy
+            } else {
+                Selection::Unavailable
+            };
+        };
         self.inflight[selected.0].fetch_add(1, Ordering::Relaxed);
-        Some((
+        Selection::Selected(
             selected.1,
             ActiveRequest {
                 counts: self.inflight.clone(),
                 slot: selected.0,
             },
-        ))
+        )
     }
 }
 
@@ -93,11 +116,20 @@ async fn forward(State(shared): State<ApiState>, request: Request) -> Response {
     }
     let current = shared.select();
     match current {
-        Some((current, _active)) => match current.router.oneshot(request).await {
+        Selection::Selected(current, _active) => match current.router.oneshot(request).await {
             Ok(response) => response,
             Err(never) => match never {},
         },
-        None => (
+        Selection::Busy => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [
+                (header::CACHE_CONTROL, "no-store"),
+                (header::RETRY_AFTER, "1"),
+            ],
+            Json(serde_json::json!({"message":"Server busy","statusCode":503})),
+        )
+            .into_response(),
+        Selection::Unavailable => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"message":"Database unavailable","statusCode":503})),
         )
@@ -291,6 +323,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok("least-inflight") => Routing::LeastInflight,
         _ => return Err("invalid API database routing policy".into()),
     };
+    let max_inflight_per_connection: usize =
+        match std::env::var("SWALLOW_API_MAX_INFLIGHT_PER_CONNECTION") {
+            Ok(value) => value.parse().map_err(|_| "invalid API inflight limit")?,
+            Err(std::env::VarError::NotPresent) => 0,
+            Err(_) => return Err("invalid API inflight limit".into()),
+        };
+    if max_inflight_per_connection > 1000 {
+        return Err("invalid API inflight limit".into());
+    }
     let health_endpoints = match std::env::var("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED").as_deref() {
         Ok("true") => true,
         Ok("false") | Err(std::env::VarError::NotPresent) => false,
@@ -308,6 +349,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         inflight: Arc::new((0..connections).map(|_| AtomicUsize::new(0)).collect()),
         selection: Arc::new(Mutex::new(())),
         routing,
+        max_inflight_per_connection,
         timeout,
         draining: Arc::new(AtomicBool::new(false)),
     };
