@@ -1205,6 +1205,61 @@ mod tests {
             .get::<_, i64>(0),
             1
         );
+        db.batch_execute("INSERT INTO novu_rust_environments VALUES ('push-unknown','org'); INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id) VALUES ('push-unknown','alice','alice-id'); INSERT INTO novu_rust_workflows(environment_id,identifier,active,has_steps,push_step_active,push_title,push_content,inbox_metadata) VALUES ('push-unknown','wf',true,true,true,'title','content','{\"id\":\"workflow-id\"}'); INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'push-unknown',session_user,'accepted',oid FROM pg_roles WHERE rolname=session_user").await.unwrap();
+        let uncertain = Uuid::new_v4();
+        let mut uncertain_payload = payload.clone();
+        for item in uncertain_payload["prepared_context"]["target_metadata"]
+            .as_array_mut()
+            .unwrap()
+        {
+            item["message_id"] = "uncertain-message".into();
+        }
+        crate::enqueue(&db, uncertain, "push-unknown", JOB_KIND, &uncertain_payload)
+            .await
+            .unwrap();
+        let (provider, server) = mock(vec![500]).await;
+        assert!(
+            process_one_with_policy(
+                &mut db,
+                "push-unknown",
+                Some(&provider),
+                None,
+                false,
+                crate::push_step_policy::Policy::Active
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(server.await.unwrap(), vec!["a"]);
+        db.execute("UPDATE novu_rust_workflows SET push_step_active=false WHERE environment_id='push-unknown' AND identifier='wf'",&[]).await.unwrap();
+        assert!(
+            process_one_with_policy(
+                &mut db,
+                "push-unknown",
+                Some(&provider),
+                None,
+                false,
+                crate::push_step_policy::Policy::Active
+            )
+            .await
+            .unwrap()
+        );
+        crate::reconciliation::resolve_cancelled_push(
+            &db,
+            "push-unknown",
+            uncertain,
+            1,
+            0,
+            "accepted",
+            "operator",
+            "verified",
+        )
+        .await
+        .unwrap();
+        let row=db.query_one("SELECT j.status,a.state,a.operator_resolution FROM novu_queue_jobs j JOIN novu_rust_fcm_attempts a ON a.job_id=j.id WHERE j.id=$1", &[&uncertain]).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), "cancelled");
+        assert_eq!(row.get::<_, String>(1), "accepted");
+        assert_eq!(row.get::<_, String>(2), "accepted");
         let row = db
             .query_one(
                 "SELECT status,delivery_state FROM novu_rust_push_messages WHERE push_job_id=$1",

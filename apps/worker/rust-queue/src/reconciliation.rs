@@ -176,6 +176,50 @@ pub async fn push_policy_evidence(
     )
 }
 
+/// Resolve one unknown attempt of a policy-cancelled push without resuming it.
+#[allow(clippy::too_many_arguments)] // Mirrors the explicit, audited database operation.
+pub async fn resolve_cancelled_push(
+    client: &Client,
+    environment: &str,
+    job: Uuid,
+    revision: i64,
+    target: i32,
+    decision: &str,
+    operator: &str,
+    reason: &str,
+) -> Result<()> {
+    client
+        .query_one(
+            "SELECT public.novu_rust_resolve_cancelled_push($1,$2,$3,$4,$5,$6,$7)",
+            &[
+                &environment,
+                &job,
+                &revision,
+                &target,
+                &decision,
+                &operator,
+                &reason,
+            ],
+        )
+        .await?;
+    Ok(())
+}
+pub async fn list_cancelled_push_resolutions(
+    client: &Client,
+    environment: &str,
+    job: Uuid,
+    revision: i64,
+    after: i32,
+) -> Result<Vec<Value>> {
+    let rows = client
+        .query(
+            "SELECT * FROM public.novu_rust_list_cancelled_push_resolutions($1,$2,$3,$4)",
+            &[&environment, &job, &revision, &after],
+        )
+        .await?;
+    Ok(rows.into_iter().map(|r|json!({"targetIndex":r.get::<_,i32>(0),"decision":r.get::<_,String>(1),"createdAt":r.get::<_,String>(2),"revision":r.get::<_,String>(3)})).collect())
+}
+
 /// Count failed queue jobs not acknowledged for their current snapshot.
 pub async fn failed_queue_count(client: &Client, environment: &str) -> Result<i64> {
     Ok(client

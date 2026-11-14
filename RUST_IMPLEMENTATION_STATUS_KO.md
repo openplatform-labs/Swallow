@@ -3,6 +3,16 @@
 > 기준: 원본 Novu 커밋 `895388f37efe9e06de0aa333e5727303e6ad6853` · 작성: 2026-11-12.
 > **현재 구현은 실험용이며 Novu와 100% 호환되지 않는다. 운영에 사용하거나 기존 Novu의 대체품으로 배포하지 않는다.**
 
+### 정책 취소 푸시의 불명 대상 수동 판정 (워커 0126)
+
+푸시 작업이 정책으로 취소되기 전에 발송 결과가 불명인 대상이 남을 수 있다. 범위 제한 `SWALLOW_MONITOR_SCOPED_ACCESS=true`와 `public.novu_rust_list_unknown_attempts(text,uuid,integer)` 실행 및 `alert_view` 권한을 사용한 `delivery-reconcile list ENV`에서 해당 대상 인덱스를, `list-channel-policy ENV push`에서 취소 revision을 확인하고 실제 공급자 증거를 별도로 조사한 뒤 `resolve-cancelled-push ENV JOB REVISION TARGET accepted|not_accepted OPERATOR REASON`으로 판단을 기록한다. 두 선택 모두 작업을 취소 상태로 두고 다른 대상을 발송·재시도하지 않는다. 기존 0107의 실패 작업 재처리 명령은 이 취소 작업을 처리하지 않는다.
+
+`accepted`는 운영자의 공급자 접수 판단이며 기기 수신 확인이 아니다. `not_accepted`는 운영자의 미접수 판단이다. 기존 상태 체계와 호환하기 위해 각각 시도 상태를 `accepted`와 `rejected`로 저장하지만 새 `operator_resolution` 열과 감사 기록에 판단의 출처를 명시한다. 따라서 일반 결과 집계의 accepted·rejected에는 공급자의 실제 응답과 운영자 판단이 섞인다. `list-cancelled-push-resolutions ENV JOB REVISION [AFTER_TARGET]`은 현재 시도에 적용된 판단의 대상·종류·시각과 판단 당시 revision을 최대 100개씩 반환하며 입력한 운영자명·사유·자격증명은 반환하지 않는다. 재취소로 revision이 바뀌면 이전 요청은 거절되며 새 revision으로 조회하면 현재 시도에 적용 중인 이전 판단도 볼 수 있다. 감사 테이블에는 DB 로그인·운영자 입력·사유·기존 HTTP 상태와 revision이 기록된다.
+
+0126 적용 후 판정 DB 로그인에 `public.novu_rust_resolve_cancelled_push(text,uuid,bigint,integer,text,text,text)` 실행 권한과 해당 환경의 `accepted` 또는 `retry` 권한이 각각 필요하다. `retry` 권한은 미접수 판정을 보호하는 기존 권한이며 이 명령이 자동 재시도한다는 뜻은 아니다. 목록에는 `public.novu_rust_list_cancelled_push_resolutions(text,uuid,bigint,integer)` 실행 및 `alert_view`가 필요하다. 대상이 불명 상태가 아니거나 취소 revision이 바뀌면 거절한다. 권한·작업·대상 잠금과 감사 삽입·시도 갱신은 원자적이며 감사 실패 시 롤백한다. 확인 정보는 운영자가 입력한 주장으로 독립적인 공급자 확인이 필요하고 운영자명은 인증된 개인 ID가 아니다. 직접 DB 변경과 감사 테이블·함수 소유자를 보호한다. 감사 행의 작업 외래 키 때문에 해당 작업 삭제는 감사 보존 정책에 따라 차단될 수 있다. 부분 발송 메시지의 기존 그룹별 `error`/`unknown` 표시는 변경하지 않으므로 판단 후에도 남을 수 있다. 자동 재발송이나 나머지 대상 재개는 미구현이다. 0126은 기존 시도 테이블에 열과 제약을 추가해 마이그레이션 잠금·검사 비용이 생긴다.
+
+Docker PostgreSQL에서 모의 FCM 불명 응답→다음 대상 취소→판정 경로와 제한 로그인, 두 판단, 환경 격리, 오래된 revision, 중복·동시 판단, 권한 회수 경합, 감사 삽입 실패 롤백 및 CLI를 검증했다. 최종 목록의 이전 revision 판단 조회는 Docker 엔진 장애 때문에 격리 로컬 PostgreSQL 17.12에서 검증했다. 실제 공급자 확인·수신, 운영 부하, Novu와 이 운영 확장의 호환성은 검증하지 않았다.
+
 ### 푸시 정책 취소 경보와 부분 발송 확인 (워커 0125)
 
 워커 0125는 이메일·SMS 정책 취소 감시·확인에 FCM 푸시를 추가한다. `check-channel-policy ENV push`, `list-channel-policy ENV push [AFTER_JOB]`, `ack-channel-policy ENV JOB REVISION OPERATOR REASON`으로 조회·확인할 수 있다. `all`에도 푸시가 추가된다. 선택형 `SWALLOW_ALERT_PUSH_POLICY_CANCELLED_ENABLED=true`는 푸시 건수를 기존 Slack·이메일 경보에 포함하며 기본값은 false다. 이메일·SMS 감시 설정과 독립적이다. 0125와 새 경보·운영 도구를 배포해야 하며 구버전 경보 도구는 푸시 항목을 감시하지 않는다. `alert_view`·`queue_ack`와 기존 함수의 실행 권한은 0122·0123 설명과 같다.
