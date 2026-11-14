@@ -135,6 +135,59 @@ pub async fn health(
         serde_json::json!({"unknownAttempts":row.get::<_,i64>(0),"rejectedAttempts":row.get::<_,i64>(1),"strandedDispatches":row.get::<_,i64>(2),"preDispatchFailures":row.get::<_,i64>(4),"missingEndpoints":row.get::<_,i64>(5)}),
     )
 }
+/// List the same Slack attention categories as health, without payloads or error text.
+/// The UUID cursor is exclusive; each page contains at most 100 jobs.
+pub async fn list_attention(
+    client: &Client,
+    environment: &str,
+    after: Option<Uuid>,
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+    if environment.trim().is_empty() {
+        return Err("environment required".into());
+    }
+    if client
+        .query_opt(
+            "SELECT 1 FROM novu_rust_environments WHERE id=$1",
+            &[&environment],
+        )
+        .await?
+        .is_none()
+    {
+        return Err("environment not found".into());
+    }
+    let rows = client.query(r#"
+        SELECT j.id, j.kind, j.status, j.attempts, a.http_status,
+          CASE
+            WHEN a.state='unknown' THEN 'unknownAttempt'
+            WHEN a.state='rejected' THEN 'rejectedAttempt'
+            WHEN a.state='dispatching' AND (j.status<>'running' OR j.lease_until<=statement_timestamp()) THEN 'strandedDispatch'
+            WHEN j.status='failed' THEN 'preDispatchFailure'
+            ELSE 'missingEndpoint'
+          END AS category
+        FROM novu_queue_jobs j
+        LEFT JOIN novu_rust_slack_attempts a ON a.job_id=j.id AND a.environment_id=j.environment_id
+        WHERE j.environment_id=$1 AND ($2::uuid IS NULL OR j.id>$2) AND (
+          (j.kind=ANY($3) AND (a.state IN ('unknown','rejected') OR
+            (a.state='dispatching' AND (j.status<>'running' OR j.lease_until<=statement_timestamp()))))
+          OR (j.kind=ANY($4) AND j.status='failed' AND j.last_error IS NOT NULL
+            AND NOT EXISTS(SELECT 1 FROM novu_rust_slack_attempts x WHERE x.job_id=j.id)
+            AND NOT EXISTS(SELECT 1 FROM novu_rust_slack_workflow_acknowledgements z WHERE z.environment_id=j.environment_id AND z.job_id=j.id AND z.job_attempts=j.attempts AND z.job_status=j.status AND z.job_error=j.last_error))
+          OR (j.kind=$5 AND j.status='cancelled' AND j.last_error='no Slack endpoints'
+            AND NOT EXISTS(SELECT 1 FROM novu_rust_slack_workflow_acknowledgements z WHERE z.environment_id=j.environment_id AND z.job_id=j.id AND z.job_attempts=j.attempts AND z.job_status=j.status AND z.job_error=j.last_error))
+        ) ORDER BY j.id LIMIT 100
+    "#, &[&environment, &after, &vec![JOB_KIND,crate::slack_webhook_queue::JOB_KIND,crate::slack_workflow::DELIVERY_KIND], &vec![crate::slack_workflow::FANOUT_KIND,crate::slack_workflow::DELIVERY_KIND], &crate::slack_workflow::FANOUT_KIND]).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "jobId":row.get::<_,Uuid>(0).to_string(), "kind":row.get::<_,String>(1),
+                "jobStatus":row.get::<_,String>(2), "attempts":row.get::<_,i32>(3),
+                "httpStatus":row.get::<_,Option<i32>>(4), "category":row.get::<_,String>(5)
+            })
+        })
+        .collect())
+}
+
 async fn claim(client: &Client, environment: &str) -> Result<Option<ClaimedJob>, Error> {
     let token = Uuid::new_v4();
     let row=client.query_opt("WITH candidate AS (SELECT id FROM novu_queue_jobs WHERE environment_id=$1 AND kind=$2 AND status='pending' AND available_at<=now() ORDER BY available_at,created_at,id FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE novu_queue_jobs j SET status='running',attempts=j.attempts+1,lease_token=$3,lease_until=clock_timestamp()+interval '60 seconds' FROM candidate WHERE j.id=candidate.id RETURNING j.id,j.environment_id,j.kind,j.payload,j.attempts", &[&environment,&JOB_KIND,&token]).await?;

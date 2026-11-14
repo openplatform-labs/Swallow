@@ -85,6 +85,37 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
     assert_eq!(health["preDispatchFailures"], 1);
     assert_eq!(health["missingEndpoints"], 1);
     assert_eq!(health["unknownAttempts"], 1);
+    let listed = slack_queue::list_attention(&db, "a", None).await.unwrap();
+    assert_eq!(listed.len(), 3);
+    for (id, category) in [
+        (failed, "preDispatchFailure"),
+        (missing, "missingEndpoint"),
+        (attempted, "unknownAttempt"),
+    ] {
+        assert!(
+            listed
+                .iter()
+                .any(|row| row["jobId"] == id.to_string() && row["category"] == category)
+        );
+    }
+    assert!(
+        !serde_json::to_string(&listed)
+            .unwrap()
+            .contains("fixture-sensitive")
+    );
+    assert_eq!(
+        slack_queue::list_attention(&db, "b", None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        slack_queue::list_attention(&db, "absent", None)
+            .await
+            .is_err()
+    );
+
     assert!(
         slack_queue::acknowledge_workflow(&mut db, "a", failed, "operator", "ticket")
             .await
@@ -163,6 +194,11 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
     )
     .await
     .unwrap();
+    let listed_cli = cli(&["list-slack", "a"], false);
+    assert!(listed_cli.status.success());
+    let listed_cli: serde_json::Value = serde_json::from_slice(&listed_cli.stdout).unwrap();
+    assert_eq!(listed_cli.as_array().unwrap().len(), 1);
+    assert_eq!(listed_cli[0]["jobId"], missing.to_string());
     assert_eq!(cli(&["check-slack", "a"], false).status.code(), Some(0));
     assert_eq!(cli(&["check-slack", "a"], true).status.code(), Some(2));
     db.execute("INSERT INTO novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES ('a','slack','ops','rejected')",&[]).await.unwrap();
@@ -273,6 +309,55 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
     let records=db.query_one("SELECT count(*),bool_and(database_session_user=session_user) FROM novu_rust_slack_workflow_acknowledgements WHERE environment_id='a'",&[]).await.unwrap();
     assert_eq!(records.get::<_, i64>(0), 4);
     assert!(records.get::<_, bool>(1));
+    db.execute(
+        "INSERT INTO novu_rust_environments VALUES ('pagination','org')",
+        &[],
+    )
+    .await
+    .unwrap();
+    for i in 1..=101u128 {
+        let id = Uuid::from_u128(i);
+        queue::enqueue(
+            &db,
+            id,
+            "pagination",
+            slack_workflow::DELIVERY_KIND,
+            &json!({}),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "UPDATE novu_queue_jobs SET status='failed',last_error='sensitive failure' WHERE id=$1",
+            &[&id],
+        )
+        .await
+        .unwrap();
+    }
+    let first = slack_queue::list_attention(&db, "pagination", None)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 100);
+    let cursor = Uuid::parse_str(first[99]["jobId"].as_str().unwrap()).unwrap();
+    let second = slack_queue::list_attention(&db, "pagination", Some(cursor))
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0]["jobId"], Uuid::from_u128(101).to_string());
+    assert!(
+        !serde_json::to_string(&first)
+            .unwrap()
+            .contains("sensitive failure")
+    );
+    let page = cli(&["list-slack", "pagination", &cursor.to_string()], false);
+    assert!(page.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&page.stdout)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     let text = serde_json::to_string(&slack_queue::health(&db, "a").await.unwrap()).unwrap();
     assert!(!text.contains("fixture-sensitive"));
 }

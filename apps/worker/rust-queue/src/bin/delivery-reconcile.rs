@@ -6,7 +6,7 @@ use uuid::Uuid;
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if ![2, 3, 4, 5, 6, 7].contains(&args.len()) {
-        return Err("usage: delivery-reconcile slack-ack ENV JOB OPERATOR REASON | operator-grant|operator-revoke ENV DB_LOGIN PERMISSION REASON | check|check-slack ENV | slack-resolve ENV JOB retry|accepted OPERATOR REASON | check-alert-delivery ENV | alert-status ENV | alert-resolve ENV CHANNEL TARGET DECISION OPERATOR REASON | check-queue ENV MAX_WAIT_SECONDS | check-resend|check-resend-metrics|check-twilio|check-twilio-metrics ENV GRACE_SECONDS HEARTBEAT_MAX_SECONDS | list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | email-dispatch-evidence ENV EMAIL_JOB | resend-evidence|resend-check ENV EMAIL_JOB | sms-evidence|sms-delivery ENV SMS_JOB | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
+        return Err("usage: delivery-reconcile list-slack ENV [AFTER_JOB] | slack-ack ENV JOB OPERATOR REASON | operator-grant|operator-revoke ENV DB_LOGIN PERMISSION REASON | check|check-slack ENV | slack-resolve ENV JOB retry|accepted OPERATOR REASON | check-alert-delivery ENV | alert-status ENV | alert-resolve ENV CHANNEL TARGET DECISION OPERATOR REASON | check-queue ENV MAX_WAIT_SECONDS | check-resend|check-resend-metrics|check-twilio|check-twilio-metrics ENV GRACE_SECONDS HEARTBEAT_MAX_SECONDS | list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | email-dispatch-evidence ENV EMAIL_JOB | resend-evidence|resend-check ENV EMAIL_JOB | sms-evidence|sms-delivery ENV SMS_JOB | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
     }
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let (mut db, connection) = config.connect(tls).await?;
@@ -15,7 +15,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             eprintln!("database connection failed");
         }
     });
-    if args.len() == 5 && args[0] == "slack-ack" {
+    if (args.len() == 2 || args.len() == 3) && args[0] == "list-slack" {
+        let after = args.get(2).map(|s| Uuid::parse_str(s)).transpose()?;
+        let rows = novu_postgres_queue::slack_queue::list_attention(&db, &args[1], after).await?;
+        println!("{}", serde_json::to_string(&rows)?);
+    } else if args.len() == 5 && args[0] == "slack-ack" {
         let changed = novu_postgres_queue::slack_queue::acknowledge_workflow(
             &mut db,
             &args[1],
