@@ -49,7 +49,7 @@ INSERT INTO novu_rust_workflows(environment_id,identifier,active,has_steps,push_
 INSERT INTO novu_rust_fcm_integrations(environment_id,internal_id,identifier,active) VALUES ('64a000000000000000000002','64a000000000000000000063','fixture-fcm',true);
 ''')
 
-all_cases=('change_tokens','remove_token','readd_token','same_tokens','recreate_subscriber','delete_subscriber')
+all_cases=('change_tokens','remove_token','readd_token','same_tokens','same_tokens_patch','recreate_subscriber','delete_subscriber')
 cases=os.environ.get('TEST_PUSH_RACE_CASES',','.join(all_cases)).split(',')
 assert cases and all(case in all_cases for case in cases),cases
 for case in cases:
@@ -99,7 +99,24 @@ for case in cases:
             for index,base in enumerate(bases):
                 if case=='change_tokens':tokens(base,subscriber,[good,token])
                 elif case=='remove_token':tokens(base,subscriber,[good])
-                elif case=='same_tokens':tokens(base,subscriber,[token])
+                elif case=='same_tokens':
+                    if base==bases[1] and os.environ.get('SWALLOW_FCM_REASSERT_REGISTRATION')=='true':
+                        run('docker','exec',pg,'psql','-v','ON_ERROR_STOP=1','-U','postgres','-d','novu_compat','-c','ALTER TABLE novu_rust_fcm_devices DISABLE TRIGGER novu_rust_fcm_device_cleanup_generation')
+                        try:
+                            status,_=request(base,'PUT','/v1/subscribers/'+subscriber+'/credentials',{'providerId':'fcm','credentials':{'deviceTokens':[token]}})
+                            assert status==503,status
+                        finally:
+                            run('docker','exec',pg,'psql','-v','ON_ERROR_STOP=1','-U','postgres','-d','novu_compat','-c','ALTER TABLE novu_rust_fcm_devices ENABLE TRIGGER novu_rust_fcm_device_cleanup_generation')
+                        run('docker','exec',pg,'psql','-v','ON_ERROR_STOP=1','-U','postgres','-d','novu_compat','-c',"CREATE FUNCTION public.test_fcm_skip_update() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$; CREATE TRIGGER zz_test_fcm_skip_update BEFORE UPDATE ON novu_rust_fcm_devices FOR EACH ROW EXECUTE FUNCTION public.test_fcm_skip_update()")
+                        try:
+                            status,_=request(base,'PUT','/v1/subscribers/'+subscriber+'/credentials',{'providerId':'fcm','credentials':{'deviceTokens':[token]}})
+                            assert status==500,status
+                        finally:
+                            run('docker','exec',pg,'psql','-v','ON_ERROR_STOP=1','-U','postgres','-d','novu_compat','-c','DROP TRIGGER zz_test_fcm_skip_update ON novu_rust_fcm_devices; DROP FUNCTION public.test_fcm_skip_update()')
+                    tokens(base,subscriber,[token])
+                elif case=='same_tokens_patch':
+                    status,_=request(base,'PATCH','/v1/subscribers/'+subscriber+'/credentials',{'providerId':'fcm','credentials':{'deviceTokens':[token]}})
+                    assert status==200,status
                 elif case=='readd_token':
                     tokens(base,subscriber,[])
                     tokens(base,subscriber,[token,good])
@@ -141,9 +158,10 @@ for case in cases:
             assert status==404,(base,status,body)
         else:
             expected=[token,good] if case=='recreate_subscriber' else [good]
-            if case=='same_tokens': expected=[]
+            if case in ('same_tokens','same_tokens_patch'): expected=[]
             if os.environ.get('TEST_PUSH_CLEANUP_GUARD')=='version' and base==bases[1]:
                 if case=='change_tokens': expected=[good,token]
                 if case=='readd_token': expected=[token,good]
+                if case in ('same_tokens','same_tokens_patch') and os.environ.get('SWALLOW_FCM_REASSERT_REGISTRATION')=='true': expected=[token]
             assert status==200 and body['data']['channels'][0]['credentials']['deviceTokens']==expected,(case,base,status,body,expected)
     print(case+': in-flight invalid-token cleanup verified')

@@ -1,6 +1,7 @@
 //! Experimental FCM-only subscriber credential endpoints.
-use super::{ApiError, authenticate, error_at, subscriber_entity_response};
+use super::{ApiError, FcmRegistrationPolicy, authenticate, error_at, subscriber_entity_response};
 use axum::{
+    Extension,
     body::Bytes,
     extract::{OriginalUri, Path, State},
     http::{HeaderMap, Method, StatusCode},
@@ -35,6 +36,7 @@ pub(super) async fn attach(
 
 pub(super) async fn update(
     State(db): State<Arc<Client>>,
+    Extension(registration): Extension<FcmRegistrationPolicy>,
     headers: HeaderMap,
     Path(subscriber): Path<String>,
     OriginalUri(uri): OriginalUri,
@@ -161,8 +163,19 @@ pub(super) async fn update(
     };
     let integration: String = found.get(0);
     let replace = method == Method::PUT;
+    if registration.0 {
+        let guard = db.query_opt("SELECT 1 FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_proc p ON p.oid=t.tgfoid WHERE t.tgrelid=to_regclass('public.novu_rust_fcm_devices') AND t.tgname='novu_rust_fcm_device_cleanup_generation' AND NOT t.tgisinternal AND (t.tgenabled='A' OR (t.tgenabled='O' AND current_setting('session_replication_role')<>'replica')) AND p.oid=to_regprocedure('public.novu_rust_bump_fcm_device_cleanup_generation()') AND EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a WHERE a.attrelid=t.tgrelid AND a.attname='cleanup_generation' AND NOT a.attisdropped AND a.atttypid='uuid'::regtype)", &[]).await;
+        if !matches!(guard, Ok(Some(_))) {
+            return error_at(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "FCM registration protection unavailable",
+                "Service Unavailable",
+                &path,
+            );
+        }
+    }
     for _ in 0..4 {
-        let row=db.query_opt("WITH fcm_guard AS MATERIALIZED (SELECT 1 WHERE public.novu_rust_lock_active_fcm_integration($1,$4,$6)), target AS MATERIALIZED (SELECT s.environment_id,s.subscriber_id FROM novu_rust_subscribers s CROSS JOIN fcm_guard WHERE s.environment_id=$1 AND s.subscriber_id=$2 FOR UPDATE OF s), incoming AS MATERIALIZED (SELECT COALESCE(array_agg(v ORDER BY first_pos),'{}'::text[]) AS tokens FROM (SELECT v,min(pos) AS first_pos FROM unnest($3::text[]) WITH ORDINALITY AS x(v,pos) GROUP BY v) dedup), written AS (INSERT INTO novu_rust_fcm_devices AS d(environment_id,subscriber_id,device_tokens,integration_internal_id) SELECT target.environment_id,target.subscriber_id,incoming.tokens,$4 FROM target CROSS JOIN incoming WHERE cardinality(incoming.tokens)<=100 ON CONFLICT(environment_id,subscriber_id,integration_internal_id) WHERE integration_internal_id IS NOT NULL DO UPDATE SET device_tokens=(SELECT COALESCE(array_agg(v ORDER BY first_pos),'{}'::text[]) FROM (SELECT v,min(pos) AS first_pos FROM unnest(CASE WHEN $5::boolean OR cardinality(EXCLUDED.device_tokens)=0 THEN EXCLUDED.device_tokens ELSE d.device_tokens || EXCLUDED.device_tokens END) WITH ORDINALITY AS x(v,pos) GROUP BY v) dedup),integration_internal_id=EXCLUDED.integration_internal_id WHERE (SELECT count(DISTINCT v) FROM unnest(CASE WHEN $5::boolean OR cardinality(EXCLUDED.device_tokens)=0 THEN EXCLUDED.device_tokens ELSE d.device_tokens || EXCLUDED.device_tokens END) AS x(v))<=100 AND (d.integration_internal_id IS DISTINCT FROM EXCLUDED.integration_internal_id OR d.device_tokens IS DISTINCT FROM EXCLUDED.device_tokens) RETURNING 1), changed AS (UPDATE novu_rust_subscribers s SET updated_at=now() FROM target WHERE s.environment_id=target.environment_id AND s.subscriber_id=target.subscriber_id AND EXISTS(SELECT 1 FROM written) RETURNING s.*) SELECT changed.internal_id,changed.profile,e.organization_id,to_char(changed.created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),to_char(changed.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),changed.is_online,to_char(changed.last_online_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS last_online_at FROM changed JOIN novu_rust_environments e ON e.id=changed.environment_id",&[&env,&subscriber,&tokens,&integration,&replace,&identifier]).await;
+        let row=db.query_opt("WITH fcm_guard AS MATERIALIZED (SELECT 1 WHERE public.novu_rust_lock_active_fcm_integration($1,$4,$6)), target AS MATERIALIZED (SELECT s.environment_id,s.subscriber_id FROM novu_rust_subscribers s CROSS JOIN fcm_guard WHERE s.environment_id=$1 AND s.subscriber_id=$2 FOR UPDATE OF s), incoming AS MATERIALIZED (SELECT COALESCE(array_agg(v ORDER BY first_pos),'{}'::text[]) AS tokens FROM (SELECT v,min(pos) AS first_pos FROM unnest($3::text[]) WITH ORDINALITY AS x(v,pos) GROUP BY v) dedup), written AS (INSERT INTO novu_rust_fcm_devices AS d(environment_id,subscriber_id,device_tokens,integration_internal_id) SELECT target.environment_id,target.subscriber_id,incoming.tokens,$4 FROM target CROSS JOIN incoming WHERE cardinality(incoming.tokens)<=100 ON CONFLICT(environment_id,subscriber_id,integration_internal_id) WHERE integration_internal_id IS NOT NULL DO UPDATE SET device_tokens=(SELECT COALESCE(array_agg(v ORDER BY first_pos),'{}'::text[]) FROM (SELECT v,min(pos) AS first_pos FROM unnest(CASE WHEN $5::boolean OR cardinality(EXCLUDED.device_tokens)=0 THEN EXCLUDED.device_tokens ELSE d.device_tokens || EXCLUDED.device_tokens END) WITH ORDINALITY AS x(v,pos) GROUP BY v) dedup),integration_internal_id=EXCLUDED.integration_internal_id WHERE (SELECT count(DISTINCT v) FROM unnest(CASE WHEN $5::boolean OR cardinality(EXCLUDED.device_tokens)=0 THEN EXCLUDED.device_tokens ELSE d.device_tokens || EXCLUDED.device_tokens END) AS x(v))<=100 AND ($7::boolean OR d.integration_internal_id IS DISTINCT FROM EXCLUDED.integration_internal_id OR d.device_tokens IS DISTINCT FROM EXCLUDED.device_tokens) RETURNING 1), changed AS (UPDATE novu_rust_subscribers s SET updated_at=now() FROM target WHERE s.environment_id=target.environment_id AND s.subscriber_id=target.subscriber_id AND EXISTS(SELECT 1 FROM written) RETURNING s.*) SELECT changed.internal_id,changed.profile,e.organization_id,to_char(changed.created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),to_char(changed.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),changed.is_online,to_char(changed.last_online_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS last_online_at FROM changed JOIN novu_rust_environments e ON e.id=changed.environment_id",&[&env,&subscriber,&tokens,&integration,&replace,&identifier,&registration.0]).await;
         match row {
             Ok(Some(row)) => {
                 return attach(
@@ -190,7 +203,7 @@ pub(super) async fn update(
                             &path,
                         );
                     }
-                    Ok(Some(row)) if row.get::<_, bool>(7) => {
+                    Ok(Some(row)) if row.get::<_, bool>(7) && !registration.0 => {
                         return attach(
                             &db,
                             &env,

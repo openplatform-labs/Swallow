@@ -48,6 +48,8 @@ pub const SNOOZE_POLICY_MIGRATION: &str =
 struct InboxHmacKeys(HashMap<String, Vec<String>>);
 #[derive(Clone, Copy)]
 struct InboxJwtPolicy(bool);
+#[derive(Clone, Copy)]
+struct FcmRegistrationPolicy(bool);
 
 /// Matches the reference's txn_ + 4-byte Unix-seconds hex + 12 base36 characters.
 fn generate_transaction_id() -> Option<String> {
@@ -78,6 +80,7 @@ pub struct RuntimeConfig {
     twilio: Option<twilio_webhook::Config>,
     resend: Option<resend_webhook::Config>,
     require_jwt_exp: bool,
+    reassert_fcm_registration: bool,
 }
 impl RuntimeConfig {
     pub fn from_env() -> Self {
@@ -100,6 +103,12 @@ impl RuntimeConfig {
             Ok("false") | Err(std::env::VarError::NotPresent) => false,
             _ => return Err(invalid()),
         };
+        let reassert_fcm_registration =
+            match std::env::var("SWALLOW_FCM_REASSERT_REGISTRATION").as_deref() {
+                Ok("true") => true,
+                Ok("false") | Err(std::env::VarError::NotPresent) => false,
+                _ => return Err(invalid()),
+            };
         let required = match std::env::var("SWALLOW_API_REQUIRED_SECURITY") {
             Ok(value) => {
                 let mut items = std::collections::HashSet::new();
@@ -192,6 +201,7 @@ impl RuntimeConfig {
             twilio,
             resend,
             require_jwt_exp,
+            reassert_fcm_registration,
         })
     }
     pub fn router(&self, db: Arc<Client>) -> Router {
@@ -202,6 +212,7 @@ impl RuntimeConfig {
             self.twilio.clone(),
             self.resend.clone(),
             self.require_jwt_exp,
+            self.reassert_fcm_registration,
         )
     }
 }
@@ -220,7 +231,15 @@ pub fn router_with_subscriber_secret_and_exp_policy(
     secret: Option<Vec<u8>>,
     require_exp: bool,
 ) -> Router {
-    router_with_webhook_configs_and_jwt_policy(db, secret, HashMap::new(), None, None, require_exp)
+    router_with_webhook_configs_and_jwt_policy(
+        db,
+        secret,
+        HashMap::new(),
+        None,
+        None,
+        require_exp,
+        false,
+    )
 }
 
 pub fn router_with_session_keys(
@@ -247,7 +266,7 @@ pub fn router_with_webhook_configs(
     twilio: Option<twilio_webhook::Config>,
     resend: Option<resend_webhook::Config>,
 ) -> Router {
-    router_with_webhook_configs_and_jwt_policy(db, secret, keys, twilio, resend, false)
+    router_with_webhook_configs_and_jwt_policy(db, secret, keys, twilio, resend, false, false)
 }
 
 fn router_with_webhook_configs_and_jwt_policy(
@@ -257,6 +276,7 @@ fn router_with_webhook_configs_and_jwt_policy(
     twilio: Option<twilio_webhook::Config>,
     resend: Option<resend_webhook::Config>,
     require_jwt_exp: bool,
+    reassert_fcm_registration: bool,
 ) -> Router {
     Router::new()
         .route(
@@ -431,6 +451,7 @@ fn router_with_webhook_configs_and_jwt_policy(
         .with_state(db)
         .layer(Extension(Arc::new(secret)))
         .layer(Extension(InboxJwtPolicy(require_jwt_exp)))
+        .layer(Extension(FcmRegistrationPolicy(reassert_fcm_registration)))
         .layer(Extension(Arc::new(InboxHmacKeys(keys))))
         .layer(Extension(Arc::new(twilio)))
         .layer(Extension(Arc::new(resend)))
