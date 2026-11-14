@@ -52,6 +52,12 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
     db.batch_execute(include_str!("../migrations/0084_slack_scoped_health.sql"))
         .await
         .unwrap();
+    db.batch_execute(slack_queue::ATTENTION_REVISION_MIGRATION)
+        .await
+        .unwrap();
+    db.batch_execute(slack_queue::ATTENTION_REVISION_MIGRATION)
+        .await
+        .unwrap();
     let failed = Uuid::new_v4();
     let missing = Uuid::new_v4();
     let other = Uuid::new_v4();

@@ -12,6 +12,8 @@ pub const OPERATOR_MIGRATION: &str =
     include_str!("../migrations/0071_slack_operator_permissions.sql");
 pub const WORKFLOW_ATTENTION_MIGRATION: &str =
     include_str!("../migrations/0079_slack_workflow_attention.sql");
+pub const ATTENTION_REVISION_MIGRATION: &str =
+    include_str!("../migrations/0092_slack_attention_revision.sql");
 pub const RESOLVE_FUNCTION_MIGRATION: &str =
     include_str!("../migrations/0083_slack_resolve_function.sql");
 
@@ -58,7 +60,7 @@ pub async fn health(
     if environment.trim().is_empty() {
         return Err("environment required".into());
     }
-    let row=client.query_one("SELECT count(*) FILTER (WHERE a.state='unknown'), count(*) FILTER (WHERE a.state='rejected'), count(*) FILTER (WHERE a.state='dispatching' AND (j.status<>'running' OR j.lease_until<=statement_timestamp())), EXISTS(SELECT 1 FROM novu_rust_environments WHERE id=$1), (SELECT count(*) FROM novu_queue_jobs x WHERE x.environment_id=$1 AND x.kind=ANY($3) AND x.status='failed' AND x.last_error IS NOT NULL AND NOT EXISTS(SELECT 1 FROM novu_rust_slack_attempts a2 WHERE a2.job_id=x.id) AND NOT EXISTS(SELECT 1 FROM novu_rust_slack_workflow_acknowledgements z WHERE z.environment_id=x.environment_id AND z.job_id=x.id AND z.job_attempts=x.attempts AND z.job_status=x.status AND z.job_error=x.last_error)), (SELECT count(*) FROM novu_queue_jobs x WHERE x.environment_id=$1 AND x.kind=$4 AND x.status='cancelled' AND x.last_error='no Slack endpoints' AND NOT EXISTS(SELECT 1 FROM novu_rust_slack_workflow_acknowledgements z WHERE z.environment_id=x.environment_id AND z.job_id=x.id AND z.job_attempts=x.attempts AND z.job_status=x.status AND z.job_error=x.last_error)) FROM novu_rust_slack_attempts a JOIN novu_queue_jobs j ON j.id=a.job_id AND j.environment_id=a.environment_id WHERE a.environment_id=$1 AND j.kind=ANY($2)", &[&environment,&vec![JOB_KIND,crate::slack_webhook_queue::JOB_KIND,crate::slack_workflow::DELIVERY_KIND],&vec![crate::slack_workflow::FANOUT_KIND,crate::slack_workflow::DELIVERY_KIND],&crate::slack_workflow::FANOUT_KIND]).await?;
+    let row=client.query_one("SELECT count(*) FILTER (WHERE a.state='unknown'), count(*) FILTER (WHERE a.state='rejected'), count(*) FILTER (WHERE a.state='dispatching' AND (j.status<>'running' OR j.lease_until<=statement_timestamp())), EXISTS(SELECT 1 FROM novu_rust_environments WHERE id=$1), (SELECT count(*) FROM novu_queue_jobs x WHERE x.environment_id=$1 AND x.kind=ANY($3) AND x.status='failed' AND x.last_error IS NOT NULL AND NOT EXISTS(SELECT 1 FROM novu_rust_slack_attempts a2 WHERE a2.job_id=x.id) AND NOT EXISTS(SELECT 1 FROM novu_rust_slack_workflow_acknowledgements z WHERE z.environment_id=x.environment_id AND z.job_id=x.id AND z.job_attempts=x.attempts AND z.job_status=x.status AND z.job_error=x.last_error AND z.job_attention_revision=x.slack_attention_revision)), (SELECT count(*) FROM novu_queue_jobs x WHERE x.environment_id=$1 AND x.kind=$4 AND x.status='cancelled' AND x.last_error='no Slack endpoints' AND NOT EXISTS(SELECT 1 FROM novu_rust_slack_workflow_acknowledgements z WHERE z.environment_id=x.environment_id AND z.job_id=x.id AND z.job_attempts=x.attempts AND z.job_status=x.status AND z.job_error=x.last_error AND z.job_attention_revision=x.slack_attention_revision)) FROM novu_rust_slack_attempts a JOIN novu_queue_jobs j ON j.id=a.job_id AND j.environment_id=a.environment_id WHERE a.environment_id=$1 AND j.kind=ANY($2)", &[&environment,&vec![JOB_KIND,crate::slack_webhook_queue::JOB_KIND,crate::slack_workflow::DELIVERY_KIND],&vec![crate::slack_workflow::FANOUT_KIND,crate::slack_workflow::DELIVERY_KIND],&crate::slack_workflow::FANOUT_KIND]).await?;
     if !row.get::<_, bool>(3) {
         return Err("environment not found".into());
     }
@@ -293,6 +295,7 @@ mod tests {
         a.batch_execute(MIGRATION).await.unwrap();
         a.batch_execute(MIGRATION).await.unwrap();
         a.batch_execute(WORKFLOW_ATTENTION_MIGRATION).await.unwrap();
+        a.batch_execute(ATTENTION_REVISION_MIGRATION).await.unwrap();
         let id = Uuid::new_v4();
         crate::enqueue(
             &a,

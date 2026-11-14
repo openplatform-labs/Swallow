@@ -508,6 +508,7 @@ mod tests {
             include_str!("../migrations/0072_operator_grant_management.sql"),
             include_str!("../migrations/0073_operator_role_identity.sql"),
             crate::slack_queue::WORKFLOW_ATTENTION_MIGRATION,
+            crate::slack_queue::ATTENTION_REVISION_MIGRATION,
             include_str!("../migrations/0080_slack_ack_permission.sql"),
             crate::slack_queue::RESOLVE_FUNCTION_MIGRATION,
         ] {
