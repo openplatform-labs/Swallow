@@ -20,14 +20,14 @@ async function until(fn,message,timeout=4000){for(let i=0;i<timeout/25;i++){if(f
 (async()=>{
   const guarded=await open(process.env.GUARDED_PORT), legacy=await open(process.env.LEGACY_PORT);
   await wait(200);
-  assert.equal(sql("SELECT count(*) FROM pg_stat_activity WHERE application_name='novu-rust-ws-listener'"),'2');
+  assert.equal(sql("SELECT count(*) FROM pg_stat_activity WHERE application_name='novu-rust-ws-listener'"),'3');
   sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name='novu-rust-ws-listener'");
   await until(()=>guarded.messages.some(x=>x.startsWith('41'))||guarded.closed,'guarded socket was not disconnected');
   assert(!legacy.closed && !legacy.messages.some(x=>x.startsWith('41')),'default mode disconnected');
   const during=await open(process.env.GUARDED_PORT);
   await until(()=>during.messages.some(x=>x.startsWith('41'))||during.closed,'new connection was not rejected during listener gap',700);
   during.ws.close();
-  for(let i=0;i<100;i++){if(sql("SELECT count(*) FROM pg_stat_activity WHERE application_name='novu-rust-ws-listener'")==='2')break;await wait(50);if(i===99)throw Error('listeners did not recover');}
+  for(let i=0;i<100;i++){if(sql("SELECT count(*) FROM pg_stat_activity WHERE application_name='novu-rust-ws-listener'")==='3')break;await wait(50);if(i===99)throw Error('listeners did not recover');}
   const resumed=await open(process.env.GUARDED_PORT);await wait(200);
   sql("INSERT INTO novu_rust_ws_events(environment_id,subscriber_internal_id,event,data) VALUES ('env-a','subscriber-id','recovered_probe','{\"ok\":true}')");
   await until(()=>resumed.messages.some(x=>x.includes('recovered_probe')),'reconnected socket did not receive event');
@@ -35,7 +35,17 @@ async function until(fn,message,timeout=4000){for(let i=0;i<timeout/25;i++){if(f
   sql("ALTER TABLE novu_rust_ws_events RENAME TO temporarily_unavailable_ws_events; INSERT INTO temporarily_unavailable_ws_events(environment_id,subscriber_internal_id,event,data) VALUES ('env-a','subscriber-id','lost_probe','{}')");
   await until(()=>resumed.messages.some(x=>x.startsWith('41'))||resumed.closed,'guarded socket was not disconnected after event lookup failure');
   assert(!legacy.closed && !legacy.messages.some(x=>x.startsWith('41')),'default socket closed after event lookup failure');
+  await wait(2200);
+  assert.equal((await fetch(`http://127.0.0.1:${process.env.GUARDED_PORT}/health/ready`)).status,503,'readiness recovered while event lookup remained unavailable');
+  const blocked=await open(process.env.GUARDED_PORT);
+  await until(()=>blocked.messages.some(x=>x.startsWith('41'))||blocked.closed,'new socket admitted during sustained event lookup failure');
+  blocked.ws.close();
+  const immediate=await open(process.env.IMMEDIATE_PORT);
+  await wait(300);
+  assert(!immediate.closed && !immediate.messages.some(x=>x.startsWith('41')),'immediate mode rejected new socket');
+  immediate.ws.close();
   sql("ALTER TABLE temporarily_unavailable_ws_events RENAME TO novu_rust_ws_events");
+  for(let i=0;i<100;i++){if((await fetch(`http://127.0.0.1:${process.env.GUARDED_PORT}/health/ready`)).status===204)break;await wait(50);if(i===99)throw Error('event lookup probe did not recover readiness');}
   const restored=await open(process.env.GUARDED_PORT);await wait(200);
   sql("INSERT INTO novu_rust_ws_events(environment_id,subscriber_internal_id,event,data) VALUES ('env-a','subscriber-id','second_recovery','{}')");
   await until(()=>restored.messages.some(x=>x.includes('second_recovery')),'guarded delivery did not recover after lookup failure');

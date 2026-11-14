@@ -562,9 +562,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok("false") | Err(std::env::VarError::NotPresent) => false,
         _ => return Err("NOVU_WS_DISCONNECT_ON_EVENT_GAP must be true or false".into()),
     };
+    let probe_event_recovery = match std::env::var("NOVU_WS_EVENT_LOOKUP_RECOVERY").as_deref() {
+        Ok("immediate") | Err(std::env::VarError::NotPresent) => false,
+        Ok("probe") => true,
+        _ => return Err("NOVU_WS_EVENT_LOOKUP_RECOVERY must be immediate or probe".into()),
+    };
+    if probe_event_recovery && !disconnect_on_gap {
+        return Err("probe event recovery requires NOVU_WS_DISCONNECT_ON_EVENT_GAP=true".into());
+    }
     // Even generations mean LISTEN is active. Every outage changes the generation,
     // including an outage that ends while a socket is being registered.
     let listener_generation = Arc::new(AtomicU64::new(0));
+    // Odd means event lookups need a successful probe before accepting sockets.
+    // Each failure changes the epoch, preventing an older probe from clearing it.
+    let event_generation = Arc::new(AtomicU64::new(0));
     let (event_tx, mut event_rx) = mpsc::channel::<ListenerEvent>(1024);
     let initial_listener = start_event_listener(&database_url, event_tx.clone()).await?;
     let listener_ready = Arc::new(AtomicBool::new(true));
@@ -600,6 +611,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let events_db = db.clone();
     let events_io = io.clone();
     let events_generation = listener_generation.clone();
+    let event_lookup_generation = event_generation.clone();
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
             match event {
@@ -610,6 +622,19 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                             // Preserve odd/even listener availability, while invalidating
                             // registrations overlapping a failed event lookup.
                             events_generation.fetch_add(2, Ordering::SeqCst);
+                            if probe_event_recovery {
+                                let _ = event_lookup_generation.fetch_update(
+                                    Ordering::SeqCst,
+                                    Ordering::SeqCst,
+                                    |value| {
+                                        Some(value.wrapping_add(if value.is_multiple_of(2) {
+                                            1
+                                        } else {
+                                            2
+                                        }))
+                                    },
+                                );
+                            }
                             disconnect_all(&events_io);
                         }
                     }
@@ -625,6 +650,33 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             }
         }
     });
+    if probe_event_recovery {
+        let probe_db = db.clone();
+        let probe_generation = event_generation.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let generation = probe_generation.load(Ordering::SeqCst);
+                if generation.is_multiple_of(2) {
+                    continue;
+                }
+                let probe = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    probe_db.lock().await?.query_opt(
+                        "SELECT e.environment_id,e.subscriber_internal_id,e.context_keys,e.event,e.data,EXISTS(SELECT 1 FROM novu_rust_subscribers s WHERE s.environment_id=e.environment_id AND s.internal_id=e.subscriber_internal_id) FROM novu_rust_ws_events e WHERE e.id=$1",
+                        &[&Uuid::nil()],
+                    ).await
+                }).await;
+                if matches!(probe, Ok(Ok(_))) {
+                    let _ = probe_generation.compare_exchange(
+                        generation,
+                        generation.wrapping_add(1),
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    );
+                }
+            }
+        });
+    }
     if !compatibility_mode() {
         let expiry_io = io.clone();
         tokio::spawn(async move {
@@ -650,15 +702,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         });
     }
     let health_db = db.clone();
+    let socket_event_generation = event_generation.clone();
     io.ns(
         "/",
         move |socket: SocketRef, TryData(auth): TryData<Value>| {
             let db = db.clone();
             let secret = secret.clone();
             let listener_generation = listener_generation.clone();
+            let event_generation = socket_event_generation.clone();
             async move {
                 let generation = listener_generation.load(Ordering::SeqCst);
-                if disconnect_on_gap && !generation.is_multiple_of(2) {
+                let event_epoch = event_generation.load(Ordering::SeqCst);
+                if disconnect_on_gap
+                    && (!generation.is_multiple_of(2) || !event_epoch.is_multiple_of(2))
+                {
                     socket.disconnect().ok();
                     return;
                 }
@@ -730,7 +787,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         ));
                     }
                 });
-                if disconnect_on_gap && listener_generation.load(Ordering::SeqCst) != generation {
+                if disconnect_on_gap
+                    && (listener_generation.load(Ordering::SeqCst) != generation
+                        || event_generation.load(Ordering::SeqCst) != event_epoch)
+                {
                     socket.clone().disconnect().ok();
                 }
                 if !socket.connected() {
@@ -756,8 +816,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 get(move || {
                     let db = health_db.clone();
                     let listener_ready = listener_ready.clone();
+                    let event_generation = event_generation.clone();
                     async move {
-                        if !listener_ready.load(Ordering::SeqCst) {
+                        if !listener_ready.load(Ordering::SeqCst)
+                            || !event_generation.load(Ordering::SeqCst).is_multiple_of(2)
+                        {
                             return StatusCode::SERVICE_UNAVAILABLE;
                         }
                         let probe =
@@ -765,7 +828,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                 db.lock().await?.simple_query("SELECT 1").await
                             })
                             .await;
-                        if matches!(probe, Ok(Ok(_))) && listener_ready.load(Ordering::SeqCst) {
+                        if matches!(probe, Ok(Ok(_)))
+                            && listener_ready.load(Ordering::SeqCst)
+                            && event_generation.load(Ordering::SeqCst).is_multiple_of(2)
+                        {
                             StatusCode::NO_CONTENT
                         } else {
                             StatusCode::SERVICE_UNAVAILABLE
