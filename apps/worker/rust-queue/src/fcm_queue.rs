@@ -533,14 +533,16 @@ async fn process_one_inner(
     }
     tx.commit().await?;
     let result = selected_provider.send_wire(&messages[index]).await;
-    let invalid_token = matches!(result, Err(SendError::InvalidDeviceToken(_)));
+    let invalid_token = matches!(result, Err(SendError::InvalidDeviceToken(code)) if (400..500).contains(&code) && ![408, 409].contains(&code));
     let (state, status, id) = match result {
         Ok(id) => (
             "accepted",
             None,
             Some(id.chars().take(1024).collect::<String>()),
         ),
-        Err(SendError::Provider(code) | SendError::InvalidDeviceToken(code)) if code >= 500 => {
+        Err(SendError::Provider(code) | SendError::InvalidDeviceToken(code))
+            if !(400..500).contains(&code) || [408, 409].contains(&code) =>
+        {
             ("unknown", Some(i32::from(code)), None)
         }
         Err(SendError::Provider(code) | SendError::InvalidDeviceToken(code)) => {
@@ -911,6 +913,36 @@ mod tests {
                 .unwrap()
                 .get::<_, String>(0),
             "pending"
+        );
+        let ambiguous = Uuid::new_v4();
+        crate::enqueue(&db, ambiguous, "test", JOB_KIND, &payload)
+            .await
+            .unwrap();
+        let (provider, server) = mock(vec![302, 408, 409]).await;
+        for _ in 0..3 {
+            assert!(process_one(&mut db, "test", &provider).await.unwrap());
+        }
+        assert_eq!(server.await.unwrap(), ["a", "b", "c"]);
+        let rows = db.query("SELECT state,http_status FROM novu_rust_fcm_attempts WHERE job_id=$1 ORDER BY target_index", &[&ambiguous]).await.unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.get::<_, String>(0), row.get::<_, Option<i32>>(1)))
+                .collect::<Vec<_>>(),
+            vec![
+                ("unknown".to_owned(), Some(302)),
+                ("unknown".to_owned(), Some(408)),
+                ("unknown".to_owned(), Some(409))
+            ]
+        );
+        assert_eq!(
+            db.query_one(
+                "SELECT status FROM novu_queue_jobs WHERE id=$1",
+                &[&ambiguous]
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+            "failed"
         );
         for (statuses, expected) in [(vec![200, 429], "completed"), (vec![429, 429], "failed")] {
             let id = Uuid::new_v4();
