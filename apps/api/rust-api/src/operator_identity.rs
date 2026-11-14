@@ -55,6 +55,7 @@ fn failure(status: StatusCode, path: &str) -> Response {
         StatusCode::SERVICE_UNAVAILABLE => {
             ("Operator authentication unavailable", "Service Unavailable")
         }
+        StatusCode::CONFLICT => ("Workflow changed", "Conflict"),
         _ => ("Internal server error", "Internal Server Error"),
     };
     let mut response = error_at(status, message, label, path).into_response();
@@ -144,6 +145,101 @@ pub(super) async fn workflow_read(
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
 ) -> Response {
     query(db, headers, uri, verifier, Lookup::WorkflowRead).await
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkflowWriteBody {
+    workflow: String,
+    resource: String,
+    expected: serde_json::Value,
+    desired: serde_json::Value,
+    reason: String,
+}
+
+fn json_contains_nul(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(s) => s.contains('\0'),
+        serde_json::Value::Array(v) => v.iter().any(json_contains_nul),
+        serde_json::Value::Object(v) => v
+            .iter()
+            .any(|(k, v)| k.contains('\0') || json_contains_nul(v)),
+        _ => false,
+    }
+}
+
+pub(super) async fn workflow_write(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+    body: Bytes,
+) -> Response {
+    let identity = match authenticate(&headers, verifier) {
+        Ok(v) => v,
+        Err(status) => return failure(status, uri.path()),
+    };
+    let params: Vec<_> = form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).collect();
+    if params.len() != 1
+        || params[0].0 != "environmentId"
+        || params[0].1.is_empty()
+        || params[0].1.len() > 512
+        || params[0].1.contains('\0')
+    {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    }
+    let Some(input) = (body.len() <= 1_000_000)
+        .then(|| serde_json::from_slice::<WorkflowWriteBody>(&body).ok())
+        .flatten()
+    else {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    };
+    if input.workflow.contains('\0')
+        || input.reason.contains('\0')
+        || input.resource.contains('\0')
+        || json_contains_nul(&input.expected)
+        || json_contains_nul(&input.desired)
+    {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    }
+    let Ok(exp) = i64::try_from(identity.expires_at) else {
+        return failure(StatusCode::UNAUTHORIZED, uri.path());
+    };
+    let env = params[0].1.as_ref();
+    match db
+        .query_one(
+            "SELECT public.novu_rust_operator_jwt_workflow_write($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+            &[
+                &identity.issuer,
+                &identity.subject,
+                &identity.client_id,
+                &env,
+                &exp,
+                &input.workflow,
+                &input.resource,
+                &input.expected,
+                &input.desired,
+                &input.reason,
+            ],
+        )
+        .await
+    {
+        Ok(row) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(row.get::<_, serde_json::Value>(0)),
+        )
+            .into_response(),
+        Err(e) if e.code().is_some_and(|c| c.code() == "42501") => {
+            failure(StatusCode::UNAUTHORIZED, uri.path())
+        }
+        Err(e) if e.code().is_some_and(|c| c.code() == "22023") => {
+            failure(StatusCode::BAD_REQUEST, uri.path())
+        }
+        Err(e) if e.code().is_some_and(|c| c.code() == "P4090") => {
+            failure(StatusCode::CONFLICT, uri.path())
+        }
+        Err(_) => failure(StatusCode::INTERNAL_SERVER_ERROR, uri.path()),
+    }
 }
 async fn query(
     db: Arc<Client>,
