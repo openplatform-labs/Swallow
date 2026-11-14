@@ -1,6 +1,7 @@
 import { Component, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { ClrAlertModule } from '@clr/angular/emphasis/alert';
+import { OperatorOidc, type PreparedOidc, type VerifiedSession } from './operator-oidc';
 
 type ConnectionState = 'unchecked' | 'checking' | 'ready' | 'unavailable';
 type Subscriber = { id: string; firstName: string; lastName: string; email: string };
@@ -82,6 +83,53 @@ export class App {
   private subscriberRequestId = 0;
   private subscriberAbort: AbortController | null = null;
   private requestId = 0;
+  oidcIssuer = '';
+  oidcClientId = '';
+  oidcScope = 'openid';
+  oidcResource = '';
+  oidcAudience = '';
+  oidcEnvironment = '';
+  readonly oidcStatus = signal<'idle' | 'preparing' | 'ready' | 'signing' | 'signed-in' | 'error'>('idle');
+  readonly oidcSubject = signal('');
+  private oidcPrepared: PreparedOidc | null = null;
+  private oidcSession: VerifiedSession | null = null;
+  private oidcSequence = 0;
+  private readonly oidc = new OperatorOidc();
+
+  resetOidc(): void {
+    if (this.decisionStatus() === 'sending') return;
+    this.oidcSequence++; this.oidcPrepared = null; this.oidcSession = null;
+    this.oidcStatus.set('idle'); this.oidcSubject.set('');
+    this.forgetKey(); this.forgetAlertKey();
+  }
+
+  async prepareOidc(): Promise<void> {
+    if (this.oidcStatus() === 'preparing' || this.oidcStatus() === 'signing') return;
+    this.resetOidc(); const sequence=this.oidcSequence; this.oidcStatus.set('preparing');
+    try {
+      const prepared=await this.oidc.prepare({issuer:this.oidcIssuer,clientId:this.oidcClientId,scope:this.oidcScope,resource:this.oidcResource,audience:this.oidcAudience,apiOrigin:this.apiOrigin,environmentId:this.oidcEnvironment});
+      if (sequence !== this.oidcSequence) return;
+      this.oidcPrepared=prepared; this.oidcStatus.set('ready');
+    } catch { if (sequence === this.oidcSequence) this.oidcStatus.set('error'); }
+  }
+
+  async signInOidc(): Promise<void> {
+    if (this.oidcStatus() !== 'ready' || !this.oidcPrepared) return;
+    const sequence=this.oidcSequence; const prepared=this.oidcPrepared; this.oidcStatus.set('signing');
+    try {
+      const session=await this.oidc.signIn(prepared);
+      if (sequence !== this.oidcSequence) return;
+      this.oidcSession=session; this.oidcSubject.set(session.subject); this.oidcStatus.set('signed-in');
+    } catch { if (sequence === this.oidcSequence) this.oidcStatus.set('error'); }
+  }
+
+  useOidc(section: 'subscribers' | 'alerts'): void {
+    if (!this.oidcSession || this.decisionStatus() === 'sending') return;
+    const session=this.oidcSession;
+    this.setSection(section);
+    if (section === 'subscribers') { this.forgetKey(); this.credentialMode='jwt'; this.subscriberEnvironment=session.environmentId; this.apiKey=session.token; }
+    else { this.forgetAlertKey(); this.alertAuthMode='jwt'; this.alertEnvironment=session.environmentId; this.alertKey=session.token; }
+  }
 
   private validJwt(key: string): boolean {
     return key.length <= 16384 && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(key);
@@ -105,6 +153,7 @@ export class App {
   }
 
   connectionChanged(): void {
+    this.resetOidc();
     this.apiKey = '';
     this.clearSubscribers();
     this.forgetAlertKey();

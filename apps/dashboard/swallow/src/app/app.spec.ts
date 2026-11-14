@@ -1,9 +1,34 @@
 import { TestBed } from '@angular/core/testing';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { App } from './app';
+import { OperatorOidc } from './operator-oidc';
 
 describe('Swallow console', () => {
   afterEach(() => vi.restoreAllMocks());
+
+  it('uses an operator session only after login and removes it on local logout', async () => {
+    vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));
+    vi.spyOn(OperatorOidc.prototype,'signIn').mockResolvedValue({token:'aaa.bbb.ccc',subject:'alice',environmentId:'env-a'});
+    const app=TestBed.createComponent(App).componentInstance;
+    app.oidcIssuer='https://issuer.test'; app.oidcClientId='console'; app.oidcEnvironment='env-a';
+    await app.prepareOidc(); expect(app.oidcStatus()).toBe('ready');
+    await app.signInOidc(); expect(app.oidcStatus()).toBe('signed-in'); expect(app.oidcSubject()).toBe('alice');
+    app.useOidc('subscribers'); expect(app.credentialMode).toBe('jwt'); expect(app.apiKey).toBe('aaa.bbb.ccc');
+    app.useOidc('alerts'); expect(app.alertAuthMode).toBe('jwt'); expect(app.alertKey).toBe('aaa.bbb.ccc');
+    app.resetOidc(); expect(app.alertKey).toBe(''); expect(app.oidcStatus()).toBe('idle');
+    app.useOidc('alerts'); expect(app.alertKey).toBe('');
+  });
+
+  it('ignores a login result after settings or API address change', async () => {
+    vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));
+    let finish!: (session:{token:string;subject:string;environmentId:string})=>void;
+    vi.spyOn(OperatorOidc.prototype,'signIn').mockReturnValue(new Promise(done=>{finish=done;}));
+    const app=TestBed.createComponent(App).componentInstance;
+    app.oidcIssuer='https://issuer.test';app.oidcClientId='console';app.oidcEnvironment='env-a';
+    await app.prepareOidc();const pending=app.signInOidc();app.connectionChanged();
+    finish({token:'aaa.bbb.ccc',subject:'alice',environmentId:'env-a'});await pending;
+    expect(app.oidcStatus()).toBe('idle');expect(app.oidcSubject()).toBe('');app.useOidc('alerts');expect(app.alertKey).toBe('');
+  });
 
   it('loads subscriber pages with an operator JWT and an explicit environment', async () => {
     const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValue(new Response(JSON.stringify({data:[{subscriberId:'alice',firstName:'Alice',email:'alice@example.test'}],next:'alice',previous:null}),{status:200}));
@@ -52,7 +77,7 @@ describe('Swallow console', () => {
   it('shows unimplemented management without invented operational data', async () => {
     const fixture = TestBed.createComponent(App);
     await fixture.whenStable();
-    expect(fixture.nativeElement.textContent).toContain('관리자 로그인과 대부분의 관리 기능은 개발 중');
+    expect(fixture.nativeElement.textContent).toContain('대부분의 관리 기능은 개발 중');
     expect(fixture.nativeElement.textContent).toContain('연결 확인 필요');
   });
 
