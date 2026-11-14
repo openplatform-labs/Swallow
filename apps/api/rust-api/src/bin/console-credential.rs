@@ -1,0 +1,105 @@
+//! Offline database administrator tool for scoped console credentials.
+use ring::rand::{SecureRandom, SystemRandom};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::{error::Error, fs::OpenOptions, io::Write};
+use uuid::Uuid;
+
+#[cfg(unix)]
+fn write_secret(path: &str, bytes: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+#[cfg(not(unix))]
+fn write_secret(_path: &str, _bytes: &[u8]) -> Result<(), Box<dyn Error + Send + Sync>> {
+    Err("secure token file creation is unavailable on this platform".into())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let usage = "usage: console-credential issue ENV SECONDS NEW_FILE REASON | revoke ENV CREDENTIAL_ID REASON | list ENV [AFTER_ID] | audit ENV [AFTER_ID]";
+    let valid = matches!(args.as_slice(),[action,_,_,_,_] if action=="issue")
+        || matches!(args.as_slice(),[action,_,_,_] if action=="revoke")
+        || matches!(args.as_slice(),[action,_] if action=="list" || action=="audit")
+        || matches!(args.as_slice(),[action,_,_] if action=="list" || action=="audit");
+    if !valid {
+        return Err(usage.into());
+    }
+    let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
+    let (db, connection) =
+        tokio::time::timeout(std::time::Duration::from_secs(30), config.connect(tls)).await??;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    match args[0].as_str() {
+        "issue" => {
+            let seconds: i64 = args[2].parse()?;
+            if !(1..=2_592_000).contains(&seconds) {
+                return Err("lifetime must be 1 to 2592000 seconds".into());
+            }
+            let mut random = [0u8; 32];
+            SystemRandom::new()
+                .fill(&mut random)
+                .map_err(|_| "secure randomness unavailable")?;
+            let token = random
+                .iter()
+                .map(|v| format!("{v:02x}"))
+                .collect::<String>();
+            write_secret(&args[3], token.as_bytes())
+                .map_err(|_| "token file creation failed; inspect the destination safely")?;
+            let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+            let result = tokio::time::timeout(std::time::Duration::from_secs(30), db.query_one("SELECT public.novu_rust_issue_console_credential($1,$2,clock_timestamp()+($3::bigint * interval '1 second'),$4)",&[&args[1],&hash,&seconds,&args[4]])).await;
+            match result {
+                Ok(Ok(row)) => println!("{}",json!({"credentialId":row.get::<_,Uuid>(0).to_string(),"tokenFileCreated":true})),
+                _ => return Err("issuance result unavailable; token file retained; investigate database and audit before retrying".into()),
+            }
+        }
+        "revoke" => {
+            let id = Uuid::parse_str(&args[2])?;
+            let changed: bool = db
+                .query_one(
+                    "SELECT public.novu_rust_revoke_console_credential($1,$2,$3)",
+                    &[&args[1], &id, &args[3]],
+                )
+                .await?
+                .get(0);
+            println!("{}", json!({"changed":changed}));
+        }
+        "list" => {
+            let after = args.get(2).map(|s| Uuid::parse_str(s)).transpose()?;
+            let rows = db
+                .query(
+                    "SELECT * FROM public.novu_rust_list_console_credentials($1,$2)",
+                    &[&args[1], &after],
+                )
+                .await?;
+            let values:Vec<_>=rows.into_iter().map(|r|json!({"credentialId":r.get::<_,Uuid>(0).to_string(),"enabled":r.get::<_,bool>(1),"expiresAt":r.get::<_,String>(2),"createdAt":r.get::<_,String>(3)})).collect();
+            println!("{}", serde_json::to_string(&values)?);
+        }
+        "audit" => {
+            let after = args
+                .get(2)
+                .map(|s| s.parse::<i64>())
+                .transpose()?
+                .unwrap_or(0);
+            let rows = db
+                .query(
+                    "SELECT * FROM public.novu_rust_list_console_credential_audit($1,$2)",
+                    &[&args[1], &after],
+                )
+                .await?;
+            let values:Vec<_>=rows.into_iter().map(|r|json!({"id":r.get::<_,String>(0),"credentialId":r.get::<_,Uuid>(1).to_string(),"action":r.get::<_,String>(2),"actor":r.get::<_,String>(3),"reason":r.get::<_,String>(4),"expiresAt":r.get::<_,String>(5),"createdAt":r.get::<_,String>(6)})).collect();
+            println!("{}", serde_json::to_string(&values)?);
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}

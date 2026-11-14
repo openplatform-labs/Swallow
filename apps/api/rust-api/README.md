@@ -1,3 +1,14 @@
+`console-credential` is an optional Unix operator CLI for the audited 0026 functions. Build with `cargo build --locked --bin console-credential`; configure `DATABASE_URL` and the same TLS settings as the API, then run:
+
+```text
+console-credential issue ENV 3600 /secure/new-token-file "ticket number"
+console-credential list ENV [AFTER_ID]
+console-credential revoke ENV CREDENTIAL_ID "ticket number"
+console-credential audit ENV [AFTER_ID]
+```
+
+Issue generates 32 bytes using the OS cryptographic random source, writes 64 lowercase hex characters to a **new** file with Unix mode 0600, flushes it, and sends only its SHA-256 hash to the database. It prints the credential UUID, never the token. Existing files and symlinks are not overwritten. The chosen directory, filesystem, backups, secret transfer and deletion remain the operator's responsibility; 0600 assumes a filesystem enforcing Unix permissions. The output filename and reason are command arguments, so do not put secrets in either. Connection and issuance are each bounded to 30 seconds. Any issuance error or timeout after the file is created is reported as outcome unknown and the file is retained: a trusted DBA must independently inspect the hash/credential and audit before retrying, deleting or delivering the file. A failed/partial file write may also leave a file. Output loss after a successful commit has the same ambiguity. Other commands do not have an application-level deadline; a lost revoke response also requires reviewing the credential and audit. No automatic retries, secure deletion or external immutable audit are provided. The CLI does not implement web login or replace SSO.
+
 API migration `0026` adds environment-scoped console credential administration with an audit trail. A trusted DBA registers each PostgreSQL LOGIN and its current role OID in `public.novu_rust_console_credential_admins`, and grants that login EXECUTE on the four public functions below. The administrator must not receive direct table access. Register using a parameterized administrative session, for example:
 
 ```sql
