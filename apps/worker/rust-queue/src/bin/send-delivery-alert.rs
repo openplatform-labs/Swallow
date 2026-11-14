@@ -87,6 +87,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let slack_jobs_enabled = env_bool("SWALLOW_ALERT_SLACK_JOBS_ENABLED", false)?;
     let failed_jobs_enabled = env_bool("SWALLOW_ALERT_FAILED_JOBS_ENABLED", false)?;
     let slack_missing_enabled = env_bool("SWALLOW_ALERT_SLACK_MISSING_ENDPOINTS_ENABLED", false)?;
+    let email_policy_enabled = env_bool("SWALLOW_ALERT_EMAIL_POLICY_CANCELLED_ENABLED", false)?;
+    let sms_policy_enabled = env_bool("SWALLOW_ALERT_SMS_POLICY_CANCELLED_ENABLED", false)?;
     let slack_policy_enabled = env_bool("SWALLOW_ALERT_SLACK_POLICY_CANCELLED_ENABLED", false)?;
     let twilio_grace = env_optional_i32("SWALLOW_ALERT_TWILIO_GRACE_SECONDS")?;
     let twilio_heartbeat = env_optional_i32("SWALLOW_ALERT_TWILIO_HEARTBEAT_MAX_SECONDS")?;
@@ -112,6 +114,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         && !attempts_enabled
         && !slack_jobs_enabled
         && !slack_policy_enabled
+        && !email_policy_enabled
+        && !sms_policy_enabled
         && !failed_jobs_enabled
         && queue_wait.is_none()
         && twilio_thresholds.is_none()
@@ -296,6 +300,28 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     } else {
         None
     };
+    let mut channel_policy_check_failed = false;
+    let mut email_policy_cancelled = None;
+    let mut sms_policy_cancelled = None;
+    for (enabled, channel, count) in [
+        (email_policy_enabled, "email", &mut email_policy_cancelled),
+        (sms_policy_enabled, "sms", &mut sms_policy_cancelled),
+    ] {
+        if enabled {
+            match tokio::time::timeout(
+                operation_timeout,
+                reconciliation::channel_policy_count(&db, &args[0], channel),
+            )
+            .await
+            {
+                Ok(Ok(value)) if value >= 0 => *count = Some(value as u64),
+                _ => {
+                    channel_policy_check_failed = true;
+                    eprintln!("{channel} policy cancellation check failed");
+                }
+            }
+        }
+    }
     let mut failed_jobs_check_failed = false;
     let failed_jobs = if failed_jobs_enabled {
         match tokio::time::timeout(
@@ -314,7 +340,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     } else {
         None
     };
-    let unhealthy = sendgrid_check_failed
+    let unhealthy = channel_policy_check_failed
+        || email_policy_cancelled.is_some_and(|n| n > 0)
+        || sms_policy_cancelled.is_some_and(|n| n > 0)
+        || sendgrid_check_failed
         || sendgrid.is_some_and(|(overdue, stale)| overdue > 0 || stale)
         || failed_jobs_check_failed
         || failed_jobs.is_some_and(|n| n > 0)
@@ -344,6 +373,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         sendgrid_check_failed,
         slack_attempts,
         slack_policy_cancelled,
+        email_policy_cancelled,
+        sms_policy_cancelled,
+        channel_policy_check_failed,
         failed_checks,
         failed_jobs,
         failed_jobs_check_failed,
@@ -389,6 +421,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut error = configuration_error
         || observation_error
         || failed_jobs_check_failed
+        || channel_policy_check_failed
         || failed_checks.iter().any(|failed| *failed);
     let mut needs_review = false;
     let mut other = if parallel_delivery && slack.is_some() && email.is_some() {

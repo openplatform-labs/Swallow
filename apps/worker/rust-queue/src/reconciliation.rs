@@ -113,6 +113,50 @@ pub async fn scoped_provider_health(
     )
 }
 
+/// Count unacknowledged guarded channel cancellations under alert_view authorization.
+pub async fn channel_policy_count(
+    client: &Client,
+    environment: &str,
+    channel: &str,
+) -> Result<i64> {
+    Ok(client
+        .query_one(
+            "SELECT public.novu_rust_count_channel_policy_attention($1,$2)",
+            &[&environment, &channel],
+        )
+        .await?
+        .get(0))
+}
+pub async fn channel_policy_list(
+    client: &Client,
+    environment: &str,
+    channel: &str,
+    after: Option<Uuid>,
+) -> Result<Vec<Value>> {
+    let rows = client
+        .query(
+            "SELECT * FROM public.novu_rust_list_channel_policy_attention($1,$2,$3)",
+            &[&environment, &channel, &after],
+        )
+        .await?;
+    Ok(rows.into_iter().map(|r| json!({"jobId":r.get::<_,Uuid>(0).to_string(),"kind":r.get::<_,String>(1),"reasonCode":r.get::<_,String>(2),"attempts":r.get::<_,i32>(3),"createdAt":r.get::<_,String>(4)})).collect())
+}
+pub async fn acknowledge_channel_policy(
+    client: &Client,
+    environment: &str,
+    job: Uuid,
+    operator: &str,
+    reason: &str,
+) -> Result<bool> {
+    Ok(client
+        .query_one(
+            "SELECT public.novu_rust_ack_channel_policy($1,$2,$3,$4)",
+            &[&environment, &job, &operator, &reason],
+        )
+        .await?
+        .get(0))
+}
+
 /// Count failed queue jobs not acknowledged for their current snapshot.
 pub async fn failed_queue_count(client: &Client, environment: &str) -> Result<i64> {
     Ok(client

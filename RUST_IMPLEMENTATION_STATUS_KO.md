@@ -3,9 +3,19 @@
 > 기준: 원본 Novu 커밋 `895388f37efe9e06de0aa333e5727303e6ad6853` · 작성: 2026-11-12.
 > **현재 구현은 실험용이며 Novu와 100% 호환되지 않는다. 운영에 사용하거나 기존 Novu의 대체품으로 배포하지 않는다.**
 
+### 이메일·SMS 정책 취소 감시와 확인 (워커 0122)
+
+`active` 또는 `unchanged` 정책으로 취소한 SendGrid·Resend·Twilio 작업을 운영자가 선택해 감시하고 확인할 수 있다. 워커 0122와 새 운영 명령·경보 바이너리를 배포한다. `delivery-reconcile check-channel-policy ENV email|sms|all`은 미확인 건수를 JSON으로 출력하고 0건이면 종료 0, 있으면 2, 오류면 1이다. `list-channel-policy ENV email|sms|all [AFTER_JOB]`은 UUID 기준 최대 100건의 작업 ID·종류·고정 사유 코드·시도 수·생성 시각만 반환한다. `ack-channel-policy ENV JOB OPERATOR REASON`은 현재 취소 건을 확인 기록하며 발송이나 재시도는 수행하지 않는다. 작업이 다시 취소되면 새 revision으로 집계된다. 단 상태·사유·시도 수가 변하지 않는 반복 UPDATE는 새 건이 아니다. 원래 취소 전에 이미 발생한 공급자 시도는 지우거나 결과를 판정하지 않는다.
+
+조회·목록은 환경별 `alert_view`와 각각 `public.novu_rust_count_channel_policy_attention(text,text)`, `public.novu_rust_list_channel_policy_attention(text,text,uuid)` 실행 권한이 필요하다. 확인은 별도 `queue_ack`와 `public.novu_rust_ack_channel_policy(text,uuid,text,text)` 실행 권한이 필요하다. 함수와 확인 테이블에는 PUBLIC 권한이 없다. 확인에는 DB 로그인과 운영자 입력·사유가 기록되며 운영자 입력은 로그인 신원 인증이 아니다. 신뢰된 관리자가 권한을 부여하고 DB 직접 변경·감사 테이블을 보호한다. 인덱스 생성은 마이그레이션 중 잠금과 쓰기 비용을 수반한다.
+
+`send-delivery-alert`의 `SWALLOW_ALERT_EMAIL_POLICY_CANCELLED_ENABLED=true`와 `SWALLOW_ALERT_SMS_POLICY_CANCELLED_ENABLED=true`를 각각 선택하면 기존 Slack·이메일 경보 경로와 재전송 억제 정책에 건수를 포함한다. 기본은 둘 다 false다. 경보 DB 로그인에도 위 count 함수 실행 및 해당 환경 `alert_view`가 필요하며, 기존 경보 발송 권한과 대상 설정은 별도다. 조회 실패는 오류로 보고하며 독립적인 실행·DB 장애 감시가 필요하다. 확인은 전달 증명이 아니고 자동 재발송·확인 후 재처리는 없다. 기존 취소도 집계하지만 0122 적용 전의 반복 이력은 복구하지 못한다. 여러 인스턴스에서 결과는 조회 시점의 스냅샷이며 직접 SQL이나 권한 있는 사용자의 변경은 보호를 우회할 수 있다. 페이지 사이 데이터 변경과 대량 데이터 성능은 미검증이다.
+
+Docker PostgreSQL에서 실제 API·워크플로 워커의 취소, 제한 로그인·환경 격리, 경보 예약 차단, 중복 확인, 재발생 및 권한 회수 경합을 검증했다. Slack·이메일 외부 수신과 원본 Novu의 경보 기능과의 비교는 수행하지 않았다. 이 기능은 Swallow 운영 확장이다.
+
 ### 대기 SMS 단계 변경 정책 (워커 0121)
 
-Twilio 워커의 `SWALLOW_SMS_WORKFLOW_STEP_POLICY`는 사용자가 `snapshot`(기본, 대기 시 템플릿 사용), `active`(워크플로와 단계 활성 확인), `unchanged`(활성 및 내용 일치 확인)를 선택한다. 조건 불일치 또는 내부 ID가 없는 기존 워크플로 작업은 발송 예약 전에 취소한다. 워크플로 context가 없는 독립 SMS에는 적용하지 않는다. 행 공유 잠금과 임대 재확인으로 예약 전 변경 경합을 처리하지만 예약이 커밋된 이후 변경은 이미 승인된 요청을 막지 못한다. 원문을 변경 후 복원한 이력과 발송 override는 감지하지 않고, 기존 발송 시도는 보존하며 취소의 자동 재발송·전용 경보는 없다.
+Twilio 워커의 `SWALLOW_SMS_WORKFLOW_STEP_POLICY`는 사용자가 `snapshot`(기본, 대기 시 템플릿 사용), `active`(워크플로와 단계 활성 확인), `unchanged`(활성 및 내용 일치 확인)를 선택한다. 조건 불일치 또는 내부 ID가 없는 기존 워크플로 작업은 발송 예약 전에 취소한다. 워크플로 context가 없는 독립 SMS에는 적용하지 않는다. 행 공유 잠금과 임대 재확인으로 예약 전 변경 경합을 처리하지만 예약이 커밋된 이후 변경은 이미 승인된 요청을 막지 못한다. 원문을 변경 후 복원한 이력과 발송 override는 감지하지 않고, 기존 발송 시도는 보존하며 자동 재발송은 없다. 선택형 경보·확인은 위 0122 항목을 참고한다.
 
 0121 적용 후 Twilio DB 로그인에 `novu_rust_sms_workflow_worker_config` SELECT·INSERT·UPDATE를 부여한다. 같은 환경의 새 워커는 동일 정책만 등록하며 불일치하면 시작을 거절한다. 스키마나 권한이 없으면 처리를 중단하고 재연결한다. 이전 워커는 검사를 우회하므로 모두 교체해야 한다. 변경할 때 해당 환경의 모든 Twilio 워커를 중지하고 신뢰된 관리자가 등록 행의 `step_policy`만 NULL로 초기화한 뒤 동일 설정으로 재시작한다. 등록 테이블과 직접 DB 쓰기를 보호해야 한다. 추가 DB 조회와 잠금의 운영 부하는 미검증이다. Docker PostgreSQL API·큐 통합 테스트에서 내용 변경, 비활성화, 동시 변경 경합, 내부 ID 누락, 워커 설정 충돌 및 DB 재연결을 검증했다. 고정 원본 서버와 모의 Twilio 비교에서는 10개 SMS 사례가 일치했으며, 그중 설정이 유지된 한 사례는 `unchanged`를 적용했다. 실 SMS 발송, 운영 부하 및 전체 Novu 호환성은 미검증이다.
 
@@ -13,7 +23,7 @@ Twilio 워커의 `SWALLOW_SMS_WORKFLOW_STEP_POLICY`는 사용자가 `snapshot`(�
 
 SendGrid와 Resend 워커는 `SWALLOW_EMAIL_WORKFLOW_STEP_POLICY=snapshot|active|unchanged`를 지원한다. 기본 `snapshot`은 대기 작업에 기록된 템플릿을 사용한다. `active`는 발송 예약 전에 같은 워크플로 내부 ID, 워크플로·이메일 단계 활성 및 제목·HTML 존재를 검사한다. `unchanged`는 대기 중인 제목·HTML이 현재 값과 같은지도 검사한다. 불일치 시 외부 발송을 시도하지 않고 작업을 취소한다. 내부 ID가 없는 이전 워크플로 작업은 선택형 검사에서 취소되며 워크플로 context가 없는 독립 이메일은 검사하지 않는다.
 
-검사 중 워크플로 행을 공유 잠금하고 대기 뒤와 예약 전에 임대를 재확인한다. 먼저 커밋된 변경은 반영되지만 예약 커밋 후 비활성화해도 이미 승인된 외부 요청은 중단되지 않는다. 변경 후 동일한 텍스트로 되돌린 이력은 감지하지 못하고 override는 렌더링 결과를 바꿀 수 있다. 이전 시도 이력은 보존하며 취소를 자동 재발송하지 않는다. 이 취소에는 아직 전용 경보·확인 기능이 없으므로 취소된 작업을 운영자가 조회하고 재발송 전 검토해야 한다.
+검사 중 워크플로 행을 공유 잠금하고 대기 뒤와 예약 전에 임대를 재확인한다. 먼저 커밋된 변경은 반영되지만 예약 커밋 후 비활성화해도 이미 승인된 외부 요청은 중단되지 않는다. 변경 후 동일한 텍스트로 되돌린 이력은 감지하지 못하고 override는 렌더링 결과를 바꿀 수 있다. 이전 시도 이력은 보존하며 취소를 자동 재발송하지 않는다. 이 취소의 선택형 경보·확인은 위 0122 항목을 참고한다. 재발송 전 운영자가 검토해야 한다.
 
 워커 0120을 적용하고 SendGrid·Resend DB 로그인에 `novu_rust_email_workflow_worker_config` SELECT·INSERT·UPDATE를 부여해야 한다. 새 워커는 환경별 동일 정책을 등록하며 다른 정책이면 시작을 거절한다. 스키마나 권한이 없으면 처리하지 않고 재연결을 반복한다. 구버전은 검사·등록을 우회하므로 모두 중지하고 교체해야 한다. 정책 변경은 해당 환경의 모든 이메일 워커를 중지한 뒤 신뢰된 관리자가 등록 행의 `step_policy`만 NULL로 초기화하고 동일 정책으로 재시작한다. 등록 테이블과 직접 DB 변경 권한을 보호한다. 검사에는 워크플로 조회·행 잠금과 임대 확인 비용이 추가된다. Docker PostgreSQL에서 API 단계 변경, SendGrid·Resend 취소, 워커 설정 충돌, 변경 경합과 구형 식별자 누락을 검증한다. 실 공급자와 운영 부하 및 모든 Novu 동작은 미검증이다.
 

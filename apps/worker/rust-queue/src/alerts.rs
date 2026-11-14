@@ -312,6 +312,9 @@ pub struct Alert {
     pub sendgrid_check_failed: bool,
     pub slack_attempts: Option<(u64, u64, u64, u64, Option<u64>)>,
     pub slack_policy_cancelled: Option<u64>,
+    pub email_policy_cancelled: Option<u64>,
+    pub sms_policy_cancelled: Option<u64>,
+    pub channel_policy_check_failed: bool,
     pub failed_checks: [bool; 5], // resend, queue, attempts, twilio, Slack chat
     pub failed_jobs: Option<u64>,
     pub failed_jobs_check_failed: bool,
@@ -372,6 +375,15 @@ impl Alert {
         if self.slack_policy_cancelled.is_some_and(|n| n > 0) {
             mask |= 1 << 25;
         }
+        if self.email_policy_cancelled.is_some_and(|n| n > 0) {
+            mask |= 1 << 26;
+        }
+        if self.sms_policy_cancelled.is_some_and(|n| n > 0) {
+            mask |= 1 << 27;
+        }
+        if self.channel_policy_check_failed {
+            mask |= 1 << 28;
+        }
         mask
     }
     /// Bits whose current state was actually observed, excluding unavailable or disabled checks.
@@ -431,6 +443,18 @@ impl Alert {
         if self.slack_policy_cancelled.is_some() {
             known |= 1 << 25;
         }
+        if self.email_policy_cancelled.is_some() {
+            known |= 1 << 26;
+        }
+        if self.sms_policy_cancelled.is_some() {
+            known |= 1 << 27;
+        }
+        if self.email_policy_cancelled.is_some()
+            || self.sms_policy_cancelled.is_some()
+            || self.channel_policy_check_failed
+        {
+            known |= 1 << 28;
+        }
         known
     }
     pub fn text(&self) -> Result<String, AlertError> {
@@ -481,6 +505,15 @@ impl Alert {
         }
         if let Some(count) = self.slack_policy_cancelled {
             details.push(format!("Slack workflow policy cancellations: {count}"));
+        }
+        if let Some(n) = self.email_policy_cancelled {
+            details.push(format!("Email workflow policy cancellations: {n}"));
+        }
+        if let Some(n) = self.sms_policy_cancelled {
+            details.push(format!("SMS workflow policy cancellations: {n}"));
+        }
+        if self.channel_policy_check_failed {
+            details.push("Channel policy cancellation check failed".into());
         }
         for (failed, name) in self.failed_checks.iter().zip([
             "Resend",
@@ -1096,12 +1129,39 @@ mod tests {
             sendgrid_check_failed: false,
             slack_attempts: None,
             slack_policy_cancelled: None,
+            email_policy_cancelled: None,
+            sms_policy_cancelled: None,
+            channel_policy_check_failed: false,
             failed_checks: [false; 5],
             failed_jobs: None,
             failed_jobs_check_failed: false,
             database_probe: None,
             alert_store_unavailable: false,
         }
+    }
+
+    #[test]
+    fn channel_policy_conditions_are_independent_and_observed() {
+        let mut a = alert();
+        a.email_policy_cancelled = Some(2);
+        a.sms_policy_cancelled = Some(0);
+        assert_ne!(a.condition_mask() & (1 << 26), 0);
+        assert_eq!(a.condition_mask() & (1 << 27), 0);
+        assert_ne!(a.observed_condition_mask() & (1 << 27), 0);
+        assert!(
+            a.text()
+                .unwrap()
+                .contains("Email workflow policy cancellations: 2")
+        );
+        a.sms_policy_cancelled = None;
+        a.channel_policy_check_failed = true;
+        assert_ne!(a.condition_mask() & (1 << 28), 0);
+        assert_eq!(a.observed_condition_mask() & (1 << 27), 0);
+        assert!(
+            a.text()
+                .unwrap()
+                .contains("Channel policy cancellation check failed")
+        );
     }
 
     #[test]
@@ -1644,6 +1704,9 @@ mod tests {
             sendgrid_check_failed: false,
             slack_attempts: None,
             slack_policy_cancelled: None,
+            email_policy_cancelled: None,
+            sms_policy_cancelled: None,
+            channel_policy_check_failed: false,
             failed_checks: [false; 5],
             failed_jobs: None,
             failed_jobs_check_failed: false,

@@ -772,4 +772,35 @@ async fn channels_are_authorized_audited_and_create_delivery_jobs() {
             .get::<_, i64>(0),
         0
     );
+    setup.batch_execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'a',session_user,p.permission,r.oid FROM pg_roles r CROSS JOIN (VALUES ('alert_view'),('queue_ack')) p(permission) WHERE r.rolname=session_user").await.unwrap();
+    assert_eq!(
+        novu_postgres_queue::reconciliation::channel_policy_count(&setup, "a", "sms")
+            .await
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        novu_postgres_queue::reconciliation::channel_policy_count(&setup, "a", "email")
+            .await
+            .unwrap(),
+        5
+    );
+    let sms_alerts =
+        novu_postgres_queue::reconciliation::channel_policy_list(&setup, "a", "sms", None)
+            .await
+            .unwrap();
+    let job = uuid::Uuid::parse_str(sms_alerts[0]["jobId"].as_str().unwrap()).unwrap();
+    assert!(
+        novu_postgres_queue::reconciliation::acknowledge_channel_policy(
+            &setup, "a", job, "operator", "reviewed"
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(
+        novu_postgres_queue::reconciliation::channel_policy_count(&setup, "a", "sms")
+            .await
+            .unwrap(),
+        3
+    );
 }
