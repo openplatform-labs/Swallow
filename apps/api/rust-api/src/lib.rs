@@ -1,5 +1,6 @@
 //! Experimental, deliberately incomplete Novu trigger endpoint.
 mod contexts;
+mod slack_endpoints;
 mod inbox_context;
 mod inbox_data;
 mod preferences;
@@ -154,6 +155,8 @@ pub fn router_with_webhook_configs(
             post(twilio_webhook::receive_dispatch),
         )
         .route("/v1/events/trigger", post(trigger))
+        .route("/v1/channel-endpoints", post(slack_endpoints::create))
+        .route("/v1/channel-endpoints/{identifier}", get(slack_endpoints::get).delete(slack_endpoints::delete))
         .route(
             "/v1/experimental/workflows/{workflow}/email-provider",
             get(get_workflow_email_provider).put(set_workflow_email_provider),
