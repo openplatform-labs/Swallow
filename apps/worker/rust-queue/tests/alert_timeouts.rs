@@ -154,3 +154,20 @@ fn both_alert_commands_reject_invalid_coordinated_delivery_policy() {
         assert!(String::from_utf8_lossy(&out.stderr).contains("invalid alert delivery policy"));
     }
 }
+
+#[test]
+fn both_alert_commands_reject_invalid_shutdown_grace() {
+    for binary in [
+        env!("CARGO_BIN_EXE_send-delivery-alert"),
+        env!("CARGO_BIN_EXE_send-database-alert"),
+    ] {
+        for value in ["0", "301", "bad"] {
+            let output = Command::new(binary)
+                .env("SWALLOW_ALERT_SHUTDOWN_GRACE_SECONDS", value)
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("invalid shutdown grace"));
+        }
+    }
+}

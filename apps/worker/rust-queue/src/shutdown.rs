@@ -36,14 +36,22 @@ where
     F: FnOnce(Stop) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
-    let seconds = match std::env::var("SWALLOW_WORKER_SHUTDOWN_GRACE_SECONDS") {
+    run_until_signal_with_setting("SWALLOW_WORKER_SHUTDOWN_GRACE_SECONDS", work).await
+}
+
+pub async fn run_until_signal_with_setting<F, Fut>(setting: &str, work: F) -> Result<()>
+where
+    F: FnOnce(Stop) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let seconds = match std::env::var(setting) {
         Ok(value) => value
             .parse::<u64>()
             .ok()
             .filter(|n| (1..=300).contains(n))
-            .ok_or("invalid worker shutdown grace")?,
+            .ok_or("invalid shutdown grace")?,
         Err(std::env::VarError::NotPresent) => 30,
-        Err(_) => return Err("invalid worker shutdown grace".into()),
+        Err(_) => return Err("invalid shutdown grace".into()),
     };
     #[cfg(unix)]
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -71,7 +79,7 @@ where
             stop.request();
             match tokio::time::timeout(grace, &mut task).await {
                 Ok(result) => result,
-                Err(_) => Err("worker graceful shutdown timed out".into()),
+                Err(_) => Err("graceful shutdown timed out".into()),
             }
         }
     }

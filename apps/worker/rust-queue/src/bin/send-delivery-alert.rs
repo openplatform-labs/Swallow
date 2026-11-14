@@ -7,6 +7,14 @@ use std::{error::Error, time::Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    novu_postgres_queue::shutdown::run_until_signal_with_setting(
+        "SWALLOW_ALERT_SHUTDOWN_GRACE_SECONDS",
+        |_| run(),
+    )
+    .await
+}
+
+async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() != 4 {
         return Err(

@@ -32,6 +32,14 @@ fn slack() -> Result<Option<SlackWebhook>> {
 }
 #[tokio::main]
 async fn main() -> Result<()> {
+    novu_postgres_queue::shutdown::run_until_signal_with_setting(
+        "SWALLOW_ALERT_SHUTDOWN_GRACE_SECONDS",
+        |_| run(),
+    )
+    .await
+}
+
+async fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() != 3 {
         return Err("usage: send-database-alert MONITOR_ENV TARGET_LABEL COOLDOWN_SECONDS".into());
