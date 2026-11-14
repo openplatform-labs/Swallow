@@ -64,11 +64,14 @@ fn read_secret(_path: &str) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: console-credential issue ENV SECONDS NEW_FILE REASON | issue-scoped ENV SECONDS NEW_FILE subscriber|none REASON | issue-permissions ENV SECONDS NEW_FILE none|subscriber|alert|both REASON | rotate ENV OLD_ID SECONDS NEW_FILE REASON | rotate-overlap ENV OLD_ID SECONDS GRACE_SECONDS NEW_FILE REASON | rotation-audit ENV [AFTER_ID] | rotation-audit-v2 ENV [AFTER_ID] | subscriber-access ENV CREDENTIAL_ID grant|revoke REASON | subscriber-access-list ENV [AFTER_ID] | subscriber-access-audit ENV [AFTER_ID] | inspect ENV TOKEN_FILE | revoke ENV CREDENTIAL_ID REASON | list ENV [AFTER_ID] | audit ENV [AFTER_ID] | alert-access ENV CREDENTIAL_ID grant|revoke REASON | alert-access-list ENV [AFTER_ID] | alert-access-audit ENV [AFTER_ID]";
+    let usage = "usage: console-credential issue ENV SECONDS NEW_FILE REASON | issue-scoped ENV SECONDS NEW_FILE subscriber|none REASON | issue-permissions ENV SECONDS NEW_FILE none|subscriber|alert|both REASON | rotate ENV OLD_ID SECONDS NEW_FILE REASON | rotate-overlap ENV OLD_ID SECONDS GRACE_SECONDS NEW_FILE REASON | rotation-audit ENV [AFTER_ID] | rotation-audit-v2 ENV [AFTER_ID] | decision-access ENV CREDENTIAL_ID retry|accepted grant|revoke REASON | decision-access-list ENV [AFTER_ID] | decision-audit ENV grant|resolution [AFTER_ID] | subscriber-access ENV CREDENTIAL_ID grant|revoke REASON | subscriber-access-list ENV [AFTER_ID] | subscriber-access-audit ENV [AFTER_ID] | inspect ENV TOKEN_FILE | revoke ENV CREDENTIAL_ID REASON | list ENV [AFTER_ID] | audit ENV [AFTER_ID] | alert-access ENV CREDENTIAL_ID grant|revoke REASON | alert-access-list ENV [AFTER_ID] | alert-access-audit ENV [AFTER_ID]";
     let valid = matches!(args.as_slice(),[action,_,_,_,_,_,_] if action=="rotate-overlap")
-        || matches!(args.as_slice(),[action,_,_,_,_,_] if action=="issue-scoped" || action=="issue-permissions" || action=="rotate")
+        || matches!(args.as_slice(),[action,_,_,_,_,_] if action=="issue-scoped" || action=="issue-permissions" || action=="rotate" || action=="decision-access")
         || matches!(args.as_slice(),[action,_,_,_,_] if action=="issue" || action=="alert-access" || action=="subscriber-access")
         || matches!(args.as_slice(),[action,_,_,_] if action=="revoke")
+        || matches!(args.as_slice(),[action,_,_,_] if action=="decision-audit")
+        || matches!(args.as_slice(),[action,_,_] if action=="decision-audit" || action=="decision-access-list")
+        || matches!(args.as_slice(),[action,_] if action=="decision-access-list")
         || matches!(args.as_slice(),[action,_,_] if action=="inspect")
         || matches!(args.as_slice(),[action,_] if action=="list" || action=="audit" || action=="rotation-audit" || action=="rotation-audit-v2" || action=="alert-access-list" || action=="alert-access-audit" || action=="subscriber-access-list" || action=="subscriber-access-audit")
         || matches!(args.as_slice(),[action,_,_] if action=="list" || action=="audit" || action=="rotation-audit" || action=="rotation-audit-v2" || action=="alert-access-list" || action=="alert-access-audit" || action=="subscriber-access-list" || action=="subscriber-access-audit");
@@ -82,6 +85,56 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let _ = connection.await;
     });
     match args[0].as_str() {
+        "decision-access" => {
+            let id = Uuid::parse_str(&args[2])?;
+            if !["retry", "accepted"].contains(&args[3].as_str())
+                || !["grant", "revoke"].contains(&args[4].as_str())
+            {
+                return Err("invalid decision access action".into());
+            }
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                db.query_one(
+                    "SELECT public.novu_rust_manage_console_alert_decision($1,$2,$3,$4,$5)",
+                    &[&args[1], &id, &args[3], &args[4], &args[5]],
+                ),
+            )
+            .await;
+            match result {
+                Ok(Ok(row)) => println!("{}",json!({"changed":row.get::<_,bool>(0)})),
+                _ => return Err("decision access outcome unavailable; reconcile grants and audit before retrying".into()),
+            }
+        }
+        "decision-access-list" => {
+            let after = args.get(2).map(|s| Uuid::parse_str(s)).transpose()?;
+            let rows = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                db.query(
+                    "SELECT * FROM public.novu_rust_list_console_alert_decisions($1,$2)",
+                    &[&args[1], &after],
+                ),
+            )
+            .await??;
+            let values: Vec<_> = rows.into_iter().map(|r| json!({"credentialId":r.get::<_,Uuid>(0).to_string(),"retry":r.get::<_,bool>(1),"accepted":r.get::<_,bool>(2),"enabled":r.get::<_,bool>(3),"expiresAt":r.get::<_,String>(4)})).collect();
+            println!("{}", serde_json::to_string(&values)?);
+        }
+        "decision-audit" => {
+            let after = args
+                .get(3)
+                .map(|s| s.parse::<i64>())
+                .transpose()?
+                .unwrap_or(0);
+            let rows = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                db.query(
+                    "SELECT * FROM public.novu_rust_list_console_decision_audit($1,$2,$3)",
+                    &[&args[1], &after, &args[2]],
+                ),
+            )
+            .await??;
+            let values: Vec<_> = rows.into_iter().map(|r| json!({"id":r.get::<_,String>(0),"credentialId":r.get::<_,Uuid>(1).to_string(),"details":r.get::<_,serde_json::Value>(2),"createdAt":r.get::<_,String>(3)})).collect();
+            println!("{}", serde_json::to_string(&values)?);
+        }
         "rotate" | "rotate-overlap" => {
             let overlap = args[0] == "rotate-overlap";
             let old = Uuid::parse_str(&args[2])?;

@@ -3,6 +3,14 @@
 > 기준: 원본 Novu 커밋 `895388f37efe9e06de0aa333e5727303e6ad6853` · 작성: 2026-11-12.
 > **현재 구현은 실험용이며 Novu와 100% 호환되지 않는다. 운영에 사용하거나 기존 Novu의 대체품으로 배포하지 않는다.**
 
+### 별도 권한의 콘솔 경보 판정 API (API 0036)
+
+`POST /v1/experimental/console/alerts/resolve`는 콘솔 인증에 연결된 환경에서 Slack·이메일 경보의 `retry` 또는 `accepted` 판정을 시도 ID와 사유를 받아 기록한다. 조회 권한과 두 판정 권한은 각각 독립적이며 관리자는 `console-credential decision-access ENV 인증_ID retry|accepted grant|revoke 사유`로 권한을 관리한다. `decision-access-list`, `decision-audit ENV grant|resolution`으로 권한과 성공한 변경·판정 이력을 확인한다. 워커 0131 이후 API 0036을 적용하고, 관리자에게 새 관리 함수 EXECUTE를, API DB 로그인에 새 판정 함수 EXECUTE 및 해당 환경의 워커 `alert_retry`/`alert_accepted` 권한을 별도로 부여해야 한다. 상세 함수 서명과 요청 형식은 [API README](apps/api/rust-api/README.md)를 참고한다.
+
+인증·권한과 슬롯을 잠그고 대기 후 만료를 재확인하며, 워커의 시도 ID 확인·워커 감사·콘솔 감사를 한 트랜잭션으로 수행한다. `retry`는 다음 발송을 허용할 뿐 즉시 발송하지 않고, `accepted`는 운영자 판단이지 수신 증거가 아니다. 결과 유실 시 상태와 감사를 대조한다. 공유 인증은 개인 신원을 증명하지 않으며 사유와 감사 DB를 보호해야 한다. 기존 인증 교체는 조회 권한만 복사하므로 판정 권한은 새 인증에 별도 부여한다. Angular 화면의 판정 기능·개인별 로그인·SSO는 아직 미구현이다.
+
+Docker PostgreSQL의 제한 API·관리자 로그인으로 별도 권한, 타 환경 거절, 오래된 시도, 감사 실패 롤백, 잠금 대기 중 인증 만료 거절과 CLI 이력 조회를 검증했다. 실제 공급자 증거 확인, 운영 부하와 전체 HA는 미검증이다.
+
 ### 운영 경보 화면의 발송 시도 ID (API 0035)
 
 기존 경보 조회 응답과 Angular·Clarity 화면에 대상의 현재 발송 시도 ID를 추가했다. 시도가 없으면 `—`, 이전 응답에 필드가 없으면 `API 업데이트 필요`로 표시한다. ID는 별도 판정 권한을 가진 운영자가 워커의 `alert-resolve-v2`를 사용할 때 필요한 조회 시점의 값이다. 화면에서는 판정이나 재발송을 수행하지 않으며 ID만으로 실제 접수·수신을 확인할 수 없다. 조회 후 시도가 바뀌면 판정이 거절되므로 다시 조회하고 조사해야 한다.
