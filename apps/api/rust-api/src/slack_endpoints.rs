@@ -56,6 +56,138 @@ async fn access(
     Ok((env, hash))
 }
 const DTO: &str = "jsonb_build_object('identifier',e.identifier,'channel','chat','providerId','slack','integrationIdentifier',e.integration_identifier,'connectionIdentifier',e.connection_identifier,'subscriberId',e.subscriber_id,'contextKeys',to_jsonb(e.context_keys),'type',e.endpoint_type,'endpoint',e.endpoint,'createdAt',to_char(e.created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),'updatedAt',to_char(e.updated_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'))";
+pub(super) async fn list(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+) -> ApiError {
+    use std::collections::HashMap;
+    let path = uri.to_string();
+    let (env, hash) = match access(&db, &headers, &path, "read").await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let mut params = HashMap::<String, String>::new();
+    let mut contexts: Option<Vec<String>> = None;
+    for (key, value) in form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()) {
+        if key == "contextKeys" {
+            let values = contexts.get_or_insert_with(Vec::new);
+            if !value.is_empty() {
+                values.push(value.into_owned());
+            }
+        } else if ![
+            "subscriberId",
+            "channel",
+            "providerId",
+            "integrationIdentifier",
+            "connectionIdentifier",
+            "after",
+            "before",
+            "limit",
+            "orderBy",
+            "orderDirection",
+            "includeCursor",
+        ]
+        .contains(&key.as_ref())
+            || params
+                .insert(key.into_owned(), value.into_owned())
+                .is_some()
+        {
+            return failure(
+                StatusCode::NOT_IMPLEMENTED,
+                "List option not implemented",
+                &path,
+            );
+        }
+    }
+    let opt = |name: &str| params.get(name).filter(|v| !v.is_empty());
+    let after = opt("after");
+    let before = opt("before");
+    if after.is_some() && before.is_some() {
+        return failure(
+            StatusCode::BAD_REQUEST,
+            "Cannot specify both before and after",
+            &path,
+        );
+    }
+    let cursor = match after.or(before) {
+        Some(s) => match Uuid::parse_str(s) {
+            Ok(v) => Some(v),
+            Err(_) => return failure(StatusCode::BAD_REQUEST, "Invalid cursor", &path),
+        },
+        None => None,
+    };
+    let limit = match params.get("limit").map(|s| s.parse::<i64>()) {
+        None | Some(Ok(0)) => 10,
+        Some(Ok(n)) if (1..=100).contains(&n) => n,
+        _ => return failure(StatusCode::BAD_REQUEST, "Invalid limit", &path),
+    };
+    let order = match opt("orderBy").map(String::as_str) {
+        None | Some("createdAt") => "created_at",
+        Some("updatedAt") => "updated_at",
+        _ => {
+            return failure(
+                StatusCode::NOT_IMPLEMENTED,
+                "Sort field not implemented",
+                &path,
+            );
+        }
+    };
+    let desc = match opt("orderDirection").map(String::as_str) {
+        None | Some("DESC") => true,
+        Some("ASC") => false,
+        _ => return failure(StatusCode::BAD_REQUEST, "Invalid sort direction", &path),
+    };
+    let include = params.get("includeCursor").is_some_and(|s| s == "true");
+    let reverse = before.is_some();
+    let raw_ascending = desc == reverse;
+    let raw_sort = if raw_ascending { "ASC" } else { "DESC" };
+    let final_sort = if desc { "DESC" } else { "ASC" };
+    let cmp = match (raw_ascending, include) {
+        (true, true) => ">=",
+        (true, false) => ">",
+        (false, true) => "<=",
+        (false, false) => "<",
+    };
+    let next_cmp = if desc { "<" } else { ">" };
+    let prev_cmp = if desc { ">" } else { "<" };
+    let subscriber = opt("subscriberId");
+    let integration = opt("integrationIdentifier");
+    let connection = opt("connectionIdentifier");
+    let channel = opt("channel");
+    let provider = opt("providerId");
+    let sql = format!(
+        "WITH auth AS MATERIALIZED (SELECT public.novu_rust_lock_slack_endpoint_grant($1,$2,'read') AS ok), cursor_row AS MATERIALIZED (SELECT {order},internal_id FROM novu_rust_slack_channel_endpoints WHERE environment_id=$2 AND internal_id=$3), filtered AS NOT MATERIALIZED (SELECT e.* FROM novu_rust_slack_channel_endpoints e CROSS JOIN auth a WHERE a.ok AND e.environment_id=$2 AND ($3::uuid IS NULL OR EXISTS(SELECT 1 FROM cursor_row)) AND ($4::text IS NULL OR e.subscriber_id=$4) AND ($5::text IS NULL OR e.integration_identifier=$5) AND ($6::text IS NULL OR e.connection_identifier=$6) AND ($7::text IS NULL OR $7='chat') AND ($8::text IS NULL OR $8='slack') AND ($9::text[] IS NULL OR (e.context_keys @> $9 AND e.context_keys <@ $9 AND cardinality(e.context_keys)=cardinality($9)))), page AS MATERIALIZED (SELECT * FROM filtered WHERE $3::uuid IS NULL OR ({order},internal_id) {cmp} (SELECT {order},internal_id FROM cursor_row) ORDER BY {order} {raw_sort},internal_id {raw_sort} LIMIT $10), first_row AS (SELECT * FROM page ORDER BY {order} {final_sort},internal_id {final_sort} LIMIT 1), last_row AS (SELECT * FROM page ORDER BY {order} {} ,internal_id {} LIMIT 1), counted AS (SELECT count(*) AS n FROM (SELECT 1 FROM filtered LIMIT 50001) t) SELECT (SELECT ok FROM auth),jsonb_build_object('data',COALESCE((SELECT jsonb_agg({DTO} ORDER BY e.{order} {final_sort},e.internal_id {final_sort}) FROM page e),'[]'::jsonb),'next',CASE WHEN EXISTS(SELECT 1 FROM filtered f,last_row z WHERE (f.{order},f.internal_id) {next_cmp} (z.{order},z.internal_id)) THEN (SELECT internal_id::text FROM last_row) ELSE NULL END,'previous',CASE WHEN EXISTS(SELECT 1 FROM filtered f,first_row z WHERE (f.{order},f.internal_id) {prev_cmp} (z.{order},z.internal_id)) THEN (SELECT internal_id::text FROM first_row) ELSE NULL END,'totalCount',LEAST((SELECT n FROM counted),50000),'totalCountCapped',(SELECT n>50000 FROM counted))",
+        if desc { "ASC" } else { "DESC" },
+        if desc { "ASC" } else { "DESC" }
+    );
+    match db
+        .query_one(
+            &sql,
+            &[
+                &hash,
+                &env,
+                &cursor,
+                &subscriber,
+                &integration,
+                &connection,
+                &channel,
+                &provider,
+                &contexts,
+                &limit,
+            ],
+        )
+        .await
+    {
+        Ok(row) if row.get::<_, bool>(0) => (StatusCode::OK, Json(row.get(1))),
+        Ok(_) => failure(StatusCode::NOT_FOUND, "Permission revoked", &path),
+        Err(_) => failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal server error",
+            &path,
+        ),
+    }
+}
 pub(super) async fn create(
     State(db): State<Arc<Client>>,
     headers: HeaderMap,

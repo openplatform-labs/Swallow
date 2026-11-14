@@ -50,6 +50,7 @@ async fn scoped_slack_endpoint_crud_and_subscriber_deletion() {
         novu_postgres_queue::in_app::MIGRATION,
         include_str!("../../../worker/rust-queue/migrations/0075_slack_channel_endpoints.sql"),
         include_str!("../../../worker/rust-queue/migrations/0076_slack_endpoint_integrations.sql"),
+        include_str!("../../../worker/rust-queue/migrations/0077_slack_endpoint_pagination.sql"),
         include_str!("../migrations/0016_slack_endpoint_permissions.sql"),
         include_str!("../migrations/0017_slack_endpoint_update_audit.sql"),
     ] {
@@ -272,6 +273,113 @@ async fn scoped_slack_endpoint_crud_and_subscriber_deletion() {
         .0,
         StatusCode::CREATED
     );
+    for identifier in ["second", "third"] {
+        assert_eq!(request(app.clone(),"POST","/v1/channel-endpoints","key-a",json!({"identifier":identifier,"subscriberId":"alice","integrationIdentifier":"main","type":"slack_user","endpoint":{"userId":"U123"}})).await.0,StatusCode::CREATED);
+    }
+    setup.execute("UPDATE novu_rust_slack_channel_endpoints SET created_at='2026-01-01T00:00:00Z' WHERE environment_id='a'",&[]).await.unwrap();
+    let (status, page) = request(
+        app.clone(),
+        "GET",
+        "/v1/channel-endpoints?limit=1&orderDirection=ASC&subscriberId=alice",
+        "key-a",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["totalCount"], 3);
+    assert_eq!(page["data"].as_array().unwrap().len(), 1);
+    let next = page["next"].as_str().unwrap();
+    let (_, second_page) = request(
+        app.clone(),
+        "GET",
+        &format!(
+            "/v1/channel-endpoints?limit=1&orderDirection=ASC&subscriberId=alice&after={next}"
+        ),
+        "key-a",
+        Value::Null,
+    )
+    .await;
+    assert_ne!(
+        page["data"][0]["identifier"],
+        second_page["data"][0]["identifier"]
+    );
+    let previous = second_page["previous"].as_str().unwrap();
+    let (_, back) = request(
+        app.clone(),
+        "GET",
+        &format!(
+            "/v1/channel-endpoints?limit=1&orderDirection=ASC&subscriberId=alice&before={previous}"
+        ),
+        "key-a",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(back["data"], page["data"]);
+    let (_, including) = request(
+        app.clone(),
+        "GET",
+        &format!(
+            "/v1/channel-endpoints?limit=1&orderDirection=ASC&after={next}&includeCursor=true"
+        ),
+        "key-a",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(including["data"], page["data"]);
+    let (_, descending) = request(
+        app.clone(),
+        "GET",
+        "/v1/channel-endpoints?limit=1&orderDirection=DESC",
+        "key-a",
+        Value::Null,
+    )
+    .await;
+    let desc_cursor = descending["next"].as_str().unwrap();
+    let (_, desc_next) = request(
+        app.clone(),
+        "GET",
+        &format!("/v1/channel-endpoints?limit=1&orderDirection=DESC&after={desc_cursor}"),
+        "key-a",
+        Value::Null,
+    )
+    .await;
+    let desc_previous = desc_next["previous"].as_str().unwrap();
+    let (_, desc_back) = request(
+        app.clone(),
+        "GET",
+        &format!("/v1/channel-endpoints?limit=1&orderDirection=DESC&before={desc_previous}"),
+        "key-a",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(desc_back["data"], descending["data"]);
+    let (_, filtered) = request(
+        app.clone(),
+        "GET",
+        "/v1/channel-endpoints?contextKeys=&connectionIdentifier=connection",
+        "key-a",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(filtered["totalCount"], 1);
+    let (_, other_channel) = request(
+        app.clone(),
+        "GET",
+        "/v1/channel-endpoints?channel=email",
+        "key-a",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(other_channel["totalCount"], 0);
+    let (_, missing_cursor) = request(
+        app.clone(),
+        "GET",
+        "/v1/channel-endpoints?after=00000000-0000-0000-0000-000000000000",
+        "key-a",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(missing_cursor["totalCount"], 0);
     let lock = setup.transaction().await.unwrap();
     lock.query_one("SELECT 1 FROM novu_rust_subscribers WHERE environment_id='a' AND subscriber_id='alice' FOR UPDATE",&[]).await.unwrap();
     let mut race_payload = json!({"identifier":"race","subscriberId":"alice","integrationIdentifier":"main","type":"slack_user","endpoint":{"userId":"U123"}});

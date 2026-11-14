@@ -155,7 +155,7 @@ pub fn router_with_webhook_configs(
             post(twilio_webhook::receive_dispatch),
         )
         .route("/v1/events/trigger", post(trigger))
-        .route("/v1/channel-endpoints", post(slack_endpoints::create))
+        .route("/v1/channel-endpoints", post(slack_endpoints::create).get(slack_endpoints::list))
         .route("/v1/channel-endpoints/{identifier}", get(slack_endpoints::get).patch(slack_endpoints::update).delete(slack_endpoints::delete))
         .route(
             "/v1/experimental/workflows/{workflow}/email-provider",

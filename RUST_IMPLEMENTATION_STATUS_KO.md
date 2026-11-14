@@ -54,7 +54,9 @@ API는 `POST /v1/channel-endpoints`, `GET /v1/channel-endpoints/{identifier}`, `
 
 API 키별 `novu_rust_slack_endpoint_permissions`의 `read`·`write` 권한은 기본 부여되지 않으며 신뢰된 DB 관리자가 키 해시에 명시적으로 부여한다. API DB 로그인에 `GRANT EXECUTE ON FUNCTION public.novu_rust_lock_slack_endpoint_grant(text,text,text)` 및 필요한 메타데이터·엔드포인트 읽기/쓰기, 감사 삽입 권한을 별도로 부여해야 한다. 최종 조회·변경에서 권한, 키 활성화 및 사용자 존재를 다시 잠그고 생성·수정·삭제와 감사 삽입을 같은 SQL 트랜잭션에 수행한다. API 인스턴스가 이 경로를 실행하기 전에 마이그레이션과 DB 권한을 준비해야 한다. 직접 DB 접근은 우회할 수 있으므로 테이블 권한을 제한한다.
 
-명시된 identifier가 없으면 Rust가 UUID 기반 ID를 생성한다. context, 구독자 자동 생성, webhook 등 다른 엔드포인트 유형과 목록은 미구현이며 입력 검증·오류 문구와 권한 정책은 원본과 다르다. 통합·연결 관리 API 및 워크플로 발송도 미구현이다. Docker PostgreSQL과 Rust HTTP 핸들러에서 생성·조회·수정·삭제, 환경·읽기/쓰기 권한 격리, 구독자 삭제 연동, 잘못된 입력과 권한 회수 경합을 확인했다. 기준 원본의 DTO mapper와 선택된 정상 응답 필드를 비교했으며 시각은 제외했다. 원본 서버·SDK와 종단 간 비교, 사용자 JWT/SSO, 전체 감사 보호와 운영 DB 적용은 미검증이다.
+명시된 identifier가 없으면 Rust가 UUID 기반 ID를 생성한다. context 생성, 구독자 자동 생성, webhook 등 다른 엔드포인트 유형은 미구현이며 입력 검증·오류 문구와 권한 정책은 원본과 다르다. 통합·연결 관리 API 및 워크플로 발송도 미구현이다. Docker PostgreSQL과 Rust HTTP 핸들러에서 생성·조회·수정·삭제, 환경·읽기/쓰기 권한 격리, 구독자 삭제 연동, 잘못된 입력과 권한 회수 경합을 확인했다. 기준 원본의 DTO mapper와 선택된 정상 응답 필드를 비교했으며 시각은 제외했다. 원본 서버·SDK와 종단 간 비교, 사용자 JWT/SSO, 전체 감사 보호와 운영 DB 적용은 미검증이다.
+
+`GET /v1/channel-endpoints`는 같은 읽기 권한 아래 Slack 엔드포인트를 조회한다. 워커 0077의 정렬 인덱스를 적용한다. 구독자·통합·연결·채널·provider·context 키 필터, 생성·수정 시각 정렬, 최대 100건과 앞뒤 커서 및 커서 포함을 지원한다. 이 구현의 커서는 PostgreSQL 내부 UUID이므로 원본 MongoDB ObjectId 커서와 교환할 수 없다. 다른 유형은 아직 저장하지 않아 목록에 나오지 않는다. 모든 목록 조회는 권한 재확인과 함께 필터 집계(최대 50,001건)·페이지·앞뒤 존재 여부를 한 쿼리로 수행하며 데이터량과 필터에 따른 DB 부하는 미검증이다. Docker PostgreSQL에서 동시간 항목의 앞뒤 페이지, 오름·내림차순, 커서 포함, 필터와 없는 커서를 검증한다. 원본 서버와 목록·커서 오류를 비교하지 않았으며 전체 context 입력·정렬·동시 변경의 호환성은 미검증이다.
 
 ## Resend 발송 응답 판정
 

@@ -1,0 +1,2 @@
+CREATE INDEX IF NOT EXISTS novu_rust_slack_endpoints_created_cursor_idx ON novu_rust_slack_channel_endpoints(environment_id,created_at,internal_id);
+CREATE INDEX IF NOT EXISTS novu_rust_slack_endpoints_updated_cursor_idx ON novu_rust_slack_channel_endpoints(environment_id,updated_at,internal_id);
