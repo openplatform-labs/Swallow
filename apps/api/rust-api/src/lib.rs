@@ -3486,7 +3486,7 @@ async fn trigger(
     let context_entries = parsed_context
         .map(|context| context.entries)
         .unwrap_or_else(|| json!([]));
-    let row = match db.query_opt("SELECT active, has_steps, in_app_content, inbox_metadata, (SELECT organization_id FROM novu_rust_environments WHERE id=$1), email_subject, email_html, sms_content, push_title, push_content FROM novu_rust_workflows WHERE environment_id = $1 AND identifier = $2", &[&environment_id, &name]).await {
+    let row = match db.query_opt("SELECT active, has_steps, in_app_content, inbox_metadata, (SELECT organization_id FROM novu_rust_environments WHERE id=$1), email_subject, email_html, sms_content, push_title, push_content, to_jsonb(w)->>'chat_content' FROM novu_rust_workflows w WHERE environment_id = $1 AND identifier = $2", &[&environment_id, &name]).await {
         Ok(Some(row)) => row,
         Ok(None) => return error(StatusCode::UNPROCESSABLE_ENTITY, "workflow_not_found", "Unprocessable Entity"),
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error", "Internal Server Error"),
@@ -3524,10 +3524,12 @@ async fn trigger(
         let sms_content: Option<String> = row.get(7);
         let push_title: Option<String> = row.get(8);
         let push_content: Option<String> = row.get(9);
+        let chat_content: Option<String> = row.get(10);
         let content = if content.is_none()
             && ((email_subject.is_some() && email_html.is_some())
                 || sms_content.is_some()
-                || (push_title.is_some() && push_content.is_some()))
+                || (push_title.is_some() && push_content.is_some())
+                || chat_content.is_some())
         {
             Some(String::new())
         } else {

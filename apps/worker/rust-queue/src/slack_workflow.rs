@@ -401,6 +401,82 @@ mod tests {
     use tokio_postgres::NoTls;
 
     #[tokio::test]
+    #[ignore = "requires differential harness PostgreSQL and loopback HTTP"]
+    async fn capture_reference_slack_workflow() {
+        let (mut db, driver) =
+            tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(), NoTls)
+                .await
+                .unwrap();
+        tokio::spawn(async move {
+            let _ = driver.await;
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut results = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 4096];
+                let message = loop {
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                        let h = String::from_utf8_lossy(&bytes[..pos]);
+                        let len: usize = h
+                            .lines()
+                            .find_map(|v| {
+                                v.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .and_then(|x| x.parse().ok())
+                            })
+                            .unwrap();
+                        if bytes.len() >= pos + 4 + len {
+                            let request = String::from_utf8(bytes).unwrap();
+                            assert!(
+                                request
+                                    .to_ascii_lowercase()
+                                    .contains("authorization: bearer fixture-token")
+                            );
+                            break serde_json::from_str::<Value>(
+                                request.split_once("\r\n\r\n").unwrap().1,
+                            )
+                            .unwrap();
+                        }
+                    }
+                };
+                let body = json!({"ok":true,"channel":message["channel"],"ts":"1.2"}).to_string();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                results.push(message);
+            }
+            std::fs::write(
+                std::env::var("TEST_SLACK_CAPTURE_PATH").unwrap(),
+                serde_json::to_vec(&results).unwrap(),
+            )
+            .unwrap();
+        });
+        let mut providers = Providers::new();
+        providers.insert(
+            ("slack-main".into(), "slack-connection".into()),
+            Slack::test_endpoint("fixture-token".into(), &url).unwrap(),
+        );
+        assert!(
+            fanout_one(&mut db, "64a000000000000000000002")
+                .await
+                .unwrap()
+        );
+        for _ in 0..2 {
+            assert!(
+                delivery_one(&mut db, "64a000000000000000000002", &providers)
+                    .await
+                    .unwrap()
+            );
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     #[ignore = "requires disposable PostgreSQL and loopback HTTP"]
     async fn resolves_endpoints_and_revalidates_each_delivery() {
         let (mut db, driver) =

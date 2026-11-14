@@ -143,6 +143,9 @@ if [[ "${NOVU_TEST_PREFERENCE_DELIVERY:-0}" == 1 ]]; then
     python3 tests/reference_subscriber_subscriptions_compare.py
   fi
   worker_options=()
+  if [[ "${NOVU_TEST_SLACK_ONLY:-0}" == 1 ]]; then
+    worker_options=(-v "$PWD/tests/reference_slack_preload.cjs:/novu-slack-preload.cjs:ro" -e NODE_OPTIONS=--require=/novu-slack-preload.cjs)
+  fi
   if [[ "${NOVU_TEST_RESEND_ONLY:-0}" == 1 ]]; then
     worker_options=(-v "$PWD/tests/reference_resend_preload.cjs:/novu-resend-preload.cjs:ro" -e NODE_OPTIONS=--require=/novu-resend-preload.cjs)
   fi
@@ -160,6 +163,11 @@ if [[ "${NOVU_TEST_PREFERENCE_DELIVERY:-0}" == 1 ]]; then
   DATABASE_URL="postgresql://postgres@127.0.0.1:$postgres_port/novu_compat" "$CARGO_TARGET_DIR/debug/in-app-worker" >/dev/null 2>&1 &
   rust_worker_pid=$!
   export NOVU_REFERENCE_MONGO_CONTAINER="$mongo" NOVU_RUST_PG_CONTAINER="$postgres" NOVU_REFERENCE_WORKER_CONTAINER="$reference_worker" NOVU_RUST_WORKER_PID="$rust_worker_pid"
+  if [[ "${NOVU_TEST_SLACK_ONLY:-0}" == 1 ]]; then
+    export TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:$postgres_port/novu_compat"
+    python3 tests/reference_slack_workflow_compare.py
+    exit 0
+  fi
   if [[ "${NOVU_TEST_FCM_MULTI_ONLY:-0}" == 1 ]]; then
     export TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:$postgres_port/novu_compat"
     python3 tests/reference_fcm_multi_compare.py
