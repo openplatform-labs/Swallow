@@ -3,6 +3,12 @@
 > 기준: 원본 Novu 커밋 `895388f37efe9e06de0aa333e5727303e6ad6853` · 작성: 2026-11-12.
 > **현재 구현은 실험용이며 Novu와 100% 호환되지 않는다. 운영에 사용하거나 기존 Novu의 대체품으로 배포하지 않는다.**
 
+### Android·웹 푸시 옵션 전달
+
+FCM 워크플로 override와 독립 작업에서 Android `priority`(normal/high), 정수 밀리초 `ttl`, `collapseKey`, `restrictedPackageName`, `directBootOk`, 문자열 `data`와 웹 푸시 `headers`, 문자열 `data`, 객체 `notification`·`fcmOptions`, 공통 `fcmOptions.analyticsLabel`을 지원한다. Android TTL은 Firebase Admin과 같이 초 단위 문자열로 바꾸고 일부 Android 속성은 wire 이름으로 바꾼다. 워크플로에서는 `overrides.fcm.android`·`webPush`·`fcmOptions` 또는 기존 provider override 경로를 사용한다. 다중 토큰에서는 각 HTTP 요청에 같은 옵션을 복사한다. 지원하지 않는 Android 알림 옵션, APNs 및 알 수 없는 최상위 플랫폼 필드와 잘못된 타입은 거절한다. API는 플랫폼 옵션의 객체 여부만 검사하고 세부 값은 워커에서 검사하므로 미지원 값도 트리거 접수 후 발송 실패할 수 있다. 웹 알림과 웹 `fcmOptions` 객체 내부는 Firebase처럼 그대로 전달되며 공급자의 검증 결과가 필요하다. TTL의 소수 밀리초와 2^53-1을 초과하는 값은 제한적으로 거절한다.
+
+기준 Firebase Admin SDK에서 선택된 설정을 실제 변환한 요청 본문과 단일·다중 토큰 변환을 비교하고, 로컬 모의 provider와 오류·대상 복사 테스트를 수행했다. 고정 원본 Novu와 Rust의 API·워크플로·워커를 실행해 FCM flat override 및 provider override 사례의 모의 요청과 메시지 이력을 비교했다. 실제 FCM과 Android·브라우저 수신, 모든 플랫폼 옵션 및 APNs는 미검증 또는 미구현이며, 요청 수가 많거나 큰 옵션을 포함한 운영 부하는 검증하지 않았다. 공급자 접수는 사용자 기기 표시를 보장하지 않는다.
+
 ### 실패 작업 확인의 버전 경합 방지 (워커 0129)
 
 기존 `ack-failed-job`은 확인 시점의 실패를 기록하므로, 운영자가 목록을 본 후 같은 작업이 재실패하면 검토하지 않은 새 실패도 확인 처리할 수 있다. 0129는 선택형 `list-failed-jobs-v2 ENV [AFTER_JOB]`와 `ack-failed-job-v2 ENV JOB REVISION OPERATOR REASON`을 제공한다. 목록의 문자열 `revision`을 그대로 사용하면 DB가 권한과 실패 작업 행을 잠근 뒤 버전이 다를 때 거절한다. 동일 버전 중복 확인은 무변경으로 처리하며, 확인은 발송 결과의 성공이나 문제 해결을 뜻하지 않는다. 목록은 최대 100건의 환경별 비밀 없는 메타데이터이며 페이지 간 전체 스냅샷은 아니다. 작업이 이미 복구되었거나 버전이 바뀌었으면 다시 목록을 보고 조사해야 한다.

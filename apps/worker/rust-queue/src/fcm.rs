@@ -306,7 +306,60 @@ fn invalid_device_token_response(body: &[u8]) -> bool {
     !known && value.to_string().contains(INVALID)
 }
 
-/// Convert the bounded Firebase message subset into HTTP v1 single-send bodies.
+// Preserve the selected Firebase Admin SDK fields and their HTTP conversion.
+fn platform_config(name: &str, value: &Value) -> Result<Value, SendError> {
+    let source = value.as_object().ok_or(SendError::UnsupportedMessage)?;
+    let mut output = Map::new();
+    for (key, value) in source {
+        let wire = match (name, key.as_str()) {
+            ("android", "collapseKey") => "collapse_key",
+            ("android", "restrictedPackageName") => "restricted_package_name",
+            ("android", "directBootOk") => "direct_boot_ok",
+            ("android", "priority" | "ttl" | "data") => key,
+            ("webpush", "headers" | "data" | "notification" | "fcmOptions") => key,
+            ("fcmOptions", "analyticsLabel") => key,
+            _ => return Err(SendError::UnsupportedMessage),
+        };
+        let converted = match (name, key.as_str()) {
+            ("android", "ttl") => {
+                let millis = value
+                    .as_u64()
+                    .filter(|n| *n <= 9_007_199_254_740_991)
+                    .ok_or(SendError::UnsupportedMessage)?;
+                let seconds = millis / 1000;
+                let nanos = (millis % 1000) * 1_000_000;
+                Value::String(if nanos == 0 {
+                    format!("{seconds}s")
+                } else {
+                    format!("{seconds}.{nanos:09}s")
+                })
+            }
+            ("android", "directBootOk") if value.is_boolean() => value.clone(),
+            ("android", "priority") if matches!(value.as_str(), Some("normal" | "high")) => {
+                value.clone()
+            }
+            ("android", "collapseKey" | "restrictedPackageName")
+            | ("fcmOptions", "analyticsLabel")
+                if value.is_string() =>
+            {
+                value.clone()
+            }
+            ("android" | "webpush", "data") | ("webpush", "headers")
+                if value
+                    .as_object()
+                    .is_some_and(|m| m.values().all(Value::is_string)) =>
+            {
+                value.clone()
+            }
+            ("webpush", "notification" | "fcmOptions") if value.is_object() => value.clone(),
+            _ => return Err(SendError::UnsupportedMessage),
+        };
+        output.insert(wire.to_owned(), converted);
+    }
+    Ok(Value::Object(output))
+}
+
+/// Convert the supported Firebase message subset into HTTP v1 single-send bodies.
 /// Unsupported platform-specific options are rejected rather than dropped.
 pub fn wire_messages(plan: &Plan) -> Result<Vec<Value>, SendError> {
     let object = plan
@@ -321,6 +374,9 @@ pub fn wire_messages(plan: &Plan) -> Result<Vec<Value>, SendError> {
             "condition",
             "notification",
             "data",
+            "android",
+            "webpush",
+            "fcmOptions",
         ]
         .contains(&key.as_str())
     }) {
@@ -352,6 +408,11 @@ pub fn wire_messages(plan: &Plan) -> Result<Vec<Value>, SendError> {
             result.insert(wire.into(), value.clone());
         }
         common.insert("notification".into(), Value::Object(result));
+    }
+    for name in ["android", "webpush", "fcmOptions"] {
+        if let Some(value) = object.get(name) {
+            common.insert(name.to_owned(), platform_config(name, value)?);
+        }
     }
     let routes: Vec<(&str, String)> = if plan.multicast {
         if object
@@ -774,12 +835,48 @@ mod tests {
         server.await.unwrap();
     }
     #[test]
+    fn platform_config_is_bounded_and_shared_across_multicast_targets() {
+        let plan = Plan {
+            multicast: true,
+            message: json!({"tokens":["a","b"],"android":{"ttl":1501,"priority":"high"},"webpush":{"headers":{"TTL":"60"}},"fcmOptions":{"analyticsLabel":"campaign"}}),
+        };
+        let messages = wire_messages(&plan).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["message"]["android"]["ttl"], "1.501000000s");
+        assert_eq!(messages[1]["message"]["token"], "b");
+        assert_eq!(
+            messages[0]["message"]["webpush"],
+            messages[1]["message"]["webpush"]
+        );
+        for invalid in [
+            json!({"android":{"ttl":-1}}),
+            json!({"android":{"ttl":1.5}}),
+            json!({"android":{"data":{"x":1}}}),
+            json!({"android":{"directBootOk":"yes"}}),
+            json!({"webpush":{"headers":{"TTL":1}}}),
+            json!({"webpush":{"unknown":1}}),
+            json!({"fcmOptions":{"analyticsLabel":2}}),
+            json!({"apns":{}}),
+        ] {
+            let mut message = invalid;
+            message["token"] = json!("a");
+            assert_eq!(
+                wire_messages(&Plan {
+                    multicast: false,
+                    message
+                }),
+                Err(SendError::UnsupportedMessage)
+            );
+        }
+    }
+
+    #[test]
     fn rejects_unsupported_and_empty_destinations() {
         let push = Push {
             title: "Hi".into(),
             content: "Hello".into(),
             targets: vec!["a".into()],
-            provider_data: json!({"android":{"priority":"high"}})
+            provider_data: json!({"android":{"notification":{"channelId":"unsupported"}}})
                 .as_object()
                 .unwrap()
                 .clone(),

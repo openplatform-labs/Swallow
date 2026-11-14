@@ -8,6 +8,9 @@ const messages=[
   {topic:'orders',data:{title:'Hi',message:'Hello'}},
   {condition:"'a' in topics",notification:{title:'Hi',body:'Hello'},data:{}},
   {token:'device-b',notification:{title:'Hi',body:'Hello'},data:{}},
+  {token:'device-a',android:{priority:'high',ttl:1501,collapseKey:'orders',restrictedPackageName:'com.example',directBootOk:true,data:{kind:'update'}}},
+  {topic:'news',webpush:{headers:{Urgency:'high'},data:{key:'value'},notification:{title:'News',icon:'https://example.test/icon.png'},fcmOptions:{link:'https://example.test/'}},fcmOptions:{analyticsLabel:'campaign'}},
+  {token:'device-b',android:{ttl:0,priority:'normal'},webpush:{headers:{TTL:'60'}}},
 ];
 for(const message of messages) validateMessage(message);
 process.stdout.write(JSON.stringify(messages.map(message=>({message}))));

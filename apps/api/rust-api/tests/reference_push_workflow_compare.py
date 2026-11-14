@@ -221,6 +221,9 @@ for label,tokens,disabled in ([] if os.environ.get('NOVU_TEST_PUSH_ROUTING_CASES
 # Firebase data/notification content. Compare both wire messages and history.
 for label, override in ([] if os.environ.get('NOVU_TEST_PUSH_ROUTING_CASES_ONLY')=='1' else [
     ('targets', {'fcm':{'deviceTokens':['override-a','override-b']}}),
+    ('platform-options', {'fcm':{'android':{'priority':'high','data':{'kind':'update'}},'webPush':{'headers':{'Urgency':'high'},'notification':{'title':'News','icon':'https://example.test/icon.png'}},'fcmOptions':{'analyticsLabel':'campaign'}}}),
+    ('platform-provider', {'providers':{'fcm':{'android':{'priority':'normal'},'webpush':{'headers':{'TTL':'60'}},'fcmOptions':{'analyticsLabel':'other'}}}}),
+
     ('notification-data', {'fcm':{'data':{'custom':'value'}}}),
     ('data-only', {'fcm':{'type':'data','data':{'custom':'value','title':'ignored'}}}),
     ('message-id-data', {'fcm':{'data':{'__nvMessageId':'custom-message-id'}}}),
