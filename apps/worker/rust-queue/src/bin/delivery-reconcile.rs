@@ -72,7 +72,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             std::process::exit(2);
         }
     } else if args.len() == 2 && args[0] == "check-slack" {
-        let health = novu_postgres_queue::slack_queue::health(&db, &args[1]).await?;
+        let scoped = match std::env::var("SWALLOW_SLACK_SCOPED_ACCESS").as_deref() {
+            Ok("true") => true,
+            Ok("false") | Err(std::env::VarError::NotPresent) => false,
+            _ => return Err("invalid Slack scoped access setting".into()),
+        };
+        let health = if scoped {
+            novu_postgres_queue::slack_queue::scoped_health(&db, &args[1]).await?
+        } else {
+            novu_postgres_queue::slack_queue::health(&db, &args[1]).await?
+        };
         let missing = match std::env::var("SWALLOW_SLACK_CHECK_MISSING_ENDPOINTS").as_deref() {
             Ok("true") => true,
             Ok("false") | Err(std::env::VarError::NotPresent) => false,

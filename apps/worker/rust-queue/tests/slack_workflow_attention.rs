@@ -30,6 +30,7 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
         include_str!("../migrations/0081_slack_view_permission.sql"),
         include_str!("../migrations/0082_slack_ack_function.sql"),
         slack_queue::RESOLVE_FUNCTION_MIGRATION,
+        include_str!("../migrations/0084_slack_scoped_health.sql"),
     ] {
         db.batch_execute(sql).await.unwrap();
     }
@@ -44,6 +45,9 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
         .unwrap();
     db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT e.id,session_user,'slack_view',r.oid FROM novu_rust_environments e CROSS JOIN pg_roles r WHERE r.rolname=session_user",&[]).await.unwrap();
     db.batch_execute(include_str!("../migrations/0082_slack_ack_function.sql"))
+        .await
+        .unwrap();
+    db.batch_execute(include_str!("../migrations/0084_slack_scoped_health.sql"))
         .await
         .unwrap();
     let failed = Uuid::new_v4();
@@ -95,6 +99,7 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
     assert_eq!(health["preDispatchFailures"], 1);
     assert_eq!(health["missingEndpoints"], 1);
     assert_eq!(health["unknownAttempts"], 1);
+    assert_eq!(slack_queue::scoped_health(&db, "a").await.unwrap(), health);
     let listed = slack_queue::list_attention(&db, "a", None).await.unwrap();
     assert_eq!(listed.len(), 3);
     for (id, category) in [
@@ -135,7 +140,7 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
     let granted: bool = db.query_one("SELECT public.novu_rust_manage_operator_grant('a',session_user::text,'slack_ack','grant','fixture')",&[]).await.unwrap().get(0);
     assert!(granted);
     let viewer = format!("slack_viewer_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {viewer} LOGIN; GRANT USAGE ON SCHEMA public TO {viewer}; GRANT EXECUTE ON FUNCTION public.novu_rust_list_slack_attention(text,uuid) TO {viewer}; GRANT EXECUTE ON FUNCTION public.novu_rust_ack_slack_workflow(text,uuid,text,text) TO {viewer}; GRANT EXECUTE ON FUNCTION public.novu_rust_resolve_slack(text,uuid,text,text,text) TO {viewer}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {viewer} LOGIN; GRANT USAGE ON SCHEMA public TO {viewer}; GRANT EXECUTE ON FUNCTION public.novu_rust_list_slack_attention(text,uuid) TO {viewer}; GRANT EXECUTE ON FUNCTION public.novu_rust_ack_slack_workflow(text,uuid,text,text) TO {viewer}; GRANT EXECUTE ON FUNCTION public.novu_rust_resolve_slack(text,uuid,text,text,text) TO {viewer}; GRANT EXECUTE ON FUNCTION public.novu_rust_slack_health(text) TO {viewer}")).await.unwrap();
     let (mut viewer_db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move {
         let _ = driver.await;
@@ -149,7 +154,13 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
             .await
             .is_err()
     );
+    assert!(slack_queue::scoped_health(&viewer_db, "a").await.is_err());
     assert!(db.query_one("SELECT public.novu_rust_manage_operator_grant('a',$1,'slack_view','grant','view fixture')",&[&viewer]).await.unwrap().get::<_,bool>(0));
+    assert_eq!(
+        slack_queue::scoped_health(&viewer_db, "a").await.unwrap(),
+        health
+    );
+    assert!(slack_queue::scoped_health(&viewer_db, "b").await.is_err());
     assert_eq!(
         slack_queue::list_attention(&viewer_db, "a", None)
             .await
@@ -183,6 +194,7 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
             .await
             .is_err()
     );
+    assert!(slack_queue::scoped_health(&viewer_db, "a").await.is_err());
     let viewer_job = Uuid::new_v4();
     queue::enqueue(
         &db,
@@ -450,6 +462,7 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
             .args(args)
             .env("DATABASE_URL", &url)
             .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("SWALLOW_SLACK_SCOPED_ACCESS", "true")
             .env(
                 "SWALLOW_SLACK_CHECK_MISSING_ENDPOINTS",
                 if missing_enabled { "true" } else { "false" },
@@ -496,6 +509,7 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
             .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
             .env("SWALLOW_ALERT_ATTEMPTS_ENABLED", "false")
             .env("SWALLOW_ALERT_SLACK_JOBS_ENABLED", "true")
+            .env("SWALLOW_ALERT_SLACK_SCOPED_ACCESS", "true")
             .env(
                 "SWALLOW_ALERT_SLACK_MISSING_ENDPOINTS_ENABLED",
                 if enabled { "true" } else { "false" },
@@ -514,6 +528,12 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
             .unwrap()
     };
     assert_eq!(alert(false).status.code(), Some(0));
+    db.execute("DELETE FROM novu_rust_delivery_operator_grants WHERE environment_id='a' AND database_principal=session_user AND decision='slack_view'",&[]).await.unwrap();
+    let denied = alert(false);
+    assert_eq!(denied.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("Slack chat health check failed"));
+    db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'a',session_user,'slack_view',oid FROM pg_roles WHERE rolname=session_user",&[]).await.unwrap();
+
     assert_eq!(alert(true).status.code(), Some(2));
     let ack = cli(
         &[

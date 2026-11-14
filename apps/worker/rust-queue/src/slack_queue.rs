@@ -66,6 +66,22 @@ pub async fn health(
         serde_json::json!({"unknownAttempts":row.get::<_,i64>(0),"rejectedAttempts":row.get::<_,i64>(1),"strandedDispatches":row.get::<_,i64>(2),"preDispatchFailures":row.get::<_,i64>(4),"missingEndpoints":row.get::<_,i64>(5)}),
     )
 }
+/// Environment-authorized aggregate health without direct table privileges.
+pub async fn scoped_health(
+    client: &Client,
+    environment: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    let row = client
+        .query_one(
+            "SELECT * FROM public.novu_rust_slack_health($1)",
+            &[&environment],
+        )
+        .await?;
+    Ok(
+        serde_json::json!({"unknownAttempts":row.get::<_,i64>(0),"rejectedAttempts":row.get::<_,i64>(1),"strandedDispatches":row.get::<_,i64>(2),"preDispatchFailures":row.get::<_,i64>(3),"missingEndpoints":row.get::<_,i64>(4)}),
+    )
+}
+
 /// List the same Slack attention categories as health, without payloads or error text.
 /// The UUID cursor is exclusive; each page contains at most 100 jobs.
 pub async fn list_attention(

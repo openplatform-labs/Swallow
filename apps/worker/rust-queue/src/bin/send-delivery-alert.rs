@@ -149,7 +149,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         None
     };
     let slack_attempts = if slack_jobs_enabled {
-        let result = novu_postgres_queue::slack_queue::health(&db, &args[0]).await;
+        let result = if env_bool("SWALLOW_ALERT_SLACK_SCOPED_ACCESS", false)? {
+            novu_postgres_queue::slack_queue::scoped_health(&db, &args[0]).await
+        } else {
+            novu_postgres_queue::slack_queue::health(&db, &args[0]).await
+        };
         let values = result.ok().and_then(|health| {
             Some((
                 health["unknownAttempts"].as_u64()?,
