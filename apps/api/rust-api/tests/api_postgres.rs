@@ -1812,6 +1812,11 @@ async fn trigger_api_contract_inner() {
     }
     let (status, _) = request(app.clone(), Some("ApiKey test-key"), json!({"name":"inbox","to":[{"type":"Topic","topicKey":"alpha","exclude":["topic-b"]},{"type":"Topic","topicKey":"beta"},"topic-b"],"transactionId":"topic-late-resolution"})).await;
     assert_eq!(status, StatusCode::CREATED);
+    let row = db.query_one("SELECT payload->'topicIdentitySnapshot', (SELECT internal_id FROM novu_rust_subscribers WHERE environment_id='env-a' AND subscriber_id='topic-a'), (SELECT internal_id FROM novu_rust_subscribers WHERE environment_id='env-a' AND subscriber_id='topic-b') FROM novu_queue_jobs WHERE payload->>'transactionId'='topic-late-resolution'", &[]).await.unwrap();
+    let snapshot: Value = row.get(0);
+    assert_eq!(snapshot["topic-a"], row.get::<_, String>(1));
+    assert_eq!(snapshot["topic-b"], row.get::<_, String>(2));
+    assert!(snapshot.get("topic-c").is_none());
     let (status, _) = inbox_mutate(
         app.clone(),
         "POST",

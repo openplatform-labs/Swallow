@@ -615,7 +615,17 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
     // trigger HTTP request is accepted. Direct recipients take precedence.
     let mut topic_preferences: HashMap<String, Vec<Option<serde_json::Value>>> = HashMap::new();
     let mut topic_identities: HashMap<String, String> = HashMap::new();
+    let mut identity_changed = false;
     if !topic_keys.is_empty() {
+        let topic_snapshot = if crate::allow_recreated_subscriber() {
+            None
+        } else {
+            Some(
+                data.get("topicIdentitySnapshot")
+                    .and_then(serde_json::Value::as_object)
+                    .ok_or(InvalidJob("topic identity snapshot missing"))?,
+            )
+        };
         let direct: Vec<String> = recipients
             .iter()
             .filter_map(|v| {
@@ -630,7 +640,19 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
                 return Err(InvalidJob("workflow identity required for topic preferences").into());
             }
             let subscriber: String = row.get(0);
-            topic_identities.insert(subscriber.clone(), row.get(3));
+            let identity = if let Some(snapshot) = topic_snapshot {
+                match snapshot.get(&subscriber) {
+                    Some(serde_json::Value::String(id)) => id.clone(),
+                    None => {
+                        identity_changed = true;
+                        continue;
+                    }
+                    _ => return Err(InvalidJob("invalid topic identity snapshot").into()),
+                }
+            } else {
+                row.get(3)
+            };
+            topic_identities.insert(subscriber.clone(), identity);
             if !topic_preferences.contains_key(&subscriber) {
                 recipients.push(serde_json::json!({"subscriberId":subscriber}));
             }
@@ -714,7 +736,6 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         }
     }
     let resolved_context = serde_json::Value::Object(resolved_context);
-    let mut identity_changed = false;
     for recipient in recipients {
         let mut fields = recipient
             .as_object()

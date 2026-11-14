@@ -532,7 +532,7 @@ async fn worker_recovers_expired_jobs_and_isolates_invalid_jobs() {
     .await
     .unwrap();
     let topic_job = Uuid::new_v4();
-    let payload = json!({"workflow":"test","transactionId":topic_job.to_string(),"content":"old notification","payload":{},"recipients":[],"topicKeys":["race-topic"],"recipientIdentitySnapshot":{}});
+    let payload = json!({"workflow":"test","transactionId":topic_job.to_string(),"content":"old notification","payload":{},"recipients":[],"topicKeys":["race-topic"],"recipientIdentitySnapshot":{},"topicIdentitySnapshot":{"topic-race":"topic-old"}});
     enqueue(&db, topic_job, "env-a", in_app::JOB_KIND, &payload)
         .await
         .unwrap();
@@ -570,5 +570,47 @@ async fn worker_recovers_expired_jobs_and_isolates_invalid_jobs() {
     let row = db.query_one("SELECT internal_id,profile->>'firstName',(SELECT count(*) FROM novu_rust_in_app_messages WHERE transaction_id=$1) FROM novu_rust_subscribers WHERE environment_id='env-a' AND subscriber_id='topic-race'", &[&topic_job.to_string()]).await.unwrap();
     assert_eq!(row.get::<_, String>(0), "topic-new");
     assert_eq!(row.get::<_, String>(1), "New owner");
+    assert_eq!(row.get::<_, i64>(2), 0);
+
+    // A changed identity and a member added after acceptance are fenced before expansion.
+    // A member whose identity is unchanged can still receive the notification.
+    db.batch_execute("INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES ('env-a','topic-unchanged','topic-stable','{}'),('env-a','topic-added','topic-added-id','{}'); INSERT INTO novu_rust_topic_subscribers(environment_id,topic_key,subscriber_id,identifier) VALUES ('env-a','race-topic','topic-unchanged','unchanged-subscription'),('env-a','race-topic','topic-added','added-subscription')").await.unwrap();
+    let before_expansion = Uuid::new_v4();
+    let legacy_topic = Uuid::new_v4();
+    let payload = json!({"workflow":"test","transactionId":before_expansion.to_string(),"content":"old notification","payload":{},"recipients":[],"topicKeys":["race-topic"],"recipientIdentitySnapshot":{},"topicIdentitySnapshot":{"topic-race":"topic-old","topic-unchanged":"topic-stable"}});
+    enqueue(&db, before_expansion, "env-a", in_app::JOB_KIND, &payload)
+        .await
+        .unwrap();
+    let legacy = json!({"workflow":"test","transactionId":legacy_topic.to_string(),"content":"old notification","payload":{},"recipients":[],"topicKeys":["race-topic"],"recipientIdentitySnapshot":{}});
+    enqueue(&db, legacy_topic, "env-a", in_app::JOB_KIND, &legacy)
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        assert!(strict_worker.0.try_wait().unwrap().is_none());
+        let n: i64 = db
+            .query_one(
+                "SELECT count(*) FROM novu_queue_jobs WHERE id=ANY($1) AND status='failed'",
+                &[&vec![before_expansion, legacy_topic]],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if n == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let rows = db
+        .query(
+            "SELECT subscriber_id FROM novu_rust_in_app_messages WHERE transaction_id=$1",
+            &[&before_expansion.to_string()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, String>(0), "topic-unchanged");
+    let row = db.query_one("SELECT (SELECT status FROM novu_queue_jobs WHERE id=$1),(SELECT status FROM novu_queue_jobs WHERE id=$2),(SELECT count(*) FROM novu_rust_in_app_messages WHERE transaction_id=$3)", &[&before_expansion,&legacy_topic,&legacy_topic.to_string()]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "failed");
+    assert_eq!(row.get::<_, String>(1), "failed");
     assert_eq!(row.get::<_, i64>(2), 0);
 }

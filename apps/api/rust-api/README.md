@@ -1,5 +1,7 @@
 # Experimental Rust API
 
+New triggers snapshot current topic member identities. In default safety mode the worker skips members added after acceptance or recreated with the same external ID, and marks the job failed; unchanged members may still receive messages. Legacy queued topic jobs without a snapshot fail in safety mode. Deploy the API first and drain or review older topic jobs before deploying the worker. Compatibility mode (`NOVU_ALLOW_RECREATED_SUBSCRIBER=true`) uses current membership like the reference and can send old notifications to a new owner. Topic snapshots add a membership query and queue payload proportional to topic size; load testing is incomplete.
+
 All Rust service binaries require hostname- and certificate-verified PostgreSQL TLS by default. `NOVU_POSTGRES_CA_FILE` adds a PEM CA bundle. `NOVU_POSTGRES_ALLOW_INSECURE=true` forces plaintext and is only for disposable local fixtures. See the [TLS test](scripts/test-postgres-tls.sh); client-certificate authentication and production deployment remain incomplete.
 
 The bounded SendGrid delivery webhook requires API migration `0004` and an environment-specific Base64 DER P-256 public key inserted in `novu_rust_sendgrid_webhook_keys`. It verifies signed raw requests and records minimal deduplicated delivery evidence. It is not the full Novu webhook contract or automatic delivery reconciliation; see the [implementation status](../../../RUST_IMPLEMENTATION_STATUS_KO.md) for privacy, retention and deployment limitations.
