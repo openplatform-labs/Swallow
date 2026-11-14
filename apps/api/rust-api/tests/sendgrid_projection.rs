@@ -67,6 +67,9 @@ async fn signed_events_update_current_recipient_and_job_results() {
         include_str!("../migrations/0008_sendgrid_dispatch_identity.sql"),
         include_str!("../migrations/0009_sendgrid_dispatch_proof.sql"),
         include_str!("../migrations/0020_sendgrid_bounce_type.sql"),
+        include_str!(
+            "../../../worker/rust-queue/migrations/0100_sendgrid_projection_invalidation.sql"
+        ),
     ] {
         db.batch_execute(sql).await.unwrap();
     }
@@ -164,6 +167,18 @@ async fn signed_events_update_current_recipient_and_job_results() {
         .await,
         StatusCode::OK
     );
+    let before: String = db
+        .query_one(
+            "SELECT sendgrid_delivery_result FROM novu_queue_jobs WHERE id=$1",
+            &[&job],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        before, "pending",
+        "unverified and old dispatch events do not invalidate"
+    );
     assert_eq!(result(&mut db, job).await, "pending");
     assert_eq!(
         callback(
@@ -191,6 +206,11 @@ async fn signed_events_update_current_recipient_and_job_results() {
         .await,
         StatusCode::OK
     );
+    let invalidated=db.query_one("SELECT j.sendgrid_delivery_result,m.sendgrid_delivery_result FROM novu_queue_jobs j JOIN novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1", &[&job]).await.unwrap();
+    assert_eq!(invalidated.get::<_, String>(0), "unknown");
+    assert_eq!(invalidated.get::<_, String>(1), "unknown");
+    let pending_recipients: i64 = db.query_one("SELECT count(*) FROM novu_rust_sendgrid_recipients WHERE dispatch_id=$1 AND delivery_result<>'unknown'", &[&dispatch]).await.unwrap().get(0);
+    assert_eq!(pending_recipients, 0);
     assert_eq!(result(&mut db, job).await, "pending");
     let rows=db.query("SELECT delivery_result FROM novu_rust_sendgrid_recipients WHERE dispatch_id=$1 ORDER BY recipient_index",&[&dispatch]).await.unwrap();
     assert_eq!(
@@ -216,6 +236,35 @@ async fn signed_events_update_current_recipient_and_job_results() {
         StatusCode::OK
     );
     assert_eq!(result(&mut db, job).await, "partial");
+    assert_eq!(
+        callback(
+            app.clone(),
+            &key,
+            json!([state(
+                "two@example.test",
+                "bounce",
+                Some("bounce"),
+                "two-hard",
+                dispatch,
+                true
+            )])
+        )
+        .await,
+        StatusCode::OK
+    );
+    let after_duplicate: String = db
+        .query_one(
+            "SELECT sendgrid_delivery_result FROM novu_queue_jobs WHERE id=$1",
+            &[&job],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        after_duplicate, "partial",
+        "duplicate callback does not invalidate"
+    );
+
     assert_eq!(
         callback(
             app.clone(),
