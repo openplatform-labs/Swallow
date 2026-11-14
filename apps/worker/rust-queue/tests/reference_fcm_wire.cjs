@@ -11,6 +11,8 @@ const messages=[
   {token:'device-a',android:{priority:'high',ttl:1501,collapseKey:'orders',restrictedPackageName:'com.example',directBootOk:true,data:{kind:'update'}}},
   {topic:'news',webpush:{headers:{Urgency:'high'},data:{key:'value'},notification:{title:'News',icon:'https://example.test/icon.png'},fcmOptions:{link:'https://example.test/'}},fcmOptions:{analyticsLabel:'campaign'}},
   {token:'device-b',android:{ttl:0,priority:'normal'},webpush:{headers:{TTL:'60'}}},
+  {token:'ios-a',apns:{headers:{'apns-priority':'10'},payload:{aps:{alert:{title:'Hi',locKey:'KEY',locArgs:['one'],titleLocKey:'TITLE',titleLocArgs:['two'],launchImage:'splash'},badge:2,sound:{name:'alert.aiff',critical:true,volume:0.5},contentAvailable:true,mutableContent:false,threadId:'thread'},custom:{order:5}},fcmOptions:{imageUrl:'https://example.test/image.png',analyticsLabel:'campaign'}}},
+  {token:'ios-b',apns:{payload:{aps:{alert:'Hi',sound:'default',contentAvailable:false,mutableContent:true}},headers:{'apns-push-type':'alert'}}},
 ];
 for(const message of messages) validateMessage(message);
 process.stdout.write(JSON.stringify(messages.map(message=>({message}))));

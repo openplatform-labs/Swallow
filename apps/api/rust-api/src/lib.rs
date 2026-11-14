@@ -3570,7 +3570,7 @@ async fn trigger(
                     ["title", "body", "imageUrl"].contains(&key.as_str()) && value.is_string()
                 })
             }),
-            "android" | "webpush" | "fcmOptions" => value.is_object(),
+            "android" | "apns" | "webpush" | "fcmOptions" => value.is_object(),
             _ => false,
         })
     };
@@ -3611,7 +3611,7 @@ async fn trigger(
                     "data" => value
                         .as_object()
                         .is_some_and(|v| v.values().all(Value::is_string)),
-                    "android" | "webPush" | "fcmOptions" => value.is_object(),
+                    "android" | "apns" | "webPush" | "fcmOptions" => value.is_object(),
                     "deviceTokens" => value.as_array().is_some_and(|items| {
                         !items.is_empty()
                             && items

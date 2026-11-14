@@ -3,11 +3,17 @@
 > 기준: 원본 Novu 커밋 `895388f37efe9e06de0aa333e5727303e6ad6853` · 작성: 2026-11-12.
 > **현재 구현은 실험용이며 Novu와 100% 호환되지 않는다. 운영에 사용하거나 기존 Novu의 대체품으로 배포하지 않는다.**
 
+### FCM을 통한 iOS APNs 옵션
+
+FCM 워크플로의 `overrides.fcm.apns` 또는 provider override와 독립 작업에 APNs `headers`, `payload`, `fcmOptions`를 전달한다. `aps`의 알림·지역화 키, 사운드·critical·volume, `contentAvailable`, `mutableContent`, `threadId`를 기준 Firebase Admin SDK의 선택된 규칙대로 검사·변환한다. APNs payload의 사용자 지정 값은 보존하며 다중 대상 발송 시 대상마다 같은 설정을 복사한다. 충돌하는 iOS 플래그, 잘못된 헤더·사운드·이미지 URL 등은 거절한다. 이미지 URL은 http/https만 허용한다. API는 객체 여부만 검사하므로 잘못되거나 지원하지 않는 내용이 트리거 접수 후 워커에서 실패할 수 있다.
+
+기준 Firebase SDK의 선택된 APNs 요청 변환, 잘못된 입력, 다중 대상 복사를 검증했다. 원본 Novu와 Rust의 API·워크플로·워커를 실행해 flat override와 provider override의 모의 FCM 요청 및 메시지 이력 두 사례를 비교했다. APNs의 모든 데이터·오류·제공자 응답, iOS 실제 수신, 성능과 Novu 전체 호환성은 검증하지 않았다. 서버 접수는 단말 표시를 보장하지 않는다.
+
 ### Android·웹 푸시 옵션 전달
 
-FCM 워크플로 override와 독립 작업에서 Android `priority`(normal/high), 정수 밀리초 `ttl`, `collapseKey`, `restrictedPackageName`, `directBootOk`, 문자열 `data`와 웹 푸시 `headers`, 문자열 `data`, 객체 `notification`·`fcmOptions`, 공통 `fcmOptions.analyticsLabel`을 지원한다. Android TTL은 Firebase Admin과 같이 초 단위 문자열로 바꾸고 일부 Android 속성은 wire 이름으로 바꾼다. 워크플로에서는 `overrides.fcm.android`·`webPush`·`fcmOptions` 또는 기존 provider override 경로를 사용한다. 다중 토큰에서는 각 HTTP 요청에 같은 옵션을 복사한다. 지원하지 않는 Android 알림 옵션, APNs 및 알 수 없는 최상위 플랫폼 필드와 잘못된 타입은 거절한다. API는 플랫폼 옵션의 객체 여부만 검사하고 세부 값은 워커에서 검사하므로 미지원 값도 트리거 접수 후 발송 실패할 수 있다. 웹 알림과 웹 `fcmOptions` 객체 내부는 Firebase처럼 그대로 전달되며 공급자의 검증 결과가 필요하다. TTL의 소수 밀리초와 2^53-1을 초과하는 값은 제한적으로 거절한다.
+FCM 워크플로 override와 독립 작업에서 Android `priority`(normal/high), 정수 밀리초 `ttl`, `collapseKey`, `restrictedPackageName`, `directBootOk`, 문자열 `data`와 웹 푸시 `headers`, 문자열 `data`, 객체 `notification`·`fcmOptions`, 공통 `fcmOptions.analyticsLabel`을 지원한다. Android TTL은 Firebase Admin과 같이 초 단위 문자열로 바꾸고 일부 Android 속성은 wire 이름으로 바꾼다. 워크플로에서는 `overrides.fcm.android`·`webPush`·`fcmOptions` 또는 기존 provider override 경로를 사용한다. 다중 토큰에서는 각 HTTP 요청에 같은 옵션을 복사한다. 지원하지 않는 Android 알림 옵션 및 알 수 없는 최상위 플랫폼 필드와 잘못된 타입은 거절한다. APNs 지원은 위 항목을 참고한다. API는 플랫폼 옵션의 객체 여부만 검사하고 세부 값은 워커에서 검사하므로 미지원 값도 트리거 접수 후 발송 실패할 수 있다. 웹 알림과 웹 `fcmOptions` 객체 내부는 Firebase처럼 그대로 전달되며 공급자의 검증 결과가 필요하다. TTL의 소수 밀리초와 2^53-1을 초과하는 값은 제한적으로 거절한다.
 
-기준 Firebase Admin SDK에서 선택된 설정을 실제 변환한 요청 본문과 단일·다중 토큰 변환을 비교하고, 로컬 모의 provider와 오류·대상 복사 테스트를 수행했다. 고정 원본 Novu와 Rust의 API·워크플로·워커를 실행해 FCM flat override 및 provider override 사례의 모의 요청과 메시지 이력을 비교했다. 실제 FCM과 Android·브라우저 수신, 모든 플랫폼 옵션 및 APNs는 미검증 또는 미구현이며, 요청 수가 많거나 큰 옵션을 포함한 운영 부하는 검증하지 않았다. 공급자 접수는 사용자 기기 표시를 보장하지 않는다.
+기준 Firebase Admin SDK에서 선택된 설정을 실제 변환한 요청 본문과 단일·다중 토큰 변환을 비교하고, 로컬 모의 provider와 오류·대상 복사 테스트를 수행했다. 고정 원본 Novu와 Rust의 API·워크플로·워커를 실행해 FCM flat override 및 provider override 사례의 모의 요청과 메시지 이력을 비교했다. 실제 FCM과 Android·브라우저 수신 및 모든 플랫폼 옵션은 미검증 또는 미구현이며, 요청 수가 많거나 큰 옵션을 포함한 운영 부하는 검증하지 않았다. 공급자 접수는 사용자 기기 표시를 보장하지 않는다.
 
 ### 실패 작업 확인의 버전 경합 방지 (워커 0129)
 

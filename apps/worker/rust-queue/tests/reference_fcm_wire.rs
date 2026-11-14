@@ -48,6 +48,14 @@ fn original_firebase_http_conversion() {
             multicast: true,
             message: json!({"tokens":["device-b"],"android":{"ttl":0,"priority":"normal"},"webpush":{"headers":{"TTL":"60"}}}),
         },
+        Plan {
+            multicast: false,
+            message: json!({"token":"ios-a","apns":{"headers":{"apns-priority":"10"},"payload":{"aps":{"alert":{"title":"Hi","locKey":"KEY","locArgs":["one"],"titleLocKey":"TITLE","titleLocArgs":["two"],"launchImage":"splash"},"badge":2,"sound":{"name":"alert.aiff","critical":true,"volume":0.5},"contentAvailable":true,"mutableContent":false,"threadId":"thread"},"custom":{"order":5}},"fcmOptions":{"imageUrl":"https://example.test/image.png","analyticsLabel":"campaign"}}}),
+        },
+        Plan {
+            multicast: false,
+            message: json!({"token":"ios-b","apns":{"payload":{"aps":{"alert":"Hi","sound":"default","contentAvailable":false,"mutableContent":true}},"headers":{"apns-push-type":"alert"}}}),
+        },
     ];
     for (index, plan) in plans.iter().enumerate() {
         assert_eq!(wire_messages(plan).unwrap(), vec![original[index].clone()]);

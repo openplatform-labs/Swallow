@@ -223,6 +223,8 @@ for label, override in ([] if os.environ.get('NOVU_TEST_PUSH_ROUTING_CASES_ONLY'
     ('targets', {'fcm':{'deviceTokens':['override-a','override-b']}}),
     ('platform-options', {'fcm':{'android':{'priority':'high','data':{'kind':'update'}},'webPush':{'headers':{'Urgency':'high'},'notification':{'title':'News','icon':'https://example.test/icon.png'}},'fcmOptions':{'analyticsLabel':'campaign'}}}),
     ('platform-provider', {'providers':{'fcm':{'android':{'priority':'normal'},'webpush':{'headers':{'TTL':'60'}},'fcmOptions':{'analyticsLabel':'other'}}}}),
+    ('apns-options', {'fcm':{'apns':{'headers':{'apns-priority':'10'},'payload':{'aps':{'alert':'Hello','badge':2,'sound':'default'},'custom':'value'}}}}),
+    ('apns-provider', {'providers':{'fcm':{'apns':{'headers':{'apns-push-type':'alert'},'payload':{'aps':{'alert':'Hello'}}}}}}),
 
     ('notification-data', {'fcm':{'data':{'custom':'value'}}}),
     ('data-only', {'fcm':{'type':'data','data':{'custom':'value','title':'ignored'}}}),

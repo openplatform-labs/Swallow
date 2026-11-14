@@ -306,6 +306,137 @@ fn invalid_device_token_response(body: &[u8]) -> bool {
     !known && value.to_string().contains(INVALID)
 }
 
+// Apply the pinned Firebase Admin SDK's APNs payload transformations.
+fn apns_config(value: &Value) -> Result<Value, SendError> {
+    let mut config = value
+        .as_object()
+        .cloned()
+        .ok_or(SendError::UnsupportedMessage)?;
+    if config
+        .keys()
+        .any(|key| !["headers", "payload", "fcmOptions"].contains(&key.as_str()))
+    {
+        return Err(SendError::UnsupportedMessage);
+    }
+    if let Some(headers) = config.get("headers")
+        && !headers
+            .as_object()
+            .is_some_and(|m| m.values().all(Value::is_string))
+    {
+        return Err(SendError::UnsupportedMessage);
+    }
+    if let Some(payload) = config.get_mut("payload") {
+        let payload = payload
+            .as_object_mut()
+            .ok_or(SendError::UnsupportedMessage)?;
+        if let Some(aps) = payload.get_mut("aps") {
+            let aps = aps.as_object_mut().ok_or(SendError::UnsupportedMessage)?;
+            if let Some(alert) = aps.get_mut("alert") {
+                if let Some(fields) = alert.as_object_mut() {
+                    for (args, key) in [
+                        ("locArgs", "locKey"),
+                        ("titleLocArgs", "titleLocKey"),
+                        ("subtitleLocArgs", "subtitleLocKey"),
+                    ] {
+                        if fields
+                            .get(args)
+                            .and_then(Value::as_array)
+                            .is_some_and(|v| !v.is_empty())
+                            && fields
+                                .get(key)
+                                .and_then(Value::as_str)
+                                .is_none_or(|s| s.is_empty())
+                        {
+                            return Err(SendError::UnsupportedMessage);
+                        }
+                    }
+                    for (from, to) in [
+                        ("locKey", "loc-key"),
+                        ("locArgs", "loc-args"),
+                        ("titleLocKey", "title-loc-key"),
+                        ("titleLocArgs", "title-loc-args"),
+                        ("subtitleLocKey", "subtitle-loc-key"),
+                        ("subtitleLocArgs", "subtitle-loc-args"),
+                        ("actionLocKey", "action-loc-key"),
+                        ("launchImage", "launch-image"),
+                    ] {
+                        if let Some(v) = fields.remove(from) {
+                            fields.insert(to.to_owned(), v);
+                        }
+                    }
+                } else if !alert.is_string() {
+                    return Err(SendError::UnsupportedMessage);
+                }
+            }
+            if let Some(sound) = aps.get_mut("sound") {
+                if let Some(fields) = sound.as_object_mut() {
+                    if fields
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_none_or(|v| v.is_empty())
+                        || fields
+                            .get("volume")
+                            .is_some_and(|v| !v.as_f64().is_some_and(|n| (0.0..=1.0).contains(&n)))
+                    {
+                        return Err(SendError::UnsupportedMessage);
+                    }
+                    if let Some(critical) = fields.remove("critical")
+                        && (critical == json!(true) || critical == json!(1))
+                    {
+                        fields.insert("critical".into(), json!(1));
+                    }
+                } else if sound.as_str().is_none_or(|s| s.is_empty()) {
+                    return Err(SendError::UnsupportedMessage);
+                }
+            }
+            for (from, to) in [
+                ("contentAvailable", "content-available"),
+                ("mutableContent", "mutable-content"),
+                ("threadId", "thread-id"),
+            ] {
+                if aps.contains_key(from) && aps.contains_key(to) {
+                    return Err(SendError::UnsupportedMessage);
+                }
+                if let Some(v) = aps.remove(from) {
+                    aps.insert(to.to_owned(), v);
+                }
+            }
+            for key in ["content-available", "mutable-content"] {
+                if let Some(v) = aps.remove(key)
+                    && (v == json!(true) || v == json!(1))
+                {
+                    aps.insert(key.to_owned(), json!(1));
+                }
+            }
+        }
+    }
+    if let Some(options) = config.get_mut("fcmOptions") {
+        let options = options
+            .as_object_mut()
+            .ok_or(SendError::UnsupportedMessage)?;
+        if options
+            .get("analyticsLabel")
+            .is_some_and(|v| !v.is_string())
+        {
+            return Err(SendError::UnsupportedMessage);
+        }
+        if let Some(image) = options.remove("imageUrl") {
+            if options.contains_key("image")
+                || !image
+                    .as_str()
+                    .and_then(|v| reqwest::Url::parse(v).ok())
+                    .is_some_and(|u| {
+                        ["http", "https"].contains(&u.scheme()) && u.host_str().is_some()
+                    })
+            {
+                return Err(SendError::UnsupportedMessage);
+            }
+            options.insert("image".into(), image);
+        }
+    }
+    Ok(Value::Object(config))
+}
+
 // Preserve the selected Firebase Admin SDK fields and their HTTP conversion.
 fn platform_config(name: &str, value: &Value) -> Result<Value, SendError> {
     let source = value.as_object().ok_or(SendError::UnsupportedMessage)?;
@@ -375,6 +506,7 @@ pub fn wire_messages(plan: &Plan) -> Result<Vec<Value>, SendError> {
             "notification",
             "data",
             "android",
+            "apns",
             "webpush",
             "fcmOptions",
         ]
@@ -408,6 +540,9 @@ pub fn wire_messages(plan: &Plan) -> Result<Vec<Value>, SendError> {
             result.insert(wire.into(), value.clone());
         }
         common.insert("notification".into(), Value::Object(result));
+    }
+    if let Some(value) = object.get("apns") {
+        common.insert("apns".into(), apns_config(value)?);
     }
     for name in ["android", "webpush", "fcmOptions"] {
         if let Some(value) = object.get(name) {
@@ -838,12 +973,20 @@ mod tests {
     fn platform_config_is_bounded_and_shared_across_multicast_targets() {
         let plan = Plan {
             multicast: true,
-            message: json!({"tokens":["a","b"],"android":{"ttl":1501,"priority":"high"},"webpush":{"headers":{"TTL":"60"}},"fcmOptions":{"analyticsLabel":"campaign"}}),
+            message: json!({"tokens":["a","b"],"android":{"ttl":1501,"priority":"high"},"apns":{"payload":{"aps":{"mutableContent":true},"custom":"value"}},"webpush":{"headers":{"TTL":"60"}},"fcmOptions":{"analyticsLabel":"campaign"}}),
         };
         let messages = wire_messages(&plan).unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["message"]["android"]["ttl"], "1.501000000s");
         assert_eq!(messages[1]["message"]["token"], "b");
+        assert_eq!(
+            messages[0]["message"]["apns"]["payload"]["aps"]["mutable-content"],
+            1
+        );
+        assert_eq!(
+            messages[0]["message"]["apns"],
+            messages[1]["message"]["apns"]
+        );
         assert_eq!(
             messages[0]["message"]["webpush"],
             messages[1]["message"]["webpush"]
@@ -856,7 +999,12 @@ mod tests {
             json!({"webpush":{"headers":{"TTL":1}}}),
             json!({"webpush":{"unknown":1}}),
             json!({"fcmOptions":{"analyticsLabel":2}}),
-            json!({"apns":{}}),
+            json!({"apns":{"headers":{"bad":3}}}),
+            json!({"apns":{"payload":{"aps":{"alert":{"locArgs":["x"]}}}}}),
+            json!({"apns":{"payload":{"aps":{"sound":{"name":"default","volume":1.1}}}}}),
+            json!({"apns":{"payload":{"aps":{"contentAvailable":true,"content-available":1}}}}),
+            json!({"apns":{"fcmOptions":{"imageUrl":"not-a-url"}}}),
+            json!({"apns":{"fcmOptions":{"imageUrl":"https://example.test/image","image":"duplicate"}}}),
         ] {
             let mut message = invalid;
             message["token"] = json!("a");
