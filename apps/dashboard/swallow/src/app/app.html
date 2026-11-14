@@ -7,7 +7,7 @@
     <nav class="sidenav" aria-label="주 메뉴">
       <div class="nav-heading">WORKSPACE</div>
       @for (item of sections; track item.id) {
-        <button class="nav-entry" [class.active]="section() === item.id" [attr.aria-current]="section() === item.id ? 'page' : null" [disabled]="decisionStatus() === 'sending' || permissionChangeStatus() === 'sending' || workflowStatus() === 'saving' || providerStatus() === 'saving' || workflowRetryStatus() === 'retrying'" (click)="setSection(item.id)">
+        <button class="nav-entry" [class.active]="section() === item.id" [attr.aria-current]="section() === item.id ? 'page' : null" [disabled]="decisionStatus() === 'sending' || (permissionChangeStatus() === 'sending' || grantChangeStatus() === 'sending') || workflowStatus() === 'saving' || providerStatus() === 'saving' || workflowRetryStatus() === 'retrying'" (click)="setSection(item.id)">
           <span class="nav-icon" aria-hidden="true">{{ item.short }}</span><span>{{ item.label }}</span>
         </button>
       }
@@ -227,18 +227,18 @@
         <clr-alert clrAlertType="info" [clrAlertClosable]="false"><clr-alert-item><span class="alert-text">조회·변경·감사에는 각각 별도로 부여된 권한이 필요합니다. 변경 전 현재 상태를 조회하세요.</span></clr-alert-item></clr-alert>
         <section class="card subscriber-card"><div class="card-block"><div class="card-eyebrow">ACCESS</div><h2>조회 인증</h2>
           <form class="subscriber-form" (ngSubmit)="loadPermissions('audit')">
-            <div><label for="permission-env">환경 ID</label><input id="permission-env" name="permissionEnvironment" [(ngModel)]="permissionEnvironment" (ngModelChange)="clearPermissions()" [disabled]="permissionChangeStatus() === 'sending'" autocomplete="off" required></div>
-            <div><label for="permission-key">운영자 접근 토큰</label><input id="permission-key" name="permissionKey" type="password" [(ngModel)]="permissionKey" (ngModelChange)="clearPermissions()" [disabled]="permissionChangeStatus() === 'sending'" autocomplete="off" spellcheck="false" required></div>
-            @if (oidcStatus() === 'signed-in') {<button type="button" class="btn btn-outline" [disabled]="permissionChangeStatus() === 'sending'" (click)="useOidcForPermissions()">현재 로그인 사용</button>}
-            <button type="button" class="btn btn-outline" [disabled]="permissionChangeStatus() === 'sending'" (click)="clearPermissions(true)">인증 지우기</button>
+            <div><label for="permission-env">환경 ID</label><input id="permission-env" name="permissionEnvironment" [(ngModel)]="permissionEnvironment" (ngModelChange)="clearPermissions()" [disabled]="(permissionChangeStatus() === 'sending' || grantChangeStatus() === 'sending')" autocomplete="off" required></div>
+            <div><label for="permission-key">운영자 접근 토큰</label><input id="permission-key" name="permissionKey" type="password" [(ngModel)]="permissionKey" (ngModelChange)="clearPermissions()" [disabled]="(permissionChangeStatus() === 'sending' || grantChangeStatus() === 'sending')" autocomplete="off" spellcheck="false" required></div>
+            @if (oidcStatus() === 'signed-in') {<button type="button" class="btn btn-outline" [disabled]="(permissionChangeStatus() === 'sending' || grantChangeStatus() === 'sending')" (click)="useOidcForPermissions()">현재 로그인 사용</button>}
+            <button type="button" class="btn btn-outline" [disabled]="(permissionChangeStatus() === 'sending' || grantChangeStatus() === 'sending')" (click)="clearPermissions(true)">인증 지우기</button>
           </form><p class="subscriber-hint">이 화면의 토큰은 메모리에만 보관하며 화면을 떠나면 지워집니다. 로그인 세션은 로그아웃 또는 만료 시 지워집니다.</p>
         </div></section>
         <section class="card decision-card"><div class="card-block"><div class="card-eyebrow">IDENTITY</div><h2>운영자 권한 조회</h2>
           <form class="decision-form" (ngSubmit)="loadPermissions('identity')">
-            <label for="permission-issuer">발급자</label><input id="permission-issuer" name="permissionIssuer" [(ngModel)]="permissionIssuer" (ngModelChange)="clearPermissions()" [disabled]="permissionChangeStatus() === 'sending'" autocomplete="off" required>
-            <label for="permission-subject">주체</label><input id="permission-subject" name="permissionSubject" [(ngModel)]="permissionSubject" (ngModelChange)="clearPermissions()" [disabled]="permissionChangeStatus() === 'sending'" autocomplete="off" required>
-            <label for="permission-client">클라이언트 ID</label><input id="permission-client" name="permissionClient" [(ngModel)]="permissionClient" (ngModelChange)="clearPermissions()" [disabled]="permissionChangeStatus() === 'sending'" autocomplete="off" required>
-            <button type="submit" class="btn btn-outline" [disabled]="permissionStatus() === 'loading' || permissionChangeStatus() === 'sending'">권한 조회</button>
+            <label for="permission-issuer">발급자</label><input id="permission-issuer" name="permissionIssuer" [(ngModel)]="permissionIssuer" (ngModelChange)="clearPermissions()" [disabled]="(permissionChangeStatus() === 'sending' || grantChangeStatus() === 'sending')" autocomplete="off" required>
+            <label for="permission-subject">주체</label><input id="permission-subject" name="permissionSubject" [(ngModel)]="permissionSubject" (ngModelChange)="clearPermissions()" [disabled]="(permissionChangeStatus() === 'sending' || grantChangeStatus() === 'sending')" autocomplete="off" required>
+            <label for="permission-client">클라이언트 ID</label><input id="permission-client" name="permissionClient" [(ngModel)]="permissionClient" (ngModelChange)="clearPermissions()" [disabled]="(permissionChangeStatus() === 'sending' || grantChangeStatus() === 'sending')" autocomplete="off" required>
+            <button type="submit" class="btn btn-outline" [disabled]="permissionStatus() === 'loading' || (permissionChangeStatus() === 'sending' || grantChangeStatus() === 'sending')">권한 조회</button>
           </form>
           @if (permissionStatus() === 'missing') {<p role="status">해당 운영자를 찾지 못했습니다.</p>}
           @if (permissionIdentity(); as identity) {<p role="status">{{ identity.subject }} · {{ identity.clientId }}<br>활성화: {{ identity.enabled ? '예' : '아니요' }}<br>구독자 조회: {{ identity.subscriberRead ? '허용' : '없음' }} · 경보 조회: {{ identity.alertRead ? '허용' : '없음' }}<br>재시도 판정: {{ identity.alertRetry ? '허용' : '없음' }} · 접수 판정: {{ identity.alertAccepted ? '허용' : '없음' }}</p>}
@@ -270,14 +270,14 @@
             }
             @if(permissionChangeStatus() === 'sending'){<p role="status">요청을 처리 중입니다.</p>}
             @if(permissionChangeMessage()){<p class="subscriber-error" role="alert">{{ permissionChangeMessage() }}</p>}
-            <button type="button" class="btn btn-outline" [disabled]="permissionChangeStatus() === 'sending'" (click)="clearPermissionChange()">요청 정보 지우기</button>
+            <button type="button" class="btn btn-outline" [disabled]="(permissionChangeStatus() === 'sending' || grantChangeStatus() === 'sending')" (click)="clearPermissionChange()">요청 정보 지우기</button>
           </div></section>
         }
         @if(permissionChangeStatus() === 'unavailable'){<p class="subscriber-error" role="alert">안전한 요청 ID 또는 인증 확인 정보를 생성하지 못해 요청을 보내지 않았습니다.</p><button type="button" class="btn btn-outline" (click)="clearPermissionChange()">닫기</button>}
         <section class="card decision-card"><div class="card-block"><div class="card-eyebrow">REQUEST RECOVERY</div><h2>보관한 변경 요청 확인</h2>
           <p>같은 운영자·클라이언트·환경의 유효한 토큰과 보관한 요청 ID를 입력하세요. 기록이 없어도 원래 요청이 진행 중일 수 있습니다.</p>
-          <form class="decision-form" (ngSubmit)="lookupPermissionRequest()"><label for="permission-request-id">요청 ID</label><input id="permission-request-id" name="permissionRequestId" [(ngModel)]="permissionRequestId" (ngModelChange)="clearPermissionRequest()" [disabled]="permissionChangeStatus() === 'sending'" autocomplete="off" required>
-            <div><button type="submit" class="btn btn-outline" [disabled]="permissionRequestStatus() === 'loading' || permissionChangeStatus() === 'sending'">보관한 요청 조회</button><button type="button" class="btn btn-outline" [disabled]="permissionChangeStatus() === 'sending'" (click)="clearPermissionRequest(true)">조회 지우기</button></div>
+          <form class="decision-form" (ngSubmit)="lookupPermissionRequest()"><label for="permission-request-id">요청 ID</label><input id="permission-request-id" name="permissionRequestId" [(ngModel)]="permissionRequestId" (ngModelChange)="clearPermissionRequest()" [disabled]="(permissionChangeStatus() === 'sending' || grantChangeStatus() === 'sending')" autocomplete="off" required>
+            <div><button type="submit" class="btn btn-outline" [disabled]="permissionRequestStatus() === 'loading' || (permissionChangeStatus() === 'sending' || grantChangeStatus() === 'sending')">보관한 요청 조회</button><button type="button" class="btn btn-outline" [disabled]="(permissionChangeStatus() === 'sending' || grantChangeStatus() === 'sending')" (click)="clearPermissionRequest(true)">조회 지우기</button></div>
           </form>
           @if(permissionRequestStatus() === 'loading'){<p role="status">요청을 확인하고 있습니다.</p>}
           @else if(permissionRequestStatus() === 'missing'){<p>기록을 찾지 못했습니다. 원래 요청이 진행 중이거나 운영자·환경이 다를 수 있습니다. 실패로 단정하지 마세요.</p>}
@@ -285,8 +285,57 @@
           @else if(permissionRequestRecord(); as request){<p role="status">기록됨: {{ request.requestId }} · {{ request.createdAt }}<br>대상: {{ request.targetIssuer }} · {{ request.targetSubject }} · {{ request.targetClientId }}<br>사유: {{ request.reason }}<br>{{ request.changed ? '권한 변경됨' : '동일한 상태로 변경 없음' }}</p>
             <p>이전: @if(request.expected; as previous){ {{ previous.enabled ? '활성' : '비활성' }} / 구독자 {{ previous.subscriberRead ? '허용' : '없음' }} / 경보 {{ previous.alertRead ? '허용' : '없음' }} / 재시도 {{ previous.alertRetry ? '허용' : '없음' }} / 접수 {{ previous.alertAccepted ? '허용' : '없음' }} } @else {없음}<br>변경: {{ request.desired.enabled ? '활성' : '비활성' }} / 구독자 {{ request.desired.subscriberRead ? '허용' : '없음' }} / 경보 {{ request.desired.alertRead ? '허용' : '없음' }} / 재시도 {{ request.desired.alertRetry ? '허용' : '없음' }} / 접수 {{ request.desired.alertAccepted ? '허용' : '없음' }}</p><p>보관한 원래 요청의 대상과 내용을 비교하세요.</p>}
         </div></section>
+        <section class="card decision-card"><div class="card-block"><div class="card-eyebrow">WORKFLOW ACCESS</div><h2>워크플로 권한 위임</h2>
+          <p>위에서 입력한 운영자를 대상으로 환경별 권한을 조회하고 변경합니다. 이 기능에는 별도의 위임 관리 권한이 필요합니다.</p>
+          <form class="decision-form" (ngSubmit)="loadGrant()">
+            <label for="grant-kind">리소스와 권한</label><select id="grant-kind" name="grantKind" [(ngModel)]="grantKind" (ngModelChange)="clearGrantRead()" [disabled]="grantChangeStatus() === 'sending' || permissionChangeStatus() === 'sending'">
+              <option value="email:read">이메일 조회</option><option value="email:write">이메일 변경</option><option value="sms:read">SMS 조회</option><option value="sms:write">SMS 변경</option><option value="push:read">푸시 조회</option><option value="push:write">푸시 변경</option><option value="slack:read">Slack 조회</option><option value="slack:write">Slack 변경</option><option value="email-provider:read">이메일 공급자 조회</option><option value="email-provider:write">이메일 공급자 변경</option><option value="audit:read">워크플로 감사 조회</option>
+            </select>
+            <button type="submit" class="btn btn-outline" [disabled]="grantStatus() === 'loading' || grantChangeStatus() === 'sending' || permissionChangeStatus() === 'sending'">워크플로 권한 조회</button>
+          </form>
+          @if(grantStatus() === 'loading'){<p role="status">조회 중입니다.</p>}
+          @else if(grantStatus() === 'missing'){<p>대상 운영자를 찾지 못했습니다. 먼저 운영자를 등록하세요.</p>}
+          @else if(grantStatus() === 'error'){<p class="subscriber-error" role="alert">조회하지 못했습니다. 인증, 위임 조회 권한과 입력을 확인하세요.</p>}
+          @else if(grantStatus() === 'loaded'){
+            <p role="status">{{ permissionEnvironment }} · {{ permissionIssuer }} · {{ permissionSubject }} · {{ permissionClient }}<br>{{ grantKind }} 현재 상태: {{ grantValue() ? '허용' : '없음' }}</p>
+            @if(grantChangeStatus() === 'idle'){
+              <form class="decision-form" (ngSubmit)="changeGrant()">
+                <label class="decision-confirm"><input type="checkbox" name="grantDesired" [(ngModel)]="grantDesired"> 이 권한 허용</label>
+                <label for="grant-reason">변경 사유</label><textarea id="grant-reason" name="grantReason" [(ngModel)]="grantReason" maxlength="1000" required></textarea><small>비밀을 제외하고 1000바이트 이내로 입력하세요. 이전 상태가 달라지면 요청이 거절됩니다.</small>
+                <label class="decision-confirm"><input type="checkbox" name="grantConfirmed" [(ngModel)]="grantConfirmed"> 대상과 권한을 확인했습니다.</label>
+                <button type="submit" class="btn btn-primary" [disabled]="!canChangeGrant()">워크플로 권한 변경</button>
+              </form>
+            }
+          }
+        </div></section>
+        @if(grantChange(); as change){
+          <section class="card decision-card"><div class="card-block"><h2>워크플로 권한 변경 요청</h2>
+            <p>요청 ID: {{ change.body.requestId }}<br>대상: {{ change.environment }} · {{ change.body.targetIssuer }} · {{ change.body.targetSubject }} · {{ change.body.targetClientId }}<br>{{ change.body.resource }} / {{ change.body.permission }}: {{ change.body.expected ? '허용' : '없음' }} → {{ change.body.desired ? '허용' : '없음' }}<br>사유: {{ change.body.reason }}</p>
+            @if(grantChangeStatus() === 'sending'){<p role="status">요청을 처리 중입니다.</p>}
+            @else if(grantChangeStatus() === 'recorded'){<p role="status">요청이 기록됐습니다. {{ grantChanged() ? '권한이 변경됐습니다.' : '변경은 없었습니다.' }}</p>}
+            @else if(grantChangeStatus() === 'rejected'){<p class="subscriber-error" role="alert">요청이 거절됐습니다. 권한과 최신 상태를 확인하세요.</p>}
+            @else if(grantChangeStatus() === 'unknown'){
+              <p class="subscriber-error" role="alert">결과를 확인할 수 없습니다. 요청 ID와 내용을 보관하세요. 화면을 떠나거나 새로고침하면 이 정보가 사라집니다.</p>
+              <label class="decision-confirm"><input type="checkbox" name="grantRetryConfirmed" [(ngModel)]="grantRetryConfirmed"> 동일한 요청을 다시 제출합니다.</label>
+              <button type="button" class="btn btn-outline" [disabled]="!grantRetryConfirmed" (click)="retryGrant()">동일 요청 재제출</button><p>재제출에는 원래 토큰, 환경과 API 주소가 필요합니다.</p>
+            }
+            @if(grantMessage()){<p class="subscriber-error" role="alert">{{ grantMessage() }}</p>}
+            <button type="button" class="btn btn-outline" [disabled]="grantChangeStatus() === 'sending'" (click)="clearGrantChange()">요청 정보 지우기</button>
+          </div></section>
+        }
+        @if(grantChangeStatus() === 'unavailable'){<p class="subscriber-error" role="alert">안전한 요청을 준비하지 못해 전송하지 않았습니다.</p><button type="button" class="btn btn-outline" (click)="clearGrantChange()">닫기</button>}
+        <section class="card decision-card"><div class="card-block"><div class="card-eyebrow">WORKFLOW GRANT RECOVERY</div><h2>보관한 위임 요청 확인</h2>
+          <p>같은 운영자·클라이언트·환경의 유효한 토큰과 요청 ID로 확인합니다. 기록이 없어도 요청이 진행 중일 수 있습니다.</p>
+          <form class="decision-form" (ngSubmit)="lookupGrantRequest()"><label for="grant-request-id">요청 ID</label><input id="grant-request-id" name="grantRequestId" [(ngModel)]="grantRequestId" (ngModelChange)="clearGrantRequest()" [disabled]="grantChangeStatus() === 'sending'" autocomplete="off" required>
+            <button type="submit" class="btn btn-outline" [disabled]="grantRequestStatus() === 'loading' || grantChangeStatus() === 'sending'">위임 요청 조회</button>
+          </form>
+          @if(grantRequestStatus() === 'loading'){<p role="status">조회 중입니다.</p>}
+          @else if(grantRequestStatus() === 'missing'){<p>기록이 없습니다. 진행 중일 수 있으므로 실패로 단정하지 마세요.</p>}
+          @else if(grantRequestStatus() === 'error'){<p class="subscriber-error" role="alert">조회하지 못했습니다. 인증, 위임 변경 권한과 요청 ID를 확인하세요.</p>}
+          @else if(grantRequestRecord(); as request){<p role="status">기록됨: {{ request.requestId }} · {{ request.createdAt }}<br>대상: {{ request.targetIssuer }} · {{ request.targetSubject }} · {{ request.targetClientId }}<br>{{ request.resource }} / {{ request.permission }}: {{ request.expected ? '허용' : '없음' }} → {{ request.desired ? '허용' : '없음' }}<br>사유: {{ request.reason }}<br>{{ request.changed ? '권한 변경됨' : '변경 없음' }}</p><p>보관한 원래 요청의 내용을 비교하세요.</p>}
+        </div></section>
         <section class="card decision-card"><div class="card-block"><div class="card-eyebrow">AUDIT</div><h2>권한 변경 이력</h2><p>페이지마다 조회 시점이 다르며 기록 ID 순서는 커밋 순서를 보장하지 않습니다.</p>
-          <button type="button" class="btn btn-outline" [disabled]="permissionStatus() === 'loading' || permissionChangeStatus() === 'sending'" (click)="loadPermissions('audit')">최근 이력 조회</button>
+          <button type="button" class="btn btn-outline" [disabled]="permissionStatus() === 'loading' || (permissionChangeStatus() === 'sending' || grantChangeStatus() === 'sending')" (click)="loadPermissions('audit')">최근 이력 조회</button>
           @if (permissionStatus() === 'audit') {
             @if (permissionAudit().length === 0) {<p>조회된 이력이 없습니다.</p>} @else {
               <div class="table-wrap"><table class="table"><thead><tr><th>기록</th><th>주체</th><th>변경 관리자</th><th>사유</th><th>변경 전·후</th></tr></thead><tbody>@for (row of permissionAudit(); track row.id) {<tr><td>{{ row.id }}<br>{{ row.recordedAt }}</td><td>{{ row.issuer }}<br>{{ row.subject }} · {{ row.clientId }}</td><td>DB: {{ row.actor }}@if (row.jwtSubject) {<br>JWT: {{ row.jwtIssuer }} / {{ row.jwtSubject }} / {{ row.jwtClientId }}<br>요청 ID: {{ row.requestId }}}</td><td>{{ row.reason }}</td><td><details><summary>상세 보기</summary><p>이전: {{ row.previous }}</p><p>변경: {{ row.current }}</p></details></td></tr>}</tbody></table></div>

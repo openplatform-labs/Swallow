@@ -19,6 +19,9 @@ type RetrySnapshot = { origin: string; endpoint: string; scheme: 'Bearer' | 'Swa
 type PermissionIdentity = { issuer:string; subject:string; clientId:string; enabled:boolean; subscriberRead:boolean; alertRead:boolean; alertRetry:boolean; alertAccepted:boolean };
 type PermissionFlags = { enabled:boolean; subscriberRead:boolean; alertRead:boolean; alertRetry:boolean; alertAccepted:boolean };
 type PermissionChange = { origin:string; environment:string; keyHash:string; body:{ requestId:string; targetIssuer:string; targetSubject:string; targetClientId:string; expected:PermissionFlags|null; desired:PermissionFlags; reason:string } };
+type GrantBody = {requestId:string;targetIssuer:string;targetSubject:string;targetClientId:string;resource:string;permission:string;expected:boolean;desired:boolean;reason:string};
+type GrantSnapshot = {origin:string;environment:string;keyHash:string;body:GrantBody};
+type GrantRecord = GrantBody & {changed:boolean;createdAt:string};
 type PermissionRequestRecord = {requestId:string; targetIssuer:string; targetSubject:string; targetClientId:string; expected:PermissionFlags|null; desired:PermissionFlags; reason:string; changed:boolean; createdAt:string};
 type PermissionAudit = { id:string; recordedAt:string; issuer:string; subject:string; clientId:string; actor:string; jwtIssuer:string|null; jwtSubject:string|null; jwtClientId:string|null; requestId:string|null; reason:string; previous:string; current:string };
 type Section = 'overview' | 'workflows' | 'subscribers' | 'channels' | 'activity' | 'alerts' | 'settings';
@@ -188,6 +191,25 @@ export class App implements OnDestroy {
   private permissionRequestSequence=0;
   private permissionRequestAbort:AbortController|null=null;
 
+  grantKind='email:read';
+  grantDesired=false;
+  grantReason='';
+  grantConfirmed=false;
+  grantRetryConfirmed=false;
+  readonly grantStatus=signal<'idle'|'loading'|'loaded'|'missing'|'error'>('idle');
+  readonly grantValue=signal<boolean|null>(null);
+  private grantSequence=0;
+  private grantAbort:AbortController|null=null;
+  readonly grantChangeStatus=signal<'idle'|'sending'|'recorded'|'rejected'|'unknown'|'unavailable'>('idle');
+  readonly grantChange=signal<GrantSnapshot|null>(null);
+  readonly grantChanged=signal<boolean|null>(null);
+  readonly grantMessage=signal('');
+  grantRequestId='';
+  readonly grantRequestStatus=signal<'idle'|'loading'|'found'|'missing'|'error'>('idle');
+  readonly grantRequestRecord=signal<GrantRecord|null>(null);
+  private grantRequestSequence=0;
+  private grantRequestAbort:AbortController|null=null;
+
   ngOnDestroy(): void {
     this.clearWorkflow(true);
     this.forgetWorkflowRequest();
@@ -238,7 +260,7 @@ export class App implements OnDestroy {
   }
 
   resetOidc(): void {
-    if (this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
+    if (this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     if (this.oidcExpiryTimer !== null) clearTimeout(this.oidcExpiryTimer);
     this.oidcExpiryTimer=null;
     this.oidcSequence++; this.oidcPrepared = null; this.oidcSession = null;
@@ -268,7 +290,7 @@ export class App implements OnDestroy {
 
   useOidc(section: 'subscribers' | 'alerts' | 'workflows'): void {
     this.expireOidcIfNeeded();
-    if (!this.oidcSession || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
+    if (!this.oidcSession || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     const session=this.oidcSession;
     this.setSection(section);
     if (section === 'subscribers') { this.forgetKey(); this.credentialMode='jwt'; this.subscriberEnvironment=session.environmentId; this.apiKey=session.token; }
@@ -290,7 +312,7 @@ export class App implements OnDestroy {
 
   useOidcForPermissions(): void {
     this.expireOidcIfNeeded();
-    if (!this.oidcSession || this.decisionStatus()==='sending' || this.permissionChangeStatus()==='sending') return;
+    if (!this.oidcSession || this.decisionStatus()==='sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending') return;
     const session=this.oidcSession;
     this.clearPermissions(true);this.permissionEnvironment=session.environmentId;this.permissionKey=session.token;
   }
@@ -299,6 +321,7 @@ export class App implements OnDestroy {
     this.permissionSequence++;this.permissionAbort?.abort();this.permissionAbort=null;
     this.permissionStatus.set('idle');this.permissionIdentity.set(null);this.permissionAudit.set([]);this.permissionNext.set(null);
     this.clearPermissionRequest(clearKey);
+    this.clearGrantRead();this.clearGrantRequest(clearKey);
     if (clearKey) this.permissionKey='';
   }
 
@@ -309,7 +332,7 @@ export class App implements OnDestroy {
   }
 
   async lookupPermissionRequest():Promise<void> {
-    if(this.permissionChangeStatus()==='sending')return;
+    if(this.permissionChangeStatus()==='sending'||this.grantChangeStatus()==='sending')return;
     this.expireOidcIfNeeded();this.clearPermissionRequest();const sequence=this.permissionRequestSequence;
     const key=this.permissionKey.trim(),env=this.permissionEnvironment.trim(),requestId=this.permissionRequestId.trim();
     if(!this.validJwt(key)||!this.validEnvironment(env)||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId)){this.permissionRequestStatus.set('error');return;}
@@ -329,6 +352,106 @@ export class App implements OnDestroy {
     finally {if(sequence===this.permissionRequestSequence)this.permissionRequestAbort=null;}
   }
 
+  clearGrantRead():void {
+    this.grantSequence++;this.grantAbort?.abort();this.grantAbort=null;
+    this.grantStatus.set('idle');this.grantValue.set(null);this.grantConfirmed=false;
+  }
+  clearGrantRequest(clearInput=false):void {
+    this.grantRequestSequence++;this.grantRequestAbort?.abort();this.grantRequestAbort=null;
+    this.grantRequestStatus.set('idle');this.grantRequestRecord.set(null);
+    if(clearInput)this.grantRequestId='';
+  }
+  clearGrantChange():void {
+    if(this.grantChangeStatus()==='sending')return;
+    this.grantChange.set(null);this.grantChangeStatus.set('idle');this.grantChanged.set(null);this.grantMessage.set('');
+    this.grantReason='';this.grantConfirmed=false;this.grantRetryConfirmed=false;
+  }
+  private grantSelection():[string,string] {
+    if(!/^(email|sms|push|slack|email-provider):(read|write)$/.test(this.grantKind) && this.grantKind!=='audit:read')throw new Error('invalid grant');
+    const [resource,permission]=this.grantKind.split(':');return [resource,permission];
+  }
+  private grantInputs():{origin:string;key:string;environment:string;targetIssuer:string;targetSubject:string;targetClientId:string;resource:string;permission:string} {
+    const origin=this.validatedOrigin(),key=this.permissionKey.trim(),environment=this.permissionEnvironment.trim();
+    const targetIssuer=this.permissionIssuer.trim(),targetSubject=this.permissionSubject.trim(),targetClientId=this.permissionClient.trim();
+    const bytes=(s:string)=>new TextEncoder().encode(s).length;
+    if(!this.validJwt(key)||!this.validEnvironment(environment)||!targetIssuer||bytes(targetIssuer)>2048||!targetSubject||bytes(targetSubject)>1024||!targetClientId||bytes(targetClientId)>1024)throw new Error('invalid input');
+    const [resource,permission]=this.grantSelection();
+    return {origin,key,environment,targetIssuer,targetSubject,targetClientId,resource,permission};
+  }
+  async loadGrant():Promise<void> {
+    if(this.grantChangeStatus()==='sending'||this.permissionChangeStatus()==='sending')return;
+    this.expireOidcIfNeeded();this.clearGrantRead();const sequence=this.grantSequence;
+    const controller=new AbortController();this.grantAbort=controller;this.grantStatus.set('loading');
+    try {
+      const {origin,key,environment,targetIssuer,targetSubject,targetClientId,resource,permission}=this.grantInputs();
+      const params=new URLSearchParams({environmentId:environment,targetIssuer,targetSubject,targetClientId,resource,permission});
+      const response=await fetch(`${origin}/v1/experimental/operator/workflow-grants?${params}`,{headers:{Authorization:`Bearer ${key}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      if(!response.ok)throw new Error('request failed');const value:unknown=await response.json();
+      if(typeof value!=='object'||value===null||!('targetExists' in value)||typeof value.targetExists!=='boolean'||!('granted' in value)||typeof value.granted!=='boolean')throw new Error('invalid response');
+      this.expireOidcIfNeeded();if(sequence!==this.grantSequence)return;
+      if(!value.targetExists){this.grantStatus.set('missing');return;}
+      this.grantValue.set(value.granted);this.grantDesired=value.granted;this.grantStatus.set('loaded');
+    } catch {this.expireOidcIfNeeded();if(sequence===this.grantSequence)this.grantStatus.set('error');}
+    finally {if(sequence===this.grantSequence)this.grantAbort=null;}
+  }
+  canChangeGrant():boolean {
+    const reason=this.grantReason.trim();
+    return this.grantChangeStatus()==='idle'&&this.permissionChangeStatus()!=='sending'&&this.grantStatus()==='loaded'&&this.grantValue()!==null&&this.grantConfirmed&&!!reason&&new TextEncoder().encode(reason).length<=1000;
+  }
+  async changeGrant():Promise<void> {
+    this.expireOidcIfNeeded();if(!this.canChangeGrant())return;
+    let input:ReturnType<App['grantInputs']>;let requestId:string;
+    try {input=this.grantInputs();requestId=crypto.randomUUID();}catch{this.grantChangeStatus.set('unavailable');return;}
+    const {origin,key,environment,targetIssuer,targetSubject,targetClientId,resource,permission}=input;
+    const body:GrantBody={requestId,targetIssuer,targetSubject,targetClientId,resource,permission,expected:this.grantValue()!,desired:this.grantDesired,reason:this.grantReason.trim()};
+    this.grantChangeStatus.set('sending');this.grantMessage.set('');
+    try {
+      let keyHash:string;try{keyHash=await this.credentialFingerprint(key);}catch{this.grantChangeStatus.set('unavailable');return;}
+      this.expireOidcIfNeeded();if(this.permissionKey.trim()!==key||this.permissionEnvironment.trim()!==environment||this.validatedOrigin()!==origin){this.grantChangeStatus.set('unavailable');return;}
+      this.grantChange.set({origin,environment,keyHash,body});
+      await this.sendGrant(key,{origin,environment,keyHash,body});
+    }catch{this.grantChangeStatus.set('unknown');}
+    finally{this.grantReason='';this.grantConfirmed=false;this.clearGrantRead();}
+  }
+  private async sendGrant(key:string,snapshot:GrantSnapshot,retry=false):Promise<void> {
+    const params=new URLSearchParams({environmentId:snapshot.environment});
+    const response=await fetch(`${snapshot.origin}/v1/experimental/operator/workflow-grants?${params}`,{method:'PUT',headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},body:JSON.stringify(snapshot.body),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
+    if(!response.ok){this.grantChangeStatus.set(!retry&&[400,401,403,409].includes(response.status)?'rejected':'unknown');if(retry)this.grantMessage.set('재제출이 거절되거나 실패했습니다. 원래 요청의 결과는 여전히 불명확합니다.');return;}
+    const value:unknown=await response.json();
+    if(typeof value!=='object'||value===null||!('changed' in value)||typeof value.changed!=='boolean'||!('replayed' in value)||typeof value.replayed!=='boolean'||!('requestId' in value)||value.requestId!==snapshot.body.requestId)throw new Error('invalid response');
+    this.grantChanged.set(value.changed);this.grantChangeStatus.set('recorded');
+  }
+  async retryGrant():Promise<void> {
+    this.expireOidcIfNeeded();const snapshot=this.grantChange(),key=this.permissionKey.trim();
+    if(!snapshot||this.grantChangeStatus()!=='unknown'||!this.grantRetryConfirmed||!this.validJwt(key))return;
+    this.grantChangeStatus.set('sending');this.grantMessage.set('');
+    try {
+      const keyHash=await this.credentialFingerprint(key);this.expireOidcIfNeeded();
+      if(this.permissionKey.trim()!==key||keyHash!==snapshot.keyHash||this.permissionEnvironment.trim()!==snapshot.environment||this.validatedOrigin()!==snapshot.origin){this.grantMessage.set('원래 요청과 같은 토큰, 환경 및 API 주소가 필요합니다.');return;}
+      await this.sendGrant(key,snapshot,true);
+    }catch{this.grantMessage.set('결과가 여전히 불명확합니다. 요청 ID로 조회하세요.');}
+    finally{this.grantRetryConfirmed=false;if(this.grantChangeStatus()==='sending')this.grantChangeStatus.set('unknown');}
+  }
+  async lookupGrantRequest():Promise<void> {
+    if(this.grantChangeStatus()==='sending'||this.permissionChangeStatus()==='sending')return;
+    this.expireOidcIfNeeded();this.clearGrantRequest();const sequence=this.grantRequestSequence;
+    const key=this.permissionKey.trim(),environment=this.permissionEnvironment.trim(),requestId=this.grantRequestId.trim();
+    if(!this.validJwt(key)||!this.validEnvironment(environment)||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId)){this.grantRequestStatus.set('error');return;}
+    const controller=new AbortController();this.grantRequestAbort=controller;this.grantRequestStatus.set('loading');
+    try {
+      const params=new URLSearchParams({environmentId:environment,requestId});
+      const response=await fetch(`${this.validatedOrigin()}/v1/experimental/operator/workflow-grants/request?${params}`,{headers:{Authorization:`Bearer ${key}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      if(!response.ok)throw new Error('request failed');const value:unknown=await response.json();
+      if(typeof value!=='object'||value===null||!('found' in value)||typeof value.found!=='boolean')throw new Error('invalid response');
+      this.expireOidcIfNeeded();if(sequence!==this.grantRequestSequence)return;
+      if(!value.found){this.grantRequestStatus.set('missing');return;}
+      const r=value as Record<string,unknown>;
+      if(typeof r['requestId']!=='string'||r['requestId'].toLowerCase()!==requestId.toLowerCase()||['targetIssuer','targetSubject','targetClientId','resource','permission','reason','createdAt'].some(k=>typeof r[k]!=='string')||['expected','desired','changed'].some(k=>typeof r[k]!=='boolean'))throw new Error('invalid response');
+      this.grantRequestRecord.set({requestId:r['requestId'] as string,targetIssuer:r['targetIssuer'] as string,targetSubject:r['targetSubject'] as string,targetClientId:r['targetClientId'] as string,resource:r['resource'] as string,permission:r['permission'] as string,expected:r['expected'] as boolean,desired:r['desired'] as boolean,reason:r['reason'] as string,changed:r['changed'] as boolean,createdAt:r['createdAt'] as string});this.grantRequestStatus.set('found');
+    }catch{this.expireOidcIfNeeded();if(sequence===this.grantRequestSequence)this.grantRequestStatus.set('error');}
+    finally{if(sequence===this.grantRequestSequence)this.grantRequestAbort=null;}
+  }
+
   private isPermissionFlags(value:unknown):value is PermissionFlags {
     if(typeof value!=='object'||value===null)return false;
     const record=value as Record<string,unknown>;
@@ -336,7 +459,7 @@ export class App implements OnDestroy {
   }
 
   async loadPermissions(mode:'identity'|'audit', next=false): Promise<void> {
-    if(this.permissionChangeStatus()==='sending')return;
+    if(this.permissionChangeStatus()==='sending'||this.grantChangeStatus()==='sending')return;
     this.expireOidcIfNeeded();
     const cursor=next ? this.permissionNext() : null;
     if (next && (!cursor || mode!=='audit')) return;
@@ -388,7 +511,7 @@ export class App implements OnDestroy {
 
   canChangePermissions(): boolean {
     const reason=this.permissionReason.trim();
-    return this.permissionChangeStatus()==='idle' && (this.permissionStatus()==='identity'||this.permissionStatus()==='missing') && this.permissionConfirmed && this.validJwt(this.permissionKey.trim()) && this.validEnvironment(this.permissionEnvironment.trim()) && !!reason && new TextEncoder().encode(reason).length<=1000;
+    return this.permissionChangeStatus()==='idle' && this.grantChangeStatus()!=='sending' && (this.permissionStatus()==='identity'||this.permissionStatus()==='missing') && this.permissionConfirmed && this.validJwt(this.permissionKey.trim()) && this.validEnvironment(this.permissionEnvironment.trim()) && !!reason && new TextEncoder().encode(reason).length<=1000;
   }
 
   async changePermissions(): Promise<void> {
@@ -674,11 +797,11 @@ export class App implements OnDestroy {
   }
 
   setSection(next: Section): void {
-    if (this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
+    if (this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     if (this.section()==='workflows' && next!=='workflows') {this.clearWorkflow(true);this.forgetWorkflowRequest();}
     if (this.section() === 'subscribers' && next !== 'subscribers') this.forgetKey();
     if (this.section() === 'alerts' && next !== 'alerts') this.forgetAlertKey();
-    if (this.section() === 'settings' && next !== 'settings') {this.clearPermissions(true);this.clearPermissionChange();}
+    if (this.section() === 'settings' && next !== 'settings') {this.clearPermissions(true);this.clearPermissionChange();this.clearGrantChange();}
     this.section.set(next);
   }
 

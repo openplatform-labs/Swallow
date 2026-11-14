@@ -6,6 +6,34 @@ import { OperatorOidc } from './operator-oidc';
 describe('Swallow console', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
+  it('reads and changes a delegated workflow grant with an expected state and reason', async () => {
+    const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({targetExists:true,granted:false}))).mockImplementationOnce(async (_url,init)=>new Response(JSON.stringify({changed:true,replayed:false,requestId:JSON.parse(init?.body as string).requestId})));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('settings');app.permissionEnvironment='env-a';app.permissionKey='aaa.bbb.ccc';app.permissionIssuer='https://issuer.test';app.permissionSubject='alice';app.permissionClient='console';app.grantKind='sms:write';
+    await app.loadGrant();expect(app.grantValue()).toBe(false);app.grantDesired=true;app.grantConfirmed=true;await app.changeGrant();expect(mock).toHaveBeenCalledTimes(1);
+    app.grantReason='ticket';await app.changeGrant();expect(app.grantChangeStatus()).toBe('recorded');
+    expect(new URL(mock.mock.calls[0][0] as string).searchParams.get('resource')).toBe('sms');expect(JSON.parse(mock.mock.calls[1][1]?.body as string)).toEqual({requestId:expect.any(String),targetIssuer:'https://issuer.test',targetSubject:'alice',targetClientId:'console',resource:'sms',permission:'write',expected:false,desired:true,reason:'ticket'});
+  });
+  it('recovers a lost grant response by lookup and retries only the original request with the original token', async () => {
+    const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({targetExists:true,granted:false}))).mockRejectedValueOnce(new TypeError('lost'));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('settings');app.permissionEnvironment='env-a';app.permissionKey='aaa.bbb.ccc';app.permissionIssuer='https://issuer.test';app.permissionSubject='alice';app.permissionClient='console';
+    await app.loadGrant();app.grantDesired=true;app.grantReason='ticket';app.grantConfirmed=true;await app.changeGrant();expect(app.grantChangeStatus()).toBe('unknown');const request=app.grantChange()!.body;const original=mock.mock.calls[1][1]?.body;
+    app.permissionKey='different.token.value';app.clearPermissions();app.grantRetryConfirmed=true;await app.retryGrant();expect(mock).toHaveBeenCalledTimes(2);expect(app.grantMessage()).toContain('같은 토큰');
+    app.grantRequestId=request.requestId;mock.mockResolvedValueOnce(new Response(JSON.stringify({found:true,...request,changed:true,createdAt:'today',secret:'discard'})));await app.lookupGrantRequest();expect(app.grantRequestStatus()).toBe('found');expect(JSON.stringify(app.grantRequestRecord())).not.toContain('discard');
+    app.permissionKey='aaa.bbb.ccc';app.clearPermissions();mock.mockResolvedValueOnce(new Response('',{status:401}));app.grantRetryConfirmed=true;await app.retryGrant();expect(app.grantChangeStatus()).toBe('unknown');expect(app.grantMessage()).toContain('불명확');mock.mockResolvedValueOnce(new Response(JSON.stringify({changed:true,replayed:true,requestId:request.requestId})));app.grantRetryConfirmed=true;await app.retryGrant();expect(mock.mock.calls[4][1]?.body).toBe(original);expect(app.grantChangeStatus()).toBe('recorded');
+  });
+  it('rejects stale grant changes and ignores responses after the target changes', async () => {
+    let finish!:(response:Response)=>void;const mock=vi.spyOn(globalThis,'fetch').mockReturnValueOnce(new Promise(done=>finish=done)).mockResolvedValueOnce(new Response(JSON.stringify({targetExists:true,granted:false}))).mockResolvedValueOnce(new Response('',{status:409}));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('settings');app.permissionEnvironment='env-a';app.permissionKey='aaa.bbb.ccc';app.permissionIssuer='https://issuer.test';app.permissionSubject='alice';app.permissionClient='console';
+    const pending=app.loadGrant();app.permissionSubject='bob';app.clearPermissions();finish(new Response(JSON.stringify({targetExists:true,granted:true})));await pending;expect(app.grantStatus()).toBe('idle');expect(app.grantValue()).toBeNull();
+    await app.loadGrant();app.grantDesired=true;app.grantReason='ticket';app.grantConfirmed=true;await app.changeGrant();expect(app.grantChangeStatus()).toBe('rejected');expect(mock).toHaveBeenCalledTimes(3);
+  });
+  it('preserves the request during an in-flight grant write and prevents navigation', async () => {
+    let finish!:(response:Response)=>void;vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({targetExists:true,granted:false}))).mockReturnValueOnce(new Promise(done=>finish=done));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('settings');app.permissionEnvironment='env-a';app.permissionKey='aaa.bbb.ccc';app.permissionIssuer='https://issuer.test';app.permissionSubject='alice';app.permissionClient='console';await app.loadGrant();app.grantDesired=true;app.grantReason='ticket';app.grantConfirmed=true;
+    const pending=app.changeGrant();await vi.waitFor(()=>expect(app.grantChange()).not.toBeNull());const id=app.grantChange()!.body.requestId;app.setSection('overview');app.clearGrantChange();expect(app.section()).toBe('settings');expect(app.grantChange()!.body.requestId).toBe(id);
+    finish(new Response(JSON.stringify({changed:true,replayed:false,requestId:id})));await pending;expect(app.grantChangeStatus()).toBe('recorded');
+  });
+
   it('pages scoped workflow audit entries and retains only the displayed metadata', async () => {
     const row=(n:number)=>({id:`00000000-0000-0000-0000-${n.toString().padStart(12,'0')}`,workflowIdentifier:'welcome',resource:'email',issuer:'issuer',subject:'alice',clientId:'console',databasePrincipal:'api',reason:'ticket',recordedAt:'today',previousActive:true,newActive:false,previousTitleBytes:1,newTitleBytes:2,previousContentBytes:3,newContentBytes:4,previousProvider:null,newProvider:null,secret:'not displayed'});
     const first=Array.from({length:50},(_,i)=>row(i+1)),second=[row(51)];
