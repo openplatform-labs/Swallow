@@ -5,7 +5,10 @@ cd "$(dirname "$0")/.."
 export NOVU_ALLOW_RECREATED_SUBSCRIBER=true
 export NOVU_POSTGRES_ALLOW_INSECURE=true
 name="novu-rust-api-test-$$"
-cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; }
+secret_file=$(mktemp)
+chmod 600 "$secret_file"
+printf %s test-secret > "$secret_file"
+cleanup() { rm -f "$secret_file"; docker rm -f "$name" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 docker run --rm -d --name "$name" -e POSTGRES_HOST_AUTH_METHOD=trust \
   -e POSTGRES_DB=novu_api_test -p 127.0.0.1::5432 postgres:17-alpine >/dev/null
@@ -21,8 +24,15 @@ TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_api_test" \
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_api_test" \
   cargo test --locked --test sendgrid_webhook -- --ignored
 
-TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_api_test" \
-  cargo test --locked --test twilio_webhook -- --ignored --test-threads=1
+env -u NOVU_TWILIO_WEBHOOK_AUTH_TOKEN TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_api_test" TEST_TWILIO_FILE_CONFIG=1 \
+  NOVU_TWILIO_WEBHOOK_ENVIRONMENT_ID=env-a NOVU_TWILIO_WEBHOOK_ACCOUNT_SID=AC11111111111111111111111111111111 \
+  NOVU_TWILIO_WEBHOOK_URL=https://events.example.test/webhooks/organizations/org-a/environments/env-a/sms/twilio \
+  NOVU_TWILIO_WEBHOOK_AUTH_TOKEN_FILE="$secret_file" \
+  cargo test --locked --test twilio_webhook signed_ -- --ignored --test-threads=1
+NOVU_TWILIO_WEBHOOK_ENVIRONMENT_ID=env-a NOVU_TWILIO_WEBHOOK_ACCOUNT_SID=AC11111111111111111111111111111111 \
+  NOVU_TWILIO_WEBHOOK_URL=https://events.example.test/webhooks/organizations/org-a/environments/env-a/sms/twilio \
+  NOVU_TWILIO_WEBHOOK_AUTH_TOKEN=test-secret NOVU_TWILIO_WEBHOOK_AUTH_TOKEN_FILE="$secret_file" \
+  cargo test --locked --test twilio_webhook conflicting_webhook_secret_sources -- --ignored
 
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_api_test" \
   cargo test --locked --test resend_webhook -- --ignored

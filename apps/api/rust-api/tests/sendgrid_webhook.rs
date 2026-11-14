@@ -40,12 +40,19 @@ async fn signed_events_are_scoped_idempotent_and_private() {
         novu_postgres_queue::sendgrid_queue::DISPATCH_PROOF_MIGRATION,
         novu_postgres_queue::reconciliation::MIGRATION,
         novu_postgres_queue::reconciliation::RETRY_DISPATCH_MIGRATION,
+        novu_postgres_queue::reconciliation::OPERATOR_GRANTS_MIGRATION,
         include_str!("../migrations/0004_sendgrid_webhooks.sql"),
         include_str!("../migrations/0008_sendgrid_dispatch_identity.sql"),
         include_str!("../migrations/0009_sendgrid_dispatch_proof.sql"),
     ] {
         db.batch_execute(sql).await.unwrap();
     }
+    db.execute(
+        "INSERT INTO novu_rust_delivery_operator_grants VALUES ('env-a',session_user,'retry')",
+        &[],
+    )
+    .await
+    .unwrap();
     let rng = SystemRandom::new();
     let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
     let key =

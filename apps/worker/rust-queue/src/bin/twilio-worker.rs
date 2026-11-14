@@ -18,9 +18,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     };
     let mut provider = Twilio::new(Config {
         account_sid: std::env::var("NOVU_TWILIO_ACCOUNT_SID")?,
-        auth_token: std::env::var("NOVU_TWILIO_AUTH_TOKEN").unwrap_or_default(),
+        auth_token: novu_rust_contracts::secret::from_env(
+            "NOVU_TWILIO_AUTH_TOKEN",
+            "NOVU_TWILIO_AUTH_TOKEN_FILE",
+        )?
+        .unwrap_or_default(),
         api_key_sid: std::env::var("NOVU_TWILIO_API_KEY_SID").ok(),
-        api_key_secret: std::env::var("NOVU_TWILIO_API_KEY_SECRET").ok(),
+        api_key_secret: novu_rust_contracts::secret::from_env(
+            "NOVU_TWILIO_API_KEY_SECRET",
+            "NOVU_TWILIO_API_KEY_SECRET_FILE",
+        )?,
         from: std::env::var("NOVU_TWILIO_FROM")?,
         region,
     })?;

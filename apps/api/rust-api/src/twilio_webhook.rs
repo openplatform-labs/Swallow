@@ -52,9 +52,12 @@ impl Config {
             std::env::var("NOVU_TWILIO_WEBHOOK_ENVIRONMENT_ID").ok()?,
             std::env::var("NOVU_TWILIO_WEBHOOK_ACCOUNT_SID").ok()?,
             std::env::var("NOVU_TWILIO_WEBHOOK_URL").ok()?,
-            std::env::var("NOVU_TWILIO_WEBHOOK_AUTH_TOKEN")
-                .ok()?
-                .into_bytes(),
+            novu_rust_contracts::secret::from_env(
+                "NOVU_TWILIO_WEBHOOK_AUTH_TOKEN",
+                "NOVU_TWILIO_WEBHOOK_AUTH_TOKEN_FILE",
+            )
+            .ok()??
+            .into_bytes(),
         )
     }
 }

@@ -18,6 +18,12 @@ const BODY: &str = "AccountSid=AC11111111111111111111111111111111&MessageSid=SM2
 // Generated independently with the pinned Twilio Node SDK 4.20.0.
 const SIGNATURE: &str = "KP5H8XYItiRooUTbGchLGWDP9H4=";
 
+#[test]
+#[ignore = "requires conflicting fixture environment variables"]
+fn conflicting_webhook_secret_sources_disable_authentication() {
+    assert!(Config::from_env().is_none());
+}
+
 async fn post(
     router: axum::Router,
     path: &str,
@@ -65,23 +71,34 @@ async fn signed_status_events_are_scoped_deduplicated_and_private() {
         include_str!("../../../worker/rust-queue/migrations/0041_experimental_twilio_attempts.sql"),
         novu_postgres_queue::reconciliation::MIGRATION,
         novu_postgres_queue::reconciliation::RETRY_DISPATCH_MIGRATION,
+        novu_postgres_queue::reconciliation::OPERATOR_GRANTS_MIGRATION,
         novu_postgres_queue::twilio_queue::DISPATCH_ID_MIGRATION,
     ] {
         db.batch_execute(migration).await.unwrap();
     }
+    db.execute(
+        "INSERT INTO novu_rust_delivery_operator_grants VALUES ('env-a',session_user,'retry')",
+        &[],
+    )
+    .await
+    .unwrap();
     db.batch_execute(
         "INSERT INTO novu_rust_environments VALUES ('env-a','org-a'),('env-b','org-b')",
     )
     .await
     .unwrap();
     let db = Arc::new(db);
-    let config = Config::new(
-        "env-a".into(),
-        format!("AC{}", "1".repeat(32)),
-        URL.into(),
-        b"test-secret".to_vec(),
-    )
-    .unwrap();
+    let config = if std::env::var_os("TEST_TWILIO_FILE_CONFIG").is_some() {
+        Config::from_env().unwrap()
+    } else {
+        Config::new(
+            "env-a".into(),
+            format!("AC{}", "1".repeat(32)),
+            URL.into(),
+            b"test-secret".to_vec(),
+        )
+        .unwrap()
+    };
     let router =
         novu_rust_api::router_with_twilio_config(db.clone(), None, HashMap::new(), Some(config));
     let form = "application/x-www-form-urlencoded";
@@ -209,10 +226,17 @@ async fn signed_job_callbacks_bind_evidence_without_changing_attempt_state() {
         include_str!("../../../worker/rust-queue/migrations/0041_experimental_twilio_attempts.sql"),
         novu_postgres_queue::reconciliation::MIGRATION,
         novu_postgres_queue::reconciliation::RETRY_DISPATCH_MIGRATION,
+        novu_postgres_queue::reconciliation::OPERATOR_GRANTS_MIGRATION,
         novu_postgres_queue::twilio_queue::DISPATCH_ID_MIGRATION,
     ] {
         db.batch_execute(migration).await.unwrap();
     }
+    db.execute(
+        "INSERT INTO novu_rust_delivery_operator_grants VALUES ('env-a',session_user,'retry')",
+        &[],
+    )
+    .await
+    .unwrap();
     db.batch_execute(
         "INSERT INTO novu_rust_environments VALUES ('env-a','org-a'),('env-b','org-b')",
     )
