@@ -148,7 +148,9 @@ Twilio SMS 워커는 `NOVU_TWILIO_AUTH_TOKEN_FILE` 또는 `NOVU_TWILIO_API_KEY_S
 
 API, 인앱·SendGrid·Twilio·FCM 워커 및 WS의 조회·이벤트 연결은 기본적으로 서버 인증서와 호스트명을 검증하는 TLS를 요구한다. 공개 신뢰 루트를 사용하며 사설 CA는 `NOVU_POSTGRES_CA_FILE`에 PEM 파일 경로를 지정해 추가한다. `DATABASE_URL`의 `sslmode=disable`만으로 TLS를 끌 수 없다. 일회용 로컬 테스트에서만 `NOVU_POSTGRES_ALLOW_INSECURE=true`를 명시하면 평문으로 연결한다. 이 변수는 TLS를 강제로 끄므로 운영에서 설정하지 않는다.
 
-[Docker PostgreSQL TLS 테스트](apps/api/rust-api/scripts/test-postgres-tls.sh)는 임시 CA로 정상 암호화 연결 및 실제 서버의 SSL 상태를 확인하고, 신뢰되지 않은 CA·호스트명 불일치·평문 서버를 거절하는지 검사한다. 명시적 평문 테스트 모드도 확인한다. DB 클라이언트 인증서(mTLS), 비밀 관리, 인증서 자동 갱신과 운영 배포·HA는 미구현 또는 미검증이며 TLS만으로 운영 준비가 완료되지 않는다.
+선택적으로 `NOVU_POSTGRES_CLIENT_CERT_FILE`과 `NOVU_POSTGRES_CLIENT_KEY_FILE`을 함께 지정하면 공통 PostgreSQL 연결에서 PEM 클라이언트 인증서를 사용한다. 인증서 체인과 암호화되지 않은 개인 키 파일은 각각 최대 1 MiB이며, 하나만 지정하거나 키가 인증서와 맞지 않거나 평문 모드와 함께 지정하면 시작을 거절한다. 파일 경로와 키는 이 오류에 출력하지 않는다. 파일은 시작 시 읽고 재연결에도 재사용하므로 인증서 교체에는 프로세스 재시작이 필요하다. 프로세스의 모든 DB 연결은 같은 클라이언트 인증서를 사용하며 독립 경보용 DB마다 다른 인증서를 지정하는 기능은 없다. PostgreSQL 서버 측 CA, 사용자 매핑과 `pg_hba.conf`는 운영자가 설정하고 파일 접근을 제한해야 한다.
+
+[Docker PostgreSQL TLS 테스트](apps/api/rust-api/scripts/test-postgres-tls.sh)는 서버 인증과 평문 선택에 더해 `cert clientcert=verify-full` DB에서 올바른 클라이언트 인증서와 API 기동을 확인하고 인증서 누락·다른 사용자·신뢰되지 않은 인증서·키 불일치를 거절하는지 검사한다. 인증서 자동 갱신, 무중단 회전, DB마다 별도 ID 사용 및 실제 운영 배포·HA는 미구현 또는 미검증이며 TLS만으로 운영 준비가 완료되지 않는다.
 
 ## 발송 상태와 복구
 
@@ -240,7 +242,7 @@ API [0014 마이그레이션](apps/api/rust-api/migrations/0014_workflow_provide
 | 영역 | 남은 기능 및 제한 |
 |---|---|
 | API와 관리 | 대다수 Novu API, workflow·integration·subscriber 관리 API, OpenAPI 전반, 전체 DTO·오류·페이지네이션·API 버전 및 공식 SDK 호환성. |
-| 인증·권한 | 사용자 JWT, OAuth, 구독자 세션의 context HMAC 소수 오류 응답·keyless·실제 통합 선택·오류 경계와 JWT의 나머지 알고리즘·만료 설정, 운영용 비밀 관리, 사용자 조직 멤버십, 역할·권한 및 엔터프라이즈 인증. DB 클라이언트 인증서와 운영 인증 정책은 미구현이다. |
+| 인증·권한 | 사용자 JWT, OAuth, 구독자 세션의 context HMAC 소수 오류 응답·keyless·실제 통합 선택·오류 경계와 JWT의 나머지 알고리즘·만료 설정, 운영용 비밀 관리, 사용자 조직 멤버십, 역할·권한 및 엔터프라이즈 인증. DB 클라이언트 인증서는 위의 제한적인 mTLS 설정을 참고하며, 전체 운영 인증 정책은 미구현이다. |
 | 워크플로 | 다단계 실행, 조건·분기, 지연·digest의 실제 워크플로 처리, 취소, bridge/stateless 워크플로, actor·tenant·복잡한 context, 첨부와 overrides. 큐 기본 연산의 존재는 워크플로 지원을 뜻하지 않는다. |
 | 구독자·설정 | Unicode·따옴표 이메일과 해당 오류 응답, 나머지 구독자 관리 API, topic, 나머지 사용자별/워크플로별 알림 설정, channel 연결·자격증명. 실험 스키마는 원본 데이터 모델의 대체물이 아니다. |
 | 템플릿 | Handlebars 전체 문법, helpers, blocks, 부동소수·안전 범위를 벗어난 정수·배열·객체 보간, 번역, 일부 사용자 프로필 및 사용자 정의 branding. 지원 범위의 일부 입력만 검증되었다. |

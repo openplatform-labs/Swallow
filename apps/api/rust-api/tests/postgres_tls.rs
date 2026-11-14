@@ -4,7 +4,12 @@
 async fn verifies_postgres_transport() {
     let url = std::env::var("TEST_DATABASE_URL").unwrap();
     let expected = std::env::var("TEST_POSTGRES_TLS_EXPECT").unwrap();
-    let (config, tls) = novu_rust_contracts::postgres::configure(&url).unwrap();
+    let configured = novu_rust_contracts::postgres::configure(&url);
+    if expected == "config_reject" {
+        assert!(configured.is_err(), "invalid client identity was accepted");
+        return;
+    }
+    let (config, tls) = configured.unwrap();
     let result = config.connect(tls).await;
     if expected == "reject" {
         assert!(
@@ -23,5 +28,16 @@ async fn verifies_postgres_transport() {
         .await
         .unwrap()
         .get(0);
-    assert_eq!(encrypted, expected == "tls");
+    assert_eq!(encrypted, expected == "tls" || expected == "mtls");
+    if expected == "mtls" {
+        let client_dn: Option<String> = client
+            .query_one(
+                "SELECT client_dn FROM pg_stat_ssl WHERE pid=pg_backend_pid()",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(client_dn.as_deref(), Some("/CN=postgres"));
+    }
 }
