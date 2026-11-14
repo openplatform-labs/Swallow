@@ -145,6 +145,10 @@ impl RuntimeConfig {
             })?,
             None => HashMap::new(),
         };
+        match std::env::var("NOVU_RESEND_WEBHOOK_LOCK_RETRY_JOBS").as_deref() {
+            Ok("true" | "false") | Err(std::env::VarError::NotPresent) => {}
+            _ => return Err(invalid()),
+        }
         let twilio = twilio_webhook::Config::from_env();
         let resend = resend_webhook::Config::from_env();
         let is_set = |names: &[&str]| names.iter().any(|name| std::env::var_os(name).is_some());

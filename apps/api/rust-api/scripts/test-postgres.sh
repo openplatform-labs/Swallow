@@ -22,7 +22,7 @@ for ((i=0; i<30; i++)); do
   sleep 1
 done
 env -u INBOX_HMAC_KEYS_JSON -u JWT_SECRET_FILE \
-  -u NOVU_RESEND_WEBHOOK_ENVIRONMENT_ID -u NOVU_RESEND_WEBHOOK_SECRET -u NOVU_RESEND_WEBHOOK_SECRET_FILE \
+  -u NOVU_RESEND_WEBHOOK_ENVIRONMENT_ID -u NOVU_RESEND_WEBHOOK_SECRET -u NOVU_RESEND_WEBHOOK_SECRET_FILE -u NOVU_RESEND_WEBHOOK_LOCK_RETRY_JOBS \
   -u NOVU_TWILIO_WEBHOOK_ENVIRONMENT_ID -u NOVU_TWILIO_WEBHOOK_ACCOUNT_SID -u NOVU_TWILIO_WEBHOOK_URL -u NOVU_TWILIO_WEBHOOK_AUTH_TOKEN -u NOVU_TWILIO_WEBHOOK_AUTH_TOKEN_FILE \
   SWALLOW_API_STRICT_SECURITY_CONFIG=true SWALLOW_API_REQUIRED_SECURITY=inbox-jwt TEST_INBOX_HMAC_FILE_CONFIG=1 INBOX_HMAC_KEYS_JSON_FILE="$hmac_file" JWT_SECRET=isolated-subscriber-secret \
   TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_api_test" \
@@ -47,7 +47,9 @@ TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_twilio_invalidat
   cargo test --locked --test twilio_invalidation -- --ignored
 
 docker exec "$name" createdb -U postgres novu_resend_invalidation_test
-TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_resend_invalidation_test" \
+env -u NOVU_RESEND_WEBHOOK_SECRET_FILE TEST_RESEND_LOCK_CONFIG=1 NOVU_RESEND_WEBHOOK_LOCK_RETRY_JOBS=true \
+  NOVU_RESEND_WEBHOOK_ENVIRONMENT_ID=env-a NOVU_RESEND_WEBHOOK_SECRET=whsec_dGVzdC1zZWNyZXQtaXMtMzItYnl0ZXMtbG9uZyEh \
+  TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_resend_invalidation_test" \
   cargo test --locked --test resend_invalidation -- --ignored
 
 docker exec "$name" createdb -U postgres novu_sendgrid_projection_test
@@ -67,10 +69,12 @@ NOVU_TWILIO_WEBHOOK_ENVIRONMENT_ID=env-a NOVU_TWILIO_WEBHOOK_ACCOUNT_SID=AC11111
   NOVU_TWILIO_WEBHOOK_AUTH_TOKEN=test-secret NOVU_TWILIO_WEBHOOK_AUTH_TOKEN_FILE="$secret_file" \
   cargo test --locked --test twilio_webhook conflicting_webhook_secret_sources -- --ignored
 
-env -u NOVU_RESEND_WEBHOOK_SECRET_FILE TEST_RESEND_STRICT_CONFIG=1 SWALLOW_API_STRICT_SECURITY_CONFIG=true SWALLOW_API_REQUIRED_SECURITY=resend-webhook \
+env -u NOVU_RESEND_WEBHOOK_SECRET_FILE -u NOVU_RESEND_WEBHOOK_LOCK_RETRY_JOBS TEST_RESEND_STRICT_CONFIG=1 SWALLOW_API_STRICT_SECURITY_CONFIG=true SWALLOW_API_REQUIRED_SECURITY=resend-webhook \
   NOVU_RESEND_WEBHOOK_ENVIRONMENT_ID=env-a NOVU_RESEND_WEBHOOK_SECRET=whsec_dGVzdC1zZWNyZXQtaXMtMzItYnl0ZXMtbG9uZyEh \
   TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_api_test" \
-  cargo test --locked --test resend_webhook -- --ignored
+  cargo test --locked --test resend_webhook signed_events_are_scoped_deduplicated_and_private -- --ignored
+
+NOVU_RESEND_WEBHOOK_LOCK_RETRY_JOBS=invalid cargo test --locked --test resend_webhook invalid_retry_lock_policy_rejects_startup -- --ignored
 
 # The final case pauses and restarts this disposable container.
 docker exec "$name" createdb -U postgres novu_api_reconnect_test

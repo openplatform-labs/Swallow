@@ -14,6 +14,12 @@ use std::{
 use tokio_postgres::NoTls;
 use tower::ServiceExt;
 
+#[test]
+#[ignore = "requires invalid lock policy fixture environment"]
+fn invalid_retry_lock_policy_rejects_startup() {
+    assert!(novu_rust_api::RuntimeConfig::try_from_env().is_err());
+}
+
 fn signature(secret: &[u8], id: &str, timestamp: &str, body: &[u8]) -> String {
     let mut data = format!("{id}.{timestamp}.").into_bytes();
     data.extend_from_slice(body);
@@ -107,7 +113,11 @@ async fn signed_events_are_scoped_deduplicated_and_private() {
             .router(db.clone())
     } else {
         novu_rust_api::router_with_webhook_configs(
-            db.clone(), None, HashMap::new(), None, Some(config),
+            db.clone(),
+            None,
+            HashMap::new(),
+            None,
+            Some(config),
         )
     };
     let path = "/webhooks/organizations/org-a/environments/env-a/email/resend";

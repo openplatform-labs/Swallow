@@ -17,6 +17,7 @@ use tokio_postgres::Client;
 pub struct Config {
     environment: String,
     secret: Vec<u8>,
+    lock_retry_jobs: bool,
 }
 impl Config {
     pub fn new(environment: String, secret: &str) -> Option<Self> {
@@ -27,16 +28,30 @@ impl Config {
         Some(Self {
             environment,
             secret: decoded,
+            lock_retry_jobs: false,
         })
     }
+    pub fn with_retry_job_lock(mut self, enabled: bool) -> Self {
+        self.lock_retry_jobs = enabled;
+        self
+    }
     pub fn from_env() -> Option<Self> {
-        Self::new(
-            std::env::var("NOVU_RESEND_WEBHOOK_ENVIRONMENT_ID").ok()?,
-            &novu_rust_contracts::secret::from_env(
-                "NOVU_RESEND_WEBHOOK_SECRET",
-                "NOVU_RESEND_WEBHOOK_SECRET_FILE",
-            )
-            .ok()??,
+        let lock_retry_jobs = match std::env::var("NOVU_RESEND_WEBHOOK_LOCK_RETRY_JOBS").as_deref()
+        {
+            Ok("true") => true,
+            Ok("false") | Err(std::env::VarError::NotPresent) => false,
+            _ => return None,
+        };
+        Some(
+            Self::new(
+                std::env::var("NOVU_RESEND_WEBHOOK_ENVIRONMENT_ID").ok()?,
+                &novu_rust_contracts::secret::from_env(
+                    "NOVU_RESEND_WEBHOOK_SECRET",
+                    "NOVU_RESEND_WEBHOOK_SECRET_FILE",
+                )
+                .ok()??,
+            )?
+            .with_retry_job_lock(lock_retry_jobs),
         )
     }
 }
@@ -139,10 +154,29 @@ pub async fn receive(
         .map(|address| {
             STANDARD.encode(digest::digest(&digest::SHA256, address.as_bytes()).as_ref())
         });
-    match db.execute("INSERT INTO novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type,payload_fingerprint,recipient_hash) SELECT e.id,$3,$4,$5,$6,$7 FROM novu_rust_environments e WHERE e.id=$1 AND e.organization_id=$2 ON CONFLICT(environment_id,event_id) DO UPDATE SET event_id=EXCLUDED.event_id WHERE novu_rust_resend_delivery_events.email_id=EXCLUDED.email_id AND novu_rust_resend_delivery_events.event_type=EXCLUDED.event_type AND (novu_rust_resend_delivery_events.payload_fingerprint IS NULL OR novu_rust_resend_delivery_events.payload_fingerprint=EXCLUDED.payload_fingerprint)", &[&environment,&organization,&id,&email,&kind,&fingerprint.as_ref(),&recipient_hash]).await {
-        Ok(1)=>StatusCode::NO_CONTENT,
-        Ok(_)=>StatusCode::CONFLICT,
-        Err(_)=>StatusCode::INTERNAL_SERVER_ERROR,
+    let sql = if config.lock_retry_jobs {
+        "WITH valid_env AS MATERIALIZED (SELECT id FROM public.novu_rust_environments WHERE id=$1 AND organization_id=$2), locked AS MATERIALIZED (SELECT id,public.novu_rust_lock_resend_webhook_jobs(id,$4) AS n FROM valid_env) INSERT INTO public.novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type,payload_fingerprint,recipient_hash) SELECT id,$3,$4,$5,$6,$7 FROM locked WHERE n>=0 ON CONFLICT(environment_id,event_id) DO UPDATE SET event_id=EXCLUDED.event_id WHERE public.novu_rust_resend_delivery_events.email_id=EXCLUDED.email_id AND public.novu_rust_resend_delivery_events.event_type=EXCLUDED.event_type AND (public.novu_rust_resend_delivery_events.payload_fingerprint IS NULL OR public.novu_rust_resend_delivery_events.payload_fingerprint=EXCLUDED.payload_fingerprint)"
+    } else {
+        "INSERT INTO novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type,payload_fingerprint,recipient_hash) SELECT e.id,$3,$4,$5,$6,$7 FROM novu_rust_environments e WHERE e.id=$1 AND e.organization_id=$2 ON CONFLICT(environment_id,event_id) DO UPDATE SET event_id=EXCLUDED.event_id WHERE novu_rust_resend_delivery_events.email_id=EXCLUDED.email_id AND novu_rust_resend_delivery_events.event_type=EXCLUDED.event_type AND (novu_rust_resend_delivery_events.payload_fingerprint IS NULL OR novu_rust_resend_delivery_events.payload_fingerprint=EXCLUDED.payload_fingerprint)"
+    };
+    match db
+        .execute(
+            sql,
+            &[
+                &environment,
+                &organization,
+                &id,
+                &email,
+                &kind,
+                &fingerprint.as_ref(),
+                &recipient_hash,
+            ],
+        )
+        .await
+    {
+        Ok(1) => StatusCode::NO_CONTENT,
+        Ok(_) => StatusCode::CONFLICT,
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 

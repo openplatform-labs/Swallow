@@ -64,6 +64,10 @@ async fn events_invalidate_only_matching_results_and_serialize_with_projector() 
         include_str!(
             "../../../worker/rust-queue/migrations/0102_resend_projection_invalidation.sql"
         ),
+        novu_postgres_queue::reconciliation::MIGRATION,
+        novu_postgres_queue::reconciliation::RETRY_DISPATCH_MIGRATION,
+        "ALTER TABLE novu_rust_delivery_reconciliations ADD COLUMN retry_provider_message_id text",
+        include_str!("../../../worker/rust-queue/migrations/0111_resend_webhook_job_lock.sql"),
     ] {
         db.batch_execute(sql).await.unwrap();
     }
@@ -72,6 +76,7 @@ async fn events_invalidate_only_matching_results_and_serialize_with_projector() 
     )
     .await
     .unwrap();
+    db.execute("INSERT INTO novu_rust_resend_webhook_lock_grants SELECT 'env-a',session_user,oid FROM pg_roles WHERE rolname=session_user", &[]).await.unwrap();
     let job = Uuid::new_v4();
     let other = Uuid::new_v4();
     for (j, env) in [(job, "env-a"), (other, "env-b")] {
@@ -101,11 +106,16 @@ async fn events_invalidate_only_matching_results_and_serialize_with_projector() 
     .unwrap();
     tokio::spawn(async move { driver.await.unwrap() });
     let secret = b"test-secret-is-32-bytes-long!!";
-    let config = novu_rust_api::resend_webhook::Config::new(
-        "env-a".into(),
-        &format!("whsec_{}", STANDARD.encode(secret)),
-    )
-    .unwrap();
+    let config = if std::env::var_os("TEST_RESEND_LOCK_CONFIG").is_some() {
+        novu_rust_api::resend_webhook::Config::from_env().unwrap()
+    } else {
+        novu_rust_api::resend_webhook::Config::new(
+            "env-a".into(),
+            &format!("whsec_{}", STANDARD.encode(secret)),
+        )
+        .unwrap()
+        .with_retry_job_lock(true)
+    };
     let app = novu_rust_api::router_with_webhook_configs(
         Arc::new(webdb),
         None,
@@ -217,5 +227,139 @@ async fn events_invalidate_only_matching_results_and_serialize_with_projector() 
             .unwrap()
             .get::<_, String>(0),
         "unknown"
+    );
+    // A prior retry is still locked after its attempt is deleted.
+    let retried = Uuid::new_v4();
+    novu_postgres_queue::enqueue(
+        &db,
+        retried,
+        "env-a",
+        novu_postgres_queue::resend_queue::JOB_KIND,
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO novu_rust_delivery_reconciliations(id,environment_id,job_id,decision,operator_name,reason,retry_provider_message_id) VALUES ($1,'env-a',$2,'retry','operator','ticket','old-retry-id')", &[&Uuid::new_v4(),&retried]).await.unwrap();
+    let tx = db.transaction().await.unwrap();
+    tx.query_one(
+        "SELECT id FROM novu_queue_jobs WHERE id=$1 FOR UPDATE",
+        &[&retried],
+    )
+    .await
+    .unwrap();
+    let waiting = tokio::spawn(event(
+        app.clone(),
+        secret,
+        "evt-prior-retry",
+        "email.delivered",
+        "old-retry-id",
+    ));
+    let mut blocked = false;
+    for _ in 0..100 {
+        if observer.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='resend_invalidation_webhook' AND wait_event_type='Lock')", &[]).await.unwrap().get::<_,bool>(0) {blocked=true;break;}
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(blocked && !waiting.is_finished());
+    assert!(!observer.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_resend_delivery_events WHERE event_id='evt-prior-retry')", &[]).await.unwrap().get::<_,bool>(0));
+    tx.commit().await.unwrap();
+    assert_eq!(waiting.await.unwrap(), StatusCode::NO_CONTENT);
+    assert!(observer.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_resend_delivery_events WHERE environment_id='env-a' AND email_id='old-retry-id')", &[]).await.unwrap().get::<_,bool>(0));
+    // Restrict lock access to an explicitly granted API login; no direct queue read is needed.
+    let role = format!("webhook_{}", Uuid::new_v4().simple());
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT EXECUTE ON FUNCTION public.novu_rust_lock_resend_webhook_jobs(text,text) TO {role}")).await.unwrap();
+    db.execute("INSERT INTO novu_rust_resend_webhook_lock_grants SELECT 'env-a',$1,oid FROM pg_roles WHERE rolname::text=$1", &[&role]).await.unwrap();
+    let (restricted, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move { driver.await.unwrap() });
+    restricted
+        .batch_execute(&format!("SET SESSION AUTHORIZATION {role}"))
+        .await
+        .unwrap();
+    assert_eq!(
+        restricted
+            .query_one(
+                "SELECT public.novu_rust_lock_resend_webhook_jobs('env-a','old-retry-id')",
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, i32>(0),
+        1
+    );
+    assert!(
+        restricted
+            .query(
+                "SELECT public.novu_rust_lock_resend_webhook_jobs('env-b','old-retry-id')",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        restricted
+            .query(
+                "SELECT * FROM public.novu_rust_resend_webhook_lock_grants",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        restricted
+            .query("SELECT payload FROM public.novu_queue_jobs", &[])
+            .await
+            .is_err()
+    );
+    // The HTTP handler can use the lock function without direct queue or audit reads.
+    db.batch_execute(&format!("GRANT USAGE ON SCHEMA public TO {role}; GRANT SELECT ON public.novu_rust_environments TO {role}; GRANT SELECT,INSERT,UPDATE ON public.novu_rust_resend_delivery_events TO {role}")).await.unwrap();
+    let (limited_web, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move { driver.await.unwrap() });
+    limited_web
+        .batch_execute(&format!("SET SESSION AUTHORIZATION {role}"))
+        .await
+        .unwrap();
+    let limited_config = novu_rust_api::resend_webhook::Config::new(
+        "env-a".into(),
+        &format!("whsec_{}", STANDARD.encode(secret)),
+    )
+    .unwrap()
+    .with_retry_job_lock(true);
+    let limited_app = novu_rust_api::router_with_webhook_configs(
+        Arc::new(limited_web),
+        None,
+        HashMap::new(),
+        None,
+        Some(limited_config),
+    );
+    assert_eq!(
+        event(
+            limited_app,
+            secret,
+            "evt-limited-api",
+            "email.delivered",
+            "old-retry-id"
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    db.execute("DELETE FROM novu_rust_resend_webhook_lock_grants WHERE environment_id='env-a' AND database_principal=$1", &[&role]).await.unwrap();
+    assert!(
+        restricted
+            .query(
+                "SELECT public.novu_rust_lock_resend_webhook_jobs('env-a','old-retry-id')",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    db.execute("INSERT INTO novu_rust_resend_webhook_lock_grants SELECT 'env-a',$1,oid FROM pg_roles WHERE rolname::text=$1", &[&role]).await.unwrap();
+    db.batch_execute(&format!("REVOKE EXECUTE ON FUNCTION public.novu_rust_lock_resend_webhook_jobs(text,text) FROM {role}")).await.unwrap();
+    assert!(
+        restricted
+            .query(
+                "SELECT public.novu_rust_lock_resend_webhook_jobs('env-a','old-retry-id')",
+                &[]
+            )
+            .await
+            .is_err()
     );
 }
