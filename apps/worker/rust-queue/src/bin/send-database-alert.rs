@@ -73,6 +73,11 @@ async fn main() -> Result<()> {
         Ok("destination") | Err(std::env::VarError::NotPresent) => false,
         _ => return Err("invalid alert cooldown policy".into()),
     };
+    let fallback = match std::env::var("SWALLOW_DB_ALERT_STATE_FAILURE_MODE").as_deref() {
+        Ok("send-uncoordinated") => true,
+        Ok("report-only") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid state database failure mode".into()),
+    };
     let scoped = flag("SWALLOW_ALERT_SCOPED_DELIVERY", false)?;
     let mut bad_config = false;
     let slack = match slack() {
@@ -107,6 +112,7 @@ async fn main() -> Result<()> {
         failed_jobs: None,
         failed_jobs_check_failed: false,
         database_probe: Some((args[1].clone(), false)),
+        alert_store_unavailable: false,
     };
     alert.text().map_err(|_| "invalid alert label")?;
     let default_target = format!("db-{}", args[1]);
@@ -119,16 +125,6 @@ async fn main() -> Result<()> {
     let (probe_config, probe_tls) =
         novu_rust_contracts::postgres::configure(&std::env::var("SWALLOW_DB_PROBE_URL")?)
             .map_err(|_| "invalid target database configuration")?;
-    let (mut db, connection) = tokio::time::timeout(
-        Duration::from_secs(seconds),
-        monitor_config.connect(monitor_tls),
-    )
-    .await
-    .map_err(|_| "monitor database connection timed out")?
-    .map_err(|_| "monitor database connection failed")?;
-    let _monitor_driver = AbortOnDrop(tokio::spawn(async move {
-        let _ = connection.await;
-    }));
     let probe = tokio::time::timeout(Duration::from_secs(seconds), async move {
         let (client, connection) = probe_config.connect(probe_tls).await?;
         let _driver = AbortOnDrop(tokio::spawn(async move {
@@ -140,6 +136,44 @@ async fn main() -> Result<()> {
     .await;
     let unhealthy = !matches!(probe, Ok(Ok(())));
     alert.database_probe = Some((args[1].clone(), unhealthy));
+    let monitor = tokio::time::timeout(
+        Duration::from_secs(seconds),
+        monitor_config.connect(monitor_tls),
+    )
+    .await;
+    let (mut db, connection) = match monitor {
+        Ok(Ok(value)) => value,
+        _ if fallback => {
+            alert.alert_store_unavailable = true;
+            eprintln!("monitor database connection failed; sending uncoordinated alerts");
+            let result = alerts::send_uncoordinated(
+                &alert,
+                slack.as_ref(),
+                email.as_ref().map(|(to, provider)| (provider, to.as_str())),
+                operation_timeout,
+            )
+            .await;
+            for (channel, outcome) in [("Slack", result.0), ("email", result.1)] {
+                if let Some(outcome) = outcome {
+                    match outcome {
+                        Ok(()) => println!("{channel} uncoordinated alert accepted"),
+                        Err(
+                            alerts::AlertError::Rejected(_)
+                            | alerts::AlertError::InvalidConfiguration,
+                        ) => eprintln!("{channel} uncoordinated alert rejected"),
+                        Err(alerts::AlertError::Unknown) => {
+                            eprintln!("{channel} uncoordinated alert outcome unknown")
+                        }
+                    }
+                }
+            }
+            std::process::exit(1);
+        }
+        _ => return Err("monitor database connection failed or timed out".into()),
+    };
+    let _monitor_driver = AbortOnDrop(tokio::spawn(async move {
+        let _ = connection.await;
+    }));
     let mut error = bad_config;
     if on_new {
         for (channel, target, enabled) in [

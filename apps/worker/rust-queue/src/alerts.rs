@@ -313,6 +313,7 @@ pub struct Alert {
     pub failed_jobs: Option<u64>,
     pub failed_jobs_check_failed: bool,
     pub database_probe: Option<(String, bool)>,
+    pub alert_store_unavailable: bool,
 }
 impl Alert {
     /// Bit flags describe problem categories, not counts or sensitive content.
@@ -352,6 +353,9 @@ impl Alert {
             .is_some_and(|(_, unhealthy)| *unhealthy)
         {
             mask |= 1 << 20;
+        }
+        if self.alert_store_unavailable {
+            mask |= 1 << 21;
         }
         mask
     }
@@ -399,6 +403,9 @@ impl Alert {
         }
         if self.database_probe.is_some() {
             known |= 1 << 20;
+        }
+        if self.alert_store_unavailable {
+            known |= 1 << 21;
         }
         known
     }
@@ -467,6 +474,9 @@ impl Alert {
                 return Err(AlertError::InvalidConfiguration);
             }
             details.push(format!("database {name} probe failed: {unhealthy}"));
+        }
+        if self.alert_store_unavailable {
+            details.push("alert state database unavailable".into());
         }
         if details.is_empty() {
             return Err(AlertError::InvalidConfiguration);
@@ -589,6 +599,38 @@ pub async fn send_email(
             }
             _ => AlertError::Unknown,
         })
+}
+
+/// Best-effort fallback, deliberately without durable coordination or automatic retry.
+pub async fn send_uncoordinated(
+    alert: &Alert,
+    slack: Option<&SlackWebhook>,
+    email: Option<(&Resend, &str)>,
+    timeout: Duration,
+) -> (
+    Option<Result<(), AlertError>>,
+    Option<Result<(), AlertError>>,
+) {
+    let key = format!("swallow-db-fallback/{}", Uuid::new_v4());
+    let slack_result = if let Some(provider) = slack {
+        Some(
+            tokio::time::timeout(timeout, provider.send(alert))
+                .await
+                .unwrap_or(Err(AlertError::Unknown)),
+        )
+    } else {
+        None
+    };
+    let email_result = if let Some((provider, to)) = email {
+        Some(
+            tokio::time::timeout(timeout, send_email(provider, to, alert, &key))
+                .await
+                .unwrap_or(Err(AlertError::Unknown)),
+        )
+    } else {
+        None
+    };
+    (slack_result, email_result)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -765,6 +807,7 @@ mod tests {
             failed_jobs: None,
             failed_jobs_check_failed: false,
             database_probe: None,
+            alert_store_unavailable: false,
         }
     }
 
@@ -971,6 +1014,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uncoordinated_fallback_tries_both_transports_independently() {
+        let mut a = alert();
+        a.resend_enabled = false;
+        a.database_probe = Some(("primary".into(), true));
+        a.alert_store_unavailable = true;
+        let (url, slack_server) = mock_server("500 Internal Server Error", "failed").await;
+        let slack = SlackWebhook::with_endpoint(url).unwrap();
+        let (url, email_server) = mock_server("200 OK", r#"{"id":"fallback"}"#).await;
+        let email = Resend::test_endpoint(
+            crate::resend::Config {
+                api_key: "fixture-key".into(),
+                from: "from@example.test".into(),
+                sender_name: String::new(),
+            },
+            url.as_str(),
+        )
+        .unwrap();
+        let result = send_uncoordinated(
+            &a,
+            Some(&slack),
+            Some((&email, "ops@example.test")),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(result.0, Some(Err(AlertError::Unknown)));
+        assert_eq!(result.1, Some(Ok(())));
+        let slack_request = slack_server.await.unwrap();
+        let email_request = email_server.await.unwrap();
+        for request in [&slack_request, &email_request] {
+            assert!(request.contains("alert state database unavailable"));
+            assert!(request.contains("database primary probe failed: true"));
+        }
+        assert!(
+            email_request
+                .to_ascii_lowercase()
+                .contains("idempotency-key: swallow-db-fallback/")
+        );
+        assert!(!a.text().unwrap().contains("fixture-key"));
+    }
+
+    #[tokio::test]
     async fn resend_alert_is_separate_from_slack_and_has_idempotency_key() {
         let (url, server) = mock_server("200 OK", r#"{"id":"mock-id"}"#).await;
         let provider = Resend::test_endpoint(
@@ -1046,6 +1130,7 @@ mod tests {
             failed_jobs: None,
             failed_jobs_check_failed: false,
             database_probe: None,
+            alert_store_unavailable: false,
         };
         assert!(alert.projector_stale);
         let (url, slack_server) = mock_server("200 OK", "ok").await;

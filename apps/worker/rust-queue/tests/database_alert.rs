@@ -49,6 +49,7 @@ async fn target_outage_is_reported_using_independent_alert_database() {
             .env("SWALLOW_DB_ALERT_OPERATION_TIMEOUT_SECONDS", "1")
             .env("SWALLOW_ALERT_COOLDOWN_POLICY", "new-condition")
             .env("SWALLOW_ALERT_SCOPED_DELIVERY", "true")
+            .env("SWALLOW_DB_ALERT_STATE_FAILURE_MODE", "send-uncoordinated")
             .env(
                 "SWALLOW_ALERT_SLACK_WEBHOOK",
                 "https://hooks.slack.com/services/A/B/C",
@@ -109,6 +110,7 @@ async fn target_outage_is_reported_using_independent_alert_database() {
         .env("SWALLOW_DB_PROBE_URL", &monitor)
         .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
         .env("SWALLOW_DB_PROBE_TIMEOUT_SECONDS", "2")
+        .env("SWALLOW_DB_ALERT_STATE_FAILURE_MODE", "report-only")
         .env(
             "SWALLOW_ALERT_SLACK_WEBHOOK",
             "https://hooks.slack.com/services/A/B/C",
