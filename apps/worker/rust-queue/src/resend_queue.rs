@@ -151,6 +151,56 @@ mod tests {
     use tokio_postgres::NoTls;
 
     #[tokio::test]
+    #[ignore = "sends real email and requires a fresh disposable PostgreSQL database"]
+    async fn live_workflow_send() {
+        let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL required");
+        let recipient = std::env::var("NOVU_RESEND_TEST_TO").expect("NOVU_RESEND_TEST_TO required");
+        let (mut db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+        tokio::spawn(async move { driver.await.unwrap() });
+        db.batch_execute("CREATE TABLE novu_rust_workflows (environment_id text, identifier text, in_app_content text, has_steps boolean NOT NULL DEFAULT true, PRIMARY KEY (environment_id, identifier))").await.unwrap();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut paths: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|v| v == "sql"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            db.batch_execute(&std::fs::read_to_string(path).unwrap())
+                .await
+                .unwrap();
+        }
+        db.execute("INSERT INTO novu_rust_workflows(environment_id,identifier,email_subject,email_html,email_provider,in_app_step_active,inbox_metadata) VALUES ('env-a','live-test','Swallow Resend workflow test','<p>Swallow Resend workflow test message.</p>','resend',false,'{\"id\":\"workflow-id\"}')",&[]).await.unwrap();
+        db.execute("INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES ('env-a','live-recipient','live-id',jsonb_build_object('email',$1::text))", &[&recipient]).await.unwrap();
+        let trigger = Uuid::new_v4();
+        let payload = json!({"workflow":"live-test","transactionId":trigger.to_string(),"content":"","payload":{},"recipients":[{"subscriberId":"live-recipient"}],"recipientIdentitySnapshot":{"live-recipient":"live-id"},"severityOverride":null});
+        enqueue(&db, trigger, "env-a", crate::in_app::JOB_KIND, &payload)
+            .await
+            .unwrap();
+        assert!(crate::in_app::process_one(&mut db).await.unwrap());
+        let job: Uuid = db
+            .query_one(
+                "SELECT id FROM novu_queue_jobs WHERE kind=$1 AND payload->>'transaction_id'=$2",
+                &[&JOB_KIND, &trigger.to_string()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let provider = Resend::new(Config {
+            api_key: std::env::var("NOVU_RESEND_API_KEY").expect("NOVU_RESEND_API_KEY required"),
+            from: std::env::var("NOVU_RESEND_FROM").expect("NOVU_RESEND_FROM required"),
+            sender_name: String::new(),
+        })
+        .unwrap();
+        assert!(process_one(&mut db, "env-a", &provider).await.unwrap());
+        let row=db.query_one("SELECT j.status,a.state,m.delivery_state,a.provider_message_id FROM novu_queue_jobs j JOIN novu_rust_resend_attempts a ON a.job_id=j.id JOIN novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1", &[&job]).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), "completed");
+        assert_eq!(row.get::<_, String>(1), "accepted");
+        assert_eq!(row.get::<_, String>(2), "accepted");
+        assert!(!row.get::<_, String>(3).is_empty());
+    }
+
+    #[tokio::test]
     #[ignore = "requires fresh disposable PostgreSQL and loopback"]
     async fn workflow_delivery_revalidates_subscriber() {
         let url = std::env::var("TEST_DATABASE_URL").unwrap();
