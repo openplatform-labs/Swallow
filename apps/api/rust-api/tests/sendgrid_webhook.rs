@@ -45,9 +45,13 @@ async fn signed_events_are_scoped_idempotent_and_private() {
         include_str!("../migrations/0004_sendgrid_webhooks.sql"),
         include_str!("../migrations/0008_sendgrid_dispatch_identity.sql"),
         include_str!("../migrations/0009_sendgrid_dispatch_proof.sql"),
+        include_str!("../migrations/0020_sendgrid_bounce_type.sql"),
     ] {
         db.batch_execute(sql).await.unwrap();
     }
+    db.batch_execute(include_str!("../migrations/0020_sendgrid_bounce_type.sql"))
+        .await
+        .unwrap();
     db.execute(
         "INSERT INTO novu_rust_delivery_operator_grants VALUES ('env-a',session_user,'retry')",
         &[],
@@ -280,6 +284,21 @@ async fn signed_events_are_scoped_idempotent_and_private() {
     assert_eq!(saved, Some(tracked_dispatch));
     let stored = db.query_one("SELECT row_to_json(e)::text FROM novu_rust_sendgrid_delivery_events e WHERE event_id='tracked'", &[]).await.unwrap().get::<_,String>(0);
     assert!(!stored.contains(&proof) && !stored.contains(&proof_hash));
+    let bounces = json!([
+        {"id":"64a000000000000000000097","event":"bounce","type":"bounce","sg_event_id":"hard-bounce","timestamp":1730000001,"email":"hard@example.test","swallow_dispatch_id":tracked_dispatch.to_string(),"swallow_dispatch_proof":proof},
+        {"id":"64a000000000000000000097","event":"bounce","type":"blocked","sg_event_id":"soft-bounce","timestamp":1730000001,"email":"soft@example.test","swallow_dispatch_id":tracked_dispatch.to_string(),"swallow_dispatch_proof":proof},
+        {"id":"64a000000000000000000097","event":"bounce","sg_event_id":"unknown-bounce","timestamp":1730000001,"email":"unknown@example.test","swallow_dispatch_id":tracked_dispatch.to_string(),"swallow_dispatch_proof":proof}
+    ]);
+    let raw = serde_json::to_vec(&bounces).unwrap();
+    let mut signed = timestamp.as_bytes().to_vec();
+    signed.extend_from_slice(&raw);
+    let signature = STANDARD.encode(key.sign(&rng, &signed).unwrap().as_ref());
+    let response = call(router.clone(), path, &timestamp, &signature, raw).await;
+    assert_eq!(response.0, StatusCode::OK);
+    assert_eq!(response.1["recorded"], 3);
+    let rows = db.query("SELECT event_id,bounce_type,dispatch_proof_verified FROM novu_rust_sendgrid_delivery_events WHERE event_id IN ('hard-bounce','soft-bounce','unknown-bounce') ORDER BY event_id", &[]).await.unwrap();
+    assert_eq!(rows.iter().map(|r| r.get::<_,Option<String>>(1)).collect::<Vec<_>>(), vec![Some("bounce".into()),Some("blocked".into()),None]);
+    assert!(rows.iter().all(|r|r.get::<_,bool>(2)));
     let err = novu_postgres_queue::reconciliation::resolve(
         &mut operator_db,
         "env-a",

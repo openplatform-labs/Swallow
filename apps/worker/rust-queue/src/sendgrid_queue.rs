@@ -14,6 +14,7 @@ pub const DISPATCH_ID_MIGRATION: &str =
     include_str!("../migrations/0057_sendgrid_dispatch_identity.sql");
 pub const DISPATCH_PROOF_MIGRATION: &str =
     include_str!("../migrations/0058_sendgrid_dispatch_proof.sql");
+pub const RECIPIENT_MIGRATION: &str = include_str!("../migrations/0096_sendgrid_recipients.sql");
 const DISPATCH_ARGUMENT: &str = "swallow_dispatch_id";
 const DISPATCH_PROOF_ARGUMENT: &str = "swallow_dispatch_proof";
 
@@ -23,6 +24,11 @@ fn proof_hash(proof: &str) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+/// Match the webhook's exact-byte lowercase hexadecimal recipient hash.
+pub(crate) fn recipient_hash(address: &str) -> String {
+    proof_hash(address)
 }
 
 async fn claim(
@@ -316,6 +322,23 @@ pub async fn process_one(
         let proof = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
         let hash = proof_hash(&proof);
         tx.execute("INSERT INTO novu_rust_sendgrid_dispatch_ids(id,job_id,environment_id,proof_hash) VALUES ($1,$2,$3,$4)", &[&dispatch,&job.id,&job.environment_id,&hash]).await?;
+        let mut recipients = Vec::new();
+        if email
+            .to
+            .len()
+            .saturating_add(email.cc.len())
+            .saturating_add(email.bcc.len())
+            <= 1000
+        {
+            for (kind, addresses) in [("to", &email.to), ("cc", &email.cc), ("bcc", &email.bcc)] {
+                for (index, address) in addresses.iter().enumerate() {
+                    recipients.push(
+                        serde_json::json!({"kind":kind,"idx":index,"hash":recipient_hash(address)}),
+                    );
+                }
+            }
+        }
+        tx.execute("INSERT INTO public.novu_rust_sendgrid_recipients(dispatch_id,environment_id,recipient_kind,recipient_index,recipient_hash) SELECT $1,$2,r.kind,r.idx,r.hash FROM jsonb_to_recordset($3::jsonb) AS r(kind text,idx integer,hash text)", &[&dispatch,&environment,&serde_json::json!(recipients)]).await?;
         email
             .custom_data
             .insert(DISPATCH_ARGUMENT.into(), dispatch.to_string().into());
@@ -513,6 +536,8 @@ mod tests {
         db.batch_execute(MIGRATION).await.unwrap();
         db.batch_execute(DISPATCH_ID_MIGRATION).await.unwrap();
         db.batch_execute(DISPATCH_PROOF_MIGRATION).await.unwrap();
+        db.batch_execute(RECIPIENT_MIGRATION).await.unwrap();
+        db.batch_execute(RECIPIENT_MIGRATION).await.unwrap();
         db.batch_execute(crate::in_app::EMAIL_MESSAGES_MIGRATION)
             .await
             .unwrap();
@@ -892,7 +917,10 @@ mod tests {
         let tracked = Uuid::new_v4();
         let older = Uuid::new_v4();
         let retry_target = Uuid::new_v4();
-        crate::enqueue(&db, tracked, "env-a", JOB_KIND, &message)
+        let mut tracked_message = message.clone();
+        tracked_message["cc"] = json!(["cc@example.test"]);
+        tracked_message["bcc"] = json!(["bcc@example.test"]);
+        crate::enqueue(&db, tracked, "env-a", JOB_KIND, &tracked_message)
             .await
             .unwrap();
         db.execute("INSERT INTO novu_rust_email_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,subject,status,email_job_id) VALUES ('tracked-email','env-a','s','s','n','w','t','subject','sent',$1)", &[&tracked]).await.unwrap();
@@ -957,6 +985,17 @@ mod tests {
         let (dispatch, proof) = server.await.unwrap();
         let count:i64=db.query_one("SELECT count(*) FROM novu_rust_sendgrid_attempts a JOIN novu_rust_sendgrid_dispatch_ids d ON d.id=a.dispatch_id AND d.job_id=a.job_id AND d.environment_id=a.environment_id WHERE a.job_id=$1 AND d.id=$2 AND d.proof_hash=$3", &[&tracked,&dispatch,&proof_hash(&proof)]).await.unwrap().get(0);
         assert_eq!(count, 1);
+        let rows = db.query("SELECT recipient_kind,recipient_index,recipient_hash FROM novu_rust_sendgrid_recipients WHERE environment_id='env-a' AND dispatch_id=$1 ORDER BY recipient_kind,recipient_index", &[&dispatch]).await.unwrap();
+        assert_eq!(rows.len(), 3);
+        for (row, (kind, address)) in rows.iter().zip([
+            ("bcc", "bcc@example.test"),
+            ("cc", "cc@example.test"),
+            ("to", "alice@example.test"),
+        ]) {
+            assert_eq!(row.get::<_, String>(0), kind);
+            assert_eq!(row.get::<_, i32>(1), 0);
+            assert_eq!(row.get::<_, String>(2), recipient_hash(address));
+        }
         // Never overwrite a user-provided argument used for trusted correlation.
         for key in [DISPATCH_ARGUMENT, DISPATCH_PROOF_ARGUMENT] {
             let collision = Uuid::new_v4();
