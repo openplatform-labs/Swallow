@@ -51,6 +51,7 @@ async fn fcm_metadata_management_is_scoped_authorized_and_audited() {
         include_str!("../../../worker/rust-queue/migrations/0047_experimental_fcm_credentials.sql"),
         include_str!("../../../worker/rust-queue/migrations/0051_multiple_fcm_channels.sql"),
         include_str!("../migrations/0018_fcm_integration_management.sql"),
+        include_str!("../migrations/0019_lock_active_fcm_integration.sql"),
     ] {
         db.batch_execute(sql).await.unwrap();
     }
@@ -241,6 +242,40 @@ async fn fcm_metadata_management_is_scoped_authorized_and_audited() {
         .await
         .0,
         StatusCode::CREATED
+    );
+    setup.batch_execute("CREATE ROLE fcm_credential_limited NOLOGIN; GRANT USAGE ON SCHEMA public TO fcm_credential_limited; GRANT EXECUTE ON FUNCTION public.novu_rust_lock_active_fcm_integration(text,text,text) TO fcm_credential_limited").await.unwrap();
+    let other_id: String = setup.query_one("SELECT internal_id FROM novu_rust_fcm_integrations WHERE environment_id='b' AND identifier='main'", &[]).await.unwrap().get(0);
+    let (limited, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move { driver.await.unwrap() });
+    limited
+        .batch_execute("SET ROLE fcm_credential_limited")
+        .await
+        .unwrap();
+    assert!(
+        limited
+            .query_one(
+                "SELECT public.novu_rust_lock_active_fcm_integration($1,$2,$3)",
+                &[&"b", &other_id, &"main"]
+            )
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
+    assert!(
+        !limited
+            .query_one(
+                "SELECT public.novu_rust_lock_active_fcm_integration($1,$2,$3)",
+                &[&"a", &other_id, &"main"]
+            )
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
+    assert!(
+        limited
+            .query("SELECT * FROM novu_rust_fcm_integrations", &[])
+            .await
+            .is_err()
     );
     let tx = setup.transaction().await.unwrap();
     tx.execute("DELETE FROM novu_rust_fcm_integration_permissions WHERE key_hash=$1 AND permission='write'", &[&a]).await.unwrap();

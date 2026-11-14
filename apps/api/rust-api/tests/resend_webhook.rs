@@ -147,7 +147,8 @@ async fn signed_events_are_scoped_deduplicated_and_private() {
         .await,
         StatusCode::CONFLICT
     );
-    let future = (timestamp.parse::<u64>().unwrap() + 301).to_string();
+    // Leave room for the wall clock to cross a second boundary before the request.
+    let future = (timestamp.parse::<u64>().unwrap() + 600).to_string();
     assert_eq!(
         call(
             app.clone(),

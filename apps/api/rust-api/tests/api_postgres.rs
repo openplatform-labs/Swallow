@@ -534,6 +534,9 @@ async fn trigger_api_contract_inner() {
     db.batch_execute(novu_postgres_queue::in_app::MULTIPLE_FCM_CHANNELS_MIGRATION)
         .await
         .unwrap();
+    db.batch_execute(include_str!("../migrations/0019_lock_active_fcm_integration.sql"))
+        .await
+        .unwrap();
     db.batch_execute(novu_postgres_queue::in_app::WORKFLOW_EMAIL_PROVIDER_MIGRATION)
         .await
         .unwrap();
@@ -4562,6 +4565,7 @@ async fn fcm_credentials_contract(app: axum::Router, db: &mut tokio_postgres::Cl
     assert_eq!(status, StatusCode::OK);
     assert!(db.query_opt("SELECT 1 FROM novu_rust_fcm_devices WHERE environment_id='env-a' AND subscriber_id='fcm-concurrent'",&[]).await.unwrap().is_none());
     db.batch_execute(include_str!("../migrations/0018_fcm_integration_management.sql")).await.unwrap();
+    db.batch_execute(include_str!("../migrations/0019_lock_active_fcm_integration.sql")).await.unwrap();
     let key_hash = format!("{:x}", Sha256::digest(b"test-key"));
     db.execute("INSERT INTO novu_rust_fcm_integration_permissions VALUES ($1,'write')", &[&key_hash]).await.unwrap();
     db.execute("INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id) VALUES ('env-a','fcm-managed',novu_rust_new_objectid())", &[]).await.unwrap();
@@ -4577,7 +4581,65 @@ async fn fcm_credentials_contract(app: axum::Router, db: &mut tokio_postgres::Cl
     let stored: String = db.query_one("SELECT integration_internal_id FROM novu_rust_fcm_devices WHERE environment_id='env-a' AND subscriber_id='fcm-managed'", &[]).await.unwrap().get(0);
     assert_eq!(stored, id);
     assert_eq!(inbox_mutate(app.clone(), "PATCH", "/v1/experimental/fcm-integrations/managed-fcm", Some("ApiKey test-key"), json!({"active":false})).await.0, StatusCode::OK);
-    assert_eq!(inbox_mutate(app, "PUT", credentials_path, Some("ApiKey test-key"), credentials).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(inbox_mutate(app.clone(), "PUT", credentials_path, Some("ApiKey test-key"), credentials).await.0, StatusCode::BAD_REQUEST);
+
+    // First the deactivation owns the integration row; the credentials request
+    // sees the old snapshot but must recheck after waiting for the row lock.
+    let integration_path = "/v1/experimental/fcm-integrations/managed-fcm";
+    assert_eq!(inbox_mutate(app.clone(), "PATCH", integration_path, Some("ApiKey test-key"), json!({"active":true})).await.0, StatusCode::OK);
+    db.execute("INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id) VALUES ('env-a','fcm-lock-race',novu_rust_new_objectid())", &[]).await.unwrap();
+    let race_path = "/v1/subscribers/fcm-lock-race/credentials";
+    let race_body = json!({"providerId":"fcm","integrationIdentifier":"managed-fcm","credentials":{"deviceTokens":["race-token"]}});
+    let tx = db.transaction().await.unwrap();
+    tx.execute("UPDATE novu_rust_fcm_integrations SET active=false WHERE environment_id='env-a' AND identifier='managed-fcm'", &[]).await.unwrap();
+    let first_app = app.clone();
+    let body = race_body.clone();
+    let pending = tokio::spawn(async move { inbox_mutate(first_app,"PUT",race_path,Some("ApiKey test-key"),body).await });
+    wait_for_fcm_guard(&tx).await;
+    tx.commit().await.unwrap();
+    assert_eq!(pending.await.unwrap().0,StatusCode::BAD_REQUEST);
+    assert!(db.query_opt("SELECT 1 FROM novu_rust_fcm_devices WHERE environment_id='env-a' AND subscriber_id='fcm-lock-race'",&[]).await.unwrap().is_none());
+
+    // Conversely, deactivation waits for an already-authorized registration.
+    assert_eq!(inbox_mutate(app.clone(),"PATCH",integration_path,Some("ApiKey test-key"),json!({"active":true})).await.0,StatusCode::OK);
+    let tx = db.transaction().await.unwrap();
+    tx.query_one("SELECT 1 FROM novu_rust_subscribers WHERE environment_id='env-a' AND subscriber_id='fcm-lock-race' FOR UPDATE",&[]).await.unwrap();
+    let first_app = app.clone();
+    let registration = tokio::spawn(async move { inbox_mutate(first_app,"PUT",race_path,Some("ApiKey test-key"),race_body).await });
+    wait_for_fcm_guard(&tx).await;
+    let (other, driver) = tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(), NoTls).await.unwrap();
+    tokio::spawn(async move { driver.await.unwrap() });
+    let other_app = novu_rust_api::router(Arc::new(other));
+    let disabling = tokio::spawn(async move { inbox_mutate(other_app,"PATCH",integration_path,Some("ApiKey test-key"),json!({"active":false})).await });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(!disabling.is_finished());
+    tx.commit().await.unwrap();
+    assert_eq!(registration.await.unwrap().0,StatusCode::OK);
+    assert_eq!(disabling.await.unwrap().0,StatusCode::OK);
+    let row=db.query_one("SELECT i.active,d.device_tokens FROM novu_rust_fcm_integrations i JOIN novu_rust_fcm_devices d ON d.environment_id=i.environment_id AND d.integration_internal_id=i.internal_id WHERE i.environment_id='env-a' AND i.identifier='managed-fcm' AND d.subscriber_id='fcm-lock-race'",&[]).await.unwrap();
+    assert!(!row.get::<_,bool>(0));
+    assert_eq!(row.get::<_,Vec<String>>(1),vec!["race-token"]);
+
+    // An identical existing token must not bypass the active check via the
+    // no-op fallback after deactivation wins the race.
+    assert_eq!(inbox_mutate(app.clone(),"PATCH",integration_path,Some("ApiKey test-key"),json!({"active":true})).await.0,StatusCode::OK);
+    let tx = db.transaction().await.unwrap();
+    tx.execute("UPDATE novu_rust_fcm_integrations SET active=false WHERE environment_id='env-a' AND identifier='managed-fcm'", &[]).await.unwrap();
+    let first_app = app.clone();
+    let pending = tokio::spawn(async move { inbox_mutate(first_app,"PUT","/v1/subscribers/fcm-managed/credentials",Some("ApiKey test-key"),json!({"providerId":"fcm","integrationIdentifier":"managed-fcm","credentials":{"deviceTokens":["managed-token"]}})).await });
+    wait_for_fcm_guard(&tx).await;
+    tx.commit().await.unwrap();
+    assert_eq!(pending.await.unwrap().0,StatusCode::BAD_REQUEST);
+}
+
+async fn wait_for_fcm_guard(tx: &tokio_postgres::Transaction<'_>) {
+    for _ in 0..100 {
+        tx.query_one("SELECT pg_stat_clear_snapshot()", &[]).await.unwrap();
+        let waiting: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE 'WITH fcm_guard AS MATERIALIZED%')", &[]).await.unwrap().get(0);
+        if waiting { return; }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("FCM registration did not wait on the expected database lock");
 }
 
 async fn notification_action_contract(app: axum::Router, db: &mut tokio_postgres::Client) {
