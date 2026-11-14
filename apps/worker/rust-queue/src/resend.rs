@@ -1,5 +1,6 @@
 //! Bounded Resend API adapter used by the experimental email worker.
 use crate::sendgrid::Email;
+use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{Client, header};
 use serde_json::{Value, json};
 use std::{fmt, time::Duration};
@@ -36,9 +37,8 @@ pub fn request_body(config: &Config, email: &Email) -> Result<Value, SendError> 
         || email.to.len() > 50
         || email.to.iter().any(String::is_empty)
         || email.cc.iter().chain(&email.bcc).any(String::is_empty)
+        || email.attachments.len() > 100
         || !email.alternatives.is_empty()
-        || !email.attachments.is_empty()
-        || !email.headers.is_empty()
         || !email.custom_data.is_empty()
         || email.provider_from_without_name
     {
@@ -77,6 +77,48 @@ pub fn request_body(config: &Config, email: &Email) -> Result<Value, SendError> 
     }
     if let Some(reply) = &email.reply_to {
         body["reply_to"] = json!(reply);
+    }
+    if email.headers.len() > 100
+        || email.headers.iter().any(|(key, value)| {
+            header::HeaderName::from_bytes(key.as_bytes()).is_err()
+                || value
+                    .as_str()
+                    .is_none_or(|v| v.len() > 4096 || header::HeaderValue::from_str(v).is_err())
+        })
+    {
+        return Err(SendError::InvalidMessage);
+    }
+    if !email.headers.is_empty() {
+        body["headers"] = json!(email.headers);
+    }
+    // Use an intentionally conservative limit below Resend's encoded 40 MB
+    // limit. Reject unknown disposition rather than silently dropping it.
+    let mut size = 0usize;
+    let mut attachments = Vec::with_capacity(email.attachments.len());
+    for file in &email.attachments {
+        size = size
+            .checked_add(file.file.len())
+            .ok_or(SendError::InvalidMessage)?;
+        if size > 20 * 1024 * 1024
+            || file.name.is_empty()
+            || file.name.len() > 255
+            || file.name.contains(['\r', '\n'])
+            || file.disposition.is_some()
+            || file
+                .cid
+                .as_ref()
+                .is_some_and(|v| v.is_empty() || v.len() > 255 || v.contains(['\r', '\n']))
+        {
+            return Err(SendError::InvalidMessage);
+        }
+        let mut item = json!({"filename":file.name,"content":STANDARD.encode(&file.file)});
+        if let Some(cid) = &file.cid {
+            item["content_id"] = json!(cid);
+        }
+        attachments.push(item);
+    }
+    if !attachments.is_empty() {
+        body["attachments"] = json!(attachments);
     }
     Ok(body)
 }
@@ -193,6 +235,35 @@ mod tests {
         );
         email.custom_data.clear();
         email.to = vec!["x".into(); 51];
+        assert_eq!(
+            request_body(&config(), &email),
+            Err(SendError::InvalidMessage)
+        );
+    }
+    #[test]
+    fn attachments_and_headers_are_encoded() {
+        let mut email = message();
+        email.headers.insert("X-Trace".into(), json!("value"));
+        email.attachments.push(crate::sendgrid::Attachment {
+            file: vec![0, 1, 255],
+            name: "image.png".into(),
+            mime: "image/png".into(),
+            cid: Some("logo".into()),
+            disposition: None,
+        });
+        let body = request_body(&config(), &email).unwrap();
+        assert_eq!(body["headers"], json!({"X-Trace":"value"}));
+        assert_eq!(
+            body["attachments"],
+            json!([{"filename":"image.png","content":"AAH/","content_id":"logo"}])
+        );
+        email.headers.insert("Bad\nHeader".into(), json!("value"));
+        assert_eq!(
+            request_body(&config(), &email),
+            Err(SendError::InvalidMessage)
+        );
+        email.headers.clear();
+        email.attachments[0].disposition = Some("attachment".into());
         assert_eq!(
             request_body(&config(), &email),
             Err(SendError::InvalidMessage)

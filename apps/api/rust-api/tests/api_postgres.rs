@@ -4714,7 +4714,7 @@ async fn email_workflow_contract(app: axum::Router, worker: &mut tokio_postgres:
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    let (status, _) = request(app, Some("ApiKey test-key"), json!({"name":"email-only","to":{"subscriberId":"resend-recipient","email":"resend@example.test"},"payload":{"name":"Test"},"transactionId":"resend-workflow-api"})).await;
+    let (status, _) = request(app, Some("ApiKey test-key"), json!({"name":"email-only","to":{"subscriberId":"resend-recipient","email":"resend@example.test"},"payload":{"name":"Test"},"transactionId":"resend-workflow-api","overrides":{"providers":{"resend":{"subject":"override","headers":{"X-Trace":"value"}}}}})).await;
     assert_eq!(status, StatusCode::CREATED);
     assert!(
         novu_postgres_queue::in_app::process_one(worker)
@@ -4730,5 +4730,9 @@ async fn email_workflow_contract(app: axum::Router, worker: &mut tokio_postgres:
     assert_eq!(
         payload["workflow_context"]["subject_template"],
         "Hello {{subscriber.firstName}}"
+    );
+    assert_eq!(
+        payload["workflow_context"]["overrides"]["subject"],
+        "override"
     );
 }

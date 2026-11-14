@@ -14,6 +14,7 @@ const Original = new Function('isResendError',`${js}; return Original;`)(()=>fal
 const config = {apiKey:'fixture',from:'sender@example.test',senderName:'Sender'};
 const cases = [
   {to:['a@example.test'],subject:'Hello',html:'<p>Hello</p>',replyTo:'reply@example.test'},
+  {to:['a@example.test'],subject:'Attachment',html:'<img src="cid:logo">',replyTo:'reply@example.test',headers:{'X-Trace':'value'},attachments:[{file:Buffer.from([0,1,255]),name:'image.png',mime:'image/png',cid:'logo'}]},
   {to:['a@example.test','b@example.test'],cc:['cc@example.test'],bcc:['bcc@example.test'],from:'alt@example.test',senderName:'Alias',subject:'Hi',html:'<b>Hi</b>',text:'Hi',replyTo:'reply@example.test'},
   {to:['a@example.test'],subject:'Plain',html:'Hi',replyTo:'reply@example.test',senderName:'No comma'},
 ];
@@ -24,6 +25,8 @@ const cases = [
     const o=provider.captured;
     const wire={from:o.from,to:o.to,subject:o.subject,html:o.html,reply_to:o.replyTo};
     for(const field of ['cc','bcc','text']) if(o[field] !== undefined) wire[field]=o[field];
+    if(o.headers !== undefined) wire.headers=o.headers;
+    if(o.attachments !== undefined) wire.attachments=o.attachments.map(a=>({filename:a.filename,content:a.content.toString('base64'),...(a.contentId ? {content_id:a.contentId}: {})}));
     results.push(wire);
   }
   process.stdout.write(JSON.stringify(results));

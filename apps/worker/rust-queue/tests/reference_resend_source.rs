@@ -1,7 +1,7 @@
 //! Selected original provider option mapping with a mocked SDK, not wire or e2e.
 use novu_postgres_queue::{
     resend::{self, Config},
-    sendgrid::Email,
+    sendgrid::{Attachment, Email},
 };
 use serde_json::Value;
 use std::process::Command;
@@ -33,6 +33,24 @@ fn original_resend_options_match_selected_cases() {
             subject: "Hello".into(),
             html: "<p>Hello</p>".into(),
             reply_to: Some("reply@example.test".into()),
+            ..Email::default()
+        },
+        Email {
+            to: vec!["a@example.test".into()],
+            subject: "Attachment".into(),
+            html: "<img src=\"cid:logo\">".into(),
+            reply_to: Some("reply@example.test".into()),
+            headers: serde_json::json!({"X-Trace":"value"})
+                .as_object()
+                .unwrap()
+                .clone(),
+            attachments: vec![Attachment {
+                file: vec![0, 1, 255],
+                name: "image.png".into(),
+                mime: "image/png".into(),
+                cid: Some("logo".into()),
+                disposition: None,
+            }],
             ..Email::default()
         },
         Email {

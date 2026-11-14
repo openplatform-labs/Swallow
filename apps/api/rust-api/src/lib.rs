@@ -3395,7 +3395,7 @@ async fn trigger(
     let valid_providers = |value: &Value| {
         value.as_object().is_some_and(|entries| {
             entries.iter().all(|(key, layer)| match key.as_str() {
-                "sendgrid" => valid_layer(layer),
+                "sendgrid" | "resend" => valid_layer(layer),
                 "twilio" => valid_sms_layer(layer),
                 "fcm" => valid_fcm_layer(layer),
                 _ => false,
