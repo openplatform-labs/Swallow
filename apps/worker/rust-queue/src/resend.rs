@@ -90,6 +90,10 @@ impl Resend {
     pub fn new(config: Config) -> Result<Self, SendError> {
         Self::with_endpoint(config, "https://api.resend.com/emails")
     }
+    #[cfg(test)]
+    pub(crate) fn test_endpoint(config: Config, endpoint: &str) -> Result<Self, SendError> {
+        Self::with_endpoint(config, endpoint)
+    }
     fn with_endpoint(config: Config, endpoint: &str) -> Result<Self, SendError> {
         if config.api_key.is_empty()
             || header::HeaderValue::from_str(&format!("Bearer {}", config.api_key)).is_err()

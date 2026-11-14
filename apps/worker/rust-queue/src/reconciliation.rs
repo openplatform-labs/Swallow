@@ -20,6 +20,7 @@ pub async fn health(client: &Client, environment: &str) -> Result<Value> {
          min(a.updated_at) FILTER (WHERE a.state='dispatching' AND (j.status <> 'running' OR j.lease_until <= statement_timestamp()))::text \
          FROM novu_queue_jobs j JOIN ( \
          SELECT job_id,environment_id,state,updated_at FROM novu_rust_sendgrid_attempts \
+         UNION ALL SELECT job_id,environment_id,state,updated_at FROM novu_rust_resend_attempts \
          UNION ALL SELECT job_id,environment_id,state,updated_at FROM novu_rust_twilio_attempts \
          UNION ALL SELECT job_id,environment_id,state,updated_at FROM novu_rust_fcm_attempts \
          ) a ON a.job_id=j.id AND a.environment_id=j.environment_id WHERE j.environment_id=$1",
@@ -81,7 +82,7 @@ pub async fn list_after(
     }
     let after_job = after.as_ref().map(|(job, _)| *job);
     let after_index = after.and_then(|(_, index)| index).unwrap_or(-1);
-    let rows=client.query("SELECT j.id,j.kind,j.status,a.target_index,a.http_status,a.updated_at::text FROM novu_queue_jobs j JOIN (SELECT job_id,environment_id,NULL::integer AS target_index,http_status,updated_at FROM novu_rust_sendgrid_attempts WHERE state='unknown' UNION ALL SELECT job_id,environment_id,NULL::integer,http_status,updated_at FROM novu_rust_twilio_attempts WHERE state='unknown' UNION ALL SELECT job_id,environment_id,target_index,http_status,updated_at FROM novu_rust_fcm_attempts WHERE state='unknown') a ON a.job_id=j.id AND a.environment_id=j.environment_id WHERE j.environment_id=$1 AND ($2::uuid IS NULL OR (j.id,COALESCE(a.target_index,-1))>($2,$3)) ORDER BY j.id,COALESCE(a.target_index,-1) LIMIT 100", &[&environment,&after_job,&after_index]).await?;
+    let rows=client.query("SELECT j.id,j.kind,j.status,a.target_index,a.http_status,a.updated_at::text FROM novu_queue_jobs j JOIN (SELECT job_id,environment_id,NULL::integer AS target_index,http_status,updated_at FROM novu_rust_sendgrid_attempts WHERE state='unknown' UNION ALL SELECT job_id,environment_id,NULL::integer,http_status,updated_at FROM novu_rust_resend_attempts WHERE state='unknown' UNION ALL SELECT job_id,environment_id,NULL::integer,http_status,updated_at FROM novu_rust_twilio_attempts WHERE state='unknown' UNION ALL SELECT job_id,environment_id,target_index,http_status,updated_at FROM novu_rust_fcm_attempts WHERE state='unknown') a ON a.job_id=j.id AND a.environment_id=j.environment_id WHERE j.environment_id=$1 AND ($2::uuid IS NULL OR (j.id,COALESCE(a.target_index,-1))>($2,$3)) ORDER BY j.id,COALESCE(a.target_index,-1) LIMIT 100", &[&environment,&after_job,&after_index]).await?;
     Ok(rows.into_iter().map(|r| json!({"jobId":r.get::<_,Uuid>(0).to_string(),"kind":r.get::<_,String>(1),"jobStatus":r.get::<_,String>(2),"targetIndex":r.get::<_,Option<i32>>(3),"httpStatus":r.get::<_,Option<i32>>(4),"updatedAt":r.get::<_,String>(5)})).collect())
 }
 
@@ -232,6 +233,7 @@ pub async fn resolve(
     }
     let attempt=match (kind.as_str(),target) {
         (crate::sendgrid_queue::JOB_KIND,None)=>tx.query_opt("SELECT http_status,dispatch_id FROM novu_rust_sendgrid_attempts WHERE environment_id=$1 AND job_id=$2 AND state='unknown' FOR UPDATE", &[&environment,&job]).await?,
+        (crate::resend_queue::JOB_KIND,None)=>tx.query_opt("SELECT http_status,NULL::uuid FROM novu_rust_resend_attempts WHERE environment_id=$1 AND job_id=$2 AND state='unknown' FOR UPDATE", &[&environment,&job]).await?,
         (crate::twilio_queue::JOB_KIND,None)=>tx.query_opt("SELECT http_status,dispatch_id FROM novu_rust_twilio_attempts WHERE environment_id=$1 AND job_id=$2 AND state='unknown' FOR UPDATE", &[&environment,&job]).await?,
         (crate::fcm_queue::JOB_KIND,Some(index))=>tx.query_opt("SELECT http_status,NULL::uuid FROM novu_rust_fcm_attempts WHERE environment_id=$1 AND job_id=$2 AND target_index=$3 AND state='unknown' FOR UPDATE", &[&environment,&job,&index]).await?,
         _=>return Err("job kind and target do not match".into()),
@@ -263,6 +265,16 @@ pub async fn resolve(
     }
     tx.execute("INSERT INTO novu_rust_delivery_reconciliations(id,environment_id,job_id,target_index,decision,operator_name,reason,previous_http_status,retry_dispatch_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",&[&Uuid::new_v4(),&environment,&job,&target,&decision,&operator,&reason,&http_status,&retry_dispatch]).await?;
     match (kind.as_str(), target, decision) {
+        (crate::resend_queue::JOB_KIND, None, "retry") => {
+            tx.execute(
+                "DELETE FROM novu_rust_resend_attempts WHERE environment_id=$1 AND job_id=$2",
+                &[&environment, &job],
+            )
+            .await?;
+        }
+        (crate::resend_queue::JOB_KIND, None, "accepted") => {
+            tx.execute("UPDATE novu_rust_resend_attempts SET state='accepted',updated_at=clock_timestamp() WHERE environment_id=$1 AND job_id=$2", &[&environment, &job]).await?;
+        }
         (crate::sendgrid_queue::JOB_KIND, None, "retry") => {
             tx.execute(
                 "DELETE FROM novu_rust_sendgrid_attempts WHERE environment_id=$1 AND job_id=$2",

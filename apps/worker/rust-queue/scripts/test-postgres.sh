@@ -32,6 +32,8 @@ TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_queue_test" \
   cargo test --locked --lib fcm_queue::tests::multicast_attempts_recovery_and_tenant_isolation -- --ignored
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_queue_test" \
   cargo test --locked --test reconciliation -- --ignored
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_queue_test" \
+  cargo test --locked --lib resend_queue::tests::standalone_dispatch_and_recovery -- --ignored
 
 # Exercise strict actor fencing in a fresh database, independent of legacy fixtures.
 docker exec "$name" createdb -U postgres novu_actor_test

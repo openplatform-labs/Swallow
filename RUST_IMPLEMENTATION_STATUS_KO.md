@@ -34,7 +34,7 @@ API, 인앱·SendGrid·Twilio·FCM 워커 및 WS의 조회·이벤트 연결은 
 
 ## 발송 상태와 복구
 
-`delivery-reconcile check ENV`는 해당 환경의 이메일·SMS·FCM 결과 불명 시도와 임대가 만료됐거나 실행 중이 아닌 `dispatching` 시도를 한 쿼리로 집계한다. JSON에 각 건수와 가장 오래된 시도의 수정 시각을 출력하며 정상은 종료 코드 0, 확인이 필요한 건이 있으면 2, DB·인자 오류는 1이다. FCM은 대상별 시도를 각각 센다. 조회 계정은 큐와 세 시도 테이블 읽기 권한이 필요하다. 알림 시스템에서 주기적으로 실행하고 코드 2와 명령 실패·미실행을 각각 경보로 연결해야 한다. 존재하지 않거나 오타인 환경 ID도 0건으로 보이므로 배포 설정을 별도로 검증해야 한다. 결과는 조회 시점의 스냅샷이며 임대 만료 직후 정상 복구 중에도 일시적으로 경보가 발생할 수 있다. 전체 시도 테이블 집계 비용과 대규모 환경의 성능은 미검증이다. 이 기능은 경보용 신호일 뿐 작업을 복구하거나 발송하지 않으며, 대기열 정체·DB 장애나 모든 유형의 발송 누락을 독립적으로 감지하지 않는다. 운영자 확인과 적절한 경보 구성이 여전히 필요하다.
+`delivery-reconcile check ENV`는 해당 환경의 SendGrid·Resend 이메일, SMS·FCM 결과 불명 시도와 임대가 만료됐거나 실행 중이 아닌 `dispatching` 시도를 한 쿼리로 집계한다. JSON에 각 건수와 가장 오래된 시도의 수정 시각을 출력하며 정상은 종료 코드 0, 확인이 필요한 건이 있으면 2, DB·인자 오류는 1이다. FCM은 대상별 시도를 각각 센다. 조회 계정은 0060 마이그레이션과 큐 및 네 시도 테이블 읽기 권한이 필요하다. 알림 시스템에서 주기적으로 실행하고 코드 2와 명령 실패·미실행을 각각 경보로 연결해야 한다. 존재하지 않거나 오타인 환경 ID도 0건으로 보이므로 배포 설정을 별도로 검증해야 한다. 결과는 조회 시점의 스냅샷이며 임대 만료 직후 정상 복구 중에도 일시적으로 경보가 발생할 수 있다. 전체 시도 테이블 집계 비용과 대규모 환경의 성능은 미검증이다. 이 기능은 경보용 신호일 뿐 작업을 복구하거나 발송하지 않으며, 대기열 정체·DB 장애나 모든 유형의 발송 누락을 독립적으로 감지하지 않는다. 운영자 확인과 적절한 경보 구성이 여전히 필요하다.
 
 `delivery-reconcile check-queue ENV MAX_WAIT_SECONDS`는 모든 종류의 큐 작업에 대해 실행 가능 시각이 지정한 초(1–86400)를 지난 대기 작업과 임대가 만료된 실행 작업을 집계한다. 미래에 예약된 작업은 제외한다. 결과 JSON에는 건수와 가장 오래된 실행 가능·임대 만료 시각이 포함되며 종료 코드 0·2·1의 의미는 `check`와 같다. 발송 시도 기록 전에 워커가 중단된 경우도 감지할 수 있지만 모든 실패나 누락을 찾아내지는 못한다. 작업 종류와 무관한 집계이며 정상 복구 중에도 일시 경보가 날 수 있으므로 임계치와 경보 지연을 운영 환경에 맞춰 설정한다. DB 큐 읽기 권한이 필요하고 환경 ID 오타, 명령 미실행, DB 장애 및 집계 성능에 관한 위 제한도 동일하다. Docker PostgreSQL 테스트는 대기·미래 예약·만료 임대·환경 격리 및 종료 코드를 확인한다.
 
@@ -69,7 +69,9 @@ API 마이그레이션 `0006`·`0007`과 워커 마이그레이션 `0056`까지 
 
 ## 구현된 범위
 
-- [Resend 이메일 어댑터](apps/worker/rust-queue/src/resend.rs)는 발신자·수신자·제목·HTML·텍스트·참조·숨은 참조·회신 주소와 선택적 idempotency 키를 [Resend 이메일 API](https://resend.com/docs/api-reference/emails/send-email)에 전송한다. 미지원 첨부·헤더·provider custom data는 무시하지 않고 거절한다. 로컬 모의 HTTP 서버에서 요청·키·응답 및 302·429·500을 검증했으며 성공 응답이 불완전하면 결과 불명으로 취급한다. 원본 Novu provider, 실제 Resend 계정과 수신은 비교하지 않았다. **아직 워크플로·큐·통합 관리 API·웹훅에 연결되지 않았으므로 제품에서 Resend를 선택해 발송할 수 없다.** Resend의 idempotency 키 보관 기간은 [24시간](https://resend.com/docs/dashboard/emails/idempotency-keys)이며 자동 재시도는 구현하지 않았다.
+- [Resend 독립 큐 워커](apps/worker/rust-queue/src/resend_queue.rs)는 0060 마이그레이션을 적용한 뒤 `NOVU_RESEND_ENVIRONMENT_ID`, `NOVU_RESEND_API_KEY`, `NOVU_RESEND_FROM`, 선택적 `NOVU_RESEND_SENDER_NAME`과 `DATABASE_URL`로 실행한다. 수동으로 준비한 `experimental_resend_email` 작업을 환경별로 처리하며 `swallow/<작업 UUID>`를 idempotency 키로 사용한다. 시도 기록 이전 임대 만료는 재대기하고 기록 이후 만료·전송 실패·불완전한 성공 응답·5xx·409는 결과 불명으로 보관한다. 2xx는 provider 접수이지 실제 수신이 아니다. 로컬 모의 HTTP·Docker PostgreSQL에서 요청, 환경 격리, 시도 기록 전후 복구를 검증했다. 별도 작업은 구독자 ID·설정 확인을 수행하지 않으며 워크플로 작업은 거절한다. API·워크플로 생성, 관리 API·Resend 웹훅, 실제 Resend·수신함 및 Novu와의 비교는 아직 미구현 또는 미검증이다. 자격증명은 환경변수에 있고 작업 본문에는 이메일 주소와 내용이 저장되므로 DB와 프로세스 환경 접근을 제한해야 한다. `check`·`list`·수동 `retry`/`accepted`도 0060을 요구하며 운영자는 provider 접수 여부를 독립적으로 확인해야 한다. 멱등 키가 24시간을 넘기거나 요청 내용이 변하면 재시도 시 중복 또는 오류가 발생할 수 있다. 실제 운영에 사용할 수 있는 통합이 아니다.
+
+- [Resend 이메일 어댑터](apps/worker/rust-queue/src/resend.rs)는 발신자·수신자·제목·HTML·텍스트·참조·숨은 참조·회신 주소와 선택적 idempotency 키를 [Resend 이메일 API](https://resend.com/docs/api-reference/emails/send-email)에 전송한다. 미지원 첨부·헤더·provider custom data는 무시하지 않고 거절한다. 로컬 모의 HTTP 서버에서 요청·키·응답 및 302·429·500을 검증했으며 성공 응답이 불완전하면 결과 불명으로 취급한다. 원본 Novu provider, 실제 Resend 계정과 수신은 비교하지 않았다. **워크플로·통합 관리 API·웹훅에 연결되지 않았으므로 제품에서 Resend를 선택해 발송할 수 없다.** Resend의 idempotency 키 보관 기간은 [24시간](https://resend.com/docs/dashboard/emails/idempotency-keys)이며 자동 재시도는 구현하지 않았다.
 
 - 제한적인 트리거 API: API 키 해시로 환경과 연결된 사용자를 조회하고, 워크플로 없음·비활성·단계 없음의 일부 응답을 처리한다. 트리거와 관리 API의 사용자 Bearer 인증은 구현되지 않아 거절한다.
 - 자동 트랜잭션 ID는 기준 소스의 `txn_` + 8자리 Unix 초 hex + 12자리 영숫자 형식을 따른다. 전체 서버 간 비교는 아직 수행하지 않았다.

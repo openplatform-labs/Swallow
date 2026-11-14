@@ -12,13 +12,14 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     tokio::spawn(async move {
         connection.await.unwrap();
     });
-    db.batch_execute("DROP TABLE IF EXISTS novu_rust_sendgrid_dispatch_ids,novu_rust_twilio_dispatch_ids,novu_rust_delivery_reconciliations,novu_rust_sendgrid_attempts,novu_rust_twilio_attempts,novu_rust_fcm_attempts,novu_rust_email_messages,novu_rust_sms_messages,novu_rust_push_messages,novu_queue_jobs CASCADE").await.unwrap();
+    db.batch_execute("DROP TABLE IF EXISTS novu_rust_resend_attempts,novu_rust_sendgrid_dispatch_ids,novu_rust_twilio_dispatch_ids,novu_rust_delivery_reconciliations,novu_rust_sendgrid_attempts,novu_rust_twilio_attempts,novu_rust_fcm_attempts,novu_rust_email_messages,novu_rust_sms_messages,novu_rust_push_messages,novu_queue_jobs CASCADE").await.unwrap();
     for migration in [
         queue::MIGRATION,
         queue::sendgrid_queue::MIGRATION,
         queue::twilio_queue::MIGRATION,
         queue::twilio_queue::DISPATCH_ID_MIGRATION,
         queue::fcm_queue::MIGRATION,
+        queue::resend_queue::MIGRATION,
         queue::in_app::EMAIL_MESSAGES_MIGRATION,
         queue::in_app::EMAIL_PROVIDER_RESULT_MIGRATION,
         queue::in_app::SMS_MESSAGES_MIGRATION,
@@ -913,4 +914,82 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
             assert_eq!(row.get::<_, Option<String>>(1).as_deref(), Some(error));
         }
     }
+    let resend_retry = Uuid::new_v4();
+    let resend_accepted = Uuid::new_v4();
+    for job in [resend_retry, resend_accepted] {
+        queue::enqueue(
+            &db,
+            job,
+            "tenant-resend",
+            queue::resend_queue::JOB_KIND,
+            &json!({}),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "UPDATE novu_queue_jobs SET status='failed' WHERE id=$1",
+            &[&job],
+        )
+        .await
+        .unwrap();
+        db.execute("INSERT INTO novu_rust_resend_attempts(job_id,environment_id,state) VALUES ($1,'tenant-resend','unknown')", &[&job]).await.unwrap();
+    }
+    assert_eq!(
+        reconciliation::health(&db, "tenant-resend").await.unwrap()["unknownAttempts"],
+        2
+    );
+    assert_eq!(
+        reconciliation::list(&db, "tenant-resend")
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(
+        reconciliation::resolve(
+            &mut db,
+            "tenant-b",
+            resend_retry,
+            None,
+            "retry",
+            "operator",
+            "checked"
+        )
+        .await
+        .is_err()
+    );
+    reconciliation::resolve(
+        &mut db,
+        "tenant-resend",
+        resend_retry,
+        None,
+        "retry",
+        "operator",
+        "confirmed non-acceptance",
+    )
+    .await
+    .unwrap();
+    reconciliation::resolve(
+        &mut db,
+        "tenant-resend",
+        resend_accepted,
+        None,
+        "accepted",
+        "operator",
+        "confirmed acceptance",
+    )
+    .await
+    .unwrap();
+    let rows=db.query("SELECT j.status,a.state FROM novu_queue_jobs j LEFT JOIN novu_rust_resend_attempts a ON a.job_id=j.id WHERE j.id=ANY($1) ORDER BY j.status", &[&vec![resend_retry,resend_accepted]]).await.unwrap();
+    assert_eq!(rows[0].get::<_, String>(0), "completed");
+    assert_eq!(
+        rows[0].get::<_, Option<String>>(1).as_deref(),
+        Some("accepted")
+    );
+    assert_eq!(rows[1].get::<_, String>(0), "pending");
+    assert!(rows[1].get::<_, Option<String>>(1).is_none());
+    assert_eq!(
+        reconciliation::health(&db, "tenant-resend").await.unwrap()["unknownAttempts"],
+        0
+    );
 }
