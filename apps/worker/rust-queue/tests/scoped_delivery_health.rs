@@ -9,7 +9,7 @@ use uuid::Uuid;
 async fn scoped_checks_match_legacy_and_isolate_database_login() {
     let url = std::env::var("TEST_DATABASE_URL").unwrap();
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let (db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    let (mut db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move {
         let _ = driver.await;
     });
@@ -225,16 +225,23 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
         failed,
         "a",
         queue::fcm_queue::JOB_KIND,
-        &json!({"secret":"fixture-private"}),
+        &json!({"workflow_context":{"subscriber_id":"missing","subscriber_internal_id":"old-subscriber","workflow_identifier":"fixture","workflow_internal_id":null,"title_template":"hello","content_template":"hi","payload":{"secret":"fixture-private"},"context_keys":[],"actor":null}}),
     )
     .await
     .unwrap();
-    db.execute(
-        "UPDATE novu_queue_jobs SET status='failed',last_error='sensitive diagnostic' WHERE id=$1",
-        &[&failed],
-    )
-    .await
-    .unwrap();
+    assert!(
+        queue::fcm_queue::process_one_with_integrations(
+            &mut db,
+            "a",
+            &std::collections::HashMap::new()
+        )
+        .await
+        .unwrap()
+    );
+    let failure=db.query_one("SELECT status,last_error,(SELECT count(*) FROM novu_rust_fcm_attempts WHERE job_id=$1) FROM novu_queue_jobs WHERE id=$1",&[&failed]).await.unwrap();
+    assert_eq!(failure.get::<_, String>(0), "failed");
+    assert_eq!(failure.get::<_, String>(1), "subscriber not found");
+    assert_eq!(failure.get::<_, i64>(2), 0);
     assert_eq!(
         reconciliation::failed_queue_count(&actor, "a")
             .await
@@ -251,7 +258,7 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
         .unwrap();
     assert_eq!(listed.len(), 1);
     let result = serde_json::to_string(&listed).unwrap();
-    assert!(!result.contains("fixture-private") && !result.contains("sensitive diagnostic"));
+    assert!(!result.contains("fixture-private") && !result.contains("subscriber not found"));
     assert!(
         reconciliation::acknowledge_failed_queue(&actor, "a", failed, "operator", "reviewed")
             .await
@@ -347,11 +354,20 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
     );
     assert_eq!(failure_alert().status.code(), Some(0));
     db.execute(
-        "UPDATE novu_queue_jobs SET attempts=attempts+1 WHERE id=$1",
+        "UPDATE novu_queue_jobs SET status='pending' WHERE id=$1",
         &[&failed],
     )
     .await
     .unwrap();
+    assert!(
+        queue::fcm_queue::process_one_with_integrations(
+            &mut db,
+            "a",
+            &std::collections::HashMap::new()
+        )
+        .await
+        .unwrap()
+    );
     assert_eq!(failure_alert().status.code(), Some(2));
     db.execute("INSERT INTO novu_queue_jobs(id,environment_id,kind,payload,status) SELECT gen_random_uuid(),'a','pagination_fixture','{}'::jsonb,'failed' FROM generate_series(1,101)",&[]).await.unwrap();
     let page = reconciliation::failed_queue_list(&actor, "a", None)
