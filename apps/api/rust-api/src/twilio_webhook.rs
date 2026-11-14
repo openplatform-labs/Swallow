@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 /// One explicitly configured Twilio account and its public HTTPS callback URL.
 /// Keep the auth token out of logs and of the database.
+#[derive(Clone)]
 pub struct Config {
     environment: String,
     account_sid: String,

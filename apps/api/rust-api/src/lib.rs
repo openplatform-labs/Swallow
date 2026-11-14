@@ -65,22 +65,43 @@ fn generate_transaction_id() -> Option<String> {
     Some(format!("txn_{seconds:08x}{suffix}"))
 }
 
+#[derive(Clone)]
+pub struct RuntimeConfig {
+    secret: Option<Vec<u8>>,
+    keys: HashMap<String, Vec<String>>,
+    twilio: Option<twilio_webhook::Config>,
+    resend: Option<resend_webhook::Config>,
+}
+impl RuntimeConfig {
+    pub fn from_env() -> Self {
+        let secret = novu_rust_contracts::secret::from_env("JWT_SECRET", "JWT_SECRET_FILE")
+            .ok()
+            .flatten()
+            .map(String::into_bytes);
+        let keys = std::env::var("INBOX_HMAC_KEYS_JSON")
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        Self {
+            secret,
+            keys,
+            twilio: twilio_webhook::Config::from_env(),
+            resend: resend_webhook::Config::from_env(),
+        }
+    }
+    pub fn router(&self, db: Arc<Client>) -> Router {
+        router_with_webhook_configs(
+            db,
+            self.secret.clone(),
+            self.keys.clone(),
+            self.twilio.clone(),
+            self.resend.clone(),
+        )
+    }
+}
+
 pub fn router(db: Arc<Client>) -> Router {
-    let secret = novu_rust_contracts::secret::from_env("JWT_SECRET", "JWT_SECRET_FILE")
-        .ok()
-        .flatten()
-        .map(String::into_bytes);
-    let keys = std::env::var("INBOX_HMAC_KEYS_JSON")
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    router_with_webhook_configs(
-        db,
-        secret,
-        keys,
-        twilio_webhook::Config::from_env(),
-        resend_webhook::Config::from_env(),
-    )
+    RuntimeConfig::from_env().router(db)
 }
 
 pub fn router_with_subscriber_secret(db: Arc<Client>, secret: Option<Vec<u8>>) -> Router {

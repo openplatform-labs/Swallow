@@ -13,6 +13,7 @@ use std::{
 };
 use tokio_postgres::Client;
 
+#[derive(Clone)]
 pub struct Config {
     environment: String,
     secret: Vec<u8>,

@@ -17,7 +17,8 @@ sha2 = "0.10"
 ring = "0.17"
 spki = "0.7"
 der = "0.7"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
+tower = { version = "0.5", features = ["util"] }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-uuid-1"] }
 uuid = { version = "1", features = ["v4"] }
 novu-rust-contracts = { path = "../rust-contracts" }
@@ -25,4 +26,3 @@ novu-rust-contracts = { path = "../rust-contracts" }
 [dev-dependencies]
 novu-postgres-queue = { path = "../../worker/rust-queue" }
 http-body-util = "0.1"
-tower = { version = "0.5", features = ["util"] }
