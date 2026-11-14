@@ -72,7 +72,7 @@ async fn administration_is_scoped_audited_atomic_and_revocable() {
     );
     assert_eq!(
         db.query_one(
-            "SELECT count(*) FROM public.novu_rust_operator_jwt_permission_audit",
+            "SELECT count(*) FROM public.novu_rust_operator_jwt_permission_audit WHERE environment_id='admin-a'",
             &[]
         )
         .await
@@ -99,7 +99,7 @@ async fn administration_is_scoped_audited_atomic_and_revocable() {
             .get::<_, bool>(0)
     );
     assert!(api_db.query_one("SELECT public.novu_rust_operator_jwt_self('https://issuer.test','alice','console','admin-a',4102444800)", &[]).await.is_err());
-    let audit = db.query_one("SELECT previous,current,actor::text,reason FROM public.novu_rust_operator_jwt_permission_audit ORDER BY id DESC LIMIT 1", &[]).await.unwrap();
+    let audit = db.query_one("SELECT previous,current,actor::text,reason FROM public.novu_rust_operator_jwt_permission_audit WHERE environment_id='admin-a' ORDER BY id DESC LIMIT 1", &[]).await.unwrap();
     let previous: serde_json::Value = audit.get(0);
     let current: serde_json::Value = audit.get(1);
     assert_eq!(previous["enabled"], true);
@@ -130,7 +130,7 @@ async fn administration_is_scoped_audited_atomic_and_revocable() {
     assert!(admin_db.query_one(get, &[&"admin-a"]).await.is_err());
     assert_eq!(
         db.query_one(
-            "SELECT count(*) FROM public.novu_rust_operator_jwt_permission_audit",
+            "SELECT count(*) FROM public.novu_rust_operator_jwt_permission_audit WHERE environment_id='admin-a'",
             &[]
         )
         .await
