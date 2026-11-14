@@ -1,0 +1,263 @@
+//! Scoped operator decisions against disposable PostgreSQL with real service migrations.
+use novu_postgres_queue as queue;
+use serde_json::json;
+use std::{path::Path, process::Command};
+use tokio_postgres::{Client, NoTls};
+use uuid::Uuid;
+async fn connect(url: &str) -> Client {
+    let (db, driver) = tokio_postgres::connect(url, NoTls).await.unwrap();
+    tokio::spawn(async move { driver.await.unwrap() });
+    db
+}
+async fn create_job(db: &Client, kind: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    queue::enqueue(db, id, "a", kind, &json!({"secret":"payload"}))
+        .await
+        .unwrap();
+    db.execute("UPDATE novu_queue_jobs SET status='failed',last_error='unknown',sendgrid_delivery_result='delivered' WHERE id=$1", &[&id]).await.unwrap();
+    let table = if kind == queue::sendgrid_queue::JOB_KIND {
+        "novu_rust_sendgrid_attempts"
+    } else if kind == queue::resend_queue::JOB_KIND {
+        "novu_rust_resend_attempts"
+    } else {
+        "novu_rust_twilio_attempts"
+    };
+    db.execute(&format!("INSERT INTO {table}(job_id,environment_id,state,http_status) VALUES ($1,'a','unknown',500)"), &[&id]).await.unwrap();
+    if kind == queue::twilio_queue::JOB_KIND {
+        db.execute("INSERT INTO novu_rust_sms_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,status,sms_job_id,delivery_state,twilio_delivery_result) VALUES ($1,'a','s','s','n','w','t','error',$2,'unknown','delivered')", &[&id.to_string(),&id]).await.unwrap();
+    } else {
+        db.execute("INSERT INTO novu_rust_email_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,subject,status,email_job_id,delivery_state,sendgrid_delivery_result,resend_delivery_result) VALUES ($1,'a','s','s','n','w','t','subject','error',$2,'unknown','delivered','delivered')", &[&id.to_string(),&id]).await.unwrap();
+    }
+    id
+}
+async fn snapshot(db: &Client, job: Uuid, kind: &str) -> serde_json::Value {
+    let table = if kind == queue::sendgrid_queue::JOB_KIND {
+        "novu_rust_sendgrid_attempts"
+    } else if kind == queue::resend_queue::JOB_KIND {
+        "novu_rust_resend_attempts"
+    } else {
+        "novu_rust_twilio_attempts"
+    };
+    let message_table = if kind == queue::twilio_queue::JOB_KIND {
+        "novu_rust_sms_messages"
+    } else {
+        "novu_rust_email_messages"
+    };
+    let message_key = if kind == queue::twilio_queue::JOB_KIND {
+        "sms_job_id"
+    } else {
+        "email_job_id"
+    };
+    let query = format!(
+        "SELECT jsonb_build_object('status',j.status,'sendgrid',j.sendgrid_delivery_result,'resend',j.resend_delivery_result,'twilio',j.twilio_delivery_result,'attempt',(SELECT state FROM {table} WHERE job_id=j.id),'message',(SELECT jsonb_build_array(status,delivery_state,error_id,error_text,identifier) FROM {message_table} WHERE {message_key}=j.id),'audit',(SELECT jsonb_build_array(decision,previous_http_status,retry_dispatch_id) FROM novu_rust_delivery_reconciliations WHERE job_id=j.id)) FROM novu_queue_jobs j WHERE j.id=$1"
+    );
+    db.query_one(&query, &[&job]).await.unwrap().get(0)
+}
+async fn resolve(
+    db: &Client,
+    env: &str,
+    id: Uuid,
+    decision: &str,
+) -> Result<(), tokio_postgres::Error> {
+    db.query_one(
+        "SELECT public.novu_rust_resolve_email_sms($1,$2,$3,'operator','ticket')",
+        &[&env, &id, &decision],
+    )
+    .await
+    .map(|_| ())
+}
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL and roles"]
+async fn scoped_email_sms_decisions_are_authorized_atomic_and_fenced() {
+    let url = std::env::var("TEST_DATABASE_URL").unwrap();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let api = root.join("../../api/rust-api/migrations");
+    let worker = root.join("migrations");
+    for args in [
+        vec!["apply", "api", api.to_str().unwrap(), "--through", "17"],
+        vec!["apply", "worker", worker.to_str().unwrap()],
+        vec!["apply", "api", api.to_str().unwrap()],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_migrate-worker"))
+            .args(args)
+            .env("DATABASE_URL", &url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let mut db = connect(&url).await;
+    db.batch_execute("INSERT INTO novu_rust_environments VALUES ('a','org'),('b','org')")
+        .await
+        .unwrap();
+    let role = format!("operator_{}", Uuid::new_v4().simple());
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'fixture-password'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_resolve_email_sms(text,uuid,text,text,text) TO {role}")).await.unwrap();
+    let mut role_url = reqwest::Url::parse(&url).unwrap();
+    role_url.set_username(&role).unwrap();
+    role_url.set_password(Some("fixture-password")).unwrap();
+    let actor = connect(role_url.as_str()).await;
+    let mail = create_job(&db, queue::sendgrid_queue::JOB_KIND).await;
+    assert!(resolve(&actor, "a", mail, "retry").await.is_err());
+    db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'a',$1,'retry',oid FROM pg_roles WHERE rolname::text=$1", &[&role]).await.unwrap();
+    assert!(resolve(&actor, "b", mail, "retry").await.is_err());
+    assert!(resolve(&actor, "a", mail, "accepted").await.is_err());
+    assert!(
+        actor
+            .execute(
+                "UPDATE public.novu_queue_jobs SET status='completed' WHERE id=$1",
+                &[&mail]
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        actor
+            .query("SELECT payload FROM public.novu_queue_jobs", &[])
+            .await
+            .is_err()
+    );
+    // A recorded authenticated callback blocks a retry and leaves no audit entry.
+    db.execute("INSERT INTO novu_rust_sendgrid_delivery_events(environment_id,event_id,message_internal_id,event_type,event_timestamp,recipient_hash) VALUES ('a','e',$1,'delivered',1,'hash')", &[&mail.to_string()]).await.unwrap();
+    assert!(resolve(&actor, "a", mail, "retry").await.is_err());
+    assert_eq!(
+        db.query_one(
+            "SELECT count(*) FROM novu_rust_delivery_reconciliations WHERE job_id=$1",
+            &[&mail]
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0),
+        0
+    );
+    db.execute(
+        "DELETE FROM novu_rust_sendgrid_delivery_events WHERE event_id='e'",
+        &[],
+    )
+    .await
+    .unwrap();
+    let actor2 = connect(role_url.as_str()).await;
+    let (one, two) = tokio::join!(
+        resolve(&actor, "a", mail, "retry"),
+        resolve(&actor2, "a", mail, "retry")
+    );
+    assert_ne!(one.is_ok(), two.is_ok());
+    let row=db.query_one("SELECT j.status,j.sendgrid_delivery_result,m.delivery_state,m.sendgrid_delivery_result,(SELECT count(*) FROM novu_rust_sendgrid_attempts WHERE job_id=j.id) FROM novu_queue_jobs j JOIN novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1", &[&mail]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "pending");
+    assert_eq!(row.get::<_, String>(1), "unknown");
+    assert_eq!(row.get::<_, String>(2), "not_attempted");
+    assert_eq!(row.get::<_, String>(3), "unknown");
+    assert_eq!(row.get::<_, i64>(4), 0);
+    let row=db.query_one("SELECT database_user,database_session_user,decision,previous_http_status FROM novu_rust_delivery_reconciliations WHERE job_id=$1", &[&mail]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), role);
+    assert_eq!(row.get::<_, String>(1), role);
+    assert_eq!(row.get::<_, String>(2), "retry");
+    assert_eq!(row.get::<_, Option<i32>>(3), Some(500));
+    db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'a',$1,'accepted',oid FROM pg_roles WHERE rolname::text=$1", &[&role]).await.unwrap();
+    for kind in [
+        queue::sendgrid_queue::JOB_KIND,
+        queue::resend_queue::JOB_KIND,
+        queue::twilio_queue::JOB_KIND,
+    ] {
+        let accepted = create_job(&db, kind).await;
+        resolve(&actor, "a", accepted, "accepted").await.unwrap();
+        assert_eq!(
+            db.query_one(
+                "SELECT status FROM novu_queue_jobs WHERE id=$1",
+                &[&accepted]
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+            "completed"
+        );
+        assert!(resolve(&actor, "a", accepted, "accepted").await.is_err());
+        if kind != queue::sendgrid_queue::JOB_KIND {
+            let retry = create_job(&db, kind).await;
+            if kind == queue::twilio_queue::JOB_KIND {
+                db.execute("INSERT INTO novu_rust_twilio_delivery_events(environment_id,account_sid,message_sid,status,job_id) VALUES ('a','AC','SM','delivered',$1)", &[&retry]).await.unwrap();
+                assert!(resolve(&actor, "a", retry, "retry").await.is_err());
+                db.execute(
+                    "DELETE FROM novu_rust_twilio_delivery_events WHERE job_id=$1",
+                    &[&retry],
+                )
+                .await
+                .unwrap();
+            }
+            resolve(&actor, "a", retry, "retry").await.unwrap();
+            assert_eq!(
+                db.query_one("SELECT status FROM novu_queue_jobs WHERE id=$1", &[&retry])
+                    .await
+                    .unwrap()
+                    .get::<_, String>(0),
+                "pending"
+            );
+        }
+    }
+    // Compare final state with the established direct-table implementation.
+    db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'a',session_user,permission,oid FROM pg_roles CROSS JOIN unnest(ARRAY['retry','accepted']) permission WHERE rolname=session_user", &[]).await.unwrap();
+    for kind in [
+        queue::sendgrid_queue::JOB_KIND,
+        queue::resend_queue::JOB_KIND,
+        queue::twilio_queue::JOB_KIND,
+    ] {
+        for decision in ["retry", "accepted"] {
+            let legacy = create_job(&db, kind).await;
+            let scoped = create_job(&db, kind).await;
+            queue::reconciliation::resolve(
+                &mut db, "a", legacy, None, decision, "operator", "ticket",
+            )
+            .await
+            .unwrap();
+            resolve(&actor, "a", scoped, decision).await.unwrap();
+            assert_eq!(
+                snapshot(&db, legacy, kind).await,
+                snapshot(&db, scoped, kind).await,
+                "{kind} {decision}"
+            );
+        }
+    }
+    let fcm = Uuid::new_v4();
+    queue::enqueue(&db, fcm, "a", queue::fcm_queue::JOB_KIND, &json!({}))
+        .await
+        .unwrap();
+    db.execute(
+        "UPDATE novu_queue_jobs SET status='failed' WHERE id=$1",
+        &[&fcm],
+    )
+    .await
+    .unwrap();
+    assert!(resolve(&actor, "a", fcm, "retry").await.is_err());
+    let cli_job = create_job(&db, queue::resend_queue::JOB_KIND).await;
+    let output = Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .args([
+            "retry",
+            "a",
+            &cli_job.to_string(),
+            "-",
+            "operator",
+            "ticket",
+        ])
+        .env("DATABASE_URL", role_url.as_str())
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .env("SWALLOW_RECONCILIATION_SCOPED_ACCESS", "true")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    db.execute("DELETE FROM novu_rust_delivery_operator_grants WHERE environment_id='a' AND database_principal=$1 AND decision='retry'", &[&role]).await.unwrap();
+    let denied = create_job(&db, queue::resend_queue::JOB_KIND).await;
+    assert!(resolve(&actor, "a", denied, "retry").await.is_err());
+    assert!(
+        actor
+            .execute("DELETE FROM public.novu_rust_delivery_reconciliations", &[])
+            .await
+            .is_err()
+    );
+}

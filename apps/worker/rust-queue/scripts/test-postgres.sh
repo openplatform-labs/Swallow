@@ -126,6 +126,10 @@ TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_slack_attention_
 docker exec "$name" createdb -U postgres novu_failure_revision_migration_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_failure_revision_migration_test" \
   cargo test --locked --test failure_revision_migration -- --ignored
+docker exec "$name" createdb -U postgres novu_scoped_email_sms_resolution_test
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_scoped_email_sms_resolution_test" \
+  cargo test --locked --test scoped_email_sms_resolution -- --ignored
+
 docker exec "$name" createdb -U postgres novu_scoped_delivery_health_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_scoped_delivery_health_test" \
   cargo test --locked --test scoped_delivery_health -- --ignored
