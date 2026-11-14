@@ -55,6 +55,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let resend_enabled = env_bool("SWALLOW_ALERT_RESEND_ENABLED", true)?;
     let attempts_enabled = env_bool("SWALLOW_ALERT_ATTEMPTS_ENABLED", false)?;
     let slack_jobs_enabled = env_bool("SWALLOW_ALERT_SLACK_JOBS_ENABLED", false)?;
+    let slack_missing_enabled = env_bool("SWALLOW_ALERT_SLACK_MISSING_ENDPOINTS_ENABLED", false)?;
     let twilio_grace = env_optional_i32("SWALLOW_ALERT_TWILIO_GRACE_SECONDS")?;
     let twilio_heartbeat = env_optional_i32("SWALLOW_ALERT_TWILIO_HEARTBEAT_MAX_SECONDS")?;
     let twilio_thresholds = match (twilio_grace, twilio_heartbeat) {
@@ -154,6 +155,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 health["unknownAttempts"].as_u64()?,
                 health["rejectedAttempts"].as_u64()?,
                 health["strandedDispatches"].as_u64()?,
+                health["preDispatchFailures"].as_u64()?,
+                if slack_missing_enabled {
+                    Some(health["missingEndpoints"].as_u64()?)
+                } else {
+                    None
+                },
             ))
         });
         if values.is_none() {
@@ -169,8 +176,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         || queue.is_some_and(|(overdue, expired)| overdue > 0 || expired > 0)
         || attempts.is_some_and(|(unknown, stranded)| unknown > 0 || stranded > 0)
         || twilio.is_some_and(|(overdue, stale)| overdue > 0 || stale)
-        || slack_attempts.is_some_and(|(unknown, rejected, stranded)| {
-            unknown > 0 || rejected > 0 || stranded > 0
+        || slack_attempts.is_some_and(|(unknown, rejected, stranded, pre_dispatch, missing)| {
+            unknown > 0
+                || rejected > 0
+                || stranded > 0
+                || pre_dispatch > 0
+                || missing.is_some_and(|n| n > 0)
         });
     let (overdue, stale) = resend.unwrap_or((0, false));
     let alert = Alert {

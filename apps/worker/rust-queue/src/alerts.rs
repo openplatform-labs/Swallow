@@ -214,7 +214,7 @@ pub struct Alert {
     pub queue: Option<(u64, u64)>,
     pub attempts: Option<(u64, u64)>,
     pub twilio: Option<(u64, bool)>,
-    pub slack_attempts: Option<(u64, u64, u64)>,
+    pub slack_attempts: Option<(u64, u64, u64, u64, Option<u64>)>,
     pub failed_checks: [bool; 5], // resend, queue, attempts, twilio, Slack chat
 }
 impl Alert {
@@ -250,8 +250,11 @@ impl Alert {
                 "Twilio overdue undelivered jobs: {overdue}; projector stale: {stale}"
             ));
         }
-        if let Some((unknown, rejected, stranded)) = self.slack_attempts {
-            details.push(format!("Slack chat unknown attempts: {unknown}; rejected attempts: {rejected}; stranded dispatches: {stranded}"));
+        if let Some((unknown, rejected, stranded, pre_dispatch, missing)) = self.slack_attempts {
+            let missing = missing
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "disabled".into());
+            details.push(format!("Slack chat unknown attempts: {unknown}; rejected attempts: {rejected}; stranded dispatches: {stranded}; pre-dispatch failures: {pre_dispatch}; missing endpoint alerts: {missing}"));
         }
         for (failed, name) in self.failed_checks.iter().zip([
             "Resend",
@@ -543,7 +546,7 @@ mod tests {
         a.queue = Some((3, 1));
         a.attempts = Some((2, 4));
         a.twilio = Some((5, true));
-        a.slack_attempts = Some((1, 2, 3));
+        a.slack_attempts = Some((1, 2, 3, 4, Some(5)));
         let text = a.text().unwrap();
         assert!(text.contains("queue overdue jobs: 3; expired leases: 1"));
         assert!(text.contains("unknown delivery attempts: 2; stranded dispatches: 4"));

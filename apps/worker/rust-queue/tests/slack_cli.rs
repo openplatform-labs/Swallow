@@ -27,6 +27,9 @@ async fn worker_secret_and_attention_status() {
     db.batch_execute(novu_postgres_queue::slack_queue::MIGRATION)
         .await
         .unwrap();
+    db.batch_execute(novu_postgres_queue::slack_queue::WORKFLOW_ATTENTION_MIGRATION)
+        .await
+        .unwrap();
     let check = |env: &str| {
         Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
             .args(["check-slack", env])

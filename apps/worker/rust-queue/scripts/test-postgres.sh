@@ -112,6 +112,10 @@ docker exec "$name" createdb -U postgres novu_slack_workflow_cli_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_slack_workflow_cli_test" \
   cargo test --locked --test slack_workflow_cli -- --ignored
 
+docker exec "$name" createdb -U postgres novu_slack_workflow_attention_test
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_slack_workflow_attention_test" \
+  cargo test --locked --test slack_workflow_attention -- --ignored
+
 docker exec "$name" createdb -U postgres novu_slack_reconnect_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_slack_reconnect_test" TEST_PG_CONTAINER="$name" \
   cargo test --locked --test slack_reconnect -- --ignored

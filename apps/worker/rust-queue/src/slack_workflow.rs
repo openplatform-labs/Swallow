@@ -147,6 +147,11 @@ pub async fn fanout_one(db: &mut Client, environment: &str) -> Result<bool, Erro
         return Ok(true);
     }
     let endpoints=tx.query("SELECT internal_id,endpoint_type,endpoint,integration_identifier,connection_identifier FROM novu_rust_slack_channel_endpoints WHERE environment_id=$1 AND subscriber_internal_id=$2 AND context_keys @> $3 AND context_keys <@ $3 AND cardinality(context_keys)=cardinality($3) ORDER BY created_at,internal_id",&[&environment,&ctx.subscriber_internal_id,&ctx.context_keys]).await?;
+    if endpoints.is_empty() {
+        terminal(&tx, &job, "cancelled", Some("no Slack endpoints")).await?;
+        tx.commit().await?;
+        return Ok(true);
+    }
     for row in endpoints {
         let id: Uuid = row.get(0);
         let kind: String = row.get(1);
@@ -502,6 +507,8 @@ mod tests {
             crate::slack_queue::OPERATOR_MIGRATION,
             include_str!("../migrations/0072_operator_grant_management.sql"),
             include_str!("../migrations/0073_operator_role_identity.sql"),
+            crate::slack_queue::WORKFLOW_ATTENTION_MIGRATION,
+            include_str!("../migrations/0080_slack_ack_permission.sql"),
         ] {
             db.batch_execute(migration).await.unwrap();
         }
@@ -743,6 +750,34 @@ mod tests {
                 .unwrap()
                 .get::<_, String>(0),
             "pending"
+        );
+        db.execute("INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id) VALUES ('env','nobody','nobody-id')",&[]).await.unwrap();
+        let mut no_endpoint = ctx.clone();
+        no_endpoint.subscriber_id = "nobody".into();
+        no_endpoint.subscriber_internal_id = "nobody-id".into();
+        let empty = Uuid::new_v4();
+        crate::enqueue(
+            &db,
+            empty,
+            "env",
+            FANOUT_KIND,
+            &serde_json::to_value(no_endpoint).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(fanout_one(&mut db, "env").await.unwrap());
+        let row = db
+            .query_one(
+                "SELECT status,last_error FROM novu_queue_jobs WHERE id=$1",
+                &[&empty],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, String>(0), "cancelled");
+        assert_eq!(row.get::<_, String>(1), "no Slack endpoints");
+        assert_eq!(
+            crate::slack_queue::health(&db, "env").await.unwrap()["missingEndpoints"],
+            1
         );
     }
     #[tokio::test]
