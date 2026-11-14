@@ -184,6 +184,33 @@ describe('Swallow console', () => {
     await app.resolveAlert(); expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it('retrieves only a specified decision history and clears it on leaving', async () => {
+    const attempt = '1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[{id:'1',decision:'retry',reason:'reviewed',createdAt:'2026-01-01T00:00:00Z'}]}),{status:200}));
+    const fixture = TestBed.createComponent(App);
+    const app = fixture.componentInstance;
+    app.setSection('alerts'); app.historyKey = 'b'.repeat(64); app.historyChannel = 'slack'; app.historyTarget = 'ops'; app.historyAttempt = attempt;
+    await app.loadDecisionHistory(); fixture.detectChanges();
+    expect(app.historyStatus()).toBe('loaded');
+    expect(fixture.nativeElement.textContent).toContain('reviewed');
+    expect(fetchMock.mock.calls[0][0]).toContain(`channel=slack&targetId=ops&attemptId=${attempt}`);
+    expect(fetchMock.mock.calls[0][1]).toEqual(expect.objectContaining({headers:{Authorization:`SwallowConsole ${'b'.repeat(64)}`},credentials:'omit',redirect:'error'}));
+    app.setSection('overview');
+    expect(app.historyKey).toBe(''); expect(app.historyRows()).toEqual([]);
+  });
+
+  it('discards an obsolete history response', async () => {
+    let resolve!: (response: Response) => void;
+    vi.spyOn(globalThis, 'fetch').mockReturnValueOnce(new Promise<Response>(done => { resolve = done; }));
+    const app = TestBed.createComponent(App).componentInstance;
+    app.historyKey = 'b'.repeat(64); app.historyTarget = 'ops'; app.historyAttempt = '1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
+    const pending = app.loadDecisionHistory();
+    app.clearHistory(true);
+    resolve(new Response(JSON.stringify({data:[{id:'1',decision:'retry',reason:'old',createdAt:'2026-01-01T00:00:00Z'}]}),{status:200}));
+    await pending;
+    expect(app.historyStatus()).toBe('idle'); expect(app.historyRows()).toEqual([]); expect(app.historyKey).toBe('');
+  });
+
   it('requests the next alert page and can return to the first', async () => {
     const first = {data:[{channel:'email',targetId:'ops',state:'accepted',lastStartedAt:null}],hasMore:true,next:{channel:'email',targetId:'ops'}};
     const second = {data:[{channel:'slack',targetId:'ops',state:'unknown',lastStartedAt:null}],hasMore:false,next:null};

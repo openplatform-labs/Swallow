@@ -6,6 +6,7 @@ type ConnectionState = 'unchecked' | 'checking' | 'ready' | 'unavailable';
 type Subscriber = { id: string; firstName: string; lastName: string; email: string };
 type AlertSlot = { channel: string; targetId: string; state: string; lastStartedAt: string | null; attemptId?: string | null };
 type AlertCursor = { channel: string; targetId: string };
+type DecisionHistory = { id: string; decision: string; reason: string; createdAt: string };
 type Section = 'overview' | 'workflows' | 'subscribers' | 'channels' | 'activity' | 'alerts' | 'settings';
 
 @Component({
@@ -45,6 +46,14 @@ export class App {
   decision: 'retry' | 'accepted' = 'retry';
   decisionReason = '';
   decisionConfirmed = false;
+  historyKey = '';
+  historyChannel = 'slack';
+  historyTarget = '';
+  historyAttempt = '';
+  readonly historyStatus = signal<'idle' | 'loading' | 'loaded' | 'error'>('idle');
+  readonly historyRows = signal<DecisionHistory[]>([]);
+  private historyRequestId = 0;
+  private historyAbort: AbortController | null = null;
   alertKey = '';
   private alertHistory: (AlertCursor | null)[] = [null];
   private alertRequestId = 0;
@@ -107,6 +116,46 @@ export class App {
     this.alertStatus.set('idle');
     this.alertError.set('');
     this.clearDecision();
+    this.clearHistory(true);
+  }
+
+  clearHistory(clearKey = false): void {
+    this.historyRequestId++;
+    this.historyAbort?.abort();
+    this.historyAbort = null;
+    this.historyRows.set([]);
+    this.historyStatus.set('idle');
+    if (clearKey) { this.historyKey = ''; this.historyTarget = ''; this.historyAttempt = ''; this.historyChannel = 'slack'; }
+  }
+
+  async loadDecisionHistory(): Promise<void> {
+    if (this.decisionStatus() === 'sending') return;
+    this.clearHistory();
+    const id = this.historyRequestId;
+    const key = this.historyKey.trim();
+    const target = this.historyTarget.trim();
+    const attempt = this.historyAttempt.trim();
+    if (!/^[0-9a-f]{64}$/.test(key) || !['email','slack'].includes(this.historyChannel) || !/^[A-Za-z0-9._-]{1,64}$/.test(target) || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(attempt)) { this.historyStatus.set('error'); return; }
+    const controller = new AbortController();
+    this.historyAbort = controller;
+    this.historyStatus.set('loading');
+    try {
+      const query = new URLSearchParams({channel:this.historyChannel,targetId:target,attemptId:attempt});
+      const response = await fetch(`${this.validatedOrigin()}/v1/experimental/console/alerts/decisions?${query}`, {method:'GET',headers:{Authorization:`SwallowConsole ${key}`},cache:'no-store',credentials:'omit',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      if (!response.ok) throw new Error('history unavailable');
+      const body: unknown = await response.json();
+      if (typeof body !== 'object' || body === null || !('data' in body) || !Array.isArray(body.data) || body.data.length > 20) throw new Error('invalid history');
+      const rows: DecisionHistory[] = body.data.map((row: unknown) => {
+        if (typeof row !== 'object' || row === null || !('id' in row) || typeof row.id !== 'string' || !/^\d+$/.test(row.id) || !('decision' in row) || (row.decision !== 'retry' && row.decision !== 'accepted') || !('reason' in row) || typeof row.reason !== 'string' || !('createdAt' in row) || typeof row.createdAt !== 'string') throw new Error('invalid history');
+        return {id:row.id,decision:row.decision,reason:row.reason,createdAt:row.createdAt};
+      });
+      if (id !== this.historyRequestId) return;
+      this.historyRows.set(rows); this.historyStatus.set('loaded');
+    } catch {
+      if (id === this.historyRequestId) this.historyStatus.set('error');
+    } finally {
+      if (id === this.historyRequestId) this.historyAbort = null;
+    }
   }
 
   clearDecision(): void {
@@ -154,6 +203,10 @@ export class App {
     } catch {
       this.decisionStatus.set('unknown');
     } finally {
+      this.clearHistory(true);
+      this.historyChannel = slot.channel;
+      this.historyTarget = slot.targetId;
+      this.historyAttempt = slot.attemptId;
       this.decisionKey = '';
       this.decisionReason = '';
       this.decisionConfirmed = false;

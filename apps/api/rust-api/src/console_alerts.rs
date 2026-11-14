@@ -13,6 +13,65 @@ use std::{collections::HashMap, sync::Arc};
 use tokio_postgres::Client;
 use uuid::Uuid;
 
+pub(super) async fn history(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let path = uri.to_string();
+    let failure = |status, message, label| error_at(status, message, label, &path).into_response();
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("SwallowConsole "));
+    let Some(token) = token.filter(|v| {
+        v.len() == 64
+            && v.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    }) else {
+        return failure(StatusCode::UNAUTHORIZED, "Unauthorized", "Unauthorized");
+    };
+    let fields = (
+        params.get("channel"),
+        params.get("targetId"),
+        params
+            .get("attemptId")
+            .and_then(|v| Uuid::parse_str(v).ok()),
+    );
+    let (Some(channel), Some(target), Some(attempt)) = fields else {
+        return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+    };
+    if params.len() != 3 {
+        return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+    }
+    let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+    match db
+        .query_one(
+            "SELECT public.novu_rust_console_decision_history($1,$2,$3,$4)",
+            &[&hash, &channel, &target, &attempt],
+        )
+        .await
+    {
+        Ok(row) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(row.get::<_, Value>(0)),
+        )
+            .into_response(),
+        Err(e) if e.code().is_some_and(|c| c.code() == "42501") => {
+            failure(StatusCode::UNAUTHORIZED, "Unauthorized", "Unauthorized")
+        }
+        Err(e) if e.code().is_some_and(|c| c.code() == "22023") => {
+            failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request")
+        }
+        Err(_) => failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal server error",
+            "Internal Server Error",
+        ),
+    }
+}
+
 pub(super) async fn resolve(
     State(db): State<Arc<Client>>,
     headers: HeaderMap,

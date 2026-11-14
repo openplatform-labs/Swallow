@@ -55,6 +55,23 @@
         @if (decisionStatus() === 'recorded') { <p class="decision-result" role="status">판정을 기록했습니다. 현재 상태와 감사 기록을 다시 확인해 주세요. 실제 수신이 확인된 것은 아닙니다.</p> }
         @if (decisionStatus() === 'rejected') { <p class="decision-result subscriber-error" role="alert">요청이 거절되었습니다. 인증·권한과 최신 시도를 확인한 뒤 다시 조회해 주세요.</p> }
         @if (decisionStatus() === 'unknown') { <p class="decision-result subscriber-error" role="alert">결과를 확인할 수 없습니다. 재시도하기 전에 상태와 감사 기록을 확인해 주세요.</p> }
+        <section class="card decision-card"><div class="card-block">
+          <div class="card-eyebrow">DECISION HISTORY</div><h2>내 판정 이력 확인</h2>
+          <p>판정에 사용한 같은 인증 값으로 시도별 최근 이력을 조회합니다. 이력이 없어도 요청이 아직 처리 중이거나 다른 인증·환경을 사용했을 수 있으므로 실패로 단정하지 마세요.</p>
+          <form class="decision-form" (ngSubmit)="loadDecisionHistory()">
+            <label for="history-key">판정 권한 인증 값</label><input id="history-key" class="clr-input" name="historyKey" type="password" [(ngModel)]="historyKey" (ngModelChange)="clearHistory()" [disabled]="decisionStatus() === 'sending'" autocomplete="off" spellcheck="false" required>
+            <label for="history-channel">채널</label><select id="history-channel" class="clr-select" name="historyChannel" [(ngModel)]="historyChannel" (ngModelChange)="clearHistory()" [disabled]="decisionStatus() === 'sending'"><option value="slack">Slack</option><option value="email">이메일</option></select>
+            <label for="history-target">대상 ID</label><input id="history-target" class="clr-input" name="historyTarget" [(ngModel)]="historyTarget" (ngModelChange)="clearHistory()" [disabled]="decisionStatus() === 'sending'" autocomplete="off" required>
+            <label for="history-attempt">발송 시도 ID</label><input id="history-attempt" class="clr-input" name="historyAttempt" [(ngModel)]="historyAttempt" (ngModelChange)="clearHistory()" [disabled]="decisionStatus() === 'sending'" autocomplete="off" required>
+            <div><button type="submit" class="btn btn-outline" [disabled]="decisionStatus() === 'sending' || historyStatus() === 'loading'">이력 조회</button><button type="button" class="btn btn-outline" [disabled]="decisionStatus() === 'sending'" (click)="clearHistory(true)">이력 지우기</button></div>
+          </form>
+          @if (historyStatus() === 'error') {<p class="subscriber-error" role="alert">이력을 조회하지 못했습니다. 인증·권한과 입력 값을 확인해 주세요.</p>}
+          @else if (historyStatus() === 'loading') {<p role="status">이력을 불러오는 중입니다.</p>}
+          @else if (historyStatus() === 'loaded') {
+            @if (historyRows().length === 0) {<p>해당 인증의 이력이 없습니다. 원래 요청의 처리 상태와 관리자 감사 기록도 확인하세요.</p>}
+            @else {<div class="table-wrap"><table class="table"><thead><tr><th>기록 ID</th><th>판정</th><th>사유</th><th>기록 시각</th></tr></thead><tbody>@for (entry of historyRows(); track entry.id) {<tr><td>{{ entry.id }}</td><td>{{ entry.decision }}</td><td>{{ entry.reason }}</td><td>{{ entry.createdAt }}</td></tr>}</tbody></table></div><p>최대 최근 20건입니다. 기록 순서는 커밋 순서를 보장하지 않습니다.</p>}
+          }
+        </div></section>
         @if (selectedAlert(); as slot) {
           <section class="card decision-card"><div class="card-block">
             <div class="card-eyebrow">REVIEW DECISION</div><h2>경보 발송 판정</h2>

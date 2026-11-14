@@ -3,6 +3,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
+use http_body_util::BodyExt;
 use sha2::{Digest, Sha256};
 use std::{process::Command, sync::Arc};
 use tokio_postgres::{Client, NoTls};
@@ -23,7 +24,7 @@ async fn independently_scoped_decisions_are_fenced_and_audited() {
     db.batch_execute("INSERT INTO public.novu_rust_environments VALUES ('decision-a','org'),('decision-b','org')").await.unwrap();
     let admin_role = format!("decision_admin_{}", Uuid::new_v4().simple());
     let api_role = format!("decision_api_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {admin_role} LOGIN; CREATE ROLE {api_role} LOGIN; GRANT USAGE ON SCHEMA public TO {admin_role},{api_role}; GRANT EXECUTE ON FUNCTION public.novu_rust_manage_console_alert_decision(text,uuid,text,text,text),public.novu_rust_list_console_alert_decisions(text,uuid),public.novu_rust_list_console_decision_audit(text,bigint,text) TO {admin_role}; GRANT EXECUTE ON FUNCTION public.novu_rust_console_resolve_alert(text,text,text,uuid,text,text) TO {api_role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {admin_role} LOGIN; CREATE ROLE {api_role} LOGIN; GRANT USAGE ON SCHEMA public TO {admin_role},{api_role}; GRANT EXECUTE ON FUNCTION public.novu_rust_manage_console_alert_decision(text,uuid,text,text,text),public.novu_rust_list_console_alert_decisions(text,uuid),public.novu_rust_list_console_decision_audit(text,bigint,text) TO {admin_role}; GRANT EXECUTE ON FUNCTION public.novu_rust_console_resolve_alert(text,text,text,uuid,text,text),public.novu_rust_console_decision_history(text,text,text,uuid) TO {api_role}")).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_console_credential_admins(environment_id,database_principal,principal_oid) SELECT 'decision-a',rolname,oid FROM pg_roles WHERE rolname::text=$1", &[&admin_role]).await.unwrap();
     for decision in ["alert_retry", "alert_accepted"] {
         db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'decision-a',rolname,$2,oid FROM pg_roles WHERE rolname::text=$1", &[&api_role,&decision]).await.unwrap();
@@ -149,6 +150,68 @@ async fn independently_scoped_decisions_are_fenced_and_audited() {
     let audit: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
     assert_eq!(audit[0]["credentialId"], id.to_string());
     assert_eq!(audit[0]["details"]["attemptId"], attempt.to_string());
+    let history = |token: &str, attempt: Uuid| {
+        Request::builder().uri(format!("/v1/experimental/console/alerts/decisions?channel=slack&targetId=ops&attemptId={attempt}")).header("authorization",format!("SwallowConsole {token}")).body(Body::empty()).unwrap()
+    };
+    let history_response = router
+        .clone()
+        .oneshot(history(&"a".repeat(64), attempt))
+        .await
+        .unwrap();
+    assert_eq!(history_response.status(), StatusCode::OK);
+    let body = history_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let history_value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(history_value["data"].as_array().unwrap().len(), 1);
+    assert_eq!(history_value["data"][0]["decision"], "retry");
+    assert_eq!(history_value["data"][0]["reason"], "verified");
+    let other_token = "b".repeat(64);
+    let other_hash = format!("{:x}", Sha256::digest(other_token.as_bytes()));
+    let other_id:Uuid=db.query_one("INSERT INTO public.novu_rust_console_credentials(token_hash,environment_id,expires_at,subscriber_read) VALUES($1,'decision-a',clock_timestamp()+interval '1 hour',false) RETURNING credential_id", &[&other_hash]).await.unwrap().get(0);
+    assert!(
+        run(&[
+            "decision-access",
+            "decision-a",
+            &other_id.to_string(),
+            "retry",
+            "grant",
+            "ticket"
+        ])
+        .status
+        .success()
+    );
+    let other = router
+        .clone()
+        .oneshot(history(&other_token, attempt))
+        .await
+        .unwrap();
+    assert_eq!(other.status(), StatusCode::OK);
+    let body = other.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["data"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    db.execute("INSERT INTO public.novu_rust_console_alert_decision_audit(environment_id,credential_id,channel,target_id,attempt_id,decision,reason,database_session_user) SELECT 'decision-a',$1,'slack','ops',$2,'retry','batch',session_user FROM generate_series(1,22)", &[&other_id,&attempt]).await.unwrap();
+    let bounded = router
+        .clone()
+        .oneshot(history(&other_token, attempt))
+        .await
+        .unwrap();
+    let body = bounded.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["data"]
+            .as_array()
+            .unwrap()
+            .len(),
+        20
+    );
     assert!(
         run(&[
             "decision-access",
@@ -160,6 +223,28 @@ async fn independently_scoped_decisions_are_fenced_and_audited() {
         ])
         .status
         .success()
+    );
+    // Removing the only decision grant also removes access to own history.
+    assert!(
+        run(&[
+            "decision-access",
+            "decision-a",
+            &other_id.to_string(),
+            "retry",
+            "revoke",
+            "ticket"
+        ])
+        .status
+        .success()
+    );
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(history(&other_token, attempt))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
     );
     db.execute("UPDATE public.novu_rust_alert_delivery_slots SET state='rejected' WHERE environment_id='decision-a' AND target_id='ops'", &[]).await.unwrap();
     assert_eq!(
@@ -238,5 +323,5 @@ async fn independently_scoped_decisions_are_fenced_and_audited() {
     tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
     tx.commit().await.unwrap();
     assert_eq!(pending.await.unwrap(), StatusCode::UNAUTHORIZED);
-    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_console_alert_decision_audit WHERE environment_id='decision-a'", &[]).await.unwrap().get::<_,i64>(0),2);
+    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_console_alert_decision_audit WHERE environment_id='decision-a' AND credential_id=$1", &[&id]).await.unwrap().get::<_,i64>(0),2);
 }
