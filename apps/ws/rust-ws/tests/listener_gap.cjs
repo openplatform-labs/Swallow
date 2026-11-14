@@ -32,6 +32,16 @@ async function until(fn,message,timeout=4000){for(let i=0;i<timeout/25;i++){if(f
   sql("INSERT INTO novu_rust_ws_events(environment_id,subscriber_internal_id,event,data) VALUES ('env-a','subscriber-id','recovered_probe','{\"ok\":true}')");
   await until(()=>resumed.messages.some(x=>x.includes('recovered_probe')),'reconnected socket did not receive event');
   await until(()=>legacy.messages.some(x=>x.includes('recovered_probe')),'default socket did not receive event');
-  resumed.ws.close();legacy.ws.close();guarded.ws.close();
-  console.log('listener loss policy closes guarded sockets, preserves default, and resumes events');
+  sql("ALTER TABLE novu_rust_ws_events RENAME TO temporarily_unavailable_ws_events; INSERT INTO temporarily_unavailable_ws_events(environment_id,subscriber_internal_id,event,data) VALUES ('env-a','subscriber-id','lost_probe','{}')");
+  await until(()=>resumed.messages.some(x=>x.startsWith('41'))||resumed.closed,'guarded socket was not disconnected after event lookup failure');
+  assert(!legacy.closed && !legacy.messages.some(x=>x.startsWith('41')),'default socket closed after event lookup failure');
+  sql("ALTER TABLE temporarily_unavailable_ws_events RENAME TO novu_rust_ws_events");
+  const restored=await open(process.env.GUARDED_PORT);await wait(200);
+  sql("INSERT INTO novu_rust_ws_events(environment_id,subscriber_internal_id,event,data) VALUES ('env-a','subscriber-id','second_recovery','{}')");
+  await until(()=>restored.messages.some(x=>x.includes('second_recovery')),'guarded delivery did not recover after lookup failure');
+  sql("BEGIN; INSERT INTO novu_rust_ws_events(id,environment_id,subscriber_internal_id,event,data) VALUES ('00000000-0000-4000-8000-000000000001','env-a','subscriber-id','missing_probe','{}'); DELETE FROM novu_rust_ws_events WHERE id='00000000-0000-4000-8000-000000000001'; COMMIT");
+  await until(()=>restored.messages.some(x=>x.startsWith('41'))||restored.closed,'missing event did not disconnect guarded socket');
+  assert(!legacy.closed && !legacy.messages.some(x=>x.startsWith('41')),'default socket closed for missing event');
+  restored.ws.close();resumed.ws.close();legacy.ws.close();guarded.ws.close();
+  console.log('listener and event query failures close guarded sockets, preserve default, and recover');
 })().catch(e=>{console.error(e);process.exitCode=1});

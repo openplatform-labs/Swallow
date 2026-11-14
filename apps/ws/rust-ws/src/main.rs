@@ -96,6 +96,14 @@ enum ListenerEvent {
     },
 }
 
+fn disconnect_all(io: &SocketIo) {
+    if let Some(namespace) = io.of("/") {
+        for socket in namespace.sockets() {
+            socket.disconnect().ok();
+        }
+    }
+}
+
 fn disconnect_identity(io: &SocketIo, environment: &str, subscriber: &str) {
     if io.of("/").is_none() {
         return;
@@ -211,13 +219,11 @@ async fn deliver_event(
     db: &Database,
     io: &SocketIo,
     id: Uuid,
-) -> Result<(), tokio_postgres::Error> {
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let row = db.lock().await?.query_opt(
         "SELECT e.environment_id,e.subscriber_internal_id,e.context_keys,e.event,e.data,EXISTS(SELECT 1 FROM novu_rust_subscribers s WHERE s.environment_id=e.environment_id AND s.internal_id=e.subscriber_internal_id) FROM novu_rust_ws_events e WHERE e.id=$1", &[&id]
     ).await?;
-    let Some(row) = row else {
-        return Ok(());
-    };
+    let row = row.ok_or("socket event record missing")?;
     let environment: String = row.get(0);
     let subscriber: String = row.get(1);
     let context: Vec<String> = row.get(2);
@@ -552,11 +558,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             let _ = driver.await;
             if disconnect_on_gap {
                 listener_generation_task.fetch_add(1, Ordering::SeqCst);
-                if let Some(namespace) = listener_io.of("/") {
-                    for socket in namespace.sockets() {
-                        socket.disconnect().ok();
-                    }
-                }
+                disconnect_all(&listener_io);
             }
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -575,12 +577,19 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     });
     let events_db = db.clone();
     let events_io = io.clone();
+    let events_generation = listener_generation.clone();
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
             match event {
                 ListenerEvent::Delivery(id) => {
                     if let Err(error) = deliver_event(&events_db, &events_io, id).await {
                         eprintln!("socket event delivery failed: {error}");
+                        if disconnect_on_gap {
+                            // Preserve odd/even listener availability, while invalidating
+                            // registrations overlapping a failed event lookup.
+                            events_generation.fetch_add(2, Ordering::SeqCst);
+                            disconnect_all(&events_io);
+                        }
                     }
                 }
                 ListenerEvent::SubscriberDeleted {
