@@ -9,6 +9,7 @@ mod fcm_integrations;
 mod inbox_context;
 mod inbox_data;
 mod preferences;
+pub mod operator_access_token;
 pub mod resend_webhook;
 mod sendgrid_webhook;
 mod slack_endpoints;
