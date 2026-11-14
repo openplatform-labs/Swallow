@@ -64,13 +64,14 @@ fn read_secret(_path: &str) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: console-credential issue ENV SECONDS NEW_FILE REASON | issue-scoped ENV SECONDS NEW_FILE subscriber|none REASON | issue-permissions ENV SECONDS NEW_FILE none|subscriber|alert|both REASON | rotate ENV OLD_ID SECONDS NEW_FILE REASON | rotation-audit ENV [AFTER_ID] | subscriber-access ENV CREDENTIAL_ID grant|revoke REASON | subscriber-access-list ENV [AFTER_ID] | subscriber-access-audit ENV [AFTER_ID] | inspect ENV TOKEN_FILE | revoke ENV CREDENTIAL_ID REASON | list ENV [AFTER_ID] | audit ENV [AFTER_ID] | alert-access ENV CREDENTIAL_ID grant|revoke REASON | alert-access-list ENV [AFTER_ID] | alert-access-audit ENV [AFTER_ID]";
-    let valid = matches!(args.as_slice(),[action,_,_,_,_,_] if action=="issue-scoped" || action=="issue-permissions" || action=="rotate")
+    let usage = "usage: console-credential issue ENV SECONDS NEW_FILE REASON | issue-scoped ENV SECONDS NEW_FILE subscriber|none REASON | issue-permissions ENV SECONDS NEW_FILE none|subscriber|alert|both REASON | rotate ENV OLD_ID SECONDS NEW_FILE REASON | rotate-overlap ENV OLD_ID SECONDS GRACE_SECONDS NEW_FILE REASON | rotation-audit ENV [AFTER_ID] | rotation-audit-v2 ENV [AFTER_ID] | subscriber-access ENV CREDENTIAL_ID grant|revoke REASON | subscriber-access-list ENV [AFTER_ID] | subscriber-access-audit ENV [AFTER_ID] | inspect ENV TOKEN_FILE | revoke ENV CREDENTIAL_ID REASON | list ENV [AFTER_ID] | audit ENV [AFTER_ID] | alert-access ENV CREDENTIAL_ID grant|revoke REASON | alert-access-list ENV [AFTER_ID] | alert-access-audit ENV [AFTER_ID]";
+    let valid = matches!(args.as_slice(),[action,_,_,_,_,_,_] if action=="rotate-overlap")
+        || matches!(args.as_slice(),[action,_,_,_,_,_] if action=="issue-scoped" || action=="issue-permissions" || action=="rotate")
         || matches!(args.as_slice(),[action,_,_,_,_] if action=="issue" || action=="alert-access" || action=="subscriber-access")
         || matches!(args.as_slice(),[action,_,_,_] if action=="revoke")
         || matches!(args.as_slice(),[action,_,_] if action=="inspect")
-        || matches!(args.as_slice(),[action,_] if action=="list" || action=="audit" || action=="rotation-audit" || action=="alert-access-list" || action=="alert-access-audit" || action=="subscriber-access-list" || action=="subscriber-access-audit")
-        || matches!(args.as_slice(),[action,_,_] if action=="list" || action=="audit" || action=="rotation-audit" || action=="alert-access-list" || action=="alert-access-audit" || action=="subscriber-access-list" || action=="subscriber-access-audit");
+        || matches!(args.as_slice(),[action,_] if action=="list" || action=="audit" || action=="rotation-audit" || action=="rotation-audit-v2" || action=="alert-access-list" || action=="alert-access-audit" || action=="subscriber-access-list" || action=="subscriber-access-audit")
+        || matches!(args.as_slice(),[action,_,_] if action=="list" || action=="audit" || action=="rotation-audit" || action=="rotation-audit-v2" || action=="alert-access-list" || action=="alert-access-audit" || action=="subscriber-access-list" || action=="subscriber-access-audit");
     if !valid {
         return Err(usage.into());
     }
@@ -81,11 +82,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let _ = connection.await;
     });
     match args[0].as_str() {
-        "rotate" => {
+        "rotate" | "rotate-overlap" => {
+            let overlap = args[0] == "rotate-overlap";
             let old = Uuid::parse_str(&args[2])?;
             let seconds: i64 = args[3].parse()?;
             if !(1..=2_592_000).contains(&seconds) {
                 return Err("lifetime must be 1 to 2592000 seconds".into());
+            }
+            let grace: i32 = if overlap { args[4].parse()? } else { 0 };
+            if overlap && !(1..=86400).contains(&grace) {
+                return Err("overlap must be 1 to 86400 seconds".into());
             }
             let mut random = [0u8; 32];
             SystemRandom::new()
@@ -95,14 +101,37 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 .iter()
                 .map(|v| format!("{v:02x}"))
                 .collect::<String>();
-            write_secret(&args[4], token.as_bytes())
+            let file = if overlap { &args[5] } else { &args[4] };
+            let reason = if overlap { &args[6] } else { &args[5] };
+            write_secret(file, token.as_bytes())
                 .map_err(|_| "token file creation failed; inspect the destination safely")?;
             let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
-            let result = tokio::time::timeout(std::time::Duration::from_secs(30), db.query_one("SELECT public.novu_rust_rotate_console_credential($1,$2,$3,clock_timestamp()+($4::bigint * interval '1 second'),$5)", &[&args[1],&old,&hash,&seconds,&args[5]])).await;
+            let result = if overlap {
+                tokio::time::timeout(std::time::Duration::from_secs(30), db.query_one("SELECT * FROM public.novu_rust_rotate_console_credential_overlap($1,$2,$3,clock_timestamp()+($4::bigint * interval '1 second'),$5,$6)", &[&args[1],&old,&hash,&seconds,&grace,reason])).await
+            } else {
+                tokio::time::timeout(std::time::Duration::from_secs(30), db.query_one("SELECT public.novu_rust_rotate_console_credential($1,$2,$3,clock_timestamp()+($4::bigint * interval '1 second'),$5)", &[&args[1],&old,&hash,&seconds,reason])).await
+            };
             match result {
-                Ok(Ok(row)) => println!("{}",json!({"credentialId":row.get::<_,Uuid>(0).to_string(),"tokenFileCreated":true})),
+                Ok(Ok(row)) => println!("{}",json!({"credentialId":row.get::<_,Uuid>(0).to_string(),"tokenFileCreated":true,"oldValidUntil":if overlap {Some(row.get::<_,String>(1))} else {None}})),
                 _ => return Err("rotation result unavailable; token file retained; reconcile old and new credentials and rotation audit before retrying".into()),
             }
+        }
+        "rotation-audit-v2" => {
+            let after = args
+                .get(2)
+                .map(|s| s.parse::<i64>())
+                .transpose()?
+                .unwrap_or(0);
+            let rows = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                db.query(
+                    "SELECT * FROM public.novu_rust_list_console_rotation_audit_v2($1,$2)",
+                    &[&args[1], &after],
+                ),
+            )
+            .await??;
+            let values: Vec<_> = rows.into_iter().map(|r| json!({"id":r.get::<_,String>(0),"oldCredentialId":r.get::<_,Uuid>(1).to_string(),"newCredentialId":r.get::<_,Uuid>(2).to_string(),"actor":r.get::<_,String>(3),"reason":r.get::<_,String>(4),"createdAt":r.get::<_,String>(5),"oldValidUntil":r.get::<_,Option<String>>(6)})).collect();
+            println!("{}", serde_json::to_string(&values)?);
         }
         "rotation-audit" => {
             let after = args
