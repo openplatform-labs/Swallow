@@ -105,6 +105,7 @@ async fn main() -> Result<()> {
         slack_policy_cancelled: None,
         email_policy_cancelled: None,
         sms_policy_cancelled: None,
+        push_policy_cancelled: None,
         channel_policy_check_failed: false,
         failed_checks: [false; 5],
         failed_jobs: None,

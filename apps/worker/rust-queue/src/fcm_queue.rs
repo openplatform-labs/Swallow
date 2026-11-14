@@ -1214,6 +1214,19 @@ mod tests {
             .unwrap();
         assert_eq!(row.get::<_, String>(0), "error");
         assert_eq!(row.get::<_, String>(1), "unknown");
+        db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'push-guard',session_user,'alert_view',oid FROM pg_roles WHERE rolname=session_user",&[]).await.unwrap();
+        assert_eq!(
+            crate::reconciliation::channel_policy_count(&db, "push-guard", "push")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            crate::reconciliation::push_policy_evidence(&db, "push-guard", job, 1)
+                .await
+                .unwrap(),
+            json!({"accepted":1,"rejected":0,"unknown":0,"dispatching":0,"unattempted":1})
+        );
         let legacy = Uuid::new_v4();
         let mut old = payload.clone();
         old.as_object_mut().unwrap().remove("workflow_guard");

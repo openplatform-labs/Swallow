@@ -158,6 +158,24 @@ pub async fn acknowledge_channel_policy(
         .get(0))
 }
 
+/// Aggregate attempt counts for the reviewed push cancellation revision.
+pub async fn push_policy_evidence(
+    client: &Client,
+    environment: &str,
+    job: Uuid,
+    revision: i64,
+) -> Result<Value> {
+    let r = client
+        .query_one(
+            "SELECT * FROM public.novu_rust_push_policy_evidence($1,$2,$3)",
+            &[&environment, &job, &revision],
+        )
+        .await?;
+    Ok(
+        json!({"accepted":r.get::<_,i64>(0),"rejected":r.get::<_,i64>(1),"unknown":r.get::<_,i64>(2),"dispatching":r.get::<_,i64>(3),"unattempted":r.get::<_,Option<i64>>(4)}),
+    )
+}
+
 /// Count failed queue jobs not acknowledged for their current snapshot.
 pub async fn failed_queue_count(client: &Client, environment: &str) -> Result<i64> {
     Ok(client

@@ -314,6 +314,7 @@ pub struct Alert {
     pub slack_policy_cancelled: Option<u64>,
     pub email_policy_cancelled: Option<u64>,
     pub sms_policy_cancelled: Option<u64>,
+    pub push_policy_cancelled: Option<u64>,
     pub channel_policy_check_failed: bool,
     pub failed_checks: [bool; 5], // resend, queue, attempts, twilio, Slack chat
     pub failed_jobs: Option<u64>,
@@ -384,6 +385,9 @@ impl Alert {
         if self.channel_policy_check_failed {
             mask |= 1 << 28;
         }
+        if self.push_policy_cancelled.is_some_and(|n| n > 0) {
+            mask |= 1 << 29;
+        }
         mask
     }
     /// Bits whose current state was actually observed, excluding unavailable or disabled checks.
@@ -449,8 +453,12 @@ impl Alert {
         if self.sms_policy_cancelled.is_some() {
             known |= 1 << 27;
         }
+        if self.push_policy_cancelled.is_some() {
+            known |= 1 << 29;
+        }
         if self.email_policy_cancelled.is_some()
             || self.sms_policy_cancelled.is_some()
+            || self.push_policy_cancelled.is_some()
             || self.channel_policy_check_failed
         {
             known |= 1 << 28;
@@ -511,6 +519,9 @@ impl Alert {
         }
         if let Some(n) = self.sms_policy_cancelled {
             details.push(format!("SMS workflow policy cancellations: {n}"));
+        }
+        if let Some(n) = self.push_policy_cancelled {
+            details.push(format!("Push workflow policy cancellations: {n}"));
         }
         if self.channel_policy_check_failed {
             details.push("Channel policy cancellation check failed".into());
@@ -1131,6 +1142,7 @@ mod tests {
             slack_policy_cancelled: None,
             email_policy_cancelled: None,
             sms_policy_cancelled: None,
+            push_policy_cancelled: None,
             channel_policy_check_failed: false,
             failed_checks: [false; 5],
             failed_jobs: None,
@@ -1145,6 +1157,13 @@ mod tests {
         let mut a = alert();
         a.email_policy_cancelled = Some(2);
         a.sms_policy_cancelled = Some(0);
+        a.push_policy_cancelled = Some(1);
+        assert_ne!(a.condition_mask() & (1 << 29), 0);
+        assert!(
+            a.text()
+                .unwrap()
+                .contains("Push workflow policy cancellations: 1")
+        );
         assert_ne!(a.condition_mask() & (1 << 26), 0);
         assert_eq!(a.condition_mask() & (1 << 27), 0);
         assert_ne!(a.observed_condition_mask() & (1 << 27), 0);
@@ -1706,6 +1725,7 @@ mod tests {
             slack_policy_cancelled: None,
             email_policy_cancelled: None,
             sms_policy_cancelled: None,
+            push_policy_cancelled: None,
             channel_policy_check_failed: false,
             failed_checks: [false; 5],
             failed_jobs: None,

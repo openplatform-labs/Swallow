@@ -6,7 +6,7 @@ use uuid::Uuid;
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if ![2, 3, 4, 5, 6, 7].contains(&args.len()) {
-        return Err("usage: delivery-reconcile check-channel-policy ENV email|sms|all | list-channel-policy ENV email|sms|all [AFTER_JOB] | ack-channel-policy ENV JOB REVISION OPERATOR REASON | check-failed-jobs ENV | list-failed-jobs ENV [AFTER_JOB] | ack-failed-job ENV JOB OPERATOR REASON | list-slack ENV [AFTER_JOB] | slack-ack ENV JOB OPERATOR REASON | operator-scope ENV | operator-scope-set ENV DB_LOGIN GRANT_JSON REVOKE_JSON REASON | operator-scope-audit ENV [AFTER_ID] | operator-grants ENV [AFTER_LOGIN AFTER_PERMISSION] | operator-grant-audit ENV [AFTER_ID] | operator-grant|operator-revoke ENV DB_LOGIN PERMISSION REASON | check|check-slack ENV | slack-resolve ENV JOB retry|accepted OPERATOR REASON | check-alert-delivery ENV | alert-status ENV | alert-resolve ENV CHANNEL TARGET DECISION OPERATOR REASON | check-queue ENV MAX_WAIT_SECONDS | check-resend|check-resend-metrics|check-twilio|check-twilio-metrics|check-sendgrid|check-sendgrid-metrics ENV GRACE_SECONDS HEARTBEAT_MAX_SECONDS | list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | email-dispatch-evidence|sendgrid-result ENV EMAIL_JOB | resend-evidence|resend-check|resend-result ENV EMAIL_JOB | sms-evidence|sms-delivery|twilio-result ENV SMS_JOB | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
+        return Err("usage: delivery-reconcile check-channel-policy ENV email|sms|push|all | list-channel-policy ENV email|sms|push|all [AFTER_JOB] | ack-channel-policy ENV JOB REVISION OPERATOR REASON | push-policy-evidence ENV JOB REVISION | check-failed-jobs ENV | list-failed-jobs ENV [AFTER_JOB] | ack-failed-job ENV JOB OPERATOR REASON | list-slack ENV [AFTER_JOB] | slack-ack ENV JOB OPERATOR REASON | operator-scope ENV | operator-scope-set ENV DB_LOGIN GRANT_JSON REVOKE_JSON REASON | operator-scope-audit ENV [AFTER_ID] | operator-grants ENV [AFTER_LOGIN AFTER_PERMISSION] | operator-grant-audit ENV [AFTER_ID] | operator-grant|operator-revoke ENV DB_LOGIN PERMISSION REASON | check|check-slack ENV | slack-resolve ENV JOB retry|accepted OPERATOR REASON | check-alert-delivery ENV | alert-status ENV | alert-resolve ENV CHANNEL TARGET DECISION OPERATOR REASON | check-queue ENV MAX_WAIT_SECONDS | check-resend|check-resend-metrics|check-twilio|check-twilio-metrics|check-sendgrid|check-sendgrid-metrics ENV GRACE_SECONDS HEARTBEAT_MAX_SECONDS | list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | email-dispatch-evidence|sendgrid-result ENV EMAIL_JOB | resend-evidence|resend-check|resend-result ENV EMAIL_JOB | sms-evidence|sms-delivery|twilio-result ENV SMS_JOB | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
     }
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let (mut db, connection) = config.connect(tls).await?;
@@ -15,7 +15,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             eprintln!("database connection failed");
         }
     });
-    if args.len() == 3 && args[0] == "check-channel-policy" {
+    if args.len() == 4 && args[0] == "push-policy-evidence" {
+        let evidence = novu_postgres_queue::reconciliation::push_policy_evidence(
+            &db,
+            &args[1],
+            Uuid::parse_str(&args[2])?,
+            args[3].parse::<i64>()?,
+        )
+        .await?;
+        println!("{}", serde_json::to_string(&evidence)?);
+    } else if args.len() == 3 && args[0] == "check-channel-policy" {
         let count =
             novu_postgres_queue::reconciliation::channel_policy_count(&db, &args[1], &args[2])
                 .await?;

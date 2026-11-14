@@ -45,7 +45,13 @@ async fn cancellation_alerts_are_scoped_and_acknowledge_each_revision() {
     let role = format!("channel_policy_{}", Uuid::new_v4().simple());
     db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'fixture-password'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_list_channel_policy_attention(text,text,uuid),public.novu_rust_ack_channel_policy(text,uuid,text,text) TO {role}")).await.unwrap();
     let upgrade = Command::new(env!("CARGO_BIN_EXE_migrate-worker"))
-        .args(["apply", "worker", worker.to_str().unwrap()])
+        .args([
+            "apply",
+            "worker",
+            worker.to_str().unwrap(),
+            "--through",
+            "124",
+        ])
         .env("DATABASE_URL", &url)
         .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
         .output()
@@ -58,10 +64,24 @@ async fn cancellation_alerts_are_scoped_and_acknowledge_each_revision() {
     assert!(db.query_one("SELECT to_regprocedure('public.novu_rust_ack_channel_policy(text,uuid,text,text)') IS NULL", &[]).await.unwrap().get::<_,bool>(0));
     assert!(!db.query_one("SELECT has_function_privilege($1,'public.novu_rust_list_channel_policy_attention(text,text,uuid)','execute')", &[&role]).await.unwrap().get::<_,bool>(0));
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_count_channel_policy_attention(text,text),public.novu_rust_list_channel_policy_attention(text,text,uuid),public.novu_rust_ack_channel_policy(text,uuid,bigint,text,text),public.novu_rust_reserve_alert(text,text,text,integer,integer),public.novu_rust_finish_alert(text,text,text,uuid,text,integer) TO {role}")).await.unwrap();
+    let upgrade = Command::new(env!("CARGO_BIN_EXE_migrate-worker"))
+        .args(["apply", "worker", worker.to_str().unwrap()])
+        .env("DATABASE_URL", &url)
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .output()
+        .unwrap();
+    assert!(
+        upgrade.status.success(),
+        "{}",
+        String::from_utf8_lossy(&upgrade.stderr)
+    );
+    assert!(db.query_one("SELECT has_function_privilege($1,'public.novu_rust_list_channel_policy_attention(text,text,uuid)','execute')", &[&role]).await.unwrap().get::<_,bool>(0));
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_push_policy_evidence(text,uuid,bigint) TO {role}")).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'a',$1,p.permission,r.oid FROM pg_roles r CROSS JOIN (VALUES ('alert_view'),('queue_ack'),('alert_send')) p(permission) WHERE r.rolname::text=$1", &[&role]).await.unwrap();
     let email = Uuid::new_v4();
     let sms = Uuid::new_v4();
     let other = Uuid::new_v4();
+    let push = Uuid::new_v4();
     for (id, env, kind, reason) in [
         (
             email,
@@ -92,6 +112,17 @@ async fn cancellation_alerts_are_scoped_and_acknowledge_each_revision() {
         .await
         .unwrap();
     }
+    queue::enqueue(
+        &db,
+        push,
+        "a",
+        queue::fcm_queue::JOB_KIND,
+        &json!({"prepared_messages":[{},{}],"secret":"not returned"}),
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO public.novu_rust_fcm_attempts(job_id,environment_id,target_index,state) VALUES ($1,'a',0,'accepted')", &[&push]).await.unwrap();
+    db.execute("UPDATE public.novu_queue_jobs SET status='cancelled',last_error='push workflow step changed' WHERE id=$1", &[&push]).await.unwrap();
     let mut role_url = reqwest::Url::parse(&url).unwrap();
     role_url.set_username(&role).unwrap();
     role_url.set_password(Some("fixture-password")).unwrap();
@@ -132,8 +163,31 @@ async fn cancellation_alerts_are_scoped_and_acknowledge_each_revision() {
     let rows = queue::reconciliation::channel_policy_list(&operator, "a", "all", None)
         .await
         .unwrap();
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3);
     assert!(!format!("{rows:?}").contains("not returned"));
+    assert_eq!(
+        queue::reconciliation::channel_policy_count(&operator, "a", "push")
+            .await
+            .unwrap(),
+        1
+    );
+    let evidence = queue::reconciliation::push_policy_evidence(&operator, "a", push, 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        evidence,
+        json!({"accepted":1,"rejected":0,"unknown":0,"dispatching":0,"unattempted":1})
+    );
+    assert!(
+        queue::reconciliation::push_policy_evidence(&operator, "b", push, 1)
+            .await
+            .is_err()
+    );
+    assert!(
+        queue::reconciliation::push_policy_evidence(&operator, "a", push, 0)
+            .await
+            .is_err()
+    );
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
             .args(args)
@@ -148,14 +202,21 @@ async fn cancellation_alerts_are_scoped_and_acknowledge_each_revision() {
         serde_json::from_slice::<Value>(&check.stdout).unwrap()["unacknowledgedPolicyCancellations"],
         1
     );
+    let evidence_cli = run(&["push-policy-evidence", "a", &push.to_string(), "1"]);
+    assert!(evidence_cli.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&evidence_cli.stdout).unwrap(),
+        evidence
+    );
     db.execute("INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES ('a','slack','ops','rejected')", &[]).await.unwrap();
     let alert = Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"))
         .args(["a", "300", "120", "60"])
         .env("DATABASE_URL", role_url.as_str())
         .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
         .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
-        .env("SWALLOW_ALERT_EMAIL_POLICY_CANCELLED_ENABLED", "true")
-        .env("SWALLOW_ALERT_SMS_POLICY_CANCELLED_ENABLED", "true")
+        .env("SWALLOW_ALERT_EMAIL_POLICY_CANCELLED_ENABLED", "false")
+        .env("SWALLOW_ALERT_SMS_POLICY_CANCELLED_ENABLED", "false")
+        .env("SWALLOW_ALERT_PUSH_POLICY_CANCELLED_ENABLED", "true")
         .env("SWALLOW_ALERT_SCOPED_DELIVERY", "true")
         .env(
             "SWALLOW_ALERT_SLACK_WEBHOOK",
@@ -173,6 +234,65 @@ async fn cancellation_alerts_are_scoped_and_acknowledge_each_revision() {
         String::from_utf8_lossy(&alert.stderr)
     );
     assert!(String::from_utf8_lossy(&alert.stderr).contains("requires operator review"));
+    assert!(
+        queue::reconciliation::acknowledge_channel_policy(
+            &operator,
+            "a",
+            push,
+            1,
+            "operator",
+            "reviewed partial delivery"
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(
+        queue::reconciliation::channel_policy_count(&operator, "a", "push")
+            .await
+            .unwrap(),
+        0
+    );
+    db.execute(
+        "UPDATE public.novu_queue_jobs SET status='pending' WHERE id=$1",
+        &[&push],
+    )
+    .await
+    .unwrap();
+    db.execute("UPDATE public.novu_queue_jobs SET status='cancelled',last_error='push workflow step changed' WHERE id=$1", &[&push]).await.unwrap();
+    assert_eq!(
+        queue::reconciliation::channel_policy_count(&operator, "a", "push")
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(
+        queue::reconciliation::push_policy_evidence(&operator, "a", push, 1)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        queue::reconciliation::push_policy_evidence(&operator, "a", push, 2)
+            .await
+            .unwrap(),
+        evidence
+    );
+    let unprepared = Uuid::new_v4();
+    queue::enqueue(
+        &db,
+        unprepared,
+        "a",
+        queue::fcm_queue::JOB_KIND,
+        &json!({"workflow_context":{}}),
+    )
+    .await
+    .unwrap();
+    db.execute("UPDATE public.novu_queue_jobs SET status='cancelled',last_error='push workflow step disabled' WHERE id=$1", &[&unprepared]).await.unwrap();
+    assert_eq!(
+        queue::reconciliation::push_policy_evidence(&operator, "a", unprepared, 1)
+            .await
+            .unwrap()["unattempted"],
+        Value::Null
+    );
     assert!(
         queue::reconciliation::acknowledge_channel_policy(
             &operator, "a", sms, 1, "operator", "ticket"
