@@ -277,13 +277,90 @@ mod tests {
             &endpoint,
         )
         .unwrap();
-        assert!(process_one(&mut db, "env-a", &provider).await.unwrap());
+        let second_provider = Resend::test_endpoint(
+            Config {
+                api_key: "re_test".into(),
+                from: "from@example.test".into(),
+                sender_name: String::new(),
+            },
+            &endpoint,
+        )
+        .unwrap();
+        let (mut second_db, second_driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+        tokio::spawn(async move { second_driver.await.unwrap() });
+        let (first, second) = tokio::join!(
+            process_one(&mut db, "env-a", &provider),
+            process_one(&mut second_db, "env-a", &second_provider)
+        );
+        assert_eq!(
+            usize::from(first.unwrap()) + usize::from(second.unwrap()),
+            1
+        );
         mock.await.unwrap();
         let row=db.query_one("SELECT j.status,a.state,m.delivery_state,m.identifier FROM novu_queue_jobs j JOIN novu_rust_resend_attempts a ON a.job_id=j.id JOIN novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1", &[&email_job]).await.unwrap();
         assert_eq!(row.get::<_, String>(0), "completed");
         assert_eq!(row.get::<_, String>(1), "accepted");
         assert_eq!(row.get::<_, String>(2), "accepted");
         assert_eq!(row.get::<_, String>(3), "resend-workflow-id");
+        // A stale worker must not overwrite the unknown result after another
+        // worker recovers an expired lease during an outstanding HTTP call.
+        let race = Uuid::new_v4();
+        enqueue(
+            &db,
+            race,
+            "env-race",
+            JOB_KIND,
+            &json!({"to":["to@example.test"],"subject":"Race","html":"Hi"}),
+        )
+        .await
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/emails", listener.local_addr().unwrap());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let mock = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut data = [0; 4096];
+            assert!(socket.read(&mut data).await.unwrap() > 0);
+            started_tx.send(()).unwrap();
+            finish_rx.await.unwrap();
+            let body = "{\"id\":\"late-provider-id\"}";
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let provider_race = Resend::test_endpoint(
+            Config {
+                api_key: "re_test".into(),
+                from: "from@example.test".into(),
+                sender_name: String::new(),
+            },
+            &endpoint,
+        )
+        .unwrap();
+        let (mut dispatch_db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+        tokio::spawn(async move { driver.await.unwrap() });
+        let dispatch =
+            tokio::spawn(
+                async move { process_one(&mut dispatch_db, "env-race", &provider_race).await },
+            );
+        started_rx.await.unwrap();
+        db.execute("UPDATE novu_queue_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1", &[&race]).await.unwrap();
+        assert_eq!(recover_expired(&mut db, "env-race").await.unwrap(), 1);
+        finish_tx.send(()).unwrap();
+        assert!(dispatch.await.unwrap().unwrap());
+        mock.await.unwrap();
+        let row=db.query_one("SELECT j.status,a.state,a.provider_message_id FROM novu_queue_jobs j JOIN novu_rust_resend_attempts a ON a.job_id=j.id WHERE j.id=$1", &[&race]).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), "failed");
+        assert_eq!(row.get::<_, String>(1), "unknown");
+        assert!(row.get::<_, Option<String>>(2).is_none());
         let trigger2 = Uuid::new_v4();
         let mut second = payload.clone();
         second["transactionId"] = json!(trigger2.to_string());
