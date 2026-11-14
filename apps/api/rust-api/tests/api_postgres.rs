@@ -4552,7 +4552,7 @@ async fn fcm_credentials_contract(app: axum::Router, db: &mut tokio_postgres::Cl
     assert_eq!(rows[1].get::<_, String>(0), "integration-test");
     assert_eq!(rows[1].get::<_, Vec<String>>(1), vec!["token-a"]);
     let (status, _) = inbox_mutate(
-        app,
+        app.clone(),
         "DELETE",
         "/v2/subscribers/fcm-concurrent",
         Some("ApiKey test-key"),
@@ -4561,6 +4561,23 @@ async fn fcm_credentials_contract(app: axum::Router, db: &mut tokio_postgres::Cl
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(db.query_opt("SELECT 1 FROM novu_rust_fcm_devices WHERE environment_id='env-a' AND subscriber_id='fcm-concurrent'",&[]).await.unwrap().is_none());
+    db.batch_execute(include_str!("../migrations/0018_fcm_integration_management.sql")).await.unwrap();
+    let key_hash = format!("{:x}", Sha256::digest(b"test-key"));
+    db.execute("INSERT INTO novu_rust_fcm_integration_permissions VALUES ($1,'write')", &[&key_hash]).await.unwrap();
+    db.execute("INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id) VALUES ('env-a','fcm-managed',novu_rust_new_objectid())", &[]).await.unwrap();
+    let base = "/v1/experimental/fcm-integrations";
+    let (status, integration) = inbox_mutate(app.clone(), "POST", base, Some("ApiKey test-key"), json!({"identifier":"managed-fcm"})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let id = integration["data"]["internalId"].as_str().unwrap();
+    let credentials_path = "/v1/subscribers/fcm-managed/credentials";
+    let credentials = json!({"providerId":"fcm","integrationIdentifier":"managed-fcm","credentials":{"deviceTokens":["managed-token"]}});
+    assert_eq!(inbox_mutate(app.clone(), "PUT", credentials_path, Some("ApiKey test-key"), credentials.clone()).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(inbox_mutate(app.clone(), "PATCH", "/v1/experimental/fcm-integrations/managed-fcm", Some("ApiKey test-key"), json!({"active":true})).await.0, StatusCode::OK);
+    assert_eq!(inbox_mutate(app.clone(), "PUT", credentials_path, Some("ApiKey test-key"), credentials.clone()).await.0, StatusCode::OK);
+    let stored: String = db.query_one("SELECT integration_internal_id FROM novu_rust_fcm_devices WHERE environment_id='env-a' AND subscriber_id='fcm-managed'", &[]).await.unwrap().get(0);
+    assert_eq!(stored, id);
+    assert_eq!(inbox_mutate(app.clone(), "PATCH", "/v1/experimental/fcm-integrations/managed-fcm", Some("ApiKey test-key"), json!({"active":false})).await.0, StatusCode::OK);
+    assert_eq!(inbox_mutate(app, "PUT", credentials_path, Some("ApiKey test-key"), credentials).await.0, StatusCode::BAD_REQUEST);
 }
 
 async fn notification_action_contract(app: axum::Router, db: &mut tokio_postgres::Client) {

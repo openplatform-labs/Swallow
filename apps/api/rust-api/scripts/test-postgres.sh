@@ -35,6 +35,10 @@ docker exec "$name" createdb -U postgres novu_slack_endpoint_api_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_slack_endpoint_api_test" \
   cargo test --locked --test slack_endpoints -- --ignored
 
+docker exec "$name" createdb -U postgres novu_fcm_integration_api_test
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_fcm_integration_api_test" \
+  cargo test --locked --test fcm_integrations -- --ignored
+
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_api_test" \
   cargo test --locked --test sendgrid_webhook -- --ignored
 

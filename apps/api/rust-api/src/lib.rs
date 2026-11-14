@@ -1,5 +1,6 @@
 //! Experimental, deliberately incomplete Novu trigger endpoint.
 mod contexts;
+mod fcm_integrations;
 mod inbox_context;
 mod inbox_data;
 mod preferences;
@@ -243,6 +244,8 @@ pub fn router_with_webhook_configs(
             post(twilio_webhook::receive_dispatch),
         )
         .route("/v1/events/trigger", post(trigger))
+        .route("/v1/experimental/fcm-integrations", get(fcm_integrations::list).post(fcm_integrations::create))
+        .route("/v1/experimental/fcm-integrations/{identifier}", get(fcm_integrations::get).patch(fcm_integrations::update))
         .route("/v1/channel-endpoints", post(slack_endpoints::create).get(slack_endpoints::list))
         .route("/v1/channel-endpoints/{identifier}", get(slack_endpoints::get).patch(slack_endpoints::update).delete(slack_endpoints::delete))
         .route(
