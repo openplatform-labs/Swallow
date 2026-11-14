@@ -62,6 +62,7 @@ async fn worker_secret_and_attention_status() {
         novu_postgres_queue::alerts::RESOLUTION_MIGRATION,
         novu_postgres_queue::reconciliation::OPERATOR_GRANT_LOCK_MIGRATION,
         novu_postgres_queue::slack_queue::OPERATOR_MIGRATION,
+        novu_postgres_queue::slack_queue::RESOLVE_FUNCTION_MIGRATION,
     ] {
         db.batch_execute(sql).await.unwrap();
     }

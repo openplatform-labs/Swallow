@@ -29,6 +29,7 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
         include_str!("../migrations/0080_slack_ack_permission.sql"),
         include_str!("../migrations/0081_slack_view_permission.sql"),
         include_str!("../migrations/0082_slack_ack_function.sql"),
+        slack_queue::RESOLVE_FUNCTION_MIGRATION,
     ] {
         db.batch_execute(sql).await.unwrap();
     }
@@ -134,7 +135,7 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
     let granted: bool = db.query_one("SELECT public.novu_rust_manage_operator_grant('a',session_user::text,'slack_ack','grant','fixture')",&[]).await.unwrap().get(0);
     assert!(granted);
     let viewer = format!("slack_viewer_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {viewer} LOGIN; GRANT USAGE ON SCHEMA public TO {viewer}; GRANT EXECUTE ON FUNCTION public.novu_rust_list_slack_attention(text,uuid) TO {viewer}; GRANT EXECUTE ON FUNCTION public.novu_rust_ack_slack_workflow(text,uuid,text,text) TO {viewer}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {viewer} LOGIN; GRANT USAGE ON SCHEMA public TO {viewer}; GRANT EXECUTE ON FUNCTION public.novu_rust_list_slack_attention(text,uuid) TO {viewer}; GRANT EXECUTE ON FUNCTION public.novu_rust_ack_slack_workflow(text,uuid,text,text) TO {viewer}; GRANT EXECUTE ON FUNCTION public.novu_rust_resolve_slack(text,uuid,text,text,text) TO {viewer}")).await.unwrap();
     let (mut viewer_db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move {
         let _ = driver.await;
@@ -257,6 +258,150 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
     db.execute("DELETE FROM novu_queue_jobs WHERE id=$1", &[&viewer_job])
         .await
         .unwrap();
+    let retry_job = Uuid::new_v4();
+    let accepted_job = Uuid::new_v4();
+    let rejected_job = Uuid::new_v4();
+    for (job, state) in [
+        (retry_job, "unknown"),
+        (accepted_job, "unknown"),
+        (rejected_job, "rejected"),
+    ] {
+        queue::enqueue(&db, job, "a", slack_queue::JOB_KIND, &json!({}))
+            .await
+            .unwrap();
+        db.execute(
+            "UPDATE novu_queue_jobs SET status='failed' WHERE id=$1",
+            &[&job],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO novu_rust_slack_attempts(job_id,environment_id,state) VALUES ($1,'a',$2)",
+            &[&job, &state],
+        )
+        .await
+        .unwrap();
+    }
+    assert!(
+        slack_queue::resolve(
+            &mut viewer_db,
+            "a",
+            retry_job,
+            "retry",
+            "operator",
+            "reviewed"
+        )
+        .await
+        .is_err()
+    );
+    assert!(db.query_one("SELECT public.novu_rust_manage_operator_grant('a',$1,'slack_retry','grant','retry fixture')",&[&viewer]).await.unwrap().get::<_,bool>(0));
+    assert!(
+        slack_queue::resolve(
+            &mut viewer_db,
+            "b",
+            retry_job,
+            "retry",
+            "operator",
+            "reviewed"
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        slack_queue::resolve(
+            &mut viewer_db,
+            "a",
+            accepted_job,
+            "accepted",
+            "operator",
+            "reviewed"
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        slack_queue::resolve(
+            &mut viewer_db,
+            "a",
+            retry_job,
+            "retry",
+            "operator",
+            "reviewed"
+        )
+        .await
+        .is_ok()
+    );
+    let status: String = db
+        .query_one(
+            "SELECT status FROM novu_queue_jobs WHERE id=$1",
+            &[&retry_job],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(status, "pending");
+    assert!(db.query_one("SELECT public.novu_rust_manage_operator_grant('a',$1,'slack_accepted','grant','accepted fixture')",&[&viewer]).await.unwrap().get::<_,bool>(0));
+    assert!(
+        slack_queue::resolve(
+            &mut viewer_db,
+            "a",
+            rejected_job,
+            "accepted",
+            "operator",
+            "reviewed"
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        slack_queue::resolve(
+            &mut viewer_db,
+            "a",
+            accepted_job,
+            "accepted",
+            "operator",
+            "reviewed"
+        )
+        .await
+        .is_ok()
+    );
+    let row=db.query_one("SELECT database_session_user,database_user FROM novu_rust_slack_resolutions WHERE job_id=$1",&[&accepted_job]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), viewer);
+    assert_eq!(row.get::<_, String>(1), viewer);
+    assert!(
+        viewer_db
+            .execute(
+                "DELETE FROM public.novu_rust_slack_resolutions WHERE job_id=$1",
+                &[&accepted_job]
+            )
+            .await
+            .is_err()
+    );
+    assert!(db.query_one("SELECT public.novu_rust_manage_operator_grant('a',$1,'slack_retry','revoke','retry fixture')",&[&viewer]).await.unwrap().get::<_,bool>(0));
+    assert!(
+        slack_queue::resolve(
+            &mut viewer_db,
+            "a",
+            rejected_job,
+            "retry",
+            "operator",
+            "reviewed"
+        )
+        .await
+        .is_err()
+    );
+    for job in [retry_job, accepted_job, rejected_job] {
+        db.execute("DELETE FROM novu_queue_jobs WHERE id=$1", &[&job])
+            .await
+            .unwrap();
+    }
+    db.execute(
+        "DELETE FROM novu_rust_slack_resolutions WHERE job_id=ANY($1)",
+        &[&vec![retry_job, accepted_job, rejected_job]],
+    )
+    .await
+    .unwrap();
+    db.query_one("SELECT public.novu_rust_manage_operator_grant('a',$1,'slack_accepted','revoke','accepted fixture')",&[&viewer]).await.unwrap();
     viewer_db
         .batch_execute("RESET SESSION AUTHORIZATION")
         .await

@@ -12,6 +12,8 @@ pub const OPERATOR_MIGRATION: &str =
     include_str!("../migrations/0071_slack_operator_permissions.sql");
 pub const WORKFLOW_ATTENTION_MIGRATION: &str =
     include_str!("../migrations/0079_slack_workflow_attention.sql");
+pub const RESOLVE_FUNCTION_MIGRATION: &str =
+    include_str!("../migrations/0083_slack_resolve_function.sql");
 
 /// Acknowledge one pre-dispatch failure or missing-endpoint result without changing the job.
 pub async fn acknowledge_workflow(
@@ -39,49 +41,12 @@ pub async fn resolve(
     operator: &str,
     reason: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if environment.trim().is_empty()
-        || !["retry", "accepted"].contains(&decision)
-        || operator.trim().is_empty()
-        || operator.len() > 128
-        || reason.trim().is_empty()
-        || reason.len() > 512
-    {
-        return Err("invalid Slack resolution".into());
-    }
-    let permission = format!("slack_{decision}");
-    let tx = client.transaction().await?;
-    let allowed: bool = tx
+    client
         .query_one(
-            "SELECT public.novu_rust_lock_operator_grant($1,$2)",
-            &[&environment, &permission],
-        )
-        .await?
-        .get(0);
-    if !allowed {
-        return Err("Slack resolution permission denied".into());
-    }
-    let row=tx.query_opt("SELECT j.status,a.state FROM novu_queue_jobs j JOIN novu_rust_slack_attempts a ON a.job_id=j.id AND a.environment_id=j.environment_id WHERE j.id=$1 AND j.environment_id=$2 AND j.kind=ANY($3) FOR UPDATE OF j,a", &[&job,&environment,&vec![JOB_KIND,crate::slack_webhook_queue::JOB_KIND,crate::slack_workflow::DELIVERY_KIND]]).await?.ok_or("Slack attempt not found")?;
-    let status: String = row.get(0);
-    let previous: String = row.get(1);
-    if status != "failed"
-        || !["unknown", "rejected"].contains(&previous.as_str())
-        || (decision == "accepted" && previous != "unknown")
-    {
-        return Err("Slack outcome is not eligible for this decision".into());
-    }
-    tx.execute("INSERT INTO novu_rust_slack_resolutions(id,environment_id,job_id,previous_state,decision,operator_name,reason) VALUES ($1,$2,$3,$4,$5,$6,$7)", &[&Uuid::new_v4(),&environment,&job,&previous,&decision,&operator,&reason]).await?;
-    if decision == "retry" {
-        tx.execute(
-            "DELETE FROM novu_rust_slack_attempts WHERE job_id=$1 AND environment_id=$2",
-            &[&job, &environment],
+            "SELECT public.novu_rust_resolve_slack($1,$2,$3,$4,$5)",
+            &[&environment, &job, &decision, &operator, &reason],
         )
         .await?;
-        tx.execute("UPDATE novu_queue_jobs SET status='pending',available_at=clock_timestamp(),last_error=NULL WHERE id=$1 AND environment_id=$2", &[&job,&environment]).await?;
-    } else {
-        tx.execute("UPDATE novu_rust_slack_attempts SET state='accepted',updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$2", &[&job,&environment]).await?;
-        tx.execute("UPDATE novu_queue_jobs SET status='completed',last_error=NULL WHERE id=$1 AND environment_id=$2", &[&job,&environment]).await?;
-    }
-    tx.commit().await?;
     Ok(())
 }
 

@@ -509,6 +509,7 @@ mod tests {
             include_str!("../migrations/0073_operator_role_identity.sql"),
             crate::slack_queue::WORKFLOW_ATTENTION_MIGRATION,
             include_str!("../migrations/0080_slack_ack_permission.sql"),
+            crate::slack_queue::RESOLVE_FUNCTION_MIGRATION,
         ] {
             db.batch_execute(migration).await.unwrap();
         }

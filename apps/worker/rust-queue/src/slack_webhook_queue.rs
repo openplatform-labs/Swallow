@@ -156,6 +156,7 @@ mod tests {
             crate::alerts::RESOLUTION_MIGRATION,
             crate::reconciliation::OPERATOR_GRANT_LOCK_MIGRATION,
             crate::slack_queue::OPERATOR_MIGRATION,
+            crate::slack_queue::RESOLVE_FUNCTION_MIGRATION,
             crate::slack_queue::WORKFLOW_ATTENTION_MIGRATION,
         ] {
             db.batch_execute(migration).await.unwrap();
