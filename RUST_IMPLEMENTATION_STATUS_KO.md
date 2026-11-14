@@ -77,7 +77,7 @@ API 마이그레이션 `0006`·`0007`과 워커 마이그레이션 `0056`까지 
 
 - [Resend 독립 큐 워커](apps/worker/rust-queue/src/resend_queue.rs)는 0060 마이그레이션을 적용한 뒤 `NOVU_RESEND_ENVIRONMENT_ID`, `NOVU_RESEND_API_KEY`, `NOVU_RESEND_FROM`, 선택적 `NOVU_RESEND_SENDER_NAME`과 `DATABASE_URL`로 실행한다. 수동으로 준비한 `experimental_resend_email` 작업을 환경별로 처리하며 `swallow/<작업 UUID>`를 idempotency 키로 사용한다. 시도 기록 이전 임대 만료는 재대기하고 기록 이후 만료·전송 실패·불완전한 성공 응답·5xx·409는 결과 불명으로 보관한다. 2xx는 provider 접수이지 실제 수신이 아니다. 로컬 모의 HTTP·Docker PostgreSQL에서 요청, 환경 격리, 시도 기록 전후 복구를 검증했다. 별도 수동 작업은 구독자 ID·설정 확인을 수행하지 않는다. 0061 적용 후 수동으로 워크플로의 email_provider를 resend로 설정하면 워크플로 처리 시 Resend 작업을 생성하고 발송 직전 구독자·설정·워크플로를 재확인해 템플릿을 렌더링한다. 안전 모드에서 바뀐 구독자 ID는 차단한다. 원본 통합 관리 API, 전체 provider override·템플릿, 실제 Resend·수신함 및 Novu와의 종단 간 비교는 아직 미구현 또는 미검증이다. 자격증명은 환경변수에 있고 작업 본문에는 이메일 주소와 내용이 저장되므로 DB와 프로세스 환경 접근을 제한해야 한다. `check`·`list`·수동 `retry`/`accepted`도 0060을 요구하며 운영자는 provider 접수 여부를 독립적으로 확인해야 한다. 멱등 키가 24시간을 넘기거나 요청 내용이 변하면 재시도 시 중복 또는 오류가 발생할 수 있다. 실제 운영에 사용할 수 있는 통합이 아니다.
 
-- [Resend 이메일 어댑터](apps/worker/rust-queue/src/resend.rs)는 발신자·수신자·제목·HTML·텍스트·참조·숨은 참조·회신 주소와 선택적 idempotency 키를 [Resend 이메일 API](https://resend.com/docs/api-reference/emails/send-email)에 전송한다. 미지원 첨부·헤더·provider custom data는 무시하지 않고 거절한다. 로컬 모의 HTTP 서버에서 요청·키·응답 및 302·429·500을 검증했으며 성공 응답이 불완전하면 결과 불명으로 취급한다. 원본 provider의 선택된 옵션 매핑만 비교했으며, 실제 Resend 계정과 수신은 검증하지 않았다. **제한된 워크플로를 DB에서 수동 설정할 수 있지만 통합 관리 API와 완전한 웹훅 상태 처리는 없다.** Resend의 idempotency 키 보관 기간은 [24시간](https://resend.com/docs/dashboard/emails/idempotency-keys)이며 자동 재시도는 구현하지 않았다.
+- [Resend 이메일 어댑터](apps/worker/rust-queue/src/resend.rs)는 발신자·수신자·제목·HTML·텍스트·참조·숨은 참조·회신 주소와 선택적 idempotency 키를 [Resend 이메일 API](https://resend.com/docs/api-reference/emails/send-email)에 전송한다. 미지원 첨부·헤더·provider custom data는 무시하지 않고 거절한다. 로컬 모의 HTTP 서버에서 요청·키·응답 및 302·429·500을 검증했으며 성공 응답이 불완전하면 결과 불명으로 취급한다. 원본 provider의 선택된 옵션 매핑만 비교했으며, 실제 Resend 발송은 HTTP 403으로 실패해 수신을 검증하지 못했다. **제한된 워크플로를 DB에서 수동 설정할 수 있지만 통합 관리 API와 완전한 웹훅 상태 처리는 없다.** Resend의 idempotency 키 보관 기간은 [24시간](https://resend.com/docs/dashboard/emails/idempotency-keys)이며 자동 재시도는 구현하지 않았다.
 
 - 제한적인 트리거 API: API 키 해시로 환경과 연결된 사용자를 조회하고, 워크플로 없음·비활성·단계 없음의 일부 응답을 처리한다. 트리거와 관리 API의 사용자 Bearer 인증은 구현되지 않아 거절한다.
 - 자동 트랜잭션 ID는 기준 소스의 `txn_` + 8자리 Unix 초 hex + 12자리 영숫자 형식을 따른다. 전체 서버 간 비교는 아직 수행하지 않았다.
@@ -115,6 +115,8 @@ API 마이그레이션 `0006`·`0007`과 워커 마이그레이션 `0056`까지 
 | 에디션·범위 | 클론은 shallow이고 enterprise 서브모듈 `.source`는 초기화되지 않았다. Enterprise/Cloud 전용 기능과 라이선스 범위, 외부 패키지·서비스는 별도 확인이 필요하다. |
 
 ## 수행한 검증
+
+- 2026-11-14 사용자가 지정한 발신·수신 주소와 Resend API 키로 [실제 발송 테스트](apps/worker/rust-queue/src/resend.rs)를 한 번 실행했으나 Resend가 HTTP 403을 반환해 **실패했다**. 오류 본문은 개인정보와 비밀 노출을 피하기 위해 저장·출력하지 않아 거절 원인은 확인하지 못했다. 성공적인 provider 접수와 메일함 수신은 검증되지 않았다. 발신 도메인과 키 권한을 확인한 후 재시험해야 한다. 이 검사는 어댑터 직접 호출이며 워크플로 종단 간 검증이 아니다.
 
 - [Resend 원본 메서드 비교](apps/worker/rust-queue/tests/reference_resend_source.rs)는 기준 커밋과 일치하는 체크아웃의 원본 `sendMessage`를 Node로 실행하고 SDK와 빈 bridge 데이터를 모의하여 기본 필드·발신자 override·참조·본문·회신 주소 세 사례를 Rust 요청과 비교했다. 테스트에서 SDK 옵션의 `replyTo`를 HTTP 필드명으로 변환한다. 원본 SDK 자체의 HTTP 직렬화, `_passthrough`, 첨부·헤더·웹훅 및 원본 서버 전체는 검증하지 않은 소스 수준 비교다.
 
