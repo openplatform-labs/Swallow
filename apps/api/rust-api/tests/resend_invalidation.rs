@@ -23,7 +23,7 @@ async fn event(app: Router, secret: &[u8], id: &str, kind: &str, email: &str) ->
         .as_secs()
         .to_string();
     let body = serde_json::to_vec(
-        &json!({"type":kind,"data":{"email_id":email,"to":["one@example.test"]}}),
+        &json!({"type":kind,"data":{"email_id":email,"to":["one@example.test"],"tags":{"swallow_dispatch":"e93bc23b-d9c4-4df9-810f-e642a9659a60"}}}),
     )
     .unwrap();
     let mut signed = format!("{id}.{timestamp}.").into_bytes();
@@ -61,6 +61,7 @@ async fn events_invalidate_only_matching_results_and_serialize_with_projector() 
         include_str!("../migrations/0010_resend_webhooks.sql"),
         include_str!("../migrations/0012_resend_event_fingerprint.sql"),
         include_str!("../migrations/0013_resend_event_recipient.sql"),
+        include_str!("../migrations/0047_resend_event_correlation.sql"),
         include_str!(
             "../../../worker/rust-queue/migrations/0102_resend_projection_invalidation.sql"
         ),
@@ -117,7 +118,8 @@ async fn events_invalidate_only_matching_results_and_serialize_with_projector() 
         )
         .unwrap()
         .with_retry_job_lock(true)
-    };
+    }
+    .with_correlation_capture(true);
     let app = novu_rust_api::router_with_webhook_configs(
         Arc::new(webdb),
         None,
@@ -129,6 +131,7 @@ async fn events_invalidate_only_matching_results_and_serialize_with_projector() 
         event(app.clone(), secret, "evt-1", "email.bounced", "email-123").await,
         StatusCode::NO_CONTENT
     );
+    assert_eq!(db.query_one("SELECT correlation_id::text FROM novu_rust_resend_delivery_events WHERE event_id='evt-1'", &[]).await.unwrap().get::<_,Option<String>>(0).as_deref(),Some("e93bc23b-d9c4-4df9-810f-e642a9659a60"));
     let row=db.query_one("SELECT j.resend_delivery_result,m.resend_delivery_result FROM novu_queue_jobs j JOIN novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1", &[&job]).await.unwrap();
     assert_eq!(row.get::<_, String>(0), "unknown");
     assert_eq!(row.get::<_, String>(1), "unknown");

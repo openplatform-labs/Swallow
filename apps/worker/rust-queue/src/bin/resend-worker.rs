@@ -42,6 +42,11 @@ async fn run(
         Ok("false") | Err(std::env::VarError::NotPresent) => false,
         _ => return Err("invalid Resend retry evidence guard setting".into()),
     };
+    let correlation = match std::env::var("NOVU_RESEND_CORRELATION_TAG").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid Resend correlation tag setting".into()),
+    };
     let timeout = Duration::from_secs(timeout);
     loop {
         if stop.requested() {
@@ -109,12 +114,13 @@ async fn run(
                     }
                     match tokio::time::timeout(
                         timeout,
-                        resend_queue::process_one_with_policies(
+                        resend_queue::process_one_with_correlation(
                             &mut db,
                             &environment,
                             &provider,
                             retry_guard,
                             step_policy,
+                            correlation,
                         ),
                     )
                     .await

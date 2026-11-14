@@ -1,3 +1,9 @@
+## Resend 발송·웹훅의 선택적 상관 태그 (워커 0134, API 0047)
+
+새 Resend 발송에 `NOVU_RESEND_CORRELATION_TAG=true`를 설정하면 발송 전에 매 시도별 임의 UUID를 DB에 기록하고 공급자 태그 `swallow_dispatch`로 보낸다. API의 `NOVU_RESEND_WEBHOOK_CAPTURE_CORRELATION=true`는 서명 검증된 웹훅의 유효한 UUID v4 태그만 저장한다. 둘 다 기본값은 비활성이다. 적용 순서, 수동 조회와 보안·재시도 제한은 [워커 README](apps/worker/rust-queue/README.md)와 [API README](apps/api/rust-api/README.md)를 참고한다.
+
+Docker PostgreSQL과 모의 발송에서 저장 ID와 요청 태그 일치를, 합성 서명 웹훅에서 태그 저장·중복·잘못된 태그·기존 잠금 경로를 확인했다. 별도 시험이며 실제 Resend 태그 왕복은 미검증이다. 이전 작업과 이벤트는 복원할 수 없고 재시도 시 이전 시도 행이 삭제되어 연결 정보가 사라진다. 태그는 아직 자동 상태 판정이나 재시도 보호에 사용되지 않는다. 웹훅 누락·지연, 충돌·위변조 가능성, 멱등 키 유지 기간과 재시도 경합은 추가 처리와 검증이 필요하다.
+
 ## PostgreSQL 역할별 경보 검사
 
 `send-database-alert`에서 `SWALLOW_DB_PROBE_ROLE=any|writable-primary|standby`를 선택할 수 있다. 기본 `any`는 연결만 검사한다. `writable-primary`는 복구 중이 아니고 해당 검사 세션이 읽기 전용이 아닌지 확인하며, `standby`는 복구 중인지 확인한다. 불일치는 기존 DB 실패 경보와 종료 코드 2로 처리하고 잘못된 설정은 1로 거절한다. 각각의 대상에 별도 안정적인 라벨과 발송 대상 ID를 구성한다. 상세 구성과 제한은 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.

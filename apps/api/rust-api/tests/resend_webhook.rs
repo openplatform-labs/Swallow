@@ -94,6 +94,11 @@ async fn signed_events_are_scoped_deduplicated_and_private() {
     .await
     .unwrap();
     db.batch_execute(include_str!(
+        "../migrations/0047_resend_event_correlation.sql"
+    ))
+    .await
+    .unwrap();
+    db.batch_execute(include_str!(
         "../migrations/0013_resend_event_recipient.sql"
     ))
     .await
@@ -418,5 +423,64 @@ async fn signed_events_are_scoped_deduplicated_and_private() {
         novu_postgres_queue::reconciliation::resend_evidence(db.as_ref(), "env-b", job)
             .await
             .is_err()
+    );
+    let tagged_app = novu_rust_api::router_with_webhook_configs(
+        db.clone(),
+        None,
+        HashMap::new(),
+        None,
+        Some(
+            novu_rust_api::resend_webhook::Config::new("env-a".into(), &key)
+                .unwrap()
+                .with_correlation_capture(true),
+        ),
+    );
+    let correlation = uuid::Uuid::new_v4().to_string();
+    let tagged = serde_json::json!({"type":"email.delivered","data":{"email_id":"tagged-id","to":["private@example.test"],"tags":{"swallow_dispatch":correlation}}}).to_string().into_bytes();
+    let sig = signature(raw_secret, "msg_tagged", &timestamp, &tagged);
+    assert_eq!(
+        call(
+            tagged_app.clone(),
+            path,
+            "msg_tagged",
+            &timestamp,
+            &sig,
+            &tagged
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        call(
+            tagged_app.clone(),
+            path,
+            "msg_tagged",
+            &timestamp,
+            &sig,
+            &tagged
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let stored: Option<String> = db.query_one("SELECT correlation_id::text FROM novu_rust_resend_delivery_events WHERE environment_id='env-a' AND event_id='msg_tagged'", &[]).await.unwrap().get(0);
+    assert_eq!(stored.as_deref(), Some(correlation.as_str()));
+    let invalid = br#"{"type":"email.delivered","data":{"email_id":"tagged-id","tags":{"swallow_dispatch":"not-a-uuid"}}}"#;
+    assert_eq!(
+        call(
+            tagged_app.clone(),
+            path,
+            "msg_invalid_tag",
+            &timestamp,
+            &signature(raw_secret, "msg_invalid_tag", &timestamp, invalid),
+            invalid
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let stored: Option<String> = db.query_one("SELECT correlation_id::text FROM novu_rust_resend_delivery_events WHERE event_id='msg_invalid_tag'", &[]).await.unwrap().get(0);
+    assert!(stored.is_none());
+    assert_eq!(
+        call(tagged_app, path, "msg_forged", &timestamp, &sig, &tagged).await,
+        StatusCode::UNAUTHORIZED
     );
 }

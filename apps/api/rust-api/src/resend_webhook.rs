@@ -18,6 +18,7 @@ pub struct Config {
     environment: String,
     secret: Vec<u8>,
     lock_retry_jobs: bool,
+    capture_correlation: bool,
 }
 impl Config {
     pub fn new(environment: String, secret: &str) -> Option<Self> {
@@ -29,10 +30,15 @@ impl Config {
             environment,
             secret: decoded,
             lock_retry_jobs: false,
+            capture_correlation: false,
         })
     }
     pub fn with_retry_job_lock(mut self, enabled: bool) -> Self {
         self.lock_retry_jobs = enabled;
+        self
+    }
+    pub fn with_correlation_capture(mut self, enabled: bool) -> Self {
+        self.capture_correlation = enabled;
         self
     }
     pub fn from_env() -> Option<Self> {
@@ -42,6 +48,12 @@ impl Config {
             Ok("false") | Err(std::env::VarError::NotPresent) => false,
             _ => return None,
         };
+        let capture_correlation =
+            match std::env::var("NOVU_RESEND_WEBHOOK_CAPTURE_CORRELATION").as_deref() {
+                Ok("true") => true,
+                Ok("false") | Err(std::env::VarError::NotPresent) => false,
+                _ => return None,
+            };
         Some(
             Self::new(
                 std::env::var("NOVU_RESEND_WEBHOOK_ENVIRONMENT_ID").ok()?,
@@ -51,7 +63,8 @@ impl Config {
                 )
                 .ok()??,
             )?
-            .with_retry_job_lock(lock_retry_jobs),
+            .with_retry_job_lock(lock_retry_jobs)
+            .with_correlation_capture(capture_correlation),
         )
     }
 }
@@ -159,21 +172,39 @@ pub async fn receive(
     } else {
         "INSERT INTO novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type,payload_fingerprint,recipient_hash) SELECT e.id,$3,$4,$5,$6,$7 FROM novu_rust_environments e WHERE e.id=$1 AND e.organization_id=$2 ON CONFLICT(environment_id,event_id) DO UPDATE SET event_id=EXCLUDED.event_id WHERE novu_rust_resend_delivery_events.email_id=EXCLUDED.email_id AND novu_rust_resend_delivery_events.event_type=EXCLUDED.event_type AND (novu_rust_resend_delivery_events.payload_fingerprint IS NULL OR novu_rust_resend_delivery_events.payload_fingerprint=EXCLUDED.payload_fingerprint)"
     };
-    match db
-        .execute(
-            sql,
-            &[
-                &environment,
-                &organization,
-                &id,
-                &email,
-                &kind,
-                &fingerprint.as_ref(),
-                &recipient_hash,
-            ],
-        )
-        .await
-    {
+    let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
+        &environment,
+        &organization,
+        &id,
+        &email,
+        &kind,
+        &fingerprint.as_ref(),
+        &recipient_hash,
+    ];
+    let result = if config.capture_correlation {
+        // Accept only the canonical random UUID form produced by the worker.
+        let correlation = value
+            .pointer("/data/tags/swallow_dispatch")
+            .and_then(Value::as_str)
+            .and_then(|s| {
+                uuid::Uuid::parse_str(s)
+                    .ok()
+                    .filter(|u| u.get_version_num() == 4 && u.to_string() == s)
+                    .map(|u| u.to_string())
+            });
+        let tagged_sql = sql
+            .replace(
+                "payload_fingerprint,recipient_hash)",
+                "payload_fingerprint,recipient_hash,correlation_id)",
+            )
+            .replace("$5,$6,$7 FROM", "$5,$6,$7,$8::text::uuid FROM");
+        let mut tagged_params = params.to_vec();
+        tagged_params.push(&correlation);
+        db.execute(&tagged_sql, &tagged_params).await
+    } else {
+        db.execute(sql, params).await
+    };
+    match result {
         Ok(1) => StatusCode::NO_CONTENT,
         Ok(_) => StatusCode::CONFLICT,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,

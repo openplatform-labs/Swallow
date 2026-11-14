@@ -156,7 +156,19 @@ impl Resend {
         email: &Email,
         idempotency_key: Option<&str>,
     ) -> Result<String, SendError> {
-        let body = request_body(&self.config, email)?;
+        self.send_with_correlation(email, idempotency_key, None)
+            .await
+    }
+    pub async fn send_with_correlation(
+        &self,
+        email: &Email,
+        idempotency_key: Option<&str>,
+        correlation: Option<uuid::Uuid>,
+    ) -> Result<String, SendError> {
+        let mut body = request_body(&self.config, email)?;
+        if let Some(correlation) = correlation {
+            body["tags"] = json!([{"name":"swallow_dispatch","value":correlation.to_string()}]);
+        }
         if idempotency_key.is_some_and(|key| {
             key.is_empty() || key.len() > 256 || !key.bytes().all(|v| (0x21..=0x7e).contains(&v))
         }) {

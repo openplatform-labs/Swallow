@@ -68,6 +68,17 @@ pub async fn process_one_with_policies(
     retry_guard: bool,
     policy: crate::email_step_policy::Policy,
 ) -> Result<bool, Error> {
+    process_one_with_correlation(client, environment, provider, retry_guard, policy, false).await
+}
+
+pub async fn process_one_with_correlation(
+    client: &mut Client,
+    environment: &str,
+    provider: &Resend,
+    retry_guard: bool,
+    policy: crate::email_step_policy::Policy,
+    correlation_enabled: bool,
+) -> Result<bool, Error> {
     let Some(job) = claim(client, environment).await? else {
         return Ok(false);
     };
@@ -125,7 +136,12 @@ pub async fn process_one_with_policies(
         tx.rollback().await?;
         return Ok(true);
     }
-    let inserted=tx.execute("INSERT INTO novu_rust_resend_attempts(job_id,environment_id,state) VALUES ($1,$2,'dispatching') ON CONFLICT(job_id) DO NOTHING", &[&job.id,&environment]).await?;
+    let correlation = correlation_enabled.then(Uuid::new_v4);
+    let inserted = if correlation_enabled {
+        tx.execute("INSERT INTO novu_rust_resend_attempts(job_id,environment_id,state,correlation_id) VALUES ($1,$2,'dispatching',$3) ON CONFLICT(job_id) DO NOTHING", &[&job.id,&environment,&correlation]).await?
+    } else {
+        tx.execute("INSERT INTO novu_rust_resend_attempts(job_id,environment_id,state) VALUES ($1,$2,'dispatching') ON CONFLICT(job_id) DO NOTHING", &[&job.id,&environment]).await?
+    };
     if inserted == 0 {
         tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='Resend attempt already exists',lease_token=NULL,lease_until=NULL WHERE id=$1 AND environment_id=$2", &[&job.id,&environment]).await?;
         tx.commit().await?;
@@ -153,7 +169,10 @@ pub async fn process_one_with_policies(
     }
     tx.commit().await?;
     let key = format!("swallow/{}", job.id);
-    let (state, code, id, diagnostic) = match provider.send(&email, Some(&key)).await {
+    let (state, code, id, diagnostic) = match provider
+        .send_with_correlation(&email, Some(&key), correlation)
+        .await
+    {
         Ok(id) => ("accepted", None, Some(id), None),
         Err(SendError::Provider(code))
             if !(400..500).contains(&code) || [408, 409].contains(&code) =>
@@ -799,6 +818,9 @@ mod tests {
         db.batch_execute(MIGRATION).await.unwrap();
         db.batch_execute(RECIPIENT_MIGRATION).await.unwrap();
         db.batch_execute(RECIPIENT_MIGRATION).await.unwrap();
+        db.batch_execute(include_str!("../migrations/0134_resend_correlation.sql"))
+            .await
+            .unwrap();
         db.batch_execute(crate::in_app::EMAIL_MESSAGES_MIGRATION)
             .await
             .unwrap();
@@ -841,8 +863,13 @@ mod tests {
             let req = String::from_utf8(bytes).unwrap().to_ascii_lowercase();
             assert!(req.contains(&format!("idempotency-key: swallow/{id}")));
             assert!(req.contains("authorization: bearer re_test"));
+            let value: serde_json::Value =
+                serde_json::from_str(req.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(value["tags"][0]["name"], "swallow_dispatch");
+            let correlation = Uuid::parse_str(value["tags"][0]["value"].as_str().unwrap()).unwrap();
             let response = "{\"id\":\"resend-id\"}";
             socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).as_bytes()).await.unwrap();
+            correlation
         });
         let provider = Resend::test_endpoint(
             Config {
@@ -853,8 +880,29 @@ mod tests {
             &endpoint,
         )
         .unwrap();
-        assert!(process_one(&mut db, "env-a", &provider).await.unwrap());
-        mock.await.unwrap();
+        assert!(
+            process_one_with_correlation(
+                &mut db,
+                "env-a",
+                &provider,
+                false,
+                crate::email_step_policy::Policy::Snapshot,
+                true
+            )
+            .await
+            .unwrap()
+        );
+        let correlation = mock.await.unwrap();
+        assert_eq!(
+            db.query_one(
+                "SELECT correlation_id FROM novu_rust_resend_attempts WHERE job_id=$1",
+                &[&id]
+            )
+            .await
+            .unwrap()
+            .get::<_, Uuid>(0),
+            correlation
+        );
         let row=db.query_one("SELECT j.status,a.state,a.provider_message_id FROM novu_queue_jobs j JOIN novu_rust_resend_attempts a ON a.job_id=j.id WHERE j.id=$1", &[&id]).await.unwrap();
         assert_eq!(row.get::<_, String>(0), "completed");
         assert_eq!(row.get::<_, String>(1), "accepted");
