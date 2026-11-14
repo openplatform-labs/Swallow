@@ -35,7 +35,10 @@ GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_audit_read(text
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_write_v2(text,text,text,text,bigint,uuid,text,text,jsonb,jsonb,text),public.novu_rust_operator_jwt_workflow_request_read(text,text,text,text,bigint,text,uuid) TO ui_resend_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_workflow_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_workflow_grant_request(text,text,text,text,bigint,uuid) TO ui_resend_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_grant_audit_read(text,text,text,text,bigint,uuid) TO ui_resend_fixture;
-GRANT SELECT ON public.novu_rust_users,public.novu_rust_api_keys,public.novu_rust_workflows TO ui_resend_fixture;
+GRANT SELECT ON public.novu_rust_users,public.novu_rust_api_keys,public.novu_rust_workflows,public.novu_rust_environments,public.novu_rust_fcm_devices TO ui_resend_fixture;
+GRANT SELECT,INSERT,UPDATE ON public.novu_rust_subscribers TO ui_resend_fixture;
+GRANT SELECT ON public.novu_rust_objectid_identity TO ui_resend_fixture;
+GRANT USAGE ON SEQUENCE public.novu_rust_objectid_counter TO ui_resend_fixture;
 GRANT UPDATE(email_subject,email_html,email_step_active,sms_content,sms_step_active,push_title,push_content,push_step_active,chat_content,chat_step_active) ON public.novu_rust_workflows TO ui_resend_fixture;
 GRANT INSERT ON public.novu_rust_channel_workflow_audit,public.novu_rust_slack_workflow_audit TO ui_resend_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_lock_channel_workflow_grant(text,text,text,text),public.novu_rust_lock_slack_workflow_grant(text,text,text) TO ui_resend_fixture;

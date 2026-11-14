@@ -6,6 +6,18 @@ import { OperatorOidc } from './operator-oidc';
 describe('Swallow console', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
+  it('creates a subscriber without overwriting an existing ID and requires confirmation', async () => {
+    const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:{subscriberId:'user-1'}}),{status:201}));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('subscribers');app.credentialMode='api-key';app.apiKey='fixture-key';app.createSubscriberId=' user-1 ';app.createFirstName=' Alice ';app.createEmail='alice@example.test';await app.createSubscriber();expect(mock).not.toHaveBeenCalled();app.createConfirmed=true;await app.createSubscriber();expect(app.createStatus()).toBe('created');expect(mock.mock.calls[0][0]).toBe('http://127.0.0.1:3000/v2/subscribers?failIfExists=true');expect(mock.mock.calls[0][1]?.headers).toEqual({Authorization:'ApiKey fixture-key','Content-Type':'application/json'});expect(JSON.parse(mock.mock.calls[0][1]?.body as string)).toEqual({subscriberId:'user-1',firstName:'Alice',email:'alice@example.test'});
+    app.resetCreateSubscriber();app.createSubscriberId='user-1';app.createConfirmed=true;mock.mockResolvedValueOnce(new Response('',{status:409}));await app.createSubscriber();expect(app.createStatus()).toBe('rejected');expect(app.createMessage()).toContain('이미 존재');
+  });
+  it('preserves an uncertain subscriber creation result and blocks navigation in flight', async () => {
+    let finish!:(response:Response)=>void;const mock=vi.spyOn(globalThis,'fetch').mockReturnValueOnce(new Promise(done=>finish=done));const app=TestBed.createComponent(App).componentInstance;app.setSection('subscribers');app.credentialMode='api-key';app.apiKey='fixture-key';app.createSubscriberId='user-2';app.createConfirmed=true;const pending=app.createSubscriber();app.setSection('overview');app.forgetKey();expect(app.section()).toBe('subscribers');expect(app.apiKey).toBe('fixture-key');finish(new Response('',{status:500}));await pending;expect(app.createStatus()).toBe('unknown');expect(app.createdSubscriberId()).toBe('user-2');await app.createSubscriber();expect(mock).toHaveBeenCalledTimes(1);
+  });
+  it('does not create subscribers with read-only or JWT credentials', async () => {
+    const mock=vi.spyOn(globalThis,'fetch');const app=TestBed.createComponent(App).componentInstance;app.createSubscriberId='user-3';app.createConfirmed=true;app.apiKey='aaa.bbb.ccc';app.credentialMode='jwt';await app.createSubscriber();expect(mock).not.toHaveBeenCalled();app.credentialMode='restricted';await app.createSubscriber();expect(mock).not.toHaveBeenCalled();
+  });
+
   it('pages delegated grant audit with separate credentials and clears it when credentials change', async () => {
     const row=(n:number)=>({id:`00000000-0000-0000-0000-${n.toString().padStart(12,'0')}`,actorIssuer:'issuer',actorSubject:'alice',actorClientId:'console',databasePrincipal:'api',requestId:'11111111-1111-1111-1111-111111111111',targetIssuer:'issuer',targetSubject:'bob',targetClientId:'console',resource:'email',permission:'read',previous:false,current:true,reason:'ticket',recordedAt:'today',secret:'discard'});
     const first=Array.from({length:50},(_,i)=>row(i+1)),second=[row(51)];const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:first,hasMore:true,next:first[49].id}))).mockResolvedValueOnce(new Response(JSON.stringify({data:second,hasMore:false,next:null}))).mockResolvedValueOnce(new Response(JSON.stringify({data:first,hasMore:true,next:first[49].id})));

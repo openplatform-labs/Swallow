@@ -117,9 +117,31 @@
           </div></section>
         }
       } @else if (section() === 'subscribers') {
-        <div class="page-heading"><div><div class="eyebrow">AUDIENCE</div><h1>구독자</h1><p>선택한 환경의 구독자 목록을 조회합니다.</p></div></div>
+        <div class="page-heading"><div><div class="eyebrow">AUDIENCE</div><h1>구독자</h1><p>선택한 환경의 구독자를 조회하고 API 키로 생성합니다.</p></div></div>
         <clr-alert clrAlertType="warning" [clrAlertClosable]="false"><clr-alert-item><span class="alert-text">@if (credentialMode === 'api-key') {API 키 방식은 개발 검증용입니다. 기존 키는 더 넓은 권한을 가질 수 있으므로 격리된 테스트 키만 사용해 주세요.} @else if (credentialMode === 'jwt') {인증 공급자가 발급한 접근 토큰과 해당 환경의 구독자 조회 권한이 필요합니다. 개요에서 운영자 로그인 후 사용하거나 토큰을 직접 입력할 수 있습니다.} @else {구독자 조회 권한을 부여받은 인증이 필요하며 경보 권한은 별도로 부여됩니다. 정식 관리자 로그인은 아직 준비 중입니다.}</span></clr-alert-item></clr-alert>
-        <section class="card subscriber-card"><div class="card-block"><div class="card-eyebrow">ACCESS</div><h2>조회 설정</h2><form (ngSubmit)="loadSubscribers()" class="subscriber-form"><div><label for="subscriber-mode">인증 방식</label><select id="subscriber-mode" class="clr-select" name="credentialMode" [(ngModel)]="credentialMode" (ngModelChange)="forgetKey()"><option value="restricted">조회 전용 인증</option><option value="jwt">운영자 JWT</option><option value="api-key">환경 API 키 (개발용)</option></select></div>@if (credentialMode === 'jwt') {<div><label for="subscriber-environment">환경 ID</label><input id="subscriber-environment" name="subscriberEnvironment" class="clr-input" [(ngModel)]="subscriberEnvironment" (ngModelChange)="clearSubscribers()" autocomplete="off" required></div>}<div><label for="subscriber-key">{{ credentialMode === 'restricted' ? '조회 전용 인증 값' : credentialMode === 'jwt' ? '운영자 접근 토큰' : '환경 API 키' }}</label><input id="subscriber-key" class="clr-input" name="apiKey" type="password" [(ngModel)]="apiKey" (ngModelChange)="clearSubscribers()" autocomplete="off" spellcheck="false" required></div><div><label for="subscriber-name">이름 검색 <span>(선택)</span></label><input id="subscriber-name" class="clr-input" name="subscriberName" type="search" [(ngModel)]="subscriberName" (ngModelChange)="clearSubscribers()" autocomplete="off" placeholder="이름 검색"></div><button class="btn btn-primary" type="submit" [disabled]="subscriberStatus() === 'loading'">{{ subscriberStatus() === 'loading' ? '조회 중' : '조회' }}</button><button class="btn btn-outline" type="button" (click)="forgetKey()">키 지우기</button></form><p class="subscriber-hint">API 주소는 개요의 연결 설정을 사용합니다. 다른 화면으로 이동하면 키와 조회 결과가 지워집니다.</p></div></section>
+        <section class="card subscriber-card"><div class="card-block"><div class="card-eyebrow">ACCESS</div><h2>조회 설정</h2><form (ngSubmit)="loadSubscribers()" class="subscriber-form"><div><label for="subscriber-mode">인증 방식</label><select id="subscriber-mode" class="clr-select" name="credentialMode" [disabled]="createStatus() === 'sending'" [(ngModel)]="credentialMode" (ngModelChange)="forgetKey()"><option value="restricted">조회 전용 인증</option><option value="jwt">운영자 JWT</option><option value="api-key">환경 API 키 (개발용)</option></select></div>@if (credentialMode === 'jwt') {<div><label for="subscriber-environment">환경 ID</label><input id="subscriber-environment" name="subscriberEnvironment" class="clr-input" [(ngModel)]="subscriberEnvironment" (ngModelChange)="clearSubscribers()" autocomplete="off" required></div>}<div><label for="subscriber-key">{{ credentialMode === 'restricted' ? '조회 전용 인증 값' : credentialMode === 'jwt' ? '운영자 접근 토큰' : '환경 API 키' }}</label><input id="subscriber-key" class="clr-input" name="apiKey" [disabled]="createStatus() === 'sending'" type="password" [(ngModel)]="apiKey" (ngModelChange)="clearSubscribers()" autocomplete="off" spellcheck="false" required></div><div><label for="subscriber-name">이름 검색 <span>(선택)</span></label><input id="subscriber-name" class="clr-input" name="subscriberName" type="search" [(ngModel)]="subscriberName" (ngModelChange)="clearSubscribers()" autocomplete="off" placeholder="이름 검색"></div><button class="btn btn-primary" type="submit" [disabled]="subscriberStatus() === 'loading'">{{ subscriberStatus() === 'loading' ? '조회 중' : '조회' }}</button><button class="btn btn-outline" type="button" [disabled]="createStatus() === 'sending'" (click)="forgetKey()">키 지우기</button></form><p class="subscriber-hint">API 주소는 개요의 연결 설정을 사용합니다. 다른 화면으로 이동하면 키와 조회 결과가 지워집니다.</p></div></section>
+        @if(credentialMode === 'api-key'){
+          <section class="card decision-card"><div class="card-block"><div class="card-eyebrow">CREATE SUBSCRIBER</div><h2>구독자 생성</h2>
+            <p>선택한 환경 API 키로 생성합니다. 이미 존재하는 ID는 덮어쓰지 않습니다.</p>
+            @if(createStatus() === 'idle'){
+              <form class="decision-form" (ngSubmit)="createSubscriber()">
+                <label for="create-subscriber-id">구독자 ID</label><input id="create-subscriber-id" name="createSubscriberId" [(ngModel)]="createSubscriberId" autocomplete="off" required>
+                <label for="create-first-name">이름 (선택)</label><input id="create-first-name" name="createFirstName" [(ngModel)]="createFirstName" autocomplete="off">
+                <label for="create-last-name">성 (선택)</label><input id="create-last-name" name="createLastName" [(ngModel)]="createLastName" autocomplete="off">
+                <label for="create-email">이메일 (선택)</label><input id="create-email" name="createEmail" [(ngModel)]="createEmail" type="email" autocomplete="off">
+                <label for="create-phone">전화번호 (선택)</label><input id="create-phone" name="createPhone" [(ngModel)]="createPhone" autocomplete="off">
+                <label class="decision-confirm"><input type="checkbox" name="createConfirmed" [(ngModel)]="createConfirmed"> 환경과 구독자 정보를 확인했습니다.</label>
+                <button type="submit" class="btn btn-primary" [disabled]="!canCreateSubscriber()">구독자 생성</button>
+              </form>
+            } @else {
+              <p>구독자 ID: {{ createdSubscriberId() }}</p>
+              @if(createStatus() === 'sending'){<p role="status">생성 중입니다.</p>}
+              @else if(createStatus() === 'created'){<p role="status">구독자를 생성했습니다. 목록을 다시 조회하세요.</p>}
+              @else {<p class="subscriber-error" role="alert">{{ createMessage() }}</p>@if(createStatus() === 'unknown'){<p>응답이 유실되었거나 서버 처리 중일 수 있습니다. 목록 또는 단건 API에서 상태를 확인하세요. 존재한다는 사실만으로 이 요청이 생성한 것인지 확정할 수 없습니다.</p>}}
+              <button type="button" class="btn btn-outline" [disabled]="createStatus() === 'sending'" (click)="resetCreateSubscriber()">닫기</button>
+            }
+          </div></section>
+        }
         <section class="card subscriber-list"><div class="card-block"><div class="subscriber-heading"><div><div class="card-eyebrow">SUBSCRIBERS</div><h2>구독자 목록</h2></div>@if (subscriberStatus() === 'loaded') {<span>{{ subscribers().length }}명 표시</span>}</div>
           @if (subscriberStatus() === 'error') {<p class="subscriber-error" role="alert">{{ subscriberError() }}</p>}
           @else if (subscriberStatus() === 'loading') {<p aria-live="polite">목록을 불러오는 중입니다.</p>}
@@ -147,6 +169,28 @@
             @if (resendStatus() === 'error') {<p class="subscriber-error" role="alert">{{ resendError() }}</p>}
             @else if (resendStatus() === 'loading') {<p aria-live="polite">작업 결과를 불러오는 중입니다.</p>}
             @else if (resendResult(); as result) {<div role="status"><p>전달 결과: <strong>{{ result.result }}</strong> · 작업 상태: {{ result.jobStatus }} · 발송 시도: {{ result.attemptState || '없음' }}</p><p>자동 복구: {{ result.autoCorrelated ? '예' : '아니요' }} · 증거 충돌: {{ result.autoCorrelationConflict || result.providerIdAmbiguous ? '확인 필요' : '없음' }}</p><p>자동 복구 시각: {{ result.autoCorrelatedAt || '—' }} · 집계 완료 시각: {{ result.lastCompletedScanAt || '—' }}</p><p class="subscriber-hint">공급자 접수와 전달 결과는 서로 다릅니다. 결과는 조회 시점의 정보이며 메일 열람을 뜻하지 않습니다.</p></div>}
+          </div></section>
+        }
+        @if(credentialMode === 'api-key'){
+          <section class="card decision-card"><div class="card-block"><div class="card-eyebrow">CREATE SUBSCRIBER</div><h2>구독자 생성</h2>
+            <p>선택한 환경 API 키로 생성합니다. 이미 존재하는 ID는 덮어쓰지 않습니다.</p>
+            @if(createStatus() === 'idle'){
+              <form class="decision-form" (ngSubmit)="createSubscriber()">
+                <label for="create-subscriber-id">구독자 ID</label><input id="create-subscriber-id" name="createSubscriberId" [(ngModel)]="createSubscriberId" autocomplete="off" required>
+                <label for="create-first-name">이름 (선택)</label><input id="create-first-name" name="createFirstName" [(ngModel)]="createFirstName" autocomplete="off">
+                <label for="create-last-name">성 (선택)</label><input id="create-last-name" name="createLastName" [(ngModel)]="createLastName" autocomplete="off">
+                <label for="create-email">이메일 (선택)</label><input id="create-email" name="createEmail" [(ngModel)]="createEmail" type="email" autocomplete="off">
+                <label for="create-phone">전화번호 (선택)</label><input id="create-phone" name="createPhone" [(ngModel)]="createPhone" autocomplete="off">
+                <label class="decision-confirm"><input type="checkbox" name="createConfirmed" [(ngModel)]="createConfirmed"> 환경과 구독자 정보를 확인했습니다.</label>
+                <button type="submit" class="btn btn-primary" [disabled]="!canCreateSubscriber()">구독자 생성</button>
+              </form>
+            } @else {
+              <p>구독자 ID: {{ createdSubscriberId() }}</p>
+              @if(createStatus() === 'sending'){<p role="status">생성 중입니다.</p>}
+              @else if(createStatus() === 'created'){<p role="status">구독자를 생성했습니다. 목록을 다시 조회하세요.</p>}
+              @else {<p class="subscriber-error" role="alert">{{ createMessage() }}</p>@if(createStatus() === 'unknown'){<p>응답이 유실되었거나 서버 처리 중일 수 있습니다. 목록 또는 단건 API에서 상태를 확인하세요. 존재한다는 사실만으로 이 요청이 생성한 것인지 확정할 수 없습니다.</p>}}
+              <button type="button" class="btn btn-outline" [disabled]="createStatus() === 'sending'" (click)="resetCreateSubscriber()">닫기</button>
+            }
           </div></section>
         }
         <section class="card subscriber-list"><div class="card-block"><div class="subscriber-heading"><div><div class="card-eyebrow">ALERT DESTINATIONS</div><h2>경보 대상 상태</h2></div></div>

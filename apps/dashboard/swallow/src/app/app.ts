@@ -151,6 +151,15 @@ export class App implements OnDestroy {
   credentialMode: 'restricted' | 'api-key' | 'jwt' = 'restricted';
   subscriberEnvironment = '';
   subscriberName = '';
+  createSubscriberId='';
+  createFirstName='';
+  createLastName='';
+  createEmail='';
+  createPhone='';
+  createConfirmed=false;
+  readonly createStatus=signal<'idle'|'sending'|'created'|'rejected'|'unknown'>('idle');
+  readonly createMessage=signal('');
+  readonly createdSubscriberId=signal('');
   private subscriberRequestId = 0;
   private subscriberAbort: AbortController | null = null;
   private requestId = 0;
@@ -268,7 +277,7 @@ export class App implements OnDestroy {
   }
 
   resetOidc(): void {
-    if (this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
+    if (this.createStatus()==='sending' || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     if (this.oidcExpiryTimer !== null) clearTimeout(this.oidcExpiryTimer);
     this.oidcExpiryTimer=null;
     this.oidcSequence++; this.oidcPrepared = null; this.oidcSession = null;
@@ -298,7 +307,7 @@ export class App implements OnDestroy {
 
   useOidc(section: 'subscribers' | 'alerts' | 'workflows'): void {
     this.expireOidcIfNeeded();
-    if (!this.oidcSession || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
+    if (!this.oidcSession || this.createStatus()==='sending' || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     const session=this.oidcSession;
     this.setSection(section);
     if (section === 'subscribers') { this.forgetKey(); this.credentialMode='jwt'; this.subscriberEnvironment=session.environmentId; this.apiKey=session.token; }
@@ -834,7 +843,7 @@ export class App implements OnDestroy {
   }
 
   setSection(next: Section): void {
-    if (this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
+    if (this.createStatus()==='sending' || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     if (this.section()==='workflows' && next!=='workflows') {this.clearWorkflow(true);this.forgetWorkflowRequest();}
     if (this.section() === 'subscribers' && next !== 'subscribers') this.forgetKey();
     if (this.section() === 'alerts' && next !== 'alerts') this.forgetAlertKey();
@@ -866,6 +875,8 @@ export class App implements OnDestroy {
   }
 
   forgetKey(): void {
+    if(this.createStatus()==='sending')return;
+    this.resetCreateSubscriber();
     this.apiKey = '';
     this.clearSubscribers();
   }
@@ -1257,6 +1268,35 @@ export class App implements OnDestroy {
     } finally {
       if (id === this.alertRequestId) this.alertAbort = null;
     }
+  }
+
+  resetCreateSubscriber():void {
+    if(this.createStatus()==='sending')return;
+    this.createSubscriberId='';this.createFirstName='';this.createLastName='';this.createEmail='';this.createPhone='';this.createConfirmed=false;this.createdSubscriberId.set('');this.createMessage.set('');this.createStatus.set('idle');
+  }
+  canCreateSubscriber():boolean {
+    const id=this.createSubscriberId.trim(),key=this.apiKey.trim();
+    return this.credentialMode==='api-key'&&this.createStatus()==='idle'&&this.createConfirmed&&!!id&&new TextEncoder().encode(id).length<=512&&!id.includes('\0')&&!!key&&!/[^\x21-\x7e]/.test(key);
+  }
+  async createSubscriber():Promise<void> {
+    if(!this.canCreateSubscriber())return;
+    let origin:string;try{origin=this.validatedOrigin();}catch{this.createStatus.set('rejected');this.createMessage.set('API 주소를 확인하세요.');return;}
+    const key=this.apiKey.trim(),subscriberId=this.createSubscriberId.trim();
+    const body:Record<string,string>={subscriberId};
+    for(const [name,value] of [['firstName',this.createFirstName],['lastName',this.createLastName],['email',this.createEmail],['phone',this.createPhone]])if(value.trim())body[name]=value.trim();
+    this.createdSubscriberId.set(subscriberId);this.createStatus.set('sending');this.createMessage.set('');
+    try {
+      const response=await fetch(`${origin}/v2/subscribers?failIfExists=true`,{method:'POST',headers:{Authorization:`ApiKey ${key}`,'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
+      if(!response.ok){
+        if([400,401,403,409,501].includes(response.status)){this.createStatus.set('rejected');this.createMessage.set(response.status===409?'이미 존재하는 구독자 ID입니다. 기존 구독자는 변경되지 않았습니다.':'입력 값, 인증과 API 지원 여부를 확인하세요.');}
+        else {this.createStatus.set('unknown');this.createMessage.set('요청 결과를 확인할 수 없습니다. 같은 ID를 조회해 확인하세요.');}
+        return;
+      }
+      const value:unknown=await response.json();
+      if(response.status!==201||typeof value!=='object'||value===null||!('data' in value)||typeof value.data!=='object'||value.data===null||!('subscriberId' in value.data)||value.data.subscriberId!==subscriberId)throw new Error('invalid response');
+      this.createStatus.set('created');this.clearSubscribers();
+    }catch{this.createStatus.set('unknown');this.createMessage.set('요청 결과를 확인할 수 없습니다. 같은 ID를 조회해 확인하세요.');}
+    finally{this.createConfirmed=false;}
   }
 
   private validatedOrigin(): string {
