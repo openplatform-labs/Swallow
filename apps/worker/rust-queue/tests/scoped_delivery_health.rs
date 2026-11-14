@@ -254,6 +254,92 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
             .await
             .is_err()
     );
+    // A second current attempt can reuse a provider ID after a successful projection.
+    // Monitoring must notice without waiting for the projector's next scan.
+    for (provider, original, kind, attempts, value) in [
+        (
+            "resend",
+            resend_job,
+            queue::resend_queue::JOB_KIND,
+            "novu_rust_resend_attempts",
+            "secret-provider-id",
+        ),
+        (
+            "twilio",
+            sms,
+            queue::twilio_queue::JOB_KIND,
+            "novu_rust_twilio_attempts",
+            "secret-sms-id",
+        ),
+    ] {
+        db.execute(&format!("UPDATE novu_queue_jobs SET {provider}_delivery_result='delivered',available_at=clock_timestamp()-interval '1 hour' WHERE id=$1"), &[&original]).await.unwrap();
+        let base = reconciliation::scoped_provider_health(&actor, "a", provider, 300, 120)
+            .await
+            .unwrap();
+        let isolated = Uuid::new_v4();
+        queue::enqueue(&db, isolated, "b", kind, &json!({}))
+            .await
+            .unwrap();
+        db.execute(&format!("INSERT INTO {attempts}(job_id,environment_id,state,provider_message_id) VALUES ($1,'b','accepted',$2)"), &[&isolated,&value]).await.unwrap();
+        assert_eq!(
+            reconciliation::scoped_channel_result(&actor, "a", original, provider)
+                .await
+                .unwrap()["providerIdAmbiguous"],
+            false
+        );
+        let duplicate = Uuid::new_v4();
+        queue::enqueue(&db, duplicate, "a", kind, &json!({}))
+            .await
+            .unwrap();
+        db.execute(
+            "UPDATE novu_queue_jobs SET status='cancelled' WHERE id=$1",
+            &[&duplicate],
+        )
+        .await
+        .unwrap();
+        db.execute(&format!("INSERT INTO {attempts}(job_id,environment_id,state,provider_message_id) VALUES ($1,'a','accepted',$2)"), &[&duplicate,&value]).await.unwrap();
+        let result = reconciliation::scoped_channel_result(&actor, "a", original, provider)
+            .await
+            .unwrap();
+        assert_eq!(result["providerIdAmbiguous"], true);
+        assert_eq!(result["result"], "unknown");
+        assert!(!result.to_string().contains("secret"));
+        let health = reconciliation::scoped_provider_health(&actor, "a", provider, 300, 120)
+            .await
+            .unwrap();
+        assert_eq!(
+            health["overdueUndelivered"].as_i64().unwrap(),
+            base["overdueUndelivered"].as_i64().unwrap() + 1
+        );
+        let direct = if provider == "resend" {
+            reconciliation::resend_health(&db, "a", 300, 120)
+                .await
+                .unwrap()
+        } else {
+            reconciliation::twilio_health(&db, "a", 300, 120)
+                .await
+                .unwrap()
+        };
+        assert_eq!(health, direct);
+        db.execute(
+            "DELETE FROM novu_queue_jobs WHERE id=ANY($1)",
+            &[&vec![isolated, duplicate]],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reconciliation::scoped_channel_result(&actor, "a", original, provider)
+                .await
+                .unwrap()["providerIdAmbiguous"],
+            false
+        );
+        db.execute(
+            &format!("UPDATE novu_queue_jobs SET {provider}_delivery_result=NULL WHERE id=$1"),
+            &[&original],
+        )
+        .await
+        .unwrap();
+    }
     let first = reconciliation::scoped_list_after(&actor, "a", None)
         .await
         .unwrap();

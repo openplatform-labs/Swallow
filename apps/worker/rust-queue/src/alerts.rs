@@ -1149,6 +1149,7 @@ mod tests {
         for sql in [
             crate::MIGRATION,
             crate::in_app::EMAIL_MESSAGES_MIGRATION,
+            crate::resend_queue::MIGRATION,
             crate::resend_projection::MIGRATION,
             crate::resend_projection::HEARTBEAT_MIGRATION,
             crate::reconciliation::MIGRATION,
