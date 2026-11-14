@@ -277,31 +277,24 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         )
         .await?;
         println!("alert resolution recorded");
-    } else if args.len() == 2 && args[0] == "list" {
-        println!(
-            "{}",
-            serde_json::to_string(
-                &novu_postgres_queue::reconciliation::list(&db, &args[1]).await?
-            )?
-        );
-    } else if args.len() == 4 && args[0] == "list" {
-        let job = Uuid::parse_str(&args[2])?;
-        let target = if args[3] == "-" {
-            None
+    } else if (args.len() == 2 || args.len() == 4) && args[0] == "list" {
+        let after = if args.len() == 4 {
+            let job = Uuid::parse_str(&args[2])?;
+            let target = if args[3] == "-" {
+                None
+            } else {
+                Some(args[3].parse::<i32>()?)
+            };
+            Some((job, target))
         } else {
-            Some(args[3].parse::<i32>()?)
+            None
         };
-        println!(
-            "{}",
-            serde_json::to_string(
-                &novu_postgres_queue::reconciliation::list_after(
-                    &db,
-                    &args[1],
-                    Some((job, target))
-                )
-                .await?
-            )?
-        );
+        let rows = if monitor_scoped_access()? {
+            novu_postgres_queue::reconciliation::scoped_list_after(&db, &args[1], after).await?
+        } else {
+            novu_postgres_queue::reconciliation::list_after(&db, &args[1], after).await?
+        };
+        println!("{}", serde_json::to_string(&rows)?);
     } else if args.len() == 3 && args[0] == "evidence" {
         println!(
             "{}",

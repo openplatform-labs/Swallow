@@ -263,6 +263,29 @@ pub async fn list_after(
     Ok(rows.into_iter().map(|r| json!({"jobId":r.get::<_,Uuid>(0).to_string(),"kind":r.get::<_,String>(1),"jobStatus":r.get::<_,String>(2),"targetIndex":r.get::<_,Option<i32>>(3),"httpStatus":r.get::<_,Option<i32>>(4),"updatedAt":r.get::<_,String>(5)})).collect())
 }
 
+/// List unknown attempts using an environment-scoped operator login.
+pub async fn scoped_list_after(
+    client: &Client,
+    environment: &str,
+    after: Option<(Uuid, Option<i32>)>,
+) -> Result<Vec<Value>> {
+    if after
+        .as_ref()
+        .is_some_and(|(_, index)| index.is_some_and(|i| i < 0))
+    {
+        return Err("invalid target index".into());
+    }
+    let job = after.as_ref().map(|(id, _)| *id);
+    let index = after.and_then(|(_, index)| index).unwrap_or(-1);
+    let rows = client
+        .query(
+            "SELECT * FROM public.novu_rust_list_unknown_attempts($1,$2,$3)",
+            &[&environment, &job, &index],
+        )
+        .await?;
+    Ok(rows.into_iter().map(|r| json!({"jobId":r.get::<_,Uuid>(0).to_string(),"kind":r.get::<_,String>(1),"jobStatus":r.get::<_,String>(2),"targetIndex":r.get::<_,Option<i32>>(3),"httpStatus":r.get::<_,Option<i32>>(4),"updatedAt":r.get::<_,String>(5)})).collect())
+}
+
 /// Read a current SendGrid projection through the environment-scoped DB role.
 pub async fn scoped_sendgrid_result(
     client: &Client,
