@@ -154,7 +154,7 @@ describe('Swallow console', () => {
     app.setSection('alerts'); app.alertKey = 'a'.repeat(64);
     await app.loadAlerts();
     app.selectAlert(app.alertSlots()[0]);
-    app.decisionKey = 'b'.repeat(64); app.decision = 'accepted'; app.decisionReason = 'ticket'; app.decisionConfirmed = true;
+    app.decisionProtocol = 'legacy'; app.decisionKey = 'b'.repeat(64); app.decision = 'accepted'; app.decisionReason = 'ticket'; app.decisionConfirmed = true;
     const pending = app.resolveAlert();
     await app.resolveAlert();
     app.setSection('overview');
@@ -174,7 +174,7 @@ describe('Swallow console', () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[{channel:'email',targetId:'ops',state:'rejected',lastStartedAt:null,attemptId:id}],hasMore:false,next:null}),{status:200})).mockRejectedValueOnce(new TypeError('network'));
     const app = TestBed.createComponent(App).componentInstance;
     app.setSection('alerts'); app.alertKey = 'a'.repeat(64); await app.loadAlerts();
-    app.selectAlert(app.alertSlots()[0]); app.decisionKey = 'b'.repeat(64); app.decisionReason = 'ticket';
+    app.selectAlert(app.alertSlots()[0]); app.decisionProtocol = 'legacy'; app.decisionKey = 'b'.repeat(64); app.decisionReason = 'ticket';
     await app.resolveAlert(); expect(fetchMock).toHaveBeenCalledTimes(1);
     app.decisionConfirmed = true; app.decision = 'accepted';
     await app.resolveAlert(); expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -182,6 +182,63 @@ describe('Swallow console', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2); expect(app.decisionStatus()).toBe('unknown');
     expect(app.decisionKey).toBe(''); expect(app.alertSlots()).toEqual([]);
     await app.resolveAlert(); expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses a new request ID and can look up its committed result', async () => {
+    const attempt = '1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[{channel:'slack',targetId:'ops',state:'unknown',lastStartedAt:null,attemptId:attempt}],hasMore:false,next:null}),{status:200})).mockResolvedValueOnce(new Response(JSON.stringify({recorded:true,replayed:false}),{status:200}));
+    const fixture = TestBed.createComponent(App);
+    const app = fixture.componentInstance;
+    app.setSection('alerts'); app.alertKey = 'a'.repeat(64); await app.loadAlerts();
+    app.selectAlert(app.alertSlots()[0]); app.decisionKey = 'b'.repeat(64); app.decisionReason = 'verified'; app.decisionConfirmed = true;
+    await app.resolveAlert();
+    const id = app.decisionRequestId();
+    expect(id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(fetchMock.mock.calls[1][0]).toBe('http://127.0.0.1:3000/v1/experimental/console/alerts/resolve-v2');
+    expect(JSON.parse(fetchMock.mock.calls[1][1]?.body as string)).toEqual({channel:'slack',targetId:'ops',attemptId:attempt,decision:'retry',reason:'verified',requestId:id});
+    expect(app.lookupId).toBe(id); expect(app.decisionKey).toBe('');
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({found:true,requestId:id,channel:'slack',targetId:'ops',attemptId:attempt,decision:'retry',reason:'verified',createdAt:'2026-01-01T00:00:00Z'}),{status:200}));
+    app.lookupKey = 'b'.repeat(64);
+    await app.lookupDecisionRequest(); fixture.detectChanges();
+    expect(app.lookupStatus()).toBe('found');
+    expect(fixture.nativeElement.textContent).toContain('verified');
+    expect(fetchMock.mock.calls[2][0]).toContain(`requestId=${id}`);
+    app.setSection('overview'); expect(app.lookupKey).toBe(''); expect(app.lookupId).toBe(''); expect(app.decisionRequestId()).toBeNull();
+  });
+
+  it('preserves an ambiguous request ID without retrying and treats absence as inconclusive', async () => {
+    const attempt='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[{channel:'email',targetId:'ops',state:'unknown',lastStartedAt:null,attemptId:attempt}],hasMore:false,next:null}),{status:200})).mockRejectedValueOnce(new TypeError('network')).mockResolvedValueOnce(new Response(JSON.stringify({found:false}),{status:200}));
+    const app=TestBed.createComponent(App).componentInstance;
+    app.setSection('alerts'); app.alertKey='a'.repeat(64); await app.loadAlerts();
+    app.selectAlert(app.alertSlots()[0]); app.decisionKey='b'.repeat(64); app.decisionReason='investigation'; app.decisionConfirmed=true;
+    await app.resolveAlert();
+    expect(app.decisionStatus()).toBe('unknown'); expect(app.lookupId).toBe(app.decisionRequestId());
+    app.lookupKey='b'.repeat(64); await app.lookupDecisionRequest();
+    expect(app.lookupStatus()).toBe('not-found'); expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not downgrade or send when secure request IDs cannot be created', async () => {
+    const attempt='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[{channel:'email',targetId:'ops',state:'unknown',lastStartedAt:null,attemptId:attempt}],hasMore:false,next:null}),{status:200}));
+    vi.spyOn(globalThis.crypto,'randomUUID').mockImplementation(() => { throw new Error('unavailable'); });
+    const app=TestBed.createComponent(App).componentInstance;
+    app.setSection('alerts'); app.alertKey='a'.repeat(64); await app.loadAlerts();
+    app.selectAlert(app.alertSlots()[0]); app.decisionKey='b'.repeat(64); app.decisionReason='ticket'; app.decisionConfirmed=true;
+    await app.resolveAlert();
+    expect(app.decisionStatus()).toBe('unavailable'); expect(fetchMock).toHaveBeenCalledTimes(1); expect(app.decisionRequestId()).toBeNull();
+  });
+
+  it('ignores stale request lookups and clears their credentials', async () => {
+    let resolve!: (response: Response) => void;
+    vi.spyOn(globalThis,'fetch').mockReturnValueOnce(new Promise<Response>(done => { resolve=done; }));
+    const app=TestBed.createComponent(App).componentInstance;
+    app.setSection('alerts'); app.lookupKey='b'.repeat(64); app.lookupId='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
+    const pending=app.lookupDecisionRequest();
+    app.setSection('overview');
+    resolve(new Response(JSON.stringify({found:false}),{status:200}));
+    await pending;
+    expect(app.lookupStatus()).toBe('idle'); expect(app.lookupKey).toBe(''); expect(app.lookupId).toBe('');
   });
 
   it('retrieves only a specified decision history and clears it on leaving', async () => {

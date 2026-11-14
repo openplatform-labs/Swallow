@@ -7,6 +7,7 @@ type Subscriber = { id: string; firstName: string; lastName: string; email: stri
 type AlertSlot = { channel: string; targetId: string; state: string; lastStartedAt: string | null; attemptId?: string | null };
 type AlertCursor = { channel: string; targetId: string };
 type DecisionHistory = { id: string; decision: string; reason: string; createdAt: string };
+type DecisionRequest = { requestId: string; channel: string; targetId: string; attemptId: string; decision: string; reason: string; createdAt: string };
 type Section = 'overview' | 'workflows' | 'subscribers' | 'channels' | 'activity' | 'alerts' | 'settings';
 
 @Component({
@@ -41,7 +42,15 @@ export class App {
   readonly alertNext = signal<AlertCursor | null>(null);
   readonly alertPage = signal(1);
   readonly selectedAlert = signal<AlertSlot | null>(null);
-  readonly decisionStatus = signal<'idle' | 'sending' | 'recorded' | 'rejected' | 'unknown'>('idle');
+  readonly decisionStatus = signal<'idle' | 'sending' | 'recorded' | 'rejected' | 'unknown' | 'unavailable'>('idle');
+  decisionProtocol: 'idempotent' | 'legacy' = 'idempotent';
+  readonly decisionRequestId = signal<string | null>(null);
+  lookupKey = '';
+  lookupId = '';
+  readonly lookupStatus = signal<'idle' | 'loading' | 'found' | 'not-found' | 'error'>('idle');
+  readonly lookupResult = signal<DecisionRequest | null>(null);
+  private lookupSequence = 0;
+  private lookupAbort: AbortController | null = null;
   decisionKey = '';
   decision: 'retry' | 'accepted' = 'retry';
   decisionReason = '';
@@ -128,6 +137,42 @@ export class App {
     if (clearKey) { this.historyKey = ''; this.historyTarget = ''; this.historyAttempt = ''; this.historyChannel = 'slack'; }
   }
 
+  clearRequestLookup(clearInputs = false): void {
+    this.lookupSequence++;
+    this.lookupAbort?.abort();
+    this.lookupAbort = null;
+    this.lookupResult.set(null);
+    this.lookupStatus.set('idle');
+    if (clearInputs) { this.lookupKey = ''; this.lookupId = ''; this.decisionRequestId.set(null); }
+  }
+
+  async lookupDecisionRequest(): Promise<void> {
+    if (this.decisionStatus() === 'sending') return;
+    this.clearRequestLookup();
+    const sequence = this.lookupSequence;
+    const key = this.lookupKey.trim();
+    const requestId = this.lookupId.trim();
+    if (!/^[0-9a-f]{64}$/.test(key) || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId)) { this.lookupStatus.set('error'); return; }
+    const controller = new AbortController();
+    this.lookupAbort = controller;
+    this.lookupStatus.set('loading');
+    try {
+      const response = await fetch(`${this.validatedOrigin()}/v1/experimental/console/alerts/request?${new URLSearchParams({requestId})}`, {method:'GET',headers:{Authorization:`SwallowConsole ${key}`},cache:'no-store',credentials:'omit',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      if (!response.ok) throw new Error('request unavailable');
+      const body: unknown = await response.json();
+      if (typeof body !== 'object' || body === null || !('found' in body) || typeof body.found !== 'boolean') throw new Error('invalid response');
+      if (sequence !== this.lookupSequence) return;
+      if (!body.found) { this.lookupStatus.set('not-found'); return; }
+      if (!('requestId' in body) || typeof body.requestId !== 'string' || body.requestId.toLowerCase() !== requestId.toLowerCase() || !('channel' in body) || (body.channel !== 'slack' && body.channel !== 'email') || !('targetId' in body) || typeof body.targetId !== 'string' || !('attemptId' in body) || typeof body.attemptId !== 'string' || !('decision' in body) || (body.decision !== 'retry' && body.decision !== 'accepted') || !('reason' in body) || typeof body.reason !== 'string' || !('createdAt' in body) || typeof body.createdAt !== 'string') throw new Error('invalid response');
+      this.lookupResult.set({requestId:body.requestId,channel:body.channel,targetId:body.targetId,attemptId:body.attemptId,decision:body.decision,reason:body.reason,createdAt:body.createdAt});
+      this.lookupStatus.set('found');
+    } catch {
+      if (sequence === this.lookupSequence) this.lookupStatus.set('error');
+    } finally {
+      if (sequence === this.lookupSequence) this.lookupAbort = null;
+    }
+  }
+
   async loadDecisionHistory(): Promise<void> {
     if (this.decisionStatus() === 'sending') return;
     this.clearHistory();
@@ -177,7 +222,7 @@ export class App {
   canResolve(): boolean {
     const slot = this.selectedAlert();
     const reason = this.decisionReason.trim();
-    return this.decisionStatus() === 'idle' && !!slot?.attemptId && this.decisionConfirmed && /^[0-9a-f]{64}$/.test(this.decisionKey.trim()) && !!reason && new TextEncoder().encode(reason).length <= 512 && (this.decision === 'retry' || (this.decision === 'accepted' && slot.state === 'unknown'));
+    return this.decisionStatus() === 'idle' && (this.decisionProtocol === 'legacy' || this.decisionProtocol === 'idempotent') && !!slot?.attemptId && this.decisionConfirmed && /^[0-9a-f]{64}$/.test(this.decisionKey.trim()) && !!reason && new TextEncoder().encode(reason).length <= 512 && (this.decision === 'retry' || (this.decision === 'accepted' && slot.state === 'unknown'));
   }
 
   async resolveAlert(): Promise<void> {
@@ -187,16 +232,25 @@ export class App {
     if (!this.canResolve() || !slot?.attemptId) return;
     let origin: string;
     try { origin = this.validatedOrigin(); } catch { this.decisionStatus.set('rejected'); return; }
+    let requestId: string | null = null;
+    if (this.decisionProtocol === 'idempotent') {
+      try { requestId = crypto.randomUUID(); } catch { this.decisionStatus.set('unavailable'); return; }
+      this.clearRequestLookup(true);
+      this.decisionRequestId.set(requestId);
+      this.lookupId = requestId;
+    } else {
+      this.clearRequestLookup(true);
+    }
     this.decisionStatus.set('sending');
     try {
-      const response = await fetch(`${origin}/v1/experimental/console/alerts/resolve`, {
+      const response = await fetch(`${origin}/v1/experimental/console/alerts/${requestId ? 'resolve-v2' : 'resolve'}`, {
         method: 'POST', headers: { Authorization: `SwallowConsole ${key}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ channel: slot.channel, targetId: slot.targetId, attemptId: slot.attemptId, decision: this.decision, reason }),
+        body: JSON.stringify({ channel: slot.channel, targetId: slot.targetId, attemptId: slot.attemptId, decision: this.decision, reason, ...(requestId ? {requestId} : {}) }),
         cache: 'no-store', credentials: 'omit', redirect: 'error', signal: AbortSignal.timeout(10000),
       });
       if (response.ok) {
         const body: unknown = await response.json();
-        this.decisionStatus.set(typeof body === 'object' && body !== null && 'recorded' in body && body.recorded === true ? 'recorded' : 'unknown');
+        this.decisionStatus.set(typeof body === 'object' && body !== null && 'recorded' in body && body.recorded === true && (!requestId || ('replayed' in body && typeof body.replayed === 'boolean')) ? 'recorded' : 'unknown');
       } else {
         this.decisionStatus.set([400, 401, 403].includes(response.status) ? 'rejected' : 'unknown');
       }
@@ -223,6 +277,7 @@ export class App {
   forgetAlertKey(): void {
     this.alertKey = '';
     this.clearAlerts();
+    this.clearRequestLookup(true);
   }
 
   async loadAlerts(direction?: 'next' | 'previous'): Promise<void> {

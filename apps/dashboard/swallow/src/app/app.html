@@ -55,6 +55,21 @@
         @if (decisionStatus() === 'recorded') { <p class="decision-result" role="status">판정을 기록했습니다. 현재 상태와 감사 기록을 다시 확인해 주세요. 실제 수신이 확인된 것은 아닙니다.</p> }
         @if (decisionStatus() === 'rejected') { <p class="decision-result subscriber-error" role="alert">요청이 거절되었습니다. 인증·권한과 최신 시도를 확인한 뒤 다시 조회해 주세요.</p> }
         @if (decisionStatus() === 'unknown') { <p class="decision-result subscriber-error" role="alert">결과를 확인할 수 없습니다. 재시도하기 전에 상태와 감사 기록을 확인해 주세요.</p> }
+        @if (decisionStatus() === 'unavailable') { <p class="decision-result subscriber-error" role="alert">이 브라우저에서 안전한 요청 ID를 생성할 수 없어 판정 요청을 보내지 않았습니다.</p> }
+        @if (decisionRequestId(); as requestId) {<p class="decision-result" role="status">요청 ID: <strong>{{ requestId }}</strong> · 화면을 떠나거나 새로고침하기 전에 보관하세요.</p>}
+        <section class="card decision-card"><div class="card-block">
+          <div class="card-eyebrow">REQUEST STATUS</div><h2>판정 요청 결과 확인</h2>
+          <p>요청 ID 방식으로 판정할 때 사용한 같은 인증과 요청 ID를 입력합니다. 조회 결과가 없어도 요청이 처리 중일 수 있으므로 실패로 단정하지 마세요.</p>
+          <form class="decision-form" (ngSubmit)="lookupDecisionRequest()">
+            <label for="lookup-key">판정 권한 인증 값</label><input id="lookup-key" name="lookupKey" type="password" [(ngModel)]="lookupKey" (ngModelChange)="clearRequestLookup()" [disabled]="decisionStatus() === 'sending'" autocomplete="off" required>
+            <label for="lookup-id">요청 ID</label><input id="lookup-id" name="lookupId" [(ngModel)]="lookupId" (ngModelChange)="clearRequestLookup()" [disabled]="decisionStatus() === 'sending'" autocomplete="off" required>
+            <div><button type="submit" class="btn btn-outline" [disabled]="decisionStatus() === 'sending' || lookupStatus() === 'loading'">요청 결과 조회</button><button type="button" class="btn btn-outline" [disabled]="decisionStatus() === 'sending'" (click)="clearRequestLookup(true)">요청 조회 지우기</button></div>
+          </form>
+          @if (lookupStatus() === 'error') {<p class="subscriber-error" role="alert">요청 결과를 조회하지 못했습니다. 인증·권한과 요청 ID를 확인해 주세요.</p>}
+          @else if (lookupStatus() === 'loading') {<p role="status">요청 결과를 확인하는 중입니다.</p>}
+          @else if (lookupStatus() === 'not-found') {<p>커밋된 요청을 찾지 못했습니다. 원래 요청이 진행 중이거나 인증·환경·DB가 다를 수 있습니다. 관리자 감사와 원래 트랜잭션을 확인하세요.</p>}
+          @else if (lookupResult(); as result) {<p role="status">기록됨: {{ result.channel }} · {{ result.targetId }} · {{ result.attemptId }}<br>판정: {{ result.decision }} / 사유: {{ result.reason }}<br>기록 시각: {{ result.createdAt }}</p>}
+        </div></section>
         <section class="card decision-card"><div class="card-block">
           <div class="card-eyebrow">DECISION HISTORY</div><h2>내 판정 이력 확인</h2>
           <p>판정에 사용한 같은 인증 값으로 시도별 최근 이력을 조회합니다. 이력이 없어도 요청이 아직 처리 중이거나 다른 인증·환경을 사용했을 수 있으므로 실패로 단정하지 마세요.</p>
@@ -78,6 +93,7 @@
             <p><strong>{{ slot.channel }} · {{ slot.targetId }}</strong> / {{ slot.state }}<br>발송 시도 ID: {{ slot.attemptId }}</p>
             <p>공급자의 결과를 별도로 확인한 후 선택하세요. 재시도 허용은 이후 발송에서 중복이 생길 수 있습니다. 접수 판정은 수신을 보장하지 않습니다.</p>
             <form class="decision-form" (ngSubmit)="resolveAlert()">
+              <label for="decision-protocol">판정 요청 방식</label><select id="decision-protocol" name="decisionProtocol" [(ngModel)]="decisionProtocol" [disabled]="decisionStatus() === 'sending'"><option value="idempotent">요청 ID 사용 (API 0038)</option><option value="legacy">기존 방식 (API 0036)</option></select><small>요청 ID 방식은 동일 요청의 중복 판정을 방지합니다. 두 방식 모두 자동 재시도하지 않습니다.</small>
               <label for="decision-kind">판정</label><select id="decision-kind" class="clr-select" name="decision" [(ngModel)]="decision" [disabled]="decisionStatus() === 'sending'"><option value="retry">재시도 허용</option>@if (slot.state === 'unknown') {<option value="accepted">공급자 접수로 판정</option>}</select>
               <label for="decision-key">판정 권한 인증 값</label><input id="decision-key" class="clr-input" name="decisionKey" type="password" [(ngModel)]="decisionKey" [disabled]="decisionStatus() === 'sending'" autocomplete="off" spellcheck="false" required>
               <label for="decision-reason">조사 사유</label><textarea id="decision-reason" name="decisionReason" [(ngModel)]="decisionReason" [disabled]="decisionStatus() === 'sending'" maxlength="512" required></textarea><small>비밀을 제외하고 512바이트 이내로 입력하세요.</small>
