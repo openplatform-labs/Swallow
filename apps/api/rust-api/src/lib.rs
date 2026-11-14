@@ -1,5 +1,6 @@
 //! Experimental, deliberately incomplete Novu trigger endpoint.
 mod contexts;
+mod channel_workflow_management;
 mod fcm_integrations;
 mod inbox_context;
 mod inbox_data;
@@ -302,6 +303,7 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/events/trigger", post(trigger))
         .route("/v1/experimental/fcm-integrations", get(fcm_integrations::list).post(fcm_integrations::create))
         .route("/v1/experimental/fcm-integrations/{identifier}", get(fcm_integrations::get).patch(fcm_integrations::update))
+        .route("/v1/experimental/workflows/{workflow}/channel-steps/{channel}", get(channel_workflow_management::get).put(channel_workflow_management::put))
         .route("/v1/experimental/slack-integrations", get(slack_integrations::list_integrations).post(slack_integrations::create_integration))
         .route("/v1/experimental/slack-integrations/{integration}", get(slack_integrations::get_integration).delete(slack_integrations::delete_integration))
         .route("/v1/experimental/slack-integrations/{integration}/connections", get(slack_integrations::list_connections).post(slack_integrations::create_connection))

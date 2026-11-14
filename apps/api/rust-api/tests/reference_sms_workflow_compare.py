@@ -25,9 +25,12 @@ d.notificationtemplates.insertOne({_id:w,_environmentId:e,_organizationId:o,name
 d.preferences.insertOne({_environmentId:e,_organizationId:o,_templateId:w,type:"WORKFLOW_RESOURCE",preferences:{all:{enabled:true,readOnly:false},channels:{sms:{enabled:true}}},deleted:false});
 ''')
 run('docker','exec',pg,'psql','-v','ON_ERROR_STOP=1','-U','postgres','-d','novu_compat','-c','''
-INSERT INTO novu_rust_workflows(environment_id,identifier,active,has_steps,sms_content,sms_step_id,inbox_metadata) VALUES ('64a000000000000000000002','sms-compare',true,true,'Hello {{subscriber.firstName}} {{name}}','sms-step','{"id":"64a000000000000000000031","name":"SMS Compare","critical":false,"tags":[]}'::jsonb);
+INSERT INTO novu_rust_workflows(environment_id,identifier,active,has_steps,sms_content,sms_step_id,inbox_metadata) VALUES ('64a000000000000000000002','sms-compare',true,true,NULL,'sms-step','{"id":"64a000000000000000000031","name":"SMS Compare","critical":false,"tags":[]}'::jsonb);
+INSERT INTO novu_rust_channel_workflow_permissions SELECT key_hash,'sms','write' FROM novu_rust_api_keys WHERE environment_id='64a000000000000000000002';
 INSERT INTO novu_rust_workflow_preferences(environment_id,workflow_identifier,all_enabled,read_only,sms_enabled) VALUES ('64a000000000000000000002','sms-compare',true,false,true);
 ''')
+status,_=request(os.environ['NOVU_RUST_URL'],'PUT','/v1/experimental/workflows/sms-compare/channel-steps/sms',{'title':None,'content':'Hello {{subscriber.firstName}} {{name}}','active':True})
+assert status==200,status
 cases=[
  ('subscriber',{'subscriberId':'sms-a','phone':'+15550000002','firstName':'Jane'},{'name':'Alice'},None,{'To':'+15550000002','From':'+15550000001','Body':'Hello Jane Alice'}),
  ('payload',{'subscriberId':'sms-b','phone':'+15550000002','firstName':'Jane'},{'name':'Alice','phone':'+15550000003'},None,{'To':'+15550000003','From':'+15550000001','Body':'Hello Jane Alice'}),

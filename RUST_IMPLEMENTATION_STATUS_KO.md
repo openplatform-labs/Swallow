@@ -3,6 +3,16 @@
 > 기준: 원본 Novu 커밋 `895388f37efe9e06de0aa333e5727303e6ad6853` · 작성: 2026-11-12.
 > **현재 구현은 실험용이며 Novu와 100% 호환되지 않는다. 운영에 사용하거나 기존 Novu의 대체품으로 배포하지 않는다.**
 
+### 이메일·SMS·푸시 워크플로 단계 관리 (API 0023)
+
+`GET/PUT /v1/experimental/workflows/{workflow}/channel-steps/{channel}`에서 실험 단일 이메일·SMS·푸시 단계 내용을 관리한다. 채널은 `email`, `sms`, `push`이며 PUT 본문은 `title`, `content`, `active` 세 필드만 허용한다. SMS의 `title`은 null이어야 하며 `content` null은 단계 제거다. 이메일과 푸시는 제목·내용이 둘 다 문자열이거나 둘 다 null이어야 한다. 문자열은 각각 UTF-8 40,000바이트 이하이고 NUL을 허용하지 않는다. 응답은 워크플로 식별자·채널·제목·내용·활성 상태다. 워크플로 활성·`has_steps`, 공급자 선택, 단계 ID와 수신 설정은 별도다. 트리거 워커가 처리할 때 현재 설정을 읽으며 이미 생성된 채널 발송 작업에는 이전 설정이 남는다.
+
+API 0023에는 기본 권한이 없다. 신뢰된 관리자가 `novu_rust_channel_workflow_permissions`에 키 해시별 채널·read/write를 부여하고 API DB 로그인에 `public.novu_rust_lock_channel_workflow_grant(text,text,text,text)` 실행 권한, 키·사용자·워크플로 읽기, 필요한 단계 열 수정, 감사 테이블 INSERT 권한을 부여한다. 최종 조회·변경 시 키·사용자·해당 채널 권한을 재검사하고 잠그며 변경과 감사는 원자적이다. 감사에는 템플릿 원문 대신 길이와 활성 상태를 기록한다. 거절 요청·직접 DB 변경은 기록하지 않으며 DB 관리자에 대한 위변조 방지는 아니다. 템플릿 응답과 접근을 보호하고 비밀을 넣지 않는다.
+
+이 경로는 원본 Novu 관리 API가 아닌 Swallow 실험 확장이며 다단계 편집, 전체 provider 옵션과 운영 화면을 제공하지 않는다. Docker PostgreSQL에서 환경·채널·읽기/쓰기 권한, 제한 DB 로그인, 감사 실패 롤백, 권한 회수 경합 및 HTTP 트리거부터 각 채널 발송 작업 생성을 검증했다. 실제 외부 발송과 전체 원본 호환성은 검증하지 않았다.
+
+기준 원본 서버 비교에서는 Rust의 세 단계 내용을 이 API로 설정하고 원본의 단계는 MongoDB에 직접 준비했다. 이후 양쪽 HTTP 트리거부터 선택된 SendGrid·Twilio·FCM 모의 요청과 이력·오류 사례를 비교해 일치했다. Rust 채널 워커는 테스트 하네스로 실행했고, 원본과 관리 API 계약이나 실제 공급자 수신을 비교한 것은 아니다.
+
 ### FCM 재등록 보호 검사 원자화 (워커 0119)
 
 워커 0119는 `SWALLOW_FCM_REASSERT_REGISTRATION=true`인 API의 기기 세대 보호 검사를 자격증명 쓰기와 같은 SQL 트랜잭션에서 수행한다. `public.novu_rust_assert_fcm_registration_guard()`는 기기 테이블의 ROW EXCLUSIVE 잠금을 얻고 세대 열, 올바른 트리거 및 현재 세션의 트리거 활성 상태를 검사한다. 잠금은 쓰기 트랜잭션이 끝날 때까지 유지되므로 트리거 비활성화 같은 경합 DDL은 기다린다. 보호 함수가 없거나 실행 권한이 없거나 검사가 실패하면 자격증명 쓰기는 503이다. 기본 미사용 설정의 기존 동작은 유지한다.

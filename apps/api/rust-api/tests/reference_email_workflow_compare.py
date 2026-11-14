@@ -29,9 +29,12 @@ d.preferences.insertOne({_environmentId:e,_organizationId:o,_templateId:w,type:"
 ''')
 run('docker','exec',pg,'psql','-v','ON_ERROR_STOP=1','-U','postgres','-d','novu_compat','-c', '''
 INSERT INTO novu_rust_workflows(environment_id,identifier,active,has_steps,email_subject,email_html,inbox_metadata,email_step_id)
-VALUES ('64a000000000000000000002','email-compare',true,true,' Hello {{subscriber.firstName}} ','<p>{{name}}</p>','{"id":"64a000000000000000000021","name":"Email Compare","critical":false,"tags":[]}'::jsonb,'email-step');
+VALUES ('64a000000000000000000002','email-compare',true,true,NULL,NULL,'{"id":"64a000000000000000000021","name":"Email Compare","critical":false,"tags":[]}'::jsonb,'email-step');
 INSERT INTO novu_rust_workflow_preferences(environment_id,workflow_identifier,all_enabled,read_only,email_enabled) VALUES ('64a000000000000000000002','email-compare',true,false,true);
+INSERT INTO novu_rust_channel_workflow_permissions SELECT key_hash,'email','write' FROM novu_rust_api_keys WHERE environment_id='64a000000000000000000002';
 ''')
+req=urllib.request.Request(os.environ['NOVU_RUST_URL']+'/v1/experimental/workflows/email-compare/channel-steps/email',data=json.dumps({'title':' Hello {{subscriber.firstName}} ','content':'<p>{{name}}</p>','active':True}).encode(),headers={'Content-Type':'application/json','Authorization':'ApiKey '+os.environ['NOVU_TEST_API_KEY']},method='PUT')
+with urllib.request.urlopen(req,timeout=10) as response: assert response.status==200
 body = {'name':workflow,'to':{'subscriberId':'email-reference-user','email':'recipient@example.test','firstName':'Jane'},'payload':{'name':'<Alice>'},'transactionId':transaction}
 for key in ['NOVU_REFERENCE_URL','NOVU_RUST_URL']:
     req = urllib.request.Request(os.environ[key]+'/v1/events/trigger', data=json.dumps(body).encode(), headers={'Content-Type':'application/json','Authorization':'ApiKey '+os.environ['NOVU_TEST_API_KEY']}, method='POST')

@@ -19,10 +19,13 @@ d.notificationtemplates.insertOne({_id:w,_environmentId:e,_organizationId:o,name
 d.preferences.insertOne({_environmentId:e,_organizationId:o,_templateId:w,type:"WORKFLOW_RESOURCE",preferences:{all:{enabled:true,readOnly:false},channels:{push:{enabled:true}}},deleted:false});
 ''')
 run('docker','exec',pg,'psql','-v','ON_ERROR_STOP=1','-U','postgres','-d','novu_compat','-c','''
-INSERT INTO novu_rust_workflows(environment_id,identifier,active,has_steps,push_title,push_content,push_step_id,inbox_metadata) VALUES ('64a000000000000000000002','push-compare',true,true,'Hi {{subscriber.firstName}}','Hello {{name}}','push-step','{"id":"64a000000000000000000051","name":"Push Compare","critical":false,"tags":[]}'::jsonb);
+INSERT INTO novu_rust_workflows(environment_id,identifier,active,has_steps,push_title,push_content,push_step_id,inbox_metadata) VALUES ('64a000000000000000000002','push-compare',true,true,NULL,NULL,'push-step','{"id":"64a000000000000000000051","name":"Push Compare","critical":false,"tags":[]}'::jsonb);
 INSERT INTO novu_rust_workflow_preferences(environment_id,workflow_identifier,all_enabled,read_only,push_enabled) VALUES ('64a000000000000000000002','push-compare',true,false,true);
 INSERT INTO novu_rust_fcm_integrations(environment_id,internal_id,identifier,active) VALUES ('64a000000000000000000002','64a000000000000000000053','fixture-fcm',true);
+INSERT INTO novu_rust_channel_workflow_permissions SELECT key_hash,'push','write' FROM novu_rust_api_keys WHERE environment_id='64a000000000000000000002';
 ''')
+status,_=request(os.environ['NOVU_RUST_URL'],'PUT','/v1/experimental/workflows/push-compare/channel-steps/push',{'title':'Hi {{subscriber.firstName}}','content':'Hello {{name}}','active':True})
+assert status==200,status
 credential_user='push-credentials-'+uuid.uuid4().hex
 for key in ['NOVU_REFERENCE_URL','NOVU_RUST_URL']:
     assert request(os.environ[key],'POST','/v2/subscribers',{'subscriberId':credential_user})[0]==201
