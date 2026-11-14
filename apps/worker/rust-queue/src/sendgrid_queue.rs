@@ -82,6 +82,7 @@ pub(crate) async fn prepare_workflow_email(
     subscriber: Option<tokio_postgres::Row>,
 ) -> Result<bool, Error> {
     if let Some(context) = email.workflow_context.take() {
+        email.workflow_wire_defaults = true;
         let skip = if let Some(row) = subscriber.as_ref() {
             if !crate::allow_recreated_subscriber()
                 && row.get::<_, String>(7) != context.subscriber_internal_id

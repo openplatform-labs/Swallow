@@ -138,6 +138,9 @@ if [[ "${NOVU_TEST_PREFERENCE_DELIVERY:-0}" == 1 ]]; then
     python3 tests/reference_subscriber_subscriptions_compare.py
   fi
   worker_options=()
+  if [[ "${NOVU_TEST_RESEND_ONLY:-0}" == 1 ]]; then
+    worker_options=(-v "$PWD/tests/reference_resend_preload.cjs:/novu-resend-preload.cjs:ro" -e NODE_OPTIONS=--require=/novu-resend-preload.cjs)
+  fi
   if [[ "${NOVU_TEST_EMAIL_ONLY:-0}" == 1 || "${NOVU_TEST_EMAIL_QUEUED_ONLY:-0}" == 1 ]]; then
     worker_options=(-v "$PWD/tests/reference_email_preload.cjs:/novu-email-preload.cjs:ro" -e NODE_OPTIONS=--require=/novu-email-preload.cjs)
   fi
@@ -187,6 +190,11 @@ if [[ "${NOVU_TEST_PREFERENCE_DELIVERY:-0}" == 1 ]]; then
   if [[ "${NOVU_TEST_EMAIL_QUEUED_ONLY:-0}" == 1 ]]; then
     export TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:$postgres_port/novu_compat"
     python3 tests/reference_email_queued_compare.py
+    exit 0
+  fi
+  if [[ "${NOVU_TEST_RESEND_ONLY:-0}" == 1 ]]; then
+    export TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:$postgres_port/novu_compat"
+    python3 tests/reference_resend_workflow_compare.py
     exit 0
   fi
   if [[ "${NOVU_TEST_EMAIL_ONLY:-0}" == 1 ]]; then

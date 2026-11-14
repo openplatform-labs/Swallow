@@ -151,6 +151,73 @@ mod tests {
     use tokio_postgres::NoTls;
 
     #[tokio::test]
+    #[ignore = "requires differential PostgreSQL and loopback access"]
+    async fn capture_reference_resend_workflow() {
+        let (mut db, driver) =
+            tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(), NoTls)
+                .await
+                .unwrap();
+        tokio::spawn(async move { driver.await.unwrap() });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/emails", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut buf = [0; 4096];
+            loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buf[..n]);
+                if let Some(pos) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                    let h = String::from_utf8_lossy(&bytes[..pos]);
+                    let len: usize = h
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .and_then(|v| v.parse().ok())
+                        })
+                        .unwrap();
+                    if bytes.len() >= pos + 4 + len {
+                        std::fs::write(
+                            std::env::var("TEST_EMAIL_CAPTURE_PATH").unwrap(),
+                            &bytes[pos + 4..pos + 4 + len],
+                        )
+                        .unwrap();
+                        break;
+                    }
+                }
+            }
+            let body = "{\"id\":\"mock-resend-id\"}";
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let provider = Resend::test_endpoint(
+            Config {
+                api_key: "re_fixture".into(),
+                from: "sender@example.test".into(),
+                sender_name: "Sender".into(),
+            },
+            &endpoint,
+        )
+        .unwrap();
+        assert!(
+            process_one(&mut db, "64a000000000000000000002", &provider)
+                .await
+                .unwrap()
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     #[ignore = "sends real email and requires a fresh disposable PostgreSQL database"]
     async fn live_workflow_send() {
         let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL required");

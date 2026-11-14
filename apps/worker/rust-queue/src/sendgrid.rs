@@ -21,6 +21,8 @@ pub enum Region {
 #[derive(Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Email {
+    #[serde(skip)]
+    pub workflow_wire_defaults: bool,
     pub to: Vec<String>,
     pub cc: Vec<String>,
     pub bcc: Vec<String>,

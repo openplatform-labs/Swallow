@@ -120,6 +120,9 @@ API 마이그레이션 `0006`·`0007`과 워커 마이그레이션 `0056`까지 
 
 ## 수행한 검증
 
+- [Resend 워크플로 원본 비교](apps/api/rust-api/tests/reference_resend_workflow_compare.py)는 기준 커밋에서 직접 빌드한 Novu API·워커와 Rust API·워커를 MongoDB·Redis·PostgreSQL의 격리 환경에서 실행한다. 동일한 이메일 트리거 한 사례에서 모의 Resend 요청 본문과 양쪽 메시지의 `sent`·provider ID가 일치했고 Rust의 별도 `delivery_state=accepted`도 확인했다. Rust는 원본과 맞추기 위해 워크플로 요청의 빈 `cc`·`bcc`·`headers`를 보존한다. 이 비교는 실제 Resend·웹훅·수신함, 다른 오류·설정·첨부와 관리 API를 다루지 않으며 원본 ID 재사용 호환 모드로 실행한다. Rust 큐의 idempotency 헤더는 원본 기본 요청과 다르며 이 비교에서 본문만 대조했다.
+- 원본 요청의 빈 필드 처리에 맞춘 뒤에도 사용자가 지정한 주소로 Docker PostgreSQL의 Rust 워크플로 실발송을 재실행해 Resend의 성공 응답과 이력 접수를 확인했다. 이 재실행의 메일함 수신은 별도로 확인하지 않았다.
+
 - [Resend SDK 요청 비교](apps/worker/rust-queue/tests/reference_resend_wire.rs)는 기준 커밋에서 빌드한 원본 제공자와 lockfile의 Resend Node SDK가 생성한 HTTP 본문을 fetch를 모의해 캡처한다. 기본 요청과 발신·참조·헤더 override 두 사례는 Rust와 일치한다. 첨부 사례에서 원본 SDK는 바이트를 `{"type":"Buffer","data":[...]}`로 직렬화하고 Rust는 Resend가 문서화한 Base64 문자열을 사용해 **요청 바이트가 다르다**. 첨부의 나머지 선택 필드를 정규화 후 비교했다. 원본 서버 전체·실제 첨부 전달·모든 override는 확인하지 않았다. 원본 기본 요청은 idempotency 헤더를 보내지 않지만 Rust 큐는 중복 방지를 위해 추가하므로 헤더도 다르다.
 
 - 2026-11-14 [격리된 실발송 테스트](apps/worker/rust-queue/scripts/test-resend-live.sh)는 Docker PostgreSQL에 워크플로 트리거 작업을 직접 넣고 Rust 인앱 워커→Resend 워커→실제 Resend API의 성공 응답을 확인했다. 큐 작업, 발송 시도와 이메일 이력의 상태가 `completed`/`accepted`/`accepted`로 기록됐다. 사용자가 지정 메일함에서 해당 테스트 메일과 본문 수신을 확인했다. API HTTP 트리거, 관리 API, 웹훅과 원본 Novu는 이 시험에서 확인하지 않았다. 실행할 때마다 새 이메일 한 건을 발송한다.

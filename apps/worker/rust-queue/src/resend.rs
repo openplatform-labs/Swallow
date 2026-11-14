@@ -66,10 +66,10 @@ pub fn request_body(config: &Config, email: &Email) -> Result<Value, SendError> 
         format!("{name} <{from}>")
     };
     let mut body = json!({"from":from,"to":email.to,"subject":email.subject,"html":email.html,"reply_to":email.reply_to});
-    if !email.cc.is_empty() {
+    if !email.cc.is_empty() || email.workflow_wire_defaults {
         body["cc"] = json!(email.cc);
     }
-    if !email.bcc.is_empty() {
+    if !email.bcc.is_empty() || email.workflow_wire_defaults {
         body["bcc"] = json!(email.bcc);
     }
     if let Some(text) = &email.text {
@@ -85,7 +85,7 @@ pub fn request_body(config: &Config, email: &Email) -> Result<Value, SendError> 
     {
         return Err(SendError::InvalidMessage);
     }
-    if !email.headers.is_empty() {
+    if !email.headers.is_empty() || email.workflow_wire_defaults {
         body["headers"] = json!(email.headers);
     }
     // Use an intentionally conservative limit below Resend's encoded 40 MB
