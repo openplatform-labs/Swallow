@@ -72,6 +72,47 @@ pub async fn queue_health(
     }))
 }
 
+/// Environment-authorized attempt aggregates without direct table access.
+pub async fn scoped_health(client: &Client, environment: &str) -> Result<Value> {
+    let r = client
+        .query_one(
+            "SELECT * FROM public.novu_rust_delivery_health($1)",
+            &[&environment],
+        )
+        .await?;
+    Ok(
+        json!({"unknownAttempts":r.get::<_,i64>(0),"strandedDispatches":r.get::<_,i64>(1),"oldestUnknownUpdatedAt":r.get::<_,Option<String>>(2),"oldestStrandedUpdatedAt":r.get::<_,Option<String>>(3)}),
+    )
+}
+pub async fn scoped_queue_health(client: &Client, environment: &str, wait: i32) -> Result<Value> {
+    let r = client
+        .query_one(
+            "SELECT * FROM public.novu_rust_queue_health($1,$2)",
+            &[&environment, &wait],
+        )
+        .await?;
+    Ok(
+        json!({"overdueJobs":r.get::<_,i64>(0),"expiredLeases":r.get::<_,i64>(1),"oldestOverdueAvailableAt":r.get::<_,Option<String>>(2),"oldestExpiredLeaseAt":r.get::<_,Option<String>>(3),"maxWaitSeconds":wait}),
+    )
+}
+pub async fn scoped_provider_health(
+    client: &Client,
+    environment: &str,
+    provider: &str,
+    grace: i32,
+    heartbeat: i32,
+) -> Result<Value> {
+    let r = client
+        .query_one(
+            "SELECT * FROM public.novu_rust_provider_health($1,$2,$3,$4)",
+            &[&environment, &provider, &grace, &heartbeat],
+        )
+        .await?;
+    Ok(
+        json!({"overdueUndelivered":r.get::<_,i64>(0),"eligibleJobs":r.get::<_,i64>(1),"lastProjectionAt":r.get::<_,Option<String>>(2),"projectorStale":r.get::<_,bool>(3),"graceSeconds":grace,"heartbeatMaxSeconds":heartbeat}),
+    )
+}
+
 /// Alert on overdue non-delivered Resend jobs and an absent or stale projector.
 pub async fn resend_health(
     client: &Client,

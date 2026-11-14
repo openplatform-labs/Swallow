@@ -58,6 +58,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let _ = connection.await;
     });
     let scoped_delivery = env_bool("SWALLOW_ALERT_SCOPED_DELIVERY", false)?;
+    let scoped_checks = env_bool("SWALLOW_ALERT_CHECK_SCOPED_ACCESS", false)?;
     let resend_enabled = env_bool("SWALLOW_ALERT_RESEND_ENABLED", true)?;
     let attempts_enabled = env_bool("SWALLOW_ALERT_ATTEMPTS_ENABLED", false)?;
     let slack_jobs_enabled = env_bool("SWALLOW_ALERT_SLACK_JOBS_ENABLED", false)?;
@@ -91,7 +92,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     let mut failed_checks = [false; 5];
     let resend = if resend_enabled {
-        let result = reconciliation::resend_health(&db, &args[0], grace, heartbeat).await;
+        let result = if scoped_checks {
+            reconciliation::scoped_provider_health(&db, &args[0], "resend", grace, heartbeat).await
+        } else {
+            reconciliation::resend_health(&db, &args[0], grace, heartbeat).await
+        };
         let values = result.ok().and_then(|health| {
             Some((
                 health["overdueUndelivered"].as_u64()?,
@@ -107,7 +112,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         None
     };
     let queue = if let Some(wait) = queue_wait {
-        let result = reconciliation::queue_health(&db, &args[0], wait).await;
+        let result = if scoped_checks {
+            reconciliation::scoped_queue_health(&db, &args[0], wait).await
+        } else {
+            reconciliation::queue_health(&db, &args[0], wait).await
+        };
         let values = result.ok().and_then(|health| {
             Some((
                 health["overdueJobs"].as_u64()?,
@@ -123,7 +132,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         None
     };
     let attempts = if attempts_enabled {
-        let result = reconciliation::health(&db, &args[0]).await;
+        let result = if scoped_checks {
+            reconciliation::scoped_health(&db, &args[0]).await
+        } else {
+            reconciliation::health(&db, &args[0]).await
+        };
         let values = result.ok().and_then(|health| {
             Some((
                 health["unknownAttempts"].as_u64()?,
@@ -139,7 +152,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         None
     };
     let twilio = if let Some((grace, heartbeat)) = twilio_thresholds {
-        let result = reconciliation::twilio_health(&db, &args[0], grace, heartbeat).await;
+        let result = if scoped_checks {
+            reconciliation::scoped_provider_health(&db, &args[0], "twilio", grace, heartbeat).await
+        } else {
+            reconciliation::twilio_health(&db, &args[0], grace, heartbeat).await
+        };
         let values = result.ok().and_then(|health| {
             Some((
                 health["overdueUndelivered"].as_u64()?,

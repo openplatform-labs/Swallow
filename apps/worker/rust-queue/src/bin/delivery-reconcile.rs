@@ -58,7 +58,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             }
         );
     } else if args.len() == 2 && args[0] == "check" {
-        let health = novu_postgres_queue::reconciliation::health(&db, &args[1]).await?;
+        let health = if monitor_scoped_access()? {
+            novu_postgres_queue::reconciliation::scoped_health(&db, &args[1]).await?
+        } else {
+            novu_postgres_queue::reconciliation::health(&db, &args[1]).await?
+        };
         println!("{}", serde_json::to_string(&health)?);
         if health["unknownAttempts"]
             .as_i64()
@@ -112,9 +116,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .await?;
         println!("Slack resolution recorded");
     } else if args.len() == 3 && args[0] == "check-queue" {
-        let health =
-            novu_postgres_queue::reconciliation::queue_health(&db, &args[1], args[2].parse()?)
-                .await?;
+        let wait = args[2].parse()?;
+        let health = if monitor_scoped_access()? {
+            novu_postgres_queue::reconciliation::scoped_queue_health(&db, &args[1], wait).await?
+        } else {
+            novu_postgres_queue::reconciliation::queue_health(&db, &args[1], wait).await?
+        };
         println!("{}", serde_json::to_string(&health)?);
         if health["overdueJobs"]
             .as_i64()
@@ -137,7 +144,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .contains(&args[0].as_str())
     {
         let twilio = args[0].starts_with("check-twilio");
-        let health = if twilio {
+        let health = if monitor_scoped_access()? {
+            novu_postgres_queue::reconciliation::scoped_provider_health(
+                &db,
+                &args[1],
+                if twilio { "twilio" } else { "resend" },
+                args[2].parse()?,
+                args[3].parse()?,
+            )
+            .await?
+        } else if twilio {
             novu_postgres_queue::reconciliation::twilio_health(
                 &db,
                 &args[1],
@@ -333,5 +349,13 @@ fn alert_scoped_access() -> Result<bool, Box<dyn Error + Send + Sync>> {
         Ok("true") => Ok(true),
         Ok("false") | Err(std::env::VarError::NotPresent) => Ok(false),
         _ => Err("invalid alert status scoped access setting".into()),
+    }
+}
+
+fn monitor_scoped_access() -> Result<bool, Box<dyn Error + Send + Sync>> {
+    match std::env::var("SWALLOW_MONITOR_SCOPED_ACCESS").as_deref() {
+        Ok("true") => Ok(true),
+        Ok("false") | Err(std::env::VarError::NotPresent) => Ok(false),
+        _ => Err("invalid monitor scoped access setting".into()),
     }
 }
