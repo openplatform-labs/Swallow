@@ -263,6 +263,21 @@ pub async fn list_after(
     Ok(rows.into_iter().map(|r| json!({"jobId":r.get::<_,Uuid>(0).to_string(),"kind":r.get::<_,String>(1),"jobStatus":r.get::<_,String>(2),"targetIndex":r.get::<_,Option<i32>>(3),"httpStatus":r.get::<_,Option<i32>>(4),"updatedAt":r.get::<_,String>(5)})).collect())
 }
 
+/// Read a current SendGrid projection through the environment-scoped DB role.
+pub async fn scoped_sendgrid_result(
+    client: &Client,
+    environment: &str,
+    job: Uuid,
+) -> Result<Value> {
+    Ok(client
+        .query_one(
+            "SELECT public.novu_rust_sendgrid_result($1,$2)",
+            &[&environment, &job],
+        )
+        .await?
+        .get(0))
+}
+
 /// Summarize authenticated SendGrid evidence without exposing recipient hashes.
 pub async fn email_evidence(client: &Client, environment: &str, job: Uuid) -> Result<Vec<Value>> {
     if environment.is_empty() {

@@ -87,8 +87,17 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
     )
     .await
     .unwrap();
+    let dispatch = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO novu_rust_sendgrid_dispatch_ids(id,job_id,environment_id) VALUES ($1,$2,'a')",
+        &[&dispatch, &sendgrid],
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO novu_rust_sendgrid_attempts(job_id,environment_id,state,dispatch_id) VALUES ($1,'a','accepted',$2)", &[&sendgrid,&dispatch]).await.unwrap();
+    db.execute("INSERT INTO novu_rust_sendgrid_recipients(dispatch_id,environment_id,recipient_kind,recipient_index,recipient_hash,delivery_result) VALUES ($1,'a','to',0,repeat('a',64),'delivered'),($1,'a','cc',0,repeat('b',64),'pending')", &[&dispatch]).await.unwrap();
     let role = format!("monitor_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'scoped-fixture-password'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_delivery_health(text),public.novu_rust_queue_health(text,integer),public.novu_rust_provider_health(text,text,integer,integer),public.novu_rust_sendgrid_health(text,integer,integer),public.novu_rust_reserve_alert(text,text,text,integer,integer),public.novu_rust_finish_alert(text,text,text,uuid,text,integer),public.novu_rust_failed_queue_count(text),public.novu_rust_failed_queue_list(text,uuid),public.novu_rust_ack_failed_queue(text,uuid,text,text),public.novu_rust_observe_alert_conditions(text,text,text,integer,integer) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'scoped-fixture-password'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_delivery_health(text),public.novu_rust_queue_health(text,integer),public.novu_rust_provider_health(text,text,integer,integer),public.novu_rust_sendgrid_health(text,integer,integer),public.novu_rust_sendgrid_result(text,uuid),public.novu_rust_reserve_alert(text,text,text,integer,integer),public.novu_rust_finish_alert(text,text,text,uuid,text,integer),public.novu_rust_failed_queue_count(text),public.novu_rust_failed_queue_list(text,uuid),public.novu_rust_ack_failed_queue(text,uuid,text,text),public.novu_rust_observe_alert_conditions(text,text,text,integer,integer) TO {role}")).await.unwrap();
     let (actor, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move {
         let _ = driver.await;
@@ -98,7 +107,57 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
         .await
         .unwrap();
     assert!(reconciliation::scoped_health(&actor, "a").await.is_err());
+    assert!(
+        reconciliation::scoped_sendgrid_result(&actor, "a", sendgrid)
+            .await
+            .is_err()
+    );
     db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'a',$1,'alert_view',oid FROM pg_roles WHERE rolname::text=$1",&[&role]).await.unwrap();
+    db.batch_execute(&format!(
+        "REVOKE EXECUTE ON FUNCTION public.novu_rust_sendgrid_result(text,uuid) FROM {role}"
+    ))
+    .await
+    .unwrap();
+    assert!(
+        reconciliation::scoped_sendgrid_result(&actor, "a", sendgrid)
+            .await
+            .is_err()
+    );
+    db.batch_execute(&format!(
+        "GRANT EXECUTE ON FUNCTION public.novu_rust_sendgrid_result(text,uuid) TO {role}"
+    ))
+    .await
+    .unwrap();
+    let result = reconciliation::scoped_sendgrid_result(&actor, "a", sendgrid)
+        .await
+        .unwrap();
+    assert_eq!(result["attemptState"], "accepted");
+    assert_eq!(result["dispatchId"], dispatch.to_string());
+    assert_eq!(
+        result["recipients"],
+        json!([{"kind":"cc","index":0,"result":"pending"},{"kind":"to","index":0,"result":"delivered"}])
+    );
+    assert!(!result.to_string().contains(&"a".repeat(64)));
+    assert!(
+        reconciliation::scoped_sendgrid_result(&actor, "b", sendgrid)
+            .await
+            .is_err()
+    );
+    assert!(
+        reconciliation::scoped_sendgrid_result(&actor, "a", sms)
+            .await
+            .is_err()
+    );
+    assert!(
+        actor
+            .query(
+                "SELECT recipient_hash FROM public.novu_rust_sendgrid_recipients",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+
     assert_eq!(
         reconciliation::scoped_health(&actor, "a").await.unwrap(),
         reconciliation::health(&db, "a").await.unwrap()
@@ -226,6 +285,20 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
     role_url
         .set_password(Some("scoped-fixture-password"))
         .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .args(["sendgrid-result", "a", &sendgrid.to_string()])
+        .env("DATABASE_URL", role_url.as_str())
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output_json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output_json["jobId"], sendgrid.to_string());
+    assert_eq!(output_json["recipients"].as_array().unwrap().len(), 2);
     let scoped_monitor = |environment: &str| {
         Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
             .args(["check", environment])
