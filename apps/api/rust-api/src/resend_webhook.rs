@@ -31,7 +31,11 @@ impl Config {
     pub fn from_env() -> Option<Self> {
         Self::new(
             std::env::var("NOVU_RESEND_WEBHOOK_ENVIRONMENT_ID").ok()?,
-            &std::env::var("NOVU_RESEND_WEBHOOK_SECRET").ok()?,
+            &novu_rust_contracts::secret::from_env(
+                "NOVU_RESEND_WEBHOOK_SECRET",
+                "NOVU_RESEND_WEBHOOK_SECRET_FILE",
+            )
+            .ok()??,
         )
     }
 }

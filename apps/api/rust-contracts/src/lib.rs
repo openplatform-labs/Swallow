@@ -5,6 +5,7 @@ pub mod message;
 pub mod postgres;
 pub mod preference;
 pub mod recipients;
+pub mod secret;
 pub mod socket;
 pub mod template;
 pub mod timezone;

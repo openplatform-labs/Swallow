@@ -12,7 +12,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         return Err("environment is required".into());
     }
     let provider = Resend::new(Config {
-        api_key: std::env::var("NOVU_RESEND_API_KEY")?,
+        api_key: novu_rust_contracts::secret::from_env(
+            "NOVU_RESEND_API_KEY",
+            "NOVU_RESEND_API_KEY_FILE",
+        )?
+        .ok_or("Resend API key is required")?,
         from: std::env::var("NOVU_RESEND_FROM")?,
         sender_name: std::env::var("NOVU_RESEND_SENDER_NAME").unwrap_or_default(),
     })?;
