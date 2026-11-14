@@ -11,7 +11,10 @@ use socketioxide::{
 use std::{
     error::Error,
     future::poll_fn,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex, MutexGuard, mpsc};
@@ -530,18 +533,39 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         client: Mutex::new(client),
     });
     let (layer, io) = SocketIo::new_layer();
+    let disconnect_on_gap = match std::env::var("NOVU_WS_DISCONNECT_ON_EVENT_GAP").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("NOVU_WS_DISCONNECT_ON_EVENT_GAP must be true or false".into()),
+    };
+    // Even generations mean LISTEN is active. Every outage changes the generation,
+    // including an outage that ends while a socket is being registered.
+    let listener_generation = Arc::new(AtomicU64::new(0));
     let (event_tx, mut event_rx) = mpsc::channel::<ListenerEvent>(1024);
     let initial_listener = start_event_listener(&database_url, event_tx.clone()).await?;
+    let listener_generation_task = listener_generation.clone();
+    let listener_io = io.clone();
     tokio::spawn(async move {
         let mut listener = initial_listener;
         loop {
             let (_client, driver) = listener;
             let _ = driver.await;
+            if disconnect_on_gap {
+                listener_generation_task.fetch_add(1, Ordering::SeqCst);
+                if let Some(namespace) = listener_io.of("/") {
+                    for socket in namespace.sockets() {
+                        socket.disconnect().ok();
+                    }
+                }
+            }
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 match start_event_listener(&database_url, event_tx.clone()).await {
                     Ok(reconnected) => {
                         listener = reconnected;
+                        if disconnect_on_gap {
+                            listener_generation_task.fetch_add(1, Ordering::SeqCst);
+                        }
                         break;
                     }
                     Err(error) => eprintln!("socket event listener reconnect failed: {error}"),
@@ -599,7 +623,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         move |socket: SocketRef, TryData(auth): TryData<Value>| {
             let db = db.clone();
             let secret = secret.clone();
+            let listener_generation = listener_generation.clone();
             async move {
+                let generation = listener_generation.load(Ordering::SeqCst);
+                if disconnect_on_gap && !generation.is_multiple_of(2) {
+                    socket.disconnect().ok();
+                    return;
+                }
                 let from_auth = auth
                     .ok()
                     .and_then(|v| v.get("token").cloned())
@@ -656,6 +686,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         tokio::spawn(retry_disconnect(db, id, claims, update_presence));
                     }
                 });
+                if disconnect_on_gap && listener_generation.load(Ordering::SeqCst) != generation {
+                    socket.clone().disconnect().ok();
+                }
                 if !socket.connected() {
                     let update_presence =
                         !compatibility_mode() || verify(&token, &secret).is_some();
