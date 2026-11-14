@@ -1,6 +1,12 @@
 //! Experimental environment-scoped FCM worker; not a full Novu worker.
 use novu_postgres_queue::{fcm::Fcm, fcm_queue};
-use std::{collections::HashMap, error::Error, time::Duration};
+use std::{
+    collections::HashMap,
+    error::Error,
+    fs::File,
+    io::{self, Read},
+    time::Duration,
+};
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -9,6 +15,42 @@ struct IntegrationConfig {
     access_token: Option<String>,
     client_email: Option<String>,
     private_key: Option<String>,
+}
+
+// PEM and JSON may contain newlines. Never include a path or value in errors.
+fn multiline_secret(name: &str, file_name: &str, limit: u64) -> Result<Option<String>, io::Error> {
+    let inline = match std::env::var(name) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid secret")),
+    };
+    let path = std::env::var_os(file_name);
+    if inline.is_some() && path.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "multiple secret sources",
+        ));
+    }
+    let bytes = match (inline, path) {
+        (Some(value), None) => value.into_bytes(),
+        (None, Some(path)) => {
+            let mut bytes = Vec::new();
+            File::open(path)
+                .map_err(|_| io::Error::other("secret file unavailable"))?
+                .take(limit + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| io::Error::other("secret file unavailable"))?;
+            bytes
+        }
+        (None, None) => return Ok(None),
+        _ => unreachable!(),
+    };
+    if bytes.is_empty() || bytes.len() as u64 > limit || bytes.contains(&0) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid secret"));
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid secret"))
 }
 
 fn build_integrations(raw: &str) -> Result<HashMap<String, Fcm>, Box<dyn Error + Send + Sync>> {
@@ -40,17 +82,25 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if environment.is_empty() {
         return Err("NOVU_FCM_ENVIRONMENT_ID must not be empty".into());
     }
-    let (provider, integrations) = if let Ok(raw) = std::env::var("NOVU_FCM_INTEGRATIONS") {
+    let (provider, integrations) = if let Some(raw) = multiline_secret(
+        "NOVU_FCM_INTEGRATIONS",
+        "NOVU_FCM_INTEGRATIONS_FILE",
+        1_048_576,
+    )? {
         (None, Some(build_integrations(&raw)?))
     } else {
         let project = std::env::var("NOVU_FCM_PROJECT_ID")?;
-        let provider = if let Ok(token) = std::env::var("NOVU_FCM_ACCESS_TOKEN") {
+        let provider = if let Some(token) = novu_rust_contracts::secret::from_env(
+            "NOVU_FCM_ACCESS_TOKEN",
+            "NOVU_FCM_ACCESS_TOKEN_FILE",
+        )? {
             Fcm::new(&project, token)?
         } else {
             Fcm::with_service_account(
                 &project,
                 std::env::var("NOVU_FCM_CLIENT_EMAIL")?,
-                &std::env::var("NOVU_FCM_PRIVATE_KEY")?,
+                &multiline_secret("NOVU_FCM_PRIVATE_KEY", "NOVU_FCM_PRIVATE_KEY_FILE", 65_536)?
+                    .ok_or("FCM private key required")?,
             )?
         };
         (Some(provider), None)
