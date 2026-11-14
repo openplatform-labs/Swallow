@@ -142,40 +142,12 @@ pub async fn list_attention(
     environment: &str,
     after: Option<Uuid>,
 ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
-    if environment.trim().is_empty() {
-        return Err("environment required".into());
-    }
-    if client
-        .query_opt(
-            "SELECT 1 FROM novu_rust_environments WHERE id=$1",
-            &[&environment],
+    let rows = client
+        .query(
+            "SELECT * FROM public.novu_rust_list_slack_attention($1,$2)",
+            &[&environment, &after],
         )
-        .await?
-        .is_none()
-    {
-        return Err("environment not found".into());
-    }
-    let rows = client.query(r#"
-        SELECT j.id, j.kind, j.status, j.attempts, a.http_status,
-          CASE
-            WHEN a.state='unknown' THEN 'unknownAttempt'
-            WHEN a.state='rejected' THEN 'rejectedAttempt'
-            WHEN a.state='dispatching' AND (j.status<>'running' OR j.lease_until<=statement_timestamp()) THEN 'strandedDispatch'
-            WHEN j.status='failed' THEN 'preDispatchFailure'
-            ELSE 'missingEndpoint'
-          END AS category
-        FROM novu_queue_jobs j
-        LEFT JOIN novu_rust_slack_attempts a ON a.job_id=j.id AND a.environment_id=j.environment_id
-        WHERE j.environment_id=$1 AND ($2::uuid IS NULL OR j.id>$2) AND (
-          (j.kind=ANY($3) AND (a.state IN ('unknown','rejected') OR
-            (a.state='dispatching' AND (j.status<>'running' OR j.lease_until<=statement_timestamp()))))
-          OR (j.kind=ANY($4) AND j.status='failed' AND j.last_error IS NOT NULL
-            AND NOT EXISTS(SELECT 1 FROM novu_rust_slack_attempts x WHERE x.job_id=j.id)
-            AND NOT EXISTS(SELECT 1 FROM novu_rust_slack_workflow_acknowledgements z WHERE z.environment_id=j.environment_id AND z.job_id=j.id AND z.job_attempts=j.attempts AND z.job_status=j.status AND z.job_error=j.last_error))
-          OR (j.kind=$5 AND j.status='cancelled' AND j.last_error='no Slack endpoints'
-            AND NOT EXISTS(SELECT 1 FROM novu_rust_slack_workflow_acknowledgements z WHERE z.environment_id=j.environment_id AND z.job_id=j.id AND z.job_attempts=j.attempts AND z.job_status=j.status AND z.job_error=j.last_error))
-        ) ORDER BY j.id LIMIT 100
-    "#, &[&environment, &after, &vec![JOB_KIND,crate::slack_webhook_queue::JOB_KIND,crate::slack_workflow::DELIVERY_KIND], &vec![crate::slack_workflow::FANOUT_KIND,crate::slack_workflow::DELIVERY_KIND], &crate::slack_workflow::FANOUT_KIND]).await?;
+        .await?;
     Ok(rows
         .into_iter()
         .map(|row| {

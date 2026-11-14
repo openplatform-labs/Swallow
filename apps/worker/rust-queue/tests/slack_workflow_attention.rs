@@ -27,6 +27,7 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
         include_str!("../migrations/0073_operator_role_identity.sql"),
         slack_queue::WORKFLOW_ATTENTION_MIGRATION,
         include_str!("../migrations/0080_slack_ack_permission.sql"),
+        include_str!("../migrations/0081_slack_view_permission.sql"),
     ] {
         db.batch_execute(sql).await.unwrap();
     }
@@ -36,6 +37,10 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
     db.batch_execute(include_str!("../migrations/0080_slack_ack_permission.sql"))
         .await
         .unwrap();
+    db.batch_execute(include_str!("../migrations/0081_slack_view_permission.sql"))
+        .await
+        .unwrap();
+    db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT e.id,session_user,'slack_view',r.oid FROM novu_rust_environments e CROSS JOIN pg_roles r WHERE r.rolname=session_user",&[]).await.unwrap();
     let failed = Uuid::new_v4();
     let missing = Uuid::new_v4();
     let other = Uuid::new_v4();
@@ -124,6 +129,63 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
     db.execute("INSERT INTO novu_rust_operator_grant_admins(environment_id,database_principal,principal_oid) SELECT 'a',session_user,oid FROM pg_roles WHERE rolname=session_user",&[]).await.unwrap();
     let granted: bool = db.query_one("SELECT public.novu_rust_manage_operator_grant('a',session_user::text,'slack_ack','grant','fixture')",&[]).await.unwrap().get(0);
     assert!(granted);
+    let viewer = format!("slack_viewer_{}", Uuid::new_v4().simple());
+    db.batch_execute(&format!("CREATE ROLE {viewer} LOGIN; GRANT USAGE ON SCHEMA public TO {viewer}; GRANT EXECUTE ON FUNCTION public.novu_rust_list_slack_attention(text,uuid) TO {viewer}")).await.unwrap();
+    let (viewer_db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    viewer_db
+        .batch_execute(&format!("SET SESSION AUTHORIZATION {viewer}"))
+        .await
+        .unwrap();
+    assert!(
+        slack_queue::list_attention(&viewer_db, "a", None)
+            .await
+            .is_err()
+    );
+    assert!(db.query_one("SELECT public.novu_rust_manage_operator_grant('a',$1,'slack_view','grant','view fixture')",&[&viewer]).await.unwrap().get::<_,bool>(0));
+    assert_eq!(
+        slack_queue::list_attention(&viewer_db, "a", None)
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    assert!(
+        slack_queue::list_attention(&viewer_db, "b", None)
+            .await
+            .is_err()
+    );
+    assert!(
+        viewer_db
+            .query("SELECT payload FROM public.novu_queue_jobs", &[])
+            .await
+            .is_err()
+    );
+    assert!(
+        viewer_db
+            .query(
+                "SELECT * FROM public.novu_rust_slack_workflow_acknowledgements",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    assert!(db.query_one("SELECT public.novu_rust_manage_operator_grant('a',$1,'slack_view','revoke','view fixture')",&[&viewer]).await.unwrap().get::<_,bool>(0));
+    assert!(
+        slack_queue::list_attention(&viewer_db, "a", None)
+            .await
+            .is_err()
+    );
+    viewer_db
+        .batch_execute("RESET SESSION AUTHORIZATION")
+        .await
+        .unwrap();
+    db.batch_execute(&format!("DROP OWNED BY {viewer}; DROP ROLE {viewer}"))
+        .await
+        .unwrap();
+
     db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'a',session_user,'alert_send',oid FROM pg_roles WHERE rolname=session_user",&[]).await.unwrap();
     assert!(
         slack_queue::acknowledge_workflow(&mut db, "b", other, "operator", "ticket")
@@ -315,6 +377,7 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
     )
     .await
     .unwrap();
+    db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'pagination',session_user,'slack_view',oid FROM pg_roles WHERE rolname=session_user",&[]).await.unwrap();
     for i in 1..=101u128 {
         let id = Uuid::from_u128(i);
         queue::enqueue(
