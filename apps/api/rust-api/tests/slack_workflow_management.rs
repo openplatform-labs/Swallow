@@ -282,6 +282,17 @@ async fn slack_step_management_is_authorized_audited_and_connected_to_fanout() {
             .get::<_, i64>(0),
         1
     );
+    assert!(
+        novu_postgres_queue::slack_workflow::delivery_one_with_policy(
+            &mut setup,
+            "a",
+            &novu_postgres_queue::slack_workflow::Providers::new(),
+            novu_postgres_queue::slack_workflow::StepPolicy::Active,
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(setup.query_one("SELECT last_error FROM public.novu_queue_jobs WHERE environment_id='a' AND kind=$1", &[&novu_postgres_queue::slack_workflow::DELIVERY_KIND]).await.unwrap().get::<_,Option<String>>(0).as_deref(), Some("Slack workflow step disabled"));
     // Pause the HTTP write on the workflow row after it acquires the grant.
     let (mut holder, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move {

@@ -14,6 +14,30 @@ pub const DELIVERY_KIND: &str = "experimental_slack_workflow_delivery";
 pub const MIGRATION: &str = include_str!("../migrations/0078_slack_workflow.sql");
 pub type Providers = HashMap<(String, String), Slack>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepPolicy {
+    Snapshot,
+    Active,
+    Unchanged,
+}
+impl StepPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Snapshot => "snapshot",
+            Self::Active => "active",
+            Self::Unchanged => "unchanged",
+        }
+    }
+    pub fn from_env() -> Result<Self, &'static str> {
+        match std::env::var("NOVU_SLACK_WORKFLOW_STEP_POLICY").as_deref() {
+            Ok("snapshot") | Err(std::env::VarError::NotPresent) => Ok(Self::Snapshot),
+            Ok("active") => Ok(Self::Active),
+            Ok("unchanged") => Ok(Self::Unchanged),
+            _ => Err("invalid Slack workflow step policy"),
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Context {
@@ -114,7 +138,44 @@ async fn terminal(
     tx.execute("UPDATE novu_queue_jobs SET status=$2,last_error=$3,lease_token=NULL,lease_until=NULL WHERE id=$1",&[&job.id,&status,&error]).await?;
     Ok(())
 }
+// Lock the workflow until the fan-out or attempt reservation commits. A
+// management update that committed first is visible to this SELECT; an update
+// after reservation cannot stop the already-authorized external request.
+async fn step_rejection(
+    tx: &Transaction<'_>,
+    job: &ClaimedJob,
+    ctx: &Context,
+    policy: StepPolicy,
+) -> Result<Option<&'static str>, Error> {
+    if policy == StepPolicy::Snapshot {
+        return Ok(None);
+    }
+    let row=tx.query_opt("SELECT active,has_steps,chat_step_active,chat_content FROM public.novu_rust_workflows WHERE environment_id=$1 AND identifier=$2 AND ($3::text IS NULL OR inbox_metadata->>'id'=$3) FOR SHARE", &[&job.environment_id,&ctx.workflow_identifier,&ctx.workflow_internal_id]).await?;
+    let Some(row) = row else {
+        return Ok(Some("Slack workflow step disabled"));
+    };
+    let content: Option<String> = row.get(3);
+    if !row.get::<_, bool>(0)
+        || !row.get::<_, bool>(1)
+        || !row.get::<_, bool>(2)
+        || content.is_none()
+    {
+        return Ok(Some("Slack workflow step disabled"));
+    }
+    if policy == StepPolicy::Unchanged && content.as_deref() != Some(ctx.content_template.as_str())
+    {
+        return Ok(Some("Slack workflow content changed"));
+    }
+    Ok(None)
+}
 pub async fn fanout_one(db: &mut Client, environment: &str) -> Result<bool, Error> {
+    fanout_one_with_policy(db, environment, StepPolicy::Snapshot).await
+}
+pub async fn fanout_one_with_policy(
+    db: &mut Client,
+    environment: &str,
+    policy: StepPolicy,
+) -> Result<bool, Error> {
     let Some(job) = claim(db, environment, FANOUT_KIND).await? else {
         return Ok(false);
     };
@@ -143,6 +204,16 @@ pub async fn fanout_one(db: &mut Client, environment: &str) -> Result<bool, Erro
             Some(reason),
         )
         .await?;
+        tx.commit().await?;
+        return Ok(true);
+    }
+    let step_reason = step_rejection(&tx, &job, &ctx, policy).await?;
+    if policy != StepPolicy::Snapshot && !live(&tx, &job).await? {
+        tx.rollback().await?;
+        return Ok(true);
+    }
+    if let Some(reason) = step_reason {
+        terminal(&tx, &job, "cancelled", Some(reason)).await?;
         tx.commit().await?;
         return Ok(true);
     }
@@ -191,6 +262,14 @@ pub async fn delivery_one(
     environment: &str,
     providers: &Providers,
 ) -> Result<bool, Error> {
+    delivery_one_with_policy(db, environment, providers, StepPolicy::Snapshot).await
+}
+pub async fn delivery_one_with_policy(
+    db: &mut Client,
+    environment: &str,
+    providers: &Providers,
+    policy: StepPolicy,
+) -> Result<bool, Error> {
     let Some(job) = claim(db, environment, DELIVERY_KIND).await? else {
         return Ok(false);
     };
@@ -226,6 +305,16 @@ pub async fn delivery_one(
             Some(reason),
         )
         .await?;
+        tx.commit().await?;
+        return Ok(true);
+    }
+    let step_reason = step_rejection(&tx, &job, ctx, policy).await?;
+    if policy != StepPolicy::Snapshot && !live(&tx, &job).await? {
+        tx.rollback().await?;
+        return Ok(true);
+    }
+    if let Some(reason) = step_reason {
+        terminal(&tx, &job, "cancelled", Some(reason)).await?;
         tx.commit().await?;
         return Ok(true);
     }
@@ -333,6 +422,10 @@ pub async fn delivery_one(
         tx.commit().await?;
         return Ok(true);
     }
+    if policy != StepPolicy::Snapshot && !live(&tx, &job).await? {
+        tx.rollback().await?;
+        return Ok(true);
+    }
     let inserted=tx.execute("INSERT INTO novu_rust_slack_attempts(job_id,environment_id,state) VALUES ($1,$2,'dispatching') ON CONFLICT DO NOTHING",&[&job.id,&environment]).await?;
     if inserted != 1 {
         terminal(&tx, &job, "failed", Some("Slack attempt requires review")).await?;
@@ -404,6 +497,185 @@ mod tests {
         net::TcpListener,
     };
     use tokio_postgres::NoTls;
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL"]
+    async fn step_policies_recheck_and_fence_workflow_updates() {
+        let url = std::env::var("TEST_DATABASE_URL").unwrap();
+        let (mut db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+        tokio::spawn(async move {
+            let _ = driver.await;
+        });
+        db.batch_execute("CREATE TABLE novu_rust_environments(id text PRIMARY KEY,organization_id text NOT NULL); INSERT INTO novu_rust_environments VALUES ('env','org'); CREATE TABLE novu_rust_workflows(environment_id text,identifier text,inbox_metadata jsonb,active boolean NOT NULL,has_steps boolean NOT NULL,PRIMARY KEY(environment_id,identifier)); INSERT INTO novu_rust_workflows VALUES ('env','workflow','{\"id\":\"wid\"}',true,true); CREATE TABLE novu_rust_workflow_preferences(environment_id text,workflow_identifier text,read_only boolean,all_enabled boolean,PRIMARY KEY(environment_id,workflow_identifier)); CREATE TABLE novu_rust_subscriber_preferences(environment_id text,subscriber_id text,channels jsonb,PRIMARY KEY(environment_id,subscriber_id)); CREATE TABLE novu_rust_subscriber_workflow_preferences(environment_id text,subscriber_id text,workflow_identifier text,channels jsonb,PRIMARY KEY(environment_id,subscriber_id,workflow_identifier))").await.unwrap();
+        for migration in [
+            crate::MIGRATION,
+            crate::in_app::MIGRATION,
+            crate::slack_queue::MIGRATION,
+            include_str!("../migrations/0075_slack_channel_endpoints.sql"),
+            include_str!("../migrations/0076_slack_endpoint_integrations.sql"),
+            MIGRATION,
+        ] {
+            db.batch_execute(migration).await.unwrap();
+        }
+        db.batch_execute("UPDATE novu_rust_workflows SET chat_content='original' WHERE environment_id='env'; INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id) VALUES ('env','alice','old'); INSERT INTO novu_rust_slack_endpoint_integrations VALUES ('env','main'); INSERT INTO novu_rust_slack_channel_endpoints(environment_id,identifier,subscriber_id,subscriber_internal_id,integration_identifier,endpoint_type,endpoint) VALUES ('env','endpoint','alice','old','main','slack_channel','{\"channelId\":\"C123\"}')").await.unwrap();
+        let ctx = Context {
+            subscriber_id: "alice".into(),
+            subscriber_internal_id: "old".into(),
+            workflow_identifier: "workflow".into(),
+            workflow_internal_id: Some("wid".into()),
+            content_template: "original".into(),
+            payload: json!({}),
+            context_keys: vec![],
+            actor: None,
+            actor_internal_id: None,
+        };
+        let payload = serde_json::to_value(&ctx).unwrap();
+        // A committed edit prevents an unchanged-policy fanout, while the
+        // active policy intentionally permits its original snapshot.
+        db.execute(
+            "UPDATE novu_rust_workflows SET chat_content='edited' WHERE environment_id='env'",
+            &[],
+        )
+        .await
+        .unwrap();
+        let unchanged = Uuid::new_v4();
+        crate::enqueue(&db, unchanged, "env", FANOUT_KIND, &payload)
+            .await
+            .unwrap();
+        assert!(
+            fanout_one_with_policy(&mut db, "env", StepPolicy::Unchanged)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            db.query_one(
+                "SELECT status,last_error FROM novu_queue_jobs WHERE id=$1",
+                &[&unchanged]
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(1),
+            "Slack workflow content changed"
+        );
+        let active = Uuid::new_v4();
+        crate::enqueue(&db, active, "env", FANOUT_KIND, &payload)
+            .await
+            .unwrap();
+        assert!(
+            fanout_one_with_policy(&mut db, "env", StepPolicy::Active)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            db.query_one(
+                "SELECT count(*) FROM novu_rust_slack_workflow_fanout WHERE parent_job_id=$1",
+                &[&active]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+            1
+        );
+        // Unchanged delivery must cancel even after the fanout was created.
+        assert!(
+            delivery_one_with_policy(&mut db, "env", &Providers::new(), StepPolicy::Unchanged)
+                .await
+                .unwrap()
+        );
+        assert_eq!(db.query_one("SELECT count(*) FROM novu_queue_jobs WHERE kind=$1 AND status='cancelled' AND last_error='Slack workflow content changed'",&[&DELIVERY_KIND]).await.unwrap().get::<_,i64>(0),1);
+        db.execute(
+            "UPDATE novu_rust_workflows SET chat_step_active=false WHERE environment_id='env'",
+            &[],
+        )
+        .await
+        .unwrap();
+        let disabled = Uuid::new_v4();
+        crate::enqueue(&db, disabled, "env", FANOUT_KIND, &payload)
+            .await
+            .unwrap();
+        assert!(
+            fanout_one_with_policy(&mut db, "env", StepPolicy::Active)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            db.query_one(
+                "SELECT last_error FROM novu_queue_jobs WHERE id=$1",
+                &[&disabled]
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+            "Slack workflow step disabled"
+        );
+        let snapshot = Uuid::new_v4();
+        crate::enqueue(&db, snapshot, "env", FANOUT_KIND, &payload)
+            .await
+            .unwrap();
+        assert!(fanout_one(&mut db, "env").await.unwrap());
+        assert_eq!(
+            db.query_one(
+                "SELECT count(*) FROM novu_rust_slack_workflow_fanout WHERE parent_job_id=$1",
+                &[&snapshot]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+            1
+        );
+        // A step update that holds the workflow row must complete before the
+        // worker checks the step and schedules any new children.
+        let race = Uuid::new_v4();
+        crate::enqueue(&db, race, "env", FANOUT_KIND, &payload)
+            .await
+            .unwrap();
+        let (mut worker, driver) =
+            tokio_postgres::connect(&format!("{url}?application_name=slack_step_guard"), NoTls)
+                .await
+                .unwrap();
+        tokio::spawn(async move {
+            let _ = driver.await;
+        });
+        let tx = db.transaction().await.unwrap();
+        tx.execute(
+            "UPDATE novu_rust_workflows SET chat_step_active=false WHERE environment_id='env'",
+            &[],
+        )
+        .await
+        .unwrap();
+        let task = tokio::spawn(async move {
+            fanout_one_with_policy(&mut worker, "env", StepPolicy::Active).await
+        });
+        let (observer, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+        tokio::spawn(async move {
+            let _ = driver.await;
+        });
+        let mut waiting = false;
+        for _ in 0..100 {
+            if observer.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='slack_step_guard' AND wait_event_type='Lock')",&[]).await.unwrap().get::<_,bool>(0){waiting=true;break;}
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(waiting && !task.is_finished());
+        tx.commit().await.unwrap();
+        assert!(task.await.unwrap().unwrap());
+        assert_eq!(
+            db.query_one(
+                "SELECT last_error FROM novu_queue_jobs WHERE id=$1",
+                &[&race]
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+            "Slack workflow step disabled"
+        );
+        assert_eq!(
+            db.query_one("SELECT count(*) FROM novu_rust_slack_attempts", &[])
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            0
+        );
+    }
 
     #[tokio::test]
     #[ignore = "requires differential harness PostgreSQL and loopback HTTP"]

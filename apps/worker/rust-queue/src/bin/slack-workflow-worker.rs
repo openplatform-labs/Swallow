@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::{error::Error, time::Duration};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let step_policy = slack_workflow::StepPolicy::from_env()?;
     let environment = std::env::var("NOVU_SLACK_ENVIRONMENT_ID")?;
     if environment.trim().is_empty() {
         return Err("Slack environment is required".into());
@@ -62,9 +63,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 Ok(Ok(_))
             );
             if configured {
-                match tokio::time::timeout(timeout,db.query_opt("INSERT INTO novu_rust_slack_workflow_worker_config(environment_id,credential_map_hash) VALUES ($1,$2) ON CONFLICT(environment_id) DO UPDATE SET credential_map_hash=EXCLUDED.credential_map_hash WHERE novu_rust_slack_workflow_worker_config.credential_map_hash=EXCLUDED.credential_map_hash RETURNING 1",&[&environment,&fingerprint])).await {
+                match tokio::time::timeout(timeout,db.query_opt("INSERT INTO novu_rust_slack_workflow_worker_config(environment_id,credential_map_hash,step_policy) VALUES ($1,$2,$3) ON CONFLICT(environment_id) DO UPDATE SET credential_map_hash=EXCLUDED.credential_map_hash,step_policy=EXCLUDED.step_policy WHERE novu_rust_slack_workflow_worker_config.credential_map_hash=EXCLUDED.credential_map_hash AND (novu_rust_slack_workflow_worker_config.step_policy IS NULL OR novu_rust_slack_workflow_worker_config.step_policy=EXCLUDED.step_policy) RETURNING 1",&[&environment,&fingerprint,&step_policy.as_str()])).await {
                     Ok(Ok(Some(_)))=>{},
-                    Ok(Ok(None))=>{task.abort();return Err("Slack workflow workers have different credential maps".into());},
+                    Ok(Ok(None))=>{task.abort();return Err("Slack workflow workers have different credential maps or step policies".into());},
                     _=>{task.abort();let _=task.await;eprintln!("Slack workflow configuration registration failed; reconnecting");tokio::time::sleep(Duration::from_secs(2)).await;continue;}
                 }
             }
@@ -86,7 +87,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     }
                     let fanout = tokio::time::timeout(
                         timeout,
-                        slack_workflow::fanout_one(&mut db, &environment),
+                        slack_workflow::fanout_one_with_policy(&mut db, &environment, step_policy),
                     )
                     .await;
                     if !matches!(fanout, Ok(Ok(_))) {
@@ -94,7 +95,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     }
                     let delivery = tokio::time::timeout(
                         timeout,
-                        slack_workflow::delivery_one(&mut db, &environment, &providers),
+                        slack_workflow::delivery_one_with_policy(
+                            &mut db,
+                            &environment,
+                            &providers,
+                            step_policy,
+                        ),
                     )
                     .await;
                     match delivery {
