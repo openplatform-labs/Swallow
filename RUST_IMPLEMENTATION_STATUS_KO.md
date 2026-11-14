@@ -680,3 +680,6 @@ WS 서비스의 `NOVU_WS_PRESENCE_POLICY=active`는 연결 해제 후 같은 환
 
 
 WS의 `NOVU_WS_ENABLE_HEALTH_ENDPOINTS=true`는 `GET /health/live`와 `GET /health/ready`를 제공한다. 기본값은 비활성화이고 잘못된 값은 시작 시 거절한다. live는 HTTP 응답이 가능한지, ready는 이벤트 리스너 연결과 공유 DB 연결에서 2초 이내 `SELECT 1` 성공 여부를 각각 HTTP 204 또는 503으로 나타낸다. 인증 없는 경로이므로 네트워크에서 접근을 제한한다. 리스너 중단 시 재연결까지 준비 실패로 표시하며 소켓은 이 기능만으로 해제하지 않는다. 이는 순간적인 확인으로 유실된 이벤트, 연결이 끊긴 것으로 감지되지 않은 정지, 다른 SQL 권한 및 발송 성공을 증명하지 않는다. 공유 연결 경합에서도 준비 실패가 발생할 수 있고 프로브가 DB 요청을 추가하므로 간격과 임계치를 운영자가 설정해야 한다. Docker PostgreSQL에서 리스너 강제 종료 및 복구, DB 중단 및 복구, 기본 경로 비활성화와 잘못된 설정을 확인한다. 실제 로드밸런서와 운영 부하는 미검증이다.
+
+
+운영 경보 메일은 `SWALLOW_ALERT_EMAIL_PROVIDER=resend|sendgrid`로 선택한다. 기본은 기존 Resend이며 `send-delivery-alert`와 `send-database-alert` 모두에 적용된다. SendGrid 선택 시 `SWALLOW_ALERT_EMAIL_TO`, `NOVU_SENDGRID_FROM`, `NOVU_SENDGRID_API_KEY` 또는 `NOVU_SENDGRID_API_KEY_FILE`을 설정하고 `NOVU_SENDGRID_SENDER_NAME`, `NOVU_SENDGRID_REGION=global|eu`를 선택할 수 있다. 대상 또는 공급자 변경 시 새 비밀 아닌 대상 ID를 쓰고 모든 발송 프로세스의 설정을 일치시켜야 한다. ID는 실제 주소나 공급자의 권한 검증이 아니라 쿨다운과 시도 슬롯의 식별자다. SendGrid도 기존 DB 예약·권한·쿨다운·불명 결과 운영자 확인을 사용하며 독립 DB 경보의 비조정 대체 방식에도 적용된다. SendGrid에는 Resend 멱등성 키가 없고 공급자 접수는 수신을 보장하지 않는다. 재시도 판단을 잘못하면 중복될 수 있다. 모의 HTTP와 Docker PostgreSQL에서 접수·429 거절·500 불명, 불명 후 자동 재발송 차단, 제한 로그인·쿨다운·선택 설정 및 비조정 대체 전송을 확인한다. 실제 SendGrid 경보 수신·웹훅 연결 및 원본 비교는 미검증이다.

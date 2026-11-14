@@ -518,6 +518,58 @@ pub struct SlackWebhook {
     client: Client,
     endpoint: Url,
 }
+
+/// The provider is selected by the operator; changing it requires a new target ID.
+pub enum AlertEmailProvider {
+    Resend(Resend),
+    Sendgrid(crate::sendgrid::Sendgrid),
+}
+
+pub fn email_from_env() -> DbResult<Option<(String, AlertEmailProvider)>> {
+    let to = match std::env::var("SWALLOW_ALERT_EMAIL_TO") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(_) => return Err("invalid email recipient".into()),
+    };
+    let provider = match std::env::var("SWALLOW_ALERT_EMAIL_PROVIDER").as_deref() {
+        Ok("resend") | Err(std::env::VarError::NotPresent) => AlertEmailProvider::Resend(
+            Resend::new(crate::resend::Config {
+                api_key: novu_rust_contracts::secret::from_env(
+                    "NOVU_RESEND_API_KEY",
+                    "NOVU_RESEND_API_KEY_FILE",
+                )?
+                .ok_or("Resend API key is required")?,
+                from: std::env::var("NOVU_RESEND_FROM")?,
+                sender_name: std::env::var("NOVU_RESEND_SENDER_NAME").unwrap_or_default(),
+            })
+            .map_err(|_| "invalid email configuration")?,
+        ),
+        Ok("sendgrid") => {
+            let region = match std::env::var("NOVU_SENDGRID_REGION").as_deref() {
+                Ok("global") | Err(std::env::VarError::NotPresent) => {
+                    crate::sendgrid::Region::Global
+                }
+                Ok("eu") => crate::sendgrid::Region::Eu,
+                _ => return Err("invalid SendGrid region".into()),
+            };
+            AlertEmailProvider::Sendgrid(
+                crate::sendgrid::Sendgrid::new(crate::sendgrid::Config {
+                    api_key: novu_rust_contracts::secret::from_env(
+                        "NOVU_SENDGRID_API_KEY",
+                        "NOVU_SENDGRID_API_KEY_FILE",
+                    )?
+                    .ok_or("SendGrid API key is required")?,
+                    from: std::env::var("NOVU_SENDGRID_FROM")?,
+                    sender_name: std::env::var("NOVU_SENDGRID_SENDER_NAME").unwrap_or_default(),
+                    region,
+                })
+                .map_err(|_| "invalid email configuration")?,
+            )
+        }
+        _ => return Err("invalid email alert provider".into()),
+    };
+    Ok(Some((to, provider)))
+}
 impl SlackWebhook {
     /// Webhook URL is a credential and must never be printed or persisted here.
     pub fn new(url: &str) -> Result<Self, AlertError> {
@@ -624,6 +676,83 @@ pub async fn send_email(
             }
             _ => AlertError::Unknown,
         })
+}
+
+async fn send_selected_email(
+    provider: &AlertEmailProvider,
+    recipient: &str,
+    alert: &Alert,
+    idempotency_key: &str,
+) -> Result<(), AlertError> {
+    match provider {
+        AlertEmailProvider::Resend(provider) => {
+            send_email(provider, recipient, alert, idempotency_key).await
+        }
+        AlertEmailProvider::Sendgrid(provider) => {
+            if recipient.is_empty()
+                || recipient.len() > 320
+                || recipient.contains(['\r', '\n', '<', '>'])
+                || !recipient.contains('@')
+            {
+                return Err(AlertError::InvalidConfiguration);
+            }
+            let text = alert.text()?;
+            let email = Email {
+                to: vec![recipient.to_owned()],
+                subject: "Swallow delivery alert".into(),
+                html: format!("<p>{text}</p>"),
+                text: Some(text),
+                ..Default::default()
+            };
+            provider
+                .send(&email)
+                .await
+                .map(|_| ())
+                .map_err(|error| match error {
+                    crate::sendgrid::SendError::InvalidConfiguration
+                    | crate::sendgrid::SendError::InvalidMessage => {
+                        AlertError::InvalidConfiguration
+                    }
+                    crate::sendgrid::SendError::Provider(code)
+                        if (400..500).contains(&code) && code != 408 && code != 409 =>
+                    {
+                        AlertError::Rejected(code)
+                    }
+                    _ => AlertError::Unknown,
+                })
+        }
+    }
+}
+
+pub async fn send_uncoordinated_selected(
+    alert: &Alert,
+    slack: Option<&SlackWebhook>,
+    email: Option<(&AlertEmailProvider, &str)>,
+    timeout: Duration,
+) -> (
+    Option<Result<(), AlertError>>,
+    Option<Result<(), AlertError>>,
+) {
+    let key = format!("swallow-db-fallback/{}", Uuid::new_v4());
+    let slack_result = if let Some(provider) = slack {
+        Some(
+            tokio::time::timeout(timeout, provider.send(alert))
+                .await
+                .unwrap_or(Err(AlertError::Unknown)),
+        )
+    } else {
+        None
+    };
+    let email_result = if let Some((provider, to)) = email {
+        Some(
+            tokio::time::timeout(timeout, send_selected_email(provider, to, alert, &key))
+                .await
+                .unwrap_or(Err(AlertError::Unknown)),
+        )
+    } else {
+        None
+    };
+    (slack_result, email_result)
 }
 
 /// Best-effort fallback, deliberately without durable coordination or automatic retry.
@@ -808,6 +937,37 @@ pub async fn dispatch_email_with_options(
         return Err("invalid alert recipient".into());
     }
     dispatch(db,&alert.environment,"email",target,cooldown,(on_new_condition.then(|| alert.condition_mask()),scoped),|id|async move {send_email(provider,recipient,alert,&format!("swallow-alert/{id}")).await}).await
+}
+
+pub async fn dispatch_selected_email_with_options(
+    db: &mut PgClient,
+    target: &str,
+    cooldown: i32,
+    alert: &Alert,
+    provider: &AlertEmailProvider,
+    recipient: &str,
+    policy: (bool, bool),
+) -> DbResult<Dispatch> {
+    alert.text().map_err(|_| "invalid alert environment")?;
+    if recipient.is_empty()
+        || recipient.len() > 320
+        || recipient.contains(['\r', '\n', '<', '>'])
+        || !recipient.contains('@')
+    {
+        return Err("invalid alert recipient".into());
+    }
+    dispatch(
+        db,
+        &alert.environment,
+        "email",
+        target,
+        cooldown,
+        (policy.0.then(|| alert.condition_mask()), policy.1),
+        |id| async move {
+            send_selected_email(provider, recipient, alert, &format!("swallow-alert/{id}")).await
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1134,6 +1294,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_sendgrid_alert_classifies_provider_outcomes() {
+        for (status, expected) in [
+            ("202 Accepted", Ok(())),
+            ("429 Too Many Requests", Err(AlertError::Rejected(429))),
+            ("500 Server Error", Err(AlertError::Unknown)),
+        ] {
+            let (url, server) = mock_server(status, "").await;
+            let provider = AlertEmailProvider::Sendgrid(
+                crate::sendgrid::Sendgrid::test_endpoint(
+                    crate::sendgrid::Config {
+                        api_key: "fixture-key".into(),
+                        from: "from@example.test".into(),
+                        sender_name: "Ops".into(),
+                        region: crate::sendgrid::Region::Global,
+                    },
+                    url.as_str(),
+                )
+                .unwrap(),
+            );
+            assert_eq!(
+                send_selected_email(&provider, "ops@example.test", &alert(), "ignored").await,
+                expected
+            );
+            let request = server.await.unwrap();
+            let body: serde_json::Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(
+                body["personalizations"][0]["to"][0]["email"],
+                "ops@example.test"
+            );
+            assert_eq!(body["subject"], "Swallow delivery alert");
+            assert!(!body.to_string().contains("fixture-key"));
+            assert!(!request.to_ascii_lowercase().contains("idempotency-key:"));
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_fallback_attempts_sendgrid_after_slack_failure() {
+        let (url, slack_server) = mock_server("500 Server Error", "failed").await;
+        let slack = SlackWebhook::with_endpoint(url).unwrap();
+        let (url, email_server) = mock_server("202 Accepted", "").await;
+        let email = AlertEmailProvider::Sendgrid(
+            crate::sendgrid::Sendgrid::test_endpoint(
+                crate::sendgrid::Config {
+                    api_key: "fixture-key".into(),
+                    from: "from@example.test".into(),
+                    sender_name: String::new(),
+                    region: crate::sendgrid::Region::Global,
+                },
+                url.as_str(),
+            )
+            .unwrap(),
+        );
+        let result = send_uncoordinated_selected(
+            &alert(),
+            Some(&slack),
+            Some((&email, "ops@example.test")),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(result, (Some(Err(AlertError::Unknown)), Some(Ok(()))));
+        slack_server.await.unwrap();
+        assert!(
+            email_server
+                .await
+                .unwrap()
+                .contains("Swallow delivery alert")
+        );
+    }
+
+    #[tokio::test]
     #[ignore = "requires disposable PostgreSQL and mock loopback servers"]
     async fn unhealthy_environment_dispatches_both_destinations_with_cooldown() {
         let (mut db, driver) = tokio_postgres::connect(
@@ -1230,6 +1461,91 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.get::<_, String>(1) == "accepted"));
+        // The selected SendGrid path shares reservation and uncertain-outcome fencing.
+        let (url, server) = mock_server("202 Accepted", "").await;
+        let selected = AlertEmailProvider::Sendgrid(
+            crate::sendgrid::Sendgrid::test_endpoint(
+                crate::sendgrid::Config {
+                    api_key: "fixture-key".into(),
+                    from: "from@example.test".into(),
+                    sender_name: String::new(),
+                    region: crate::sendgrid::Region::Global,
+                },
+                url.as_str(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            dispatch_selected_email_with_options(
+                &mut db,
+                "sendgrid-ops",
+                60,
+                &alert,
+                &selected,
+                "ops@example.test",
+                (false, false)
+            )
+            .await
+            .unwrap(),
+            Dispatch::Accepted
+        );
+        server.await.unwrap();
+        assert_eq!(
+            dispatch_selected_email_with_options(
+                &mut db,
+                "sendgrid-ops",
+                60,
+                &alert,
+                &selected,
+                "ops@example.test",
+                (false, false)
+            )
+            .await
+            .unwrap(),
+            Dispatch::CoolingDown
+        );
+        let (url, server) = mock_server("500 Server Error", "").await;
+        let unknown = AlertEmailProvider::Sendgrid(
+            crate::sendgrid::Sendgrid::test_endpoint(
+                crate::sendgrid::Config {
+                    api_key: "fixture-key".into(),
+                    from: "from@example.test".into(),
+                    sender_name: String::new(),
+                    region: crate::sendgrid::Region::Global,
+                },
+                url.as_str(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            dispatch_selected_email_with_options(
+                &mut db,
+                "sendgrid-unknown",
+                60,
+                &alert,
+                &unknown,
+                "ops@example.test",
+                (false, false)
+            )
+            .await
+            .unwrap(),
+            Dispatch::NeedsReview
+        );
+        server.await.unwrap();
+        assert_eq!(
+            dispatch_selected_email_with_options(
+                &mut db,
+                "sendgrid-unknown",
+                60,
+                &alert,
+                &unknown,
+                "ops@example.test",
+                (false, false)
+            )
+            .await
+            .unwrap(),
+            Dispatch::NeedsReview
+        );
         db.batch_execute(include_str!(
             "../migrations/0085_alert_condition_cooldown.sql"
         ))
@@ -1316,8 +1632,9 @@ mod tests {
             url.as_str(),
         )
         .unwrap();
+        let scoped_email = AlertEmailProvider::Resend(scoped_email);
         assert_eq!(
-            dispatch_email_with_options(
+            dispatch_selected_email_with_options(
                 &mut db,
                 "scoped-email",
                 60,
@@ -1397,6 +1714,35 @@ mod tests {
                 .is_err()
         );
         assert_eq!(db.query_one("SELECT count(*) FROM novu_rust_alert_delivery_attempts WHERE sender_session_user=$1 AND state='accepted'",&[&role]).await.unwrap().get::<_,i64>(0),2);
+        let (url, server) = mock_server("202 Accepted", "").await;
+        let selected = AlertEmailProvider::Sendgrid(
+            crate::sendgrid::Sendgrid::test_endpoint(
+                crate::sendgrid::Config {
+                    api_key: "fixture-key".into(),
+                    from: "from@example.test".into(),
+                    sender_name: String::new(),
+                    region: crate::sendgrid::Region::Global,
+                },
+                url.as_str(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            dispatch_selected_email_with_options(
+                &mut restricted,
+                "limited-sendgrid",
+                60,
+                &alert,
+                &selected,
+                "ops@example.test",
+                (true, true)
+            )
+            .await
+            .unwrap(),
+            Dispatch::Accepted
+        );
+        server.await.unwrap();
+        assert_eq!(db.query_one("SELECT count(*) FROM novu_rust_alert_delivery_attempts WHERE sender_session_user=$1 AND target_id='limited-sendgrid' AND state='accepted'", &[&role]).await.unwrap().get::<_,i64>(0), 1);
         // An operation timeout after the HTTP request starts must not cause an automatic retry.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();

@@ -2,7 +2,6 @@
 use novu_postgres_queue::{
     alerts::{self, Alert, Dispatch, SlackWebhook},
     reconciliation,
-    resend::{Config, Resend},
 };
 use std::{error::Error, time::Duration};
 
@@ -48,7 +47,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             None
         }
     };
-    let email = match email_config() {
+    let email = match alerts::email_from_env() {
         Ok(value) => value,
         Err(_) => {
             eprintln!("email alert configuration failed");
@@ -398,7 +397,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if let Some((to, provider)) = email {
         match tokio::time::timeout(
             operation_timeout,
-            alerts::dispatch_email_with_options(
+            alerts::dispatch_selected_email_with_options(
                 &mut db,
                 &email_id,
                 cooldown,
@@ -454,23 +453,4 @@ fn slack_config() -> Result<Option<SlackWebhook>, Box<dyn Error + Send + Sync>> 
     )?
     .map(|s| SlackWebhook::new(&s).map_err(|_| "invalid Slack configuration"))
     .transpose()?)
-}
-
-fn email_config() -> Result<Option<(String, Resend)>, Box<dyn Error + Send + Sync>> {
-    let to = match std::env::var("SWALLOW_ALERT_EMAIL_TO") {
-        Ok(value) => value,
-        Err(std::env::VarError::NotPresent) => return Ok(None),
-        Err(_) => return Err("invalid email recipient".into()),
-    };
-    let provider = Resend::new(Config {
-        api_key: novu_rust_contracts::secret::from_env(
-            "NOVU_RESEND_API_KEY",
-            "NOVU_RESEND_API_KEY_FILE",
-        )?
-        .ok_or("Resend API key is required")?,
-        from: std::env::var("NOVU_RESEND_FROM")?,
-        sender_name: std::env::var("NOVU_RESEND_SENDER_NAME").unwrap_or_default(),
-    })
-    .map_err(|_| "invalid email configuration")?;
-    Ok(Some((to, provider)))
 }

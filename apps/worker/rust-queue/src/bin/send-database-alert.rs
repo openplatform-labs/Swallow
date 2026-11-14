@@ -1,8 +1,5 @@
 //! Probe a target PostgreSQL database using a separate alert-state database.
-use novu_postgres_queue::{
-    alerts::{self, Alert, Dispatch, SlackWebhook},
-    resend::{Config, Resend},
-};
+use novu_postgres_queue::alerts::{self, Alert, Dispatch, SlackWebhook};
 use std::{error::Error, time::Duration};
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -32,24 +29,6 @@ fn slack() -> Result<Option<SlackWebhook>> {
     )?
     .map(|s| SlackWebhook::new(&s).map_err(|_| "invalid Slack configuration".into()))
     .transpose()
-}
-fn email() -> Result<Option<(String, Resend)>> {
-    let to = match std::env::var("SWALLOW_ALERT_EMAIL_TO") {
-        Ok(v) => v,
-        Err(std::env::VarError::NotPresent) => return Ok(None),
-        Err(_) => return Err("invalid email recipient".into()),
-    };
-    let provider = Resend::new(Config {
-        api_key: novu_rust_contracts::secret::from_env(
-            "NOVU_RESEND_API_KEY",
-            "NOVU_RESEND_API_KEY_FILE",
-        )?
-        .ok_or("Resend API key is required")?,
-        from: std::env::var("NOVU_RESEND_FROM")?,
-        sender_name: std::env::var("NOVU_RESEND_SENDER_NAME").unwrap_or_default(),
-    })
-    .map_err(|_| "invalid email configuration")?;
-    Ok(Some((to, provider)))
 }
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -95,7 +74,7 @@ async fn main() -> Result<()> {
             None
         }
     };
-    let email = match email() {
+    let email = match alerts::email_from_env() {
         Ok(v) => v,
         Err(_) => {
             bad_config = true;
@@ -177,7 +156,7 @@ async fn main() -> Result<()> {
         _ if fallback == StateFailureMode::Uncoordinated => {
             alert.alert_store_unavailable = true;
             eprintln!("monitor database connection failed; sending uncoordinated alerts");
-            let result = alerts::send_uncoordinated(
+            let result = alerts::send_uncoordinated_selected(
                 &alert,
                 slack.as_ref(),
                 email.as_ref().map(|(to, provider)| (provider, to.as_str())),
@@ -259,7 +238,7 @@ async fn main() -> Result<()> {
     if let Some((to, provider)) = email {
         match tokio::time::timeout(
             operation_timeout,
-            alerts::dispatch_email_with_options(
+            alerts::dispatch_selected_email_with_options(
                 &mut db,
                 &email_id,
                 cooldown,

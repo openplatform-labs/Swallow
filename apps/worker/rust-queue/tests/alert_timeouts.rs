@@ -58,3 +58,46 @@ fn alert_command_bounds_a_database_handshake() {
         String::from_utf8_lossy(&output.stderr).contains("alert database connection timed out")
     );
 }
+
+#[test]
+fn both_alert_commands_select_email_provider_before_connecting() {
+    for (binary, args) in [
+        (
+            env!("CARGO_BIN_EXE_send-delivery-alert"),
+            vec!["env", "300", "120", "60"],
+        ),
+        (
+            env!("CARGO_BIN_EXE_send-database-alert"),
+            vec!["env", "db", "60"],
+        ),
+    ] {
+        let run = |provider: &str| {
+            Command::new(binary)
+                .args(&args)
+                .env("SWALLOW_ALERT_EMAIL_TO", "ops@example.test")
+                .env("SWALLOW_ALERT_EMAIL_PROVIDER", provider)
+                .env("NOVU_SENDGRID_API_KEY", "fixture-key")
+                .env_remove("NOVU_SENDGRID_API_KEY_FILE")
+                .env("NOVU_SENDGRID_FROM", "sender@example.test")
+                .env("NOVU_SENDGRID_REGION", "eu")
+                .env_remove("SWALLOW_ALERT_SLACK_WEBHOOK")
+                .env_remove("SWALLOW_ALERT_SLACK_WEBHOOK_FILE")
+                .env_remove("NOVU_RESEND_API_KEY")
+                .env_remove("NOVU_RESEND_API_KEY_FILE")
+                .env("DATABASE_URL", "not-a-database-url")
+                .env("SWALLOW_DB_PROBE_URL", "not-a-database-url")
+                .output()
+                .unwrap()
+        };
+        let selected = run("sendgrid");
+        assert!(!selected.status.success());
+        let err = String::from_utf8_lossy(&selected.stderr);
+        assert!(!err.contains("email alert configuration failed"), "{err}");
+        assert!(!err.contains("fixture-key"));
+        let invalid = run("unsupported");
+        assert!(!invalid.status.success());
+        assert!(
+            String::from_utf8_lossy(&invalid.stderr).contains("email alert configuration failed")
+        );
+    }
+}
