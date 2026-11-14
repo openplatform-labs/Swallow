@@ -293,6 +293,8 @@ pub struct Alert {
     pub twilio: Option<(u64, bool)>,
     pub slack_attempts: Option<(u64, u64, u64, u64, Option<u64>)>,
     pub failed_checks: [bool; 5], // resend, queue, attempts, twilio, Slack chat
+    pub failed_jobs: Option<u64>,
+    pub failed_jobs_check_failed: bool,
 }
 impl Alert {
     /// Bit flags describe problem categories, not counts or sensitive content.
@@ -318,6 +320,13 @@ impl Alert {
             if enabled {
                 mask |= 1 << bit;
             }
+        }
+        // Preserve existing bit numbers used by persisted cooldown masks.
+        if self.failed_jobs.is_some_and(|count| count > 0) {
+            mask |= 1 << 18;
+        }
+        if self.failed_jobs_check_failed {
+            mask |= 1 << 19;
         }
         mask
     }
@@ -369,6 +378,12 @@ impl Alert {
             if *failed {
                 details.push(format!("{name} check failed"));
             }
+        }
+        if let Some(count) = self.failed_jobs {
+            details.push(format!("unacknowledged failed jobs: {count}"));
+        }
+        if self.failed_jobs_check_failed {
+            details.push("failed jobs check failed".into());
         }
         if details.is_empty() {
             return Err(AlertError::InvalidConfiguration);
@@ -664,6 +679,8 @@ mod tests {
             twilio: None,
             slack_attempts: None,
             failed_checks: [false; 5],
+            failed_jobs: None,
+            failed_jobs_check_failed: false,
         }
     }
 
@@ -677,7 +694,12 @@ mod tests {
         assert_ne!(a.condition_mask(), base);
         let with_queue = a.condition_mask();
         a.failed_checks[2] = true;
-        assert_ne!(a.condition_mask(), with_queue);
+        assert_eq!(a.condition_mask() ^ with_queue, 1 << 15);
+        let prior = a.condition_mask();
+        a.failed_jobs = Some(1);
+        assert_eq!(a.condition_mask() ^ prior, 1 << 18);
+        a.failed_jobs_check_failed = true;
+        assert_eq!(a.condition_mask() ^ prior, (1 << 18) | (1 << 19));
     }
 
     async fn mock_server(status: &str, body: &str) -> (Url, tokio::task::JoinHandle<String>) {
@@ -881,6 +903,8 @@ mod tests {
             twilio: None,
             slack_attempts: None,
             failed_checks: [false; 5],
+            failed_jobs: None,
+            failed_jobs_check_failed: false,
         };
         assert!(alert.projector_stale);
         let (url, slack_server) = mock_server("200 OK", "ok").await;

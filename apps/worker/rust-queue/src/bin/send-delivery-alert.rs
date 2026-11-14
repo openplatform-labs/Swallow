@@ -62,6 +62,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let resend_enabled = env_bool("SWALLOW_ALERT_RESEND_ENABLED", true)?;
     let attempts_enabled = env_bool("SWALLOW_ALERT_ATTEMPTS_ENABLED", false)?;
     let slack_jobs_enabled = env_bool("SWALLOW_ALERT_SLACK_JOBS_ENABLED", false)?;
+    let failed_jobs_enabled = env_bool("SWALLOW_ALERT_FAILED_JOBS_ENABLED", false)?;
     let slack_missing_enabled = env_bool("SWALLOW_ALERT_SLACK_MISSING_ENDPOINTS_ENABLED", false)?;
     let twilio_grace = env_optional_i32("SWALLOW_ALERT_TWILIO_GRACE_SECONDS")?;
     let twilio_heartbeat = env_optional_i32("SWALLOW_ALERT_TWILIO_HEARTBEAT_MAX_SECONDS")?;
@@ -78,6 +79,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if !resend_enabled
         && !attempts_enabled
         && !slack_jobs_enabled
+        && !failed_jobs_enabled
         && queue_wait.is_none()
         && twilio_thresholds.is_none()
     {
@@ -198,7 +200,22 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     } else {
         None
     };
-    let unhealthy = failed_checks.iter().any(|failed| *failed)
+    let mut failed_jobs_check_failed = false;
+    let failed_jobs = if failed_jobs_enabled {
+        match reconciliation::failed_queue_count(&db, &args[0]).await {
+            Ok(count) if count >= 0 => Some(count as u64),
+            _ => {
+                failed_jobs_check_failed = true;
+                eprintln!("failed jobs health check failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let unhealthy = failed_jobs_check_failed
+        || failed_jobs.is_some_and(|n| n > 0)
+        || failed_checks.iter().any(|failed| *failed)
         || resend.is_some_and(|(overdue, stale)| overdue > 0 || stale)
         || queue.is_some_and(|(overdue, expired)| overdue > 0 || expired > 0)
         || attempts.is_some_and(|(unknown, stranded)| unknown > 0 || stranded > 0)
@@ -221,6 +238,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         twilio,
         slack_attempts,
         failed_checks,
+        failed_jobs,
+        failed_jobs_check_failed,
     };
     alert.text().map_err(|_| "invalid alert environment")?;
     if !unhealthy {
@@ -230,7 +249,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         println!("{{\"status\":\"healthy\"}}");
         return Ok(());
     }
-    let mut error = configuration_error || failed_checks.iter().any(|failed| *failed);
+    let mut error = configuration_error
+        || failed_jobs_check_failed
+        || failed_checks.iter().any(|failed| *failed);
     let mut needs_review = false;
     if let Some(provider) = slack {
         match alerts::dispatch_slack_with_options(

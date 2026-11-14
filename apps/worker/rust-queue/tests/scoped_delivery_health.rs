@@ -60,7 +60,7 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
     .await
     .unwrap();
     let role = format!("monitor_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'scoped-fixture-password'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_delivery_health(text),public.novu_rust_queue_health(text,integer),public.novu_rust_provider_health(text,text,integer,integer),public.novu_rust_reserve_alert(text,text,text,integer,integer),public.novu_rust_finish_alert(text,text,text,uuid,text,integer) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'scoped-fixture-password'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_delivery_health(text),public.novu_rust_queue_health(text,integer),public.novu_rust_provider_health(text,text,integer,integer),public.novu_rust_reserve_alert(text,text,text,integer,integer),public.novu_rust_finish_alert(text,text,text,uuid,text,integer),public.novu_rust_failed_queue_count(text),public.novu_rust_failed_queue_list(text,uuid),public.novu_rust_ack_failed_queue(text,uuid,text,text) TO {role}")).await.unwrap();
     let (actor, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move {
         let _ = driver.await;
@@ -219,6 +219,141 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
         "{}",
         String::from_utf8_lossy(&alert.stderr)
     );
+    let failed = Uuid::new_v4();
+    queue::enqueue(
+        &db,
+        failed,
+        "a",
+        queue::fcm_queue::JOB_KIND,
+        &json!({"secret":"fixture-private"}),
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE novu_queue_jobs SET status='failed',last_error='sensitive diagnostic' WHERE id=$1",
+        &[&failed],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reconciliation::failed_queue_count(&actor, "a")
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(
+        reconciliation::failed_queue_count(&actor, "b")
+            .await
+            .is_err()
+    );
+    let listed = reconciliation::failed_queue_list(&actor, "a", None)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    let result = serde_json::to_string(&listed).unwrap();
+    assert!(!result.contains("fixture-private") && !result.contains("sensitive diagnostic"));
+    assert!(
+        reconciliation::acknowledge_failed_queue(&actor, "a", failed, "operator", "reviewed")
+            .await
+            .is_err()
+    );
+    db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'a',$1,'queue_ack',oid FROM pg_roles WHERE rolname::text=$1",&[&role]).await.unwrap();
+    let failure_cli = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+            .args(args)
+            .env("DATABASE_URL", role_url.as_str())
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .output()
+            .unwrap()
+    };
+    assert_eq!(
+        failure_cli(&["check-failed-jobs", "a"]).status.code(),
+        Some(2)
+    );
+    assert_eq!(
+        failure_cli(&["list-failed-jobs", "b"]).status.code(),
+        Some(1)
+    );
+    let failure_alert = || {
+        Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"))
+            .args(["a", "300", "120", "60"])
+            .env("DATABASE_URL", role_url.as_str())
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
+            .env("SWALLOW_ALERT_FAILED_JOBS_ENABLED", "true")
+            .env("SWALLOW_ALERT_SCOPED_DELIVERY", "true")
+            .env("SWALLOW_ALERT_ATTEMPTS_ENABLED", "false")
+            .env("SWALLOW_ALERT_SLACK_JOBS_ENABLED", "false")
+            .env_remove("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS")
+            .env_remove("SWALLOW_ALERT_TWILIO_GRACE_SECONDS")
+            .env_remove("SWALLOW_ALERT_TWILIO_HEARTBEAT_MAX_SECONDS")
+            .env(
+                "SWALLOW_ALERT_SLACK_WEBHOOK",
+                "https://hooks.slack.com/services/A/B/C",
+            )
+            .env("SWALLOW_ALERT_SLACK_TARGET_ID", "ops")
+            .env_remove("SWALLOW_ALERT_EMAIL_TO")
+            .env_remove("SWALLOW_ALERT_SLACK_WEBHOOK_FILE")
+            .output()
+            .unwrap()
+    };
+    assert_eq!(failure_alert().status.code(), Some(2));
+    assert!(
+        failure_cli(&[
+            "ack-failed-job",
+            "a",
+            &failed.to_string(),
+            "operator",
+            "reviewed"
+        ])
+        .status
+        .success()
+    );
+    assert!(
+        !reconciliation::acknowledge_failed_queue(&actor, "a", failed, "operator", "reviewed")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        failure_cli(&["check-failed-jobs", "a"]).status.code(),
+        Some(0)
+    );
+    assert_eq!(failure_alert().status.code(), Some(0));
+    assert_eq!(
+        db.query_one("SELECT status FROM novu_queue_jobs WHERE id=$1", &[&failed])
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        "failed"
+    );
+    db.execute(
+        "UPDATE novu_queue_jobs SET attempts=attempts+1 WHERE id=$1",
+        &[&failed],
+    )
+    .await
+    .unwrap();
+    assert_eq!(failure_alert().status.code(), Some(2));
+    db.execute("INSERT INTO novu_queue_jobs(id,environment_id,kind,payload,status) SELECT gen_random_uuid(),'a','pagination_fixture','{}'::jsonb,'failed' FROM generate_series(1,101)",&[]).await.unwrap();
+    let page = reconciliation::failed_queue_list(&actor, "a", None)
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 100);
+    let cursor = Uuid::parse_str(page[99]["jobId"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        reconciliation::failed_queue_list(&actor, "a", Some(cursor))
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    db.execute(
+        "DELETE FROM novu_queue_jobs WHERE environment_id='a' AND kind='pagination_fixture'",
+        &[],
+    )
+    .await
+    .unwrap();
+    let row=db.query_one("SELECT database_session_user FROM novu_rust_queue_failure_acknowledgements WHERE job_id=$1",&[&failed]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), role);
     db.execute("DELETE FROM novu_rust_delivery_operator_grants WHERE database_principal=$1 AND decision='alert_view'",&[&role]).await.unwrap();
     assert_eq!(scoped_monitor("a").status.code(), Some(1));
     let denied = run_limited_alert();

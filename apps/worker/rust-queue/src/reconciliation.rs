@@ -113,6 +113,46 @@ pub async fn scoped_provider_health(
     )
 }
 
+/// Count failed queue jobs not acknowledged for their current snapshot.
+pub async fn failed_queue_count(client: &Client, environment: &str) -> Result<i64> {
+    Ok(client
+        .query_one(
+            "SELECT public.novu_rust_failed_queue_count($1)",
+            &[&environment],
+        )
+        .await?
+        .get(0))
+}
+/// List bounded failure metadata without payload or diagnostic text.
+pub async fn failed_queue_list(
+    client: &Client,
+    environment: &str,
+    after: Option<Uuid>,
+) -> Result<Vec<Value>> {
+    let rows = client
+        .query(
+            "SELECT * FROM public.novu_rust_failed_queue_list($1,$2)",
+            &[&environment, &after],
+        )
+        .await?;
+    Ok(rows.into_iter().map(|r|json!({"jobId":r.get::<_,Uuid>(0).to_string(),"kind":r.get::<_,String>(1),"attempts":r.get::<_,i32>(2),"createdAt":r.get::<_,String>(3)})).collect())
+}
+pub async fn acknowledge_failed_queue(
+    client: &Client,
+    environment: &str,
+    job: Uuid,
+    operator: &str,
+    reason: &str,
+) -> Result<bool> {
+    Ok(client
+        .query_one(
+            "SELECT public.novu_rust_ack_failed_queue($1,$2,$3,$4)",
+            &[&environment, &job, &operator, &reason],
+        )
+        .await?
+        .get(0))
+}
+
 /// Alert on overdue non-delivered Resend jobs and an absent or stale projector.
 pub async fn resend_health(
     client: &Client,
