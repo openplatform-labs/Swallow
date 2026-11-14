@@ -6,7 +6,7 @@ use uuid::Uuid;
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if ![2, 3, 4, 6].contains(&args.len()) {
-        return Err("usage: delivery-reconcile check ENV | check-queue ENV MAX_WAIT_SECONDS | list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | email-dispatch-evidence ENV EMAIL_JOB | resend-evidence|resend-check ENV EMAIL_JOB | sms-evidence|sms-delivery ENV SMS_JOB | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
+        return Err("usage: delivery-reconcile check ENV | check-queue ENV MAX_WAIT_SECONDS | check-resend|check-resend-metrics ENV GRACE_SECONDS HEARTBEAT_MAX_SECONDS | list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | email-dispatch-evidence ENV EMAIL_JOB | resend-evidence|resend-check ENV EMAIL_JOB | sms-evidence|sms-delivery ENV SMS_JOB | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
     }
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let (mut db, connection) = config.connect(tls).await?;
@@ -43,6 +43,43 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 .ok_or("invalid health result")?
                 > 0
         {
+            std::process::exit(2);
+        }
+    } else if args.len() == 4
+        && ["check-resend", "check-resend-metrics"].contains(&args[0].as_str())
+    {
+        let health = novu_postgres_queue::reconciliation::resend_health(
+            &db,
+            &args[1],
+            args[2].parse()?,
+            args[3].parse()?,
+        )
+        .await?;
+        let overdue = health["overdueUndelivered"]
+            .as_i64()
+            .ok_or("invalid health result")?;
+        let stale = health["projectorStale"]
+            .as_bool()
+            .ok_or("invalid health result")?;
+        if args[0] == "check-resend-metrics" {
+            if args[1].chars().any(|c| c.is_control() && c != '\n') {
+                return Err("invalid environment for metrics".into());
+            }
+            let environment = args[1]
+                .replace('\\', "\\\\")
+                .replace('\n', "\\n")
+                .replace('"', "\\\"");
+            let eligible = health["eligibleJobs"]
+                .as_i64()
+                .ok_or("invalid health result")?;
+            println!(
+                "# TYPE swallow_resend_overdue_undelivered gauge\nswallow_resend_overdue_undelivered{{environment=\"{environment}\"}} {overdue}\n# TYPE swallow_resend_projector_stale gauge\nswallow_resend_projector_stale{{environment=\"{environment}\"}} {}\n# TYPE swallow_resend_eligible_jobs gauge\nswallow_resend_eligible_jobs{{environment=\"{environment}\"}} {eligible}",
+                i32::from(stale)
+            );
+        } else {
+            println!("{}", serde_json::to_string(&health)?);
+        }
+        if args[0] == "check-resend" && (overdue > 0 || stale) {
             std::process::exit(2);
         }
     } else if args.len() == 2 && args[0] == "list" {

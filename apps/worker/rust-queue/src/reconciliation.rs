@@ -70,6 +70,28 @@ pub async fn queue_health(
     }))
 }
 
+/// Alert on overdue non-delivered Resend jobs and an absent or stale projector.
+pub async fn resend_health(
+    client: &Client,
+    environment: &str,
+    grace: i32,
+    heartbeat_max_age: i32,
+) -> Result<Value> {
+    if environment.trim().is_empty()
+        || !(1..=86_400).contains(&grace)
+        || !(1..=86_400).contains(&heartbeat_max_age)
+    {
+        return Err("invalid environment or threshold (1-86400 seconds)".into());
+    }
+    let row=client.query_one("SELECT count(*) FILTER (WHERE j.resend_delivery_result IS DISTINCT FROM 'delivered'), count(*), EXISTS(SELECT 1 FROM novu_rust_environments e WHERE e.id=$1), (SELECT h.last_completed_at::text FROM novu_rust_resend_projection_heartbeat h WHERE h.environment_id=$1), COALESCE((SELECT h.last_completed_at < statement_timestamp() - $3::integer * interval '1 second' FROM novu_rust_resend_projection_heartbeat h WHERE h.environment_id=$1),true) FROM novu_queue_jobs j WHERE j.environment_id=$1 AND j.kind=$4 AND j.status<>'cancelled' AND j.available_at<=statement_timestamp()-$2::integer*interval '1 second'", &[&environment,&grace,&heartbeat_max_age,&crate::resend_queue::JOB_KIND]).await?;
+    if !row.get::<_, bool>(2) {
+        return Err("environment not found".into());
+    }
+    Ok(
+        json!({"overdueUndelivered":row.get::<_,i64>(0),"eligibleJobs":row.get::<_,i64>(1),"lastProjectionAt":row.get::<_,Option<String>>(3),"projectorStale":row.get::<_,bool>(4),"graceSeconds":grace,"heartbeatMaxSeconds":heartbeat_max_age}),
+    )
+}
+
 /// List bounded unknown attempts without returning recipient data or payloads.
 pub async fn list(client: &Client, environment: &str) -> Result<Vec<Value>> {
     list_after(client, environment, None).await

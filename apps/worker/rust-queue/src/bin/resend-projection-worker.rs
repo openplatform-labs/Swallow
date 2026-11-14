@@ -52,6 +52,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         resend_projection::project(&mut db, &environment, job).await?;
                     }
                 }
+                db.execute("INSERT INTO novu_rust_resend_projection_heartbeat(environment_id,last_completed_at) VALUES ($1,clock_timestamp()) ON CONFLICT(environment_id) DO UPDATE SET last_completed_at=EXCLUDED.last_completed_at", &[&environment]).await?;
                 Ok::<(), Box<dyn Error + Send + Sync>>(())
             };
             let failed = tokio::select! {

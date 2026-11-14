@@ -6,6 +6,8 @@ use uuid::Uuid;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 pub const MIGRATION: &str = include_str!("../migrations/0063_resend_delivery_projection.sql");
+pub const HEARTBEAT_MIGRATION: &str =
+    include_str!("../migrations/0065_resend_projection_heartbeat.sql");
 
 fn classify(evidence: &Value) -> &'static str {
     let Some(recipients) = evidence["recipients"].as_array() else {

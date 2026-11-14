@@ -38,6 +38,7 @@ async fn projector_reconnects_after_database_restart() {
         queue::resend_queue::RECIPIENT_MIGRATION,
         queue::in_app::EMAIL_MESSAGES_MIGRATION,
         queue::resend_projection::MIGRATION,
+        queue::resend_projection::HEARTBEAT_MIGRATION,
         include_str!("../../../api/rust-api/migrations/0010_resend_webhooks.sql"),
         include_str!("../../../api/rust-api/migrations/0012_resend_event_fingerprint.sql"),
         include_str!("../../../api/rust-api/migrations/0013_resend_event_recipient.sql"),

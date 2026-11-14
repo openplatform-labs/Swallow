@@ -17,6 +17,7 @@ async fn resend_check_exits_for_unmatched_and_missing_evidence() {
         queue::resend_queue::RECIPIENT_MIGRATION,
         queue::in_app::EMAIL_MESSAGES_MIGRATION,
         queue::resend_projection::MIGRATION,
+        queue::resend_projection::HEARTBEAT_MIGRATION,
         include_str!("../../../api/rust-api/migrations/0010_resend_webhooks.sql"),
         include_str!("../../../api/rust-api/migrations/0012_resend_event_fingerprint.sql"),
         include_str!("../../../api/rust-api/migrations/0013_resend_event_recipient.sql"),
@@ -27,6 +28,22 @@ async fn resend_check_exits_for_unmatched_and_missing_evidence() {
     queue::enqueue(&db, job, "env", queue::resend_queue::JOB_KIND, &json!({}))
         .await
         .unwrap();
+    db.execute("UPDATE novu_queue_jobs SET available_at=clock_timestamp()-interval '10 minutes' WHERE id=$1", &[&job]).await.unwrap();
+    let no_heartbeat = queue::reconciliation::resend_health(&db, "env", 300, 120)
+        .await
+        .unwrap();
+    assert_eq!(no_heartbeat["projectorStale"], true);
+    assert_eq!(no_heartbeat["overdueUndelivered"], 1);
+    assert!(
+        queue::reconciliation::resend_health(&db, "other", 300, 120)
+            .await
+            .is_err()
+    );
+    assert!(
+        queue::reconciliation::resend_health(&db, "env", 0, 120)
+            .await
+            .is_err()
+    );
     db.execute("INSERT INTO novu_rust_resend_attempts(job_id,environment_id,state,provider_message_id) VALUES ($1,'env','accepted','id')", &[&job]).await.unwrap();
     db.execute("INSERT INTO novu_rust_email_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,subject,status,email_job_id) VALUES ('message','env','s','s','n','w','t','subject','sent',$1)", &[&job]).await.unwrap();
     db.execute(
@@ -102,15 +119,15 @@ async fn resend_check_exits_for_unmatched_and_missing_evidence() {
         .unwrap();
     let mut observed = false;
     for _ in 0..50 {
-        let result: Option<String> = db
+        let row = db
             .query_one(
-                "SELECT resend_delivery_result FROM novu_queue_jobs WHERE id=$1",
+                "SELECT resend_delivery_result,EXISTS(SELECT 1 FROM novu_rust_resend_projection_heartbeat WHERE environment_id='env') FROM novu_queue_jobs WHERE id=$1",
                 &[&job],
             )
             .await
-            .unwrap()
-            .get(0);
-        if result.as_deref() == Some("delivered") {
+            .unwrap();
+        let result: Option<String> = row.get(0);
+        if result.as_deref() == Some("delivered") && row.get::<_, bool>(1) {
             observed = true;
             break;
         }
@@ -124,6 +141,39 @@ async fn resend_check_exits_for_unmatched_and_missing_evidence() {
     assert_eq!(row.get::<_, String>(1), "delivered");
     assert_eq!(row.get::<_, String>(2), "pending");
     assert_eq!(row.get::<_, String>(3), "sent");
+    db.execute("INSERT INTO novu_rust_resend_projection_heartbeat VALUES ('env',clock_timestamp()) ON CONFLICT(environment_id) DO UPDATE SET last_completed_at=EXCLUDED.last_completed_at", &[]).await.unwrap();
+    let check_environment = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+            .args(["check-resend", "env", "300", "120"])
+            .env("DATABASE_URL", &url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .output()
+            .unwrap()
+    };
+    assert_eq!(check_environment().status.code(), Some(0));
+    let metrics = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+            .args(["check-resend-metrics", "env", "300", "120"])
+            .env("DATABASE_URL", &url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .output()
+            .unwrap()
+    };
+    let healthy_metrics = metrics();
+    assert_eq!(healthy_metrics.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&healthy_metrics.stdout)
+            .contains("swallow_resend_projector_stale{environment=\"env\"} 0")
+    );
+    db.execute("UPDATE novu_rust_resend_projection_heartbeat SET last_completed_at=clock_timestamp()-interval '5 minutes' WHERE environment_id='env'", &[]).await.unwrap();
+    assert_eq!(check_environment().status.code(), Some(2));
+    let stale_metrics = metrics();
+    assert_eq!(stale_metrics.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&stale_metrics.stdout)
+            .contains("swallow_resend_projector_stale{environment=\"env\"} 1")
+    );
+    db.execute("UPDATE novu_rust_resend_projection_heartbeat SET last_completed_at=clock_timestamp() WHERE environment_id='env'", &[]).await.unwrap();
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&healthy.stdout).unwrap()["needsAttention"],
         false
@@ -168,6 +218,28 @@ async fn resend_check_exits_for_unmatched_and_missing_evidence() {
         .unwrap()
         .get::<_, String>(0),
         "unknown"
+    );
+    assert_eq!(check_environment().status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&metrics().stdout)
+            .contains("swallow_resend_overdue_undelivered{environment=\"env\"} 1")
+    );
+    let special = "env\"\\\nname";
+    db.execute(
+        "INSERT INTO novu_rust_environments(id,organization_id) VALUES ($1,'org')",
+        &[&special],
+    )
+    .await
+    .unwrap();
+    let escaped = std::process::Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .args(["check-resend-metrics", special, "300", "120"])
+        .env("DATABASE_URL", &url)
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .output()
+        .unwrap();
+    assert_eq!(escaped.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&escaped.stdout).contains("environment=\"env\\\"\\\\\\nname\"")
     );
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&alert.stdout).unwrap()["evidence"]["unmatchedEvents"],
