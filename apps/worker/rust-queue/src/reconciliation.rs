@@ -583,6 +583,9 @@ pub async fn resolve(
         }
         (crate::resend_queue::JOB_KIND, None, "accepted") => {
             tx.execute("UPDATE novu_rust_resend_attempts SET state='accepted',updated_at=clock_timestamp() WHERE environment_id=$1 AND job_id=$2", &[&environment, &job]).await?;
+            // Acceptance is an operator assertion, not evidence of recipient delivery.
+            tx.execute("UPDATE novu_queue_jobs SET resend_delivery_result=NULL WHERE environment_id=$1 AND id=$2", &[&environment,&job]).await?;
+            tx.execute("UPDATE novu_rust_email_messages SET delivery_state='accepted',status='sent',error_id=NULL,error_text=NULL,identifier=COALESCE((SELECT provider_message_id FROM novu_rust_resend_attempts WHERE environment_id=$1 AND job_id=$2),identifier),resend_delivery_result=NULL WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job]).await?;
         }
         (crate::sendgrid_queue::JOB_KIND, None, "retry") => {
             tx.execute(

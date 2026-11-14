@@ -255,6 +255,50 @@ async fn scoped_email_sms_decisions_are_authorized_atomic_and_fenced() {
             );
         }
     }
+    // Acceptance updates message history without claiming recipient delivery.
+    for scoped in [false, true] {
+        for provider_id in [None, Some("provider-confirmed-id")] {
+            let accepted = create_job(&db, queue::resend_queue::JOB_KIND).await;
+            db.execute(
+                "UPDATE novu_queue_jobs SET resend_delivery_result='delivered' WHERE id=$1",
+                &[&accepted],
+            )
+            .await
+            .unwrap();
+            db.execute(
+                "UPDATE novu_rust_resend_attempts SET provider_message_id=$2 WHERE job_id=$1",
+                &[&accepted, &provider_id],
+            )
+            .await
+            .unwrap();
+            db.execute("UPDATE novu_rust_email_messages SET error_id='mail_unexpected_error',error_text='old failure',resend_delivery_result='delivered' WHERE email_job_id=$1", &[&accepted]).await.unwrap();
+            let cross = Uuid::new_v4().to_string();
+            db.execute("INSERT INTO novu_rust_email_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,subject,status,email_job_id,delivery_state,resend_delivery_result) VALUES ($1,'b','s','s','n','w','t','subject','error',$2,'unknown','delivered')", &[&cross,&accepted]).await.unwrap();
+            if scoped {
+                resolve(&actor, "a", accepted, "accepted").await.unwrap();
+            } else {
+                queue::reconciliation::resolve(
+                    &mut db, "a", accepted, None, "accepted", "operator", "ticket",
+                )
+                .await
+                .unwrap();
+            }
+            let row=db.query_one("SELECT j.status,j.resend_delivery_result,a.state,m.status,m.delivery_state,m.error_id,m.error_text,m.identifier,m.resend_delivery_result FROM novu_queue_jobs j JOIN novu_rust_resend_attempts a ON a.job_id=j.id JOIN novu_rust_email_messages m ON m.email_job_id=j.id AND m.environment_id=j.environment_id WHERE j.id=$1", &[&accepted]).await.unwrap();
+            assert_eq!(row.get::<_, String>(0), "completed");
+            assert!(row.get::<_, Option<String>>(1).is_none());
+            assert_eq!(row.get::<_, String>(2), "accepted");
+            assert_eq!(row.get::<_, String>(3), "sent");
+            assert_eq!(row.get::<_, String>(4), "accepted");
+            assert!(row.get::<_, Option<String>>(5).is_none());
+            assert!(row.get::<_, Option<String>>(6).is_none());
+            assert_eq!(row.get::<_, Option<String>>(7).as_deref(), provider_id);
+            assert!(row.get::<_, Option<String>>(8).is_none());
+            let untouched=db.query_one("SELECT status,delivery_state,resend_delivery_result FROM novu_rust_email_messages WHERE internal_id=$1", &[&cross]).await.unwrap();
+            assert_eq!(untouched.get::<_, String>(0), "error");
+            assert_eq!(untouched.get::<_, String>(1), "unknown");
+            assert_eq!(untouched.get::<_, String>(2), "delivered");
+        }
+    }
     // FCM target/group state is compared to the existing implementation.
     let no_function = fcm_job(
         &db,
