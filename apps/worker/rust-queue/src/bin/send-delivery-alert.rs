@@ -242,14 +242,38 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         failed_jobs_check_failed,
     };
     alert.text().map_err(|_| "invalid alert environment")?;
+    let mut observation_error = false;
+    if on_new_condition {
+        for (channel, target, enabled) in [
+            ("slack", slack_id.as_str(), slack.is_some()),
+            ("email", email_id.as_str(), email.is_some()),
+        ] {
+            if enabled
+                && alerts::observe_conditions(
+                    &db,
+                    &args[0],
+                    channel,
+                    target,
+                    alert.condition_mask(),
+                    alert.observed_condition_mask(),
+                )
+                .await
+                .is_err()
+            {
+                observation_error = true;
+                eprintln!("{channel} alert observation failed");
+            }
+        }
+    }
     if !unhealthy {
-        if configuration_error {
+        if configuration_error || observation_error {
             std::process::exit(1);
         }
         println!("{{\"status\":\"healthy\"}}");
         return Ok(());
     }
     let mut error = configuration_error
+        || observation_error
         || failed_jobs_check_failed
         || failed_checks.iter().any(|failed| *failed);
     let mut needs_review = false;

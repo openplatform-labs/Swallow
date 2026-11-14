@@ -26,6 +26,7 @@ async fn isolated_senders_fence_outcomes_and_preserve_inflight_revocation() {
         include_str!("../migrations/0073_operator_role_identity.sql"),
         include_str!("../migrations/0085_alert_condition_cooldown.sql"),
         include_str!("../migrations/0088_scoped_alert_dispatch.sql"),
+        include_str!("../migrations/0093_alert_condition_recovery.sql"),
     ] {
         admin.batch_execute(sql).await.unwrap();
     }
@@ -36,7 +37,7 @@ async fn isolated_senders_fence_outcomes_and_preserve_inflight_revocation() {
     let first = format!("alert_sender_a_{}", Uuid::new_v4().simple());
     let second = format!("alert_sender_b_{}", Uuid::new_v4().simple());
     for role in [&first, &second] {
-        admin.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_reserve_alert(text,text,text,integer,integer),public.novu_rust_finish_alert(text,text,text,uuid,text,integer) TO {role}")).await.unwrap();
+        admin.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_reserve_alert(text,text,text,integer,integer),public.novu_rust_finish_alert(text,text,text,uuid,text,integer),public.novu_rust_observe_alert_conditions(text,text,text,integer,integer) TO {role}")).await.unwrap();
     }
     let connect = |role: String| {
         let url = url.clone();
@@ -136,6 +137,22 @@ async fn isolated_senders_fence_outcomes_and_preserve_inflight_revocation() {
             .await
             .unwrap()
     );
+    assert!(
+        alerts::observe_conditions(loser, "b", "slack", "ops", 0, 3)
+            .await
+            .is_err()
+    );
+    assert!(
+        alerts::observe_conditions(loser, "a", "slack", "ops", 4, 3)
+            .await
+            .is_err()
+    );
+    alerts::observe_conditions(loser, "a", "slack", "ops", 0, 3)
+        .await
+        .unwrap();
+    let unchanged=admin.query_one("SELECT state,last_condition_mask FROM novu_rust_alert_delivery_slots WHERE environment_id='a' AND target_id='ops'",&[]).await.unwrap();
+    assert_eq!(unchanged.get::<_, String>(0), "unknown");
+    assert_eq!(unchanged.get::<_, i32>(1), 3);
     let state: String = admin
         .query_one(
             "SELECT state FROM novu_rust_alert_delivery_attempts WHERE id=$1",

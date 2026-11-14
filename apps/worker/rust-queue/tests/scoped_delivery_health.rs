@@ -60,7 +60,7 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
     .await
     .unwrap();
     let role = format!("monitor_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'scoped-fixture-password'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_delivery_health(text),public.novu_rust_queue_health(text,integer),public.novu_rust_provider_health(text,text,integer,integer),public.novu_rust_reserve_alert(text,text,text,integer,integer),public.novu_rust_finish_alert(text,text,text,uuid,text,integer),public.novu_rust_failed_queue_count(text),public.novu_rust_failed_queue_list(text,uuid),public.novu_rust_ack_failed_queue(text,uuid,text,text) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'scoped-fixture-password'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_delivery_health(text),public.novu_rust_queue_health(text,integer),public.novu_rust_provider_health(text,text,integer,integer),public.novu_rust_reserve_alert(text,text,text,integer,integer),public.novu_rust_finish_alert(text,text,text,uuid,text,integer),public.novu_rust_failed_queue_count(text),public.novu_rust_failed_queue_list(text,uuid),public.novu_rust_ack_failed_queue(text,uuid,text,text),public.novu_rust_observe_alert_conditions(text,text,text,integer,integer) TO {role}")).await.unwrap();
     let (actor, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move {
         let _ = driver.await;
@@ -325,6 +325,41 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
         failure_cli(&["check-failed-jobs", "a"]).status.code(),
         Some(0)
     );
+    db.execute("INSERT INTO novu_rust_alert_delivery_slots(environment_id,channel,target_id,state,last_started_at,last_condition_mask) VALUES ('a','slack','recovery','accepted',clock_timestamp(),$1)",&[&(1i32<<18)]).await.unwrap();
+    let recovery = Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"))
+        .args(["a", "300", "120", "60"])
+        .env("DATABASE_URL", role_url.as_str())
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
+        .env("SWALLOW_ALERT_FAILED_JOBS_ENABLED", "true")
+        .env("SWALLOW_ALERT_COOLDOWN_POLICY", "new-condition")
+        .env("SWALLOW_ALERT_SCOPED_DELIVERY", "true")
+        .env("SWALLOW_ALERT_ATTEMPTS_ENABLED", "false")
+        .env("SWALLOW_ALERT_SLACK_JOBS_ENABLED", "false")
+        .env_remove("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS")
+        .env_remove("SWALLOW_ALERT_TWILIO_GRACE_SECONDS")
+        .env_remove("SWALLOW_ALERT_TWILIO_HEARTBEAT_MAX_SECONDS")
+        .env(
+            "SWALLOW_ALERT_SLACK_WEBHOOK",
+            "https://hooks.slack.com/services/A/B/C",
+        )
+        .env("SWALLOW_ALERT_SLACK_TARGET_ID", "recovery")
+        .env_remove("SWALLOW_ALERT_EMAIL_TO")
+        .env_remove("SWALLOW_ALERT_SLACK_WEBHOOK_FILE")
+        .output()
+        .unwrap();
+    assert_eq!(
+        recovery.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&recovery.stderr)
+    );
+    assert_eq!(db.query_one("SELECT last_condition_mask FROM novu_rust_alert_delivery_slots WHERE environment_id='a' AND target_id='recovery'",&[]).await.unwrap().get::<_,i32>(0),0);
+    assert!(
+        queue::alerts::observe_conditions(&actor, "b", "slack", "recovery", 0, 1 << 18)
+            .await
+            .is_err()
+    );
     assert_eq!(failure_alert().status.code(), Some(0));
     assert_eq!(
         db.query_one("SELECT status FROM novu_queue_jobs WHERE id=$1", &[&failed])
@@ -369,6 +404,25 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
         .unwrap()
     );
     assert_eq!(failure_alert().status.code(), Some(2));
+    let reservation =
+        queue::alerts::reserve_scoped(&actor, "a", "slack", "recovery", 60, Some(1 << 18))
+            .await
+            .unwrap();
+    let id = match reservation {
+        queue::alerts::Reservation::Claimed(id) => id,
+        _ => panic!("recurring incident should bypass cooldown"),
+    };
+    assert!(
+        queue::alerts::finish_scoped(&actor, "a", "slack", "recovery", id, &Ok(()))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        queue::alerts::reserve_scoped(&actor, "a", "slack", "recovery", 60, Some(1 << 18))
+            .await
+            .unwrap(),
+        queue::alerts::Reservation::CoolingDown
+    );
     db.execute("INSERT INTO novu_queue_jobs(id,environment_id,kind,payload,status) SELECT gen_random_uuid(),'a','pagination_fixture','{}'::jsonb,'failed' FROM generate_series(1,101)",&[]).await.unwrap();
     let page = reconciliation::failed_queue_list(&actor, "a", None)
         .await

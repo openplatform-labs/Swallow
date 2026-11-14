@@ -165,6 +165,23 @@ pub async fn finish_scoped(
         .get(0))
 }
 
+/// Record which successfully observed conditions have recovered for one destination.
+pub async fn observe_conditions(
+    db: &PgClient,
+    environment: &str,
+    channel: &str,
+    target: &str,
+    active: i32,
+    known: i32,
+) -> DbResult<()> {
+    db.query_one(
+        "SELECT public.novu_rust_observe_alert_conditions($1,$2,$3,$4,$5)",
+        &[&environment, &channel, &target, &active, &known],
+    )
+    .await?;
+    Ok(())
+}
+
 /// The lease fences late responses after another process has recovered a slot.
 pub async fn finish(
     db: &mut PgClient,
@@ -329,6 +346,50 @@ impl Alert {
             mask |= 1 << 19;
         }
         mask
+    }
+    /// Bits whose current state was actually observed, excluding unavailable or disabled checks.
+    pub fn observed_condition_mask(&self) -> i32 {
+        let mut known = 0;
+        if self.resend_enabled {
+            known |= (1 << 0) | (1 << 1);
+        }
+        if self.queue.is_some() {
+            known |= (1 << 2) | (1 << 3);
+        }
+        if self.attempts.is_some() {
+            known |= (1 << 4) | (1 << 5);
+        }
+        if self.twilio.is_some() {
+            known |= (1 << 6) | (1 << 7);
+        }
+        if let Some(slack) = self.slack_attempts {
+            known |= (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11);
+            if slack.4.is_some() {
+                known |= 1 << 12;
+            }
+        }
+        for (i, enabled) in [
+            self.resend_enabled,
+            self.queue.is_some(),
+            self.attempts.is_some(),
+            self.twilio.is_some(),
+            self.slack_attempts.is_some(),
+        ]
+        .into_iter()
+        .zip(self.failed_checks)
+        .enumerate()
+        {
+            if enabled.0 || enabled.1 {
+                known |= 1 << (13 + i);
+            }
+        }
+        if self.failed_jobs.is_some() {
+            known |= 1 << 18;
+        }
+        if self.failed_jobs.is_some() || self.failed_jobs_check_failed {
+            known |= 1 << 19;
+        }
+        known
     }
     pub fn text(&self) -> Result<String, AlertError> {
         if self.environment.is_empty()
@@ -700,6 +761,20 @@ mod tests {
         assert_eq!(a.condition_mask() ^ prior, 1 << 18);
         a.failed_jobs_check_failed = true;
         assert_eq!(a.condition_mask() ^ prior, (1 << 18) | (1 << 19));
+    }
+
+    #[test]
+    fn observation_does_not_clear_disabled_or_failed_checks() {
+        let mut a = alert();
+        a.queue = Some((0, 0));
+        a.failed_checks[2] = true;
+        a.slack_attempts = Some((0, 0, 0, 0, None));
+        let mask = a.observed_condition_mask();
+        assert_ne!(mask & ((1 << 0) | (1 << 1)), 0);
+        assert_eq!(mask & ((1 << 4) | (1 << 5)), 0);
+        assert_ne!(mask & (1 << 15), 0);
+        assert_eq!(mask & (1 << 12), 0);
+        assert_eq!(a.condition_mask() & !mask, 0);
     }
 
     async fn mock_server(status: &str, body: &str) -> (Url, tokio::task::JoinHandle<String>) {
