@@ -589,4 +589,187 @@ async fn channels_are_authorized_audited_and_create_delivery_jobs() {
             .get::<_, i64>(0),
         0
     );
+    use novu_postgres_queue::sms_step_policy::Policy as SmsPolicy;
+    let twilio = novu_postgres_queue::twilio::Twilio::new(novu_postgres_queue::twilio::Config {
+        account_sid: "AC11111111111111111111111111111111".into(),
+        auth_token: "fixture".into(),
+        api_key_sid: None,
+        api_key_secret: None,
+        from: "+15550000001".into(),
+        region: novu_postgres_queue::twilio::Region::Us,
+    })
+    .unwrap();
+    assert_eq!(
+        call(
+            app.clone(),
+            "PUT",
+            sms,
+            "a-key",
+            json!({"title":null,"content":"new SMS","active":true})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert!(
+        novu_postgres_queue::twilio_queue::process_one_with_step_policy(
+            &mut setup,
+            "a",
+            &twilio,
+            SmsPolicy::Unchanged
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(setup.query_one("SELECT count(*) FROM novu_queue_jobs WHERE kind=$1 AND last_error='sms workflow step changed'", &[&novu_postgres_queue::twilio_queue::JOB_KIND]).await.unwrap().get::<_,i64>(0),1);
+    assert_eq!(
+        call(
+            app.clone(),
+            "POST",
+            "/v1/events/trigger",
+            "a-key",
+            json!({"name":"workflow","to":"alice","transactionId":"sms-policy-2","payload":{}})
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    assert!(
+        novu_postgres_queue::in_app::process_one(&mut setup)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        call(
+            app.clone(),
+            "PUT",
+            sms,
+            "a-key",
+            json!({"title":null,"content":"new SMS","active":false})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert!(
+        novu_postgres_queue::twilio_queue::process_one_with_step_policy(
+            &mut setup,
+            "a",
+            &twilio,
+            SmsPolicy::Active
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(setup.query_one("SELECT count(*) FROM novu_queue_jobs WHERE kind=$1 AND last_error='sms workflow step disabled'", &[&novu_postgres_queue::twilio_queue::JOB_KIND]).await.unwrap().get::<_,i64>(0),1);
+    assert_eq!(
+        call(
+            app.clone(),
+            "PUT",
+            sms,
+            "a-key",
+            json!({"title":null,"content":"new SMS","active":true})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(
+            app.clone(),
+            "POST",
+            "/v1/events/trigger",
+            "a-key",
+            json!({"name":"workflow","to":"alice","transactionId":"sms-policy-3","payload":{}})
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    assert!(
+        novu_postgres_queue::in_app::process_one(&mut setup)
+            .await
+            .unwrap()
+    );
+    let tx = setup.transaction().await.unwrap();
+    tx.execute("UPDATE novu_rust_workflows SET sms_step_active=false WHERE environment_id='a' AND identifier='workflow'",&[]).await.unwrap();
+    let (mut other, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    let waiting = tokio::spawn(async move {
+        novu_postgres_queue::twilio_queue::process_one_with_step_policy(
+            &mut other,
+            "a",
+            &twilio,
+            SmsPolicy::Active,
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !waiting.is_finished(),
+        "worker must wait for workflow update"
+    );
+    tx.commit().await.unwrap();
+    assert!(waiting.await.unwrap().unwrap());
+    assert_eq!(setup.query_one("SELECT count(*) FROM novu_queue_jobs WHERE kind=$1 AND last_error='sms workflow step disabled'", &[&novu_postgres_queue::twilio_queue::JOB_KIND]).await.unwrap().get::<_,i64>(0),2);
+    assert_eq!(
+        call(
+            app.clone(),
+            "PUT",
+            sms,
+            "a-key",
+            json!({"title":null,"content":"new SMS","active":true})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(
+            app.clone(),
+            "POST",
+            "/v1/events/trigger",
+            "a-key",
+            json!({"name":"workflow","to":"alice","transactionId":"sms-policy-4","payload":{}})
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    assert!(
+        novu_postgres_queue::in_app::process_one(&mut setup)
+            .await
+            .unwrap()
+    );
+    setup.execute("UPDATE novu_queue_jobs SET payload=payload #- '{workflow_context,workflow_internal_id}' WHERE environment_id='a' AND kind=$1 AND status='pending'", &[&novu_postgres_queue::twilio_queue::JOB_KIND]).await.unwrap();
+    let twilio = novu_postgres_queue::twilio::Twilio::new(novu_postgres_queue::twilio::Config {
+        account_sid: "AC11111111111111111111111111111111".into(),
+        auth_token: "fixture".into(),
+        api_key_sid: None,
+        api_key_secret: None,
+        from: "+15550000001".into(),
+        region: novu_postgres_queue::twilio::Region::Us,
+    })
+    .unwrap();
+    assert!(
+        novu_postgres_queue::twilio_queue::process_one_with_step_policy(
+            &mut setup,
+            "a",
+            &twilio,
+            SmsPolicy::Active
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(setup.query_one("SELECT count(*) FROM novu_queue_jobs WHERE kind=$1 AND last_error='sms workflow identity missing'", &[&novu_postgres_queue::twilio_queue::JOB_KIND]).await.unwrap().get::<_,i64>(0),1);
+    assert_eq!(
+        setup
+            .query_one("SELECT count(*) FROM novu_rust_twilio_attempts", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
 }

@@ -82,6 +82,11 @@ async fn workers_reconnect_and_preserve_uncertain_attempts() {
     let container = std::env::var("TEST_PG_CONTAINER").unwrap();
     let mut db = connect(&url).await;
     db.batch_execute("CREATE TABLE novu_rust_environments(id text PRIMARY KEY,organization_id text NOT NULL); INSERT INTO novu_rust_environments VALUES ('env','org')").await.unwrap();
+    db.batch_execute(include_str!(
+        "../migrations/0121_sms_workflow_worker_policy.sql"
+    ))
+    .await
+    .unwrap();
     db.batch_execute(queue::MIGRATION).await.unwrap();
     db.batch_execute(queue::twilio_queue::MIGRATION)
         .await

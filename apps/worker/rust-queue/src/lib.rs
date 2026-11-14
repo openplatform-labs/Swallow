@@ -17,6 +17,7 @@ pub mod slack_queue;
 pub mod slack_webhook;
 pub mod slack_webhook_queue;
 pub mod slack_workflow;
+pub mod sms_step_policy;
 pub mod twilio;
 pub mod twilio_projection;
 pub mod twilio_queue;

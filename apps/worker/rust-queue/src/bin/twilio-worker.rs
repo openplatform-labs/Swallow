@@ -11,6 +11,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if environment.is_empty() {
         return Err("NOVU_TWILIO_ENVIRONMENT_ID must not be empty".into());
     }
+    let step_policy = novu_postgres_queue::sms_step_policy::Policy::from_env()?;
     let region = match std::env::var("NOVU_TWILIO_REGION").as_deref() {
         Ok("us") | Err(std::env::VarError::NotPresent) => Region::Us,
         Ok("eu") => Region::Eu,
@@ -63,6 +64,25 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             );
             let mut recovery = tokio::time::Instant::now();
             if configured {
+                match tokio::time::timeout(
+                    timeout,
+                    novu_postgres_queue::sms_step_policy::register(&db, &environment, step_policy),
+                )
+                .await
+                {
+                    Ok(Ok(true)) => {}
+                    Ok(Ok(false)) => {
+                        task.abort();
+                        return Err("SMS workers have different workflow step policies".into());
+                    }
+                    _ => {
+                        task.abort();
+                        let _ = task.await;
+                        eprintln!("SMS workflow policy registration failed; reconnecting");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                }
                 loop {
                     if tokio::time::Instant::now() >= recovery {
                         if !matches!(
@@ -79,7 +99,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     }
                     match tokio::time::timeout(
                         timeout,
-                        twilio_queue::process_one(&mut db, &environment, &provider),
+                        twilio_queue::process_one_with_step_policy(
+                            &mut db,
+                            &environment,
+                            &provider,
+                            step_policy,
+                        ),
                     )
                     .await
                     {

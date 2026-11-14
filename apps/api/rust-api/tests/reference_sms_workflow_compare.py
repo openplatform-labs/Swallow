@@ -66,6 +66,7 @@ for index,(label,recipient,payload,override,expected) in enumerate(cases):
     with tempfile.TemporaryDirectory(prefix='novu-sms-compare-') as directory:
         capture=Path(directory)/'capture.json'
         env=dict(os.environ,TEST_SMS_CAPTURE_PATH=str(capture))
+        if label=='subscriber': env['TEST_SMS_STEP_POLICY']='unchanged'
         if expected is None: env['TEST_SMS_ALLOW_NO_REQUEST']='1'
         if label=='rejected': env['TEST_SMS_HTTP_STATUS']='429'
         subprocess.run(['cargo','test','--locked','--offline','--lib','capture_reference_workflow_sms','--','--ignored'],cwd=Path(__file__).resolve().parents[3]/'worker'/'rust-queue',env=env,check=True)

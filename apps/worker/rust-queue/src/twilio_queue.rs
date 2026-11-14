@@ -69,6 +69,21 @@ pub async fn process_one(
     environment: &str,
     provider: &Twilio,
 ) -> Result<bool, Error> {
+    process_one_with_step_policy(
+        client,
+        environment,
+        provider,
+        crate::sms_step_policy::Policy::Snapshot,
+    )
+    .await
+}
+
+pub async fn process_one_with_step_policy(
+    client: &mut Client,
+    environment: &str,
+    provider: &Twilio,
+    policy: crate::sms_step_policy::Policy,
+) -> Result<bool, Error> {
     let Some(job) = claim(client, environment).await? else {
         return Ok(false);
     };
@@ -101,6 +116,17 @@ pub async fn process_one(
             }
             tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='sms retry blocked by provider callback',lease_token=NULL,lease_until=NULL WHERE id=$1 AND environment_id=$2", &[&job.id,&environment]).await?;
             tx.commit().await?;
+            return Ok(true);
+        }
+    }
+    match crate::sms_step_policy::check(&tx, environment, &job, &sms, policy).await? {
+        crate::sms_step_policy::Check::Continue => {}
+        crate::sms_step_policy::Check::Cancelled => {
+            tx.commit().await?;
+            return Ok(true);
+        }
+        crate::sms_step_policy::Check::LeaseLost => {
+            tx.rollback().await?;
             return Ok(true);
         }
     }
@@ -216,6 +242,10 @@ pub async fn process_one(
         sms.to = phone.to_owned();
         sms.content = option("content").unwrap_or(&content).to_owned();
         sms.from = option("from").map(str::to_owned);
+    }
+    if policy != crate::sms_step_policy::Policy::Snapshot && !lock_live(&tx, &job).await? {
+        tx.rollback().await?;
+        return Ok(true);
     }
     let dispatch = Uuid::new_v4();
     let inserted = tx.execute("INSERT INTO novu_rust_twilio_attempts(job_id,environment_id,state,dispatch_id) VALUES ($1,$2,'dispatching',$3) ON CONFLICT(job_id) DO NOTHING", &[&job.id,&job.environment_id,&dispatch]).await?;
@@ -472,11 +502,23 @@ mod tests {
             &origin,
         )
         .unwrap();
-        assert!(
-            process_one(&mut db, "64a000000000000000000002", &provider)
+        let policy = match std::env::var("TEST_SMS_STEP_POLICY").as_deref() {
+            Ok("unchanged") => crate::sms_step_policy::Policy::Unchanged,
+            Ok("active") => crate::sms_step_policy::Policy::Active,
+            _ => crate::sms_step_policy::Policy::Snapshot,
+        };
+        let processed =
+            process_one_with_step_policy(&mut db, "64a000000000000000000002", &provider, policy)
                 .await
-                .unwrap()
-        );
+                .unwrap();
+        if !processed {
+            let rows = db.query("SELECT kind,status,count(*) FROM novu_queue_jobs GROUP BY kind,status ORDER BY kind,status", &[]).await.unwrap();
+            let states: Vec<(String, String, i64)> = rows
+                .iter()
+                .map(|r| (r.get(0), r.get(1), r.get(2)))
+                .collect();
+            panic!("no claimable SMS job; queue states: {states:?}");
+        }
         server.await.unwrap();
     }
 

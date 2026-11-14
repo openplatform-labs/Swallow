@@ -24,6 +24,12 @@ async fn twilio_worker_accepts_files_and_rejects_conflicts() {
     db.batch_execute(novu_postgres_queue::MIGRATION)
         .await
         .unwrap();
+    db.batch_execute("CREATE TABLE novu_rust_environments(id text PRIMARY KEY); INSERT INTO novu_rust_environments VALUES ('env')").await.unwrap();
+    db.batch_execute(include_str!(
+        "../migrations/0121_sms_workflow_worker_policy.sql"
+    ))
+    .await
+    .unwrap();
     let path =
         std::env::temp_dir().join(format!("swallow-twilio-fixture-{}", uuid::Uuid::new_v4()));
     let fixture = Fixture(path);
@@ -45,6 +51,7 @@ async fn twilio_worker_accepts_files_and_rejects_conflicts() {
             .env_remove("NOVU_TWILIO_API_KEY_SECRET_FILE")
             .env_remove("NOVU_TWILIO_STATUS_CALLBACK_BASE_URL")
             .env_remove("NOVU_TWILIO_REGION")
+            .env_remove("SWALLOW_SMS_WORKFLOW_STEP_POLICY")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         c
