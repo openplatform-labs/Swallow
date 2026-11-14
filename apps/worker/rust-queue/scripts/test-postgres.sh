@@ -60,6 +60,10 @@ docker exec "$name" createdb -U postgres novu_fcm_secret_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_fcm_secret_test" \
   cargo test --locked --test fcm_secret_files -- --ignored
 
+docker exec "$name" createdb -U postgres novu_fcm_routing_guard_test
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_fcm_routing_guard_test" \
+  cargo test --locked --test fcm_routing_guard -- --ignored
+
 docker exec "$name" createdb -U postgres novu_alert_delivery_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_alert_delivery_test" \
   cargo test --locked --test alerts_postgres -- --ignored

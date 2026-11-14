@@ -1,7 +1,7 @@
 //! Experimental environment-scoped FCM worker; not a full Novu worker.
 use novu_postgres_queue::{fcm::Fcm, fcm_queue};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     error::Error,
     fs::File,
     io::{self, Read},
@@ -113,6 +113,40 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if shared_provider && integrations.is_some() {
         return Err("shared FCM provider cannot be combined with an integration map".into());
     }
+    let enforce_routing = match std::env::var("SWALLOW_FCM_ENFORCE_ROUTING_CONFIG").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid FCM routing guard setting".into()),
+    };
+    let routing_hash = if enforce_routing {
+        let (mode, projects) = if let Some(integrations) = &integrations {
+            (
+                "mapped",
+                integrations
+                    .iter()
+                    .map(|(id, fcm)| (id.clone(), fcm.project_id().to_owned()))
+                    .collect::<BTreeMap<_, _>>(),
+            )
+        } else {
+            (
+                if shared_provider { "shared" } else { "single" },
+                BTreeMap::from([(
+                    String::new(),
+                    provider.as_ref().unwrap().project_id().to_owned(),
+                )]),
+            )
+        };
+        let value = serde_json::to_vec(&serde_json::json!({"mode":mode,"projects":projects}))?;
+        Some(
+            ring::digest::digest(&ring::digest::SHA256, &value)
+                .as_ref()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+        )
+    } else {
+        None
+    };
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let timeout = match std::env::var("NOVU_FCM_DB_TIMEOUT_SECONDS") {
         Ok(value) => value
@@ -140,6 +174,36 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 .await,
                 Ok(Ok(_))
             );
+            if configured && let Some(hash) = &routing_hash {
+                match tokio::time::timeout(
+                    timeout,
+                    db.query_one(
+                        "SELECT public.novu_rust_claim_fcm_routing($1,$2)",
+                        &[&environment, hash],
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(row)) if row.get::<_, bool>(0) => {}
+                    Ok(Ok(_)) => {
+                        task.abort();
+                        let _ = task.await;
+                        return Err("FCM workers have different routing configurations".into());
+                    }
+                    Ok(Err(error)) if error.as_db_error().is_some() => {
+                        task.abort();
+                        let _ = task.await;
+                        return Err("FCM routing guard rejected database configuration".into());
+                    }
+                    _ => {
+                        task.abort();
+                        let _ = task.await;
+                        eprintln!("FCM routing guard connection failed; reconnecting");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                }
+            }
             let mut recovery = tokio::time::Instant::now();
             if configured {
                 loop {

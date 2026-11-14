@@ -61,6 +61,7 @@ async fn worker_supports_token_pem_and_integration_files() {
             .env_remove("NOVU_FCM_PRIVATE_KEY")
             .env_remove("NOVU_FCM_PRIVATE_KEY_FILE")
             .env_remove("SWALLOW_FCM_ALLOW_SHARED_PROVIDER")
+            .env_remove("SWALLOW_FCM_ENFORCE_ROUTING_CONFIG")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         c
@@ -103,6 +104,12 @@ async fn worker_supports_token_pem_and_integration_files() {
             .unwrap();
         assert!(!result.status.success());
     }
+    let result = command()
+        .env("NOVU_FCM_ACCESS_TOKEN_FILE", &token)
+        .env("SWALLOW_FCM_ENFORCE_ROUTING_CONFIG", "invalid")
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
     let result = command()
         .env("NOVU_FCM_INTEGRATIONS_FILE", &integrations)
         .env("SWALLOW_FCM_ALLOW_SHARED_PROVIDER", "true")

@@ -146,6 +146,25 @@ FCM 워커는 기본적으로 여러 통합에 각각의 자격증명을 지정�
 
 여러 통합으로 준비된 작업을 공유 모드가 아닌 단일 공급자 워커가 이어받으면 새 발송 전에 작업을 실패 처리한다. 이미 수락된 대상이 있을 수 있으므로 전체 작업 실패가 미발송을 뜻하지 않는다. 이 검사는 저장된 대상별 통합 ID가 있는 작업에 적용되며, 이전 형식의 메타데이터가 없는 작업이나 여러 워커에 서로 다른 통합별 자격증명이 설정된 경우까지 식별하지 못한다. 동일 환경의 워커에 일관된 설정을 배포하고 설정 변경 시 대기·진행 작업을 확인해야 한다. 실제 FCM 서비스 발송, 모든 재시작·부분 성공 조합과 자동 설정 동기화는 미검증 또는 미구현이다.
 
+### 선택적 FCM 워커 라우팅 일치 검사
+
+워커 마이그레이션 0095를 적용하고 `SWALLOW_FCM_ENFORCE_ROUTING_CONFIG=true`로 시작하면 각 환경에서 참여 워커의 모드(single·shared·mapped)와 통합 ID별 FCM project ID가 일치해야 큐를 소비한다. 기본값 false는 기존 동작이며 true·false 이외는 거절한다. 통합 맵은 키 순서에 관계없이 정규화해 SHA-256을 저장한다. 토큰·비밀키·서비스 계정은 해시에 포함하지 않으므로 자격증명 교체는 가능하지만 유효성, 동일 계정 여부나 키 불일치는 확인하지 못한다. 프로젝트 이름 등은 유추 가능한 해시일 수 있으므로 DB 접근을 제한한다.
+
+DB 관리자는 `novu_rust_fcm_routing_workers`에 환경, 워커 DB 로그인명과 현재 로그인 역할 OID를 등록하고 해당 역할에 `GRANT EXECUTE ON FUNCTION public.novu_rust_claim_fcm_routing(text,text) TO "WORKER_LOGIN"`을 부여한다. 이 테이블과 라우팅 설정·감사 테이블의 직접 변경 권한은 일반 워커에 주지 않는다. 신뢰된 소유자로 함수를 설치하고 public 스키마를 보호한다. 역할 이름 재사용은 OID 불일치로 거절되며 DB 복원이나 역할 재생성 시 재등록이 필요하다. 실행 권한이나 등록이 없으면 검사 모드 워커는 기동에 실패한다. 검사를 끈 워커나 구버전은 참여하지 않으므로 먼저 모두 교체·중지한 후 사용해야 한다.
+
+예를 들어 신뢰된 관리자가 다음과 같이 워커 로그인을 등록한다. 관리자 DB 계정은 기존 운영자 권한 위임 절차에 따라 `novu_rust_operator_grant_admins`에 별도로 등록한다.
+
+```sql
+INSERT INTO public.novu_rust_fcm_routing_workers(environment_id,database_principal,principal_oid)
+SELECT 'ENV', rolname, oid FROM pg_catalog.pg_roles
+WHERE rolname = 'WORKER_LOGIN' AND rolcanlogin;
+GRANT EXECUTE ON FUNCTION public.novu_rust_claim_fcm_routing(text,text) TO "WORKER_LOGIN";
+```
+
+일치하는 참여 워커는 DB 연결 동안 환경별 공유 advisory 잠금을 보유하고 재접속 시 다시 등록한다. 설정을 변경하려면 참여 워커를 모두 중지한 뒤, 해당 환경의 기존 `novu_rust_operator_grant_admins`에 등록된 관리자 DB 로그인에 `GRANT EXECUTE ON FUNCTION public.novu_rust_reset_fcm_routing(text,text)`를 부여하고 `SELECT public.novu_rust_reset_fcm_routing('ENV','변경 사유')`를 실행한다. 워커 잠금이 남아 있거나 등록된 설정이 없으면 false다. 성공 시 이전 해시·관리자 DB 로그인과 OID·사유를 감사에 남긴다. 사유에는 비밀을 넣지 않는다. DB 소유자·슈퍼유저의 직접 변경이나 비참여 워커, 이미 전송 중인 외부 요청은 막지 못한다. 워커 권한 회수는 이미 연결된 세션을 즉시 중단하지 않으므로 별도 세션 종료가 필요하다. 해시·advisory 잠금 키 충돌, DB 장애 감지 전 지연, 대규모 HA 부하, 실제 FCM 발송은 미검증이다.
+
+Docker PostgreSQL에서 같은 맵의 순서·토큰 차이 허용, 프로젝트·모드 차이 거절, 환경별 권한, 워커가 남아 있을 때 초기화 거절과 종료 후 감사된 초기화를 검사했다. DB를 재시작한 뒤 두 워커가 재연결하고 공유 잠금을 다시 확보하는지 확인했다. 원본 Novu와는 기존 다중 FCM 발송의 모의 비교를 재실행했으며 이 보호 기능 자체는 원본 기능과의 호환 비교가 아니다.
+
 ## FCM 통합 메타데이터 관리
 
 `POST /v1/experimental/fcm-integrations`는 `{"identifier":"main","active":false}`로 비밀이 없는 FCM 통합을 생성한다. active 기본값은 false이며, 응답의 `internalId`는 워커의 다중 통합 시크릿 맵 키다. `GET` 목록은 내부 ID 오름차순으로 최대 100건씩 `next` 커서로 조회하며 페이지 간 스냅샷은 제공하지 않는다. `GET /v1/experimental/fcm-integrations/{identifier}`와 `PATCH`의 `{"active":true}` 또는 `false`로 단건 조회·활성 상태를 변경한다. identifier는 영문·숫자·`-_.`의 1~128자이며 `.`과 `..`은 허용하지 않고 환경 내에서 고유하다. 시크릿·이름·규칙·provider 변경과 삭제는 이 API가 지원하지 않는다. 기존 identifier가 null인 레거시 행은 목록에 보이지만 이 경로로 단건 변경할 수 없다.

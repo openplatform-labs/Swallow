@@ -410,8 +410,12 @@ pub struct Fcm {
     http: Client,
     endpoint: String,
     auth: Auth,
+    project_id: String,
 }
 impl Fcm {
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
     pub fn new(project_id: &str, access_token: String) -> Result<Self, SendError> {
         Self::with_origin(project_id, access_token, "https://fcm.googleapis.com")
     }
@@ -453,6 +457,7 @@ impl Fcm {
             http,
             endpoint: format!("{origin}/v1/projects/{project_id}/messages:send"),
             auth: Auth::Bearer(access_token),
+            project_id: project_id.to_owned(),
         })
     }
     /// One request per target, each attempted once. Failures may be ambiguous.

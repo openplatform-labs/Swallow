@@ -38,6 +38,8 @@ fn worker(url: &str, application: &str) -> Worker {
             .env("NOVU_FCM_ENVIRONMENT_ID", "env")
             .env("NOVU_FCM_PROJECT_ID", "fixture")
             .env("NOVU_FCM_ACCESS_TOKEN", "fixture-token")
+            .env("SWALLOW_FCM_ENFORCE_ROUTING_CONFIG", "true")
+            .env_remove("SWALLOW_FCM_ALLOW_SHARED_PROVIDER")
             .env_remove("NOVU_FCM_ACCESS_TOKEN_FILE")
             .env_remove("NOVU_FCM_INTEGRATIONS")
             .env_remove("NOVU_FCM_INTEGRATIONS_FILE")
@@ -78,6 +80,9 @@ async fn workers_reconnect_and_preserve_uncertain_attempts() {
     let container = std::env::var("TEST_PG_CONTAINER").unwrap();
     let mut db = connect(&url).await;
     db.batch_execute("CREATE TABLE novu_rust_environments(id text PRIMARY KEY,organization_id text NOT NULL); INSERT INTO novu_rust_environments VALUES ('env','org')").await.unwrap();
+    db.batch_execute("CREATE TABLE novu_rust_operator_grant_admins(environment_id text,database_principal text,principal_oid oid)").await.unwrap();
+    db.batch_execute(include_str!("../migrations/0095_fcm_routing_guard.sql")).await.unwrap();
+    db.batch_execute("INSERT INTO novu_rust_fcm_routing_workers SELECT 'env',rolname,oid FROM pg_roles WHERE rolname=session_user").await.unwrap();
     db.batch_execute(queue::MIGRATION).await.unwrap();
     db.batch_execute(queue::fcm_queue::MIGRATION).await.unwrap();
     db.batch_execute(queue::in_app::PUSH_MESSAGES_MIGRATION)
@@ -151,8 +156,8 @@ async fn workers_reconnect_and_preserve_uncertain_attempts() {
     transaction.commit().await.unwrap();
     let mut recovered = false;
     for _ in 0..200 {
-        let row = db.query_one("SELECT (SELECT status='failed' FROM novu_queue_jobs WHERE id=$1),(SELECT count(*)=2 AND count(*) FILTER (WHERE state='unknown')=1 AND count(*) FILTER (WHERE state='accepted')=1 FROM novu_rust_fcm_attempts WHERE job_id=$1),(SELECT status='failed' FROM novu_queue_jobs WHERE id=$2),(SELECT count(*)=2 FROM pg_stat_activity WHERE application_name IN ('fcm_delivery_ha_1','fcm_delivery_ha_2'))", &[&uncertain,&invalid]).await.unwrap();
-        recovered = (0..4).all(|i| row.get::<_, Option<bool>>(i) == Some(true));
+        let row = db.query_one("SELECT (SELECT status='failed' FROM novu_queue_jobs WHERE id=$1),(SELECT count(*)=2 AND count(*) FILTER (WHERE state='unknown')=1 AND count(*) FILTER (WHERE state='accepted')=1 FROM novu_rust_fcm_attempts WHERE job_id=$1),(SELECT status='failed' FROM novu_queue_jobs WHERE id=$2),(SELECT count(*)=2 FROM pg_stat_activity WHERE application_name IN ('fcm_delivery_ha_1','fcm_delivery_ha_2')),(SELECT count(*)=2 FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE a.application_name IN ('fcm_delivery_ha_1','fcm_delivery_ha_2') AND l.locktype='advisory' AND l.mode='ShareLock' AND l.granted)", &[&uncertain,&invalid]).await.unwrap();
+        recovered = (0..5).all(|i| row.get::<_, Option<bool>>(i) == Some(true));
         if recovered {
             break;
         }
