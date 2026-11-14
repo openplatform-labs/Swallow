@@ -64,8 +64,9 @@ fn read_secret(_path: &str) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: console-credential issue ENV SECONDS NEW_FILE REASON | issue-scoped ENV SECONDS NEW_FILE subscriber|none REASON | issue-permissions ENV SECONDS NEW_FILE none|subscriber|alert|both REASON | rotate ENV OLD_ID SECONDS NEW_FILE REASON | rotate-overlap ENV OLD_ID SECONDS GRACE_SECONDS NEW_FILE REASON | rotation-audit ENV [AFTER_ID] | rotation-audit-v2 ENV [AFTER_ID] | decision-access ENV CREDENTIAL_ID retry|accepted grant|revoke REASON | decision-access-list ENV [AFTER_ID] | decision-audit ENV grant|resolution [AFTER_ID] | subscriber-access ENV CREDENTIAL_ID grant|revoke REASON | subscriber-access-list ENV [AFTER_ID] | subscriber-access-audit ENV [AFTER_ID] | inspect ENV TOKEN_FILE | revoke ENV CREDENTIAL_ID REASON | list ENV [AFTER_ID] | audit ENV [AFTER_ID] | alert-access ENV CREDENTIAL_ID grant|revoke REASON | alert-access-list ENV [AFTER_ID] | alert-access-audit ENV [AFTER_ID]";
-    let valid = matches!(args.as_slice(),[action,_,_,_,_,_,_] if action=="rotate-overlap")
+    let usage = "usage: console-credential rotate-scoped ENV OLD_ID SECONDS GRACE_SECONDS NEW_FILE none|copy|retry|accepted|both REASON | issue ENV SECONDS NEW_FILE REASON | issue-scoped ENV SECONDS NEW_FILE subscriber|none REASON | issue-permissions ENV SECONDS NEW_FILE none|subscriber|alert|both REASON | rotate ENV OLD_ID SECONDS NEW_FILE REASON | rotate-overlap ENV OLD_ID SECONDS GRACE_SECONDS NEW_FILE REASON | rotation-audit ENV [AFTER_ID] | rotation-audit-v2 ENV [AFTER_ID] | decision-access ENV CREDENTIAL_ID retry|accepted grant|revoke REASON | decision-access-list ENV [AFTER_ID] | decision-audit ENV grant|resolution [AFTER_ID] | subscriber-access ENV CREDENTIAL_ID grant|revoke REASON | subscriber-access-list ENV [AFTER_ID] | subscriber-access-audit ENV [AFTER_ID] | inspect ENV TOKEN_FILE | revoke ENV CREDENTIAL_ID REASON | list ENV [AFTER_ID] | audit ENV [AFTER_ID] | alert-access ENV CREDENTIAL_ID grant|revoke REASON | alert-access-list ENV [AFTER_ID] | alert-access-audit ENV [AFTER_ID]";
+    let valid = matches!(args.as_slice(),[action,_,_,_,_,_,_,_] if action=="rotate-scoped")
+        || matches!(args.as_slice(),[action,_,_,_,_,_,_] if action=="rotate-overlap")
         || matches!(args.as_slice(),[action,_,_,_,_,_] if action=="issue-scoped" || action=="issue-permissions" || action=="rotate" || action=="decision-access")
         || matches!(args.as_slice(),[action,_,_,_,_] if action=="issue" || action=="alert-access" || action=="subscriber-access")
         || matches!(args.as_slice(),[action,_,_,_] if action=="revoke")
@@ -85,6 +86,36 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let _ = connection.await;
     });
     match args[0].as_str() {
+        "rotate-scoped" => {
+            let old = Uuid::parse_str(&args[2])?;
+            let seconds: i64 = args[3].parse()?;
+            let grace: i32 = args[4].parse()?;
+            if !(1..=2_592_000).contains(&seconds)
+                || !(0..=86400).contains(&grace)
+                || !["none", "copy", "retry", "accepted", "both"].contains(&args[6].as_str())
+            {
+                return Err("invalid lifetime, overlap or decision scope".into());
+            }
+            let mut random = [0u8; 32];
+            SystemRandom::new()
+                .fill(&mut random)
+                .map_err(|_| "secure randomness unavailable")?;
+            let token = random
+                .iter()
+                .map(|v| format!("{v:02x}"))
+                .collect::<String>();
+            write_secret(&args[5], token.as_bytes())
+                .map_err(|_| "token file creation failed; inspect the destination safely")?;
+            let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+            let result = tokio::time::timeout(std::time::Duration::from_secs(30), db.query_one(
+                "SELECT * FROM public.novu_rust_rotate_console_credential_scoped($1,$2,$3,clock_timestamp()+($4::bigint * interval '1 second'),$5,$6,$7)",
+                &[&args[1],&old,&hash,&seconds,&grace,&args[6],&args[7]],
+            )).await;
+            match result {
+                Ok(Ok(row)) => println!("{}", json!({"credentialId":row.get::<_,Uuid>(0).to_string(),"tokenFileCreated":true,"oldValidUntil":row.get::<_,Option<String>>(1)})),
+                _ => return Err("rotation result unavailable; token file retained; reconcile old and new credentials, grants and rotation audit before retrying".into()),
+            }
+        }
         "decision-access" => {
             let id = Uuid::parse_str(&args[2])?;
             if !["retry", "accepted"].contains(&args[3].as_str())
