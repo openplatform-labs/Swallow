@@ -76,6 +76,18 @@ fn original_firebase_http_conversion() {
             multicast: false,
             message: json!({"token":"sticky-b","android":{"notification":{"sticky":false}}}),
         },
+        Plan {
+            multicast: false,
+            message: json!({"token":"event-a","android":{"notification":{"eventTime":"2026-11-14T12:34:56.123Z"}}}),
+        },
+        Plan {
+            multicast: false,
+            message: json!({"token":"event-b","android":{"notification":{"eventTime":"2026-11-14T21:34:56.999987+09:00"}}}),
+        },
+        Plan {
+            multicast: false,
+            message: json!({"token":"event-c","android":{"notification":{"eventTime":"1969-12-31T23:59:59Z"}}}),
+        },
     ];
     for (index, plan) in plans.iter().enumerate() {
         assert_eq!(wire_messages(plan).unwrap(), vec![original[index].clone()]);

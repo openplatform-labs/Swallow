@@ -574,6 +574,24 @@ fn android_notification(value: &Value) -> Result<Value, SendError> {
                 }
                 ("image", value.clone())
             }
+            "eventTime" => {
+                use chrono::{Datelike, Timelike};
+                let text = value
+                    .as_str()
+                    .filter(|s| s.len() <= 64)
+                    .ok_or(SendError::UnsupportedMessage)?;
+                let parsed = chrono::DateTime::parse_from_rfc3339(text)
+                    .map_err(|_| SendError::UnsupportedMessage)?;
+                let utc = parsed.with_timezone(&chrono::Utc);
+                // FCM Timestamp's supported range excludes year zero and leap seconds.
+                if !(1..=9999).contains(&utc.year()) || utc.nanosecond() >= 1_000_000_000 {
+                    return Err(SendError::UnsupportedMessage);
+                }
+                (
+                    "event_time",
+                    Value::String(utc.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+                )
+            }
             "sticky"
             | "localOnly"
             | "defaultVibrateTimings"
@@ -1071,7 +1089,7 @@ mod tests {
                     serde_json::from_str(raw.split_once("\r\n\r\n").unwrap().1).unwrap();
                 assert_eq!(
                     body,
-                    json!({"message":{"token":format!("token{index}"),"notification":{"title":"Hi","body":"Hello"},"data":{}}})
+                    json!({"message":{"token":format!("token{index}"),"notification":{"title":"Hi","body":"Hello"},"data":{},"android":{"notification":{"event_time":"2026-11-14T12:34:56.999Z"}}}})
                 );
                 let response = r#"{"name":"projects/demo-project/messages/123"}"#;
                 socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).as_bytes()).await.unwrap();
@@ -1083,6 +1101,7 @@ mod tests {
                 title: "Hi".into(),
                 content: "Hello".into(),
                 targets: vec!["token0".into(), "token1".into()],
+                overrides:json!({"android":{"notification":{"eventTime":"2026-11-14T21:34:56.999987+09:00"}}}).as_object().unwrap().clone(),
                 ..Push::default()
             }))
             .await
@@ -1167,6 +1186,39 @@ mod tests {
         oauth_server.await.unwrap();
         server.await.unwrap();
     }
+    #[test]
+    fn android_event_time_normalizes_offsets_and_rejects_invalid_timestamp() {
+        let make = |value: Value| Plan {
+            multicast: false,
+            message: json!({"token":"a","android":{"notification":{"eventTime":value}}}),
+        };
+        let output = wire_messages(&make(json!("2026-11-14T21:34:56.999987+09:00"))).unwrap();
+        assert_eq!(
+            output[0]["message"]["android"]["notification"]["event_time"],
+            "2026-11-14T12:34:56.999Z"
+        );
+        for invalid in [
+            json!(null),
+            json!(123),
+            json!("not-a-date"),
+            json!("0000-01-01T00:00:00Z"),
+            json!("2016-12-31T23:59:60Z"),
+            json!("0001-01-01T00:00:00+01:00"),
+        ] {
+            assert_eq!(
+                wire_messages(&make(invalid)),
+                Err(SendError::UnsupportedMessage)
+            );
+        }
+        assert_eq!(
+            wire_messages(&Plan {
+                multicast: false,
+                message: json!({"token":"a","android":{"notification":{"eventTimestamp":"2026-11-14T12:34:56.123Z"}}})
+            }),
+            Err(SendError::UnsupportedMessage)
+        );
+    }
+
     #[test]
     fn platform_config_is_bounded_and_shared_across_multicast_targets() {
         let plan = Plan {

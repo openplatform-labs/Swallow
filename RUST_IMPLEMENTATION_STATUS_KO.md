@@ -9,6 +9,12 @@ PostgreSQL 큐에 남는 워크플로 첨부파일에 대해 운영자가 환경
 > 기준: 원본 Novu 커밋 `895388f37efe9e06de0aa333e5727303e6ad6853` · 작성: 2026-11-12.
 > **현재 구현은 실험용이며 Novu와 100% 호환되지 않는다. 운영에 사용하거나 기존 Novu의 대체품으로 배포하지 않는다.**
 
+### FCM Android 알림 이벤트 시각
+
+Swallow 확장 `overrides.fcm.android.notification.eventTime`으로 RFC 3339 문자열을 선택하면 UTC 밀리초 정밀도의 FCM `event_time`으로 변환한다. 허용 범위와 예시는 [워커 README](apps/worker/rust-queue/README.md)를 참고한다. 원본 Firebase Admin Node SDK의 `eventTimestamp`는 JavaScript `Date` 객체를 요구하며 JSON 문자열을 거절하므로, 동일 입력 계약이라고 주장하지 않는다. 기존 JSON `eventTimestamp` 거절은 유지한다.
+
+고정 원본 SDK의 세 `Date` 입력과 동등한 Swallow 확장의 전송 본문, 잘못된 입력, UTC 오프셋과 밀리초 절삭, 로컬 모의 FCM 요청을 검증했다. 실제 FCM·기기 수신 및 원본 서버의 전체 워크플로 비교는 미검증이다.
+
 ### 보관한 권한 변경 요청 조회
 
 설정 화면에서 보관한 요청 ID를 입력해 화면 재시작 후에도 동일 JWT 주체의 유효한 새 토큰으로 커밋된 변경 요청을 조회한다. 결과에 이전·변경 권한, 대상과 사유가 표시되며 원본 요청과 대조해야 한다. 해당 조회는 변경을 재실행하지 않고 미조회 결과는 실패의 증거가 아니다. 다른 주체의 요청은 반환하지 않는다. UI 테스트 50개가 통과했고 로컬 OIDC 공급자·Docker PostgreSQL·실제 브라우저에서 응답 유실 모의, 새로고침, 실제로 다른 테스트 토큰으로 재로그인 및 조회를 확인했다. API 라우터·Docker PostgreSQL에서 다른 권한 있는 주체의 요청 격리도 확인했다. 실제 외부 IdP와 네트워크 장애는 미검증이다. [관리 화면 README](apps/dashboard/swallow/README.md)를 참고한다.
