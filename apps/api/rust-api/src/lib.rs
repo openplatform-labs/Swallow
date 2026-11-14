@@ -318,6 +318,8 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/operator/me", get(operator_identity::me))
         .route("/v1/experimental/operator/subscribers", get(operator_identity::subscribers))
         .route("/v1/experimental/operator/alerts", get(operator_identity::alerts))
+        .route("/v1/experimental/operator/alerts/resolve", post(operator_identity::resolve))
+        .route("/v1/experimental/operator/alerts/request", get(operator_identity::decision_request))
         .route("/v1/experimental/console/alerts", get(console_alerts::list))
         .route("/v1/experimental/console/alerts/resolve", post(console_alerts::resolve))
         .route("/v1/experimental/console/alerts/resolve-v2", post(console_alerts::resolve_v2))

@@ -1,19 +1,62 @@
 //! Optional JWT identity and permission-scoped subscriber lookup.
-use crate::{error_at, operator_access_token::AccessTokenVerifier};
+use crate::{
+    error_at,
+    operator_access_token::{AccessTokenVerifier, VerifiedSubject},
+};
 use axum::{
     Json,
+    body::Bytes,
     extract::{Extension, OriginalUri, State},
     http::{HeaderMap, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
 use std::{collections::HashMap, sync::Arc};
 use tokio_postgres::Client;
+use uuid::Uuid;
 
 #[derive(Clone, Copy)]
 enum Lookup {
     Identity,
     Subscribers,
     Alerts,
+    DecisionRequest,
+}
+
+fn authenticate(
+    headers: &HeaderMap,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Result<VerifiedSubject, StatusCode> {
+    let Some(Extension(verifier)) = verifier else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let token = values
+        .next()
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    if values.next().is_some() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    token
+        .and_then(|t| verifier.verify(t))
+        .ok_or(StatusCode::UNAUTHORIZED)
+}
+
+fn failure(status: StatusCode, path: &str) -> Response {
+    let (message, label) = match status {
+        StatusCode::UNAUTHORIZED => ("Unauthorized", "Unauthorized"),
+        StatusCode::BAD_REQUEST => ("Invalid or stale request", "Bad Request"),
+        StatusCode::SERVICE_UNAVAILABLE => {
+            ("Operator authentication unavailable", "Service Unavailable")
+        }
+        _ => ("Internal server error", "Internal Server Error"),
+    };
+    let mut response = error_at(status, message, label, path).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 pub(super) async fn me(
@@ -40,6 +83,14 @@ pub(super) async fn alerts(
 ) -> Response {
     query(db, headers, uri, verifier, Lookup::Alerts).await
 }
+pub(super) async fn decision_request(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::DecisionRequest).await
+}
 async fn query(
     db: Arc<Client>,
     headers: HeaderMap,
@@ -55,23 +106,9 @@ async fn query(
         );
         response
     };
-    let Some(Extension(verifier)) = verifier else {
-        return failure(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Operator authentication unavailable",
-            "Service Unavailable",
-        );
-    };
-    let mut authorizations = headers.get_all(header::AUTHORIZATION).iter();
-    let token = authorizations
-        .next()
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    if authorizations.next().is_some() {
-        return failure(StatusCode::UNAUTHORIZED, "Unauthorized", "Unauthorized");
-    }
-    let Some(identity) = token.and_then(|token| verifier.verify(token)) else {
-        return failure(StatusCode::UNAUTHORIZED, "Unauthorized", "Unauthorized");
+    let identity = match authenticate(&headers, verifier) {
+        Ok(identity) => identity,
+        Err(status) => return self::failure(status, uri.path()),
     };
     let mut params = HashMap::new();
     for (key, value) in form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()) {
@@ -85,6 +122,7 @@ async fn query(
     let allowed: &[&str] = match lookup {
         Lookup::Subscribers => &["environmentId", "name", "after", "before", "limit"],
         Lookup::Alerts => &["environmentId", "afterChannel", "afterTarget"],
+        Lookup::DecisionRequest => &["environmentId", "requestId"],
         Lookup::Identity => &["environmentId"],
     };
     if params.keys().any(|key| !allowed.contains(&key.as_str()))
@@ -138,6 +176,26 @@ async fn query(
             )
             .await
         }
+        Lookup::DecisionRequest => {
+            let Some(request) = params
+                .get("requestId")
+                .and_then(|id| Uuid::parse_str(id).ok())
+            else {
+                return self::failure(StatusCode::BAD_REQUEST, uri.path());
+            };
+            db.query_one(
+                "SELECT public.novu_rust_operator_jwt_decision_request($1,$2,$3,$4,$5,$6)",
+                &[
+                    &identity.issuer,
+                    &identity.subject,
+                    &identity.client_id,
+                    &env,
+                    &exp,
+                    &request,
+                ],
+            )
+            .await
+        }
         Lookup::Identity => {
             db.query_one(
                 "SELECT public.novu_rust_operator_jwt_self($1,$2,$3,$4,$5)",
@@ -169,5 +227,57 @@ async fn query(
             "Internal server error",
             "Internal Server Error",
         ),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DecisionBody {
+    request_id: String,
+    channel: String,
+    target_id: String,
+    attempt_id: String,
+    decision: String,
+    reason: String,
+}
+
+pub(super) async fn resolve(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+    body: Bytes,
+) -> Response {
+    let identity = match authenticate(&headers, verifier) {
+        Ok(identity) => identity,
+        Err(status) => return failure(status, uri.path()),
+    };
+    let params: Vec<_> = form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).collect();
+    if params.len() != 1
+        || params[0].0 != "environmentId"
+        || params[0].1.is_empty()
+        || params[0].1.len() > 512
+    {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    }
+    let Some(input) = (body.len() <= 4096)
+        .then(|| serde_json::from_slice::<DecisionBody>(&body).ok())
+        .flatten()
+    else {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    };
+    let (Ok(request), Ok(attempt), Ok(exp)) = (
+        Uuid::parse_str(&input.request_id),
+        Uuid::parse_str(&input.attempt_id),
+        i64::try_from(identity.expires_at),
+    ) else {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    };
+    let env = params[0].1.as_ref();
+    match db.query_one("SELECT public.novu_rust_operator_jwt_resolve_alert($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)", &[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&input.channel,&input.target_id,&attempt,&input.decision,&input.reason]).await {
+        Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"recorded":true,"replayed":row.get::<_,bool>(0)}))).into_response(),
+        Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
+        Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
+        Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path()),
     }
 }
