@@ -131,6 +131,27 @@ describe('Swallow console', () => {
     expect(fetchMock.mock.calls[2][0]).not.toContain('?');
   });
 
+  it('returns to earlier alert pages using prior cursors', async () => {
+    const pages = [
+      {data:[{channel:'email',targetId:'one',state:'accepted',lastStartedAt:null}],hasMore:true,next:{channel:'email',targetId:'one'}},
+      {data:[{channel:'email',targetId:'two',state:'accepted',lastStartedAt:null}],hasMore:true,next:{channel:'email',targetId:'two'}},
+      {data:[{channel:'slack',targetId:'three',state:'unknown',lastStartedAt:null}],hasMore:false,next:null},
+    ];
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+    for (const n of [0,1,2,1,0]) fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(pages[n]),{status:200}));
+    const app = TestBed.createComponent(App).componentInstance;
+    app.alertKey = 'a'.repeat(64);
+    await app.loadAlerts();
+    await app.loadAlerts('next');
+    await app.loadAlerts('next');
+    await app.loadAlerts('previous');
+    expect(app.alertPage()).toBe(2);
+    expect(fetchMock.mock.calls[3][0]).toContain('afterChannel=email&afterTarget=one');
+    await app.loadAlerts('previous');
+    expect(app.alertPage()).toBe(1);
+    expect(fetchMock.mock.calls[4][0]).not.toContain('?');
+  });
+
   it('does not show an obsolete or unauthorized alert response', async () => {
     let resolve!: (response: Response) => void;
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockReturnValueOnce(new Promise<Response>((done) => { resolve = done; }));

@@ -40,6 +40,7 @@ export class App {
   readonly alertNext = signal<AlertCursor | null>(null);
   readonly alertPage = signal(1);
   alertKey = '';
+  private alertHistory: (AlertCursor | null)[] = [null];
   private alertRequestId = 0;
   private alertAbort: AbortController | null = null;
   apiOrigin = 'http://127.0.0.1:3000';
@@ -94,6 +95,7 @@ export class App {
     this.alertsHaveMore.set(false);
     this.alertNext.set(null);
     this.alertPage.set(1);
+    this.alertHistory = [null];
     this.alertStatus.set('idle');
     this.alertError.set('');
   }
@@ -103,10 +105,12 @@ export class App {
     this.clearAlerts();
   }
 
-  async loadAlerts(direction?: 'next'): Promise<void> {
-    const cursor = direction === 'next' ? this.alertNext() : null;
-    if (direction && !cursor) return;
-    const nextPage = direction ? this.alertPage() + 1 : 1;
+  async loadAlerts(direction?: 'next' | 'previous'): Promise<void> {
+    if (direction === 'previous' && this.alertPage() <= 1) return;
+    const cursor = direction === 'next' ? this.alertNext() : direction === 'previous' ? this.alertHistory[this.alertPage() - 2] : null;
+    if (direction === 'next' && !cursor) return;
+    if (cursor === undefined) return;
+    const nextPage = direction === 'next' ? this.alertPage() + 1 : direction === 'previous' ? this.alertPage() - 1 : 1;
     const id = ++this.alertRequestId;
     this.alertAbort?.abort();
     const controller = new AbortController();
@@ -136,6 +140,7 @@ export class App {
       this.alertSlots.set(rows);
       this.alertsHaveMore.set(body.hasMore);
       this.alertNext.set(body.next as AlertCursor | null);
+      this.alertHistory = direction === 'next' ? [...this.alertHistory.slice(0, nextPage - 1), cursor] : direction === 'previous' ? this.alertHistory.slice(0, nextPage) : [null];
       this.alertPage.set(nextPage);
       this.alertStatus.set('loaded');
     } catch (error: unknown) {
