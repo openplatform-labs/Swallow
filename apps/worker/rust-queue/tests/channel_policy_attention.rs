@@ -76,7 +76,7 @@ async fn cancellation_alerts_are_scoped_and_acknowledge_each_revision() {
         String::from_utf8_lossy(&upgrade.stderr)
     );
     assert!(db.query_one("SELECT has_function_privilege($1,'public.novu_rust_list_channel_policy_attention(text,text,uuid)','execute')", &[&role]).await.unwrap().get::<_,bool>(0));
-    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_push_policy_evidence(text,uuid,bigint) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_push_policy_evidence_v2(text,uuid,bigint) TO {role}")).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'a',$1,p.permission,r.oid FROM pg_roles r CROSS JOIN (VALUES ('alert_view'),('queue_ack'),('alert_send')) p(permission) WHERE r.rolname::text=$1", &[&role]).await.unwrap();
     let email = Uuid::new_v4();
     let sms = Uuid::new_v4();
@@ -176,8 +176,46 @@ async fn cancellation_alerts_are_scoped_and_acknowledge_each_revision() {
         .unwrap();
     assert_eq!(
         evidence,
-        json!({"accepted":1,"rejected":0,"unknown":0,"dispatching":0,"unattempted":1})
+        json!({"accepted":1,"rejected":0,"unknown":0,"dispatching":0,"unattempted":1,"skipped":0})
     );
+    db.execute("INSERT INTO public.novu_rust_fcm_attempts(job_id,environment_id,target_index,state,skip_reason) VALUES ($1,'a',1,'skipped','unregistered')", &[&push]).await.unwrap();
+    let skipped_evidence = queue::reconciliation::push_policy_evidence(&operator, "a", push, 1)
+        .await
+        .unwrap();
+    assert_eq!(skipped_evidence["skipped"], 1);
+    assert_eq!(skipped_evidence["unattempted"], 0);
+    assert!(
+        queue::reconciliation::list_skipped_fcm(&operator, "a", push, -1)
+            .await
+            .is_err()
+    );
+    db.batch_execute(&format!(
+        "GRANT EXECUTE ON FUNCTION public.novu_rust_list_skipped_fcm(text,uuid,integer) TO {role}"
+    ))
+    .await
+    .unwrap();
+    let skipped = queue::reconciliation::list_skipped_fcm(&operator, "a", push, -1)
+        .await
+        .unwrap();
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0]["reason"], "unregistered");
+    assert!(
+        queue::reconciliation::list_skipped_fcm(&operator, "b", push, -1)
+            .await
+            .is_err()
+    );
+    assert!(
+        queue::reconciliation::list_skipped_fcm(&operator, "a", push, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    db.execute(
+        "DELETE FROM public.novu_rust_fcm_attempts WHERE job_id=$1 AND target_index=1",
+        &[&push],
+    )
+    .await
+    .unwrap();
     assert!(
         queue::reconciliation::push_policy_evidence(&operator, "b", push, 1)
             .await

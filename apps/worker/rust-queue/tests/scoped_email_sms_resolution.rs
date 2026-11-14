@@ -65,7 +65,7 @@ async fn fcm_job(db: &Client, payload: serde_json::Value, error: &str, states: &
     .await
     .unwrap();
     for (index, state) in states.iter().enumerate() {
-        db.execute("INSERT INTO novu_rust_fcm_attempts(job_id,environment_id,target_index,state,http_status) VALUES ($1,'a',$2,$3,500)", &[&job,&(index as i32),state]).await.unwrap();
+        db.execute("INSERT INTO novu_rust_fcm_attempts(job_id,environment_id,target_index,state,http_status,skip_reason) VALUES ($1,'a',$2,$3,500,CASE WHEN $3='skipped' THEN 'unregistered' ELSE NULL END)", &[&job,&(index as i32),state]).await.unwrap();
     }
     db.execute("INSERT INTO novu_rust_push_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,device_tokens,title,status,push_job_id,target_index,delivery_state) VALUES ($1,'a','s','s','n','w','t',ARRAY['secret-token'],'title','error',$2,0,'unknown')", &[&job.to_string(),&job]).await.unwrap();
     job
@@ -379,6 +379,24 @@ async fn scoped_email_sms_decisions_are_authorized_atomic_and_fenced() {
         (
             "accepted",
             "push delivery outcome unknown",
+            vec!["unknown", "skipped", "accepted"],
+            grouped.clone(),
+        ),
+        (
+            "retry",
+            "push delivery outcome unknown",
+            vec!["unknown", "skipped", "accepted"],
+            grouped.clone(),
+        ),
+        (
+            "accepted",
+            "push delivery outcome unknown",
+            vec!["unknown", "skipped", "accepted"],
+            json!({"prepared_messages":[{},{},{}],"prepared_context":{"target_metadata":[{"history_index":0,"group_size":1},{"history_index":1,"group_size":1},{"history_index":2,"group_size":1}]}}),
+        ),
+        (
+            "accepted",
+            "push delivery outcome unknown",
             vec!["unknown", "accepted", "accepted"],
             grouped.clone(),
         ),
@@ -445,6 +463,15 @@ async fn scoped_email_sms_decisions_are_authorized_atomic_and_fenced() {
             fcm_snapshot(&db, scoped).await,
             "FCM {decision} {error} {states:?}"
         );
+        if states.contains(&"skipped") && decision == "accepted" {
+            let snapshot = fcm_snapshot(&db, scoped).await;
+            assert_eq!(snapshot["status"], "failed");
+            assert_eq!(snapshot["error"], "push targets skipped by policy");
+            // A different group may have its own successful history entry.
+            if snapshot["message"][0] == "error" {
+                assert_eq!(snapshot["message"][1], "unknown");
+            }
+        }
     }
     let refused = fcm_job(
         &db,

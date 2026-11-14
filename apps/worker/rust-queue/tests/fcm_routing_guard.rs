@@ -56,6 +56,7 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
             .env_remove("SWALLOW_FCM_TOKEN_CLEANUP_GUARD")
             .env_remove("SWALLOW_PUSH_WORKFLOW_STEP_POLICY")
             .env_remove("SWALLOW_PUSH_PREFERENCE_POLICY")
+            .env_remove("SWALLOW_PUSH_TARGET_POLICY")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         c
@@ -87,7 +88,7 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
     assert!(!mismatch_step.status.success());
     assert!(
         String::from_utf8_lossy(&mismatch_step.stderr)
-            .contains("different workflow or preference policies")
+            .contains("different workflow, preference or target policies")
     );
     let invalid_step = command("guard-env", "project-a", "fixture-token")
         .env("SWALLOW_PUSH_WORKFLOW_STEP_POLICY", "invalid")
@@ -104,8 +105,23 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
     assert!(!mismatch_preference.status.success());
     assert!(
         String::from_utf8_lossy(&mismatch_preference.stderr)
-            .contains("different workflow or preference policies")
+            .contains("different workflow, preference or target policies")
     );
+    let mismatch_target = command("guard-env", "project-a", "fixture-token")
+        .env("SWALLOW_PUSH_TARGET_POLICY", "registered")
+        .output()
+        .unwrap();
+    assert!(!mismatch_target.status.success());
+    assert!(
+        String::from_utf8_lossy(&mismatch_target.stderr)
+            .contains("different workflow, preference or target policies")
+    );
+    let invalid_target = command("guard-env", "project-a", "fixture-token")
+        .env("SWALLOW_PUSH_TARGET_POLICY", "invalid")
+        .output()
+        .unwrap();
+    assert!(!invalid_target.status.success());
+    assert!(String::from_utf8_lossy(&invalid_target.stderr).contains("invalid push target policy"));
     let invalid_preference = command("guard-env", "project-a", "fixture-token")
         .env("SWALLOW_PUSH_PREFERENCE_POLICY", "invalid")
         .output()
@@ -133,7 +149,7 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
     assert!(!default_mismatch.status.success());
     assert!(
         String::from_utf8_lossy(&default_mismatch.stderr)
-            .contains("different workflow or preference policies")
+            .contains("different workflow, preference or target policies")
     );
     let mismatch = command("guard-env", "project-b", "fixture-token-secret")
         .output()

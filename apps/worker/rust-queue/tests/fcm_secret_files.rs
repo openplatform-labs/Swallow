@@ -30,7 +30,7 @@ async fn worker_supports_token_pem_and_integration_files() {
     ))
     .await
     .unwrap();
-    db.batch_execute("ALTER TABLE public.novu_rust_push_workflow_worker_config ADD COLUMN preference_policy text DEFAULT 'snapshot'").await.unwrap();
+    db.batch_execute("ALTER TABLE public.novu_rust_push_workflow_worker_config ADD COLUMN preference_policy text DEFAULT 'snapshot', ADD COLUMN target_policy text DEFAULT 'reference'").await.unwrap();
     let fixture =
         Fixture(std::env::temp_dir().join(format!("swallow-fcm-{}", uuid::Uuid::new_v4())));
     fs::create_dir(&fixture.0).unwrap();
@@ -71,6 +71,7 @@ async fn worker_supports_token_pem_and_integration_files() {
             .env_remove("SWALLOW_FCM_ENFORCE_ROUTING_CONFIG")
             .env_remove("SWALLOW_PUSH_WORKFLOW_STEP_POLICY")
             .env_remove("SWALLOW_PUSH_PREFERENCE_POLICY")
+            .env_remove("SWALLOW_PUSH_TARGET_POLICY")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         c

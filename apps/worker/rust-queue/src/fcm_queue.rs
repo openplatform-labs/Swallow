@@ -40,17 +40,68 @@ async fn lock_live(tx: &Transaction<'_>, job: &ClaimedJob) -> Result<bool, Error
 
 /// Complete only if at least one target was accepted and none is uncertain.
 async fn finish(tx: &Transaction<'_>, job: &ClaimedJob) -> Result<(), Error> {
-    let row=tx.query_one("SELECT count(*) FILTER(WHERE state='accepted'),count(*) FILTER(WHERE state IN ('unknown','dispatching')) FROM novu_rust_fcm_attempts WHERE job_id=$1 AND environment_id=$2",&[&job.id,&job.environment_id]).await?;
+    let row=tx.query_one("SELECT count(*) FILTER(WHERE state='accepted'),count(*) FILTER(WHERE state IN ('unknown','dispatching')),count(*) FILTER(WHERE state='skipped') FROM novu_rust_fcm_attempts WHERE job_id=$1 AND environment_id=$2",&[&job.id,&job.environment_id]).await?;
     let accepted: i64 = row.get(0);
     let unknown: i64 = row.get(1);
+    let skipped: i64 = row.get(2);
     let (status, diagnostic) = if unknown > 0 {
         ("failed", Some("push delivery outcome unknown"))
+    } else if skipped > 0 {
+        ("failed", Some("push targets skipped by policy"))
     } else if accepted > 0 {
         ("completed", None)
     } else {
         ("failed", Some("all push targets rejected"))
     };
     tx.execute("UPDATE novu_queue_jobs SET status=$2,last_error=$3,lease_token=NULL,lease_until=NULL WHERE id=$1 AND lease_token=$4",&[&job.id,&status,&diagnostic,&job.lease_token]).await?;
+    Ok(())
+}
+
+async fn refresh_group(
+    tx: &Transaction<'_>,
+    environment: &str,
+    job: Uuid,
+    history: i32,
+    size: i32,
+) -> Result<(), Error> {
+    let end = history.saturating_add(size);
+    let row=tx.query_one("SELECT count(*),count(*) FILTER (WHERE state='accepted'),count(*) FILTER (WHERE state IN ('unknown','dispatching')),count(*) FILTER (WHERE state='skipped') FROM public.novu_rust_fcm_attempts WHERE environment_id=$1 AND job_id=$2 AND target_index >= $3 AND target_index < $4", &[&environment,&job,&history,&end]).await?;
+    let count: i64 = row.get(0);
+    let accepted: i64 = row.get(1);
+    let unknown: i64 = row.get(2);
+    let skipped: i64 = row.get(3);
+    if skipped > 0 {
+        tx.execute("UPDATE public.novu_rust_push_messages SET status='error',error_id='unexpected_push_error',error_text='push target skipped by policy',delivery_state='unknown' WHERE environment_id=$1 AND push_job_id=$2 AND target_index=$3", &[&environment,&job,&history]).await?;
+    } else if count == i64::from(size) {
+        let status = if accepted > 0 && unknown == 0 {
+            "sent"
+        } else {
+            "error"
+        };
+        let diagnostic = if unknown > 0 {
+            Some("push delivery outcome unknown")
+        } else if accepted == 0 {
+            Some("push provider rejected request")
+        } else {
+            None
+        };
+        let error_id = (status == "error").then_some("unexpected_push_error");
+        let delivery = if unknown > 0 {
+            "unknown"
+        } else if accepted > 0 {
+            "accepted"
+        } else {
+            "rejected"
+        };
+        tx.execute("UPDATE public.novu_rust_push_messages SET status=$4,error_id=$5,error_text=$6,identifier=internal_id,delivery_state=$7 WHERE environment_id=$1 AND push_job_id=$2 AND target_index=$3", &[&environment,&job,&history,&status,&error_id,&diagnostic,&delivery]).await?;
+    } else {
+        let delivery = if unknown > 0 {
+            "unknown"
+        } else {
+            "in_progress"
+        };
+        tx.execute("UPDATE public.novu_rust_push_messages SET delivery_state=$4 WHERE environment_id=$1 AND push_job_id=$2 AND target_index=$3", &[&environment,&job,&history,&delivery]).await?;
+    }
     Ok(())
 }
 
@@ -68,6 +119,7 @@ pub async fn process_one(
         false,
         crate::push_step_policy::Policy::Snapshot,
         crate::push_step_policy::PreferencePolicy::Snapshot,
+        crate::push_step_policy::TargetPolicy::Reference,
     )
     .await
 }
@@ -86,6 +138,7 @@ pub async fn process_one_with_shared_provider(
         true,
         crate::push_step_policy::Policy::Snapshot,
         crate::push_step_policy::PreferencePolicy::Snapshot,
+        crate::push_step_policy::TargetPolicy::Reference,
     )
     .await
 }
@@ -105,6 +158,7 @@ pub async fn process_one_with_integrations(
         false,
         crate::push_step_policy::Policy::Snapshot,
         crate::push_step_policy::PreferencePolicy::Snapshot,
+        crate::push_step_policy::TargetPolicy::Reference,
     )
     .await
 }
@@ -125,6 +179,7 @@ pub async fn process_one_with_policy(
         shared,
         policy,
         crate::push_step_policy::PreferencePolicy::Snapshot,
+        crate::push_step_policy::TargetPolicy::Reference,
     )
     .await
 }
@@ -146,10 +201,36 @@ pub async fn process_one_with_policies(
         shared,
         policy,
         preference,
+        crate::push_step_policy::TargetPolicy::Reference,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)] // Three independent deployment policies share one delivery path.
+pub async fn process_one_with_target_policy(
+    client: &mut Client,
+    environment: &str,
+    provider: Option<&Fcm>,
+    providers: Option<&HashMap<String, Fcm>>,
+    shared: bool,
+    policy: crate::push_step_policy::Policy,
+    preference: crate::push_step_policy::PreferencePolicy,
+    target: crate::push_step_policy::TargetPolicy,
+) -> Result<bool, Error> {
+    process_one_inner(
+        client,
+        environment,
+        provider,
+        providers,
+        shared,
+        policy,
+        preference,
+        target,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn process_one_inner(
     client: &mut Client,
     environment: &str,
@@ -158,6 +239,7 @@ async fn process_one_inner(
     allow_shared_provider: bool,
     policy: crate::push_step_policy::Policy,
     preference_policy: crate::push_step_policy::PreferencePolicy,
+    target_policy: crate::push_step_policy::TargetPolicy,
 ) -> Result<bool, Error> {
     let Some(job) = claim(client, environment).await? else {
         return Ok(false);
@@ -178,7 +260,8 @@ async fn process_one_inner(
         None
     };
     let prepared_identity_valid = if (!crate::allow_recreated_subscriber()
-        || preference_policy == crate::push_step_policy::PreferencePolicy::Recheck)
+        || preference_policy == crate::push_step_policy::PreferencePolicy::Recheck
+        || target_policy == crate::push_step_policy::TargetPolicy::Registered)
         && push.workflow_context.is_none()
     {
         if let Some(context) = prepared_context.as_ref() {
@@ -620,9 +703,34 @@ async fn process_one_inner(
         .await?;
         return Ok(true);
     };
+    let skip_reason = if target_policy == crate::push_step_policy::TargetPolicy::Registered {
+        let subscriber = prepared_context
+            .as_ref()
+            .and_then(|v| v.get("subscriber_id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|v| !v.is_empty());
+        let token = messages[index]
+            .pointer("/message/token")
+            .and_then(serde_json::Value::as_str)
+            .filter(|v| !v.is_empty());
+        match (subscriber, integration_id, token) {
+            (Some(subscriber), Some(integration), Some(token)) => {
+                let row=tx.query_opt("SELECT i.active,$4=ANY(d.device_tokens) FROM public.novu_rust_fcm_devices d JOIN public.novu_rust_fcm_integrations i ON i.environment_id=d.environment_id AND i.internal_id=d.integration_internal_id WHERE d.environment_id=$1 AND d.subscriber_id=$2 AND d.integration_internal_id=$3", &[&environment,&subscriber,&integration,&token]).await?;
+                if row.is_some_and(|r| r.get::<_, bool>(0) && r.get::<_, bool>(1)) {
+                    None
+                } else {
+                    Some("unregistered")
+                }
+            }
+            _ => Some("unverifiable"),
+        }
+    } else {
+        None
+    };
     let guarded_cleanup =
         selected_provider.token_cleanup_guard() == fcm::TokenCleanupGuard::Version;
-    let cleanup_generation = if guarded_cleanup
+    let cleanup_generation = if skip_reason.is_none()
+        && guarded_cleanup
         && std::env::var("IS_EXPIRED_TOKENS_REMOVAL_ENABLED").as_deref() == Ok("true")
         && !target_metadata
             .and_then(|v| v.get("routed"))
@@ -714,10 +822,24 @@ async fn process_one_inner(
         }
     }
     if (policy != crate::push_step_policy::Policy::Snapshot
-        || preference_policy == crate::push_step_policy::PreferencePolicy::Recheck)
+        || preference_policy == crate::push_step_policy::PreferencePolicy::Recheck
+        || target_policy == crate::push_step_policy::TargetPolicy::Registered)
         && !lock_live(&tx, &job).await?
     {
         tx.rollback().await?;
+        return Ok(true);
+    }
+    if let Some(reason) = skip_reason {
+        tx.execute("INSERT INTO public.novu_rust_fcm_attempts(job_id,environment_id,target_index,state,skip_reason) VALUES ($1,$2,$3,'skipped',$4)", &[&job.id,&environment,&index_i32,&reason]).await?;
+        if prepared_context.is_some() {
+            refresh_group(&tx, environment, job.id, history_index, group_size).await?;
+        }
+        if attempted.len() + 1 < messages.len() {
+            tx.execute("UPDATE public.novu_queue_jobs SET status='pending',available_at=clock_timestamp(),lease_token=NULL,lease_until=NULL WHERE id=$1 AND lease_token=$2", &[&job.id,&job.lease_token]).await?;
+        } else {
+            finish(&tx, &job).await?;
+        }
+        tx.commit().await?;
         return Ok(true);
     }
     tx.execute("INSERT INTO novu_rust_fcm_attempts(job_id,environment_id,target_index,state) VALUES ($1,$2,$3,'dispatching')",&[&job.id,&environment,&index_i32]).await?;
@@ -785,42 +907,7 @@ async fn process_one_inner(
             }
         }
         if prepared_context.is_some() {
-            let end = history_index.saturating_add(group_size);
-            let counts = tx.query_one("SELECT count(*), count(*) FILTER (WHERE state='accepted'), count(*) FILTER (WHERE state IN ('unknown','dispatching')) FROM novu_rust_fcm_attempts WHERE environment_id=$1 AND job_id=$2 AND target_index >= $3 AND target_index < $4", &[&environment,&job.id,&history_index,&end]).await?;
-            let count: i64 = counts.get(0);
-            if count == i64::from(group_size) {
-                let accepted: i64 = counts.get(1);
-                let unknown: i64 = counts.get(2);
-                let message_status = if accepted > 0 && unknown == 0 {
-                    "sent"
-                } else {
-                    "error"
-                };
-                let diagnostic = if unknown > 0 {
-                    Some("push delivery outcome unknown")
-                } else if accepted == 0 {
-                    Some("push provider rejected request")
-                } else {
-                    None
-                };
-                let error_id = (message_status == "error").then_some("unexpected_push_error");
-                let delivery_state = if unknown > 0 {
-                    "unknown"
-                } else if accepted > 0 {
-                    "accepted"
-                } else {
-                    "rejected"
-                };
-                tx.execute("UPDATE novu_rust_push_messages SET status=$4,error_id=$5,error_text=$6,identifier=internal_id,delivery_state=$7 WHERE environment_id=$1 AND push_job_id=$2 AND target_index=$3",&[&environment,&job.id,&history_index,&message_status,&error_id,&diagnostic,&delivery_state]).await?;
-            } else {
-                let unknown: i64 = counts.get(2);
-                let delivery_state = if unknown > 0 {
-                    "unknown"
-                } else {
-                    "in_progress"
-                };
-                tx.execute("UPDATE novu_rust_push_messages SET delivery_state=$4 WHERE environment_id=$1 AND push_job_id=$2 AND target_index=$3", &[&environment,&job.id,&history_index,&delivery_state]).await?;
-            }
+            refresh_group(&tx, environment, job.id, history_index, group_size).await?;
         }
         if attempted.len() + 1 < messages.len() {
             tx.execute("UPDATE novu_queue_jobs SET status='pending',available_at=clock_timestamp(),lease_token=NULL,lease_until=NULL WHERE id=$1 AND lease_token=$2",&[&job.id,&job.lease_token]).await?;
@@ -1204,6 +1291,162 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires migrated disposable PostgreSQL and loopback"]
+    async fn registration_guard_skips_removed_target_and_sends_remaining() {
+        let url = std::env::var("TEST_DATABASE_URL").unwrap();
+        let (mut db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+        tokio::spawn(async move { driver.await.unwrap() });
+        db.batch_execute("INSERT INTO novu_rust_environments VALUES ('token-guard','org'); INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id) VALUES ('token-guard','alice','alice-id'); INSERT INTO novu_rust_fcm_integrations(environment_id,internal_id,identifier,active) VALUES ('token-guard','integration','fixture',true); INSERT INTO novu_rust_fcm_devices(environment_id,subscriber_id,integration_internal_id,device_tokens) VALUES ('token-guard','alice','integration',ARRAY['a','b','c']); INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'token-guard',session_user,p,oid FROM pg_roles CROSS JOIN unnest(ARRAY['alert_view','accepted']) p WHERE rolname=session_user").await.unwrap();
+        let meta = json!({"integration_internal_id":"integration","message_id":"token-message","device_tokens":["a","b","c"],"history_index":0,"group_size":3});
+        let payload = json!({"prepared_messages":[{"message":{"token":"a","notification":{"title":"title","body":"content"}}},{"message":{"token":"b","notification":{"title":"title","body":"content"}}},{"message":{"token":"c","notification":{"title":"title","body":"content"}}}],"prepared_context":{"subscriber_id":"alice","subscriber_internal_id":"alice-id","notification_internal_id":"notification","workflow_identifier":"wf","transaction_id":"txn","title":"title","content":"content","target_metadata":[meta.clone(),meta.clone(),meta]},"workflow_guard":{"identifier":"wf","id":"workflow-id","title":"title","content":"content"}});
+        let job = Uuid::new_v4();
+        crate::enqueue(&db, job, "token-guard", JOB_KIND, &payload)
+            .await
+            .unwrap();
+        let (provider, server) = mock(vec![200, 200]).await;
+        assert!(
+            process_one_with_target_policy(
+                &mut db,
+                "token-guard",
+                Some(&provider),
+                None,
+                false,
+                crate::push_step_policy::Policy::Snapshot,
+                crate::push_step_policy::PreferencePolicy::Snapshot,
+                crate::push_step_policy::TargetPolicy::Registered
+            )
+            .await
+            .unwrap()
+        );
+        let (mut other, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+        tokio::spawn(async move { driver.await.unwrap() });
+        let tx = db.transaction().await.unwrap();
+        tx.query_one("SELECT internal_id FROM novu_rust_subscribers WHERE environment_id='token-guard' AND subscriber_id='alice' FOR UPDATE",&[]).await.unwrap();
+        tx.execute("UPDATE novu_rust_fcm_devices SET device_tokens=ARRAY['a','c'] WHERE environment_id='token-guard' AND subscriber_id='alice'",&[]).await.unwrap();
+        let waiting = tokio::spawn(async move {
+            let result = process_one_with_target_policy(
+                &mut other,
+                "token-guard",
+                Some(&provider),
+                None,
+                false,
+                crate::push_step_policy::Policy::Snapshot,
+                crate::push_step_policy::PreferencePolicy::Snapshot,
+                crate::push_step_policy::TargetPolicy::Registered,
+            )
+            .await;
+            (provider, result)
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!waiting.is_finished());
+        tx.commit().await.unwrap();
+        let (provider, result) = waiting.await.unwrap();
+        assert!(result.unwrap());
+        assert!(
+            process_one_with_target_policy(
+                &mut db,
+                "token-guard",
+                Some(&provider),
+                None,
+                false,
+                crate::push_step_policy::Policy::Snapshot,
+                crate::push_step_policy::PreferencePolicy::Snapshot,
+                crate::push_step_policy::TargetPolicy::Registered
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(server.await.unwrap(), vec!["a", "c"]);
+        let rows=db.query("SELECT state,skip_reason FROM novu_rust_fcm_attempts WHERE job_id=$1 ORDER BY target_index", &[&job]).await.unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.get::<_, String>(0), r.get::<_, Option<String>>(1)))
+                .collect::<Vec<_>>(),
+            vec![
+                ("accepted".into(), None),
+                ("skipped".into(), Some("unregistered".into())),
+                ("accepted".into(), None)
+            ]
+        );
+        let row = db
+            .query_one(
+                "SELECT status,last_error FROM novu_queue_jobs WHERE id=$1",
+                &[&job],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, String>(0), "failed");
+        assert_eq!(row.get::<_, String>(1), "push targets skipped by policy");
+        let row = db
+            .query_one(
+                "SELECT status,delivery_state FROM novu_rust_push_messages WHERE push_job_id=$1",
+                &[&job],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, String>(0), "error");
+        assert_eq!(row.get::<_, String>(1), "unknown");
+        let skipped = crate::reconciliation::list_skipped_fcm(&db, "token-guard", job, -1)
+            .await
+            .unwrap();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0]["targetIndex"], 1);
+        assert_eq!(skipped[0]["reason"], "unregistered");
+        assert!(!skipped[0].to_string().contains("token"));
+
+        // A raw topic cannot be tied to a registered device; registered mode fails closed.
+        let topic_job = Uuid::new_v4();
+        let topic = json!({"prepared_messages":[{"message":{"topic":"news","notification":{"title":"title","body":"content"}}}]});
+        crate::enqueue(&db, topic_job, "token-guard", JOB_KIND, &topic)
+            .await
+            .unwrap();
+        let (unused_provider, unused_server) = mock(vec![]).await;
+        assert!(
+            process_one_with_target_policy(
+                &mut db,
+                "token-guard",
+                Some(&unused_provider),
+                None,
+                false,
+                crate::push_step_policy::Policy::Snapshot,
+                crate::push_step_policy::PreferencePolicy::Snapshot,
+                crate::push_step_policy::TargetPolicy::Registered
+            )
+            .await
+            .unwrap()
+        );
+        assert!(unused_server.await.unwrap().is_empty());
+        let skipped = crate::reconciliation::list_skipped_fcm(&db, "token-guard", topic_job, -1)
+            .await
+            .unwrap();
+        assert_eq!(skipped[0]["reason"], "unverifiable");
+
+        // Default reference mode preserves standalone prepared token dispatch.
+        let raw_job = Uuid::new_v4();
+        let raw = json!({"prepared_messages":[{"message":{"token":"old","notification":{"title":"title","body":"content"}}}]});
+        crate::enqueue(&db, raw_job, "token-guard", JOB_KIND, &raw)
+            .await
+            .unwrap();
+        let (raw_provider, raw_server) = mock(vec![200]).await;
+        assert!(
+            process_one(&mut db, "token-guard", &raw_provider)
+                .await
+                .unwrap()
+        );
+        assert_eq!(raw_server.await.unwrap(), vec!["old"]);
+        assert_eq!(
+            db.query_one(
+                "SELECT status FROM novu_queue_jobs WHERE id=$1",
+                &[&raw_job]
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+            "completed"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires migrated disposable PostgreSQL and loopback"]
     async fn guarded_multicast_preserves_attempt_and_cancels_remaining_targets() {
         let (mut db, driver) =
             tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(), NoTls)
@@ -1338,7 +1581,7 @@ mod tests {
             crate::reconciliation::push_policy_evidence(&db, "push-guard", job, 1)
                 .await
                 .unwrap(),
-            json!({"accepted":1,"rejected":0,"unknown":0,"dispatching":0,"unattempted":1})
+            json!({"accepted":1,"rejected":0,"unknown":0,"dispatching":0,"unattempted":1,"skipped":0})
         );
         let legacy = Uuid::new_v4();
         let mut old = payload.clone();

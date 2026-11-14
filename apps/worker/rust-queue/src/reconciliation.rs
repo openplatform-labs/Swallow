@@ -167,12 +167,12 @@ pub async fn push_policy_evidence(
 ) -> Result<Value> {
     let r = client
         .query_one(
-            "SELECT * FROM public.novu_rust_push_policy_evidence($1,$2,$3)",
+            "SELECT * FROM public.novu_rust_push_policy_evidence_v2($1,$2,$3)",
             &[&environment, &job, &revision],
         )
         .await?;
     Ok(
-        json!({"accepted":r.get::<_,i64>(0),"rejected":r.get::<_,i64>(1),"unknown":r.get::<_,i64>(2),"dispatching":r.get::<_,i64>(3),"unattempted":r.get::<_,Option<i64>>(4)}),
+        json!({"accepted":r.get::<_,i64>(0),"rejected":r.get::<_,i64>(1),"unknown":r.get::<_,i64>(2),"dispatching":r.get::<_,i64>(3),"unattempted":r.get::<_,Option<i64>>(4),"skipped":r.get::<_,i64>(5)}),
     )
 }
 
@@ -218,6 +218,22 @@ pub async fn list_cancelled_push_resolutions(
         )
         .await?;
     Ok(rows.into_iter().map(|r|json!({"targetIndex":r.get::<_,i32>(0),"decision":r.get::<_,String>(1),"createdAt":r.get::<_,String>(2),"revision":r.get::<_,String>(3)})).collect())
+}
+
+/// List policy-skipped FCM targets without exposing token values.
+pub async fn list_skipped_fcm(
+    client: &Client,
+    environment: &str,
+    job: Uuid,
+    after: i32,
+) -> Result<Vec<Value>> {
+    let rows = client
+        .query(
+            "SELECT * FROM public.novu_rust_list_skipped_fcm($1,$2,$3)",
+            &[&environment, &job, &after],
+        )
+        .await?;
+    Ok(rows.into_iter().map(|r|json!({"targetIndex":r.get::<_,i32>(0),"reason":r.get::<_,String>(1),"createdAt":r.get::<_,String>(2)})).collect())
 }
 
 /// Count failed queue jobs not acknowledged for their current snapshot.
@@ -752,7 +768,7 @@ pub async fn resolve(
                     .filter(|v| *v > 0)
                     .unwrap_or(1);
                 let end = history_index.saturating_add(group_size);
-                tx.execute("UPDATE novu_rust_push_messages SET delivery_state=CASE WHEN EXISTS(SELECT 1 FROM novu_rust_fcm_attempts WHERE environment_id=$1 AND job_id=$2 AND target_index >= $3 AND target_index < $4 AND state='unknown') THEN 'unknown' ELSE 'in_progress' END,status='sent',error_id=NULL,error_text=NULL WHERE environment_id=$1 AND push_job_id=$2 AND target_index=$3", &[&environment,&job,&history_index,&end]).await?;
+                tx.execute("UPDATE novu_rust_push_messages SET delivery_state=CASE WHEN EXISTS(SELECT 1 FROM novu_rust_fcm_attempts WHERE environment_id=$1 AND job_id=$2 AND target_index >= $3 AND target_index < $4 AND state IN ('unknown','skipped')) THEN 'unknown' ELSE 'in_progress' END,status=CASE WHEN EXISTS(SELECT 1 FROM novu_rust_fcm_attempts WHERE environment_id=$1 AND job_id=$2 AND target_index >= $3 AND target_index < $4 AND state='skipped') THEN 'error' ELSE 'sent' END,error_id=CASE WHEN EXISTS(SELECT 1 FROM novu_rust_fcm_attempts WHERE environment_id=$1 AND job_id=$2 AND target_index >= $3 AND target_index < $4 AND state='skipped') THEN 'unexpected_push_error' ELSE NULL END,error_text=CASE WHEN EXISTS(SELECT 1 FROM novu_rust_fcm_attempts WHERE environment_id=$1 AND job_id=$2 AND target_index >= $3 AND target_index < $4 AND state='skipped') THEN 'push target skipped by policy' ELSE NULL END WHERE environment_id=$1 AND push_job_id=$2 AND target_index=$3", &[&environment,&job,&history_index,&end]).await?;
             } else {
                 tx.execute("UPDATE novu_rust_fcm_attempts SET state='accepted',updated_at=clock_timestamp() WHERE environment_id=$1 AND job_id=$2 AND target_index=$3", &[&environment,&job,&index]).await?;
                 let group_size = metadata
@@ -762,10 +778,13 @@ pub async fn resolve(
                     .filter(|v| *v > 0)
                     .unwrap_or(1);
                 let end = history_index.saturating_add(group_size);
-                let row=tx.query_one("SELECT count(*),count(*) FILTER (WHERE state IN ('unknown','dispatching')) FROM novu_rust_fcm_attempts WHERE environment_id=$1 AND job_id=$2 AND target_index >= $3 AND target_index < $4", &[&environment,&job,&history_index,&end]).await?;
+                let row=tx.query_one("SELECT count(*),count(*) FILTER (WHERE state IN ('unknown','dispatching')),count(*) FILTER (WHERE state='skipped') FROM novu_rust_fcm_attempts WHERE environment_id=$1 AND job_id=$2 AND target_index >= $3 AND target_index < $4", &[&environment,&job,&history_index,&end]).await?;
                 let count = row.get::<_, i64>(0);
                 let uncertain = row.get::<_, i64>(1);
-                if uncertain > 0 {
+                let skipped = row.get::<_, i64>(2);
+                if skipped > 0 {
+                    tx.execute("UPDATE novu_rust_push_messages SET status='error',error_id='unexpected_push_error',error_text='push target skipped by policy',delivery_state='unknown' WHERE environment_id=$1 AND push_job_id=$2 AND target_index=$3", &[&environment,&job,&history_index]).await?;
+                } else if uncertain > 0 {
                     tx.execute("UPDATE novu_rust_push_messages SET delivery_state='unknown' WHERE environment_id=$1 AND push_job_id=$2 AND target_index=$3", &[&environment,&job,&history_index]).await?;
                 } else if count == i64::from(group_size) {
                     tx.execute("UPDATE novu_rust_push_messages SET delivery_state='accepted',status='sent',error_id=NULL,error_text=NULL,identifier=internal_id WHERE environment_id=$1 AND push_job_id=$2 AND target_index=$3", &[&environment,&job,&history_index]).await?;
@@ -785,9 +804,10 @@ pub async fn resolve(
             .get("prepared_messages")
             .and_then(Value::as_array)
             .map(|v| v.len());
-        let counts=tx.query_one("SELECT count(*),count(*) FILTER (WHERE state IN ('unknown','dispatching')) FROM novu_rust_fcm_attempts WHERE environment_id=$1 AND job_id=$2", &[&environment,&job]).await?;
+        let counts=tx.query_one("SELECT count(*),count(*) FILTER (WHERE state IN ('unknown','dispatching')),count(*) FILTER (WHERE state='skipped') FROM novu_rust_fcm_attempts WHERE environment_id=$1 AND job_id=$2", &[&environment,&job]).await?;
         let count = counts.get::<_, i64>(0);
         let unknown = counts.get::<_, i64>(1);
+        let skipped = counts.get::<_, i64>(2);
         // Resolving an attempt cannot override a different failure, such as
         // a replaced subscriber or invalid prepared payload.
         if unknown == 0
@@ -796,7 +816,9 @@ pub async fn resolve(
                 .and_then(|n| i64::try_from(n).ok())
                 .filter(|n| *n > 0)
         {
-            if count == expected {
+            if count == expected && skipped > 0 {
+                tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='push targets skipped by policy' WHERE environment_id=$1 AND id=$2", &[&environment,&job]).await?;
+            } else if count == expected {
                 tx.execute("UPDATE novu_queue_jobs SET status='completed',last_error=NULL WHERE environment_id=$1 AND id=$2", &[&environment,&job]).await?;
             } else if count < expected {
                 tx.execute("UPDATE novu_queue_jobs SET status='pending',available_at=now(),last_error=NULL WHERE environment_id=$1 AND id=$2", &[&environment,&job]).await?;

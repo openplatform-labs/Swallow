@@ -45,13 +45,34 @@ impl PreferencePolicy {
         }
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetPolicy {
+    Reference,
+    Registered,
+}
+impl TargetPolicy {
+    pub fn from_env() -> Result<Self, &'static str> {
+        match std::env::var("SWALLOW_PUSH_TARGET_POLICY").as_deref() {
+            Ok("reference") | Err(std::env::VarError::NotPresent) => Ok(Self::Reference),
+            Ok("registered") => Ok(Self::Registered),
+            _ => Err("invalid push target policy"),
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reference => "reference",
+            Self::Registered => "registered",
+        }
+    }
+}
 pub async fn register(
     db: &Client,
     environment: &str,
     policy: Policy,
     preference: PreferencePolicy,
+    target: TargetPolicy,
 ) -> Result<bool, Error> {
-    Ok(db.query_opt("INSERT INTO public.novu_rust_push_workflow_worker_config(environment_id,step_policy,preference_policy) VALUES ($1,$2,$3) ON CONFLICT(environment_id) DO UPDATE SET step_policy=EXCLUDED.step_policy,preference_policy=EXCLUDED.preference_policy WHERE (novu_rust_push_workflow_worker_config.step_policy IS NULL OR novu_rust_push_workflow_worker_config.step_policy=EXCLUDED.step_policy) AND (novu_rust_push_workflow_worker_config.preference_policy IS NULL OR novu_rust_push_workflow_worker_config.preference_policy=EXCLUDED.preference_policy) RETURNING 1", &[&environment,&policy.as_str(),&preference.as_str()]).await?.is_some())
+    Ok(db.query_opt("INSERT INTO public.novu_rust_push_workflow_worker_config(environment_id,step_policy,preference_policy,target_policy) VALUES ($1,$2,$3,$4) ON CONFLICT(environment_id) DO UPDATE SET step_policy=EXCLUDED.step_policy,preference_policy=EXCLUDED.preference_policy,target_policy=EXCLUDED.target_policy WHERE (novu_rust_push_workflow_worker_config.step_policy IS NULL OR novu_rust_push_workflow_worker_config.step_policy=EXCLUDED.step_policy) AND (novu_rust_push_workflow_worker_config.preference_policy IS NULL OR novu_rust_push_workflow_worker_config.preference_policy=EXCLUDED.preference_policy) AND (novu_rust_push_workflow_worker_config.target_policy IS NULL OR novu_rust_push_workflow_worker_config.target_policy=EXCLUDED.target_policy) RETURNING 1", &[&environment,&policy.as_str(),&preference.as_str(),&target.as_str()]).await?.is_some())
 }
 pub enum Check {
     Continue,

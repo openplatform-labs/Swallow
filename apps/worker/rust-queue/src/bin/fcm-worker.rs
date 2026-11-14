@@ -83,6 +83,7 @@ fn build_integrations(raw: &str) -> Result<HashMap<String, Fcm>, Box<dyn Error +
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let step_policy = novu_postgres_queue::push_step_policy::Policy::from_env()?;
     let preference_policy = novu_postgres_queue::push_step_policy::PreferencePolicy::from_env()?;
+    let target_policy = novu_postgres_queue::push_step_policy::TargetPolicy::from_env()?;
     let invalid_token_policy = InvalidTokenPolicy::from_env()?;
     let cleanup_guard = TokenCleanupGuard::from_env()?;
     let environment = std::env::var("NOVU_FCM_ENVIRONMENT_ID")?;
@@ -243,6 +244,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         &environment,
                         step_policy,
                         preference_policy,
+                        target_policy,
                     ),
                 )
                 .await
@@ -252,14 +254,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         task.abort();
                         let _ = task.await;
                         return Err(
-                            "push workers have different workflow or preference policies".into(),
+                            "push workers have different workflow, preference or target policies"
+                                .into(),
                         );
                     }
                     _ => {
                         task.abort();
                         let _ = task.await;
                         eprintln!(
-                            "push workflow or preference policy registration failed; reconnecting"
+                            "push workflow, preference or target policy registration failed; reconnecting"
                         );
                         tokio::time::sleep(Duration::from_secs(2)).await;
                         continue;
@@ -280,7 +283,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         recovery = tokio::time::Instant::now() + Duration::from_secs(5);
                     }
                     let dispatch = async {
-                        fcm_queue::process_one_with_policies(
+                        fcm_queue::process_one_with_target_policy(
                             &mut db,
                             &environment,
                             provider.as_ref(),
@@ -288,6 +291,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                             shared_provider,
                             step_policy,
                             preference_policy,
+                            target_policy,
                         )
                         .await
                     };

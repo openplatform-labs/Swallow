@@ -37,7 +37,7 @@ async fn resolutions_are_scoped_fenced_audited_and_do_not_dispatch() {
         .await
         .unwrap();
     let role = format!("push_resolution_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'fixture-password'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_resolve_cancelled_push(text,uuid,bigint,integer,text,text,text),public.novu_rust_list_cancelled_push_resolutions(text,uuid,bigint,integer),public.novu_rust_push_policy_evidence(text,uuid,bigint) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'fixture-password'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_resolve_cancelled_push(text,uuid,bigint,integer,text,text,text),public.novu_rust_list_cancelled_push_resolutions(text,uuid,bigint,integer),public.novu_rust_push_policy_evidence_v2(text,uuid,bigint) TO {role}")).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'a',$1,p.permission,r.oid FROM pg_roles r CROSS JOIN (VALUES ('alert_view'),('accepted'),('retry')) p(permission) WHERE r.rolname::text=$1", &[&role]).await.unwrap();
     let id = Uuid::new_v4();
     let foreign = Uuid::new_v4();
@@ -229,7 +229,7 @@ async fn resolutions_are_scoped_fenced_audited_and_do_not_dispatch() {
         .unwrap();
     assert_eq!(
         evidence,
-        json!({"accepted":1,"rejected":1,"unknown":0,"dispatching":0,"unattempted":1})
+        json!({"accepted":1,"rejected":1,"unknown":0,"dispatching":0,"unattempted":1,"skipped":0})
     );
     let race = Uuid::new_v4();
     queue::enqueue(&db, race, "a", queue::fcm_queue::JOB_KIND, &json!({}))
