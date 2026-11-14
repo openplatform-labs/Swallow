@@ -3,6 +3,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$(cd ../../.. && pwd)
+scenario=${SWALLOW_FAILOVER_TEST_SCENARIO:-in-app}
+case "$scenario" in in-app|resend) ;; *) echo 'invalid failover test scenario' >&2; exit 2;; esac
 suffix="$$-$RANDOM"
 network="swallow-ha-net-$suffix"
 primary="swallow-ha-primary-$suffix"
@@ -46,4 +48,10 @@ standby_port=$(docker port "$standby" 5432/tcp | awk -F: '{print $NF}')
 export TEST_PRIMARY_CONTAINER="$primary" TEST_STANDBY_CONTAINER="$standby"
 export TEST_PRIMARY_URL="postgresql://postgres@127.0.0.1:$primary_port/postgres" TEST_STANDBY_URL="postgresql://postgres@127.0.0.1:$standby_port/postgres"
 export TEST_FAILOVER_URL="postgresql://postgres@127.0.0.1:$standby_port,127.0.0.1:$primary_port/postgres?target_session_attrs=read-write&connect_timeout=2"
-cargo test --locked --test postgres_failover -- --ignored
+if [[ "$scenario" == resend ]]; then
+  cargo build --locked --bin resend-worker >/dev/null
+  export TEST_RESEND_WORKER_BINARY="$(cd "$CARGO_TARGET_DIR" && pwd)/debug/resend-worker"
+  cargo test --locked --lib resend_failover_test::synchronous_failover_during_resend_dispatch_preserves_unknown -- --ignored
+else
+  cargo test --locked --test postgres_failover -- --ignored
+fi

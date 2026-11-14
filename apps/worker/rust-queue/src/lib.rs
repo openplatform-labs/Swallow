@@ -23,6 +23,8 @@ pub mod sms_step_policy;
 pub mod twilio;
 pub mod twilio_projection;
 pub mod twilio_queue;
+#[cfg(test)]
+mod resend_failover_test;
 
 use serde_json::Value;
 use std::time::Duration;
