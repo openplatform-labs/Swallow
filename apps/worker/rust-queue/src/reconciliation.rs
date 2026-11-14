@@ -33,6 +33,32 @@ pub async fn health(client: &Client, environment: &str) -> Result<Value> {
     }))
 }
 
+/// Detect overdue runnable jobs and expired leases, including pre-dispatch crashes.
+pub async fn queue_health(
+    client: &Client,
+    environment: &str,
+    max_wait_seconds: i32,
+) -> Result<Value> {
+    if environment.trim().is_empty() || !(1..=86_400).contains(&max_wait_seconds) {
+        return Err("invalid environment or wait threshold (1-86400 seconds)".into());
+    }
+    let row = client.query_one(
+        "SELECT count(*) FILTER (WHERE status='pending' AND available_at <= statement_timestamp() - $2::integer * interval '1 second'), \
+         count(*) FILTER (WHERE status='running' AND lease_until <= statement_timestamp()), \
+         min(available_at) FILTER (WHERE status='pending' AND available_at <= statement_timestamp() - $2::integer * interval '1 second')::text, \
+         min(lease_until) FILTER (WHERE status='running' AND lease_until <= statement_timestamp())::text \
+         FROM novu_queue_jobs WHERE environment_id=$1",
+        &[&environment, &max_wait_seconds],
+    ).await?;
+    Ok(json!({
+        "overdueJobs": row.get::<_, i64>(0),
+        "expiredLeases": row.get::<_, i64>(1),
+        "oldestOverdueAvailableAt": row.get::<_, Option<String>>(2),
+        "oldestExpiredLeaseAt": row.get::<_, Option<String>>(3),
+        "maxWaitSeconds": max_wait_seconds,
+    }))
+}
+
 /// List bounded unknown attempts without returning recipient data or payloads.
 pub async fn list(client: &Client, environment: &str) -> Result<Vec<Value>> {
     list_after(client, environment, None).await

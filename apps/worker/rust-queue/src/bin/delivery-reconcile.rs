@@ -6,7 +6,7 @@ use uuid::Uuid;
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if ![2, 3, 4, 6].contains(&args.len()) {
-        return Err("usage: delivery-reconcile check ENV | list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | email-dispatch-evidence ENV EMAIL_JOB | sms-evidence ENV SMS_JOB | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
+        return Err("usage: delivery-reconcile check ENV | check-queue ENV MAX_WAIT_SECONDS | list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | email-dispatch-evidence ENV EMAIL_JOB | sms-evidence ENV SMS_JOB | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
     }
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let (mut db, connection) = config.connect(tls).await?;
@@ -23,6 +23,22 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             .ok_or("invalid health result")?
             > 0
             || health["strandedDispatches"]
+                .as_i64()
+                .ok_or("invalid health result")?
+                > 0
+        {
+            std::process::exit(2);
+        }
+    } else if args.len() == 3 && args[0] == "check-queue" {
+        let health =
+            novu_postgres_queue::reconciliation::queue_health(&db, &args[1], args[2].parse()?)
+                .await?;
+        println!("{}", serde_json::to_string(&health)?);
+        if health["overdueJobs"]
+            .as_i64()
+            .ok_or("invalid health result")?
+            > 0
+            || health["expiredLeases"]
                 .as_i64()
                 .ok_or("invalid health result")?
                 > 0

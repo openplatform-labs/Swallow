@@ -213,6 +213,82 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     db.execute("DELETE FROM novu_queue_jobs WHERE id=$1", &[&stranded])
         .await
         .unwrap();
+    let overdue = Uuid::new_v4();
+    let future = Uuid::new_v4();
+    let expired = Uuid::new_v4();
+    for id in [overdue, future, expired] {
+        queue::enqueue(
+            &db,
+            id,
+            "tenant-queue",
+            queue::sendgrid_queue::JOB_KIND,
+            &json!({}),
+        )
+        .await
+        .unwrap();
+    }
+    db.execute("UPDATE novu_queue_jobs SET available_at=clock_timestamp()-interval '10 minutes' WHERE id=$1", &[&overdue]).await.unwrap();
+    db.execute(
+        "UPDATE novu_queue_jobs SET available_at=clock_timestamp()+interval '1 hour' WHERE id=$1",
+        &[&future],
+    )
+    .await
+    .unwrap();
+    db.execute("UPDATE novu_queue_jobs SET status='running',lease_token=$2,lease_until=clock_timestamp()-interval '1 second' WHERE id=$1", &[&expired,&Uuid::new_v4()]).await.unwrap();
+    let result = reconciliation::queue_health(&db, "tenant-queue", 300)
+        .await
+        .unwrap();
+    assert_eq!(result["overdueJobs"], 1);
+    assert_eq!(result["expiredLeases"], 1);
+    assert!(result["oldestOverdueAvailableAt"].is_string());
+    assert!(result["oldestExpiredLeaseAt"].is_string());
+    assert_eq!(
+        reconciliation::queue_health(&db, "tenant-b", 300)
+            .await
+            .unwrap()["overdueJobs"],
+        0
+    );
+    assert!(
+        reconciliation::queue_health(&db, "tenant-queue", 0)
+            .await
+            .is_err()
+    );
+    assert!(
+        reconciliation::queue_health(&db, "tenant-queue", 86401)
+            .await
+            .is_err()
+    );
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .args(["check-queue", "tenant-queue", "300"])
+        .env("DATABASE_URL", &url)
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        result
+    );
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .args(["check-queue", "tenant-b", "300"])
+        .env("DATABASE_URL", &url)
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .args(["check-queue", "tenant-queue", "0"])
+        .env("DATABASE_URL", &url)
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    db.execute(
+        "DELETE FROM novu_queue_jobs WHERE id=ANY($1)",
+        &[&vec![overdue, future, expired]],
+    )
+    .await
+    .unwrap();
     db.execute(
         "UPDATE novu_queue_jobs SET last_error='push delivery outcome unknown' WHERE id=$1",
         &[&push],
