@@ -1,6 +1,6 @@
 // Engine.IO/Socket.IO protocol test using Node's built-in WebSocket, no provider traffic.
 const {createHmac} = require('crypto');
-const {spawnSync} = require('child_process');
+const {spawn,spawnSync} = require('child_process');
 const assert = require('assert/strict');
 const wait = ms => new Promise(r => setTimeout(r,ms));
 const tokenPart=x=>Buffer.from(JSON.stringify(x)).toString('base64url');
@@ -70,6 +70,24 @@ async function until(fn,message,timeout=4000){for(let i=0;i<timeout/25;i++){if(f
   sql("BEGIN; INSERT INTO novu_rust_ws_events(id,environment_id,subscriber_internal_id,event,data) VALUES ('00000000-0000-4000-8000-000000000001','env-a','subscriber-id','missing_probe','{}'); DELETE FROM novu_rust_ws_events WHERE id='00000000-0000-4000-8000-000000000001'; COMMIT");
   await until(()=>restored.messages.some(x=>x.startsWith('41'))||restored.closed,'missing event did not disconnect guarded socket');
   assert(!legacy.closed && !legacy.messages.some(x=>x.startsWith('41')),'default socket closed for missing event');
+  // A connected PostgreSQL backend can remain blocked without a connection error.
+  // Notify an already committed event while a different session holds an exclusive lock.
+  for(let i=0;i<100;i++){if((await fetch(`http://127.0.0.1:${process.env.GUARDED_PORT}/health/ready`)).status===204)break;await wait(50);if(i===99)throw Error('missing-event recovery did not complete');}
+  const timed=await open(process.env.GUARDED_PORT);await wait(150);
+  sql("INSERT INTO novu_rust_ws_events(id,environment_id,subscriber_internal_id,event,data) VALUES ('00000000-0000-4000-8000-000000000002','env-a','subscriber-id','timeout_fixture','{}')");
+  await until(()=>timed.messages.some(x=>x.includes('timeout_fixture')),'pre-lock event did not arrive');
+  const locker=spawn('docker',['exec',process.env.PG_CONTAINER,'psql','-q','-v','ON_ERROR_STOP=1','-U','postgres','-d','novu_ws_gap','-c',"SET application_name='novu-gap-locker'; BEGIN; LOCK TABLE novu_rust_ws_events IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(30); COMMIT"],{stdio:'ignore'});
+  await until(()=>sql("SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON l.pid=a.pid WHERE a.application_name='novu-gap-locker' AND l.relation='novu_rust_ws_events'::regclass AND l.mode='AccessExclusiveLock' AND l.granted")==='1','test lock not acquired');
+  sql("SELECT pg_notify('novu_rust_ws_events','00000000-0000-4000-8000-000000000002')");
+  await until(()=>timed.messages.some(x=>x.startsWith('41'))||timed.closed,'timed-out event did not disconnect guarded socket',5000);
+  assert.equal((await fetch(`http://127.0.0.1:${process.env.GUARDED_PORT}/health/ready`)).status,503,'timed-out lookup did not mark instance unready');
+  const timeoutBlocked=await open(process.env.GUARDED_PORT);await until(()=>timeoutBlocked.messages.some(x=>x.startsWith('41'))||timeoutBlocked.closed,'new socket admitted after timed-out lookup',700);timeoutBlocked.ws.close();
+  assert(!legacy.closed && !legacy.messages.some(x=>x.startsWith('41')),'default mode disconnected on lookup timeout');
+  sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name='novu-gap-locker'");locker.kill();
+  for(let i=0;i<150;i++){if((await fetch(`http://127.0.0.1:${process.env.GUARDED_PORT}/health/ready`)).status===204)break;await wait(50);if(i===149)throw Error('timed-out event probe did not recover');}
+  const timeoutRecovered=await open(process.env.GUARDED_PORT);await wait(150);
+  sql("INSERT INTO novu_rust_ws_events(environment_id,subscriber_internal_id,event,data) VALUES ('env-a','subscriber-id','after_timeout','{}')");
+  await until(()=>timeoutRecovered.messages.some(x=>x.includes('after_timeout')),'delivery failed after timeout recovery');timeoutRecovered.ws.close();timed.ws.close();
   restored.ws.close();resumed.ws.close();legacy.ws.close();guarded.ws.close();
   console.log('listener and event query failures close guarded sockets, preserve default, and recover');
 })().catch(e=>{console.error(e);process.exitCode=1});

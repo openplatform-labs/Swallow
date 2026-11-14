@@ -623,6 +623,28 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if probe_event_recovery && !disconnect_on_gap {
         return Err("probe event recovery requires NOVU_WS_DISCONNECT_ON_EVENT_GAP=true".into());
     }
+    // Optional timeout covers the whole event lookup and emission path. The
+    // guarded probe must succeed before accepting new sockets after a timeout.
+    let event_timeout = match std::env::var("NOVU_WS_EVENT_LOOKUP_TIMEOUT_SECONDS") {
+        Err(std::env::VarError::NotPresent) => None,
+        Ok(value) => {
+            let seconds: u64 = value
+                .parse()
+                .map_err(|_| "NOVU_WS_EVENT_LOOKUP_TIMEOUT_SECONDS must be between 1 and 300")?;
+            if !(1..=300).contains(&seconds) {
+                return Err(
+                    "NOVU_WS_EVENT_LOOKUP_TIMEOUT_SECONDS must be between 1 and 300".into(),
+                );
+            }
+            if !disconnect_on_gap || !probe_event_recovery {
+                return Err(
+                    "event lookup timeout requires disconnect-on-gap and probe recovery".into(),
+                );
+            }
+            Some(std::time::Duration::from_secs(seconds))
+        }
+        Err(_) => return Err("NOVU_WS_EVENT_LOOKUP_TIMEOUT_SECONDS must be valid Unicode".into()),
+    };
     // Even generations mean LISTEN is active. Every outage changes the generation,
     // including an outage that ends while a socket is being registered.
     let listener_generation = Arc::new(AtomicU64::new(0));
@@ -669,7 +691,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         while let Some(event) = event_rx.recv().await {
             match event {
                 ListenerEvent::Delivery(id) => {
-                    if let Err(error) = deliver_event(&events_db, &events_io, id).await {
+                    let result = if let Some(timeout) = event_timeout {
+                        match tokio::time::timeout(
+                            timeout,
+                            deliver_event(&events_db, &events_io, id),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => Err("socket event processing timed out".into()),
+                        }
+                    } else {
+                        deliver_event(&events_db, &events_io, id).await
+                    };
+                    if let Err(error) = result {
                         eprintln!("socket event delivery failed: {error}");
                         if disconnect_on_gap {
                             // Preserve odd/even listener availability, while invalidating
