@@ -16,6 +16,7 @@ mod sendgrid_webhook;
 mod slack_endpoints;
 mod slack_integrations;
 mod slack_workflow_management;
+mod subscriber_conditional;
 mod subscriber_credentials;
 mod subscriber_jwt;
 mod subscriber_subscriptions;
@@ -385,6 +386,7 @@ fn router_with_webhook_configs_and_jwt_policy(
             axum::routing::patch(update_online_status),
         )
         .route("/v1/subscribers/{subscriber_id}", get(get_subscriber_v1))
+        .route("/v1/experimental/subscribers/{subscriber_id}", get(subscriber_conditional::get).patch(subscriber_conditional::patch).delete(subscriber_conditional::delete))
         .route(
             "/v2/subscribers/{subscriber_id}/subscriptions",
             get(subscriber_subscriptions::list),
