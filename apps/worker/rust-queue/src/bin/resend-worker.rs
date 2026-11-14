@@ -21,20 +21,66 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         sender_name: std::env::var("NOVU_RESEND_SENDER_NAME").unwrap_or_default(),
     })?;
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
-    let (mut db, connection) = config.connect(tls).await?;
-    tokio::spawn(async move {
-        if connection.await.is_err() {
-            eprintln!("Resend worker database connection failed");
-        }
-    });
-    let mut next_recovery = tokio::time::Instant::now();
+    let timeout = match std::env::var("NOVU_RESEND_DB_TIMEOUT_SECONDS") {
+        Ok(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|n| (1..=300).contains(n))
+            .ok_or("invalid Resend database timeout")?,
+        Err(std::env::VarError::NotPresent) => 30,
+        Err(_) => return Err("invalid Resend database timeout".into()),
+    };
+    let timeout = Duration::from_secs(timeout);
     loop {
-        if tokio::time::Instant::now() >= next_recovery {
-            resend_queue::recover_expired(&mut db, &environment).await?;
-            next_recovery = tokio::time::Instant::now() + Duration::from_secs(5);
+        let connection = tokio::time::timeout(timeout, config.connect(tls.clone())).await;
+        if let Ok(Ok((mut db, driver))) = connection {
+            let task = tokio::spawn(driver);
+            let statement_timeout = format!("{}ms", timeout.as_millis());
+            let configured = matches!(
+                tokio::time::timeout(
+                    timeout,
+                    db.query_one(
+                        "SELECT set_config('statement_timeout',$1,false)",
+                        &[&statement_timeout]
+                    )
+                )
+                .await,
+                Ok(Ok(_))
+            );
+            let mut recovery = tokio::time::Instant::now();
+            if configured {
+                loop {
+                    if tokio::time::Instant::now() >= recovery {
+                        if !matches!(
+                            tokio::time::timeout(
+                                timeout,
+                                resend_queue::recover_expired(&mut db, &environment)
+                            )
+                            .await,
+                            Ok(Ok(_))
+                        ) {
+                            break;
+                        }
+                        recovery = tokio::time::Instant::now() + Duration::from_secs(5);
+                    }
+                    match tokio::time::timeout(
+                        timeout,
+                        resend_queue::process_one(&mut db, &environment, &provider),
+                    )
+                    .await
+                    {
+                        Ok(Ok(true)) => {}
+                        Ok(Ok(false)) => tokio::time::sleep(resend_queue::POLL_INTERVAL).await,
+                        _ => break,
+                    }
+                }
+            }
+            // Dropping the client alone can leave the driver running while a
+            // cancelled transaction waits on the server. Abort it before retry.
+            task.abort();
+            let _ = task.await;
         }
-        if !resend_queue::process_one(&mut db, &environment, &provider).await? {
-            tokio::time::sleep(resend_queue::POLL_INTERVAL).await;
-        }
+        eprintln!("Resend worker database operation stopped; reconnecting");
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
