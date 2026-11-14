@@ -1,8 +1,8 @@
 import { InMemoryWebStorage, UserManager, WebStorageStateStore, type OidcMetadata } from 'oidc-client-ts';
-import { createRemoteJWKSet, customFetch, jwtVerify } from 'jose';
+import { createRemoteJWKSet, customFetch, decodeJwt, jwtVerify } from 'jose';
 
 export type OidcSettings = { issuer: string; clientId: string; scope: string; resource: string; audience: string; apiOrigin: string; environmentId: string };
-export type VerifiedSession = { token: string; subject: string; environmentId: string };
+export type VerifiedSession = { token: string; subject: string; environmentId: string; expiresAt: number };
 export type PreparedOidc = { settings: OidcSettings; metadata: Partial<OidcMetadata> };
 
 function secureUrl(value: string, allowPath: boolean): URL {
@@ -47,7 +47,13 @@ export class OperatorOidc {
       if (!response.ok) throw new Error('operator access denied');
       const identity: unknown=await response.json();
       if (typeof identity!=='object' || identity===null || !('issuer' in identity) || identity.issuer!==settings.issuer || !('environmentId' in identity) || identity.environmentId!==settings.environmentId || !('clientId' in identity) || identity.clientId!==settings.clientId || !('subject' in identity) || typeof identity.subject!=='string' || !identity.subject || payload.sub!==identity.subject) throw new Error('identity mismatch');
-      return {token:user.access_token,subject:identity.subject,environmentId:settings.environmentId};
+      // The API has validated the access token. Its exp is used here only to
+      // clear the local session; authorization remains entirely server-side.
+      const exp=decodeJwt(user.access_token).exp;
+      if (typeof exp!=='number' || !Number.isSafeInteger(exp) || exp<=Math.floor(Date.now()/1000)) throw new Error('invalid token expiry');
+      const expiresAt=typeof user.expires_at==='number' && Number.isFinite(user.expires_at) ? Math.min(exp,user.expires_at) : exp;
+      if (expiresAt<=Date.now()/1000) throw new Error('invalid token expiry');
+      return {token:user.access_token,subject:identity.subject,environmentId:settings.environmentId,expiresAt};
     } finally { await manager.removeUser(); }
   }
 }

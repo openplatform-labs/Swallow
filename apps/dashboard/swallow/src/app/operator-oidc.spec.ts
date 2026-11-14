@@ -4,6 +4,7 @@ import { UserManager, type User } from 'oidc-client-ts';
 import { SignJWT, exportJWK, generateKeyPair } from 'jose';
 
 const settings: OidcSettings={issuer:'https://issuer.test',clientId:'console',scope:'openid',resource:'',audience:'',apiOrigin:'https://api.test',environmentId:'env'};
+const accessToken=`${btoa('{}')}.${btoa(JSON.stringify({exp:Math.floor(Date.now()/1000)+600}))}.signature`;
 const metadata={issuer:'https://issuer.test',authorization_endpoint:'https://issuer.test/authorize',token_endpoint:'https://issuer.test/token',jwks_uri:'https://issuer.test/jwks',code_challenge_methods_supported:['S256']};
 describe('operator OIDC configuration',()=>{
   afterEach(()=>vi.restoreAllMocks());
@@ -26,20 +27,20 @@ describe('operator OIDC configuration',()=>{
   it('accepts a session only when the API-verified identity matches the selected client',async()=>{
     const {privateKey,publicKey}=await generateKeyPair('RS256');
     const jwk={...(await exportJWK(publicKey)),kid:'test',alg:'RS256',use:'sig'};
-    vi.spyOn(UserManager.prototype,'signinPopup').mockImplementation(async args=>({expired:false,token_type:'Bearer',access_token:'aaa.bbb.ccc',id_token:await new SignJWT({nonce:args?.nonce}).setProtectedHeader({alg:'RS256',kid:'test'}).setIssuer('https://issuer.test').setAudience('console').setSubject('alice').setIssuedAt().setExpirationTime('1m').sign(privateKey),profile:{sub:'alice'}} as User));
+    vi.spyOn(UserManager.prototype,'signinPopup').mockImplementation(async args=>({expired:false,token_type:'Bearer',access_token:accessToken,id_token:await new SignJWT({nonce:args?.nonce}).setProtectedHeader({alg:'RS256',kid:'test'}).setIssuer('https://issuer.test').setAudience('console').setSubject('alice').setIssuedAt().setExpirationTime('1m').sign(privateKey),profile:{sub:'alice'}} as User));
     const remove=vi.spyOn(UserManager.prototype,'removeUser').mockResolvedValue();
     const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({keys:[jwk]}),{status:200})).mockResolvedValueOnce(new Response(JSON.stringify({issuer:'https://issuer.test',subject:'alice',clientId:'other',environmentId:'env'}),{status:200}));
     const service=new OperatorOidc(); const prepared={settings,metadata};
     await expect(service.signIn(prepared)).rejects.toThrow('identity mismatch');
     fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({keys:[jwk]}),{status:200})).mockResolvedValueOnce(new Response(JSON.stringify({issuer:'https://issuer.test',subject:'alice',clientId:'console',environmentId:'env'}),{status:200}));
-    expect(await service.signIn(prepared)).toEqual({token:'aaa.bbb.ccc',subject:'alice',environmentId:'env'});
+    expect(await service.signIn(prepared)).toEqual({token:accessToken,subject:'alice',environmentId:'env',expiresAt:JSON.parse(atob(accessToken.split('.')[1])).exp});
     expect(remove).toHaveBeenCalledTimes(2);
   });
   it('rejects an identity token signed by an untrusted key before calling the API',async()=>{
     const trusted=await generateKeyPair('RS256');
     const attacker=await generateKeyPair('RS256');
     const jwk={...(await exportJWK(trusted.publicKey)),kid:'test',alg:'RS256',use:'sig'};
-    vi.spyOn(UserManager.prototype,'signinPopup').mockImplementation(async args=>({expired:false,token_type:'Bearer',access_token:'aaa.bbb.ccc',id_token:await new SignJWT({nonce:args?.nonce}).setProtectedHeader({alg:'RS256',kid:'test'}).setIssuer(settings.issuer).setAudience(settings.clientId).setSubject('alice').setIssuedAt().setExpirationTime('1m').sign(attacker.privateKey)} as User));
+    vi.spyOn(UserManager.prototype,'signinPopup').mockImplementation(async args=>({expired:false,token_type:'Bearer',access_token:accessToken,id_token:await new SignJWT({nonce:args?.nonce}).setProtectedHeader({alg:'RS256',kid:'test'}).setIssuer(settings.issuer).setAudience(settings.clientId).setSubject('alice').setIssuedAt().setExpirationTime('1m').sign(attacker.privateKey)} as User));
     vi.spyOn(UserManager.prototype,'removeUser').mockResolvedValue();
     const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValue(new Response(JSON.stringify({keys:[jwk]}),{status:200}));
     await expect(new OperatorOidc().signIn({settings,metadata})).rejects.toThrow();

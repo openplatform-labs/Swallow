@@ -1,4 +1,4 @@
-import { Component, signal } from '@angular/core';
+import { Component, OnDestroy, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { ClrAlertModule } from '@clr/angular/emphasis/alert';
 import { OperatorOidc, type PreparedOidc, type VerifiedSession } from './operator-oidc';
@@ -18,7 +18,7 @@ type Section = 'overview' | 'workflows' | 'subscribers' | 'channels' | 'activity
   styleUrl: './app.css',
   templateUrl: './app.html',
 })
-export class App {
+export class App implements OnDestroy {
   readonly sections: { id: Section; label: string; short: string }[] = [
     { id: 'overview', label: '개요', short: 'OV' },
     { id: 'workflows', label: '워크플로', short: 'WF' },
@@ -89,15 +89,42 @@ export class App {
   oidcResource = '';
   oidcAudience = '';
   oidcEnvironment = '';
-  readonly oidcStatus = signal<'idle' | 'preparing' | 'ready' | 'signing' | 'signed-in' | 'error'>('idle');
+  readonly oidcStatus = signal<'idle' | 'preparing' | 'ready' | 'signing' | 'signed-in' | 'expired' | 'error'>('idle');
   readonly oidcSubject = signal('');
   private oidcPrepared: PreparedOidc | null = null;
   private oidcSession: VerifiedSession | null = null;
   private oidcSequence = 0;
+  private oidcExpiryTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly oidc = new OperatorOidc();
+
+  ngOnDestroy(): void {
+    this.oidcSequence++;
+    if (this.oidcExpiryTimer !== null) clearTimeout(this.oidcExpiryTimer);
+    this.oidcExpiryTimer = null;
+    this.oidcSession = null;
+  }
+
+  private expireOidcIfNeeded(): boolean {
+    const session=this.oidcSession;
+    if (!session || Date.now() < session.expiresAt*1000) return false;
+    if (this.oidcExpiryTimer !== null) clearTimeout(this.oidcExpiryTimer);
+    this.oidcExpiryTimer=null; this.oidcSession=null; this.oidcSubject.set(''); this.oidcStatus.set('expired');
+    // Preserve decision outcome and request ID, including an in-flight or uncertain decision.
+    if (this.apiKey===session.token) this.apiKey='';
+    if (this.alertKey===session.token) this.alertKey='';
+    return true;
+  }
+
+  private scheduleOidcExpiry(): void {
+    if (!this.oidcSession || this.expireOidcIfNeeded()) return;
+    const delay=Math.min(2147483647, Math.max(1, this.oidcSession.expiresAt*1000-Date.now()));
+    this.oidcExpiryTimer=setTimeout(()=>{ this.oidcExpiryTimer=null; this.scheduleOidcExpiry(); },delay);
+  }
 
   resetOidc(): void {
     if (this.decisionStatus() === 'sending') return;
+    if (this.oidcExpiryTimer !== null) clearTimeout(this.oidcExpiryTimer);
+    this.oidcExpiryTimer=null;
     this.oidcSequence++; this.oidcPrepared = null; this.oidcSession = null;
     this.oidcStatus.set('idle'); this.oidcSubject.set('');
     this.forgetKey(); this.forgetAlertKey();
@@ -119,11 +146,12 @@ export class App {
     try {
       const session=await this.oidc.signIn(prepared);
       if (sequence !== this.oidcSequence) return;
-      this.oidcSession=session; this.oidcSubject.set(session.subject); this.oidcStatus.set('signed-in');
+      this.oidcSession=session; this.oidcSubject.set(session.subject); this.oidcStatus.set('signed-in'); this.scheduleOidcExpiry();
     } catch { if (sequence === this.oidcSequence) this.oidcStatus.set('error'); }
   }
 
   useOidc(section: 'subscribers' | 'alerts'): void {
+    this.expireOidcIfNeeded();
     if (!this.oidcSession || this.decisionStatus() === 'sending') return;
     const session=this.oidcSession;
     this.setSection(section);
@@ -404,6 +432,7 @@ export class App {
 
   async loadAlerts(direction?: 'next' | 'previous'): Promise<void> {
     if (this.decisionStatus() === 'sending') return;
+    this.expireOidcIfNeeded();
     this.clearDecision();
     if (direction === 'previous' && this.alertPage() <= 1) return;
     const cursor = direction === 'next' ? this.alertNext() : direction === 'previous' ? this.alertHistory[this.alertPage() - 2] : null;
@@ -470,6 +499,7 @@ export class App {
   }
 
   async loadSubscribers(direction?: 'after' | 'before'): Promise<void> {
+    this.expireOidcIfNeeded();
     const cursor = direction === 'after' ? this.nextCursor() : direction === 'before' ? this.previousCursor() : null;
     if (direction && !cursor) return;
     const id = ++this.subscriberRequestId;

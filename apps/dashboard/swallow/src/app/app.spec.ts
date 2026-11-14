@@ -4,11 +4,37 @@ import { App } from './app';
 import { OperatorOidc } from './operator-oidc';
 
 describe('Swallow console', () => {
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
+
+  it('expires the popup token without losing an uncertain decision or a different credential', async () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));
+    vi.spyOn(OperatorOidc.prototype,'signIn').mockResolvedValue({token:'aaa.bbb.ccc',subject:'alice',environmentId:'env-a',expiresAt:Math.floor(Date.now()/1000)+2});
+    const fixture=TestBed.createComponent(App); const app=fixture.componentInstance;
+    app.oidcIssuer='https://issuer.test';app.oidcClientId='console';app.oidcEnvironment='env-a';
+    await app.prepareOidc();await app.signInOidc();app.useOidc('alerts');
+    app.apiKey='different.credential.value';app.decisionStatus.set('unknown');app.decisionRequestId.set('retained-request');
+    vi.advanceTimersByTime(2000);
+    expect(app.oidcStatus()).toBe('expired');expect(app.oidcSubject()).toBe('');expect(app.alertKey).toBe('');
+    expect(app.apiKey).toBe('different.credential.value');expect(app.decisionStatus()).toBe('unknown');expect(app.decisionRequestId()).toBe('retained-request');
+    app.useOidc('alerts');expect(app.alertKey).toBe('');
+    fixture.destroy();
+  });
+
+  it('checks expiry before applying a session even if the browser delayed its timer', async () => {
+    vi.useFakeTimers();vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));
+    vi.spyOn(OperatorOidc.prototype,'signIn').mockResolvedValue({token:'aaa.bbb.ccc',subject:'alice',environmentId:'env-a',expiresAt:Math.floor(Date.now()/1000)+2});
+    const fixture=TestBed.createComponent(App);const app=fixture.componentInstance;
+    app.oidcIssuer='https://issuer.test';app.oidcClientId='console';app.oidcEnvironment='env-a';
+    await app.prepareOidc();await app.signInOidc();vi.setSystemTime(new Date('2026-01-01T00:00:03Z'));
+    app.useOidc('subscribers');expect(app.oidcStatus()).toBe('expired');expect(app.apiKey).toBe('');
+    fixture.destroy();
+  });
 
   it('uses an operator session only after login and removes it on local logout', async () => {
     vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));
-    vi.spyOn(OperatorOidc.prototype,'signIn').mockResolvedValue({token:'aaa.bbb.ccc',subject:'alice',environmentId:'env-a'});
+    vi.spyOn(OperatorOidc.prototype,'signIn').mockResolvedValue({token:'aaa.bbb.ccc',subject:'alice',environmentId:'env-a',expiresAt:Math.floor(Date.now()/1000)+600});
     const app=TestBed.createComponent(App).componentInstance;
     app.oidcIssuer='https://issuer.test'; app.oidcClientId='console'; app.oidcEnvironment='env-a';
     await app.prepareOidc(); expect(app.oidcStatus()).toBe('ready');
@@ -21,12 +47,12 @@ describe('Swallow console', () => {
 
   it('ignores a login result after settings or API address change', async () => {
     vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));
-    let finish!: (session:{token:string;subject:string;environmentId:string})=>void;
+    let finish!: (session:{token:string;subject:string;environmentId:string;expiresAt:number})=>void;
     vi.spyOn(OperatorOidc.prototype,'signIn').mockReturnValue(new Promise(done=>{finish=done;}));
     const app=TestBed.createComponent(App).componentInstance;
     app.oidcIssuer='https://issuer.test';app.oidcClientId='console';app.oidcEnvironment='env-a';
     await app.prepareOidc();const pending=app.signInOidc();app.connectionChanged();
-    finish({token:'aaa.bbb.ccc',subject:'alice',environmentId:'env-a'});await pending;
+    finish({token:'aaa.bbb.ccc',subject:'alice',environmentId:'env-a',expiresAt:Math.floor(Date.now()/1000)+600});await pending;
     expect(app.oidcStatus()).toBe('idle');expect(app.oidcSubject()).toBe('');app.useOidc('alerts');expect(app.alertKey).toBe('');
   });
 
