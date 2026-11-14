@@ -31,6 +31,7 @@ GRANT USAGE ON SCHEMA public TO ui_resend_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_result(text,text,text,text,bigint,uuid) TO ui_resend_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_jobs(text,text,text,text,bigint,uuid) TO ui_resend_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_read(text,text,text,text,bigint,text,text),public.novu_rust_operator_jwt_workflow_write(text,text,text,text,bigint,text,text,jsonb,jsonb,text) TO ui_resend_fixture;
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_audit_read(text,text,text,text,bigint,text,text,uuid) TO ui_resend_fixture;
 GRANT SELECT ON public.novu_rust_users,public.novu_rust_api_keys,public.novu_rust_workflows TO ui_resend_fixture;
 GRANT UPDATE(email_subject,email_html,email_step_active,sms_content,sms_step_active,push_title,push_content,push_step_active,chat_content,chat_step_active) ON public.novu_rust_workflows TO ui_resend_fixture;
 GRANT INSERT ON public.novu_rust_channel_workflow_audit,public.novu_rust_slack_workflow_audit TO ui_resend_fixture;
@@ -49,6 +50,7 @@ INSERT INTO public.novu_rust_workflow_provider_permissions SELECT encode(sha256(
 INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname='ui_resend_fixture';
 INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
 INSERT INTO public.novu_rust_operator_jwt_workflow_grants SELECT 'https://issuer.test','ui-fixture','console','ui-fixture-env',resource,permission FROM unnest(ARRAY['email','sms','push','slack','email-provider']) resource CROSS JOIN unnest(ARRAY['read','write']) permission;
+INSERT INTO public.novu_rust_operator_jwt_workflow_audit_grants VALUES('https://issuer.test','ui-fixture','console','ui-fixture-env');
 INSERT INTO public.novu_rust_operator_jwt_resend_result_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
 INSERT INTO public.novu_rust_operator_jwt_resend_jobs_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
 INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES ('1889f88e-c0a3-4ab5-b861-2fdc1f26f254','ui-fixture-env','experimental_resend_email','{}','completed');

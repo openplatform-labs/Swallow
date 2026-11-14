@@ -47,6 +47,7 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_alerts(text,text,text,text,bigint,text,text),public.novu_rust_console_alerts_page(text,text,text),public.novu_rust_operator_jwt_resend_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_resend_jobs(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_read(text,text,text,text,bigint,text,text) TO {role}")).await.unwrap();
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_write(text,text,text,text,bigint,text,text,jsonb,jsonb,text) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_audit_read(text,text,text,text,bigint,text,text,uuid) TO {role}")).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname::text=$1",&[&role]).await.unwrap();
     db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id,alert_read) VALUES('https://issuer.test','person','console','jwt-alert-a',true),('https://issuer.test','reader','console','jwt-alert-a',false); INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state,attempt_id) SELECT 'jwt-alert-a','slack','target-'||lpad(n::text,3,'0'),'unknown',gen_random_uuid() FROM generate_series(1,101) n; INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES('jwt-alert-b','email','private','unknown')").await.unwrap();
     db.batch_execute("WITH c AS (INSERT INTO public.novu_rust_console_credentials(token_hash,environment_id,expires_at,subscriber_read) VALUES(encode(sha256(convert_to(repeat('a',64),'UTF8')),'hex'),'jwt-alert-a',clock_timestamp()+interval '1 hour',false) RETURNING credential_id) INSERT INTO public.novu_rust_console_alert_grants SELECT credential_id FROM c").await.unwrap();
@@ -73,6 +74,14 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     assert!(
         api.query(
             "SELECT * FROM public.novu_rust_operator_jwt_workflow_grants",
+            &[]
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        api.query(
+            "SELECT * FROM public.novu_rust_operator_jwt_workflow_audit",
             &[]
         )
         .await
@@ -355,6 +364,106 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
             .status(),
         StatusCode::UNAUTHORIZED
     );
+    let audit_request = |jwt: &str, query: &str| {
+        Request::builder()
+            .uri(format!("/v1/experimental/operator/workflow-audit?{query}"))
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let audit_query = "environmentId=jwt-alert-a&workflow=wf&resource=email";
+    assert_eq!(
+        app.clone()
+            .oneshot(audit_request(&token, audit_query))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_workflow_audit_grants VALUES('https://issuer.test','person','console','jwt-alert-a'); INSERT INTO public.novu_rust_operator_jwt_workflow_audit(environment_id,workflow_identifier,resource,issuer,subject,client_id,database_principal,reason) SELECT 'jwt-alert-a','wf','email','https://issuer.test','test-actor','console',session_user,'fixture' FROM generate_series(1,51); INSERT INTO public.novu_rust_operator_jwt_workflow_audit(environment_id,workflow_identifier,resource,issuer,subject,client_id,database_principal,reason) VALUES ('jwt-alert-b','wf','email','secret-issuer','other','console',session_user,'private')").await.unwrap();
+    let response = app
+        .clone()
+        .oneshot(audit_request(&token, audit_query))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let first: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(first["data"].as_array().unwrap().len(), 50);
+    assert_eq!(first["hasMore"], true);
+    let cursor = first["next"].as_str().unwrap();
+    let response = app
+        .clone()
+        .oneshot(audit_request(
+            &token,
+            &format!("{audit_query}&after={cursor}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let second: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(second["data"].as_array().unwrap().len(), 2);
+    assert_eq!(second["hasMore"], false);
+    assert!(second["next"].is_null());
+    let ids: Vec<&str> = first["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(second["data"].as_array().unwrap())
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.windows(2).all(|x| x[0] < x[1]));
+    assert!(
+        !first.to_string().contains("New email") && !first.to_string().contains("secret-issuer")
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(audit_request(&make("reader"), audit_query))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(audit_request(
+                &token,
+                "environmentId=jwt-alert-b&workflow=wf&resource=email"
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(audit_request(&token, &format!("{audit_query}&after=bad")))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let tx = workflow_revoker.transaction().await.unwrap();
+    tx.batch_execute(
+        "DELETE FROM public.novu_rust_operator_jwt_workflow_audit_grants WHERE subject='person'",
+    )
+    .await
+    .unwrap();
+    let req = audit_request(&token, audit_query);
+    let pending = tokio::spawn({
+        let app = app.clone();
+        async move { app.oneshot(req).await.unwrap().status() }
+    });
+    let mut waiting = false;
+    for _ in 0..100 {
+        if db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%novu_rust_operator_jwt_workflow_audit_read%')",&[]).await.unwrap().get::<_,bool>(0){waiting=true;break;}
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(waiting && !pending.is_finished());
+    tx.commit().await.unwrap();
+    assert_eq!(pending.await.unwrap(), StatusCode::UNAUTHORIZED);
     let job = Uuid::new_v4();
     let tag = Uuid::new_v4();
     novu_postgres_queue::enqueue(

@@ -26,6 +26,7 @@ enum Lookup {
     ResendResult,
     ResendJobs,
     WorkflowRead,
+    WorkflowAudit,
 }
 
 fn authenticate(
@@ -145,6 +146,14 @@ pub(super) async fn workflow_read(
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
 ) -> Response {
     query(db, headers, uri, verifier, Lookup::WorkflowRead).await
+}
+pub(super) async fn workflow_audit(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::WorkflowAudit).await
 }
 
 #[derive(serde::Deserialize)]
@@ -280,6 +289,7 @@ async fn query(
         Lookup::ResendResult => &["environmentId", "jobId"],
         Lookup::ResendJobs => &["environmentId", "after"],
         Lookup::WorkflowRead => &["environmentId", "workflow", "resource"],
+        Lookup::WorkflowAudit => &["environmentId", "workflow", "resource", "after"],
     };
     if params.keys().any(|key| !allowed.contains(&key.as_str()))
         || params.get("limit").is_some_and(|limit| limit != "20")
@@ -288,7 +298,7 @@ async fn query(
     }
     let Some(env) = params
         .get("environmentId")
-        .filter(|env| !env.is_empty() && env.len() <= 512)
+        .filter(|env| !env.is_empty() && env.len() <= 512 && !env.contains('\0'))
     else {
         return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
     };
@@ -296,6 +306,42 @@ async fn query(
         return failure(StatusCode::UNAUTHORIZED, "Unauthorized", "Unauthorized");
     };
     let result = match lookup {
+        Lookup::WorkflowAudit => {
+            let (Some(workflow), Some(resource)) = (params.get("workflow"), params.get("resource"))
+            else {
+                return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+            };
+            if workflow.is_empty()
+                || workflow.len() > 512
+                || workflow.contains('\0')
+                || !["email", "sms", "push", "slack", "email-provider"].contains(&resource.as_str())
+            {
+                return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+            }
+            let after = match params.get("after") {
+                None => None,
+                Some(value) => match Uuid::parse_str(value) {
+                    Ok(v) => Some(v),
+                    Err(_) => {
+                        return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+                    }
+                },
+            };
+            db.query_one(
+                "SELECT public.novu_rust_operator_jwt_workflow_audit_read($1,$2,$3,$4,$5,$6,$7,$8)",
+                &[
+                    &identity.issuer,
+                    &identity.subject,
+                    &identity.client_id,
+                    &env,
+                    &exp,
+                    &workflow,
+                    &resource,
+                    &after,
+                ],
+            )
+            .await
+        }
         Lookup::WorkflowRead => {
             let (Some(workflow), Some(resource)) = (params.get("workflow"), params.get("resource"))
             else {
@@ -303,6 +349,7 @@ async fn query(
             };
             if workflow.is_empty()
                 || workflow.len() > 512
+                || workflow.contains('\0')
                 || !["email", "sms", "push", "slack", "email-provider"].contains(&resource.as_str())
             {
                 return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");

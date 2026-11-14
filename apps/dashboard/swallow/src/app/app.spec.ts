@@ -6,6 +6,22 @@ import { OperatorOidc } from './operator-oidc';
 describe('Swallow console', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
+  it('pages scoped workflow audit entries and retains only the displayed metadata', async () => {
+    const row=(n:number)=>({id:`00000000-0000-0000-0000-${n.toString().padStart(12,'0')}`,workflowIdentifier:'welcome',resource:'email',issuer:'issuer',subject:'alice',clientId:'console',databasePrincipal:'api',reason:'ticket',recordedAt:'today',previousActive:true,newActive:false,previousTitleBytes:1,newTitleBytes:2,previousContentBytes:3,newContentBytes:4,previousProvider:null,newProvider:null,secret:'not displayed'});
+    const first=Array.from({length:50},(_,i)=>row(i+1)),second=[row(51)];
+    const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:first,hasMore:true,next:first[49].id}))).mockResolvedValueOnce(new Response(JSON.stringify({data:second,hasMore:false,next:null}))).mockResolvedValueOnce(new Response(JSON.stringify({data:first,hasMore:true,next:first[49].id})));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('workflows');app.workflowAuthMode='jwt';app.workflowEnvironment='env-a';app.workflowIdentifier='welcome';app.workflowKey='aaa.bbb.ccc';
+    await app.loadWorkflowAudit();expect(app.workflowAuditRows().length).toBe(50);expect(JSON.stringify(app.workflowAuditRows())).not.toContain('not displayed');
+    await app.loadWorkflowAudit('next');expect(app.workflowAuditPage()).toBe(2);expect(new URL(mock.mock.calls[1][0] as string).searchParams.get('after')).toBe(first[49].id);
+    await app.loadWorkflowAudit('previous');expect(app.workflowAuditPage()).toBe(1);app.setSection('overview');expect(app.workflowAuditRows()).toEqual([]);expect(app.workflowKey).toBe('');
+  });
+
+  it('rejects unauthorized audit and ignores late audit responses after credential changes', async () => {
+    let finish!:(response:Response)=>void;vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response('',{status:401})).mockReturnValueOnce(new Promise(done=>{finish=done;}));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('workflows');app.workflowAuthMode='jwt';app.workflowEnvironment='env-a';app.workflowIdentifier='welcome';app.workflowKey='aaa.bbb.ccc';
+    await app.loadWorkflowAudit();expect(app.workflowAuditStatus()).toBe('error');const pending=app.loadWorkflowAudit();app.workflowKey='other.token.value';app.clearWorkflow();finish(new Response(JSON.stringify({data:[],hasMore:false,next:null})));await pending;expect(app.workflowAuditStatus()).toBe('idle');expect(app.workflowAuditRows()).toEqual([]);
+  });
+
   it('reads and writes workflow and email provider using scoped operator JWT', async () => {
     const data={workflowIdentifier:'welcome',channel:'email',title:'title',content:'old',active:true};
     const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data}))).mockResolvedValueOnce(new Response(JSON.stringify({data:{...data,content:'new'}}))).mockResolvedValueOnce(new Response(JSON.stringify({data:{workflowIdentifier:'welcome',provider:'sendgrid'}}))).mockResolvedValueOnce(new Response(JSON.stringify({data:{workflowIdentifier:'welcome',provider:'resend'}})));

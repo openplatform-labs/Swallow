@@ -77,6 +77,19 @@
           }
           <p class="subscriber-hint">선택은 새 워크플로 처리에 적용됩니다. 이미 생성된 작업과 공급자 자격증명은 바뀌지 않습니다. 결과 불명 시 다시 저장하기 전에 현재 설정과 감사 기록을 확인하세요.</p>
         </div></section>
+        @if(workflowAuthMode==='jwt'){
+          <section class="card subscriber-card"><div class="card-block"><div class="card-eyebrow">WORKFLOW AUDIT</div><h2>워크플로 변경 이력</h2><p>위 환경과 식별자를 사용하며 별도의 감사 조회 권한이 필요합니다. UUID순 조회이며 시간순이 아닙니다.</p>
+            <form class="subscriber-form" (ngSubmit)="loadWorkflowAudit()"><div><label for="workflow-audit-resource">대상</label><select id="workflow-audit-resource" name="workflowAuditResource" [(ngModel)]="workflowAuditResource" (ngModelChange)="clearWorkflowAudit()" [disabled]="workflowStatus()==='saving' || providerStatus()==='saving'"><option value="email">이메일</option><option value="sms">SMS</option><option value="push">푸시</option><option value="slack">Slack</option><option value="email-provider">이메일 공급자</option></select></div><button type="submit" class="btn btn-outline" [disabled]="workflowAuditStatus()==='loading' || workflowStatus()==='saving' || providerStatus()==='saving'">이력 조회</button></form>
+            @if(workflowAuditStatus()==='error'){<p class="subscriber-error" role="alert">조회하지 못했습니다. 인증과 감사 조회 권한을 확인하세요.</p>}
+            @else if(workflowAuditStatus()==='loading'){<p role="status">이력을 불러오는 중입니다.</p>}
+            @else if(workflowAuditStatus()==='loaded'){
+              @if(workflowAuditRows().length===0){<p>조회된 기록이 없습니다.</p>}
+              @else{<div class="table-wrap"><table class="table"><thead><tr><th>시각 / 기록 ID</th><th>운영자</th><th>사유</th><th>변경</th></tr></thead><tbody>@for(row of workflowAuditRows();track row.id){<tr><td>{{ row.recordedAt }}<br>{{ row.id }}</td><td>{{ row.issuer }}<br>{{ row.subject }} · {{ row.clientId }}<br>DB: {{ row.databasePrincipal }}</td><td>{{ row.reason }}</td><td>@if(workflowAuditResource==='email-provider'){공급자: {{ row.previousProvider || '—' }} → {{ row.newProvider || '—' }}} @else {활성: {{ row.previousActive === null ? '—' : row.previousActive ? '예' : '아니요' }} → {{ row.newActive === null ? '—' : row.newActive ? '예' : '아니요' }}<br>제목 바이트: {{ row.previousTitleBytes ?? '—' }} → {{ row.newTitleBytes ?? '—' }}<br>내용 바이트: {{ row.previousContentBytes ?? '—' }} → {{ row.newContentBytes ?? '—' }}}</td></tr>}</tbody></table></div>}
+              <div class="pagination"><span>{{ workflowAuditPage() }}페이지 · 조회 시점의 결과</span><button type="button" class="btn btn-sm btn-outline" [disabled]="workflowAuditPage()===1" (click)="loadWorkflowAudit('previous')">이전</button><button type="button" class="btn btn-sm btn-outline" [disabled]="!workflowAuditNext()" (click)="loadWorkflowAudit('next')">다음</button></div>
+            }
+            <p class="subscriber-hint">템플릿 원문은 기록하지 않습니다. 응답 유실 시 현재 설정과 기록을 확인해도 요청의 완료 여부를 항상 확정할 수는 없습니다.</p>
+          </div></section>
+        }
         @if (workflowStatus()==='loaded' || workflowStatus()==='saving') {
           <section class="card decision-card"><div class="card-block"><h2>단계 설정</h2><p>이미 생성된 작업은 이전 템플릿을 사용할 수 있습니다. 활성화는 단계에만 적용되며 워크플로 전체 활성화와 별개입니다.</p>
             <form class="decision-form" (ngSubmit)="saveWorkflow()">

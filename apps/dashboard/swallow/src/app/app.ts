@@ -9,6 +9,7 @@ type AlertSlot = { channel: string; targetId: string; state: string; lastStarted
 type AlertCursor = { channel: string; targetId: string };
 type ResendResult = { jobId:string; jobStatus:string; result:string; attemptState:string|null; providerIdKnown:boolean; providerIdAmbiguous:boolean; autoCorrelated:boolean; autoCorrelationConflict:boolean; autoCorrelatedAt:string|null; lastCompletedScanAt:string|null };
 type WorkflowChannel = 'email'|'sms'|'push'|'slack';
+type WorkflowAudit = {id:string;issuer:string;subject:string;clientId:string;databasePrincipal:string;reason:string;recordedAt:string;previousActive:boolean|null;newActive:boolean|null;previousTitleBytes:number|null;newTitleBytes:number|null;previousContentBytes:number|null;newContentBytes:number|null;previousProvider:string|null;newProvider:string|null};
 type DecisionHistory = { id: string; decision: string; reason: string; createdAt: string };
 type DecisionRequest = { requestId: string; channel: string; targetId: string; attemptId: string; decision: string; reason: string; createdAt: string };
 type RetrySnapshot = { origin: string; endpoint: string; scheme: 'Bearer' | 'SwallowConsole'; requestId: string; channel: string; targetId: string; attemptId: string; decision: string; reason: string; keyHash: string };
@@ -63,6 +64,14 @@ export class App implements OnDestroy {
   private providerExpected:'resend'|'sendgrid'|null=null;
   private providerSequence=0;
   private providerAbort:AbortController|null=null;
+  workflowAuditResource:WorkflowChannel|'email-provider'='email';
+  readonly workflowAuditRows=signal<WorkflowAudit[]>([]);
+  readonly workflowAuditStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');
+  readonly workflowAuditNext=signal<string|null>(null);
+  readonly workflowAuditPage=signal(1);
+  private workflowAuditHistory:(string|null)[]=[null];
+  private workflowAuditSequence=0;
+  private workflowAuditAbort:AbortController|null=null;
   readonly subscribers = signal<Subscriber[]>([]);
   readonly subscriberStatus = signal<'idle' | 'loading' | 'loaded' | 'error'>('idle');
   readonly subscriberError = signal('');
@@ -200,6 +209,7 @@ export class App implements OnDestroy {
     if (this.workflowKey===session.token) {
       this.workflowKey='';this.workflowReason='';this.providerReason='';this.workflowSequence++;this.workflowAbort?.abort();this.workflowAbort=null;
       this.providerSequence++;this.providerAbort?.abort();this.providerAbort=null;
+      this.clearWorkflowAudit();
       if(this.workflowStatus()!=='saving'){this.workflowStatus.set('idle');this.workflowMessage.set('');this.workflowExpected=null;this.workflowTitle='';this.workflowContent='';this.workflowHasContent=false;this.workflowConfirmed=false;}
       if(this.providerStatus()!=='saving'){this.providerStatus.set('idle');this.providerMessage.set('');this.providerExpected=null;this.providerConfirmed=false;}
     }
@@ -429,6 +439,7 @@ export class App implements OnDestroy {
   }
 
   clearWorkflow(clearKey=false): void {
+    this.clearWorkflowAudit();
     this.workflowSequence++;this.workflowAbort?.abort();this.workflowAbort=null;
     this.workflowStatus.set('idle');this.workflowMessage.set('');this.workflowTitle='';this.workflowContent='';this.workflowHasContent=false;this.workflowActive=false;this.workflowConfirmed=false;
     this.workflowExpected=null;
@@ -436,6 +447,41 @@ export class App implements OnDestroy {
     this.providerSequence++;this.providerAbort?.abort();this.providerAbort=null;
     this.providerStatus.set('idle');this.providerMessage.set('');this.providerExpected=null;this.providerConfirmed=false;this.providerChoice='sendgrid';
     if(clearKey){this.workflowKey='';this.workflowIdentifier='';}
+  }
+
+  clearWorkflowAudit():void {
+    this.workflowAuditSequence++;this.workflowAuditAbort?.abort();this.workflowAuditAbort=null;this.workflowAuditRows.set([]);this.workflowAuditStatus.set('idle');this.workflowAuditNext.set(null);this.workflowAuditPage.set(1);this.workflowAuditHistory=[null];
+  }
+
+  async loadWorkflowAudit(direction?:'next'|'previous'):Promise<void> {
+    this.expireOidcIfNeeded();
+    if(this.workflowStatus()==='saving'||this.providerStatus()==='saving'||this.workflowAuthMode!=='jwt')return;
+    if(direction==='previous'&&this.workflowAuditPage()<=1)return;
+    const cursor=direction==='next'?this.workflowAuditNext():direction==='previous'?this.workflowAuditHistory[this.workflowAuditPage()-2]:null;
+    if((direction==='next'&&!cursor)||cursor===undefined)return;
+    const page=direction==='next'?this.workflowAuditPage()+1:direction==='previous'?this.workflowAuditPage()-1:1;
+    const sequence=++this.workflowAuditSequence;this.workflowAuditAbort?.abort();const controller=new AbortController();this.workflowAuditAbort=controller;
+    this.workflowAuditRows.set([]);this.workflowAuditNext.set(null);this.workflowAuditStatus.set('loading');
+    try {
+      this.jwtWorkflowEndpoint(this.workflowAuditResource);const environment=this.workflowEnvironment.trim(),identifier=this.workflowIdentifier.trim(),resource=this.workflowAuditResource;
+      const params=new URLSearchParams({environmentId:environment,workflow:identifier,resource});if(cursor)params.set('after',cursor);
+      const response=await fetch(`${this.validatedOrigin()}/v1/experimental/operator/workflow-audit?${params}`,{headers:{Authorization:this.workflowAuthorization()},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      if(!response.ok)throw new Error('request failed');const value:unknown=await response.json();
+      if(typeof value!=='object'||value===null)throw new Error('invalid response');const result=value as Record<string,unknown>;
+      if(!Array.isArray(result['data'])||result['data'].length>50||typeof result['hasMore']!=='boolean'||!(result['next']===null||typeof result['next']==='string'))throw new Error('invalid response');
+      const rows:WorkflowAudit[]=result['data'].map((value:unknown)=>{
+        if(typeof value!=='object'||value===null)throw new Error('invalid row');const row=value as Record<string,unknown>;
+        const required=['id','issuer','subject','clientId','databasePrincipal','reason','recordedAt'];
+        const nullableBoolean=['previousActive','newActive'], nullableNumber=['previousTitleBytes','newTitleBytes','previousContentBytes','newContentBytes'], nullableString=['previousProvider','newProvider'];
+        if(required.some(k=>typeof row[k]!=='string')||row['workflowIdentifier']!==identifier||row['resource']!==resource||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(row['id'] as string)||nullableBoolean.some(k=>!(row[k]===null||typeof row[k]==='boolean'))||nullableNumber.some(k=>!(row[k]===null||(typeof row[k]==='number'&&Number.isSafeInteger(row[k])&&(row[k] as number)>=0)))||nullableString.some(k=>!(row[k]===null||row[k]==='resend'||row[k]==='sendgrid')))throw new Error('invalid row');
+        return {id:row['id'] as string,issuer:row['issuer'] as string,subject:row['subject'] as string,clientId:row['clientId'] as string,databasePrincipal:row['databasePrincipal'] as string,reason:row['reason'] as string,recordedAt:row['recordedAt'] as string,previousActive:row['previousActive'] as boolean|null,newActive:row['newActive'] as boolean|null,previousTitleBytes:row['previousTitleBytes'] as number|null,newTitleBytes:row['newTitleBytes'] as number|null,previousContentBytes:row['previousContentBytes'] as number|null,newContentBytes:row['newContentBytes'] as number|null,previousProvider:row['previousProvider'] as string|null,newProvider:row['newProvider'] as string|null};
+      });
+      const ids=rows.map(row=>row.id.toLowerCase());
+      if(ids.some((id,i)=>(i>0&&ids[i-1]>=id)||(!!cursor&&id<=cursor.toLowerCase())) || (result['hasMore'] ? rows.length!==50 || typeof result['next']!=='string' || result['next'].toLowerCase()!==ids[ids.length-1] : result['next']!==null))throw new Error('invalid page');
+      this.expireOidcIfNeeded();if(sequence!==this.workflowAuditSequence)return;
+      this.workflowAuditRows.set(rows);this.workflowAuditNext.set(result['next'] as string|null);this.workflowAuditPage.set(page);this.workflowAuditHistory=this.workflowAuditHistory.slice(0,page-1);this.workflowAuditHistory.push(cursor);this.workflowAuditStatus.set('loaded');
+    } catch {this.expireOidcIfNeeded();if(sequence===this.workflowAuditSequence)this.workflowAuditStatus.set('error');}
+    finally {if(sequence===this.workflowAuditSequence)this.workflowAuditAbort=null;}
   }
 
   private providerEndpoint(write=false):string {

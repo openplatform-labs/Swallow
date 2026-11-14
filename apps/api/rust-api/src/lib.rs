@@ -337,6 +337,7 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/operator/resend-result", get(operator_identity::resend_result))
         .route("/v1/experimental/operator/resend-jobs", get(operator_identity::resend_jobs))
         .route("/v1/experimental/operator/workflow", get(operator_identity::workflow_read).put(operator_identity::workflow_write))
+        .route("/v1/experimental/operator/workflow-audit", get(operator_identity::workflow_audit))
         .route("/v1/experimental/operator/alerts/resolve", post(operator_identity::resolve))
         .route("/v1/experimental/operator/alerts/request", get(operator_identity::decision_request))
         .route("/v1/experimental/operator/permissions", get(operator_identity::permission_identity).put(operator_identity::change_permissions))
