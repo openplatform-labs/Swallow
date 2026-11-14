@@ -18,6 +18,10 @@ API 프로세스는 PostgreSQL 접속이 끊기거나 연결 상태 조회가 �
 
 워커 0072는 환경별 DB 로그인에 운영 권한을 부여·회수하는 제한된 경로를 추가한다. 신뢰된 DB 소유자가 0064·0067·0068·0071 이후 0072를 적용하고, `novu_rust_operator_grant_admins`에 환경 ID와 관리자 **DB 로그인명**을 직접 등록한 다음 해당 로그인에 `GRANT EXECUTE ON FUNCTION public.novu_rust_manage_operator_grant(text,text,text,text,text)`를 부여한다. 관리자에게 권한·관리자·감사 테이블 직접 쓰기 권한은 주지 않는다. 관리자 지정·회수 자체는 신뢰된 DB 소유자만 수행한다.
 
+0073 적용 후에는 운영자와 관리자 권한을 로그인 이름과 PostgreSQL 역할 OID에 함께 묶는다. 관리자 초기 등록은 예를 들어 `INSERT INTO public.novu_rust_operator_grant_admins(environment_id,database_principal,principal_oid) SELECT 'ENV',rolname,oid FROM pg_catalog.pg_roles WHERE rolname='ADMIN_LOGIN' AND rolcanlogin;`으로 신뢰된 DB 소유자가 수행한다. 일반 운영자 권한은 위 관리 명령을 사용해 현재 OID로 부여한다. 이름이 같은 계정을 삭제·재생성하면 기존 OID가 일치하지 않아 권한이 거절되며, 관리자가 새 계정에 명시적으로 다시 부여해야 한다. 감사 기록에는 새 변경부터 역할 OID도 남는다. 이름 변경도 별도 재등록이 필요하다.
+
+0073 최초 적용은 **현재 존재하는 LOGIN 역할**을 기준으로 기존 이름을 OID에 연결한다. 이미 이름이 재사용된 과거 이력은 식별할 수 없으므로 배포 전에 기존 권한과 실제 계정을 검토해야 한다. 이름이 없거나 LOGIN이 아닌 기존 항목은 OID가 없어 거절된다. 재적용은 기존 OID를 다시 채우지 않는다. DB 복원·마이그레이션 시 역할 OID가 달라지면 권한을 검토하고 재등록해야 한다. OID는 영구적인 전역 식별자가 아니며 장기간 OID 재사용, 기존 세션, 복원 및 시스템 관리자에 대한 완전한 신원 보장을 제공하지 않는다. 구버전 0068·0071·0072의 함수가 나중에 재적용되면 보호가 사라지므로 0073을 마지막에 적용하고 관련 도구를 모두 교체해야 한다. Docker PostgreSQL에서 기존 역할의 최초 연결, 운영자·관리자 역할 재생성 거절, 재부여와 마이그레이션 재실행을 검증했다. 실제 운영 DB 복원과 장기간 OID 재사용은 미검증이다.
+
 관리자는 `delivery-reconcile operator-grant ENV DB_LOGIN PERMISSION REASON` 또는 `operator-revoke`를 실행한다. 권한은 `retry`, `accepted`, `alert_send`, `alert_retry`, `alert_accepted`, `slack_retry`, `slack_accepted` 중 하나이며 신규 부여 대상은 실제 LOGIN 역할이어야 한다. 변경과 세션 사용자·대상·사유 감사는 한 트랜잭션으로 기록되고, 같은 상태로 반복한 요청은 변경 없이 반환하며 감사 행을 추가하지 않는다. 권한 회수는 해당 권한을 잠근 진행 중 작업이 끝날 때까지 대기하고 이후의 새 작업을 차단한다. 관리자 권한도 작업 중 잠그므로 동시 회수는 진행 중 변경을 기다린다. 사유에는 비밀이나 개인정보를 넣지 않는다. 관리자 계정의 위임 대상과 권한에는 별도 상한이 없으므로 해당 환경에서 모든 열거된 운영 권한을 부여할 수 있다.
 
 이는 DB 로그인 기반의 실험적 위임이며 사용자 SSO·역할 관리 API나 위변조 방지 감사가 아니다. 함수 소유자·스키마·권한 및 감사 테이블을 보호해야 하고 직접 SQL 권한이 있는 계정은 이 경로를 우회할 수 있다. 로그인 공유 시 개인을 식별하지 못한다. Docker PostgreSQL에서 제한된 계정의 환경 격리·직접 쓰기 거절·부여·회수·감사, 작업과 권한 회수의 경합 및 실제 CLI를 검증한다. 운영 DB 배포, 외부 인증 연동과 모든 동시성 사례는 미검증이다.
