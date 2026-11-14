@@ -173,6 +173,7 @@ async fn api_reconnects_without_replaying_requests() {
             .env_remove("JWT_SECRET")
             .env_remove("JWT_SECRET_FILE")
             .env_remove("INBOX_HMAC_KEYS_JSON")
+            .env_remove("INBOX_HMAC_KEYS_JSON_FILE")
             .env_remove("NOVU_RESEND_WEBHOOK_SECRET")
             .env_remove("NOVU_RESEND_WEBHOOK_SECRET_FILE")
             .env_remove("NOVU_TWILIO_WEBHOOK_AUTH_TOKEN")

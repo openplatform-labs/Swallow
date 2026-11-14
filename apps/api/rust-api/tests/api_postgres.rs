@@ -2879,19 +2879,25 @@ async fn trigger_api_contract_inner() {
         let hash = format!("{:x}", Sha256::digest(key.as_bytes()));
         worker.execute("INSERT INTO novu_rust_api_keys (key_hash,environment_id,user_id) VALUES ($1,$2,'test-user')", &[&hash, &environment]).await.unwrap();
     }
-    let session_app = novu_rust_api::router_with_session_keys(
-        db.clone(),
-        Some(secret.to_vec()),
-        [
-            (
-                "env-a".to_string(),
-                vec!["old-key".to_string(), "new-key".to_string()],
-            ),
-            ("env-b".to_string(), vec!["other-key".to_string()]),
-        ]
-        .into_iter()
-        .collect(),
-    );
+    let session_app = if std::env::var_os("TEST_INBOX_HMAC_FILE_CONFIG").is_some() {
+        novu_rust_api::RuntimeConfig::try_from_env()
+            .unwrap()
+            .router(db.clone())
+    } else {
+        novu_rust_api::router_with_session_keys(
+            db.clone(),
+            Some(secret.to_vec()),
+            [
+                (
+                    "env-a".to_string(),
+                    vec!["old-key".to_string(), "new-key".to_string()],
+                ),
+                ("env-b".to_string(), vec!["other-key".to_string()]),
+            ]
+            .into_iter()
+            .collect(),
+        )
+    };
     let session_path = "/v1/inbox/session";
     let (status, session) = inbox_mutate(session_app.clone(), "POST", session_path, None, json!({"applicationIdentifier":"app-a", "subscriber":{"subscriberId":"session-user","firstName":"Jane"}})).await;
     assert_eq!(status, StatusCode::CREATED);

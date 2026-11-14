@@ -7,9 +7,12 @@ export NOVU_POSTGRES_ALLOW_INSECURE=true
 name="novu-rust-api-test-$$"
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
 secret_file=$(mktemp)
+hmac_file=$(mktemp)
 chmod 600 "$secret_file"
+chmod 600 "$hmac_file"
 printf %s test-secret > "$secret_file"
-cleanup() { rm -f "$secret_file"; docker rm -f "$name" >/dev/null 2>&1 || true; }
+printf %s '{"env-a":["old-key","new-key"],"env-b":["other-key"]}' > "$hmac_file"
+cleanup() { rm -f "$secret_file" "$hmac_file"; docker rm -f "$name" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 docker run --rm -d --name "$name" -e POSTGRES_HOST_AUTH_METHOD=trust \
   -e POSTGRES_DB=novu_api_test -p "127.0.0.1:${port}:5432" postgres:17-alpine >/dev/null
@@ -18,7 +21,8 @@ for ((i=0; i<30; i++)); do
   if (( i == 29 )); then echo 'PostgreSQL did not become ready' >&2; exit 1; fi
   sleep 1
 done
-TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_api_test" \
+env -u INBOX_HMAC_KEYS_JSON -u JWT_SECRET_FILE TEST_INBOX_HMAC_FILE_CONFIG=1 INBOX_HMAC_KEYS_JSON_FILE="$hmac_file" JWT_SECRET=isolated-subscriber-secret \
+  TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_api_test" \
   cargo test --locked --test api_postgres -- --ignored
 docker exec "$name" createdb -U postgres novu_provider_auth_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_provider_auth_test" \

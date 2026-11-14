@@ -104,7 +104,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok("false") | Err(std::env::VarError::NotPresent) => false,
         _ => return Err("invalid health endpoint setting".into()),
     };
-    let runtime = novu_rust_api::RuntimeConfig::from_env();
+    let runtime = novu_rust_api::RuntimeConfig::try_from_env()?;
     let shared = ApiState {
         current: Arc::new(RwLock::new(None)),
         timeout,

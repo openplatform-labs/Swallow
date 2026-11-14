@@ -1,11 +1,11 @@
 //! Experimental, deliberately incomplete Novu trigger endpoint.
 mod contexts;
-mod slack_endpoints;
 mod inbox_context;
 mod inbox_data;
 mod preferences;
 pub mod resend_webhook;
 mod sendgrid_webhook;
+mod slack_endpoints;
 mod subscriber_credentials;
 mod subscriber_jwt;
 mod subscriber_subscriptions;
@@ -75,20 +75,51 @@ pub struct RuntimeConfig {
 }
 impl RuntimeConfig {
     pub fn from_env() -> Self {
+        Self::try_from_env().expect("invalid Inbox HMAC key configuration")
+    }
+    pub fn try_from_env() -> Result<Self, std::io::Error> {
         let secret = novu_rust_contracts::secret::from_env("JWT_SECRET", "JWT_SECRET_FILE")
             .ok()
             .flatten()
             .map(String::into_bytes);
-        let keys = std::env::var("INBOX_HMAC_KEYS_JSON")
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        Self {
+        let inline = match std::env::var("INBOX_HMAC_KEYS_JSON") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid Inbox HMAC key configuration",
+                ));
+            }
+        };
+        let file = std::env::var_os("INBOX_HMAC_KEYS_JSON_FILE");
+        if inline.is_some() && file.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "multiple Inbox HMAC key sources",
+            ));
+        }
+        let value = match file {
+            Some(path) => {
+                novu_rust_contracts::secret::read(None, Some(std::path::Path::new(&path)))?
+            }
+            None => inline,
+        };
+        let keys = match value {
+            Some(value) => serde_json::from_str(&value).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid Inbox HMAC key configuration",
+                )
+            })?,
+            None => HashMap::new(),
+        };
+        Ok(Self {
             secret,
             keys,
             twilio: twilio_webhook::Config::from_env(),
             resend: resend_webhook::Config::from_env(),
-        }
+        })
     }
     pub fn router(&self, db: Arc<Client>) -> Router {
         router_with_webhook_configs(
