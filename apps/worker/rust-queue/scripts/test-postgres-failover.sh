@@ -16,7 +16,7 @@ export NOVU_POSTGRES_ALLOW_INSECURE=true
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/private/tmp/swallow-ha-target}"
 docker network create "$network" >/dev/null
 docker volume create "$volume" >/dev/null
-docker run -d --name "$primary" --network "$network" -e POSTGRES_HOST_AUTH_METHOD=trust -p 127.0.0.1::5432 postgres:17-alpine -c wal_level=replica -c max_wal_senders=10 >/dev/null
+docker run -d --name "$primary" --network "$network" -e POSTGRES_HOST_AUTH_METHOD=trust -p 127.0.0.1::5432 postgres:17-alpine -c wal_level=logical -c max_wal_senders=10 >/dev/null
 for ((i=0;i<90;i++)); do
   if docker exec "$primary" pg_isready -q -U postgres; then break; fi
   if ((i==89)); then echo 'primary not ready' >&2; exit 1; fi
