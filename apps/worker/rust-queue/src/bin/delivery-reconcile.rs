@@ -534,8 +534,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .await?;
         println!("{}", serde_json::to_string(&result)?);
     } else if args.len() == 3 && args[0] == "resend-check" {
-        let evidence = novu_postgres_queue::reconciliation::resend_evidence(
-            &db,
+        let evidence = novu_postgres_queue::reconciliation::resend_evidence_snapshot(
+            &mut db,
             &args[1],
             Uuid::parse_str(&args[2])?,
         )
@@ -554,8 +554,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         println!(
             "{}",
             serde_json::to_string(
-                &novu_postgres_queue::reconciliation::resend_evidence(
-                    &db,
+                &novu_postgres_queue::reconciliation::resend_evidence_snapshot(
+                    &mut db,
                     &args[1],
                     Uuid::parse_str(&args[2])?
                 )

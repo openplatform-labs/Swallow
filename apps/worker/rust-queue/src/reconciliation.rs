@@ -548,6 +548,23 @@ pub async fn resend_evidence<C: tokio_postgres::GenericClient + Sync>(
     )
 }
 
+/// Obtain all statements of a single-job evidence read from one database snapshot.
+pub async fn resend_evidence_snapshot(
+    client: &mut Client,
+    environment: &str,
+    job: Uuid,
+) -> Result<Value> {
+    let tx = client
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
+        .await?;
+    let evidence = resend_evidence(&tx, environment, job).await?;
+    tx.commit().await?;
+    Ok(evidence)
+}
+
 /// A conservative, per-job alert: only a complete set of delivered recipients is healthy.
 pub fn resend_needs_attention(evidence: &Value) -> Result<bool> {
     evidence["recipients"]

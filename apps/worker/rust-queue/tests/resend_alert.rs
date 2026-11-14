@@ -108,9 +108,79 @@ async fn resend_check_exits_for_unmatched_and_missing_evidence() {
             .unwrap()
             .is_empty()
     );
-    db.execute("INSERT INTO novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type,recipient_hash) VALUES ('env','event1','id','email.delivered','hash')", &[]).await.unwrap();
+    // Hold the recipient table so the real CLI has read the attempt, but its
+    // later recipient query cannot begin until another transaction changes
+    // both the attempt and its events. READ COMMITTED could mix the two eras
+    // and report a healthy delivery that never existed in either snapshot.
+    let blocker = second.transaction().await.unwrap();
+    blocker
+        .batch_execute("LOCK TABLE novu_rust_resend_recipients IN ACCESS EXCLUSIVE MODE")
+        .await
+        .unwrap();
+    let cli_url = format!(
+        "{url}{}application_name=resend_snapshot_cli",
+        if url.contains('?') { "&" } else { "?" }
+    );
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .args(["resend-check", "env", &job.to_string()])
+        .env("DATABASE_URL", cli_url)
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut waiting = false;
+    for _ in 0..100 {
+        if db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='resend_snapshot_cli' AND wait_event_type='Lock')", &[]).await.unwrap().get::<_, bool>(0) {
+            waiting = true;
+            break;
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "CLI exited before reaching the lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(waiting, "CLI did not reach recipient query");
+    let change = db.transaction().await.unwrap();
+    change
+        .execute(
+            "UPDATE novu_rust_resend_attempts SET state='unknown' WHERE job_id=$1",
+            &[&job],
+        )
+        .await
+        .unwrap();
+    change.execute("INSERT INTO novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type,recipient_hash) VALUES ('env','event1','id','email.delivered','hash')", &[]).await.unwrap();
+    change.commit().await.unwrap();
+    blocker.commit().await.unwrap();
+    let output = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let snapshot: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(snapshot["evidence"]["attemptState"], "accepted");
+    assert_eq!(snapshot["evidence"]["recipients"][0]["result"], "pending");
+    assert_eq!(check().status.code(), Some(2));
+    db.execute(
+        "UPDATE novu_rust_resend_attempts SET state='accepted' WHERE job_id=$1",
+        &[&job],
+    )
+    .await
+    .unwrap();
     let healthy = check();
     assert_eq!(healthy.status.code(), Some(0));
+    let evidence = std::process::Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .args(["resend-evidence", "env", &job.to_string()])
+        .env("DATABASE_URL", &url)
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .output()
+        .unwrap();
+    assert_eq!(evidence.status.code(), Some(0));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&evidence.stdout).unwrap()["recipients"][0]["result"],
+        "delivered"
+    );
     db.execute(
         "UPDATE novu_rust_resend_attempts SET state='unknown' WHERE job_id=$1",
         &[&job],
