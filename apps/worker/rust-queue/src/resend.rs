@@ -65,7 +65,7 @@ pub fn request_body(config: &Config, email: &Email) -> Result<Value, SendError> 
     } else {
         format!("{name} <{from}>")
     };
-    let mut body = json!({"from":from,"to":email.to,"subject":email.subject,"html":email.html});
+    let mut body = json!({"from":from,"to":email.to,"subject":email.subject,"html":email.html,"reply_to":email.reply_to});
     if !email.cc.is_empty() {
         body["cc"] = json!(email.cc);
     }
@@ -74,9 +74,6 @@ pub fn request_body(config: &Config, email: &Email) -> Result<Value, SendError> 
     }
     if let Some(text) = &email.text {
         body["text"] = json!(text);
-    }
-    if let Some(reply) = &email.reply_to {
-        body["reply_to"] = json!(reply);
     }
     if email.headers.len() > 100
         || email.headers.iter().any(|(key, value)| {
