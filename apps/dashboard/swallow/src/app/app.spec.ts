@@ -6,6 +6,10 @@ import { OperatorOidc } from './operator-oidc';
 describe('Swallow console', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
+  it('uses scoped operator JWT and requires a reason for subscriber profile changes', async () => {
+    const generation='11111111-1111-1111-1111-111111111111';const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({found:true,subscriberId:'person',generation,revision:'0',profile:{firstName:'Alice',email:null}}))).mockResolvedValueOnce(new Response(JSON.stringify({subscriberId:'person',generation,revision:'1',changed:true})));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('subscribers');app.credentialMode='jwt';app.apiKey='aaa.bbb.ccc';app.subscriberEnvironment='env-a';app.subscriberEditId='person';await app.loadSubscriberEdit();app.subscriberEditProfile.firstName='Bob';app.subscriberEditConfirmed=true;await app.changeSubscriberEdit(false);expect(mock).toHaveBeenCalledTimes(1);app.subscriberEditReason='ticket';await app.changeSubscriberEdit(false);expect(app.subscriberEditStatus()).toBe('saved');expect(mock.mock.calls[1][1]?.headers).toEqual({Authorization:'Bearer aaa.bbb.ccc','Content-Type':'application/json'});expect(JSON.parse(mock.mock.calls[1][1]?.body as string)).toEqual({subscriberId:'person',generation,revision:'0',profile:{firstName:'Bob'},reason:'ticket'});expect(app.canDeleteSubscriber()).toBe(false);
+  });
   it('conditionally edits only changed subscriber profile fields', async () => {
     const generation='11111111-1111-1111-1111-111111111111';const data={subscriberId:'person',generation,revision:'7',profile:{firstName:'Alice',lastName:'Kim',email:'a@example.com',phone:'123'}};
     const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data}))).mockResolvedValueOnce(new Response(JSON.stringify({data:{subscriberId:'person',generation,revision:'8',profile:{}}})));
