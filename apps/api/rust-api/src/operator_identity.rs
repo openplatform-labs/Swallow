@@ -20,6 +20,8 @@ enum Lookup {
     Subscribers,
     Alerts,
     DecisionRequest,
+    PermissionIdentity,
+    PermissionAudit,
 }
 
 fn authenticate(
@@ -91,6 +93,22 @@ pub(super) async fn decision_request(
 ) -> Response {
     query(db, headers, uri, verifier, Lookup::DecisionRequest).await
 }
+pub(super) async fn permission_identity(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::PermissionIdentity).await
+}
+pub(super) async fn permission_audit(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::PermissionAudit).await
+}
 async fn query(
     db: Arc<Client>,
     headers: HeaderMap,
@@ -124,6 +142,8 @@ async fn query(
         Lookup::Alerts => &["environmentId", "afterChannel", "afterTarget"],
         Lookup::DecisionRequest => &["environmentId", "requestId"],
         Lookup::Identity => &["environmentId"],
+        Lookup::PermissionIdentity => &["environmentId", "issuer", "subject", "clientId"],
+        Lookup::PermissionAudit => &["environmentId", "before"],
     };
     if params.keys().any(|key| !allowed.contains(&key.as_str()))
         || params.get("limit").is_some_and(|limit| limit != "20")
@@ -140,6 +160,50 @@ async fn query(
         return failure(StatusCode::UNAUTHORIZED, "Unauthorized", "Unauthorized");
     };
     let result = match lookup {
+        Lookup::PermissionIdentity => {
+            let (Some(issuer), Some(subject), Some(client)) = (
+                params.get("issuer"),
+                params.get("subject"),
+                params.get("clientId"),
+            ) else {
+                return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+            };
+            db.query_one(
+                "SELECT public.novu_rust_operator_jwt_review_identity($1,$2,$3,$4,$5,$6,$7,$8)",
+                &[
+                    &identity.issuer,
+                    &identity.subject,
+                    &identity.client_id,
+                    &env,
+                    &exp,
+                    issuer,
+                    subject,
+                    client,
+                ],
+            )
+            .await
+        }
+        Lookup::PermissionAudit => {
+            let before = match params.get("before") {
+                None => None,
+                Some(value) => match value.parse::<i64>() {
+                    Ok(value) if value > 0 => Some(value),
+                    _ => return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request"),
+                },
+            };
+            db.query_one(
+                "SELECT public.novu_rust_operator_jwt_review_audit($1,$2,$3,$4,$5,$6)",
+                &[
+                    &identity.issuer,
+                    &identity.subject,
+                    &identity.client_id,
+                    &env,
+                    &exp,
+                    &before,
+                ],
+            )
+            .await
+        }
         Lookup::Subscribers => {
             let name = params.get("name").filter(|value| !value.is_empty());
             let after = params.get("after");
