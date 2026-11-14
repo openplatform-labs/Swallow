@@ -421,8 +421,9 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         sms_step_id,
         push_step,
         push_step_id,
+        chat_step,
     ) = if data.get("severityOverride").is_some() {
-        let row = tx.query_opt("SELECT inbox_metadata->>'severity',in_app_content,inbox_metadata->'tags',has_steps,in_app_step_active,inbox_metadata->>'id',email_subject,email_html,email_step_active,email_step_id,sms_content,sms_step_active,sms_step_id,push_title,push_content,push_step_active,push_step_id,email_provider FROM novu_rust_workflows WHERE environment_id=$1 AND identifier=$2", &[&job.environment_id, &workflow]).await?
+        let row = tx.query_opt("SELECT inbox_metadata->>'severity',in_app_content,inbox_metadata->'tags',has_steps,in_app_step_active,inbox_metadata->>'id',email_subject,email_html,email_step_active,email_step_id,sms_content,sms_step_active,sms_step_id,push_title,push_content,push_step_active,push_step_id,email_provider,to_jsonb(w)->>'chat_content',COALESCE((to_jsonb(w)->>'chat_step_active')::boolean,true) FROM novu_rust_workflows w WHERE environment_id=$1 AND identifier=$2", &[&job.environment_id, &workflow]).await?
             .ok_or(InvalidJob("workflow no longer exists"))?;
         let has_steps = row.get::<_, bool>(3);
         let email_subject: Option<String> = row.get(6);
@@ -434,6 +435,9 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         let push_title: Option<String> = row.get(13);
         let push_content: Option<String> = row.get(14);
         let push_configured = push_title.is_some() && push_content.is_some();
+        let chat_content: Option<String> = row.get(18);
+        let chat_configured = chat_content.is_some();
+        let chat_step = chat_content.filter(|_| has_steps && row.get::<_, bool>(19));
         let push_step = match (push_title, push_content) {
             (Some(title), Some(content)) if has_steps && row.get::<_, bool>(15) => {
                 Some((title, content))
@@ -451,7 +455,7 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         let step_active = has_steps
             && row.get::<_, bool>(4)
             && (row.get::<_, Option<String>>(1).is_some()
-                || (!email_configured && !sms_configured && !push_configured));
+                || (!email_configured && !sms_configured && !push_configured && !chat_configured));
         let current_content = match row.get::<_, Option<String>>(1) {
             Some(content) => content,
             None if !step_active => String::new(),
@@ -474,6 +478,7 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
             row.get::<_, Option<String>>(12),
             push_step,
             row.get::<_, Option<String>>(16),
+            chat_step,
         )
     } else {
         (
@@ -485,6 +490,7 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
             None,
             None,
             "sendgrid".to_owned(),
+            None,
             None,
             None,
             None,
@@ -822,11 +828,28 @@ async fn process_claimed(client: &mut Client, job: &crate::ClaimedJob) -> Worker
         if push_step.is_some() {
             channels.push("push");
         }
+        if chat_step.is_some() {
+            channels.push("chat");
+        }
         let organization_id = data
             .get("organizationId")
             .and_then(serde_json::Value::as_str);
         let notification = tx.query_one("INSERT INTO novu_rust_notifications (job_id,environment_id,organization_id,subscriber_id,subscriber_internal_id,workflow_identifier,workflow_internal_id,transaction_id,recipient,payload,channels,tags,severity,critical,context_keys) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT (job_id,subscriber_internal_id) DO UPDATE SET job_id=EXCLUDED.job_id RETURNING internal_id", &[&job.id,&job.environment_id,&organization_id,&subscriber,&subscriber_internal_id,&workflow,&workflow_internal_id,&transaction_id,&recipient,&payload,&channels,&tags,&severity,&critical,&context_keys]).await?;
         let notification_id: String = notification.get(0);
+        if let Some(chat_content) = chat_step.as_ref() {
+            let chat_job_id = Uuid::new_v4();
+            let chat_payload = serde_json::json!({"subscriber_id":subscriber,"subscriber_internal_id":subscriber_internal_id,"workflow_identifier":workflow,"workflow_internal_id":workflow_internal_id,"content_template":chat_content,"payload":payload,"context_keys":context_keys,"actor":actor_profile,"actor_internal_id":actor_internal_id});
+            tx.execute(
+                "INSERT INTO novu_queue_jobs(id,environment_id,kind,payload) VALUES ($1,$2,$3,$4)",
+                &[
+                    &chat_job_id,
+                    &job.environment_id,
+                    &crate::slack_workflow::FANOUT_KIND,
+                    &chat_payload,
+                ],
+            )
+            .await?;
+        }
         if let Some((push_title, push_content)) = push_step.as_ref() {
             let push_job_id = Uuid::new_v4();
             let push_payload = serde_json::json!({"workflow_context":{"subscriber_id":subscriber,"subscriber_internal_id":subscriber_internal_id,"notification_internal_id":notification_id,"transaction_id":transaction_id,"workflow_identifier":workflow,"workflow_internal_id":workflow_internal_id,"title_template":push_title,"content_template":push_content,"payload":payload,"context_keys":context_keys,"actor":actor_profile,"actor_internal_id":actor_internal_id,"overrides":data.get("pushFlatProviderOverride").and_then(|v| v.as_object()).cloned().unwrap_or_default(),"provider_data":push_provider_data}});

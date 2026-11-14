@@ -41,7 +41,7 @@ pub async fn resolve(
     if !allowed {
         return Err("Slack resolution permission denied".into());
     }
-    let row=tx.query_opt("SELECT j.status,a.state FROM novu_queue_jobs j JOIN novu_rust_slack_attempts a ON a.job_id=j.id AND a.environment_id=j.environment_id WHERE j.id=$1 AND j.environment_id=$2 AND j.kind=ANY($3) FOR UPDATE OF j,a", &[&job,&environment,&vec![JOB_KIND,crate::slack_webhook_queue::JOB_KIND]]).await?.ok_or("Slack attempt not found")?;
+    let row=tx.query_opt("SELECT j.status,a.state FROM novu_queue_jobs j JOIN novu_rust_slack_attempts a ON a.job_id=j.id AND a.environment_id=j.environment_id WHERE j.id=$1 AND j.environment_id=$2 AND j.kind=ANY($3) FOR UPDATE OF j,a", &[&job,&environment,&vec![JOB_KIND,crate::slack_webhook_queue::JOB_KIND,crate::slack_workflow::DELIVERY_KIND]]).await?.ok_or("Slack attempt not found")?;
     let status: String = row.get(0);
     let previous: String = row.get(1);
     if status != "failed"
@@ -74,7 +74,7 @@ pub async fn health(
     if environment.trim().is_empty() {
         return Err("environment required".into());
     }
-    let row=client.query_one("SELECT count(*) FILTER (WHERE a.state='unknown'), count(*) FILTER (WHERE a.state='rejected'), count(*) FILTER (WHERE a.state='dispatching' AND (j.status<>'running' OR j.lease_until<=statement_timestamp())), EXISTS(SELECT 1 FROM novu_rust_environments WHERE id=$1) FROM novu_rust_slack_attempts a JOIN novu_queue_jobs j ON j.id=a.job_id AND j.environment_id=a.environment_id WHERE a.environment_id=$1 AND j.kind=ANY($2)", &[&environment,&vec![JOB_KIND,crate::slack_webhook_queue::JOB_KIND]]).await?;
+    let row=client.query_one("SELECT count(*) FILTER (WHERE a.state='unknown'), count(*) FILTER (WHERE a.state='rejected'), count(*) FILTER (WHERE a.state='dispatching' AND (j.status<>'running' OR j.lease_until<=statement_timestamp())), EXISTS(SELECT 1 FROM novu_rust_environments WHERE id=$1) FROM novu_rust_slack_attempts a JOIN novu_queue_jobs j ON j.id=a.job_id AND j.environment_id=a.environment_id WHERE a.environment_id=$1 AND j.kind=ANY($2)", &[&environment,&vec![JOB_KIND,crate::slack_webhook_queue::JOB_KIND,crate::slack_workflow::DELIVERY_KIND]]).await?;
     if !row.get::<_, bool>(3) {
         return Err("environment not found".into());
     }

@@ -100,6 +100,18 @@ docker exec "$name" createdb -U postgres novu_slack_endpoint_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_slack_endpoint_test" \
   cargo test --locked --test slack_channel_endpoints -- --ignored
 
+docker exec "$name" createdb -U postgres novu_slack_workflow_test
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_slack_workflow_test" \
+  cargo test --locked --lib slack_workflow::tests::resolves_endpoints_and_revalidates_each_delivery -- --ignored
+
+docker exec "$name" createdb -U postgres novu_slack_trigger_test
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_slack_trigger_test" NOVU_ALLOW_RECREATED_SUBSCRIBER=false \
+  cargo test --locked --lib slack_workflow::tests::trigger_fanout_and_delivery_render_subscriber -- --ignored
+
+docker exec "$name" createdb -U postgres novu_slack_workflow_cli_test
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_slack_workflow_cli_test" \
+  cargo test --locked --test slack_workflow_cli -- --ignored
+
 docker exec "$name" createdb -U postgres novu_slack_reconnect_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_slack_reconnect_test" TEST_PG_CONTAINER="$name" \
   cargo test --locked --test slack_reconnect -- --ignored
