@@ -381,6 +381,48 @@ async fn scoped_email_sms_decisions_are_authorized_atomic_and_fenced() {
         scoped_fcm(&actor2, "a", race, 0, "accepted")
     );
     assert_ne!(one.is_ok(), two.is_ok());
+    // Grant revocation is serialized behind a decision already in flight.
+    let gate_job = fcm_job(
+        &db,
+        json!({"prepared_messages":[{}]}),
+        "push delivery outcome unknown",
+        &["unknown"],
+    )
+    .await;
+    let mut gate_actor = connect(role_url.as_str()).await;
+    let tx = gate_actor.transaction().await.unwrap();
+    tx.query_one(
+        "SELECT public.novu_rust_resolve_fcm('a',$1,0,'retry','operator','ticket')",
+        &[&gate_job],
+    )
+    .await
+    .unwrap();
+    let revoker = connect(&url).await;
+    revoker
+        .batch_execute("SET application_name='swallow_permission_revoker'")
+        .await
+        .unwrap();
+    let revoke_role = role.clone();
+    let revoke = tokio::spawn(async move {
+        revoker.execute("DELETE FROM novu_rust_delivery_operator_grants WHERE environment_id='a' AND database_principal=$1 AND decision='retry'", &[&revoke_role]).await.unwrap()
+    });
+    let mut blocked = false;
+    for _ in 0..100 {
+        if db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='swallow_permission_revoker' AND wait_event_type='Lock')", &[]).await.unwrap().get::<_,bool>(0) { blocked=true; break; }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(blocked && !revoke.is_finished());
+    tx.commit().await.unwrap();
+    assert_eq!(revoke.await.unwrap(), 1);
+    let later = fcm_job(
+        &db,
+        json!({}),
+        "push delivery outcome unknown",
+        &["unknown"],
+    )
+    .await;
+    assert!(scoped_fcm(&actor, "a", later, 0, "retry").await.is_err());
+    db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'a',$1,'retry',oid FROM pg_roles WHERE rolname::text=$1", &[&role]).await.unwrap();
     let cli_fcm = fcm_job(
         &db,
         json!({"prepared_messages":[{}]}),
