@@ -15,6 +15,7 @@ pub struct Push {
     pub workflow_context: Option<WorkflowContext>,
     pub prepared_messages: Option<Vec<Value>>,
     pub prepared_context: Option<Value>,
+    pub workflow_guard: Option<Value>,
 }
 
 #[derive(serde::Deserialize)]

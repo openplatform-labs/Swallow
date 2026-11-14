@@ -81,6 +81,7 @@ fn build_integrations(raw: &str) -> Result<HashMap<String, Fcm>, Box<dyn Error +
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let step_policy = novu_postgres_queue::push_step_policy::Policy::from_env()?;
     let invalid_token_policy = InvalidTokenPolicy::from_env()?;
     let cleanup_guard = TokenCleanupGuard::from_env()?;
     let environment = std::env::var("NOVU_FCM_ENVIRONMENT_ID")?;
@@ -234,6 +235,26 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             }
             let mut recovery = tokio::time::Instant::now();
             if configured {
+                match tokio::time::timeout(
+                    timeout,
+                    novu_postgres_queue::push_step_policy::register(&db, &environment, step_policy),
+                )
+                .await
+                {
+                    Ok(Ok(true)) => {}
+                    Ok(Ok(false)) => {
+                        task.abort();
+                        let _ = task.await;
+                        return Err("push workers have different workflow step policies".into());
+                    }
+                    _ => {
+                        task.abort();
+                        let _ = task.await;
+                        eprintln!("push workflow policy registration failed; reconnecting");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                }
                 loop {
                     if tokio::time::Instant::now() >= recovery {
                         if !matches!(
@@ -249,28 +270,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         recovery = tokio::time::Instant::now() + Duration::from_secs(5);
                     }
                     let dispatch = async {
-                        if let Some(integrations) = integrations.as_ref() {
-                            fcm_queue::process_one_with_integrations(
-                                &mut db,
-                                &environment,
-                                integrations,
-                            )
-                            .await
-                        } else if shared_provider {
-                            fcm_queue::process_one_with_shared_provider(
-                                &mut db,
-                                &environment,
-                                provider.as_ref().expect("single provider configured"),
-                            )
-                            .await
-                        } else {
-                            fcm_queue::process_one(
-                                &mut db,
-                                &environment,
-                                provider.as_ref().expect("single provider configured"),
-                            )
-                            .await
-                        }
+                        fcm_queue::process_one_with_policy(
+                            &mut db,
+                            &environment,
+                            provider.as_ref(),
+                            integrations.as_ref(),
+                            shared_provider,
+                            step_policy,
+                        )
+                        .await
                     };
                     match tokio::time::timeout(timeout, dispatch).await {
                         Ok(Ok(true)) => {}

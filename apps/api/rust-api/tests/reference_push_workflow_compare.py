@@ -163,6 +163,7 @@ for label,tokens,disabled in ([] if os.environ.get('NOVU_TEST_PUSH_ROUTING_CASES
     with tempfile.TemporaryDirectory(prefix='novu-push-compare-') as directory:
         capture=Path(directory)/'capture.json'
         env=dict(os.environ,TEST_PUSH_CAPTURE_PATH=str(capture),TEST_PUSH_EXPECTED_COUNT=str(count))
+        if label=='one':env['TEST_PUSH_STEP_POLICY']='unchanged'
         if label=='failed':env['TEST_PUSH_HTTP_STATUS']='429'
         if label=='invalid':env['TEST_PUSH_HTTP_STATUS']='404'
         if label=='invalid_mixed':env['TEST_PUSH_INVALID_TARGET']='device-invalid-mixed'

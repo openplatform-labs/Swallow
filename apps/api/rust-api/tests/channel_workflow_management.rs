@@ -808,4 +808,27 @@ async fn channels_are_authorized_audited_and_create_delivery_jobs() {
             .unwrap(),
         3
     );
+    setup.execute("UPDATE novu_rust_workflows SET push_content='changed push' WHERE environment_id='a' AND identifier='workflow'", &[]).await.unwrap();
+    let fcm = novu_postgres_queue::fcm::Fcm::new("fixture", "fixture".into()).unwrap();
+    assert!(
+        novu_postgres_queue::fcm_queue::process_one_with_policy(
+            &mut setup,
+            "a",
+            Some(&fcm),
+            None,
+            false,
+            novu_postgres_queue::push_step_policy::Policy::Unchanged
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(setup.query_one("SELECT count(*) FROM novu_queue_jobs WHERE kind=$1 AND last_error='push workflow step changed'", &[&novu_postgres_queue::fcm_queue::JOB_KIND]).await.unwrap().get::<_,i64>(0),1);
+    assert_eq!(
+        setup
+            .query_one("SELECT count(*) FROM novu_rust_fcm_attempts", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
 }

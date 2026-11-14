@@ -54,6 +54,7 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
             .env_remove("SWALLOW_FCM_ALLOW_SHARED_PROVIDER")
             .env_remove("SWALLOW_FCM_INVALID_TOKEN_POLICY")
             .env_remove("SWALLOW_FCM_TOKEN_CLEANUP_GUARD")
+            .env_remove("SWALLOW_PUSH_WORKFLOW_STEP_POLICY")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         c
@@ -78,6 +79,22 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
     );
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert!(same.0.try_wait().unwrap().is_none());
+    let mismatch_step = command("guard-env", "project-a", "fixture-token")
+        .env("SWALLOW_PUSH_WORKFLOW_STEP_POLICY", "active")
+        .output()
+        .unwrap();
+    assert!(!mismatch_step.status.success());
+    assert!(
+        String::from_utf8_lossy(&mismatch_step.stderr).contains("different workflow step policies")
+    );
+    let invalid_step = command("guard-env", "project-a", "fixture-token")
+        .env("SWALLOW_PUSH_WORKFLOW_STEP_POLICY", "invalid")
+        .output()
+        .unwrap();
+    assert!(!invalid_step.status.success());
+    assert!(
+        String::from_utf8_lossy(&invalid_step.stderr).contains("invalid push workflow step policy")
+    );
     let mismatch = command("guard-env", "project-b", "fixture-token-secret")
         .output()
         .unwrap();

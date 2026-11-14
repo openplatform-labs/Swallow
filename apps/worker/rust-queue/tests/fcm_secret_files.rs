@@ -24,6 +24,12 @@ async fn worker_supports_token_pem_and_integration_files() {
     db.batch_execute(novu_postgres_queue::MIGRATION)
         .await
         .unwrap();
+    db.batch_execute("CREATE TABLE novu_rust_environments(id text PRIMARY KEY); INSERT INTO novu_rust_environments VALUES ('env')").await.unwrap();
+    db.batch_execute(include_str!(
+        "../migrations/0124_push_workflow_worker_policy.sql"
+    ))
+    .await
+    .unwrap();
     let fixture =
         Fixture(std::env::temp_dir().join(format!("swallow-fcm-{}", uuid::Uuid::new_v4())));
     fs::create_dir(&fixture.0).unwrap();
@@ -62,6 +68,7 @@ async fn worker_supports_token_pem_and_integration_files() {
             .env_remove("NOVU_FCM_PRIVATE_KEY_FILE")
             .env_remove("SWALLOW_FCM_ALLOW_SHARED_PROVIDER")
             .env_remove("SWALLOW_FCM_ENFORCE_ROUTING_CONFIG")
+            .env_remove("SWALLOW_PUSH_WORKFLOW_STEP_POLICY")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         c

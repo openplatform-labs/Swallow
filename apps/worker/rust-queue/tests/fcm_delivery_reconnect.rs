@@ -80,8 +80,15 @@ async fn workers_reconnect_and_preserve_uncertain_attempts() {
     let container = std::env::var("TEST_PG_CONTAINER").unwrap();
     let mut db = connect(&url).await;
     db.batch_execute("CREATE TABLE novu_rust_environments(id text PRIMARY KEY,organization_id text NOT NULL); INSERT INTO novu_rust_environments VALUES ('env','org')").await.unwrap();
+    db.batch_execute(include_str!(
+        "../migrations/0124_push_workflow_worker_policy.sql"
+    ))
+    .await
+    .unwrap();
     db.batch_execute("CREATE TABLE novu_rust_operator_grant_admins(environment_id text,database_principal text,principal_oid oid)").await.unwrap();
-    db.batch_execute(include_str!("../migrations/0095_fcm_routing_guard.sql")).await.unwrap();
+    db.batch_execute(include_str!("../migrations/0095_fcm_routing_guard.sql"))
+        .await
+        .unwrap();
     db.batch_execute("INSERT INTO novu_rust_fcm_routing_workers SELECT 'env',rolname,oid FROM pg_roles WHERE rolname=session_user").await.unwrap();
     db.batch_execute(queue::MIGRATION).await.unwrap();
     db.batch_execute(queue::fcm_queue::MIGRATION).await.unwrap();

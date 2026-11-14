@@ -60,7 +60,15 @@ pub async fn process_one(
     environment: &str,
     provider: &Fcm,
 ) -> Result<bool, Error> {
-    process_one_inner(client, environment, Some(provider), None, false).await
+    process_one_inner(
+        client,
+        environment,
+        Some(provider),
+        None,
+        false,
+        crate::push_step_policy::Policy::Snapshot,
+    )
+    .await
 }
 
 /// Explicitly use one configured FCM provider for all integration IDs.
@@ -69,7 +77,15 @@ pub async fn process_one_with_shared_provider(
     environment: &str,
     provider: &Fcm,
 ) -> Result<bool, Error> {
-    process_one_inner(client, environment, Some(provider), None, true).await
+    process_one_inner(
+        client,
+        environment,
+        Some(provider),
+        None,
+        true,
+        crate::push_step_policy::Policy::Snapshot,
+    )
+    .await
 }
 
 /// Process workflow targets using an explicit integration-to-provider map.
@@ -79,7 +95,26 @@ pub async fn process_one_with_integrations(
     environment: &str,
     providers: &HashMap<String, Fcm>,
 ) -> Result<bool, Error> {
-    process_one_inner(client, environment, None, Some(providers), false).await
+    process_one_inner(
+        client,
+        environment,
+        None,
+        Some(providers),
+        false,
+        crate::push_step_policy::Policy::Snapshot,
+    )
+    .await
+}
+
+pub async fn process_one_with_policy(
+    client: &mut Client,
+    environment: &str,
+    provider: Option<&Fcm>,
+    providers: Option<&HashMap<String, Fcm>>,
+    shared: bool,
+    policy: crate::push_step_policy::Policy,
+) -> Result<bool, Error> {
+    process_one_inner(client, environment, provider, providers, shared, policy).await
 }
 
 async fn process_one_inner(
@@ -88,6 +123,7 @@ async fn process_one_inner(
     default_provider: Option<&Fcm>,
     providers: Option<&HashMap<String, Fcm>>,
     allow_shared_provider: bool,
+    policy: crate::push_step_policy::Policy,
 ) -> Result<bool, Error> {
     let Some(job) = claim(client, environment).await? else {
         return Ok(false);
@@ -136,6 +172,26 @@ async fn process_one_inner(
         tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='subscriber identity changed',lease_token=NULL,lease_until=NULL WHERE id=$1", &[&job.id]).await?;
         tx.commit().await?;
         return Ok(true);
+    }
+    match crate::push_step_policy::check(
+        &tx,
+        environment,
+        &job,
+        &push,
+        prepared_context.as_ref(),
+        policy,
+    )
+    .await?
+    {
+        crate::push_step_policy::Check::Continue => {}
+        crate::push_step_policy::Check::Cancelled => {
+            tx.commit().await?;
+            return Ok(true);
+        }
+        crate::push_step_policy::Check::LeaseLost => {
+            tx.rollback().await?;
+            return Ok(true);
+        }
     }
     let messages = if let Some(context) = push.workflow_context.take() {
         let route = fcm::routing(&context.provider_data);
@@ -394,8 +450,7 @@ async fn process_one_inner(
                 serde_json::json!({"subscriber_id":context.subscriber_id,"subscriber_internal_id":subscriber_internal_id,"notification_internal_id":notification_internal_id,"transaction_id":transaction_id,"workflow_identifier":context.workflow_identifier,"target_metadata":target_metadata,"title":title,"content":content}),
             );
         }
-        let updated =
-            serde_json::json!({"prepared_messages":messages,"prepared_context":prepared_context});
+        let updated = serde_json::json!({"prepared_messages":messages,"prepared_context":prepared_context,"workflow_guard":{"identifier":context.workflow_identifier,"id":context.workflow_internal_id,"title":context.title_template,"content":context.content_template}});
         tx.execute(
             "UPDATE novu_queue_jobs SET payload=$2 WHERE id=$1 AND lease_token=$3",
             &[&job.id, &updated, &job.lease_token],
@@ -602,6 +657,10 @@ async fn process_one_inner(
             .await?;
             return Ok(true);
         }
+    }
+    if policy != crate::push_step_policy::Policy::Snapshot && !lock_live(&tx, &job).await? {
+        tx.rollback().await?;
+        return Ok(true);
     }
     tx.execute("INSERT INTO novu_rust_fcm_attempts(job_id,environment_id,target_index,state) VALUES ($1,$2,$3,'dispatching')",&[&job.id,&environment,&index_i32]).await?;
     if prepared_context.is_some() {
@@ -1013,7 +1072,18 @@ mod tests {
                     .collect()
             });
         for _ in 0..count.max(1) {
-            let processed = if let Some(integrations) = integrations.as_ref() {
+            let processed = if std::env::var("TEST_PUSH_STEP_POLICY").as_deref() == Ok("unchanged")
+            {
+                process_one_with_policy(
+                    &mut db,
+                    "64a000000000000000000002",
+                    Some(&provider),
+                    integrations.as_ref(),
+                    std::env::var("TEST_PUSH_ALLOW_SHARED_PROVIDER").as_deref() == Ok("true"),
+                    crate::push_step_policy::Policy::Unchanged,
+                )
+                .await
+            } else if let Some(integrations) = integrations.as_ref() {
                 process_one_with_integrations(&mut db, "64a000000000000000000002", integrations)
                     .await
             } else if std::env::var("TEST_PUSH_ALLOW_SHARED_PROVIDER").as_deref() == Ok("true") {
@@ -1072,6 +1142,192 @@ mod tests {
             Fcm::with_origin("demo", "fixture".into(), &origin).unwrap(),
             server,
         )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires migrated disposable PostgreSQL and loopback"]
+    async fn guarded_multicast_preserves_attempt_and_cancels_remaining_targets() {
+        let (mut db, driver) =
+            tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(), NoTls)
+                .await
+                .unwrap();
+        tokio::spawn(async move { driver.await.unwrap() });
+        db.batch_execute("INSERT INTO novu_rust_environments VALUES ('push-guard','org'); INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id) VALUES ('push-guard','alice','alice-id'); INSERT INTO novu_rust_workflows(environment_id,identifier,active,has_steps,push_step_active,push_title,push_content,inbox_metadata) VALUES ('push-guard','wf',true,true,true,'title','content','{\"id\":\"workflow-id\"}')").await.unwrap();
+        let job = Uuid::new_v4();
+        let metadata = json!({"integration_internal_id":"integration","message_id":"message-id","device_tokens":["a","b"],"history_index":0,"group_size":2});
+        let payload = json!({"prepared_messages":[{"message":{"token":"a","notification":{"title":"title","body":"content"}}},{"message":{"token":"b","notification":{"title":"title","body":"content"}}}],"prepared_context":{"subscriber_id":"alice","subscriber_internal_id":"alice-id","notification_internal_id":"notification","workflow_identifier":"wf","transaction_id":"txn","title":"title","content":"content","target_metadata":[metadata.clone(),metadata]},"workflow_guard":{"identifier":"wf","id":"workflow-id","title":"title","content":"content"}});
+        crate::enqueue(&db, job, "push-guard", JOB_KIND, &payload)
+            .await
+            .unwrap();
+        let (provider, server) = mock(vec![200]).await;
+        assert!(
+            process_one_with_policy(
+                &mut db,
+                "push-guard",
+                Some(&provider),
+                None,
+                false,
+                crate::push_step_policy::Policy::Unchanged
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(server.await.unwrap(), vec!["a"]);
+        db.execute("UPDATE novu_rust_workflows SET push_content='changed' WHERE environment_id='push-guard' AND identifier='wf'", &[]).await.unwrap();
+        assert!(
+            process_one_with_policy(
+                &mut db,
+                "push-guard",
+                Some(&provider),
+                None,
+                false,
+                crate::push_step_policy::Policy::Unchanged
+            )
+            .await
+            .unwrap()
+        );
+        let row = db
+            .query_one(
+                "SELECT status,last_error FROM novu_queue_jobs WHERE id=$1",
+                &[&job],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, String>(0), "cancelled");
+        assert_eq!(row.get::<_, String>(1), "push workflow step changed");
+        assert_eq!(
+            db.query_one(
+                "SELECT count(*) FROM novu_rust_fcm_attempts WHERE job_id=$1 AND state='accepted'",
+                &[&job]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+            1
+        );
+        let row = db
+            .query_one(
+                "SELECT status,delivery_state FROM novu_rust_push_messages WHERE push_job_id=$1",
+                &[&job],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, String>(0), "error");
+        assert_eq!(row.get::<_, String>(1), "unknown");
+        let legacy = Uuid::new_v4();
+        let mut old = payload.clone();
+        old.as_object_mut().unwrap().remove("workflow_guard");
+        crate::enqueue(&db, legacy, "push-guard", JOB_KIND, &old)
+            .await
+            .unwrap();
+        assert!(
+            process_one_with_policy(
+                &mut db,
+                "push-guard",
+                Some(&provider),
+                None,
+                false,
+                crate::push_step_policy::Policy::Active
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            db.query_one(
+                "SELECT last_error FROM novu_queue_jobs WHERE id=$1",
+                &[&legacy]
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+            "push workflow identity or snapshot missing"
+        );
+
+        let race = Uuid::new_v4();
+        crate::enqueue(&db, race, "push-guard", JOB_KIND, &payload)
+            .await
+            .unwrap();
+        let (mut other, driver) =
+            tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(), NoTls)
+                .await
+                .unwrap();
+        tokio::spawn(async move { driver.await.unwrap() });
+        let tx = db.transaction().await.unwrap();
+        tx.execute("UPDATE novu_rust_workflows SET push_step_active=false WHERE environment_id='push-guard' AND identifier='wf'",&[]).await.unwrap();
+        let pending = tokio::spawn(async move {
+            process_one_with_policy(
+                &mut other,
+                "push-guard",
+                Some(&provider),
+                None,
+                false,
+                crate::push_step_policy::Policy::Active,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !pending.is_finished(),
+            "worker must wait for workflow update"
+        );
+        tx.commit().await.unwrap();
+        assert!(pending.await.unwrap().unwrap());
+        assert_eq!(
+            db.query_one(
+                "SELECT last_error FROM novu_queue_jobs WHERE id=$1",
+                &[&race]
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+            "push workflow step disabled"
+        );
+        assert_eq!(
+            db.query_one(
+                "SELECT count(*) FROM novu_rust_fcm_attempts WHERE job_id=$1",
+                &[&race]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+            0
+        );
+        db.execute("UPDATE novu_rust_workflows SET push_step_active=true WHERE environment_id='push-guard' AND identifier='wf'",&[]).await.unwrap();
+        let active_job = Uuid::new_v4();
+        let mut active_payload = payload.clone();
+        for item in active_payload["prepared_context"]["target_metadata"]
+            .as_array_mut()
+            .unwrap()
+        {
+            item["message_id"] = "second-message".into();
+        }
+        crate::enqueue(&db, active_job, "push-guard", JOB_KIND, &active_payload)
+            .await
+            .unwrap();
+        let (provider, server) = mock(vec![200]).await;
+        assert!(
+            process_one_with_policy(
+                &mut db,
+                "push-guard",
+                Some(&provider),
+                None,
+                false,
+                crate::push_step_policy::Policy::Active
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(server.await.unwrap(), vec!["a"]);
+        assert_eq!(
+            db.query_one(
+                "SELECT count(*) FROM novu_rust_fcm_attempts WHERE job_id=$1 AND state='accepted'",
+                &[&active_job]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+            1
+        );
     }
     #[tokio::test]
     #[ignore = "requires disposable PostgreSQL and loopback access"]
