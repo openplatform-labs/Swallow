@@ -28,6 +28,21 @@ pub async fn reserve(
     target: &str,
     cooldown: i32,
 ) -> DbResult<Reservation> {
+    reserve_with_conditions(db, environment, channel, target, cooldown, None).await
+}
+
+/// Optional mask permits new problem categories to bypass a successful cooldown.
+pub async fn reserve_with_conditions(
+    db: &mut PgClient,
+    environment: &str,
+    channel: &str,
+    target: &str,
+    cooldown: i32,
+    condition_mask: Option<i32>,
+) -> DbResult<Reservation> {
+    if condition_mask.is_some_and(|mask| mask <= 0) {
+        return Err("invalid alert condition mask".into());
+    }
     if !["slack", "email"].contains(&channel)
         || !(60..=86_400).contains(&cooldown)
         || target.is_empty()
@@ -78,10 +93,21 @@ pub async fn reserve(
         return Ok(Reservation::Blocked);
     }
     if state == "accepted" && row.get::<_, Option<bool>>(3) == Some(true) {
-        tx.commit().await?;
-        return Ok(Reservation::CoolingDown);
+        let new_condition = if let Some(mask) = condition_mask {
+            let previous: Option<i32> = tx.query_one("SELECT last_condition_mask FROM novu_rust_alert_delivery_slots WHERE environment_id=$1 AND channel=$2 AND target_id=$3", &[&environment,&channel,&target]).await?.get(0);
+            mask & !previous.unwrap_or(0) != 0
+        } else {
+            false
+        };
+        if !new_condition {
+            tx.commit().await?;
+            return Ok(Reservation::CoolingDown);
+        }
     }
     let id = Uuid::new_v4();
+    if let Some(mask) = condition_mask {
+        tx.execute("UPDATE novu_rust_alert_delivery_slots SET last_condition_mask=$4 WHERE environment_id=$1 AND channel=$2 AND target_id=$3", &[&environment,&channel,&target,&mask]).await?;
+    }
     tx.execute("UPDATE novu_rust_alert_delivery_slots SET state='dispatching',attempt_id=$4,last_started_at=clock_timestamp(),lease_until=clock_timestamp()+interval '60 seconds' WHERE environment_id=$1 AND channel=$2 AND target_id=$3", &[&environment,&channel,&target,&id]).await?;
     tx.execute("INSERT INTO novu_rust_alert_delivery_attempts(id,environment_id,channel,target_id,state) VALUES ($1,$2,$3,$4,'dispatching')", &[&id,&environment,&channel,&target]).await?;
     tx.commit().await?;
@@ -218,6 +244,32 @@ pub struct Alert {
     pub failed_checks: [bool; 5], // resend, queue, attempts, twilio, Slack chat
 }
 impl Alert {
+    /// Bit flags describe problem categories, not counts or sensitive content.
+    pub fn condition_mask(&self) -> i32 {
+        let mut mask = 0;
+        let checks = [
+            self.resend_enabled && self.overdue_undelivered > 0,
+            self.resend_enabled && self.projector_stale,
+            self.queue.is_some_and(|v| v.0 > 0),
+            self.queue.is_some_and(|v| v.1 > 0),
+            self.attempts.is_some_and(|v| v.0 > 0),
+            self.attempts.is_some_and(|v| v.1 > 0),
+            self.twilio.is_some_and(|v| v.0 > 0),
+            self.twilio.is_some_and(|v| v.1),
+            self.slack_attempts.is_some_and(|v| v.0 > 0),
+            self.slack_attempts.is_some_and(|v| v.1 > 0),
+            self.slack_attempts.is_some_and(|v| v.2 > 0),
+            self.slack_attempts.is_some_and(|v| v.3 > 0),
+            self.slack_attempts
+                .is_some_and(|v| v.4.is_some_and(|n| n > 0)),
+        ];
+        for (bit, enabled) in checks.into_iter().chain(self.failed_checks).enumerate() {
+            if enabled {
+                mask |= 1 << bit;
+            }
+        }
+        mask
+    }
     pub fn text(&self) -> Result<String, AlertError> {
         if self.environment.is_empty()
             || self.environment.len() > 128
@@ -404,13 +456,16 @@ async fn dispatch<F, Fut>(
     channel: &str,
     target: &str,
     cooldown: i32,
+    condition_mask: Option<i32>,
     send: F,
 ) -> DbResult<Dispatch>
 where
     F: FnOnce(Uuid) -> Fut,
     Fut: std::future::Future<Output = Result<(), AlertError>>,
 {
-    match reserve(db, environment, channel, target, cooldown).await? {
+    match reserve_with_conditions(db, environment, channel, target, cooldown, condition_mask)
+        .await?
+    {
         Reservation::CoolingDown => Ok(Dispatch::CoolingDown),
         Reservation::InFlight => Ok(Dispatch::InFlight),
         Reservation::Blocked => Ok(Dispatch::NeedsReview),
@@ -433,10 +488,27 @@ pub async fn dispatch_slack(
     alert: &Alert,
     provider: &SlackWebhook,
 ) -> DbResult<Dispatch> {
+    dispatch_slack_with_conditions(db, target, cooldown, alert, provider, false).await
+}
+
+pub async fn dispatch_slack_with_conditions(
+    db: &mut PgClient,
+    target: &str,
+    cooldown: i32,
+    alert: &Alert,
+    provider: &SlackWebhook,
+    on_new_condition: bool,
+) -> DbResult<Dispatch> {
     alert.text().map_err(|_| "invalid alert environment")?;
-    dispatch(db, &alert.environment, "slack", target, cooldown, |_| {
-        provider.send(alert)
-    })
+    dispatch(
+        db,
+        &alert.environment,
+        "slack",
+        target,
+        cooldown,
+        on_new_condition.then(|| alert.condition_mask()),
+        |_| provider.send(alert),
+    )
     .await
 }
 
@@ -448,6 +520,18 @@ pub async fn dispatch_email(
     provider: &Resend,
     recipient: &str,
 ) -> DbResult<Dispatch> {
+    dispatch_email_with_conditions(db, target, cooldown, alert, provider, recipient, false).await
+}
+
+pub async fn dispatch_email_with_conditions(
+    db: &mut PgClient,
+    target: &str,
+    cooldown: i32,
+    alert: &Alert,
+    provider: &Resend,
+    recipient: &str,
+    on_new_condition: bool,
+) -> DbResult<Dispatch> {
     alert.text().map_err(|_| "invalid alert environment")?;
     if recipient.is_empty()
         || recipient.len() > 320
@@ -456,7 +540,7 @@ pub async fn dispatch_email(
     {
         return Err("invalid alert recipient".into());
     }
-    dispatch(db,&alert.environment,"email",target,cooldown,|id|async move {send_email(provider,recipient,alert,&format!("swallow-alert/{id}")).await}).await
+    dispatch(db,&alert.environment,"email",target,cooldown,on_new_condition.then(|| alert.condition_mask()),|id|async move {send_email(provider,recipient,alert,&format!("swallow-alert/{id}")).await}).await
 }
 
 #[cfg(test)]
@@ -479,6 +563,19 @@ mod tests {
             slack_attempts: None,
             failed_checks: [false; 5],
         }
+    }
+
+    #[test]
+    fn condition_mask_tracks_types_not_counts() {
+        let mut a = alert();
+        let base = a.condition_mask();
+        a.overdue_undelivered = 42;
+        assert_eq!(a.condition_mask(), base);
+        a.queue = Some((1, 0));
+        assert_ne!(a.condition_mask(), base);
+        let with_queue = a.condition_mask();
+        a.failed_checks[2] = true;
+        assert_ne!(a.condition_mask(), with_queue);
     }
 
     async fn mock_server(status: &str, body: &str) -> (Url, tokio::task::JoinHandle<String>) {
@@ -731,5 +828,61 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.get::<_, String>(1) == "accepted"));
+        db.batch_execute(include_str!(
+            "../migrations/0085_alert_condition_cooldown.sql"
+        ))
+        .await
+        .unwrap();
+        let mut alert = alert;
+        let (url, server) = mock_server("200 OK", "ok").await;
+        let slack = SlackWebhook::with_endpoint(url).unwrap();
+        assert_eq!(
+            dispatch_slack_with_conditions(&mut db, "ops", 60, &alert, &slack, true)
+                .await
+                .unwrap(),
+            Dispatch::Accepted
+        );
+        server.await.unwrap();
+        assert_eq!(
+            dispatch_slack_with_conditions(&mut db, "ops", 60, &alert, &slack, true)
+                .await
+                .unwrap(),
+            Dispatch::CoolingDown
+        );
+        alert.queue = Some((1, 0));
+        let (url, server) = mock_server("200 OK", "ok").await;
+        let slack = SlackWebhook::with_endpoint(url).unwrap();
+        assert_eq!(
+            dispatch_slack_with_conditions(&mut db, "ops", 60, &alert, &slack, true)
+                .await
+                .unwrap(),
+            Dispatch::Accepted
+        );
+        assert!(server.await.unwrap().contains("queue overdue jobs: 1"));
+        let (url, server) = mock_server("200 OK", r#"{"id":"mock-new"}"#).await;
+        let email = Resend::test_endpoint(
+            crate::resend::Config {
+                api_key: "fixture-key".into(),
+                from: "from@example.test".into(),
+                sender_name: String::new(),
+            },
+            url.as_str(),
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch_email_with_conditions(
+                &mut db,
+                "oncall",
+                60,
+                &alert,
+                &email,
+                "ops@example.test",
+                true
+            )
+            .await
+            .unwrap(),
+            Dispatch::Accepted
+        );
+        assert!(server.await.unwrap().contains("queue overdue jobs: 1"));
     }
 }

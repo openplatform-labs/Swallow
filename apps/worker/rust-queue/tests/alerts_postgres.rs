@@ -30,6 +30,11 @@ async fn alert_reservations_fence_concurrency_and_ambiguous_recovery() {
     a.batch_execute(alerts::MIGRATION).await.unwrap();
     a.batch_execute(alerts::MIGRATION).await.unwrap();
     a.batch_execute(alerts::RESOLUTION_MIGRATION).await.unwrap();
+    a.batch_execute(include_str!(
+        "../migrations/0085_alert_condition_cooldown.sql"
+    ))
+    .await
+    .unwrap();
     a.batch_execute(alerts::RESOLUTION_MIGRATION).await.unwrap();
     assert!(
         alerts::reserve(&mut a, "env-a", "slack", "ops", 60)
@@ -37,6 +42,118 @@ async fn alert_reservations_fence_concurrency_and_ambiguous_recovery() {
             .is_err()
     );
     a.execute("INSERT INTO novu_rust_delivery_operator_grants VALUES ('env-a',session_user,'alert_send'),('env-b',session_user,'alert_send')", &[]).await.unwrap();
+    let first = match alerts::reserve_with_conditions(
+        &mut a,
+        "env-a",
+        "slack",
+        "condition-fixture",
+        60,
+        Some(1),
+    )
+    .await
+    .unwrap()
+    {
+        Reservation::Claimed(id) => id,
+        _ => panic!("claim expected"),
+    };
+    assert!(
+        alerts::finish(
+            &mut a,
+            "env-a",
+            "slack",
+            "condition-fixture",
+            first,
+            &Ok(())
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(
+        alerts::reserve_with_conditions(&mut a, "env-a", "slack", "condition-fixture", 60, Some(1))
+            .await
+            .unwrap(),
+        Reservation::CoolingDown
+    );
+    let (left, right) = tokio::join!(
+        alerts::reserve_with_conditions(&mut a, "env-a", "slack", "condition-fixture", 60, Some(3)),
+        alerts::reserve_with_conditions(&mut b, "env-a", "slack", "condition-fixture", 60, Some(3))
+    );
+    let results = [left.unwrap(), right.unwrap()];
+    let id = results
+        .iter()
+        .find_map(|x| {
+            if let Reservation::Claimed(id) = x {
+                Some(*id)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert_eq!(
+        results
+            .iter()
+            .filter(|x| matches!(x, Reservation::Claimed(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|x| **x == Reservation::InFlight)
+            .count(),
+        1
+    );
+    assert!(
+        alerts::finish(&mut a, "env-a", "slack", "condition-fixture", id, &Ok(()))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        alerts::reserve_with_conditions(&mut a, "env-a", "slack", "condition-fixture", 60, Some(2))
+            .await
+            .unwrap(),
+        Reservation::CoolingDown
+    );
+    assert_eq!(
+        alerts::reserve(&mut a, "env-a", "slack", "condition-fixture", 60)
+            .await
+            .unwrap(),
+        Reservation::CoolingDown
+    );
+    let next = match alerts::reserve_with_conditions(
+        &mut a,
+        "env-a",
+        "slack",
+        "condition-fixture",
+        60,
+        Some(4),
+    )
+    .await
+    .unwrap()
+    {
+        Reservation::Claimed(id) => id,
+        _ => panic!("new condition claim expected"),
+    };
+    assert!(
+        alerts::finish(
+            &mut a,
+            "env-a",
+            "slack",
+            "condition-fixture",
+            next,
+            &Err(AlertError::Unknown)
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(
+        alerts::reserve_with_conditions(&mut a, "env-a", "slack", "condition-fixture", 60, Some(8))
+            .await
+            .unwrap(),
+        Reservation::Blocked
+    );
+    a.execute("DELETE FROM novu_rust_alert_delivery_attempts WHERE environment_id='env-a' AND target_id='condition-fixture'",&[]).await.unwrap();
+    a.execute("DELETE FROM novu_rust_alert_delivery_slots WHERE environment_id='env-a' AND target_id='condition-fixture'",&[]).await.unwrap();
     let (first, second) = tokio::join!(
         alerts::reserve(&mut a, "env-a", "slack", "ops", 60),
         alerts::reserve(&mut b, "env-a", "slack", "ops", 60)

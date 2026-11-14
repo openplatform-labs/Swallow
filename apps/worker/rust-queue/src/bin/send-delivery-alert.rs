@@ -15,6 +15,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 .into(),
         );
     }
+    let on_new_condition = match std::env::var("SWALLOW_ALERT_COOLDOWN_POLICY").as_deref() {
+        Ok("new-condition") => true,
+        Ok("destination") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid alert cooldown policy".into()),
+    };
     let grace: i32 = args[1].parse()?;
     let heartbeat: i32 = args[2].parse()?;
     let cooldown: i32 = args[3].parse()?;
@@ -210,7 +215,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut error = configuration_error || failed_checks.iter().any(|failed| *failed);
     let mut needs_review = false;
     if let Some(provider) = slack {
-        match alerts::dispatch_slack(&mut db, &slack_id, cooldown, &alert, &provider).await {
+        match alerts::dispatch_slack_with_conditions(
+            &mut db,
+            &slack_id,
+            cooldown,
+            &alert,
+            &provider,
+            on_new_condition,
+        )
+        .await
+        {
             Ok(Dispatch::NeedsReview) => {
                 needs_review = true;
                 eprintln!("Slack alert requires operator review");
@@ -223,7 +237,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
     }
     if let Some((to, provider)) = email {
-        match alerts::dispatch_email(&mut db, &email_id, cooldown, &alert, &provider, &to).await {
+        match alerts::dispatch_email_with_conditions(
+            &mut db,
+            &email_id,
+            cooldown,
+            &alert,
+            &provider,
+            &to,
+            on_new_condition,
+        )
+        .await
+        {
             Ok(Dispatch::NeedsReview) => {
                 needs_review = true;
                 eprintln!("email alert requires operator review");
