@@ -804,6 +804,92 @@ pub enum Dispatch {
     NeedsReview,
 }
 
+pub struct DispatchPair<'a> {
+    pub alert: &'a Alert,
+    pub slack: Option<(&'a SlackWebhook, &'a str)>,
+    pub email: Option<(&'a AlertEmailProvider, &'a str, &'a str)>,
+    pub cooldown: i32,
+    pub on_new: bool,
+    pub scoped: bool,
+    pub timeout: Duration,
+}
+
+type DispatchOutcome = Option<DbResult<Dispatch>>;
+
+/// Each destination gets its own reservation and timeout. If a second client
+/// is provided, the two operations can overlap without sharing a transaction.
+pub async fn dispatch_pair(
+    db: &mut PgClient,
+    other: Option<&mut PgClient>,
+    cfg: DispatchPair<'_>,
+) -> (DispatchOutcome, DispatchOutcome) {
+    async fn slack(db: &mut PgClient, cfg: &DispatchPair<'_>) -> DispatchOutcome {
+        let (provider, target) = cfg.slack?;
+        Some(
+            tokio::time::timeout(
+                cfg.timeout,
+                dispatch_slack_with_options(
+                    db,
+                    target,
+                    cfg.cooldown,
+                    cfg.alert,
+                    provider,
+                    cfg.on_new,
+                    cfg.scoped,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| Err("Slack dispatch timed out".into())),
+        )
+    }
+    async fn email(db: &mut PgClient, cfg: &DispatchPair<'_>) -> DispatchOutcome {
+        let (provider, target, recipient) = cfg.email?;
+        Some(
+            tokio::time::timeout(
+                cfg.timeout,
+                dispatch_selected_email_with_options(
+                    db,
+                    target,
+                    cfg.cooldown,
+                    cfg.alert,
+                    provider,
+                    recipient,
+                    (cfg.on_new, cfg.scoped),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| Err("email dispatch timed out".into())),
+        )
+    }
+    if let Some(other) = other {
+        tokio::join!(slack(db, &cfg), email(other, &cfg))
+    } else {
+        (slack(db, &cfg).await, email(db, &cfg).await)
+    }
+}
+
+pub fn parallel_delivery_from_env() -> DbResult<bool> {
+    match std::env::var("SWALLOW_ALERT_DELIVERY_POLICY").as_deref() {
+        Ok("parallel") => Ok(true),
+        Ok("sequential") | Err(std::env::VarError::NotPresent) => Ok(false),
+        _ => Err("invalid alert delivery policy".into()),
+    }
+}
+
+/// Connect before starting either send; callers can safely fall back to a
+/// sequential dispatch if this fails. The connection driver exits on drop.
+pub async fn additional_delivery_connection(
+    config: &tokio_postgres::Config,
+    tls: novu_rust_contracts::postgres::MakeRustlsConnect,
+    timeout: Duration,
+) -> DbResult<PgClient> {
+    let (client, driver) = tokio::time::timeout(timeout, config.connect(tls)).await??;
+    tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    Ok(client)
+}
+
 async fn dispatch<F, Fut>(
     db: &mut PgClient,
     environment: &str,
@@ -1862,6 +1948,98 @@ mod tests {
         );
         server.await.unwrap();
         assert_eq!(db.query_one("SELECT count(*) FROM novu_rust_alert_delivery_attempts WHERE sender_session_user=$1 AND target_id='limited-sendgrid' AND state='accepted'", &[&role]).await.unwrap().get::<_,i64>(0), 1);
+        // Both restricted sessions reserve independently: a stalled Slack HTTP
+        // request must not prevent the email result from being committed.
+        let (mut pair_a, driver) = tokio_postgres::connect(
+            &std::env::var("TEST_DATABASE_URL").unwrap(),
+            tokio_postgres::NoTls,
+        )
+        .await
+        .unwrap();
+        tokio::spawn(async move {
+            let _ = driver.await;
+        });
+        let (mut pair_b, driver) = tokio_postgres::connect(
+            &std::env::var("TEST_DATABASE_URL").unwrap(),
+            tokio_postgres::NoTls,
+        )
+        .await
+        .unwrap();
+        tokio::spawn(async move {
+            let _ = driver.await;
+        });
+        pair_a
+            .batch_execute(&format!("SET SESSION AUTHORIZATION {role}"))
+            .await
+            .unwrap();
+        pair_b
+            .batch_execute(&format!("SET SESSION AUTHORIZATION {role}"))
+            .await
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let held_server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            assert!(stream.read(&mut buf).await.unwrap() > 0);
+            seen_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+        let pair_slack = SlackWebhook::with_endpoint(endpoint).unwrap();
+        let (url, email_server) = mock_server("202 Accepted", "").await;
+        let pair_email = AlertEmailProvider::Sendgrid(
+            crate::sendgrid::Sendgrid::test_endpoint(
+                crate::sendgrid::Config {
+                    api_key: "fixture-key".into(),
+                    from: "from@example.test".into(),
+                    sender_name: String::new(),
+                    region: crate::sendgrid::Region::Global,
+                },
+                url.as_str(),
+            )
+            .unwrap(),
+        );
+        let pair = tokio::spawn(async move {
+            dispatch_pair(
+                &mut pair_a,
+                Some(&mut pair_b),
+                DispatchPair {
+                    alert: &self::alert(),
+                    slack: Some((&pair_slack, "pair-slack")),
+                    email: Some((&pair_email, "pair-email", "ops@example.test")),
+                    cooldown: 60,
+                    on_new: true,
+                    scoped: true,
+                    timeout: Duration::from_secs(5),
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), seen_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), email_server)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut email_committed = false;
+        for _ in 0..100 {
+            if db.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_alert_delivery_slots WHERE target_id='pair-email' AND state='accepted')", &[]).await.unwrap().get::<_,bool>(0) {email_committed = true; break;}
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(email_committed && !pair.is_finished());
+        release_tx.send(()).unwrap();
+        held_server.await.unwrap();
+        let (s, e) = pair.await.unwrap();
+        assert_eq!(s.unwrap().unwrap(), Dispatch::Accepted);
+        assert_eq!(e.unwrap().unwrap(), Dispatch::Accepted);
         // An operation timeout after the HTTP request starts must not cause an automatic retry.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();

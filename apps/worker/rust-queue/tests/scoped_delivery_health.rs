@@ -631,6 +631,43 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
         String::from_utf8_lossy(&limited.stderr)
     );
 
+    db.execute("INSERT INTO novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES ('a','email','ops-email','rejected')", &[]).await.unwrap();
+    let parallel = Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"))
+        .args(["a", "300", "120", "60"])
+        .env("DATABASE_URL", role_url.as_str())
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .env("SWALLOW_ALERT_DELIVERY_POLICY", "parallel")
+        .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
+        .env("SWALLOW_ALERT_ATTEMPTS_ENABLED", "true")
+        .env("SWALLOW_ALERT_CHECK_SCOPED_ACCESS", "true")
+        .env("SWALLOW_ALERT_SCOPED_DELIVERY", "true")
+        .env(
+            "SWALLOW_ALERT_SLACK_WEBHOOK",
+            "https://hooks.slack.com/services/A/B/C",
+        )
+        .env_remove("SWALLOW_ALERT_SLACK_WEBHOOK_FILE")
+        .env("SWALLOW_ALERT_SLACK_TARGET_ID", "ops")
+        .env("SWALLOW_ALERT_EMAIL_TARGET_ID", "ops-email")
+        .env("SWALLOW_ALERT_EMAIL_TO", "ops@example.test")
+        .env("SWALLOW_ALERT_EMAIL_PROVIDER", "sendgrid")
+        .env("NOVU_SENDGRID_FROM", "sender@example.test")
+        .env("NOVU_SENDGRID_API_KEY", "fixture-key")
+        .env_remove("NOVU_SENDGRID_API_KEY_FILE")
+        .output()
+        .unwrap();
+    assert_eq!(
+        parallel.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&parallel.stderr)
+    );
+    let log = String::from_utf8_lossy(&parallel.stderr);
+    assert!(
+        log.contains("Slack alert requires operator review")
+            && log.contains("email alert requires operator review")
+    );
+    assert!(!log.contains("fixture-key"));
+
     let alert = Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"))
         .args(["a", "300", "120", "60"])
         .env("DATABASE_URL", &url)

@@ -132,3 +132,25 @@ fn database_alert_rejects_invalid_fallback_delivery_policy() {
         );
     }
 }
+
+#[test]
+fn both_alert_commands_reject_invalid_coordinated_delivery_policy() {
+    for (binary, args) in [
+        (
+            env!("CARGO_BIN_EXE_send-delivery-alert"),
+            vec!["env", "300", "120", "60"],
+        ),
+        (
+            env!("CARGO_BIN_EXE_send-database-alert"),
+            vec!["env", "db", "60"],
+        ),
+    ] {
+        let out = Command::new(binary)
+            .args(&args)
+            .env("SWALLOW_ALERT_DELIVERY_POLICY", "bad")
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("invalid alert delivery policy"));
+    }
+}

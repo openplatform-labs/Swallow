@@ -25,6 +25,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         return Err("invalid alert operation timeout".into());
     }
     let operation_timeout = Duration::from_secs(operation_seconds);
+    let parallel_delivery = alerts::parallel_delivery_from_env()?;
     let on_new_condition = match std::env::var("SWALLOW_ALERT_COOLDOWN_POLICY").as_deref() {
         Ok("new-condition") => true,
         Ok("destination") | Err(std::env::VarError::NotPresent) => false,
@@ -63,7 +64,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let email_id =
         std::env::var("SWALLOW_ALERT_EMAIL_TARGET_ID").unwrap_or_else(|_| "default".into());
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
-    let (mut db, connection) = tokio::time::timeout(operation_timeout, config.connect(tls))
+    let (mut db, connection) = tokio::time::timeout(operation_timeout, config.connect(tls.clone()))
         .await
         .map_err(|_| "alert database connection timed out")??;
     tokio::spawn(async move {
@@ -368,55 +369,62 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         || failed_jobs_check_failed
         || failed_checks.iter().any(|failed| *failed);
     let mut needs_review = false;
-    if let Some(provider) = slack {
-        match tokio::time::timeout(
-            operation_timeout,
-            alerts::dispatch_slack_with_options(
-                &mut db,
-                &slack_id,
-                cooldown,
-                &alert,
-                &provider,
-                on_new_condition,
-                scoped_delivery,
-            ),
-        )
-        .await
-        {
-            Ok(Ok(Dispatch::NeedsReview)) => {
-                needs_review = true;
-                eprintln!("Slack alert requires operator review");
+    let mut other = if parallel_delivery && slack.is_some() && email.is_some() {
+        match alerts::additional_delivery_connection(&config, tls, operation_timeout).await {
+            Ok(client) => {
+                let setup = tokio::time::timeout(
+                    operation_timeout,
+                    client.query_one(
+                        "SELECT set_config('statement_timeout',$1,false)",
+                        &[&statement_timeout],
+                    ),
+                )
+                .await;
+                if matches!(setup, Ok(Ok(_))) {
+                    Some(client)
+                } else {
+                    error = true;
+                    eprintln!("parallel alert connection setup failed; using sequential delivery");
+                    None
+                }
             }
-            Ok(Ok(result)) => println!("Slack alert: {result:?}"),
-            _ => {
+            Err(_) => {
                 error = true;
-                eprintln!("Slack alert dispatch failed");
+                eprintln!("parallel alert connection failed; using sequential delivery");
+                None
             }
         }
-    }
-    if let Some((to, provider)) = email {
-        match tokio::time::timeout(
-            operation_timeout,
-            alerts::dispatch_selected_email_with_options(
-                &mut db,
-                &email_id,
-                cooldown,
-                &alert,
-                &provider,
-                &to,
-                (on_new_condition, scoped_delivery),
-            ),
-        )
-        .await
-        {
-            Ok(Ok(Dispatch::NeedsReview)) => {
-                needs_review = true;
-                eprintln!("email alert requires operator review");
-            }
-            Ok(Ok(result)) => println!("email alert: {result:?}"),
-            _ => {
-                error = true;
-                eprintln!("email alert dispatch failed");
+    } else {
+        None
+    };
+    let (slack_result, email_result) = alerts::dispatch_pair(
+        &mut db,
+        other.as_mut(),
+        alerts::DispatchPair {
+            alert: &alert,
+            slack: slack.as_ref().map(|p| (p, slack_id.as_str())),
+            email: email
+                .as_ref()
+                .map(|(to, p)| (p, email_id.as_str(), to.as_str())),
+            cooldown,
+            on_new: on_new_condition,
+            scoped: scoped_delivery,
+            timeout: operation_timeout,
+        },
+    )
+    .await;
+    for (channel, outcome) in [("Slack", slack_result), ("email", email_result)] {
+        if let Some(outcome) = outcome {
+            match outcome {
+                Ok(Dispatch::NeedsReview) => {
+                    needs_review = true;
+                    eprintln!("{channel} alert requires operator review");
+                }
+                Ok(result) => println!("{channel} alert: {result:?}"),
+                Err(_) => {
+                    error = true;
+                    eprintln!("{channel} alert dispatch failed");
+                }
             }
         }
     }

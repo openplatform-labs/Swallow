@@ -53,6 +53,7 @@ async fn main() -> Result<()> {
         return Err("invalid alert operation timeout".into());
     }
     let operation_timeout = Duration::from_secs(operation_seconds);
+    let parallel_delivery = alerts::parallel_delivery_from_env()?;
     let on_new = match std::env::var("SWALLOW_ALERT_COOLDOWN_POLICY").as_deref() {
         Ok("new-condition") => true,
         Ok("destination") | Err(std::env::VarError::NotPresent) => false,
@@ -139,6 +140,7 @@ async fn main() -> Result<()> {
     .await;
     let probe_unhealthy = !matches!(probe, Ok(Ok(())));
     alert.database_probe = Some((args[1].clone(), probe_unhealthy));
+    let mut delivery_config = (monitor_config.clone(), monitor_tls.clone());
     let monitor = tokio::time::timeout(
         Duration::from_secs(seconds),
         monitor_config.connect(monitor_tls),
@@ -153,6 +155,7 @@ async fn main() -> Result<()> {
             eprintln!("monitor database connection failed; using secondary alert state database");
             let (config, tls) =
                 secondary_config.ok_or("secondary database configuration missing")?;
+            delivery_config = (config.clone(), tls.clone());
             tokio::time::timeout(Duration::from_secs(seconds), config.connect(tls))
                 .await
                 .map_err(|_| "secondary database connection timed out")?
@@ -224,43 +227,49 @@ async fn main() -> Result<()> {
         println!("{{\"status\":\"healthy\"}}");
         return Ok(());
     }
-    if let Some(provider) = slack {
-        match tokio::time::timeout(
+    let mut other = if parallel_delivery && slack.is_some() && email.is_some() {
+        match alerts::additional_delivery_connection(
+            &delivery_config.0,
+            delivery_config.1,
             operation_timeout,
-            alerts::dispatch_slack_with_options(
-                &mut db, &slack_id, cooldown, &alert, &provider, on_new, scoped,
-            ),
         )
         .await
         {
-            Ok(Ok(Dispatch::NeedsReview)) => eprintln!("Slack alert requires operator review"),
-            Ok(Ok(result)) => println!("Slack alert: {result:?}"),
-            _ => {
+            Ok(client) => Some(client),
+            Err(_) => {
                 error = true;
-                eprintln!("Slack alert dispatch failed or timed out");
+                eprintln!("parallel alert connection failed; using sequential delivery");
+                None
             }
         }
-    }
-    if let Some((to, provider)) = email {
-        match tokio::time::timeout(
-            operation_timeout,
-            alerts::dispatch_selected_email_with_options(
-                &mut db,
-                &email_id,
-                cooldown,
-                &alert,
-                &provider,
-                &to,
-                (on_new, scoped),
-            ),
-        )
-        .await
-        {
-            Ok(Ok(Dispatch::NeedsReview)) => eprintln!("email alert requires operator review"),
-            Ok(Ok(result)) => println!("email alert: {result:?}"),
-            _ => {
-                error = true;
-                eprintln!("email alert dispatch failed or timed out");
+    } else {
+        None
+    };
+    let (slack_result, email_result) = alerts::dispatch_pair(
+        &mut db,
+        other.as_mut(),
+        alerts::DispatchPair {
+            alert: &alert,
+            slack: slack.as_ref().map(|p| (p, slack_id.as_str())),
+            email: email
+                .as_ref()
+                .map(|(to, p)| (p, email_id.as_str(), to.as_str())),
+            cooldown,
+            on_new,
+            scoped,
+            timeout: operation_timeout,
+        },
+    )
+    .await;
+    for (channel, outcome) in [("Slack", slack_result), ("email", email_result)] {
+        if let Some(outcome) = outcome {
+            match outcome {
+                Ok(Dispatch::NeedsReview) => eprintln!("{channel} alert requires operator review"),
+                Ok(result) => println!("{channel} alert: {result:?}"),
+                Err(_) => {
+                    error = true;
+                    eprintln!("{channel} alert dispatch failed or timed out");
+                }
             }
         }
     }

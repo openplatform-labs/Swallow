@@ -133,6 +133,55 @@ async fn target_outage_is_reported_using_independent_alert_database() {
     let log = String::from_utf8_lossy(&down.stderr);
     assert!(log.contains("requires operator review"));
     assert!(!log.contains("db-alert-fixture") && !log.contains(&probe));
+    db.execute("INSERT INTO novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES ('monitor','email','db-primary','rejected')", &[]).await.unwrap();
+    let run_parallel = || {
+        Command::new(env!("CARGO_BIN_EXE_send-database-alert"))
+            .args(["monitor", "primary", "60"])
+            .env("DATABASE_URL", role_url.as_str())
+            .env("SWALLOW_DB_PROBE_URL", &probe)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("SWALLOW_DB_PROBE_TIMEOUT_SECONDS", "2")
+            .env("SWALLOW_ALERT_DELIVERY_POLICY", "parallel")
+            .env("SWALLOW_ALERT_SCOPED_DELIVERY", "true")
+            .env(
+                "SWALLOW_ALERT_SLACK_WEBHOOK",
+                "https://hooks.slack.com/services/A/B/C",
+            )
+            .env_remove("SWALLOW_ALERT_SLACK_WEBHOOK_FILE")
+            .env("SWALLOW_ALERT_EMAIL_TO", "ops@example.test")
+            .env("SWALLOW_ALERT_EMAIL_PROVIDER", "sendgrid")
+            .env("NOVU_SENDGRID_FROM", "sender@example.test")
+            .env("NOVU_SENDGRID_API_KEY", "fixture-key")
+            .env_remove("NOVU_SENDGRID_API_KEY_FILE")
+            .env_remove("SWALLOW_DB_ALERT_SLACK_TARGET_ID")
+            .env_remove("SWALLOW_DB_ALERT_EMAIL_TARGET_ID")
+            .output()
+            .unwrap()
+    };
+    let parallel = run_parallel();
+    assert_eq!(parallel.status.code(), Some(2));
+    let parallel_log = String::from_utf8_lossy(&parallel.stderr);
+    assert!(
+        parallel_log.contains("Slack alert requires operator review")
+            && parallel_log.contains("email alert requires operator review")
+    );
+    assert!(!parallel_log.contains("fixture-key"));
+    // The first login is available but the second is refused: both sends
+    // fall back before either starts and the command reports the degradation.
+    db.batch_execute(&format!("ALTER ROLE {role} CONNECTION LIMIT 1"))
+        .await
+        .unwrap();
+    let degraded = run_parallel();
+    assert_eq!(degraded.status.code(), Some(1));
+    let log = String::from_utf8_lossy(&degraded.stderr);
+    assert!(log.contains("parallel alert connection failed; using sequential delivery"));
+    assert!(
+        log.contains("Slack alert requires operator review")
+            && log.contains("email alert requires operator review")
+    );
+    db.batch_execute(&format!("ALTER ROLE {role} CONNECTION LIMIT -1"))
+        .await
+        .unwrap();
     let monitor_down = Command::new(env!("CARGO_BIN_EXE_send-database-alert"))
         .args(["monitor", "primary", "60"])
         .env("DATABASE_URL", &probe)
@@ -176,6 +225,39 @@ async fn target_outage_is_reported_using_independent_alert_database() {
     assert!(log.contains("using secondary"));
     assert!(log.contains("requires operator review"));
     assert!(!log.contains("db-alert-fixture"));
+    backup_db.execute("INSERT INTO novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES ('monitor','email','db-primary','rejected')", &[]).await.unwrap();
+    let secondary_pair = Command::new(env!("CARGO_BIN_EXE_send-database-alert"))
+        .args(["monitor", "primary", "60"])
+        .env("DATABASE_URL", &probe)
+        .env("SWALLOW_DB_PROBE_URL", &monitor)
+        .env("SWALLOW_DB_ALERT_BACKUP_DATABASE_URL", backup_url.as_str())
+        .env("SWALLOW_DB_ALERT_STATE_FAILURE_MODE", "secondary-store")
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .env("SWALLOW_DB_PROBE_TIMEOUT_SECONDS", "2")
+        .env("SWALLOW_ALERT_DELIVERY_POLICY", "parallel")
+        .env("SWALLOW_ALERT_SCOPED_DELIVERY", "true")
+        .env(
+            "SWALLOW_ALERT_SLACK_WEBHOOK",
+            "https://hooks.slack.com/services/A/B/C",
+        )
+        .env_remove("SWALLOW_ALERT_SLACK_WEBHOOK_FILE")
+        .env("SWALLOW_ALERT_EMAIL_TO", "ops@example.test")
+        .env("SWALLOW_ALERT_EMAIL_PROVIDER", "sendgrid")
+        .env("NOVU_SENDGRID_FROM", "sender@example.test")
+        .env("NOVU_SENDGRID_API_KEY", "fixture-key")
+        .env_remove("NOVU_SENDGRID_API_KEY_FILE")
+        .env_remove("SWALLOW_DB_ALERT_SLACK_TARGET_ID")
+        .env_remove("SWALLOW_DB_ALERT_EMAIL_TARGET_ID")
+        .output()
+        .unwrap();
+    assert_eq!(secondary_pair.status.code(), Some(1));
+    let log = String::from_utf8_lossy(&secondary_pair.stderr);
+    assert!(
+        log.contains("using secondary")
+            && log.contains("Slack alert requires operator review")
+            && log.contains("email alert requires operator review")
+    );
+    assert!(!log.contains("parallel alert connection failed"));
     let failed_secondary = secondary(&probe);
     assert_eq!(failed_secondary.status.code(), Some(1));
     assert!(
