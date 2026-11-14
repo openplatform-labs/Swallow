@@ -182,14 +182,22 @@ async fn run(
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (stream,path,adopt)=match args.as_slice() {
-        [command,path] if command=="apply" => (Stream::Worker,path,None),
-        [command,service,path] if command=="apply" => (Stream::parse(service)?,path,None),
-        [command,path,version,confirmation] if command=="baseline" && confirmation=="I-VERIFIED-THE-EXISTING-SCHEMA" => (Stream::Worker,path,Some(version.parse()?)),
-        [command,service,path,version,confirmation] if command=="baseline" && confirmation=="I-VERIFIED-THE-EXISTING-SCHEMA" => (Stream::parse(service)?,path,Some(version.parse()?)),
-        _=>return Err("usage: migrate-worker apply [api|worker|ws] MIGRATION_DIR | baseline [api|worker|ws] MIGRATION_DIR VERSION I-VERIFIED-THE-EXISTING-SCHEMA".into()),
+    let (stream,path,adopt,through)=match args.as_slice() {
+        [command,path] if command=="apply" => (Stream::Worker,path,None,None),
+        [command,service,path] if command=="apply" => (Stream::parse(service)?,path,None,None),
+        [command,path,flag,version] if command=="apply" && flag=="--through" => (Stream::Worker,path,None,Some(version.parse::<usize>()?)),
+        [command,service,path,flag,version] if command=="apply" && flag=="--through" => (Stream::parse(service)?,path,None,Some(version.parse::<usize>()?)),
+        [command,path,version,confirmation] if command=="baseline" && confirmation=="I-VERIFIED-THE-EXISTING-SCHEMA" => (Stream::Worker,path,Some(version.parse()?),None),
+        [command,service,path,version,confirmation] if command=="baseline" && confirmation=="I-VERIFIED-THE-EXISTING-SCHEMA" => (Stream::parse(service)?,path,Some(version.parse()?),None),
+        _=>return Err("usage: migrate-worker apply [api|worker|ws] MIGRATION_DIR [--through VERSION] | baseline [api|worker|ws] MIGRATION_DIR VERSION I-VERIFIED-THE-EXISTING-SCHEMA".into()),
     };
-    let files = read_migrations(Path::new(path))?;
+    let mut files = read_migrations(Path::new(path))?;
+    if let Some(version) = through {
+        if version == 0 || version > files.len() {
+            return Err("invalid through version".into());
+        }
+        files.truncate(version);
+    }
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let (mut db, connection) = config.connect(tls).await?;
     tokio::spawn(async move {

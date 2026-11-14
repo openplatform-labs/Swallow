@@ -301,7 +301,7 @@ mod tests {
         let url = std::env::var("TEST_DATABASE_URL").unwrap();
         let (mut db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
         tokio::spawn(async move { driver.await.unwrap() });
-        db.batch_execute("CREATE TABLE novu_rust_workflows (environment_id text, identifier text, in_app_content text, has_steps boolean NOT NULL DEFAULT true, PRIMARY KEY (environment_id, identifier))").await.unwrap();
+        db.batch_execute("CREATE TABLE novu_rust_environments (id text PRIMARY KEY, organization_id text NOT NULL); INSERT INTO novu_rust_environments VALUES ('env-a','org-a'); CREATE TABLE novu_rust_workflows (environment_id text, identifier text, in_app_content text, has_steps boolean NOT NULL DEFAULT true, PRIMARY KEY (environment_id, identifier))").await.unwrap();
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
         let mut paths: Vec<_> = std::fs::read_dir(dir)
             .unwrap()

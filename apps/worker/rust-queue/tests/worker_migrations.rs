@@ -35,7 +35,25 @@ async fn history_atomicity_concurrency_and_explicit_baseline() {
             .unwrap()
     };
     let path = dir.to_str().unwrap();
+    assert!(!exec(&["apply", path, "--through", "0"]).status.success());
+    assert!(!exec(&["apply", path, "--through", "3"]).status.success());
+    assert!(exec(&["apply", path, "--through", "1"]).status.success());
+    assert!(
+        String::from_utf8_lossy(&exec(&["apply", path, "--through", "1"]).stdout)
+            .contains("applied 0")
+    );
+    assert_eq!(
+        db.query_one(
+            "SELECT count(*) FROM public.novu_rust_worker_migration_history",
+            &[]
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0),
+        1
+    );
     assert!(exec(&["apply", path]).status.success());
+    assert!(!exec(&["apply", path, "--through", "1"]).status.success());
     assert!(String::from_utf8_lossy(&exec(&["apply", path]).stdout).contains("applied 0"));
     assert_eq!(
         db.query_one(

@@ -10,16 +10,28 @@ async fn service_migrations_apply_in_order_and_reapply_safely() {
         let _ = driver.await;
     });
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let api_dir = root.join("../../api/rust-api/migrations");
+    let initial = Command::new(env!("CARGO_BIN_EXE_migrate-worker"))
+        .args(["apply", "api", api_dir.to_str().unwrap(), "--through", "17"])
+        .env("DATABASE_URL", &url)
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .output()
+        .unwrap();
+    assert!(
+        initial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
     for (service, path, history) in [
-        (
-            "api",
-            root.join("../../api/rust-api/migrations"),
-            "public.novu_rust_api_migration_history",
-        ),
         (
             "worker",
             root.join("migrations"),
             "public.novu_rust_worker_migration_history",
+        ),
+        (
+            "api",
+            root.join("../../api/rust-api/migrations"),
+            "public.novu_rust_api_migration_history",
         ),
         (
             "ws",

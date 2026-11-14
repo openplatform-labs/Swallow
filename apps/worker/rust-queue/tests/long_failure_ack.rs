@@ -22,9 +22,21 @@ async fn long_diagnostics_can_be_acknowledged_after_upgrade() {
             fs::copy(entry.path(), dir.join(name)).unwrap();
         }
     }
+    let api_dir = root.join("../../api/rust-api/migrations");
+    let initial = Command::new(env!("CARGO_BIN_EXE_migrate-worker"))
+        .args(["apply", "api", api_dir.to_str().unwrap(), "--through", "17"])
+        .env("DATABASE_URL", &url)
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .output()
+        .unwrap();
+    assert!(
+        initial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
     for (service, path) in [
-        ("api", root.join("../../api/rust-api/migrations")),
         ("worker", dir.clone()),
+        ("api", root.join("../../api/rust-api/migrations")),
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_migrate-worker"))
             .args(["apply", service, path.to_str().unwrap()])

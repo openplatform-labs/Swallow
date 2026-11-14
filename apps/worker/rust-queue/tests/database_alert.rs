@@ -11,9 +11,21 @@ async fn target_outage_is_reported_using_independent_alert_database() {
     let container = std::env::var("TEST_PROBE_CONTAINER").unwrap();
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     for database in [&monitor, &backup] {
+        let api_dir = root.join("../../api/rust-api/migrations");
+        let initial = Command::new(env!("CARGO_BIN_EXE_migrate-worker"))
+            .args(["apply", "api", api_dir.to_str().unwrap(), "--through", "17"])
+            .env("DATABASE_URL", database)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .output()
+            .unwrap();
+        assert!(
+            initial.status.success(),
+            "{}",
+            String::from_utf8_lossy(&initial.stderr)
+        );
         for (service, path) in [
-            ("api", root.join("../../api/rust-api/migrations")),
             ("worker", root.join("migrations")),
+            ("api", root.join("../../api/rust-api/migrations")),
         ] {
             let out = Command::new(env!("CARGO_BIN_EXE_migrate-worker"))
                 .args(["apply", service, path.to_str().unwrap()])

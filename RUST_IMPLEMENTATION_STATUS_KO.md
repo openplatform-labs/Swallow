@@ -20,6 +20,8 @@ WS는 `NOVU_WS_DISCONNECT_ON_EVENT_GAP=true`를 선택하면 PostgreSQL 이벤�
 
 인앱 워커는 DB 장애나 처리 오류·시간 초과 후 2초마다 재접속한다. `NOVU_IN_APP_DB_TIMEOUT_SECONDS`는 기본 30초이고 1~300초로 설정한다. DB 연결, 개별 쿼리와 스누즈 해제 또는 한 트리거 작업 전체에 적용된다. 트리거의 도메인 쓰기와 완료는 같은 트랜잭션으로 처리하며, 중단된 대기 작업은 임대 만료 후 기존 복구 정책으로 재처리한다. 영구 스키마·권한 오류도 재접속을 반복하므로 외부 감시와 프로세스 감독이 필요하고 DB 설정 변경 시 재시작해야 한다. Docker PostgreSQL에서 두 워커의 잠금 시간 초과 및 DB 재시작 후 재접속과 단일 트리거의 알림·인앱 메시지 단일 생성을 검증했다. 트리거 처리 중 실제 DB 승격·네트워크 분할, 지속 부하와 외부 채널까지의 전체 HA는 미검증이다.
 
+신규 DB에서 서비스 간 마이그레이션 의존성을 만족하려면 `migrate-worker apply api API_DIR --through 17`, `migrate-worker apply worker WORKER_DIR`, `migrate-worker apply api API_DIR`, `migrate-worker apply ws WS_DIR` 순서로 실행한다. API 0018은 워커 FCM 테이블의 인덱스를 생성하므로 API 전체를 먼저 적용하면 실패한다. `--through`는 지정 버전까지 실제 적용하며 전체 파일의 버전 연속성을 검증하고 기록된 파일의 이름과 체크섬을 대조한다. 이미 적용된 버전보다 낮은 지정이나 존재하지 않는 버전은 거절한다. 무이력 기존 DB는 이 명령으로 자동 채택하지 않으며 기존 baseline 절차와 검토가 필요하다. 이후 새 마이그레이션에도 서비스 간 의존성이 생기면 별도 순서 검토가 필요하다.
+
 ## 운영자 권한 위임 관리
 
 워커 0072는 환경별 DB 로그인에 운영 권한을 부여·회수하는 제한된 경로를 추가한다. 신뢰된 DB 소유자가 0064·0067·0068·0071 이후 0072를 적용하고, `novu_rust_operator_grant_admins`에 환경 ID와 관리자 **DB 로그인명**을 직접 등록한 다음 해당 로그인에 `GRANT EXECUTE ON FUNCTION public.novu_rust_manage_operator_grant(text,text,text,text,text)`를 부여한다. 관리자에게 권한·관리자·감사 테이블 직접 쓰기 권한은 주지 않는다. 관리자 지정·회수 자체는 신뢰된 DB 소유자만 수행한다.
