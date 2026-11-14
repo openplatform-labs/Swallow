@@ -88,6 +88,14 @@ docker exec "$name" createdb -U postgres novu_slack_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_slack_test" \
   cargo test --locked --lib slack_queue::tests::queue_fences_concurrency_and_recovers_uncertain_attempts -- --ignored
 
+docker exec "$name" createdb -U postgres novu_slack_webhook_test
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_slack_webhook_test" \
+  cargo test --locked --lib slack_webhook_queue::tests::destinations_are_isolated_and_uncertain_attempts_are_not_retried -- --ignored
+
+docker exec "$name" createdb -U postgres novu_slack_webhook_cli_test
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_slack_webhook_cli_test" \
+  cargo test --locked --test slack_webhook_cli -- --ignored
+
 docker exec "$name" createdb -U postgres novu_slack_reconnect_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_slack_reconnect_test" TEST_PG_CONTAINER="$name" \
   cargo test --locked --test slack_reconnect -- --ignored

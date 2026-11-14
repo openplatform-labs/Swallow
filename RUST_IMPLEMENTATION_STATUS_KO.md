@@ -28,13 +28,21 @@ API 프로세스는 PostgreSQL 접속이 끊기거나 연결 상태 조회가 �
 
 ## 실험 Slack 채팅 발송
 
-`slack-worker`는 `experimental_slack_chat` 종류의 독립 PostgreSQL 작업을 Slack `chat.postMessage`로 발송한다. 워커 0070·0071까지 적용하고 환경별 `NOVU_SLACK_ENVIRONMENT_ID`, `DATABASE_URL`, `NOVU_SLACK_BOT_TOKEN` 또는 `NOVU_SLACK_BOT_TOKEN_FILE`을 설정한다. 토큰은 시작 시 읽고 작업·시도 테이블에 저장하지 않는다. 작업 payload는 `{"channel":"C123","text":"hello","blocks":[],"customData":{"thread_ts":"123.456"}}` 형식이며 blocks와 customData는 선택이다. 원본처럼 customData는 최종 요청 필드를 덮어쓰므로 channel도 변경할 수 있다. 덮어쓴 최종 channel·text·blocks는 크기와 타입을 검증하며, 이러한 제한은 원본과 다를 수 있다. 작업 생성자에게 환경과 최종 대상에 대한 인가 책임이 있고 customData를 포함한 내용은 DB에 저장되므로 접근을 보호해야 한다. **아직 워크플로 실행, 구독자 자격증명·삭제·수신 설정, 원본 채팅 관리 API에 연결되지 않았다.** 풍부한 카드 렌더링, bridge provider override, webhook 대상과 전체 원본 계약도 미구현이다. 운영용이 아닌 격리 평가 경로다.
+`slack-worker`는 `experimental_slack_chat` 종류의 독립 PostgreSQL 작업을 Slack `chat.postMessage`로 발송한다. 워커 0070·0071까지 적용하고 환경별 `NOVU_SLACK_ENVIRONMENT_ID`, `DATABASE_URL`, `NOVU_SLACK_BOT_TOKEN` 또는 `NOVU_SLACK_BOT_TOKEN_FILE`을 설정한다. 토큰은 시작 시 읽고 작업·시도 테이블에 저장하지 않는다. 작업 payload는 `{"channel":"C123","text":"hello","blocks":[],"customData":{"thread_ts":"123.456"}}` 형식이며 blocks와 customData는 선택이다. 원본처럼 customData는 최종 요청 필드를 덮어쓰므로 channel도 변경할 수 있다. 덮어쓴 최종 channel·text·blocks는 크기와 타입을 검증하며, 이러한 제한은 원본과 다를 수 있다. 작업 생성자에게 환경과 최종 대상에 대한 인가 책임이 있고 customData를 포함한 내용은 DB에 저장되므로 접근을 보호해야 한다. **아직 워크플로 실행, 구독자 자격증명·삭제·수신 설정, 원본 채팅 관리 API에 연결되지 않았다.** 풍부한 카드 렌더링, bridge provider override와 전체 원본 계약도 미구현이다. 독립 webhook 발송의 제한된 범위는 다음 항목을 참고한다. 운영용이 아닌 격리 평가 경로다.
 
 발송 전 시도를 기록하고 60초 임대로 중복 선점과 늦은 응답을 차단한다. 시도 전 임대 만료는 재대기하고 시도 후 만료·네트워크 오류·5xx·불완전한 응답 등은 결과 불명으로 남겨 자동 재발송하지 않는다. Slack 응답은 HTTP 성공뿐 아니라 본문의 ok와 channel·ts를 확인한다. 일부 명확한 오류와 408·409를 제외한 HTTP 4xx는 거절로, 그 밖의 불명 오류는 unknown으로 기록한다. 공급자 접수는 사람이 읽었다는 뜻이 아니다. 결과는 `delivery-reconcile check-slack ENV`로 점검하고 `SWALLOW_ALERT_SLACK_JOBS_ENABLED=true`를 설정하면 기존 운영 경보에 포함한다. DB 오류·명령 미실행·워커 종료는 별도 감시해야 한다.
 
 Slack 워커는 PostgreSQL 연결 실패나 처리 오류·시간 초과 뒤 2초마다 재접속해 복구를 계속한다. `NOVU_SLACK_DB_TIMEOUT_SECONDS`는 기본 30초이며 1~300초로 설정한다. 연결, PostgreSQL 개별 문장과 한 작업의 전체 처리에 적용되므로 외부 Slack 요청도 이 시간에 포함된다. 짧게 설정하거나 DB가 느리면 진행 중 요청이 취소되어 발송 결과가 불명으로 남을 수 있다. 이 경우 임대 만료 후 기존 복구 절차가 `unknown`으로 표시하며 자동 재전송하지 않는다. 고정된 잘못된 스키마·권한 오류도 재연결을 반복하므로 별도 감시와 프로세스 감독이 필요하다. DB 접속 설정과 Slack 토큰은 시작 시 읽으며 변경에는 재시작이 필요하다. Docker PostgreSQL에서 잠금 시간 초과, 두 프로세스의 DB 재시작 후 재접속과 만료된 발송 시도의 불명 처리, 미발송 잘못된 작업의 처리를 검증했다. 실제 Slack 요청 도중 DB 장애, 실제 네트워크 분할, DB 승격과 지속 부하의 HA는 미검증이다.
 
 수동 `delivery-reconcile slack-resolve ENV JOB retry|accepted OPERATOR REASON`은 해당 환경과 DB 로그인에 별도로 부여한 `slack_retry` 또는 `slack_accepted` 권한을 잠금 아래 확인하고 감사 기록과 상태 변경을 원자적으로 수행한다. 기존 이메일·SMS·푸시 및 운영 경보 권한과 별개다. accepted는 불명 상태에서만 가능하며 제공자 ID가 없는 운영자 확인이다. retry는 불명·거절에 가능하나 미접수를 독립적으로 확인하지 않으면 중복될 수 있다. 0071은 0067·0068 이후 적용하며 Slack 권한을 부여한 후 구버전 권한 제약 마이그레이션을 재적용하지 않는다. DB 직접 쓰기·감사 위변조는 별도 제한이 필요하다. Docker PostgreSQL·모의 HTTP에서 동시 선점, 발송 전후 복구·늦은 응답, 환경 격리·감시·권한·감사를 검증한다. 기준 원본의 채널·사용자 대상과 customData 덮어쓰기 등 세 요청을 모의 HTTP로 비교했으며 실제 Slack 발송, 워크플로 종단 간 비교, 모든 오류와 운영 HA는 미검증이다.
+
+### 독립 Slack incoming webhook 선택
+
+앱 토큰 방식과 별도로 `slack-webhook-worker`는 `experimental_slack_webhook` 작업을 처리한다. 워커 0070~0074를 적용하고 `DATABASE_URL`, `NOVU_SLACK_ENVIRONMENT_ID`, `NOVU_SLACK_WEBHOOK_DESTINATION_ID`, `NOVU_SLACK_WEBHOOK_URL` 또는 `NOVU_SLACK_WEBHOOK_URL_FILE`을 설정한다. URL은 시작 시 읽으며 작업에 넣지 않는다. 작업 payload는 `{"destination":"ops","text":"hello","blocks":[],"customData":{"thread_ts":"1.2"}}`이며 destination은 해당 워커의 ID와 일치해야 한다. blocks·customData는 선택이고 customData는 최종 본문을 덮어쓴다. 여러 목적지는 별도 ID와 워커로 구성한다. URL은 Slack 및 Slack Gov의 공식 HTTPS webhook 호스트만 허용하며 리디렉션을 따르지 않는다. 이는 임의의 안전한 URL도 지원하는 원본보다 제한적이다.
+
+동일 환경·목적지 ID에 서로 다른 URL을 사용하는 워커는 시작 시 거절한다. DB에는 URL의 SHA-256 지문을 저장하므로 지문·작업 테이블 접근을 보호해야 하며, 워커 DB 계정은 목적지 테이블의 SELECT·INSERT·UPDATE와 큐 처리 권한이 필요하다. URL 변경 시 새 목적지 ID를 사용한다. DB를 직접 수정하거나 같은 ID의 URL을 일방적으로 변경하는 배포는 이 보호를 우회할 수 있으므로 목적지 등록과 구성 권한을 통제해야 한다. 잘못된 ID나 누락된 ID의 작업은 해당 워커가 가져가지 않으므로 큐 정체를 별도 감시해야 한다.
+
+웹훅 워커는 발송 전 시도를 기록하고 임대 만료 후 불명 결과를 자동 재발송하지 않는다. `check-slack`·운영 경보와 `slack-resolve`는 앱과 웹훅 작업을 함께 다루며, 수동 재시도는 공급자 미접수 확인이 필요하다. `NOVU_SLACK_WEBHOOK_DB_TIMEOUT_SECONDS`는 기본 30초, 범위 1~300초로 외부 요청을 포함한 전체 처리에 적용된다. 설정 교체 시 재시작해야 한다. Docker PostgreSQL과 모의 HTTP에서 목적지·환경 격리, 중복 URL 구성 거절, 불명 복구·권한 기반 수동 재처리, 응답 처리와 URL 제한을 검증했다. 기준 원본 provider의 선택된 webhook 요청 본문 한 사례도 모의 비교했다. 실제 Slack 전송과 워크플로·구독자·연결 관리 API, 원본의 임의 webhook URL·고급 override 및 종단 간 비교는 미구현 또는 미검증이며 이 경로는 운영용이 아닌 격리 평가 기능이다.
 
 ## Resend 발송 응답 판정
 
