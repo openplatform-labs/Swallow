@@ -134,6 +134,10 @@ pub fn router_with_webhook_configs(
         )
         .route("/v1/events/trigger", post(trigger))
         .route(
+            "/v1/experimental/workflows/{workflow}/email-provider",
+            get(get_workflow_email_provider).put(set_workflow_email_provider),
+        )
+        .route(
             "/v1/subscribers/{subscriber_id}/credentials",
             axum::routing::put(subscriber_credentials::update)
                 .patch(subscriber_credentials::update),
@@ -2464,6 +2468,125 @@ async fn authenticate(db: &Client, headers: &HeaderMap, path: &str) -> Result<St
         Ok(Some(row)) => Ok(row.get(0)),
         Ok(None) => Err(error_at(StatusCode::UNAUTHORIZED, "API Key not found", "Unauthorized", path)),
         Err(_) => Err(error_at(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error", "Internal Server Error", path)),
+    }
+}
+
+async fn provider_management_access(
+    db: &Client,
+    headers: &HeaderMap,
+    path: &str,
+    permission: &str,
+) -> Result<(String, String), ApiError> {
+    let environment = authenticate(db, headers, path).await?;
+    // authenticate already verifies this exact scheme and rejects empty keys.
+    let key = headers
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("ApiKey "))
+        .ok_or_else(|| {
+            error_at(
+                StatusCode::UNAUTHORIZED,
+                "Unauthorized",
+                "Unauthorized",
+                path,
+            )
+        })?;
+    let hash = format!("{:x}", Sha256::digest(key.as_bytes()));
+    let allowed = db.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_workflow_provider_permissions p JOIN novu_rust_api_keys k ON k.key_hash=p.key_hash WHERE p.key_hash=$1 AND p.permission=$2 AND k.enabled AND k.environment_id=$3)", &[&hash,&permission,&environment]).await
+        .map_err(|_|error_at(StatusCode::INTERNAL_SERVER_ERROR,"Internal server error","Internal Server Error",path))?.get::<_,bool>(0);
+    if !allowed {
+        return Err(error_at(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            "Forbidden",
+            path,
+        ));
+    }
+    Ok((environment, hash))
+}
+
+async fn get_workflow_email_provider(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    Path(workflow): Path<String>,
+    OriginalUri(uri): OriginalUri,
+) -> (StatusCode, Json<Value>) {
+    let path = uri.to_string();
+    let (environment, _) = match provider_management_access(&db, &headers, &path, "read").await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    match db.query_opt("SELECT email_provider FROM novu_rust_workflows WHERE environment_id=$1 AND identifier=$2", &[&environment,&workflow]).await {
+        Ok(Some(row)) => (StatusCode::OK,Json(json!({"data":{"workflowIdentifier":workflow,"provider":row.get::<_,String>(0)}}))),
+        Ok(None) => error_at(StatusCode::NOT_FOUND,"Workflow not found","Not Found",&path),
+        Err(_) => error_at(StatusCode::INTERNAL_SERVER_ERROR,"Internal server error","Internal Server Error",&path),
+    }
+}
+
+async fn set_workflow_email_provider(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    Path(workflow): Path<String>,
+    OriginalUri(uri): OriginalUri,
+    body: Bytes,
+) -> (StatusCode, Json<Value>) {
+    let path = uri.to_string();
+    let (environment, hash) = match provider_management_access(&db, &headers, &path, "write").await
+    {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let input: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return error_at(
+                StatusCode::BAD_REQUEST,
+                "Invalid JSON",
+                "Bad Request",
+                &path,
+            );
+        }
+    };
+    let Some(object) = input.as_object().filter(|o| o.len() == 1) else {
+        return error_at(
+            StatusCode::BAD_REQUEST,
+            "Invalid provider",
+            "Bad Request",
+            &path,
+        );
+    };
+    let Some(provider) = object
+        .get("provider")
+        .and_then(Value::as_str)
+        .filter(|p| ["sendgrid", "resend"].contains(p))
+    else {
+        return error_at(
+            StatusCode::BAD_REQUEST,
+            "Invalid provider",
+            "Bad Request",
+            &path,
+        );
+    };
+    // Recheck the grant and key in the mutation itself to avoid applying a
+    // change after a grant has already been revoked.
+    let result=db.query_opt("UPDATE novu_rust_workflows w SET email_provider=$3 WHERE w.environment_id=$1 AND w.identifier=$2 AND EXISTS(SELECT 1 FROM novu_rust_workflow_provider_permissions p JOIN novu_rust_api_keys k ON k.key_hash=p.key_hash WHERE p.key_hash=$4 AND p.permission='write' AND k.enabled AND k.environment_id=$1) RETURNING w.email_provider", &[&environment,&workflow,&provider,&hash]).await;
+    match result {
+        Ok(Some(row)) => (
+            StatusCode::OK,
+            Json(json!({"data":{"workflowIdentifier":workflow,"provider":row.get::<_,String>(0)}})),
+        ),
+        Ok(None) => error_at(
+            StatusCode::NOT_FOUND,
+            "Workflow not found or permission revoked",
+            "Not Found",
+            &path,
+        ),
+        Err(_) => error_at(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal server error",
+            "Internal Server Error",
+            &path,
+        ),
     }
 }
 

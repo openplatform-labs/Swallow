@@ -309,10 +309,20 @@ async fn trigger_api_contract_inner() {
     let url = std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL required");
     let (db, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move { connection.await.unwrap() });
-    db.batch_execute("DROP TABLE IF EXISTS novu_rust_ws_events, novu_rust_organization_snooze_limits, novu_rust_subscription_preferences, novu_rust_topic_subscribers, novu_rust_topics, novu_rust_contexts, novu_rust_in_app_messages, novu_rust_subscribers, novu_queue_jobs, novu_rust_trigger_transactions, novu_rust_workflows, novu_rust_api_keys, novu_rust_users, novu_rust_environments CASCADE")
+    db.batch_execute("DROP TABLE IF EXISTS novu_rust_workflow_provider_permissions, novu_rust_ws_events, novu_rust_organization_snooze_limits, novu_rust_subscription_preferences, novu_rust_topic_subscribers, novu_rust_topics, novu_rust_contexts, novu_rust_in_app_messages, novu_rust_subscribers, novu_queue_jobs, novu_rust_trigger_transactions, novu_rust_workflows, novu_rust_api_keys, novu_rust_users, novu_rust_environments CASCADE")
         .await
         .unwrap();
     db.batch_execute(novu_rust_api::MIGRATION).await.unwrap();
+    db.batch_execute(include_str!(
+        "../migrations/0011_workflow_provider_permissions.sql"
+    ))
+    .await
+    .unwrap();
+    db.batch_execute(include_str!(
+        "../migrations/0011_workflow_provider_permissions.sql"
+    ))
+    .await
+    .unwrap();
     db.batch_execute(novu_rust_api::INBOX_SESSION_MIGRATION)
         .await
         .unwrap();
@@ -4632,7 +4642,78 @@ async fn email_workflow_contract(app: axum::Router, worker: &mut tokio_postgres:
             .await
             .unwrap()
     );
-    worker.execute("UPDATE novu_rust_workflows SET email_provider='resend' WHERE environment_id='env-a' AND identifier='email-only'", &[]).await.unwrap();
+    let path = "/v1/experimental/workflows/email-only/email-provider";
+    let (status, _) = inbox_mutate(
+        app.clone(),
+        "PUT",
+        path,
+        Some("ApiKey test-key"),
+        json!({"provider":"resend"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = inbox_get(app.clone(), path, Some("ApiKey test-key")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let hash = format!("{:x}", Sha256::digest(b"test-key"));
+    worker.execute("INSERT INTO novu_rust_workflow_provider_permissions(key_hash,permission) VALUES ($1,'read')", &[&hash]).await.unwrap();
+    let (status, body) = inbox_get(app.clone(), path, Some("ApiKey test-key")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["provider"], "sendgrid");
+    let (status, _) = inbox_mutate(
+        app.clone(),
+        "PUT",
+        path,
+        Some("ApiKey test-key"),
+        json!({"provider":"resend"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    worker.execute("INSERT INTO novu_rust_workflow_provider_permissions(key_hash,permission) VALUES ($1,'write')", &[&hash]).await.unwrap();
+    let (status, _) = inbox_mutate(
+        app.clone(),
+        "PUT",
+        path,
+        Some("ApiKey test-key"),
+        json!({"provider":"resend","apiKey":"forbidden"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, body) = inbox_mutate(
+        app.clone(),
+        "PUT",
+        path,
+        Some("ApiKey test-key"),
+        json!({"provider":"resend"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["provider"], "resend");
+    let (status, _) = inbox_get(app.clone(), path, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let other_hash = format!("{:x}", Sha256::digest(b"test-key-b"));
+    worker.execute("INSERT INTO novu_rust_workflow_provider_permissions(key_hash,permission) VALUES ($1,'read'),($1,'write')", &[&other_hash]).await.unwrap();
+    let (status, _) = inbox_mutate(
+        app.clone(),
+        "PUT",
+        path,
+        Some("ApiKey test-key-b"),
+        json!({"provider":"sendgrid"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = inbox_get(app.clone(), path, Some("ApiKey test-key")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["provider"], "resend");
+    worker.execute("DELETE FROM novu_rust_workflow_provider_permissions WHERE key_hash=$1 AND permission='write'", &[&hash]).await.unwrap();
+    let (status, _) = inbox_mutate(
+        app.clone(),
+        "PUT",
+        path,
+        Some("ApiKey test-key"),
+        json!({"provider":"sendgrid"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
     let (status, _) = request(app, Some("ApiKey test-key"), json!({"name":"email-only","to":{"subscriberId":"resend-recipient","email":"resend@example.test"},"payload":{"name":"Test"},"transactionId":"resend-workflow-api"})).await;
     assert_eq!(status, StatusCode::CREATED);
     assert!(
