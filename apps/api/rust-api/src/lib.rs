@@ -349,6 +349,8 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/operator/subscriber-profile-request", get(operator_identity::subscriber_profile_request))
         .route("/v1/experimental/operator/subscriber-create", post(operator_identity::subscriber_create))
         .route("/v1/experimental/operator/subscriber-create-request", get(operator_identity::subscriber_create_request))
+        .route("/v1/experimental/operator/subscriber-delete", post(operator_identity::subscriber_delete))
+        .route("/v1/experimental/operator/subscriber-delete-request", get(operator_identity::subscriber_delete_request))
         .route("/v1/experimental/operator/alerts/resolve", post(operator_identity::resolve))
         .route("/v1/experimental/operator/alerts/request", get(operator_identity::decision_request))
         .route("/v1/experimental/operator/permissions", get(operator_identity::permission_identity).put(operator_identity::change_permissions))

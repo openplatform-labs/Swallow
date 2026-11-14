@@ -54,6 +54,7 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_subscriber_profile_read(text,text,text,text,bigint,text),public.novu_rust_operator_jwt_subscriber_profile_write(text,text,text,text,bigint,text,uuid,bigint,jsonb,text) TO {role}")).await.unwrap();
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_subscriber_profile_write_v2(text,text,text,text,bigint,uuid,text,uuid,bigint,jsonb,text),public.novu_rust_operator_jwt_subscriber_profile_request_read(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_subscriber_create(text,text,text,text,bigint,uuid,text,jsonb,text),public.novu_rust_operator_jwt_subscriber_create_request_read(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_subscriber_delete(text,text,text,text,bigint,uuid,text,uuid,bigint,text),public.novu_rust_operator_jwt_subscriber_delete_request_read(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname::text=$1",&[&role]).await.unwrap();
     db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id,alert_read) VALUES('https://issuer.test','person','console','jwt-alert-a',true),('https://issuer.test','reader','console','jwt-alert-a',false); INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state,attempt_id) SELECT 'jwt-alert-a','slack','target-'||lpad(n::text,3,'0'),'unknown',gen_random_uuid() FROM generate_series(1,101) n; INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES('jwt-alert-b','email','private','unknown')").await.unwrap();
     db.batch_execute("WITH c AS (INSERT INTO public.novu_rust_console_credentials(token_hash,environment_id,expires_at,subscriber_read) VALUES(encode(sha256(convert_to(repeat('a',64),'UTF8')),'hex'),'jwt-alert-a',clock_timestamp()+interval '1 hour',false) RETURNING credential_id) INSERT INTO public.novu_rust_console_alert_grants SELECT credential_id FROM c").await.unwrap();
@@ -232,6 +233,136 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     );
     db.batch_execute("ALTER TABLE public.novu_rust_operator_jwt_subscriber_create_requests DROP CONSTRAINT fixture_create_failure").await.unwrap();
     assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_subscribers WHERE environment_id='jwt-alert-a' AND subscriber_id='create-rollback'",&[]).await.unwrap().get::<_,i64>(0),0);
+    let delete = |jwt: &str, body: Value| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/experimental/operator/subscriber-delete?environmentId=jwt-alert-a")
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let delete_lookup = |jwt: &str, id: Uuid, env: &str| {
+        Request::builder().uri(format!("/v1/experimental/operator/subscriber-delete-request?environmentId={env}&requestId={id}")).header(header::AUTHORIZATION,format!("Bearer {jwt}")).body(Body::empty()).unwrap()
+    };
+    let delete_id = Uuid::new_v4();
+    let delete_body = json!({"requestId":delete_id.to_string(),"subscriberId":"jwt-create-fixture","generation":a["generation"],"revision":"0","reason":"approved deletion"});
+    assert_eq!(
+        app.clone()
+            .oneshot(delete(&token, delete_body.clone()))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(
+        connect(&api_url)
+            .await
+            .query(
+                "SELECT * FROM public.novu_rust_operator_jwt_subscriber_delete_requests",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_subscriber_delete_grants VALUES('https://issuer.test','person','console','jwt-alert-a'); INSERT INTO public.novu_rust_in_app_messages(id,environment_id,subscriber_id,workflow_identifier,transaction_id,content,payload) VALUES('00000000-0000-4000-8000-000000000555','jwt-alert-a','jwt-create-fixture','fixture','fixture','text','{}')").await.unwrap();
+    db.batch_execute("ALTER TABLE public.novu_rust_operator_jwt_subscriber_delete_requests ADD CONSTRAINT fixture_delete_failure CHECK(false) NOT VALID").await.unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(delete(&token, delete_body.clone()))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    db.batch_execute("ALTER TABLE public.novu_rust_operator_jwt_subscriber_delete_requests DROP CONSTRAINT fixture_delete_failure").await.unwrap();
+    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_subscribers WHERE subscriber_id='jwt-create-fixture'",&[]).await.unwrap().get::<_,i64>(0),1);
+    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_in_app_messages WHERE id='00000000-0000-4000-8000-000000000555'",&[]).await.unwrap().get::<_,i64>(0),1);
+    let app2 = novu_rust_api::router(Arc::new(connect(&api_url).await)).layer(Extension(Arc::new(
+        AccessTokenVerifier::new("https://issuer.test", "swallow", &[("key", PUBLIC)]).unwrap(),
+    )));
+    let (x, y) = tokio::join!(
+        app.clone().oneshot(delete(&token, delete_body.clone())),
+        app2.oneshot(delete(&token, delete_body.clone()))
+    );
+    let x = x.unwrap();
+    let y = y.unwrap();
+    assert_eq!(x.status(), StatusCode::OK);
+    assert_eq!(y.status(), StatusCode::OK);
+    let x: Value =
+        serde_json::from_slice(&x.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let y: Value =
+        serde_json::from_slice(&y.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_ne!(x["replayed"], y["replayed"]);
+    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_in_app_messages WHERE id='00000000-0000-4000-8000-000000000555'",&[]).await.unwrap().get::<_,i64>(0),0);
+    let lookup = app
+        .clone()
+        .oneshot(delete_lookup(&token, delete_id, "jwt-alert-a"))
+        .await
+        .unwrap();
+    let lookup: Value =
+        serde_json::from_slice(&lookup.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(lookup["found"], true);
+    assert_eq!(lookup["generation"], a["generation"]);
+    let mut conflict = delete_body.clone();
+    conflict["reason"] = json!("different");
+    assert_eq!(
+        app.clone()
+            .oneshot(delete(&token, conflict))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    db.batch_execute("INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES('jwt-alert-a','jwt-create-fixture',novu_rust_new_objectid(),'{\"firstName\":\"New\"}')").await.unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(delete(&token, delete_body.clone()))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let mut stale = delete_body.clone();
+    stale["requestId"] = json!(Uuid::new_v4().to_string());
+    assert_eq!(
+        app.clone()
+            .oneshot(delete(&token, stale))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(db.query_one("SELECT profile->>'firstName' FROM public.novu_rust_subscribers WHERE environment_id='jwt-alert-a' AND subscriber_id='jwt-create-fixture'",&[]).await.unwrap().get::<_,String>(0),"New");
+    assert_eq!(
+        app.clone()
+            .oneshot(delete_lookup(&token, delete_id, "jwt-alert-b"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(delete(&make("reader"), delete_body.clone()))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    db.batch_execute(
+        "DELETE FROM public.novu_rust_operator_jwt_subscriber_delete_grants WHERE subject='person'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(delete_lookup(&token, delete_id, "jwt-alert-a"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
     db.batch_execute(
         "DELETE FROM public.novu_rust_operator_jwt_subscriber_create_grants WHERE subject='person'",
     )

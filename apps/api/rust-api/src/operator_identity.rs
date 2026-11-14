@@ -34,6 +34,7 @@ enum Lookup {
     SubscriberProfileRead,
     SubscriberProfileRequest,
     SubscriberCreateRequest,
+    SubscriberDeleteRequest,
 }
 
 fn authenticate(
@@ -185,6 +186,74 @@ pub(super) async fn workflow_grant_request(
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
 ) -> Response {
     query(db, headers, uri, verifier, Lookup::WorkflowGrantRequest).await
+}
+
+pub(super) async fn subscriber_delete_request(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::SubscriberDeleteRequest).await
+}
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SubscriberDelete {
+    request_id: String,
+    subscriber_id: String,
+    generation: String,
+    revision: String,
+    reason: String,
+}
+pub(super) async fn subscriber_delete(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+    body: Bytes,
+) -> Response {
+    let identity = match authenticate(&headers, verifier) {
+        Ok(v) => v,
+        Err(status) => return failure(status, uri.path()),
+    };
+    let params: Vec<_> = form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).collect();
+    if params.len() != 1
+        || params[0].0 != "environmentId"
+        || params[0].1.is_empty()
+        || params[0].1.len() > 512
+        || params[0].1.contains('\0')
+    {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    }
+    let Some(input) = (body.len() <= 8192)
+        .then(|| serde_json::from_slice::<SubscriberDelete>(&body).ok())
+        .flatten()
+    else {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    };
+    let (Ok(request), Ok(generation), Ok(revision), Ok(exp)) = (
+        Uuid::parse_str(&input.request_id),
+        Uuid::parse_str(&input.generation),
+        input.revision.parse::<i64>(),
+        i64::try_from(identity.expires_at),
+    ) else {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    };
+    if revision < 0
+        || revision.to_string() != input.revision
+        || input.subscriber_id.contains('\0')
+        || input.reason.contains('\0')
+    {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    }
+    let env = params[0].1.as_ref();
+    match db.query_one("SELECT public.novu_rust_operator_jwt_subscriber_delete($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&input.subscriber_id,&generation,&revision,&input.reason]).await {
+        Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
+        Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
+        Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
+        Err(e) if e.code().is_some_and(|c|c.code()=="P4090")=>failure(StatusCode::CONFLICT,uri.path()),
+        Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path()),
+    }
 }
 
 pub(super) async fn subscriber_create_request(
@@ -690,6 +759,7 @@ async fn query(
         Lookup::SubscriberProfileRead => &["environmentId", "subscriberId"],
         Lookup::SubscriberProfileRequest => &["environmentId", "requestId"],
         Lookup::SubscriberCreateRequest => &["environmentId", "requestId"],
+        Lookup::SubscriberDeleteRequest => &["environmentId", "requestId"],
     };
     if params.keys().any(|key| !allowed.contains(&key.as_str()))
         || params.get("limit").is_some_and(|limit| limit != "20")
@@ -706,6 +776,15 @@ async fn query(
         return failure(StatusCode::UNAUTHORIZED, "Unauthorized", "Unauthorized");
     };
     let result = match lookup {
+        Lookup::SubscriberDeleteRequest => {
+            let Some(request) = params
+                .get("requestId")
+                .and_then(|s| Uuid::parse_str(s).ok())
+            else {
+                return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+            };
+            db.query_one("SELECT public.novu_rust_operator_jwt_subscriber_delete_request_read($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request]).await
+        }
         Lookup::SubscriberCreateRequest => {
             let Some(request) = params
                 .get("requestId")
