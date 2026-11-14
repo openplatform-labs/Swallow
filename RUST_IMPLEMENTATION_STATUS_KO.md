@@ -3,6 +3,12 @@
 > 기준: 원본 Novu 커밋 `895388f37efe9e06de0aa333e5727303e6ad6853` · 작성: 2026-11-12.
 > **현재 구현은 실험용이며 Novu와 100% 호환되지 않는다. 운영에 사용하거나 기존 Novu의 대체품으로 배포하지 않는다.**
 
+### 콘솔 인증의 원자적 교체 (API 0033)
+
+`console-credential rotate ENV 기존_ID 초 새_파일 사유`는 유효한 기존 인증의 구독자·경보 조회 권한을 복사해 새 인증을 발급하고 기존 인증을 회수한다. 발급·회수와 기존/새 ID를 연결하는 교체 감사는 한 트랜잭션에서 처리된다. 같은 인증의 동시 교체와 권한 변경은 인증 행 잠금으로 직렬화한다. `rotation-audit ENV [AFTER_ID]`는 환경별 교체 이력을 100개씩 조회한다. 등록된 환경 관리자에게 `public.novu_rust_rotate_console_credential(text,uuid,text,timestamptz,text)` 및 `public.novu_rust_list_console_rotation_audit(text,bigint)` EXECUTE를 별도 부여해야 한다. 향후 추가되는 다른 권한은 자동 복사되지 않는다.
+
+커밋 즉시 기존 인증이 거절되므로 새 비밀의 안전한 전달과 전환 시점을 미리 조정해야 한다. 완료된 응답은 회수할 수 없고 무중단·자동 교체는 제공하지 않는다. 오류나 응답 유실 시 새 파일을 보존하고 기존·신규 인증, 권한과 교체·발급·회수 감사를 대조하며 원래 트랜잭션 종료를 확인한 후 재시도한다. 거절은 감사되지 않으며 DB 특권자는 감사와 제한을 우회할 수 있다. 개인 로그인·SSO 및 외부 불변 감사는 미구현이다. Docker PostgreSQL에서 네 권한 조합의 교체 전후 HTTP 접근, 반복·동시 교체, 환경 격리와 교체 감사 실패 시 롤백, 기존 발급 CLI 회귀를 검증했다. 실제 운영 전환과 부하는 미검증이다. 상세 절차는 [API README](apps/api/rust-api/README.md)를 참고한다.
+
 ### 콘솔 인증의 초기 권한 선택 (API 0032)
 
 환경별 관리자는 `console-credential issue-permissions ENV 초 파일 none|subscriber|alert|both 사유`로 구독자와 경보의 조회 권한을 각각 선택해 인증을 발급할 수 있다. 인증·구독자 권한 및 감사·선택한 경보 권한 및 감사는 한 트랜잭션에서 반영된다. 경보 미선택은 권한 행과 경보 감사 행을 만들지 않는다. 환경별 관리자 등록과 `public.novu_rust_issue_console_credential_permissions(text,text,timestamptz,boolean,boolean,text)`의 별도 EXECUTE 권한이 필요하다. 이전 발급 명령과 함수는 그대로 유지되므로 초기 권한 명시를 강제하려면 기존 함수의 관리자 실행 권한도 별도로 검토·회수해야 한다.
