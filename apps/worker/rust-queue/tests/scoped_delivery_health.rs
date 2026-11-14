@@ -113,8 +113,26 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
     .await
     .unwrap();
     db.execute("INSERT INTO novu_rust_fcm_attempts(job_id,environment_id,target_index,state) SELECT $1,'a',n,'unknown' FROM generate_series(0,103) n", &[&push]).await.unwrap();
+    let resend_job = Uuid::new_v4();
+    queue::enqueue(
+        &db,
+        resend_job,
+        "a",
+        queue::resend_queue::JOB_KIND,
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE novu_queue_jobs SET status='completed' WHERE id=$1",
+        &[&resend_job],
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO novu_rust_resend_attempts(job_id,environment_id,state,provider_message_id) VALUES ($1,'a','unknown','secret-provider-id')", &[&resend_job]).await.unwrap();
+    db.execute("INSERT INTO novu_rust_twilio_attempts(job_id,environment_id,state,provider_message_id) VALUES ($1,'a','accepted','secret-sms-id')", &[&sms]).await.unwrap();
     let role = format!("monitor_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'scoped-fixture-password'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_delivery_health(text),public.novu_rust_queue_health(text,integer),public.novu_rust_provider_health(text,text,integer,integer),public.novu_rust_sendgrid_health(text,integer,integer),public.novu_rust_sendgrid_result(text,uuid),public.novu_rust_list_unknown_attempts(text,uuid,integer),public.novu_rust_reserve_alert(text,text,text,integer,integer),public.novu_rust_finish_alert(text,text,text,uuid,text,integer),public.novu_rust_failed_queue_count(text),public.novu_rust_failed_queue_list(text,uuid),public.novu_rust_ack_failed_queue(text,uuid,text,text),public.novu_rust_observe_alert_conditions(text,text,text,integer,integer) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'scoped-fixture-password'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_delivery_health(text),public.novu_rust_queue_health(text,integer),public.novu_rust_provider_health(text,text,integer,integer),public.novu_rust_sendgrid_health(text,integer,integer),public.novu_rust_sendgrid_result(text,uuid),public.novu_rust_channel_result(text,uuid,text),public.novu_rust_list_unknown_attempts(text,uuid,integer),public.novu_rust_reserve_alert(text,text,text,integer,integer),public.novu_rust_finish_alert(text,text,text,uuid,text,integer),public.novu_rust_failed_queue_count(text),public.novu_rust_failed_queue_list(text,uuid),public.novu_rust_ack_failed_queue(text,uuid,text,text),public.novu_rust_observe_alert_conditions(text,text,text,integer,integer) TO {role}")).await.unwrap();
     let (actor, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move {
         let _ = driver.await;
@@ -124,6 +142,11 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
         .await
         .unwrap();
     assert!(reconciliation::scoped_health(&actor, "a").await.is_err());
+    assert!(
+        reconciliation::scoped_channel_result(&actor, "a", resend_job, "resend")
+            .await
+            .is_err()
+    );
     assert!(
         reconciliation::scoped_list_after(&actor, "a", None)
             .await
@@ -166,6 +189,71 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
             .await
             .is_err()
     );
+    db.batch_execute(&format!(
+        "REVOKE EXECUTE ON FUNCTION public.novu_rust_channel_result(text,uuid,text) FROM {role}"
+    ))
+    .await
+    .unwrap();
+    assert!(
+        reconciliation::scoped_channel_result(&actor, "a", resend_job, "resend")
+            .await
+            .is_err()
+    );
+    db.batch_execute(&format!(
+        "GRANT EXECUTE ON FUNCTION public.novu_rust_channel_result(text,uuid,text) TO {role}"
+    ))
+    .await
+    .unwrap();
+    let resend_result = reconciliation::scoped_channel_result(&actor, "a", resend_job, "resend")
+        .await
+        .unwrap();
+    assert_eq!(resend_result["attemptState"], "unknown");
+    assert_eq!(resend_result["result"], "unknown");
+    assert_eq!(resend_result["providerIdKnown"], true);
+    assert!(!resend_result.to_string().contains("secret"));
+    let no_attempt = Uuid::new_v4();
+    queue::enqueue(
+        &db,
+        no_attempt,
+        "a",
+        queue::twilio_queue::JOB_KIND,
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE novu_queue_jobs SET status='completed' WHERE id=$1",
+        &[&no_attempt],
+    )
+    .await
+    .unwrap();
+    let empty = reconciliation::scoped_channel_result(&actor, "a", no_attempt, "twilio")
+        .await
+        .unwrap();
+    assert!(empty["attemptState"].is_null());
+    assert_eq!(empty["providerIdKnown"], false);
+    assert_eq!(empty["result"], "unknown");
+    let sms_result = reconciliation::scoped_channel_result(&actor, "a", sms, "twilio")
+        .await
+        .unwrap();
+    assert_eq!(sms_result["attemptState"], "accepted");
+    assert_eq!(sms_result["providerIdKnown"], true);
+    assert!(!sms_result.to_string().contains("secret"));
+    assert!(
+        reconciliation::scoped_channel_result(&actor, "b", resend_job, "resend")
+            .await
+            .is_err()
+    );
+    assert!(
+        reconciliation::scoped_channel_result(&actor, "a", sms, "resend")
+            .await
+            .is_err()
+    );
+    assert!(
+        reconciliation::scoped_channel_result(&actor, "a", job, "other")
+            .await
+            .is_err()
+    );
     let first = reconciliation::scoped_list_after(&actor, "a", None)
         .await
         .unwrap();
@@ -193,7 +281,7 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
             .await
             .unwrap()
     );
-    assert_eq!(second.len(), 5);
+    assert_eq!(second.len(), 6);
     assert!(
         reconciliation::scoped_list_after(&actor, "b", None)
             .await
@@ -396,6 +484,24 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
     let list_json: serde_json::Value = serde_json::from_slice(&list_output.stdout).unwrap();
     assert_eq!(list_json.as_array().unwrap().len(), 100);
     assert!(!String::from_utf8_lossy(&list_output.stdout).contains("payload-secret"));
+    for (action, id) in [("resend-result", resend_job), ("twilio-result", sms)] {
+        let output = Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+            .args([action, "a", &id.to_string()])
+            .env("DATABASE_URL", role_url.as_str())
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("secret"));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["jobId"],
+            id.to_string()
+        );
+    }
     let scoped_monitor = |environment: &str| {
         Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
             .args(["check", environment])

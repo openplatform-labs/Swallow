@@ -301,6 +301,22 @@ pub async fn scoped_sendgrid_result(
         .get(0))
 }
 
+/// Read stored channel projection without direct access to provider data.
+pub async fn scoped_channel_result(
+    client: &Client,
+    environment: &str,
+    job: Uuid,
+    provider: &str,
+) -> Result<Value> {
+    Ok(client
+        .query_one(
+            "SELECT public.novu_rust_channel_result($1,$2,$3)",
+            &[&environment, &job, &provider],
+        )
+        .await?
+        .get(0))
+}
+
 /// Summarize authenticated SendGrid evidence without exposing recipient hashes.
 pub async fn email_evidence(client: &Client, environment: &str, job: Uuid) -> Result<Vec<Value>> {
     if environment.is_empty() {
