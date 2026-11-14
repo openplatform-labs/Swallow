@@ -145,6 +145,45 @@ describe('Swallow console', () => {
     expect(fixture.nativeElement.textContent).toContain('API 업데이트 필요');
   });
 
+  it('submits a separately authorized decision once and clears sensitive inputs', async () => {
+    const id = '1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[{channel:'slack',targetId:'ops',state:'unknown',lastStartedAt:null,attemptId:id}],hasMore:false,next:null}),{status:200}));
+    let resolve!: (response: Response) => void;
+    fetchMock.mockReturnValueOnce(new Promise<Response>(done => { resolve = done; }));
+    const app = TestBed.createComponent(App).componentInstance;
+    app.setSection('alerts'); app.alertKey = 'a'.repeat(64);
+    await app.loadAlerts();
+    app.selectAlert(app.alertSlots()[0]);
+    app.decisionKey = 'b'.repeat(64); app.decision = 'accepted'; app.decisionReason = 'ticket'; app.decisionConfirmed = true;
+    const pending = app.resolveAlert();
+    await app.resolveAlert();
+    app.setSection('overview');
+    expect(app.section()).toBe('alerts');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][0]).toBe('http://127.0.0.1:3000/v1/experimental/console/alerts/resolve');
+    expect(fetchMock.mock.calls[1][1]).toEqual(expect.objectContaining({method:'POST',headers:{Authorization:`SwallowConsole ${'b'.repeat(64)}`,'Content-Type':'application/json'},credentials:'omit',redirect:'error',body:JSON.stringify({channel:'slack',targetId:'ops',attemptId:id,decision:'accepted',reason:'ticket'})}));
+    resolve(new Response(JSON.stringify({recorded:true}),{status:200}));
+    await pending;
+    expect(app.decisionStatus()).toBe('recorded');
+    expect(app.decisionKey).toBe(''); expect(app.decisionReason).toBe('');
+    expect(app.alertSlots()).toEqual([]); expect(app.alertStatus()).toBe('idle');
+  });
+
+  it('requires evidence confirmation and treats an interrupted request as unknown', async () => {
+    const id = '1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[{channel:'email',targetId:'ops',state:'rejected',lastStartedAt:null,attemptId:id}],hasMore:false,next:null}),{status:200})).mockRejectedValueOnce(new TypeError('network'));
+    const app = TestBed.createComponent(App).componentInstance;
+    app.setSection('alerts'); app.alertKey = 'a'.repeat(64); await app.loadAlerts();
+    app.selectAlert(app.alertSlots()[0]); app.decisionKey = 'b'.repeat(64); app.decisionReason = 'ticket';
+    await app.resolveAlert(); expect(fetchMock).toHaveBeenCalledTimes(1);
+    app.decisionConfirmed = true; app.decision = 'accepted';
+    await app.resolveAlert(); expect(fetchMock).toHaveBeenCalledTimes(1);
+    app.decision = 'retry'; await app.resolveAlert();
+    expect(fetchMock).toHaveBeenCalledTimes(2); expect(app.decisionStatus()).toBe('unknown');
+    expect(app.decisionKey).toBe(''); expect(app.alertSlots()).toEqual([]);
+    await app.resolveAlert(); expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it('requests the next alert page and can return to the first', async () => {
     const first = {data:[{channel:'email',targetId:'ops',state:'accepted',lastStartedAt:null}],hasMore:true,next:{channel:'email',targetId:'ops'}};
     const second = {data:[{channel:'slack',targetId:'ops',state:'unknown',lastStartedAt:null}],hasMore:false,next:null};

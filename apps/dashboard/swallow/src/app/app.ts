@@ -39,6 +39,12 @@ export class App {
   readonly alertsHaveMore = signal(false);
   readonly alertNext = signal<AlertCursor | null>(null);
   readonly alertPage = signal(1);
+  readonly selectedAlert = signal<AlertSlot | null>(null);
+  readonly decisionStatus = signal<'idle' | 'sending' | 'recorded' | 'rejected' | 'unknown'>('idle');
+  decisionKey = '';
+  decision: 'retry' | 'accepted' = 'retry';
+  decisionReason = '';
+  decisionConfirmed = false;
   alertKey = '';
   private alertHistory: (AlertCursor | null)[] = [null];
   private alertRequestId = 0;
@@ -56,6 +62,7 @@ export class App {
   }
 
   setSection(next: Section): void {
+    if (this.decisionStatus() === 'sending') return;
     if (this.section() === 'subscribers' && next !== 'subscribers') this.forgetKey();
     if (this.section() === 'alerts' && next !== 'alerts') this.forgetAlertKey();
     this.section.set(next);
@@ -88,6 +95,7 @@ export class App {
   }
 
   clearAlerts(): void {
+    if (this.decisionStatus() === 'sending') return;
     this.alertRequestId++;
     this.alertAbort?.abort();
     this.alertAbort = null;
@@ -98,6 +106,65 @@ export class App {
     this.alertHistory = [null];
     this.alertStatus.set('idle');
     this.alertError.set('');
+    this.clearDecision();
+  }
+
+  clearDecision(): void {
+    if (this.decisionStatus() === 'sending') return;
+    this.selectedAlert.set(null);
+    this.decisionKey = '';
+    this.decisionReason = '';
+    this.decisionConfirmed = false;
+    this.decision = 'retry';
+    this.decisionStatus.set('idle');
+  }
+
+  selectAlert(slot: AlertSlot): void {
+    if (this.decisionStatus() === 'sending' || this.alertStatus() !== 'loaded' || !slot.attemptId || !['unknown', 'rejected'].includes(slot.state) || !['slack', 'email'].includes(slot.channel)) return;
+    this.clearDecision();
+    this.selectedAlert.set(slot);
+  }
+
+  canResolve(): boolean {
+    const slot = this.selectedAlert();
+    const reason = this.decisionReason.trim();
+    return this.decisionStatus() === 'idle' && !!slot?.attemptId && this.decisionConfirmed && /^[0-9a-f]{64}$/.test(this.decisionKey.trim()) && !!reason && new TextEncoder().encode(reason).length <= 512 && (this.decision === 'retry' || (this.decision === 'accepted' && slot.state === 'unknown'));
+  }
+
+  async resolveAlert(): Promise<void> {
+    const slot = this.selectedAlert();
+    const reason = this.decisionReason.trim();
+    const key = this.decisionKey.trim();
+    if (!this.canResolve() || !slot?.attemptId) return;
+    let origin: string;
+    try { origin = this.validatedOrigin(); } catch { this.decisionStatus.set('rejected'); return; }
+    this.decisionStatus.set('sending');
+    try {
+      const response = await fetch(`${origin}/v1/experimental/console/alerts/resolve`, {
+        method: 'POST', headers: { Authorization: `SwallowConsole ${key}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ channel: slot.channel, targetId: slot.targetId, attemptId: slot.attemptId, decision: this.decision, reason }),
+        cache: 'no-store', credentials: 'omit', redirect: 'error', signal: AbortSignal.timeout(10000),
+      });
+      if (response.ok) {
+        const body: unknown = await response.json();
+        this.decisionStatus.set(typeof body === 'object' && body !== null && 'recorded' in body && body.recorded === true ? 'recorded' : 'unknown');
+      } else {
+        this.decisionStatus.set([400, 401, 403].includes(response.status) ? 'rejected' : 'unknown');
+      }
+    } catch {
+      this.decisionStatus.set('unknown');
+    } finally {
+      this.decisionKey = '';
+      this.decisionReason = '';
+      this.decisionConfirmed = false;
+      this.selectedAlert.set(null);
+      this.alertSlots.set([]);
+      this.alertStatus.set('idle');
+      this.alertsHaveMore.set(false);
+      this.alertNext.set(null);
+      this.alertPage.set(1);
+      this.alertHistory = [null];
+    }
   }
 
   forgetAlertKey(): void {
@@ -106,6 +173,8 @@ export class App {
   }
 
   async loadAlerts(direction?: 'next' | 'previous'): Promise<void> {
+    if (this.decisionStatus() === 'sending') return;
+    this.clearDecision();
     if (direction === 'previous' && this.alertPage() <= 1) return;
     const cursor = direction === 'next' ? this.alertNext() : direction === 'previous' ? this.alertHistory[this.alertPage() - 2] : null;
     if (direction === 'next' && !cursor) return;

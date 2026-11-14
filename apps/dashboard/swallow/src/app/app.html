@@ -7,7 +7,7 @@
     <nav class="sidenav" aria-label="주 메뉴">
       <div class="nav-heading">WORKSPACE</div>
       @for (item of sections; track item.id) {
-        <button class="nav-entry" [class.active]="section() === item.id" [attr.aria-current]="section() === item.id ? 'page' : null" (click)="setSection(item.id)">
+        <button class="nav-entry" [class.active]="section() === item.id" [attr.aria-current]="section() === item.id ? 'page' : null" [disabled]="decisionStatus() === 'sending'" (click)="setSection(item.id)">
           <span class="nav-icon" aria-hidden="true">{{ item.short }}</span><span>{{ item.label }}</span>
         </button>
       }
@@ -43,15 +43,32 @@
       } @else if (section() === 'alerts') {
         <div class="page-heading"><div><div class="eyebrow">OPERATIONS</div><h1>운영 경보</h1><p>선택한 환경의 경보 전송 상태를 조회합니다.</p></div></div>
         <clr-alert clrAlertType="warning" [clrAlertClosable]="false"><clr-alert-item><span class="alert-text">별도로 경보 조회 권한을 부여받은 인증이 필요합니다. 상태는 조회 시점의 정보이며 실제 수신을 보장하지 않습니다.</span></clr-alert-item></clr-alert>
-        <section class="card subscriber-card"><div class="card-block"><div class="card-eyebrow">ACCESS</div><h2>조회 설정</h2><form (ngSubmit)="loadAlerts()" class="subscriber-form"><div><label for="alert-key">조회 전용 인증 값</label><input id="alert-key" class="clr-input" name="alertKey" type="password" [(ngModel)]="alertKey" (ngModelChange)="clearAlerts()" autocomplete="off" spellcheck="false" required></div><button class="btn btn-primary" type="submit" [disabled]="alertStatus() === 'loading'">{{ alertStatus() === 'loading' ? '조회 중' : '조회' }}</button><button class="btn btn-outline" type="button" (click)="forgetAlertKey()">키 지우기</button></form><p class="subscriber-hint">API 주소는 개요의 연결 설정을 사용합니다. 화면을 떠나면 키와 결과가 지워집니다.</p></div></section>
+        <section class="card subscriber-card"><div class="card-block"><div class="card-eyebrow">ACCESS</div><h2>조회 설정</h2><form (ngSubmit)="loadAlerts()" class="subscriber-form"><div><label for="alert-key">경보 조회 인증 값</label><input [disabled]="decisionStatus() === 'sending'" id="alert-key" class="clr-input" name="alertKey" type="password" [(ngModel)]="alertKey" (ngModelChange)="clearAlerts()" autocomplete="off" spellcheck="false" required></div><button class="btn btn-primary" type="submit" [disabled]="alertStatus() === 'loading' || decisionStatus() === 'sending'">{{ alertStatus() === 'loading' ? '조회 중' : '조회' }}</button><button class="btn btn-outline" type="button" [disabled]="decisionStatus() === 'sending'" (click)="forgetAlertKey()">키 지우기</button></form><p class="subscriber-hint">API 주소는 개요의 연결 설정을 사용합니다. 화면을 떠나면 키와 결과가 지워집니다.</p></div></section>
         <section class="card subscriber-list"><div class="card-block"><div class="subscriber-heading"><div><div class="card-eyebrow">ALERT DESTINATIONS</div><h2>경보 대상 상태</h2></div></div>
           @if (alertStatus() === 'error') {<p class="subscriber-error" role="alert">{{ alertError() }}</p>}
           @else if (alertStatus() === 'loading') {<p aria-live="polite">상태를 불러오는 중입니다.</p>}
           @else if (alertStatus() === 'idle') {<p>인증 값을 입력하고 조회해 주세요.</p>}
           @else if (alertSlots().length === 0) {<p>조회된 경보 대상이 없습니다.</p>}
-          @else {<div class="table-wrap"><table class="table"><thead><tr><th>채널</th><th>대상 ID</th><th>상태</th><th>발송 시도 ID</th><th>최근 시도</th></tr></thead><tbody>@for (slot of alertSlots(); track slot.channel + ':' + slot.targetId) {<tr><td>{{ slot.channel }}</td><td>{{ slot.targetId }}</td><td>{{ slot.state }}</td><td>{{ slot.attemptId === undefined ? "API 업데이트 필요" : slot.attemptId || "—" }}</td><td>{{ slot.lastStartedAt || '—' }}</td></tr>}</tbody></table></div>}
-          @if (alertStatus() === 'loaded') {<div class="pagination"><span>{{ alertPage() }}페이지 · 조회 시점의 결과</span><button class="btn btn-sm btn-outline" (click)="loadAlerts()" [disabled]="alertPage() === 1">처음</button><button class="btn btn-sm btn-outline" (click)="loadAlerts('previous')" [disabled]="alertPage() === 1">이전</button><button class="btn btn-sm btn-outline" (click)="loadAlerts('next')" [disabled]="!alertsHaveMore()">다음</button></div>}
+          @else {<div class="table-wrap"><table class="table"><thead><tr><th>채널</th><th>대상 ID</th><th>상태</th><th>발송 시도 ID</th><th>최근 시도</th><th>판정</th></tr></thead><tbody>@for (slot of alertSlots(); track slot.channel + ':' + slot.targetId) {<tr><td>{{ slot.channel }}</td><td>{{ slot.targetId }}</td><td>{{ slot.state }}</td><td>{{ slot.attemptId === undefined ? "API 업데이트 필요" : slot.attemptId || "—" }}</td><td>{{ slot.lastStartedAt || '—' }}</td><td><button type="button" class="btn btn-sm btn-outline" [disabled]="decisionStatus() === 'sending' || !slot.attemptId || (slot.state !== 'unknown' && slot.state !== 'rejected')" (click)="selectAlert(slot)">검토</button></td></tr>}</tbody></table></div>}
+          @if (alertStatus() === 'loaded') {<div class="pagination"><span>{{ alertPage() }}페이지 · 조회 시점의 결과</span><button class="btn btn-sm btn-outline" (click)="loadAlerts()" [disabled]="alertPage() === 1 || decisionStatus() === 'sending'">처음</button><button class="btn btn-sm btn-outline" (click)="loadAlerts('previous')" [disabled]="alertPage() === 1 || decisionStatus() === 'sending'">이전</button><button class="btn btn-sm btn-outline" (click)="loadAlerts('next')" [disabled]="!alertsHaveMore() || decisionStatus() === 'sending'">다음</button></div>}
         </div></section>
+        @if (decisionStatus() === 'recorded') { <p class="decision-result" role="status">판정을 기록했습니다. 현재 상태와 감사 기록을 다시 확인해 주세요. 실제 수신이 확인된 것은 아닙니다.</p> }
+        @if (decisionStatus() === 'rejected') { <p class="decision-result subscriber-error" role="alert">요청이 거절되었습니다. 인증·권한과 최신 시도를 확인한 뒤 다시 조회해 주세요.</p> }
+        @if (decisionStatus() === 'unknown') { <p class="decision-result subscriber-error" role="alert">결과를 확인할 수 없습니다. 재시도하기 전에 상태와 감사 기록을 확인해 주세요.</p> }
+        @if (selectedAlert(); as slot) {
+          <section class="card decision-card"><div class="card-block">
+            <div class="card-eyebrow">REVIEW DECISION</div><h2>경보 발송 판정</h2>
+            <p><strong>{{ slot.channel }} · {{ slot.targetId }}</strong> / {{ slot.state }}<br>발송 시도 ID: {{ slot.attemptId }}</p>
+            <p>공급자의 결과를 별도로 확인한 후 선택하세요. 재시도 허용은 이후 발송에서 중복이 생길 수 있습니다. 접수 판정은 수신을 보장하지 않습니다.</p>
+            <form class="decision-form" (ngSubmit)="resolveAlert()">
+              <label for="decision-kind">판정</label><select id="decision-kind" class="clr-select" name="decision" [(ngModel)]="decision" [disabled]="decisionStatus() === 'sending'"><option value="retry">재시도 허용</option>@if (slot.state === 'unknown') {<option value="accepted">공급자 접수로 판정</option>}</select>
+              <label for="decision-key">판정 권한 인증 값</label><input id="decision-key" class="clr-input" name="decisionKey" type="password" [(ngModel)]="decisionKey" [disabled]="decisionStatus() === 'sending'" autocomplete="off" spellcheck="false" required>
+              <label for="decision-reason">조사 사유</label><textarea id="decision-reason" name="decisionReason" [(ngModel)]="decisionReason" [disabled]="decisionStatus() === 'sending'" maxlength="512" required></textarea><small>비밀을 제외하고 512바이트 이내로 입력하세요.</small>
+              <label class="decision-confirm"><input type="checkbox" name="decisionConfirmed" [(ngModel)]="decisionConfirmed" [disabled]="decisionStatus() === 'sending'"> 공급자 결과와 위 시도 ID를 확인했습니다.</label>
+              <div><button type="submit" class="btn btn-primary" [disabled]="!canResolve()">{{ decisionStatus() === 'sending' ? '기록 중' : '판정 기록' }}</button><button type="button" class="btn btn-outline" [disabled]="decisionStatus() === 'sending'" (click)="clearDecision()">취소</button></div>
+            </form>
+          </div></section>
+        }
       } @else {
         <div class="page-heading"><div><div class="eyebrow">WORKSPACE</div><h1>{{ sectionName }}</h1><p>이 기능을 사용할 수 있도록 준비하고 있습니다.</p></div></div>
         <section class="card empty-card"><div class="card-block"><span class="feature-icon">{{ sectionName.slice(0, 1) }}</span><h2>{{ sectionName }} 관리</h2><p>관리자 인증과 API 연결이 완료되면 이곳에서 관리할 수 있습니다.</p><button class="btn btn-outline" (click)="setSection('overview')">개요로 돌아가기</button></div></section>
