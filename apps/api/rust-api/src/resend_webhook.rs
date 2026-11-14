@@ -5,7 +5,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use ring::hmac;
+use ring::{digest, hmac};
 use serde_json::Value;
 use std::{
     sync::Arc,
@@ -127,7 +127,9 @@ pub async fn receive(
     {
         return StatusCode::BAD_REQUEST;
     }
-    match db.execute("INSERT INTO novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type) SELECT e.id,$3,$4,$5 FROM novu_rust_environments e WHERE e.id=$1 AND e.organization_id=$2 ON CONFLICT(environment_id,event_id) DO UPDATE SET event_id=EXCLUDED.event_id WHERE novu_rust_resend_delivery_events.email_id=EXCLUDED.email_id AND novu_rust_resend_delivery_events.event_type=EXCLUDED.event_type", &[&environment,&organization,&id,&email,&kind]).await {
+    // A replay must match the complete signed payload, not just its ID and type.
+    let fingerprint = digest::digest(&digest::SHA256, &raw);
+    match db.execute("INSERT INTO novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type,payload_fingerprint) SELECT e.id,$3,$4,$5,$6 FROM novu_rust_environments e WHERE e.id=$1 AND e.organization_id=$2 ON CONFLICT(environment_id,event_id) DO UPDATE SET event_id=EXCLUDED.event_id WHERE novu_rust_resend_delivery_events.email_id=EXCLUDED.email_id AND novu_rust_resend_delivery_events.event_type=EXCLUDED.event_type AND (novu_rust_resend_delivery_events.payload_fingerprint IS NULL OR novu_rust_resend_delivery_events.payload_fingerprint=EXCLUDED.payload_fingerprint)", &[&environment,&organization,&id,&email,&kind,&fingerprint.as_ref()]).await {
         Ok(1)=>StatusCode::NO_CONTENT,
         Ok(_)=>StatusCode::CONFLICT,
         Err(_)=>StatusCode::INTERNAL_SERVER_ERROR,

@@ -66,6 +66,16 @@ async fn signed_events_are_scoped_deduplicated_and_private() {
     db.batch_execute(include_str!("../migrations/0010_resend_webhooks.sql"))
         .await
         .unwrap();
+    db.batch_execute(include_str!(
+        "../migrations/0012_resend_event_fingerprint.sql"
+    ))
+    .await
+    .unwrap();
+    db.batch_execute(include_str!(
+        "../migrations/0012_resend_event_fingerprint.sql"
+    ))
+    .await
+    .unwrap();
     db.batch_execute(include_str!("../migrations/0010_resend_webhooks.sql"))
         .await
         .unwrap();
@@ -108,6 +118,19 @@ async fn signed_events_are_scoped_deduplicated_and_private() {
     assert_eq!(
         call(app.clone(), path, "msg_test", &timestamp, &sig, b"{}").await,
         StatusCode::UNAUTHORIZED
+    );
+    let changed_recipient = br#"{"type":"email.delivered","data":{"email_id":"email-123","to":["other@example.test"]}}"#;
+    assert_eq!(
+        call(
+            app.clone(),
+            path,
+            "msg_test",
+            &timestamp,
+            &signature(raw_secret, "msg_test", &timestamp, changed_recipient),
+            changed_recipient
+        )
+        .await,
+        StatusCode::CONFLICT
     );
     let future = (timestamp.parse::<u64>().unwrap() + 301).to_string();
     assert_eq!(
