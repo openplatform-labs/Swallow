@@ -116,6 +116,55 @@ pub async fn reserve_with_conditions(
     Ok(Reservation::Claimed(id))
 }
 
+/// Reserve through the environment-scoped security-definer function.
+pub async fn reserve_scoped(
+    db: &PgClient,
+    environment: &str,
+    channel: &str,
+    target: &str,
+    cooldown: i32,
+    condition_mask: Option<i32>,
+) -> DbResult<Reservation> {
+    let row = db
+        .query_one(
+            "SELECT * FROM public.novu_rust_reserve_alert($1,$2,$3,$4,$5)",
+            &[&environment, &channel, &target, &cooldown, &condition_mask],
+        )
+        .await?;
+    let result: String = row.get(0);
+    let id: Option<Uuid> = row.get(1);
+    match (result.as_str(), id) {
+        ("claimed", Some(id)) => Ok(Reservation::Claimed(id)),
+        ("cooldown", None) => Ok(Reservation::CoolingDown),
+        ("inflight", None) => Ok(Reservation::InFlight),
+        ("blocked", None) => Ok(Reservation::Blocked),
+        _ => Err("invalid scoped reservation result".into()),
+    }
+}
+/// Record only the calling login's own still-valid in-flight attempt.
+pub async fn finish_scoped(
+    db: &PgClient,
+    environment: &str,
+    channel: &str,
+    target: &str,
+    id: Uuid,
+    result: &Result<(), AlertError>,
+) -> DbResult<bool> {
+    let (state, status) = match result {
+        Ok(()) => ("accepted", None),
+        Err(AlertError::Rejected(code)) => ("rejected", Some(i32::from(*code))),
+        Err(AlertError::InvalidConfiguration) => ("rejected", None),
+        Err(AlertError::Unknown) => ("unknown", None),
+    };
+    Ok(db
+        .query_one(
+            "SELECT public.novu_rust_finish_alert($1,$2,$3,$4,$5,$6)",
+            &[&environment, &channel, &target, &id, &state, &status],
+        )
+        .await?
+        .get(0))
+}
+
 /// The lease fences late responses after another process has recovered a slot.
 pub async fn finish(
     db: &mut PgClient,
@@ -458,22 +507,30 @@ async fn dispatch<F, Fut>(
     channel: &str,
     target: &str,
     cooldown: i32,
-    condition_mask: Option<i32>,
+    policy: (Option<i32>, bool),
     send: F,
 ) -> DbResult<Dispatch>
 where
     F: FnOnce(Uuid) -> Fut,
     Fut: std::future::Future<Output = Result<(), AlertError>>,
 {
-    match reserve_with_conditions(db, environment, channel, target, cooldown, condition_mask)
-        .await?
-    {
+    let (condition_mask, scoped) = policy;
+    let reservation = if scoped {
+        reserve_scoped(db, environment, channel, target, cooldown, condition_mask).await?
+    } else {
+        reserve_with_conditions(db, environment, channel, target, cooldown, condition_mask).await?
+    };
+    match reservation {
         Reservation::CoolingDown => Ok(Dispatch::CoolingDown),
         Reservation::InFlight => Ok(Dispatch::InFlight),
         Reservation::Blocked => Ok(Dispatch::NeedsReview),
         Reservation::Claimed(id) => {
             let result = send(id).await;
-            let recorded = finish(db, environment, channel, target, id, &result).await?;
+            let recorded = if scoped {
+                finish_scoped(db, environment, channel, target, id, &result).await?
+            } else {
+                finish(db, environment, channel, target, id, &result).await?
+            };
             if result.is_ok() && recorded {
                 Ok(Dispatch::Accepted)
             } else {
@@ -501,6 +558,27 @@ pub async fn dispatch_slack_with_conditions(
     provider: &SlackWebhook,
     on_new_condition: bool,
 ) -> DbResult<Dispatch> {
+    dispatch_slack_with_options(
+        db,
+        target,
+        cooldown,
+        alert,
+        provider,
+        on_new_condition,
+        false,
+    )
+    .await
+}
+
+pub async fn dispatch_slack_with_options(
+    db: &mut PgClient,
+    target: &str,
+    cooldown: i32,
+    alert: &Alert,
+    provider: &SlackWebhook,
+    on_new_condition: bool,
+    scoped: bool,
+) -> DbResult<Dispatch> {
     alert.text().map_err(|_| "invalid alert environment")?;
     dispatch(
         db,
@@ -508,7 +586,7 @@ pub async fn dispatch_slack_with_conditions(
         "slack",
         target,
         cooldown,
-        on_new_condition.then(|| alert.condition_mask()),
+        (on_new_condition.then(|| alert.condition_mask()), scoped),
         |_| provider.send(alert),
     )
     .await
@@ -534,6 +612,28 @@ pub async fn dispatch_email_with_conditions(
     recipient: &str,
     on_new_condition: bool,
 ) -> DbResult<Dispatch> {
+    dispatch_email_with_options(
+        db,
+        target,
+        cooldown,
+        alert,
+        provider,
+        recipient,
+        (on_new_condition, false),
+    )
+    .await
+}
+
+pub async fn dispatch_email_with_options(
+    db: &mut PgClient,
+    target: &str,
+    cooldown: i32,
+    alert: &Alert,
+    provider: &Resend,
+    recipient: &str,
+    policy: (bool, bool),
+) -> DbResult<Dispatch> {
+    let (on_new_condition, scoped) = policy;
     alert.text().map_err(|_| "invalid alert environment")?;
     if recipient.is_empty()
         || recipient.len() > 320
@@ -542,7 +642,7 @@ pub async fn dispatch_email_with_conditions(
     {
         return Err("invalid alert recipient".into());
     }
-    dispatch(db,&alert.environment,"email",target,cooldown,on_new_condition.then(|| alert.condition_mask()),|id|async move {send_email(provider,recipient,alert,&format!("swallow-alert/{id}")).await}).await
+    dispatch(db,&alert.environment,"email",target,cooldown,(on_new_condition.then(|| alert.condition_mask()),scoped),|id|async move {send_email(provider,recipient,alert,&format!("swallow-alert/{id}")).await}).await
 }
 
 #[cfg(test)]
@@ -886,5 +986,51 @@ mod tests {
             Dispatch::Accepted
         );
         assert!(server.await.unwrap().contains("queue overdue jobs: 1"));
+        db.batch_execute(include_str!("../migrations/0088_scoped_alert_dispatch.sql"))
+            .await
+            .unwrap();
+        let (url, server) = mock_server("200 OK", "ok").await;
+        let scoped_slack = SlackWebhook::with_endpoint(url).unwrap();
+        assert_eq!(
+            dispatch_slack_with_options(
+                &mut db,
+                "scoped-ops",
+                60,
+                &alert,
+                &scoped_slack,
+                true,
+                true
+            )
+            .await
+            .unwrap(),
+            Dispatch::Accepted
+        );
+        assert!(server.await.unwrap().contains("queue overdue jobs: 1"));
+        let (url, server) = mock_server("200 OK", r#"{"id":"scoped-test"}"#).await;
+        let scoped_email = Resend::test_endpoint(
+            crate::resend::Config {
+                api_key: "fixture-key".into(),
+                from: "from@example.test".into(),
+                sender_name: String::new(),
+            },
+            url.as_str(),
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch_email_with_options(
+                &mut db,
+                "scoped-email",
+                60,
+                &alert,
+                &scoped_email,
+                "ops@example.test",
+                (true, true)
+            )
+            .await
+            .unwrap(),
+            Dispatch::Accepted
+        );
+        assert!(server.await.unwrap().contains("queue overdue jobs: 1"));
+        assert_eq!(db.query_one("SELECT count(*) FROM novu_rust_alert_delivery_attempts WHERE target_id IN ('scoped-ops','scoped-email') AND state='accepted' AND sender_session_user=session_user AND sender_oid IS NOT NULL",&[]).await.unwrap().get::<_,i64>(0),2);
     }
 }

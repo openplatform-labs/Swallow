@@ -57,6 +57,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     tokio::spawn(async move {
         let _ = connection.await;
     });
+    let scoped_delivery = env_bool("SWALLOW_ALERT_SCOPED_DELIVERY", false)?;
     let resend_enabled = env_bool("SWALLOW_ALERT_RESEND_ENABLED", true)?;
     let attempts_enabled = env_bool("SWALLOW_ALERT_ATTEMPTS_ENABLED", false)?;
     let slack_jobs_enabled = env_bool("SWALLOW_ALERT_SLACK_JOBS_ENABLED", false)?;
@@ -215,13 +216,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut error = configuration_error || failed_checks.iter().any(|failed| *failed);
     let mut needs_review = false;
     if let Some(provider) = slack {
-        match alerts::dispatch_slack_with_conditions(
+        match alerts::dispatch_slack_with_options(
             &mut db,
             &slack_id,
             cooldown,
             &alert,
             &provider,
             on_new_condition,
+            scoped_delivery,
         )
         .await
         {
@@ -237,14 +239,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
     }
     if let Some((to, provider)) = email {
-        match alerts::dispatch_email_with_conditions(
+        match alerts::dispatch_email_with_options(
             &mut db,
             &email_id,
             cooldown,
             &alert,
             &provider,
             &to,
-            on_new_condition,
+            (on_new_condition, scoped_delivery),
         )
         .await
         {

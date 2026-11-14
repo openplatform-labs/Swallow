@@ -31,6 +31,8 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
         include_str!("../migrations/0082_slack_ack_function.sql"),
         slack_queue::RESOLVE_FUNCTION_MIGRATION,
         include_str!("../migrations/0084_slack_scoped_health.sql"),
+        include_str!("../migrations/0085_alert_condition_cooldown.sql"),
+        include_str!("../migrations/0088_scoped_alert_dispatch.sql"),
     ] {
         db.batch_execute(sql).await.unwrap();
     }
@@ -510,6 +512,7 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
             .env("SWALLOW_ALERT_ATTEMPTS_ENABLED", "false")
             .env("SWALLOW_ALERT_SLACK_JOBS_ENABLED", "true")
             .env("SWALLOW_ALERT_SLACK_SCOPED_ACCESS", "true")
+            .env("SWALLOW_ALERT_SCOPED_DELIVERY", "true")
             .env(
                 "SWALLOW_ALERT_SLACK_MISSING_ENDPOINTS_ENABLED",
                 if enabled { "true" } else { "false" },
