@@ -305,6 +305,8 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/console/subscribers", get(console_subscribers::list))
         .route("/v1/experimental/console/alerts", get(console_alerts::list))
         .route("/v1/experimental/console/alerts/resolve", post(console_alerts::resolve))
+        .route("/v1/experimental/console/alerts/resolve-v2", post(console_alerts::resolve_v2))
+        .route("/v1/experimental/console/alerts/request", get(console_alerts::request_status))
         .route("/v1/experimental/console/alerts/decisions", get(console_alerts::history))
         .route("/v1/events/trigger", post(trigger))
         .route("/v1/experimental/fcm-integrations", get(fcm_integrations::list).post(fcm_integrations::create))
