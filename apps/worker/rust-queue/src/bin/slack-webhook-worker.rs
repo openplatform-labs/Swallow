@@ -7,6 +7,12 @@ use novu_postgres_queue::{
 use std::{error::Error, time::Duration};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    novu_postgres_queue::shutdown::run_until_signal(run).await
+}
+
+async fn run(
+    stop: novu_postgres_queue::shutdown::Stop,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let environment = std::env::var("NOVU_SLACK_ENVIRONMENT_ID")?;
     if environment.trim().is_empty() {
         return Err("Slack environment is required".into());
@@ -35,6 +41,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     };
     let timeout = Duration::from_secs(timeout);
     loop {
+        if stop.requested() {
+            return Ok(());
+        }
         let connection = tokio::time::timeout(timeout, config.connect(tls.clone())).await;
         if let Ok(Ok((mut db, driver))) = connection {
             let task = tokio::spawn(driver);
@@ -54,12 +63,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 match tokio::time::timeout(timeout, db.query_opt("INSERT INTO novu_rust_slack_webhook_destinations(environment_id,destination_id,endpoint_hash) VALUES ($1,$2,$3) ON CONFLICT (environment_id,destination_id) DO UPDATE SET endpoint_hash=EXCLUDED.endpoint_hash WHERE novu_rust_slack_webhook_destinations.endpoint_hash=EXCLUDED.endpoint_hash RETURNING 1", &[&environment,&destination,&endpoint_hash])).await {
                     Ok(Ok(Some(_))) => {},
                     Ok(Ok(None)) => { task.abort(); return Err("Slack webhook destination already uses a different endpoint".into()); },
-                    _ => { task.abort(); let _=task.await; eprintln!("Slack webhook destination registration failed; reconnecting"); tokio::time::sleep(Duration::from_secs(2)).await; continue; }
+                    _ => { task.abort(); let _=task.await; eprintln!("Slack webhook destination registration failed; reconnecting"); stop.wait(Duration::from_secs(2)).await; continue; }
                 }
             }
             let mut recovery = tokio::time::Instant::now();
             if configured {
                 loop {
+                    if stop.requested() {
+                        break;
+                    }
                     if tokio::time::Instant::now() >= recovery {
                         if !matches!(
                             tokio::time::timeout(
@@ -77,6 +89,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         }
                         recovery = tokio::time::Instant::now() + Duration::from_secs(5);
                     }
+                    if stop.requested() {
+                        break;
+                    }
                     match tokio::time::timeout(
                         timeout,
                         slack_webhook_queue::process_one(
@@ -89,7 +104,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     .await
                     {
                         Ok(Ok(true)) => {}
-                        Ok(Ok(false)) => tokio::time::sleep(Duration::from_secs(1)).await,
+                        Ok(Ok(false)) => stop.wait(Duration::from_secs(1)).await,
                         _ => break,
                     }
                 }
@@ -99,7 +114,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             task.abort();
             let _ = task.await;
         }
+        if stop.requested() {
+            return Ok(());
+        }
         eprintln!("Slack worker database operation stopped; reconnecting");
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        stop.wait(Duration::from_secs(2)).await;
     }
 }

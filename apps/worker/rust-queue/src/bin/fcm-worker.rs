@@ -81,6 +81,12 @@ fn build_integrations(raw: &str) -> Result<HashMap<String, Fcm>, Box<dyn Error +
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    novu_postgres_queue::shutdown::run_until_signal(run).await
+}
+
+async fn run(
+    stop: novu_postgres_queue::shutdown::Stop,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let step_policy = novu_postgres_queue::push_step_policy::Policy::from_env()?;
     let preference_policy = novu_postgres_queue::push_step_policy::PreferencePolicy::from_env()?;
     let target_policy = novu_postgres_queue::push_step_policy::TargetPolicy::from_env()?;
@@ -190,6 +196,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     };
     let timeout = Duration::from_secs(timeout);
     loop {
+        if stop.requested() {
+            return Ok(());
+        }
         let connection = tokio::time::timeout(timeout, config.connect(tls.clone())).await;
         if let Ok(Ok((mut db, driver))) = connection {
             let task = tokio::spawn(driver);
@@ -230,7 +239,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         task.abort();
                         let _ = task.await;
                         eprintln!("FCM routing guard connection failed; reconnecting");
-                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        stop.wait(Duration::from_secs(2)).await;
                         continue;
                     }
                 }
@@ -264,11 +273,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         eprintln!(
                             "push workflow, preference or target policy registration failed; reconnecting"
                         );
-                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        stop.wait(Duration::from_secs(2)).await;
                         continue;
                     }
                 }
                 loop {
+                    if stop.requested() {
+                        break;
+                    }
                     if tokio::time::Instant::now() >= recovery {
                         if !matches!(
                             tokio::time::timeout(
@@ -281,6 +293,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                             break;
                         }
                         recovery = tokio::time::Instant::now() + Duration::from_secs(5);
+                    }
+                    if stop.requested() {
+                        break;
                     }
                     let dispatch = async {
                         fcm_queue::process_one_with_target_policy(
@@ -297,7 +312,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     };
                     match tokio::time::timeout(timeout, dispatch).await {
                         Ok(Ok(true)) => {}
-                        Ok(Ok(false)) => tokio::time::sleep(Duration::from_secs(1)).await,
+                        Ok(Ok(false)) => stop.wait(Duration::from_secs(1)).await,
                         _ => break,
                     }
                 }
@@ -307,8 +322,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             task.abort();
             let _ = task.await;
         }
+        if stop.requested() {
+            return Ok(());
+        }
         eprintln!("FCM worker database operation stopped; reconnecting");
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        stop.wait(Duration::from_secs(2)).await;
     }
 }
 

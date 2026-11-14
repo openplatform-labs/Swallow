@@ -18,6 +18,11 @@ fn start(url: &str, kind: &str, grace: &str) -> Worker {
         "resend" => env!("CARGO_BIN_EXE_resend-worker"),
         "sendgrid" => env!("CARGO_BIN_EXE_sendgrid-worker"),
         "twilio" => env!("CARGO_BIN_EXE_twilio-worker"),
+        "fcm" => env!("CARGO_BIN_EXE_fcm-worker"),
+        "slack" => env!("CARGO_BIN_EXE_slack-worker"),
+        "webhook" => env!("CARGO_BIN_EXE_slack-webhook-worker"),
+        "workflow" => env!("CARGO_BIN_EXE_slack-workflow-worker"),
+        "inapp" => env!("CARGO_BIN_EXE_in-app-worker"),
         _ => unreachable!(),
     };
     let mut cmd = Command::new(bin);
@@ -45,6 +50,24 @@ fn start(url: &str, kind: &str, grace: &str) -> Worker {
     .env_remove("NOVU_TWILIO_API_KEY_SECRET_FILE")
     .env_remove("NOVU_TWILIO_STATUS_CALLBACK_BASE_URL")
     .env("NOVU_TWILIO_FROM", "+15550000001")
+    .env("NOVU_SLACK_ENVIRONMENT_ID", "shutdown-env")
+    .env("NOVU_SLACK_BOT_TOKEN", "fixture")
+    .env_remove("NOVU_SLACK_BOT_TOKEN_FILE")
+    .env("NOVU_SLACK_WEBHOOK_DESTINATION_ID", "ops")
+    .env(
+        "NOVU_SLACK_WEBHOOK_URL",
+        "https://hooks.slack.com/services/A/B/fixture",
+    )
+    .env_remove("NOVU_SLACK_WEBHOOK_URL_FILE")
+    .env("NOVU_SLACK_WORKFLOW_TOKENS", r#"{"main":{"":"fixture"}}"#)
+    .env_remove("NOVU_SLACK_WORKFLOW_TOKENS_FILE")
+    .env("NOVU_FCM_ENVIRONMENT_ID", "shutdown-env")
+    .env("NOVU_FCM_PROJECT_ID", "fixture")
+    .env("NOVU_FCM_ACCESS_TOKEN", "fixture")
+    .env_remove("NOVU_FCM_ACCESS_TOKEN_FILE")
+    .env_remove("NOVU_FCM_INTEGRATIONS")
+    .env_remove("NOVU_FCM_INTEGRATIONS_FILE")
+    .env("HTTPS_PROXY", "http://127.0.0.1:1")
     .env("NOVU_RESEND_DB_TIMEOUT_SECONDS", "20")
     .env("NOVU_SENDGRID_DB_TIMEOUT_SECONDS", "20")
     .env("NOVU_TWILIO_DB_TIMEOUT_SECONDS", "20")
@@ -99,6 +122,14 @@ async fn workers_wait_for_inflight_operation_and_leave_new_jobs_unclaimed() {
         ("resend", novu_postgres_queue::resend_queue::JOB_KIND),
         ("sendgrid", novu_postgres_queue::sendgrid_queue::JOB_KIND),
         ("twilio", novu_postgres_queue::twilio_queue::JOB_KIND),
+        ("fcm", novu_postgres_queue::fcm_queue::JOB_KIND),
+        ("slack", novu_postgres_queue::slack_queue::JOB_KIND),
+        (
+            "webhook",
+            novu_postgres_queue::slack_webhook_queue::JOB_KIND,
+        ),
+        ("workflow", novu_postgres_queue::slack_workflow::FANOUT_KIND),
+        ("inapp", novu_postgres_queue::in_app::JOB_KIND),
     ] {
         let job = Uuid::new_v4();
         novu_postgres_queue::enqueue(&db, job, "shutdown-env", job_kind, &serde_json::json!({}))
@@ -139,6 +170,11 @@ fn invalid_grace_fails_before_worker_configuration() {
             env!("CARGO_BIN_EXE_resend-worker"),
             env!("CARGO_BIN_EXE_sendgrid-worker"),
             env!("CARGO_BIN_EXE_twilio-worker"),
+            env!("CARGO_BIN_EXE_fcm-worker"),
+            env!("CARGO_BIN_EXE_slack-worker"),
+            env!("CARGO_BIN_EXE_slack-webhook-worker"),
+            env!("CARGO_BIN_EXE_slack-workflow-worker"),
+            env!("CARGO_BIN_EXE_in-app-worker"),
         ] {
             let status = Command::new(binary)
                 .env("SWALLOW_WORKER_SHUTDOWN_GRACE_SECONDS", value)

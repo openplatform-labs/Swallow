@@ -8,6 +8,12 @@ use std::collections::BTreeMap;
 use std::{error::Error, time::Duration};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    novu_postgres_queue::shutdown::run_until_signal(run).await
+}
+
+async fn run(
+    stop: novu_postgres_queue::shutdown::Stop,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let step_policy = slack_workflow::StepPolicy::from_env()?;
     let endpoint_policy = slack_workflow::EndpointPolicy::from_env()?;
     let environment = std::env::var("NOVU_SLACK_ENVIRONMENT_ID")?;
@@ -48,6 +54,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     };
     let timeout = Duration::from_secs(timeout);
     loop {
+        if stop.requested() {
+            return Ok(());
+        }
         let connection = tokio::time::timeout(timeout, config.connect(tls.clone())).await;
         if let Ok(Ok((mut db, driver))) = connection {
             let task = tokio::spawn(driver);
@@ -67,12 +76,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 match tokio::time::timeout(timeout,db.query_opt("INSERT INTO novu_rust_slack_workflow_worker_config(environment_id,credential_map_hash,step_policy,endpoint_policy) VALUES ($1,$2,$3,$4) ON CONFLICT(environment_id) DO UPDATE SET credential_map_hash=EXCLUDED.credential_map_hash,step_policy=EXCLUDED.step_policy,endpoint_policy=EXCLUDED.endpoint_policy WHERE novu_rust_slack_workflow_worker_config.credential_map_hash=EXCLUDED.credential_map_hash AND (novu_rust_slack_workflow_worker_config.step_policy IS NULL OR novu_rust_slack_workflow_worker_config.step_policy=EXCLUDED.step_policy) AND (novu_rust_slack_workflow_worker_config.endpoint_policy IS NULL OR novu_rust_slack_workflow_worker_config.endpoint_policy=EXCLUDED.endpoint_policy) RETURNING 1",&[&environment,&fingerprint,&step_policy.as_str(),&endpoint_policy.as_str()])).await {
                     Ok(Ok(Some(_)))=>{},
                     Ok(Ok(None))=>{task.abort();return Err("Slack workflow workers have different credential maps or workflow policies".into());},
-                    _=>{task.abort();let _=task.await;eprintln!("Slack workflow configuration registration failed; reconnecting");tokio::time::sleep(Duration::from_secs(2)).await;continue;}
+                    _=>{task.abort();let _=task.await;eprintln!("Slack workflow configuration registration failed; reconnecting");stop.wait(Duration::from_secs(2)).await;continue;}
                 }
             }
             let mut recovery = tokio::time::Instant::now();
             if configured {
                 loop {
+                    if stop.requested() {
+                        break;
+                    }
                     if tokio::time::Instant::now() >= recovery {
                         if !matches!(
                             tokio::time::timeout(
@@ -86,6 +98,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         }
                         recovery = tokio::time::Instant::now() + Duration::from_secs(5);
                     }
+                    if stop.requested() {
+                        break;
+                    }
                     let fanout = tokio::time::timeout(
                         timeout,
                         slack_workflow::fanout_one_with_policies(
@@ -97,6 +112,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     )
                     .await;
                     if !matches!(fanout, Ok(Ok(_))) {
+                        break;
+                    }
+                    if stop.requested() {
                         break;
                     }
                     let delivery = tokio::time::timeout(
@@ -112,7 +130,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     match delivery {
                         Ok(Ok(processed)) => {
                             if !processed && matches!(fanout, Ok(Ok(false))) {
-                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                stop.wait(Duration::from_secs(1)).await;
                             }
                         }
                         _ => break,
@@ -124,7 +142,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             task.abort();
             let _ = task.await;
         }
+        if stop.requested() {
+            return Ok(());
+        }
         eprintln!("Slack worker database operation stopped; reconnecting");
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        stop.wait(Duration::from_secs(2)).await;
     }
 }
