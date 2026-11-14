@@ -1,3 +1,9 @@
+## 원본 SDK의 WS 장애 복구 확인
+
+원본 Novu `895388f37efe9e06de0aa333e5727303e6ad6853`에서 빌드한 `@novu/js` 3.19.2와 실제 Rust WS·Docker PostgreSQL로 리스너 중단을 주입했다. 서버가 Socket.IO 네임스페이스를 끊은 후 SDK는 자동 재연결하지 않았고 `socket.connect()`만 다시 호출해도 복구되지 않았다. 서버 복구 후 `socket.disconnect()` 다음 `socket.connect()`를 호출하면 다시 연결됐고, `notifications.list({ useCache: false })`는 갱신된 응답을 가져왔다. 기본 캐시 조회는 오래된 결과를 반환했다. 이 재조회는 호출자에게 새 결과를 반환하는 것으로, 모든 캐시·페이지·UI 상태를 갱신한다는 뜻은 아니다. 애플리케이션은 세션과 수명주기를 고려해 재시도·백오프 및 필요한 목록과 카운트 갱신을 직접 구현해야 한다.
+
+테스트는 `NOVU_REFERENCE_SOURCE`를 빌드된 원본 체크아웃으로 지정해 [장애 테스트](apps/ws/rust-ws/scripts/test-listener-gap.sh)를 실행한다. 세션과 Inbox HTTP 응답은 fixture이므로 실제 Inbox 데이터 복구나 애플리케이션의 자동 재동기화, 원본 서버의 장애 동등성은 검증하지 않았다. 유실 이벤트 재생도 구현되지 않았다.
+
 ## WS 이벤트 조회 지연 감지
 
 선택형 `NOVU_WS_EVENT_LOOKUP_TIMEOUT_SECONDS`를 1~300초로 설정하면 WS 이벤트 처리 중 공유 DB 연결 대기와 이벤트·메시지·카운트 조회가 제한 시간을 넘을 때 해당 인스턴스 연결을 끊는다. 기본은 미설정으로 기존 동작을 유지한다. 이 설정은 `NOVU_WS_DISCONNECT_ON_EVENT_GAP=true`와 `NOVU_WS_EVENT_LOOKUP_RECOVERY=probe`를 함께 요구하며 잘못된 조합은 기동을 거절한다. 시간 초과 후 활성 readiness는 503이고 신규 소켓은 거절되며 조회 확인 성공 뒤 복구된다. 각 WS 인스턴스에 필요한 정책을 설정해야 한다.

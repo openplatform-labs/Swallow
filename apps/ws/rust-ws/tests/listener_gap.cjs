@@ -2,6 +2,8 @@
 const {createHmac} = require('crypto');
 const {spawn,spawnSync} = require('child_process');
 const assert = require('assert/strict');
+const http = require('http');
+const path = require('path');
 const wait = ms => new Promise(r => setTimeout(r,ms));
 const tokenPart=x=>Buffer.from(JSON.stringify(x)).toString('base64url');
 const body=tokenPart({alg:'HS256',typ:'JWT'})+'.'+tokenPart({_id:'subscriber-id',environmentId:'env-a',aud:'widget_user',exp:Math.floor(Date.now()/1000)+300});
@@ -36,6 +38,29 @@ async function until(fn,message,timeout=4000){for(let i=0;i<timeout/25;i++){if(f
   await wait(200);
   assert(!noExpLegacy.closed&&!noExpLegacy.messages.some(x=>x.startsWith('41')),'default rejected a token without exp');
   noExpLegacy.ws.close();
+  // Optional real upstream SDK exercise. The session and Inbox HTTP responses
+  // are fixtures; Socket.IO and the PostgreSQL listener are real processes.
+  let sdk, api, connects=0, disconnects=0, inboxReads=0, fixtureNotifications=[];
+  if(process.env.NOVU_REFERENCE_SOURCE) {
+    const {Novu}=require(path.join(process.env.NOVU_REFERENCE_SOURCE,'packages/js/dist/cjs/index.js'));
+    api=http.createServer((req,res)=>{
+      res.setHeader('content-type','application/json');
+      if(req.method==='POST' && req.url==='/v1/inbox/session') return res.end(JSON.stringify({data:{token,applicationIdentifier:'fixture'}}));
+      if(req.method==='GET' && req.url.startsWith('/v1/inbox/notifications?')) {
+        inboxReads++;
+        return res.end(JSON.stringify({data:fixtureNotifications,hasMore:false,filter:{}}));
+      }
+      res.statusCode=404;res.end(JSON.stringify({message:'unexpected fixture request'}));
+    });
+    await new Promise(resolve=>api.listen(0,'127.0.0.1',resolve));
+    sdk=new Novu({applicationIdentifier:'fixture',subscriberId:'subscriber',apiUrl:`http://127.0.0.1:${api.address().port}`,socketUrl:`http://127.0.0.1:${process.env.GUARDED_PORT}`,socketOptions:{reconnectionDelay:100,reconnectionDelayMax:200}});
+    sdk.on('socket.connect.resolved',({error})=>{if(!error)connects++});
+    sdk.on('socket.disconnect.resolved',()=>disconnects++);
+    sdk.on('notifications.unseen_count_changed',()=>{});
+    await until(()=>connects===1,'upstream SDK did not connect',10000);
+    assert.deepEqual((await sdk.notifications.list()).data.notifications,[]);
+    assert.equal(inboxReads,1);
+  }
   const guarded=await open(process.env.GUARDED_PORT), legacy=await open(process.env.LEGACY_PORT);
   await wait(200);
   assert.equal(sql("SELECT count(*) FROM pg_stat_activity WHERE application_name='novu-rust-ws-listener'"),'3');
@@ -46,6 +71,25 @@ async function until(fn,message,timeout=4000){for(let i=0;i<timeout/25;i++){if(f
   await until(()=>during.messages.some(x=>x.startsWith('41'))||during.closed,'new connection was not rejected during listener gap',700);
   during.ws.close();
   for(let i=0;i<100;i++){if(sql("SELECT count(*) FROM pg_stat_activity WHERE application_name='novu-rust-ws-listener'")==='3')break;await wait(50);if(i===99)throw Error('listeners did not recover');}
+  if(sdk) {
+    await until(()=>disconnects>=1,'SDK did not report disconnection');
+    fixtureNotifications=[{id:'missed',body:'during gap'}];
+    await wait(800);
+    assert.equal(connects,1,'SDK unexpectedly reconnected after namespace disconnect');
+    await sdk.socket.connect();
+    await wait(300);
+    assert.equal(connects,1,'connect() unexpectedly replaced the disconnected SDK socket');
+    assert.equal((await sdk.notifications.list()).data.notifications.length,0,'cached list unexpectedly refreshed');
+    await sdk.socket.disconnect();
+    await sdk.socket.connect();
+    await until(()=>connects===2,'explicit SDK disconnect/connect did not restore socket');
+    const refreshed=await sdk.notifications.list({useCache:false});
+    assert.equal(refreshed.data.notifications[0].id,'missed');
+    assert.equal(inboxReads,2,'cache-bypassing list did not fetch Inbox');
+    await sdk.socket.disconnect();
+    await new Promise(resolve=>api.close(resolve));
+    console.log('upstream SDK: namespace disconnect requires disconnect/connect and cache-bypassing Inbox refresh');
+  }
   const resumed=await open(process.env.GUARDED_PORT);await wait(200);
   sql("INSERT INTO novu_rust_ws_events(environment_id,subscriber_internal_id,event,data) VALUES ('env-a','subscriber-id','recovered_probe','{\"ok\":true}')");
   await until(()=>resumed.messages.some(x=>x.includes('recovered_probe')),'reconnected socket did not receive event');
@@ -90,4 +134,4 @@ async function until(fn,message,timeout=4000){for(let i=0;i<timeout/25;i++){if(f
   await until(()=>timeoutRecovered.messages.some(x=>x.includes('after_timeout')),'delivery failed after timeout recovery');timeoutRecovered.ws.close();timed.ws.close();
   restored.ws.close();resumed.ws.close();legacy.ws.close();guarded.ws.close();
   console.log('listener and event query failures close guarded sockets, preserve default, and recover');
-})().catch(e=>{console.error(e);process.exitCode=1});
+})().catch(e=>{console.error(e);process.exit(1)});
