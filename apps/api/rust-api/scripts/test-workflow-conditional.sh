@@ -12,7 +12,7 @@ for ((i=0;i<60;i++)); do
 done
 port=$(docker port "$name" 5432/tcp); port=${port##*:}
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/workflow_cas" cargo test --locked --test workflow_conditional -- --ignored
-for test_name in channel_workflow_management slack_workflow_management; do
+for test_name in channel_workflow_management slack_workflow_management provider_auth_race; do
   docker exec "$name" createdb -U postgres "$test_name"
   TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/${test_name}" cargo test --locked --test "$test_name" -- --ignored
 done

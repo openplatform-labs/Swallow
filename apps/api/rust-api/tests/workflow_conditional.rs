@@ -69,9 +69,66 @@ async fn conditional_writes_lock_compare_and_audit() {
     )
     .await
     .unwrap();
+    db.execute(
+        "INSERT INTO novu_rust_workflow_provider_permissions VALUES ($1,'read'),($1,'write')",
+        &[&hash],
+    )
+    .await
+    .unwrap();
     let app = novu_rust_api::router_with_subscriber_secret(Arc::new(db), None);
     let (mut setup, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move { driver.await.unwrap() });
+    let provider_path = "/v1/experimental/workflows/workflow/email-provider";
+    assert_eq!(
+        call(
+            app.clone(),
+            provider_path,
+            json!({"provider":"resend","expected":"sendgrid"})
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(
+            app.clone(),
+            provider_path,
+            json!({"provider":"sendgrid","expected":"sendgrid"})
+        )
+        .await,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        call(
+            app.clone(),
+            provider_path,
+            json!({"provider":"sendgrid","expected":null})
+        )
+        .await,
+        StatusCode::BAD_REQUEST
+    );
+    let tx = setup.transaction().await.unwrap();
+    tx.execute("UPDATE novu_rust_workflows SET email_provider='sendgrid' WHERE environment_id='a' AND identifier='workflow'",&[]).await.unwrap();
+    let pending = tokio::spawn(call(
+        app.clone(),
+        provider_path,
+        json!({"provider":"sendgrid","expected":"resend"}),
+    ));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(!pending.is_finished());
+    tx.commit().await.unwrap();
+    assert_eq!(pending.await.unwrap(), StatusCode::CONFLICT);
+    assert_eq!(setup.query_one("SELECT email_provider,(SELECT count(*) FROM novu_rust_workflow_provider_audit) FROM novu_rust_workflows WHERE environment_id='a' AND identifier='workflow'",&[]).await.unwrap().get::<_,String>(0),"sendgrid");
+    assert_eq!(
+        setup
+            .query_one(
+                "SELECT count(*) FROM novu_rust_workflow_provider_audit",
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1
+    );
     for channel in ["email", "sms", "push", "slack"] {
         let path = if channel == "slack" {
             "/v1/experimental/workflows/workflow/slack-step".to_string()

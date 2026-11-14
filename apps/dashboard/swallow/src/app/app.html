@@ -7,7 +7,7 @@
     <nav class="sidenav" aria-label="주 메뉴">
       <div class="nav-heading">WORKSPACE</div>
       @for (item of sections; track item.id) {
-        <button class="nav-entry" [class.active]="section() === item.id" [attr.aria-current]="section() === item.id ? 'page' : null" [disabled]="decisionStatus() === 'sending' || permissionChangeStatus() === 'sending' || workflowStatus() === 'saving'" (click)="setSection(item.id)">
+        <button class="nav-entry" [class.active]="section() === item.id" [attr.aria-current]="section() === item.id ? 'page' : null" [disabled]="decisionStatus() === 'sending' || permissionChangeStatus() === 'sending' || workflowStatus() === 'saving' || providerStatus() === 'saving'" (click)="setSection(item.id)">
           <span class="nav-icon" aria-hidden="true">{{ item.short }}</span><span>{{ item.label }}</span>
         </button>
       }
@@ -53,26 +53,38 @@
         <clr-alert clrAlertType="warning" [clrAlertClosable]="false"><clr-alert-item><span class="alert-text">실험 기능입니다. API 키와 채널별 읽기·쓰기 권한이 필요합니다. 저장 시 조회한 설정과 현재 설정을 비교합니다.</span></clr-alert-item></clr-alert>
         <section class="card subscriber-card"><div class="card-block"><div class="card-eyebrow">STEP SETTINGS</div><h2>단계 조회</h2>
           <form class="subscriber-form" (ngSubmit)="loadWorkflow()">
-            <div><label for="workflow-id">워크플로 식별자</label><input id="workflow-id" name="workflowIdentifier" [(ngModel)]="workflowIdentifier" (ngModelChange)="clearWorkflow()" [disabled]="workflowStatus()==='saving'" autocomplete="off" required></div>
-            <div><label for="workflow-channel">채널</label><select id="workflow-channel" class="clr-select" name="workflowChannel" [(ngModel)]="workflowChannel" (ngModelChange)="clearWorkflow()" [disabled]="workflowStatus()==='saving'"><option value="email">이메일</option><option value="sms">SMS</option><option value="push">푸시</option><option value="slack">Slack</option></select></div>
-            <div><label for="workflow-key">환경 API 키</label><input id="workflow-key" type="password" name="workflowKey" [(ngModel)]="workflowKey" (ngModelChange)="clearWorkflow()" [disabled]="workflowStatus()==='saving'" autocomplete="off" spellcheck="false" required></div>
-            <button type="submit" class="btn btn-primary" [disabled]="workflowStatus()==='loading' || workflowStatus()==='saving'">단계 조회</button><button type="button" class="btn btn-outline" [disabled]="workflowStatus()==='saving'" (click)="clearWorkflow(true)">지우기</button>
+            <div><label for="workflow-id">워크플로 식별자</label><input id="workflow-id" name="workflowIdentifier" [(ngModel)]="workflowIdentifier" (ngModelChange)="clearWorkflow()" [disabled]="workflowStatus()==='saving' || providerStatus()==='saving'" autocomplete="off" required></div>
+            <div><label for="workflow-channel">채널</label><select id="workflow-channel" class="clr-select" name="workflowChannel" [(ngModel)]="workflowChannel" (ngModelChange)="clearWorkflow()" [disabled]="workflowStatus()==='saving' || providerStatus()==='saving'"><option value="email">이메일</option><option value="sms">SMS</option><option value="push">푸시</option><option value="slack">Slack</option></select></div>
+            <div><label for="workflow-key">환경 API 키</label><input id="workflow-key" type="password" name="workflowKey" [(ngModel)]="workflowKey" (ngModelChange)="clearWorkflow()" [disabled]="workflowStatus()==='saving' || providerStatus()==='saving'" autocomplete="off" spellcheck="false" required></div>
+            <button type="submit" class="btn btn-primary" [disabled]="workflowStatus()==='loading' || workflowStatus()==='saving' || providerStatus()==='saving'">단계 조회</button><button type="button" class="btn btn-outline" [disabled]="workflowStatus()==='saving' || providerStatus()==='saving'" (click)="clearWorkflow(true)">지우기</button>
           </form><p class="subscriber-hint">조회·수정은 위 API 키의 환경에 적용됩니다. 키와 템플릿은 이 화면의 메모리에만 남고 화면을 떠나면 지워집니다.</p>
           @if (workflowStatus()==='loading') {<p role="status">설정을 불러오는 중입니다.</p>}
           @if (workflowMessage()) {<p class="subscriber-error" role="alert">{{ workflowMessage() }}</p>}
           @if (workflowStatus()==='saved') {<p role="status">변경 응답을 받았습니다. 현재 설정을 다시 조회해 확인하세요.</p>}
         </div></section>
+        <section class="card subscriber-card"><div class="card-block"><div class="card-eyebrow">EMAIL PROVIDER</div><h2>이메일 공급자</h2><p>위 워크플로 식별자와 API 키를 사용합니다. 공급자 조회·변경에는 단계 설정과 별도의 권한이 필요합니다.</p>
+          <button type="button" class="btn btn-outline" (click)="loadProvider()" [disabled]="providerStatus()==='loading' || providerStatus()==='saving' || workflowStatus()==='saving'">공급자 조회</button>
+          @if(providerStatus()==='loading'){<p role="status">공급자를 불러오는 중입니다.</p>}
+          @if(providerMessage()){<p class="subscriber-error" role="alert">{{ providerMessage() }}</p>}
+          @if(providerStatus()==='saved'){<p role="status">공급자 변경 응답을 받았습니다. 다시 조회해 확인하세요.</p>}
+          @if(providerStatus()==='loaded' || providerStatus()==='saving'){
+            <form class="decision-form" (ngSubmit)="saveProvider()"><label for="provider-choice">워크플로 이메일 공급자</label><select id="provider-choice" name="providerChoice" [(ngModel)]="providerChoice" [disabled]="providerStatus()==='saving' || workflowStatus()==='saving'"><option value="resend">Resend</option><option value="sendgrid">SendGrid</option></select>
+              <label class="decision-confirm"><input type="checkbox" name="providerConfirmed" [(ngModel)]="providerConfirmed" [disabled]="providerStatus()==='saving' || workflowStatus()==='saving'"> 선택한 공급자로 변경합니다</label>
+              <button type="submit" class="btn btn-primary" [disabled]="!providerConfirmed || providerStatus()==='saving' || workflowStatus()==='saving'">{{ providerStatus()==='saving' ? '저장 중' : '공급자 저장' }}</button></form>
+          }
+          <p class="subscriber-hint">선택은 새 워크플로 처리에 적용됩니다. 이미 생성된 작업과 공급자 자격증명은 바뀌지 않습니다. 결과 불명 시 다시 저장하기 전에 현재 설정과 감사 기록을 확인하세요.</p>
+        </div></section>
         @if (workflowStatus()==='loaded' || workflowStatus()==='saving') {
           <section class="card decision-card"><div class="card-block"><h2>단계 설정</h2><p>이미 생성된 작업은 이전 템플릿을 사용할 수 있습니다. 활성화는 단계에만 적용되며 워크플로 전체 활성화와 별개입니다.</p>
             <form class="decision-form" (ngSubmit)="saveWorkflow()">
-              <label class="decision-confirm"><input type="checkbox" name="workflowHasContent" [(ngModel)]="workflowHasContent" [disabled]="workflowStatus()==='saving'"> 템플릿 사용</label>
+              <label class="decision-confirm"><input type="checkbox" name="workflowHasContent" [(ngModel)]="workflowHasContent" [disabled]="workflowStatus()==='saving' || providerStatus()==='saving'"> 템플릿 사용</label>
               @if (workflowHasContent) {
-                @if (workflowChannel==='email'||workflowChannel==='push') {<label for="workflow-title">{{ workflowChannel==='email' ? '메일 제목' : '푸시 제목' }}</label><input id="workflow-title" name="workflowTitle" [(ngModel)]="workflowTitle" [disabled]="workflowStatus()==='saving'">}
-                <label for="workflow-content">내용</label><textarea id="workflow-content" name="workflowContent" [(ngModel)]="workflowContent" [disabled]="workflowStatus()==='saving'"></textarea>
+                @if (workflowChannel==='email'||workflowChannel==='push') {<label for="workflow-title">{{ workflowChannel==='email' ? '메일 제목' : '푸시 제목' }}</label><input id="workflow-title" name="workflowTitle" [(ngModel)]="workflowTitle" [disabled]="workflowStatus()==='saving' || providerStatus()==='saving'">}
+                <label for="workflow-content">내용</label><textarea id="workflow-content" name="workflowContent" [(ngModel)]="workflowContent" [disabled]="workflowStatus()==='saving' || providerStatus()==='saving'"></textarea>
               }
-              <label class="decision-confirm"><input type="checkbox" name="workflowActive" [(ngModel)]="workflowActive" [disabled]="workflowStatus()==='saving'"> 이 단계 활성화</label>
-              <label class="decision-confirm"><input type="checkbox" name="workflowConfirmed" [(ngModel)]="workflowConfirmed" [disabled]="workflowStatus()==='saving'"> 선택한 환경과 채널의 설정을 변경합니다</label>
-              <button type="submit" class="btn btn-primary" [disabled]="!workflowConfirmed || workflowStatus()==='saving'">{{ workflowStatus()==='saving' ? '저장 중' : '단계 저장' }}</button>
+              <label class="decision-confirm"><input type="checkbox" name="workflowActive" [(ngModel)]="workflowActive" [disabled]="workflowStatus()==='saving' || providerStatus()==='saving'"> 이 단계 활성화</label>
+              <label class="decision-confirm"><input type="checkbox" name="workflowConfirmed" [(ngModel)]="workflowConfirmed" [disabled]="workflowStatus()==='saving' || providerStatus()==='saving'"> 선택한 환경과 채널의 설정을 변경합니다</label>
+              <button type="submit" class="btn btn-primary" [disabled]="!workflowConfirmed || workflowStatus()==='saving' || providerStatus()==='saving'">{{ workflowStatus()==='saving' ? '저장 중' : '단계 저장' }}</button>
             </form><p>통신 오류나 시간 초과 시 저장 여부가 불명일 수 있습니다. 요청이 아직 진행 중일 수 있으므로 다시 저장하기 전에 현재 설정과 감사 기록을 확인하세요.</p>
           </div></section>
         }

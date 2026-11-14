@@ -52,6 +52,13 @@ export class App implements OnDestroy {
   private workflowSequence=0;
   private workflowAbort:AbortController|null=null;
   private workflowExpected:{title:string|null;content:string|null;active:boolean}|null=null;
+  readonly providerStatus=signal<'idle'|'loading'|'loaded'|'saving'|'saved'|'error'|'unknown'>('idle');
+  readonly providerMessage=signal('');
+  providerChoice:'resend'|'sendgrid'='sendgrid';
+  providerConfirmed=false;
+  private providerExpected:'resend'|'sendgrid'|null=null;
+  private providerSequence=0;
+  private providerAbort:AbortController|null=null;
   readonly subscribers = signal<Subscriber[]>([]);
   readonly subscriberStatus = signal<'idle' | 'loading' | 'loaded' | 'error'>('idle');
   readonly subscriberError = signal('');
@@ -410,7 +417,46 @@ export class App implements OnDestroy {
     this.workflowSequence++;this.workflowAbort?.abort();this.workflowAbort=null;
     this.workflowStatus.set('idle');this.workflowMessage.set('');this.workflowTitle='';this.workflowContent='';this.workflowHasContent=false;this.workflowActive=false;this.workflowConfirmed=false;
     this.workflowExpected=null;
+    this.providerSequence++;this.providerAbort?.abort();this.providerAbort=null;
+    this.providerStatus.set('idle');this.providerMessage.set('');this.providerExpected=null;this.providerConfirmed=false;this.providerChoice='sendgrid';
     if(clearKey){this.workflowKey='';this.workflowIdentifier='';}
+  }
+
+  private providerEndpoint():string {
+    this.workflowEndpoint();
+    return `${this.validatedOrigin()}/v1/experimental/workflows/${encodeURIComponent(this.workflowIdentifier.trim())}/email-provider`;
+  }
+
+  async loadProvider():Promise<void> {
+    if(this.workflowStatus()==='saving'||this.providerStatus()==='saving')return;
+    const sequence=++this.providerSequence;this.providerAbort?.abort();const controller=new AbortController();this.providerAbort=controller;
+    this.providerExpected=null;this.providerConfirmed=false;this.providerMessage.set('');this.providerStatus.set('loading');
+    try {
+      const endpoint=this.providerEndpoint(),identifier=this.workflowIdentifier.trim();
+      const response=await fetch(endpoint,{headers:{Authorization:`ApiKey ${this.workflowKey.trim()}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      if(!response.ok)throw new Error('request failed');const value:unknown=await response.json();
+      if(sequence!==this.providerSequence)return;
+      if(typeof value!=='object'||value===null||!('data' in value)||typeof value.data!=='object'||value.data===null)throw new Error('invalid response');
+      const data=value.data as Record<string,unknown>;
+      if(data['workflowIdentifier']!==identifier||(data['provider']!=='resend'&&data['provider']!=='sendgrid'))throw new Error('invalid response');
+      this.providerExpected=data['provider'];this.providerChoice=data['provider'];this.providerStatus.set('loaded');
+    } catch {if(sequence===this.providerSequence){this.providerStatus.set('error');this.providerMessage.set('공급자를 조회하지 못했습니다. 식별자와 공급자 읽기 권한을 확인하세요.');}}
+    finally {if(sequence===this.providerSequence)this.providerAbort=null;}
+  }
+
+  async saveProvider():Promise<void> {
+    if(this.providerStatus()!=='loaded'||!this.providerConfirmed||!this.providerExpected||!['resend','sendgrid'].includes(this.providerChoice)||this.workflowStatus()==='saving')return;
+    let endpoint:string;try {endpoint=this.providerEndpoint();}catch{this.providerStatus.set('error');this.providerMessage.set('워크플로 식별자와 API 키를 확인하세요.');return;}
+    const identifier=this.workflowIdentifier.trim(),choice=this.providerChoice,expected=this.providerExpected;
+    this.providerStatus.set('saving');this.providerMessage.set('');
+    try {
+      const response=await fetch(endpoint,{method:'PUT',headers:{Authorization:`ApiKey ${this.workflowKey.trim()}`,'Content-Type':'application/json'},body:JSON.stringify({provider:choice,expected}),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
+      if(!response.ok){this.providerStatus.set([400,401,403,404,409].includes(response.status)?'error':'unknown');this.providerMessage.set(response.status===409?'설정이 변경되었거나 접근 권한을 확인할 수 없습니다. 다시 조회하세요.':this.providerStatus()==='error'?'공급자 변경이 거절됐습니다. 권한과 서버 버전을 확인하세요.':'변경 결과가 불명입니다. 재시도 전에 현재 설정과 감사 기록을 확인하세요.');return;}
+      const value:unknown=await response.json();
+      if(typeof value!=='object'||value===null||!('data' in value)||typeof value.data!=='object'||value.data===null||!('workflowIdentifier' in value.data)||value.data.workflowIdentifier!==identifier||!('provider' in value.data)||value.data.provider!==choice)throw new Error('invalid response');
+      this.providerStatus.set('saved');
+    } catch {this.providerStatus.set('unknown');this.providerMessage.set('변경 결과가 불명입니다. 재시도 전에 현재 설정과 감사 기록을 확인하세요.');}
+    finally {this.providerConfirmed=false;}
   }
 
   private workflowEndpoint(): string {
@@ -430,7 +476,7 @@ export class App implements OnDestroy {
   }
 
   async loadWorkflow():Promise<void> {
-    if(this.workflowStatus()==='saving')return;
+    if(this.workflowStatus()==='saving'||this.providerStatus()==='saving')return;
     this.clearWorkflow();const sequence=this.workflowSequence;const controller=new AbortController();this.workflowAbort=controller;this.workflowStatus.set('loading');
     try {
       const endpoint=this.workflowEndpoint(), identifier=this.workflowIdentifier.trim(), channel=this.workflowChannel;
@@ -443,7 +489,7 @@ export class App implements OnDestroy {
   }
 
   async saveWorkflow():Promise<void> {
-    if(this.workflowStatus()!=='loaded'||!this.workflowConfirmed||!this.workflowExpected)return;
+    if(this.workflowStatus()!=='loaded'||!this.workflowConfirmed||!this.workflowExpected||this.providerStatus()==='saving')return;
     let endpoint:string;
     try {endpoint=this.workflowEndpoint();} catch {this.workflowStatus.set('error');this.workflowMessage.set('워크플로 식별자와 API 키를 확인해 주세요.');return;}
     const bytes=(s:string)=>new TextEncoder().encode(s).length;
@@ -462,7 +508,7 @@ export class App implements OnDestroy {
   }
 
   setSection(next: Section): void {
-    if (this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.workflowStatus()==='saving') return;
+    if (this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving') return;
     if (this.section()==='workflows' && next!=='workflows') this.clearWorkflow(true);
     if (this.section() === 'subscribers' && next !== 'subscribers') this.forgetKey();
     if (this.section() === 'alerts' && next !== 'alerts') this.forgetAlertKey();

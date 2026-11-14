@@ -2790,7 +2790,10 @@ async fn set_workflow_email_provider(
             );
         }
     };
-    let Some(object) = input.as_object().filter(|o| o.len() == 1) else {
+    let Some(object) = input.as_object().filter(|o| {
+        (o.len() == 1 || (o.len() == 2 && o.contains_key("expected")))
+            && o.contains_key("provider")
+    }) else {
         return error_at(
             StatusCode::BAD_REQUEST,
             "Invalid provider",
@@ -2810,14 +2813,20 @@ async fn set_workflow_email_provider(
             &path,
         );
     };
+    let expected = match object.get("expected") {
+        None => None,
+        Some(Value::String(s)) if ["sendgrid", "resend"].contains(&s.as_str()) => Some(s.as_str()),
+        _ => return error_at(StatusCode::BAD_REQUEST, "Invalid expected provider", "Bad Request", &path),
+    };
     // Hold matching authorization locks; update and audit commit atomically.
     let audit_id = uuid::Uuid::new_v4();
-    let result=db.query_opt("WITH authorized AS MATERIALIZED (SELECT public.novu_rust_lock_workflow_provider_grant($4,$1,'write') AS allowed), target AS MATERIALIZED (SELECT w.environment_id,w.identifier,w.email_provider AS previous,k.user_id FROM authorized a JOIN novu_rust_workflows w ON w.environment_id=$1 AND w.identifier=$2 JOIN novu_rust_api_keys k ON k.key_hash=$4 WHERE a.allowed FOR UPDATE OF w), updated AS (UPDATE novu_rust_workflows w SET email_provider=$3 FROM target t WHERE w.environment_id=t.environment_id AND w.identifier=t.identifier RETURNING w.email_provider,t.previous,t.user_id), audited AS (INSERT INTO public.novu_rust_workflow_provider_audit(id,environment_id,workflow_identifier,api_key_hash,user_id,previous_provider,new_provider) SELECT $5,$1,$2,$4,u.user_id,u.previous,u.email_provider FROM updated u RETURNING 1) SELECT u.email_provider FROM updated u CROSS JOIN audited", &[&environment,&workflow,&provider,&hash,&audit_id]).await;
+    let result=db.query_opt("WITH authorized AS MATERIALIZED (SELECT public.novu_rust_lock_workflow_provider_grant($4,$1,'write') AS allowed), target AS MATERIALIZED (SELECT w.environment_id,w.identifier,w.email_provider AS previous,k.user_id FROM authorized a JOIN novu_rust_workflows w ON w.environment_id=$1 AND w.identifier=$2 JOIN novu_rust_api_keys k ON k.key_hash=$4 WHERE a.allowed AND ($6::text IS NULL OR w.email_provider=$6) FOR UPDATE OF w), updated AS (UPDATE novu_rust_workflows w SET email_provider=$3 FROM target t WHERE w.environment_id=t.environment_id AND w.identifier=t.identifier RETURNING w.email_provider,t.previous,t.user_id), audited AS (INSERT INTO public.novu_rust_workflow_provider_audit(id,environment_id,workflow_identifier,api_key_hash,user_id,previous_provider,new_provider) SELECT $5,$1,$2,$4,u.user_id,u.previous,u.email_provider FROM updated u RETURNING 1) SELECT u.email_provider FROM updated u CROSS JOIN audited", &[&environment,&workflow,&provider,&hash,&audit_id,&expected]).await;
     match result {
         Ok(Some(row)) => (
             StatusCode::OK,
             Json(json!({"data":{"workflowIdentifier":workflow,"provider":row.get::<_,String>(0)}})),
         ),
+        Ok(None) if expected.is_some() => error_at(StatusCode::CONFLICT, "Workflow changed, missing or permission revoked", "Conflict", &path),
         Ok(None) => error_at(
             StatusCode::NOT_FOUND,
             "Workflow not found or permission revoked",

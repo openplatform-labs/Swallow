@@ -6,6 +6,20 @@ import { OperatorOidc } from './operator-oidc';
 describe('Swallow console', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
+  it('reads and conditionally changes the workflow email provider', async () => {
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:{workflowIdentifier:'welcome',provider:'sendgrid'}}))).mockResolvedValueOnce(new Response(JSON.stringify({data:{workflowIdentifier:'welcome',provider:'resend'}})));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('workflows');app.workflowIdentifier='welcome';app.workflowKey='key';await app.loadProvider();expect(app.providerChoice).toBe('sendgrid');app.providerChoice='resend';app.providerConfirmed=true;await app.saveProvider();
+    expect(app.providerStatus()).toBe('saved');expect(JSON.parse(fetchMock.mock.calls[1][1]?.body as string)).toEqual({provider:'resend',expected:'sendgrid'});expect(new URL(fetchMock.mock.calls[0][0] as string).pathname).toBe('/v1/experimental/workflows/welcome/email-provider');
+    app.setSection('overview');expect(app.workflowKey).toBe('');expect(app.providerStatus()).toBe('idle');
+  });
+
+  it('requires rereading after provider conflict and reports unknown results', async () => {
+    const data=JSON.stringify({data:{workflowIdentifier:'welcome',provider:'sendgrid'}});
+    vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(data)).mockResolvedValueOnce(new Response('',{status:409})).mockResolvedValueOnce(new Response(data)).mockRejectedValueOnce(new TypeError('network'));
+    const app=TestBed.createComponent(App).componentInstance;app.workflowIdentifier='welcome';app.workflowKey='key';await app.loadProvider();app.providerChoice='resend';app.providerConfirmed=true;await app.saveProvider();expect(app.providerStatus()).toBe('error');expect(app.providerMessage()).toContain('다시 조회');
+    await app.loadProvider();app.providerChoice='resend';app.providerConfirmed=true;await app.saveProvider();expect(app.providerStatus()).toBe('unknown');expect(app.providerMessage()).toContain('감사');
+  });
+
   it('loads and updates each supported workflow channel with the correct API contract', async () => {
     const fetchMock=vi.spyOn(globalThis,'fetch');
     const app=TestBed.createComponent(App).componentInstance;app.setSection('workflows');app.workflowIdentifier='welcome';app.workflowKey='test-key';
