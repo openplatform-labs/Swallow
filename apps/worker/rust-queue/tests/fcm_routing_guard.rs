@@ -39,7 +39,7 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
     }
     let (db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move { driver.await.unwrap() });
-    db.batch_execute("INSERT INTO novu_rust_environments VALUES ('guard-env','org'),('map-env','org'); INSERT INTO novu_rust_fcm_routing_workers SELECT e.id,r.rolname,r.oid FROM novu_rust_environments e CROSS JOIN pg_roles r WHERE r.rolname=session_user; INSERT INTO novu_rust_operator_grant_admins(environment_id,database_principal,principal_oid) SELECT 'guard-env',rolname,oid FROM pg_roles WHERE rolname=session_user").await.unwrap();
+    db.batch_execute("INSERT INTO novu_rust_environments VALUES ('guard-env','org'),('map-env','org'),('pref-env','org'); INSERT INTO novu_rust_fcm_routing_workers SELECT e.id,r.rolname,r.oid FROM novu_rust_environments e CROSS JOIN pg_roles r WHERE r.rolname=session_user; INSERT INTO novu_rust_operator_grant_admins(environment_id,database_principal,principal_oid) SELECT 'guard-env',rolname,oid FROM pg_roles WHERE rolname=session_user").await.unwrap();
     let command = |env: &str, project: &str, token: &str| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_fcm-worker"));
         c.env("DATABASE_URL", &url)
@@ -55,6 +55,7 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
             .env_remove("SWALLOW_FCM_INVALID_TOKEN_POLICY")
             .env_remove("SWALLOW_FCM_TOKEN_CLEANUP_GUARD")
             .env_remove("SWALLOW_PUSH_WORKFLOW_STEP_POLICY")
+            .env_remove("SWALLOW_PUSH_PREFERENCE_POLICY")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         c
@@ -85,7 +86,8 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
         .unwrap();
     assert!(!mismatch_step.status.success());
     assert!(
-        String::from_utf8_lossy(&mismatch_step.stderr).contains("different workflow step policies")
+        String::from_utf8_lossy(&mismatch_step.stderr)
+            .contains("different workflow or preference policies")
     );
     let invalid_step = command("guard-env", "project-a", "fixture-token")
         .env("SWALLOW_PUSH_WORKFLOW_STEP_POLICY", "invalid")
@@ -94,6 +96,44 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
     assert!(!invalid_step.status.success());
     assert!(
         String::from_utf8_lossy(&invalid_step.stderr).contains("invalid push workflow step policy")
+    );
+    let mismatch_preference = command("guard-env", "project-a", "fixture-token")
+        .env("SWALLOW_PUSH_PREFERENCE_POLICY", "recheck")
+        .output()
+        .unwrap();
+    assert!(!mismatch_preference.status.success());
+    assert!(
+        String::from_utf8_lossy(&mismatch_preference.stderr)
+            .contains("different workflow or preference policies")
+    );
+    let invalid_preference = command("guard-env", "project-a", "fixture-token")
+        .env("SWALLOW_PUSH_PREFERENCE_POLICY", "invalid")
+        .output()
+        .unwrap();
+    assert!(!invalid_preference.status.success());
+    assert!(
+        String::from_utf8_lossy(&invalid_preference.stderr)
+            .contains("invalid push preference policy")
+    );
+    let mut guarded_preference = Worker(
+        command("pref-env", "project-a", "fixture-token")
+            .env("SWALLOW_PUSH_PREFERENCE_POLICY", "recheck")
+            .spawn()
+            .unwrap(),
+    );
+    for _ in 0..100 {
+        if db.query_one("SELECT EXISTS(SELECT 1 FROM public.novu_rust_push_workflow_worker_config WHERE environment_id='pref-env' AND preference_policy='recheck')",&[]).await.unwrap().get::<_,bool>(0) {break;}
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(db.query_one("SELECT EXISTS(SELECT 1 FROM public.novu_rust_push_workflow_worker_config WHERE environment_id='pref-env' AND preference_policy='recheck')",&[]).await.unwrap().get::<_,bool>(0));
+    assert!(guarded_preference.0.try_wait().unwrap().is_none());
+    let default_mismatch = command("pref-env", "project-a", "fixture-token")
+        .output()
+        .unwrap();
+    assert!(!default_mismatch.status.success());
+    assert!(
+        String::from_utf8_lossy(&default_mismatch.stderr)
+            .contains("different workflow or preference policies")
     );
     let mismatch = command("guard-env", "project-b", "fixture-token-secret")
         .output()

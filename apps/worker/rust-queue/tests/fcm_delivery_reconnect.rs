@@ -40,6 +40,8 @@ fn worker(url: &str, application: &str) -> Worker {
             .env("NOVU_FCM_ACCESS_TOKEN", "fixture-token")
             .env("SWALLOW_FCM_ENFORCE_ROUTING_CONFIG", "true")
             .env_remove("SWALLOW_FCM_ALLOW_SHARED_PROVIDER")
+            .env_remove("SWALLOW_PUSH_WORKFLOW_STEP_POLICY")
+            .env_remove("SWALLOW_PUSH_PREFERENCE_POLICY")
             .env_remove("NOVU_FCM_ACCESS_TOKEN_FILE")
             .env_remove("NOVU_FCM_INTEGRATIONS")
             .env_remove("NOVU_FCM_INTEGRATIONS_FILE")
@@ -85,6 +87,7 @@ async fn workers_reconnect_and_preserve_uncertain_attempts() {
     ))
     .await
     .unwrap();
+    db.batch_execute("ALTER TABLE public.novu_rust_push_workflow_worker_config ADD COLUMN preference_policy text DEFAULT 'snapshot'").await.unwrap();
     db.batch_execute("CREATE TABLE novu_rust_operator_grant_admins(environment_id text,database_principal text,principal_oid oid)").await.unwrap();
     db.batch_execute(include_str!("../migrations/0095_fcm_routing_guard.sql"))
         .await

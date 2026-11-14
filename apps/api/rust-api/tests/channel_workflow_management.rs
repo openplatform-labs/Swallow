@@ -831,4 +831,43 @@ async fn channels_are_authorized_audited_and_create_delivery_jobs() {
             .get::<_, i64>(0),
         0
     );
+    setup.execute("UPDATE novu_queue_jobs SET status='cancelled' WHERE environment_id='a' AND kind=$1 AND status='pending'", &[&novu_postgres_queue::fcm_queue::JOB_KIND]).await.unwrap();
+    let prepared = uuid::Uuid::new_v4();
+    novu_postgres_queue::enqueue(&setup,prepared,"a",novu_postgres_queue::fcm_queue::JOB_KIND,&json!({"prepared_context":{"subscriber_id":"alice","subscriber_internal_id":"alice-id","workflow_identifier":"workflow"},"prepared_messages":[{}]})).await.unwrap();
+    assert_eq!(
+        call(
+            app.clone(),
+            "PATCH",
+            "/v2/subscribers/alice/preferences",
+            "a-key",
+            json!({"channels":{"push":false}})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert!(
+        novu_postgres_queue::fcm_queue::process_one_with_policies(
+            &mut setup,
+            "a",
+            Some(&fcm),
+            None,
+            false,
+            novu_postgres_queue::push_step_policy::Policy::Snapshot,
+            novu_postgres_queue::push_step_policy::PreferencePolicy::Recheck
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(
+        setup
+            .query_one(
+                "SELECT last_error FROM novu_queue_jobs WHERE id=$1",
+                &[&prepared]
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        "push preference recheck disabled"
+    );
 }

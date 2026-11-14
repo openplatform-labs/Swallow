@@ -67,6 +67,7 @@ pub async fn process_one(
         None,
         false,
         crate::push_step_policy::Policy::Snapshot,
+        crate::push_step_policy::PreferencePolicy::Snapshot,
     )
     .await
 }
@@ -84,6 +85,7 @@ pub async fn process_one_with_shared_provider(
         None,
         true,
         crate::push_step_policy::Policy::Snapshot,
+        crate::push_step_policy::PreferencePolicy::Snapshot,
     )
     .await
 }
@@ -102,6 +104,7 @@ pub async fn process_one_with_integrations(
         Some(providers),
         false,
         crate::push_step_policy::Policy::Snapshot,
+        crate::push_step_policy::PreferencePolicy::Snapshot,
     )
     .await
 }
@@ -114,7 +117,37 @@ pub async fn process_one_with_policy(
     shared: bool,
     policy: crate::push_step_policy::Policy,
 ) -> Result<bool, Error> {
-    process_one_inner(client, environment, provider, providers, shared, policy).await
+    process_one_inner(
+        client,
+        environment,
+        provider,
+        providers,
+        shared,
+        policy,
+        crate::push_step_policy::PreferencePolicy::Snapshot,
+    )
+    .await
+}
+
+pub async fn process_one_with_policies(
+    client: &mut Client,
+    environment: &str,
+    provider: Option<&Fcm>,
+    providers: Option<&HashMap<String, Fcm>>,
+    shared: bool,
+    policy: crate::push_step_policy::Policy,
+    preference: crate::push_step_policy::PreferencePolicy,
+) -> Result<bool, Error> {
+    process_one_inner(
+        client,
+        environment,
+        provider,
+        providers,
+        shared,
+        policy,
+        preference,
+    )
+    .await
 }
 
 async fn process_one_inner(
@@ -124,6 +157,7 @@ async fn process_one_inner(
     providers: Option<&HashMap<String, Fcm>>,
     allow_shared_provider: bool,
     policy: crate::push_step_policy::Policy,
+    preference_policy: crate::push_step_policy::PreferencePolicy,
 ) -> Result<bool, Error> {
     let Some(job) = claim(client, environment).await? else {
         return Ok(false);
@@ -143,7 +177,8 @@ async fn process_one_inner(
     } else {
         None
     };
-    let prepared_identity_valid = if !crate::allow_recreated_subscriber()
+    let prepared_identity_valid = if (!crate::allow_recreated_subscriber()
+        || preference_policy == crate::push_step_policy::PreferencePolicy::Recheck)
         && push.workflow_context.is_none()
     {
         if let Some(context) = prepared_context.as_ref() {
@@ -155,7 +190,7 @@ async fn process_one_inner(
                 .get("subscriber_internal_id")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
-            tx.query_opt("SELECT internal_id FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2 FOR UPDATE", &[&environment,&id]).await?.is_some_and(|row| row.get::<_, String>(0)==expected)
+            tx.query_opt("SELECT internal_id FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2 FOR UPDATE", &[&environment,&id]).await?.is_some_and(|row| crate::allow_recreated_subscriber() || row.get::<_, String>(0)==expected)
         } else {
             true
         }
@@ -172,6 +207,26 @@ async fn process_one_inner(
         tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='subscriber identity changed',lease_token=NULL,lease_until=NULL WHERE id=$1", &[&job.id]).await?;
         tx.commit().await?;
         return Ok(true);
+    }
+    match crate::push_step_policy::check_preference(
+        &tx,
+        environment,
+        &job,
+        &push,
+        prepared_context.as_ref(),
+        preference_policy,
+    )
+    .await?
+    {
+        crate::push_step_policy::Check::Continue => {}
+        crate::push_step_policy::Check::Cancelled => {
+            tx.commit().await?;
+            return Ok(true);
+        }
+        crate::push_step_policy::Check::LeaseLost => {
+            tx.rollback().await?;
+            return Ok(true);
+        }
     }
     match crate::push_step_policy::check(
         &tx,
@@ -658,7 +713,10 @@ async fn process_one_inner(
             return Ok(true);
         }
     }
-    if policy != crate::push_step_policy::Policy::Snapshot && !lock_live(&tx, &job).await? {
+    if (policy != crate::push_step_policy::Policy::Snapshot
+        || preference_policy == crate::push_step_policy::PreferencePolicy::Recheck)
+        && !lock_live(&tx, &job).await?
+    {
         tx.rollback().await?;
         return Ok(true);
     }
@@ -1395,6 +1453,159 @@ mod tests {
             .unwrap()
             .get::<_, i64>(0),
             1
+        );
+        let (mut other, driver) =
+            tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(), NoTls)
+                .await
+                .unwrap();
+        tokio::spawn(async move { driver.await.unwrap() });
+        let tx = db.transaction().await.unwrap();
+        tx.query_one("SELECT internal_id FROM novu_rust_subscribers WHERE environment_id='push-guard' AND subscriber_id='alice' FOR UPDATE",&[]).await.unwrap();
+        tx.execute("INSERT INTO novu_rust_subscriber_preferences(environment_id,subscriber_id,channels) VALUES ('push-guard','alice','{\"push\":false}') ON CONFLICT(environment_id,subscriber_id) DO UPDATE SET channels=EXCLUDED.channels", &[]).await.unwrap();
+        let pending = tokio::spawn(async move {
+            process_one_with_policies(
+                &mut other,
+                "push-guard",
+                Some(&provider),
+                None,
+                false,
+                crate::push_step_policy::Policy::Snapshot,
+                crate::push_step_policy::PreferencePolicy::Recheck,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !pending.is_finished(),
+            "worker must wait for subscriber preference update"
+        );
+        tx.commit().await.unwrap();
+        assert!(pending.await.unwrap().unwrap());
+        let row = db
+            .query_one(
+                "SELECT status,last_error FROM novu_queue_jobs WHERE id=$1",
+                &[&active_job],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, String>(0), "cancelled");
+        assert_eq!(row.get::<_, String>(1), "push preference recheck disabled");
+        assert_eq!(
+            db.query_one(
+                "SELECT count(*) FROM novu_rust_fcm_attempts WHERE job_id=$1 AND state='accepted'",
+                &[&active_job]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+            1
+        );
+        let policy_count = crate::reconciliation::channel_policy_count(&db, "push-guard", "push")
+            .await
+            .unwrap();
+        assert_eq!(policy_count, 4); // earlier changed, missing snapshot and disabled workflow, plus this preference cancellation.
+        let evidence =
+            crate::reconciliation::push_policy_evidence(&db, "push-guard", active_job, 1)
+                .await
+                .unwrap();
+        assert_eq!(evidence["unattempted"], 1);
+        let snapshot_job = Uuid::new_v4();
+        let mut snapshot_payload = payload.clone();
+        for item in snapshot_payload["prepared_context"]["target_metadata"]
+            .as_array_mut()
+            .unwrap()
+        {
+            item["message_id"] = "snapshot-message".into();
+        }
+        crate::enqueue(&db, snapshot_job, "push-guard", JOB_KIND, &snapshot_payload)
+            .await
+            .unwrap();
+        let (provider, server) = mock(vec![200]).await;
+        assert!(
+            process_one_with_policies(
+                &mut db,
+                "push-guard",
+                Some(&provider),
+                None,
+                false,
+                crate::push_step_policy::Policy::Snapshot,
+                crate::push_step_policy::PreferencePolicy::Snapshot
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(server.await.unwrap(), vec!["a"]);
+        db.execute(
+            "UPDATE novu_queue_jobs SET status='cancelled' WHERE id=$1",
+            &[&snapshot_job],
+        )
+        .await
+        .unwrap();
+        db.execute("INSERT INTO novu_rust_workflow_preferences(environment_id,workflow_identifier,read_only,push_enabled) VALUES ('push-guard','wf',true,true)", &[]).await.unwrap();
+        let critical = Uuid::new_v4();
+        let mut critical_payload = payload.clone();
+        for item in critical_payload["prepared_context"]["target_metadata"]
+            .as_array_mut()
+            .unwrap()
+        {
+            item["message_id"] = "critical-message".into();
+        }
+        crate::enqueue(&db, critical, "push-guard", JOB_KIND, &critical_payload)
+            .await
+            .unwrap();
+        let (provider, server) = mock(vec![200]).await;
+        assert!(
+            process_one_with_policies(
+                &mut db,
+                "push-guard",
+                Some(&provider),
+                None,
+                false,
+                crate::push_step_policy::Policy::Snapshot,
+                crate::push_step_policy::PreferencePolicy::Recheck
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(server.await.unwrap(), vec!["a"]);
+        db.execute(
+            "UPDATE novu_queue_jobs SET status='cancelled' WHERE id=$1",
+            &[&critical],
+        )
+        .await
+        .unwrap();
+        let missing = Uuid::new_v4();
+        crate::enqueue(
+            &db,
+            missing,
+            "push-guard",
+            JOB_KIND,
+            &json!({"prepared_messages":[{"message":{"token":"fixture"}}]}),
+        )
+        .await
+        .unwrap();
+        assert!(
+            process_one_with_policies(
+                &mut db,
+                "push-guard",
+                Some(&provider),
+                None,
+                false,
+                crate::push_step_policy::Policy::Snapshot,
+                crate::push_step_policy::PreferencePolicy::Recheck
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            db.query_one(
+                "SELECT last_error FROM novu_queue_jobs WHERE id=$1",
+                &[&missing]
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+            "push preference context missing"
         );
     }
     #[tokio::test]

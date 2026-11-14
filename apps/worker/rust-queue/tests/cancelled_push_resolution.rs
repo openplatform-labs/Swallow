@@ -52,7 +52,7 @@ async fn resolutions_are_scoped_fenced_audited_and_do_not_dispatch() {
         .await
         .unwrap();
         db.execute("INSERT INTO public.novu_rust_fcm_attempts(job_id,environment_id,target_index,state) VALUES ($1,$2,0,'unknown'),($1,$2,1,'unknown')", &[&job,&env]).await.unwrap();
-        db.execute("UPDATE public.novu_queue_jobs SET status='cancelled',last_error='push workflow step disabled' WHERE id=$1", &[&job]).await.unwrap();
+        db.execute("UPDATE public.novu_queue_jobs SET status='cancelled',last_error='push preference recheck disabled' WHERE id=$1", &[&job]).await.unwrap();
     }
     let mut role_url = reqwest::Url::parse(&url).unwrap();
     role_url.set_username(&role).unwrap();
