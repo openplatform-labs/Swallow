@@ -40,6 +40,10 @@ export class App implements OnDestroy {
   readonly checkedAt = signal<string | null>(null);
   readonly detail = signal('');
   workflowKey='';
+  workflowAuthMode:'api-key'|'jwt'='api-key';
+  workflowEnvironment='';
+  workflowReason='';
+  providerReason='';
   workflowIdentifier='';
   workflowChannel:WorkflowChannel='email';
   workflowTitle='';
@@ -193,6 +197,12 @@ export class App implements OnDestroy {
     if (this.retryKey===session.token) this.retryKey='';
     if (this.lookupKey===session.token) { this.lookupKey=''; this.clearRequestLookup(); }
     if (this.permissionKey===session.token) { this.permissionKey=''; this.clearPermissions(); }
+    if (this.workflowKey===session.token) {
+      this.workflowKey='';this.workflowReason='';this.providerReason='';this.workflowSequence++;this.workflowAbort?.abort();this.workflowAbort=null;
+      this.providerSequence++;this.providerAbort?.abort();this.providerAbort=null;
+      if(this.workflowStatus()!=='saving'){this.workflowStatus.set('idle');this.workflowMessage.set('');this.workflowExpected=null;this.workflowTitle='';this.workflowContent='';this.workflowHasContent=false;this.workflowConfirmed=false;}
+      if(this.providerStatus()!=='saving'){this.providerStatus.set('idle');this.providerMessage.set('');this.providerExpected=null;this.providerConfirmed=false;}
+    }
     return true;
   }
 
@@ -203,12 +213,12 @@ export class App implements OnDestroy {
   }
 
   resetOidc(): void {
-    if (this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending') return;
+    if (this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving') return;
     if (this.oidcExpiryTimer !== null) clearTimeout(this.oidcExpiryTimer);
     this.oidcExpiryTimer=null;
     this.oidcSequence++; this.oidcPrepared = null; this.oidcSession = null;
     this.oidcStatus.set('idle'); this.oidcSubject.set('');
-    this.forgetKey(); this.forgetAlertKey(); this.clearPermissions(true);
+    this.forgetKey(); this.forgetAlertKey(); this.clearPermissions(true);this.clearWorkflow(true);
   }
 
   async prepareOidc(): Promise<void> {
@@ -231,13 +241,14 @@ export class App implements OnDestroy {
     } catch { if (sequence === this.oidcSequence) this.oidcStatus.set('error'); }
   }
 
-  useOidc(section: 'subscribers' | 'alerts'): void {
+  useOidc(section: 'subscribers' | 'alerts' | 'workflows'): void {
     this.expireOidcIfNeeded();
-    if (!this.oidcSession || this.decisionStatus() === 'sending') return;
+    if (!this.oidcSession || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving') return;
     const session=this.oidcSession;
     this.setSection(section);
     if (section === 'subscribers') { this.forgetKey(); this.credentialMode='jwt'; this.subscriberEnvironment=session.environmentId; this.apiKey=session.token; }
-    else { this.forgetAlertKey(); this.alertAuthMode='jwt'; this.alertEnvironment=session.environmentId; this.alertKey=session.token; }
+    else if (section==='alerts') { this.forgetAlertKey(); this.alertAuthMode='jwt'; this.alertEnvironment=session.environmentId; this.alertKey=session.token; }
+    else {this.clearWorkflow(true);this.workflowAuthMode='jwt';this.workflowEnvironment=session.environmentId;this.workflowKey=session.token;}
   }
 
   canUseOidcForDecision(): boolean {
@@ -421,49 +432,68 @@ export class App implements OnDestroy {
     this.workflowSequence++;this.workflowAbort?.abort();this.workflowAbort=null;
     this.workflowStatus.set('idle');this.workflowMessage.set('');this.workflowTitle='';this.workflowContent='';this.workflowHasContent=false;this.workflowActive=false;this.workflowConfirmed=false;
     this.workflowExpected=null;
+    this.workflowReason='';this.providerReason='';
     this.providerSequence++;this.providerAbort?.abort();this.providerAbort=null;
     this.providerStatus.set('idle');this.providerMessage.set('');this.providerExpected=null;this.providerConfirmed=false;this.providerChoice='sendgrid';
     if(clearKey){this.workflowKey='';this.workflowIdentifier='';}
   }
 
-  private providerEndpoint():string {
+  private providerEndpoint(write=false):string {
+    if(this.workflowAuthMode==='jwt')return this.jwtWorkflowEndpoint('email-provider',write);
     this.workflowEndpoint();
     return `${this.validatedOrigin()}/v1/experimental/workflows/${encodeURIComponent(this.workflowIdentifier.trim())}/email-provider`;
   }
 
+  private jwtWorkflowEndpoint(resource:string,write=false):string {
+    const identifier=this.workflowIdentifier.trim(),environment=this.workflowEnvironment.trim();
+    if(!/^[A-Za-z0-9_-][A-Za-z0-9._-]{0,255}$/.test(identifier)||!this.validEnvironment(environment)||!this.validJwt(this.workflowKey.trim()))throw new Error('운영자 인증과 워크플로 식별자를 확인해 주세요.');
+    const params=new URLSearchParams({environmentId:environment});if(!write){params.set('workflow',identifier);params.set('resource',resource);}
+    return `${this.validatedOrigin()}/v1/experimental/operator/workflow?${params}`;
+  }
+
+  private workflowAuthorization():string {return `${this.workflowAuthMode==='jwt'?'Bearer':'ApiKey'} ${this.workflowKey.trim()}`;}
+  private validWorkflowReason(reason:string):boolean {return !!reason.trim() && !reason.includes('\0') && new TextEncoder().encode(reason.trim()).length<=1000;}
+
   async loadProvider():Promise<void> {
+    this.expireOidcIfNeeded();
     if(this.workflowStatus()==='saving'||this.providerStatus()==='saving')return;
     const sequence=++this.providerSequence;this.providerAbort?.abort();const controller=new AbortController();this.providerAbort=controller;
     this.providerExpected=null;this.providerConfirmed=false;this.providerMessage.set('');this.providerStatus.set('loading');
     try {
       const endpoint=this.providerEndpoint(),identifier=this.workflowIdentifier.trim();
-      const response=await fetch(endpoint,{headers:{Authorization:`ApiKey ${this.workflowKey.trim()}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      const response=await fetch(endpoint,{headers:{Authorization:this.workflowAuthorization()},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
       if(!response.ok)throw new Error('request failed');const value:unknown=await response.json();
+      this.expireOidcIfNeeded();
       if(sequence!==this.providerSequence)return;
       if(typeof value!=='object'||value===null||!('data' in value)||typeof value.data!=='object'||value.data===null)throw new Error('invalid response');
       const data=value.data as Record<string,unknown>;
       if(data['workflowIdentifier']!==identifier||(data['provider']!=='resend'&&data['provider']!=='sendgrid'))throw new Error('invalid response');
       this.providerExpected=data['provider'];this.providerChoice=data['provider'];this.providerStatus.set('loaded');
-    } catch {if(sequence===this.providerSequence){this.providerStatus.set('error');this.providerMessage.set('공급자를 조회하지 못했습니다. 식별자와 공급자 읽기 권한을 확인하세요.');}}
+    } catch {this.expireOidcIfNeeded();if(sequence===this.providerSequence){this.providerStatus.set('error');this.providerMessage.set('공급자를 조회하지 못했습니다. 식별자와 공급자 읽기 권한을 확인하세요.');}}
     finally {if(sequence===this.providerSequence)this.providerAbort=null;}
   }
 
   async saveProvider():Promise<void> {
+    this.expireOidcIfNeeded();
     if(this.providerStatus()!=='loaded'||!this.providerConfirmed||!this.providerExpected||!['resend','sendgrid'].includes(this.providerChoice)||this.workflowStatus()==='saving')return;
-    let endpoint:string;try {endpoint=this.providerEndpoint();}catch{this.providerStatus.set('error');this.providerMessage.set('워크플로 식별자와 API 키를 확인하세요.');return;}
+    if(this.workflowAuthMode==='jwt'&&!this.validWorkflowReason(this.providerReason)){this.providerMessage.set('변경 사유를 1,000바이트 이내로 입력하세요.');return;}
+    let endpoint:string;try {endpoint=this.providerEndpoint(true);}catch{this.providerStatus.set('error');this.providerMessage.set('워크플로 식별자와 인증을 확인하세요.');return;}
     const identifier=this.workflowIdentifier.trim(),choice=this.providerChoice,expected=this.providerExpected;
+    const payload=this.workflowAuthMode==='jwt'?{workflow:identifier,resource:'email-provider',expected:{provider:expected},desired:{provider:choice},reason:this.providerReason.trim()}:{provider:choice,expected};
     this.providerStatus.set('saving');this.providerMessage.set('');
     try {
-      const response=await fetch(endpoint,{method:'PUT',headers:{Authorization:`ApiKey ${this.workflowKey.trim()}`,'Content-Type':'application/json'},body:JSON.stringify({provider:choice,expected}),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
+      const response=await fetch(endpoint,{method:'PUT',headers:{Authorization:this.workflowAuthorization(),'Content-Type':'application/json'},body:JSON.stringify(payload),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
+      this.expireOidcIfNeeded();
       if(!response.ok){this.providerStatus.set([400,401,403,404,409].includes(response.status)?'error':'unknown');this.providerMessage.set(response.status===409?'설정이 변경되었거나 접근 권한을 확인할 수 없습니다. 다시 조회하세요.':this.providerStatus()==='error'?'공급자 변경이 거절됐습니다. 권한과 서버 버전을 확인하세요.':'변경 결과가 불명입니다. 재시도 전에 현재 설정과 감사 기록을 확인하세요.');return;}
-      const value:unknown=await response.json();
+      const value:unknown=await response.json();this.expireOidcIfNeeded();
       if(typeof value!=='object'||value===null||!('data' in value)||typeof value.data!=='object'||value.data===null||!('workflowIdentifier' in value.data)||value.data.workflowIdentifier!==identifier||!('provider' in value.data)||value.data.provider!==choice)throw new Error('invalid response');
       this.providerStatus.set('saved');
-    } catch {this.providerStatus.set('unknown');this.providerMessage.set('변경 결과가 불명입니다. 재시도 전에 현재 설정과 감사 기록을 확인하세요.');}
-    finally {this.providerConfirmed=false;}
+    } catch {this.expireOidcIfNeeded();this.providerStatus.set('unknown');this.providerMessage.set('변경 결과가 불명입니다. 재시도 전에 현재 설정과 감사 기록을 확인하세요.');}
+    finally {this.expireOidcIfNeeded();this.providerConfirmed=false;this.providerReason='';}
   }
 
   private workflowEndpoint(): string {
+    if(this.workflowAuthMode==='jwt')return this.jwtWorkflowEndpoint(this.workflowChannel);
     const identifier=this.workflowIdentifier.trim();
     if (!/^[A-Za-z0-9_-][A-Za-z0-9._-]{0,255}$/.test(identifier) || !this.workflowKey.trim() || /[^\x21-\x7e]/.test(this.workflowKey.trim())) throw new Error('워크플로 식별자와 API 키를 확인해 주세요.');
     if (!['email','sms','push','slack'].includes(this.workflowChannel)) throw new Error('채널을 확인해 주세요.');
@@ -480,35 +510,40 @@ export class App implements OnDestroy {
   }
 
   async loadWorkflow():Promise<void> {
+    this.expireOidcIfNeeded();
     if(this.workflowStatus()==='saving'||this.providerStatus()==='saving')return;
     this.clearWorkflow();const sequence=this.workflowSequence;const controller=new AbortController();this.workflowAbort=controller;this.workflowStatus.set('loading');
     try {
       const endpoint=this.workflowEndpoint(), identifier=this.workflowIdentifier.trim(), channel=this.workflowChannel;
-      const response=await fetch(endpoint,{headers:{Authorization:`ApiKey ${this.workflowKey.trim()}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      const response=await fetch(endpoint,{headers:{Authorization:this.workflowAuthorization()},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
       if(!response.ok)throw new Error('조회하지 못했습니다. 워크플로와 읽기 권한을 확인해 주세요.');
-      const value:unknown=await response.json();if(sequence!==this.workflowSequence)return;
+      const value:unknown=await response.json();this.expireOidcIfNeeded();if(sequence!==this.workflowSequence)return;
       this.applyWorkflow(value,identifier,channel);this.workflowStatus.set('loaded');
-    } catch(error:unknown) {if(sequence!==this.workflowSequence)return;this.workflowStatus.set('error');this.workflowMessage.set(error instanceof Error && ['워크플로','채널','주소','원격','조회'].some(prefix=>error.message.startsWith(prefix))?error.message:'조회 응답 또는 서버 연결을 확인해 주세요.');}
+    } catch(error:unknown) {this.expireOidcIfNeeded();if(sequence!==this.workflowSequence)return;this.workflowStatus.set('error');this.workflowMessage.set(error instanceof Error && ['워크플로','운영자','채널','주소','원격','조회'].some(prefix=>error.message.startsWith(prefix))?error.message:'조회 응답 또는 서버 연결을 확인해 주세요.');}
     finally {if(sequence===this.workflowSequence)this.workflowAbort=null;}
   }
 
   async saveWorkflow():Promise<void> {
+    this.expireOidcIfNeeded();
     if(this.workflowStatus()!=='loaded'||!this.workflowConfirmed||!this.workflowExpected||this.providerStatus()==='saving')return;
     let endpoint:string;
-    try {endpoint=this.workflowEndpoint();} catch {this.workflowStatus.set('error');this.workflowMessage.set('워크플로 식별자와 API 키를 확인해 주세요.');return;}
+    try {endpoint=this.workflowAuthMode==='jwt'?this.jwtWorkflowEndpoint(this.workflowChannel,true):this.workflowEndpoint();} catch {this.workflowStatus.set('error');this.workflowMessage.set('워크플로 식별자와 인증을 확인해 주세요.');return;}
+    if(this.workflowAuthMode==='jwt'&&!this.validWorkflowReason(this.workflowReason)){this.workflowMessage.set('변경 사유를 1,000바이트 이내로 입력하세요.');return;}
     const bytes=(s:string)=>new TextEncoder().encode(s).length;
     if(this.workflowHasContent && (bytes(this.workflowContent)>40000 || this.workflowContent.includes('\0') || ((this.workflowChannel==='email'||this.workflowChannel==='push') && (bytes(this.workflowTitle)>40000 || this.workflowTitle.includes('\0'))))) {this.workflowMessage.set('제목과 내용은 각각 40,000바이트 이하여야 하며 NUL 문자를 포함할 수 없습니다.');return;}
     const identifier=this.workflowIdentifier.trim(),channel=this.workflowChannel;
     const content=this.workflowHasContent?this.workflowContent:null;
     const expected=channel==='slack'?{content:this.workflowExpected.content,active:this.workflowExpected.active}:this.workflowExpected;
-    const body=channel==='slack'?{content,active:this.workflowActive,expected}:{title:this.workflowHasContent&&(channel==='email'||channel==='push')?this.workflowTitle:null,content,active:this.workflowActive,expected};
+    const desired=channel==='slack'?{content,active:this.workflowActive}:{title:this.workflowHasContent&&(channel==='email'||channel==='push')?this.workflowTitle:null,content,active:this.workflowActive};
+    const body=this.workflowAuthMode==='jwt'?{workflow:identifier,resource:channel,expected,desired,reason:this.workflowReason.trim()}:{...desired,expected};
     this.workflowStatus.set('saving');this.workflowMessage.set('');
     try {
-      const response=await fetch(endpoint,{method:'PUT',headers:{Authorization:`ApiKey ${this.workflowKey.trim()}`,'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
+      const response=await fetch(endpoint,{method:'PUT',headers:{Authorization:this.workflowAuthorization(),'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
+      this.expireOidcIfNeeded();
       if(!response.ok){this.workflowStatus.set([400,401,403,404,409].includes(response.status)?'error':'unknown');this.workflowMessage.set(response.status===409?'설정이 변경되었거나 접근 권한을 확인할 수 없습니다. 다시 조회해 주세요.':this.workflowStatus()==='error'?'변경이 거절되었습니다. 입력과 쓰기 권한 및 서버 버전을 확인해 주세요.':'변경 결과를 확인할 수 없습니다. 재시도 전에 현재 설정과 감사 기록을 확인하세요.');return;}
-      const value:unknown=await response.json();this.applyWorkflow(value,identifier,channel);this.workflowStatus.set('saved');
-    } catch {this.workflowStatus.set('unknown');this.workflowMessage.set('변경 결과를 확인할 수 없습니다. 재시도 전에 현재 설정과 감사 기록을 확인하세요.');}
-    finally {this.workflowConfirmed=false;}
+      const value:unknown=await response.json();this.expireOidcIfNeeded();this.applyWorkflow(value,identifier,channel);this.workflowStatus.set('saved');
+    } catch {this.expireOidcIfNeeded();this.workflowStatus.set('unknown');this.workflowMessage.set('변경 결과를 확인할 수 없습니다. 재시도 전에 현재 설정과 감사 기록을 확인하세요.');}
+    finally {this.expireOidcIfNeeded();this.workflowConfirmed=false;this.workflowReason='';if(!this.workflowKey){this.workflowExpected=null;this.workflowTitle='';this.workflowContent='';this.workflowHasContent=false;}}
   }
 
   setSection(next: Section): void {
