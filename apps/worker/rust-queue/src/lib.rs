@@ -1,11 +1,12 @@
 //! PostgreSQL queue primitives for the Rust rewrite. This is not yet a Novu-compatible worker.
+pub mod alerts;
 pub mod fcm;
 pub mod fcm_queue;
 pub mod google_oauth;
 pub mod in_app;
 pub mod reconciliation;
-pub mod resend_projection;
 pub mod resend;
+pub mod resend_projection;
 pub mod resend_queue;
 pub mod sendgrid;
 pub mod sendgrid_queue;

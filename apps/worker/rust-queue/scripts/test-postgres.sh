@@ -52,6 +52,14 @@ docker exec "$name" createdb -U postgres novu_twilio_secret_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_twilio_secret_test" \
   cargo test --locked --test twilio_secret_files -- --ignored
 
+docker exec "$name" createdb -U postgres novu_alert_delivery_test
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_alert_delivery_test" \
+  cargo test --locked --test alerts_postgres -- --ignored
+
+docker exec "$name" createdb -U postgres novu_alert_transport_test
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_alert_transport_test" \
+  cargo test --locked --lib alerts::tests::unhealthy_environment_dispatches_both_destinations_with_cooldown -- --ignored
+
 # This final test restarts the disposable database container.
 docker exec "$name" createdb -U postgres novu_resend_reconnect_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_resend_reconnect_test" TEST_PG_CONTAINER="$name" \

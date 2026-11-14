@@ -5,8 +5,8 @@ use uuid::Uuid;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if ![2, 3, 4, 6].contains(&args.len()) {
-        return Err("usage: delivery-reconcile check ENV | check-queue ENV MAX_WAIT_SECONDS | check-resend|check-resend-metrics ENV GRACE_SECONDS HEARTBEAT_MAX_SECONDS | list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | email-dispatch-evidence ENV EMAIL_JOB | resend-evidence|resend-check ENV EMAIL_JOB | sms-evidence|sms-delivery ENV SMS_JOB | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
+    if ![2, 3, 4, 6, 7].contains(&args.len()) {
+        return Err("usage: delivery-reconcile check ENV | check-alert-delivery ENV | alert-status ENV | alert-resolve ENV CHANNEL TARGET DECISION OPERATOR REASON | check-queue ENV MAX_WAIT_SECONDS | check-resend|check-resend-metrics ENV GRACE_SECONDS HEARTBEAT_MAX_SECONDS | list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | email-dispatch-evidence ENV EMAIL_JOB | resend-evidence|resend-check ENV EMAIL_JOB | sms-evidence|sms-delivery ENV SMS_JOB | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
     }
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let (mut db, connection) = config.connect(tls).await?;
@@ -82,6 +82,26 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         if args[0] == "check-resend" && (overdue > 0 || stale) {
             std::process::exit(2);
         }
+    } else if args.len() == 2 && args[0] == "check-alert-delivery" {
+        let health = novu_postgres_queue::alerts::health(&db, &args[1]).await?;
+        println!("{}", serde_json::to_string(&health)?);
+        if ["unknown", "rejected", "expired"]
+            .iter()
+            .any(|key| health[*key].as_i64().is_none_or(|count| count > 0))
+        {
+            std::process::exit(2);
+        }
+    } else if args.len() == 2 && args[0] == "alert-status" {
+        println!(
+            "{}",
+            serde_json::to_string(&novu_postgres_queue::alerts::status(&db, &args[1]).await?)?
+        );
+    } else if args.len() == 7 && args[0] == "alert-resolve" {
+        novu_postgres_queue::alerts::resolve(
+            &mut db, &args[1], &args[2], &args[3], &args[4], &args[5], &args[6],
+        )
+        .await?;
+        println!("alert resolution recorded");
     } else if args.len() == 2 && args[0] == "list" {
         println!(
             "{}",
