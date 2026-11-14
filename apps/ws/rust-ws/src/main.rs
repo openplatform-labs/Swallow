@@ -432,6 +432,7 @@ async fn disconnect(
     id: Uuid,
     claims: &Claims,
     update_presence: bool,
+    active_presence: bool,
 ) -> Result<(), tokio_postgres::Error> {
     let mut client = db.lock().await?;
     let tx = client.transaction().await?;
@@ -442,18 +443,25 @@ async fn disconnect(
     .await?;
     let removed = tx.execute("DELETE FROM novu_rust_ws_connections WHERE id=$1 AND environment_id=$2 AND subscriber_internal_id=$3", &[&id,&claims.environment_id,&claims.id]).await?;
     if removed > 0 && update_presence {
-        // The original gateway tests whether more than one socket remains.
-        tx.execute("UPDATE novu_rust_subscribers SET is_online=(SELECT count(*) > 1 FROM novu_rust_ws_connections WHERE environment_id=$1 AND subscriber_internal_id=$2 AND (lease_expires_at IS NULL OR lease_expires_at>clock_timestamp())),last_online_at=now(),updated_at=now() WHERE environment_id=$1 AND internal_id=$2", &[&claims.environment_id,&claims.id]).await?;
+        // The reference gateway uses > 1 after disconnect. Operators may opt
+        // into counting any remaining live connection instead.
+        tx.execute("UPDATE novu_rust_subscribers SET is_online=(SELECT count(*) > CASE WHEN $3 THEN 0 ELSE 1 END FROM novu_rust_ws_connections WHERE environment_id=$1 AND subscriber_internal_id=$2 AND (lease_expires_at IS NULL OR lease_expires_at>clock_timestamp())),last_online_at=now(),updated_at=now() WHERE environment_id=$1 AND internal_id=$2", &[&claims.environment_id,&claims.id,&active_presence]).await?;
     }
     tx.commit().await
 }
 
 // The delete is idempotent: retrying an uncertain commit does not apply a
 // second presence transition. Capture token validity at disconnect time.
-async fn retry_disconnect(db: Arc<Database>, id: Uuid, claims: Claims, update_presence: bool) {
+async fn retry_disconnect(
+    db: Arc<Database>,
+    id: Uuid,
+    claims: Claims,
+    update_presence: bool,
+    active_presence: bool,
+) {
     let mut delay = std::time::Duration::from_secs(1);
     loop {
-        match disconnect(&db, id, &claims, update_presence).await {
+        match disconnect(&db, id, &claims, update_presence, active_presence).await {
             Ok(()) => return,
             Err(error) => eprintln!("socket disconnect update failed; retrying: {error}"),
         }
@@ -526,6 +534,11 @@ async fn start_event_listener(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let active_presence = match std::env::var("NOVU_WS_PRESENCE_POLICY").as_deref() {
+        Ok("active") => true,
+        Ok("reference") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("NOVU_WS_PRESENCE_POLICY must be reference or active".into()),
+    };
     let database_url = std::env::var("DATABASE_URL")?;
     let secret = novu_rust_contracts::secret::from_env("JWT_SECRET", "JWT_SECRET_FILE")?
         .ok_or("JWT secret is required")?
@@ -672,7 +685,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         // A lost COMMIT acknowledgement may mean the row exists.
                         let update_presence =
                             !compatibility_mode() || verify(&token, &secret).is_some();
-                        tokio::spawn(retry_disconnect(db.clone(), id, claims, update_presence));
+                        tokio::spawn(retry_disconnect(
+                            db.clone(),
+                            id,
+                            claims,
+                            update_presence,
+                            active_presence,
+                        ));
                         socket.disconnect().ok();
                         return;
                     }
@@ -692,7 +711,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     async move {
                         let update_presence =
                             !compatibility_mode() || verify(&token, &secret).is_some();
-                        tokio::spawn(retry_disconnect(db, id, claims, update_presence));
+                        tokio::spawn(retry_disconnect(
+                            db,
+                            id,
+                            claims,
+                            update_presence,
+                            active_presence,
+                        ));
                     }
                 });
                 if disconnect_on_gap && listener_generation.load(Ordering::SeqCst) != generation {
@@ -701,7 +726,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 if !socket.connected() {
                     let update_presence =
                         !compatibility_mode() || verify(&token, &secret).is_some();
-                    tokio::spawn(retry_disconnect(db, id, claims, update_presence));
+                    tokio::spawn(retry_disconnect(
+                        db,
+                        id,
+                        claims,
+                        update_presence,
+                        active_presence,
+                    ));
                 }
             }
         },
