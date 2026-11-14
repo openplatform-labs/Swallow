@@ -1,4 +1,4 @@
-//! Standalone RFC 9068 access-token verifier. It is not yet connected to HTTP routes.
+//! RFC 9068-style access-token verification for an opt-in operator identity endpoint.
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use rsa::{
     RsaPublicKey, pkcs1::DecodeRsaPublicKey, pkcs8::DecodePublicKey, traits::PublicKeyParts,
@@ -31,6 +31,20 @@ struct AccessClaims {
     nbf: Option<u64>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifierConfig {
+    issuer: String,
+    audience: String,
+    keys: Vec<VerifierKey>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifierKey {
+    kid: String,
+    pem: String,
+}
+
 fn optional_numeric<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
     u64::deserialize(deserializer).map(Some)
 }
@@ -42,6 +56,19 @@ pub struct AccessTokenVerifier {
 }
 
 impl AccessTokenVerifier {
+    pub fn from_json(value: &str) -> Result<Self, &'static str> {
+        if value.len() > 16384 {
+            return Err("invalid verifier configuration");
+        }
+        let config: VerifierConfig =
+            serde_json::from_str(value).map_err(|_| "invalid verifier configuration")?;
+        let keys: Vec<_> = config
+            .keys
+            .iter()
+            .map(|key| (key.kid.as_str(), key.pem.as_bytes()))
+            .collect();
+        Self::new(&config.issuer, &config.audience, &keys)
+    }
     /// Key material is trusted configuration; each entry is a unique key ID and RSA public PEM.
     pub fn new(issuer: &str, audience: &str, keys: &[(&str, &[u8])]) -> Result<Self, &'static str> {
         if issuer.is_empty()

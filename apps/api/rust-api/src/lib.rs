@@ -10,6 +10,7 @@ mod inbox_context;
 mod inbox_data;
 mod preferences;
 pub mod operator_access_token;
+mod operator_identity;
 pub mod resend_webhook;
 mod sendgrid_webhook;
 mod slack_endpoints;
@@ -87,6 +88,7 @@ pub struct RuntimeConfig {
     resend: Option<resend_webhook::Config>,
     require_jwt_exp: bool,
     reassert_fcm_registration: bool,
+    operator_verifier: Option<Arc<operator_access_token::AccessTokenVerifier>>,
 }
 impl RuntimeConfig {
     pub fn from_env() -> Self {
@@ -201,6 +203,8 @@ impl RuntimeConfig {
         {
             return Err(invalid());
         }
+        let operator_config = novu_rust_contracts::secret::from_env("SWALLOW_OPERATOR_JWT_CONFIG", "SWALLOW_OPERATOR_JWT_CONFIG_FILE").map_err(|_| invalid())?;
+        let operator_verifier = operator_config.map(|value| operator_access_token::AccessTokenVerifier::from_json(&value).map(Arc::new).map_err(|_| invalid())).transpose()?;
         Ok(Self {
             secret,
             keys,
@@ -208,10 +212,11 @@ impl RuntimeConfig {
             resend,
             require_jwt_exp,
             reassert_fcm_registration,
+            operator_verifier,
         })
     }
     pub fn router(&self, db: Arc<Client>) -> Router {
-        router_with_webhook_configs_and_jwt_policy(
+        let router = router_with_webhook_configs_and_jwt_policy(
             db,
             self.secret.clone(),
             self.keys.clone(),
@@ -219,7 +224,11 @@ impl RuntimeConfig {
             self.resend.clone(),
             self.require_jwt_exp,
             self.reassert_fcm_registration,
-        )
+        );
+        match &self.operator_verifier {
+            Some(verifier) => router.layer(Extension(verifier.clone())),
+            None => router,
+        }
     }
 }
 
@@ -306,6 +315,8 @@ fn router_with_webhook_configs_and_jwt_policy(
             post(twilio_webhook::receive_dispatch),
         )
         .route("/v1/experimental/console/subscribers", get(console_subscribers::list))
+        .route("/v1/experimental/operator/me", get(operator_identity::me))
+        .route("/v1/experimental/operator/subscribers", get(operator_identity::subscribers))
         .route("/v1/experimental/console/alerts", get(console_alerts::list))
         .route("/v1/experimental/console/alerts/resolve", post(console_alerts::resolve))
         .route("/v1/experimental/console/alerts/resolve-v2", post(console_alerts::resolve_v2))

@@ -104,6 +104,10 @@ fn verifies_pinned_access_tokens_and_rejects_confusion() {
 
 #[test]
 fn rejects_invalid_or_duplicate_configuration() {
+    let config = json!({"issuer":"https://issuer.test","audience":"api","keys":[{"kid":"one","pem":std::str::from_utf8(PUBLIC).unwrap()}]});
+    assert!(AccessTokenVerifier::from_json(&config.to_string()).is_ok());
+    assert!(AccessTokenVerifier::from_json("{}").is_err());
+    assert!(AccessTokenVerifier::from_json(&" ".repeat(16385)).is_err());
     assert!(AccessTokenVerifier::new("issuer", "aud", &[("weak", WEAK_PUBLIC)]).is_err());
     assert!(AccessTokenVerifier::new("issuer", "aud", &[("private", PRIVATE)]).is_err());
     assert!(AccessTokenVerifier::new("", "aud", &[("one", PUBLIC)]).is_err());
