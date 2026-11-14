@@ -331,6 +331,115 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     assert_eq!(sms_events[0]["providerMessageId"], "SMfixture");
     assert_eq!(sms_events[0]["status"], "delivered");
     assert_eq!(sms_events[0]["dispatchId"], sms_dispatch.to_string());
+    let result = reconciliation::sms_delivery(&db, "tenant-a", sms)
+        .await
+        .unwrap();
+    assert_eq!(result["providerState"], "unavailable");
+    db.execute(
+        "UPDATE novu_rust_twilio_attempts SET dispatch_id=$2 WHERE job_id=$1",
+        &[&sms, &sms_dispatch],
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO novu_rust_twilio_delivery_events(environment_id,account_sid,message_sid,status,job_id,dispatch_id) VALUES ('tenant-a','ACfixture','SMprevious','failed',$1,$2),('tenant-b','ACfixture','SMcross','failed',$1,$3)", &[&sms,&Uuid::new_v4(),&sms_dispatch]).await.unwrap();
+    let result = reconciliation::sms_delivery(&db, "tenant-a", sms)
+        .await
+        .unwrap();
+    assert_eq!(
+        result,
+        json!({"attemptState":"unknown","providerState":"delivered","eventCount":1,"messageCount":1})
+    );
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .args(["sms-delivery", "tenant-a", &sms.to_string()])
+        .env("DATABASE_URL", &url)
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        result
+    );
+    assert!(
+        reconciliation::sms_delivery(&db, "tenant-b", sms)
+            .await
+            .is_err()
+    );
+    db.execute("DELETE FROM novu_rust_twilio_delivery_events WHERE message_sid IN ('SMprevious','SMcross')", &[]).await.unwrap();
+    db.execute(
+        "UPDATE novu_rust_twilio_delivery_events SET status='sent' WHERE job_id=$1",
+        &[&sms],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reconciliation::sms_delivery(&db, "tenant-a", sms)
+            .await
+            .unwrap()["providerState"],
+        "pending"
+    );
+    db.execute(
+        "UPDATE novu_rust_twilio_delivery_events SET status='undelivered' WHERE job_id=$1",
+        &[&sms],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reconciliation::sms_delivery(&db, "tenant-a", sms)
+            .await
+            .unwrap()["providerState"],
+        "failed"
+    );
+    db.execute(
+        "UPDATE novu_rust_twilio_delivery_events SET status='new_status' WHERE job_id=$1",
+        &[&sms],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reconciliation::sms_delivery(&db, "tenant-a", sms)
+            .await
+            .unwrap()["providerState"],
+        "unrecognized"
+    );
+    db.execute(
+        "UPDATE novu_rust_twilio_delivery_events SET status='delivered' WHERE job_id=$1",
+        &[&sms],
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO novu_rust_twilio_delivery_events(environment_id,account_sid,message_sid,status,job_id,dispatch_id) VALUES ('tenant-a','ACfixture','SMfixture','failed',$1,$2)", &[&sms,&sms_dispatch]).await.unwrap();
+    assert_eq!(
+        reconciliation::sms_delivery(&db, "tenant-a", sms)
+            .await
+            .unwrap()["providerState"],
+        "conflict"
+    );
+    db.execute(
+        "DELETE FROM novu_rust_twilio_delivery_events WHERE job_id=$1 AND status='failed'",
+        &[&sms],
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO novu_rust_twilio_delivery_events(environment_id,account_sid,message_sid,status,job_id,dispatch_id) VALUES ('tenant-a','ACfixture','SMother','sent',$1,$2)", &[&sms,&sms_dispatch]).await.unwrap();
+    assert_eq!(
+        reconciliation::sms_delivery(&db, "tenant-a", sms)
+            .await
+            .unwrap()["providerState"],
+        "conflict"
+    );
+    db.execute(
+        "DELETE FROM novu_rust_twilio_delivery_events WHERE job_id=$1 AND message_sid='SMother'",
+        &[&sms],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE novu_rust_twilio_attempts SET dispatch_id=NULL WHERE job_id=$1",
+        &[&sms],
+    )
+    .await
+    .unwrap();
     assert!(
         reconciliation::sms_evidence(&db, "tenant-b", sms)
             .await

@@ -153,6 +153,47 @@ pub async fn sms_evidence(client: &Client, environment: &str, job: Uuid) -> Resu
     Ok(rows.into_iter().map(|r| json!({"providerMessageId":r.get::<_,String>(0),"status":r.get::<_,String>(1),"errorCode":r.get::<_,String>(2),"receivedAt":r.get::<_,String>(3),"dispatchId":r.get::<_,Option<Uuid>>(4).map(|id|id.to_string())})).collect())
 }
 
+/// Classify authenticated callbacks for the current identified SMS attempt.
+/// Conflicting or unfamiliar evidence is intentionally never resolved.
+pub async fn sms_delivery(client: &Client, environment: &str, job: Uuid) -> Result<Value> {
+    if environment.trim().is_empty() {
+        return Err("environment is required".into());
+    }
+    let row = client.query_opt(
+        "SELECT a.state,a.dispatch_id,count(e.message_sid),count(DISTINCT e.message_sid), \
+         COALESCE(bool_or(e.status='delivered'),false), \
+         COALESCE(bool_or(e.status IN ('failed','undelivered','canceled')),false), \
+         COALESCE(bool_or(e.status NOT IN ('accepted','scheduled','queued','sending','sent','delivered','failed','undelivered','canceled')),false) \
+         FROM novu_queue_jobs j JOIN novu_rust_twilio_attempts a ON a.job_id=j.id AND a.environment_id=j.environment_id \
+         LEFT JOIN novu_rust_twilio_delivery_events e ON e.job_id=j.id AND e.environment_id=j.environment_id AND e.dispatch_id=a.dispatch_id \
+         WHERE j.environment_id=$1 AND j.id=$2 AND j.kind=$3 GROUP BY a.state,a.dispatch_id",
+        &[&environment, &job, &crate::twilio_queue::JOB_KIND],
+    ).await?.ok_or("current SMS attempt not found")?;
+    let attempt: String = row.get(0);
+    let dispatch: Option<Uuid> = row.get(1);
+    let event_count: i64 = row.get(2);
+    let message_count: i64 = row.get(3);
+    let delivered: bool = row.get(4);
+    let failed: bool = row.get(5);
+    let unrecognized: bool = row.get(6);
+    let state = if dispatch.is_none() || event_count == 0 {
+        "unavailable"
+    } else if message_count != 1 || (delivered && failed) {
+        "conflict"
+    } else if unrecognized {
+        "unrecognized"
+    } else if delivered {
+        "delivered"
+    } else if failed {
+        "failed"
+    } else {
+        "pending"
+    };
+    Ok(
+        json!({"attemptState":attempt,"providerState":state,"eventCount":event_count,"messageCount":message_count}),
+    )
+}
+
 /// Resolve an unknown attempt after an operator independently verifies its outcome.
 /// `retry` asserts non-acceptance and can cause duplicates if that assertion is wrong.
 pub async fn resolve(
