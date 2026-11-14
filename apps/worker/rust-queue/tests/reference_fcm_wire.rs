@@ -88,6 +88,14 @@ fn original_firebase_http_conversion() {
             multicast: false,
             message: json!({"token":"event-c","android":{"notification":{"eventTime":"1969-12-31T23:59:59Z"}}}),
         },
+        Plan {
+            multicast: false,
+            message: json!({"token":"android-options-a","android":{"fcmOptions":{"analyticsLabel":"campaign","otherOption":"value"}}}),
+        },
+        Plan {
+            multicast: false,
+            message: json!({"token":"android-options-b","android":{"fcmOptions":{}}}),
+        },
     ];
     for (index, plan) in plans.iter().enumerate() {
         assert_eq!(wire_messages(plan).unwrap(), vec![original[index].clone()]);

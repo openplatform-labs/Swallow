@@ -17,7 +17,7 @@ async fn connect(url: &str) -> Client {
     db
 }
 async fn trigger(app: axum::Router, txn: &str, time: Value) -> StatusCode {
-    let body = json!({"name":"event-time-workflow","to":"fixture-subscriber","transactionId":txn,"payload":{},"overrides":{"fcm":{"android":{"notification":{"eventTime":time}}}}});
+    let body = json!({"name":"event-time-workflow","to":"fixture-subscriber","transactionId":txn,"payload":{},"overrides":{"fcm":{"android":{"notification":{"eventTime":time},"fcmOptions":{"analyticsLabel":"workflow-campaign"}}}}});
     let res = app
         .oneshot(
             Request::builder()
@@ -116,6 +116,10 @@ async fn event_time_flows_from_trigger_through_queue_to_fcm() {
         "2026-11-14T12:34:56.999Z"
     );
     assert_eq!(rows[0]["message"]["token"], "fixture-device");
+    assert_eq!(
+        rows[0]["message"]["android"]["fcmOptions"]["analyticsLabel"],
+        "workflow-campaign"
+    );
     let row=worker.query_one("SELECT j.status,(SELECT count(*) FROM public.novu_rust_fcm_attempts a WHERE a.job_id=j.id AND a.state='accepted') FROM public.novu_queue_jobs j JOIN public.novu_rust_push_step_outcomes o ON o.push_job_id=j.id WHERE o.transaction_id='event-time-valid'",&[]).await.unwrap();
     assert_eq!(row.get::<_, String>(0), "completed");
     assert_eq!(row.get::<_, i64>(1), 1);

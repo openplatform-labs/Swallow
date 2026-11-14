@@ -673,7 +673,7 @@ fn platform_config(name: &str, value: &Value) -> Result<Value, SendError> {
             ("android", "collapseKey") => "collapse_key",
             ("android", "restrictedPackageName") => "restricted_package_name",
             ("android", "directBootOk") => "direct_boot_ok",
-            ("android", "priority" | "ttl" | "data" | "notification") => key,
+            ("android", "priority" | "ttl" | "data" | "notification" | "fcmOptions") => key,
             ("webpush", "headers" | "data" | "notification" | "fcmOptions") => key,
             ("fcmOptions", "analyticsLabel") => key,
             _ => return Err(SendError::UnsupportedMessage),
@@ -681,6 +681,13 @@ fn platform_config(name: &str, value: &Value) -> Result<Value, SendError> {
         let converted = match (name, key.as_str()) {
             ("android", "ttl") => android_duration(value)?,
             ("android", "notification") => android_notification(value)?,
+            ("android", "fcmOptions")
+                if value.as_object().is_some_and(|options| {
+                    options.get("analyticsLabel").is_none_or(Value::is_string)
+                }) =>
+            {
+                value.clone()
+            }
             ("android", "directBootOk") if value.is_boolean() => value.clone(),
             ("android", "priority") if matches!(value.as_str(), Some("normal" | "high")) => {
                 value.clone()
@@ -1256,6 +1263,8 @@ mod tests {
             json!({"android":{"ttl":1.5}}),
             json!({"android":{"data":{"x":1}}}),
             json!({"android":{"directBootOk":"yes"}}),
+            json!({"android":{"fcmOptions":null}}),
+            json!({"android":{"fcmOptions":{"analyticsLabel":7}}}),
             json!({"webpush":{"headers":{"TTL":1}}}),
             json!({"webpush":{"unknown":1}}),
             json!({"fcmOptions":{"analyticsLabel":2}}),

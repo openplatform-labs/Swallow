@@ -9,6 +9,10 @@ PostgreSQL 큐에 남는 워크플로 첨부파일에 대해 운영자가 환경
 > 기준: 원본 Novu 커밋 `895388f37efe9e06de0aa333e5727303e6ad6853` · 작성: 2026-11-12.
 > **현재 구현은 실험용이며 Novu와 100% 호환되지 않는다. 운영에 사용하거나 기존 Novu의 대체품으로 배포하지 않는다.**
 
+### FCM Android 전송 옵션
+
+원본 Firebase Admin SDK가 허용하는 Android `fcmOptions` 객체를 전달하도록 지원했다. `analyticsLabel`이 있으면 문자열이어야 하며 다른 속성은 공급자 검증에 맡긴다. 잘못된 객체와 레이블은 워커에서 거절한다. 고정 원본 SDK 전송 변환 비교와 Docker PostgreSQL을 통한 Rust 트리거·워크플로·모의 FCM 요청을 검증했다. 원본 Novu 서버와 Rust 서버를 각각 실행한 선택된 푸시 워크플로 비교에서도 `analyticsLabel` 요청과 이력이 일치했다. 실제 FCM, 기기 수신과 분석 집계는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
 ### FCM 이벤트 시각의 워크플로 검증
 
 격리된 Docker PostgreSQL에서 Rust 트리거 HTTP 라우터 → 워크플로 처리 → FCM 큐 테스트 하네스 → 모의 FCM HTTP 요청을 실행했다. 유효한 시각은 UTC 밀리초로 전달되고 접수 시도가 한 건 기록됐으며, 잘못된 시각은 공급자 요청과 발송 시도 없이 푸시 단계 실패로 기록됐다. 이 검증은 실제 FCM이나 기기 수신, 원본 Novu 서버 전체와의 비교가 아니다. 재현 방법은 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
