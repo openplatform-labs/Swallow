@@ -7,6 +7,7 @@ mod preferences;
 pub mod resend_webhook;
 mod sendgrid_webhook;
 mod slack_endpoints;
+mod slack_workflow_management;
 mod subscriber_credentials;
 mod subscriber_jwt;
 mod subscriber_subscriptions;
@@ -252,6 +253,10 @@ pub fn router_with_webhook_configs(
         .route("/v1/experimental/fcm-integrations/{identifier}", get(fcm_integrations::get).patch(fcm_integrations::update))
         .route("/v1/channel-endpoints", post(slack_endpoints::create).get(slack_endpoints::list))
         .route("/v1/channel-endpoints/{identifier}", get(slack_endpoints::get).patch(slack_endpoints::update).delete(slack_endpoints::delete))
+        .route(
+            "/v1/experimental/workflows/{workflow}/slack-step",
+            get(slack_workflow_management::get).put(slack_workflow_management::put),
+        )
         .route(
             "/v1/experimental/workflows/{workflow}/email-provider",
             get(get_workflow_email_provider).put(set_workflow_email_provider),
