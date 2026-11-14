@@ -6,6 +6,23 @@ import { OperatorOidc } from './operator-oidc';
 describe('Swallow console', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
+  it('looks up a saved permission request using the current token after a reload', async () => {
+    const id='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';const desired={enabled:true,subscriberRead:true,alertRead:false,alertRetry:false,alertAccepted:false};
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({found:true,requestId:id,targetIssuer:'https://issuer.test',targetSubject:'alice',targetClientId:'console',expected:null,desired,reason:'ticket',changed:true,createdAt:'2026-01-01'}),{status:200})).mockResolvedValueOnce(new Response(JSON.stringify({found:false}),{status:200})).mockResolvedValueOnce(new Response('',{status:401}));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('settings');app.permissionEnvironment='env-a';app.permissionKey='new.token.value';app.permissionRequestId=id;
+    await app.lookupPermissionRequest();expect(app.permissionRequestStatus()).toBe('found');expect(app.permissionRequestRecord()?.desired.subscriberRead).toBe(true);
+    const url=new URL(fetchMock.mock.calls[0][0] as string);expect(url.pathname).toBe('/v1/experimental/operator/permissions/request');expect(url.searchParams.get('requestId')).toBe(id);expect(fetchMock.mock.calls[0][1]?.headers).toEqual({Authorization:'Bearer new.token.value'});
+    await app.lookupPermissionRequest();expect(app.permissionRequestStatus()).toBe('missing');expect(app.permissionRequestRecord()).toBeNull();
+    await app.lookupPermissionRequest();expect(app.permissionRequestStatus()).toBe('error');app.setSection('overview');expect(app.permissionRequestId).toBe('');expect(app.permissionKey).toBe('');
+  });
+
+  it('ignores a saved request response after the credential changes', async () => {
+    let finish!:(response:Response)=>void;vi.spyOn(globalThis,'fetch').mockReturnValueOnce(new Promise(done=>{finish=done;}));
+    const app=TestBed.createComponent(App).componentInstance;app.permissionEnvironment='env-a';app.permissionKey='aaa.bbb.ccc';app.permissionRequestId='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
+    const pending=app.lookupPermissionRequest();app.permissionKey='different.token.value';app.clearPermissions();finish(new Response(JSON.stringify({found:false}),{status:200}));await pending;
+    expect(app.permissionRequestStatus()).toBe('idle');expect(app.permissionRequestRecord()).toBeNull();
+  });
+
   it('changes a loaded identity using its observed state and keeps the request ID', async () => {
     const old={issuer:'https://issuer.test',subject:'alice',client_id:'console',environment_id:'env-a',enabled:true,subscriber_read:true,alert_read:false,alert_retry:false,alert_accepted:false};
     const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({found:true,identity:old}),{status:200})).mockResolvedValueOnce(new Response(JSON.stringify({changed:true,replayed:false}),{status:200}));

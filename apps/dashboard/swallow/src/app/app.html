@@ -189,6 +189,17 @@
           </div></section>
         }
         @if(permissionChangeStatus() === 'unavailable'){<p class="subscriber-error" role="alert">안전한 요청 ID 또는 인증 확인 정보를 생성하지 못해 요청을 보내지 않았습니다.</p><button type="button" class="btn btn-outline" (click)="clearPermissionChange()">닫기</button>}
+        <section class="card decision-card"><div class="card-block"><div class="card-eyebrow">REQUEST RECOVERY</div><h2>보관한 변경 요청 확인</h2>
+          <p>같은 운영자·클라이언트·환경의 유효한 토큰과 보관한 요청 ID를 입력하세요. 기록이 없어도 원래 요청이 진행 중일 수 있습니다.</p>
+          <form class="decision-form" (ngSubmit)="lookupPermissionRequest()"><label for="permission-request-id">요청 ID</label><input id="permission-request-id" name="permissionRequestId" [(ngModel)]="permissionRequestId" (ngModelChange)="clearPermissionRequest()" [disabled]="permissionChangeStatus() === 'sending'" autocomplete="off" required>
+            <div><button type="submit" class="btn btn-outline" [disabled]="permissionRequestStatus() === 'loading' || permissionChangeStatus() === 'sending'">보관한 요청 조회</button><button type="button" class="btn btn-outline" [disabled]="permissionChangeStatus() === 'sending'" (click)="clearPermissionRequest(true)">조회 지우기</button></div>
+          </form>
+          @if(permissionRequestStatus() === 'loading'){<p role="status">요청을 확인하고 있습니다.</p>}
+          @else if(permissionRequestStatus() === 'missing'){<p>기록을 찾지 못했습니다. 원래 요청이 진행 중이거나 운영자·환경이 다를 수 있습니다. 실패로 단정하지 마세요.</p>}
+          @else if(permissionRequestStatus() === 'error'){<p class="subscriber-error" role="alert">조회하지 못했습니다. 인증·변경 권한과 요청 ID를 확인하세요.</p>}
+          @else if(permissionRequestRecord(); as request){<p role="status">기록됨: {{ request.requestId }} · {{ request.createdAt }}<br>대상: {{ request.targetIssuer }} · {{ request.targetSubject }} · {{ request.targetClientId }}<br>사유: {{ request.reason }}<br>{{ request.changed ? '권한 변경됨' : '동일한 상태로 변경 없음' }}</p>
+            <p>이전: @if(request.expected; as previous){ {{ previous.enabled ? '활성' : '비활성' }} / 구독자 {{ previous.subscriberRead ? '허용' : '없음' }} / 경보 {{ previous.alertRead ? '허용' : '없음' }} / 재시도 {{ previous.alertRetry ? '허용' : '없음' }} / 접수 {{ previous.alertAccepted ? '허용' : '없음' }} } @else {없음}<br>변경: {{ request.desired.enabled ? '활성' : '비활성' }} / 구독자 {{ request.desired.subscriberRead ? '허용' : '없음' }} / 경보 {{ request.desired.alertRead ? '허용' : '없음' }} / 재시도 {{ request.desired.alertRetry ? '허용' : '없음' }} / 접수 {{ request.desired.alertAccepted ? '허용' : '없음' }}</p><p>보관한 원래 요청의 대상과 내용을 비교하세요.</p>}
+        </div></section>
         <section class="card decision-card"><div class="card-block"><div class="card-eyebrow">AUDIT</div><h2>권한 변경 이력</h2><p>페이지마다 조회 시점이 다르며 기록 ID 순서는 커밋 순서를 보장하지 않습니다.</p>
           <button type="button" class="btn btn-outline" [disabled]="permissionStatus() === 'loading' || permissionChangeStatus() === 'sending'" (click)="loadPermissions('audit')">최근 이력 조회</button>
           @if (permissionStatus() === 'audit') {

@@ -13,6 +13,7 @@ type RetrySnapshot = { origin: string; endpoint: string; scheme: 'Bearer' | 'Swa
 type PermissionIdentity = { issuer:string; subject:string; clientId:string; enabled:boolean; subscriberRead:boolean; alertRead:boolean; alertRetry:boolean; alertAccepted:boolean };
 type PermissionFlags = { enabled:boolean; subscriberRead:boolean; alertRead:boolean; alertRetry:boolean; alertAccepted:boolean };
 type PermissionChange = { origin:string; environment:string; keyHash:string; body:{ requestId:string; targetIssuer:string; targetSubject:string; targetClientId:string; expected:PermissionFlags|null; desired:PermissionFlags; reason:string } };
+type PermissionRequestRecord = {requestId:string; targetIssuer:string; targetSubject:string; targetClientId:string; expected:PermissionFlags|null; desired:PermissionFlags; reason:string; changed:boolean; createdAt:string};
 type PermissionAudit = { id:string; recordedAt:string; issuer:string; subject:string; clientId:string; actor:string; jwtIssuer:string|null; jwtSubject:string|null; jwtClientId:string|null; requestId:string|null; reason:string; previous:string; current:string };
 type Section = 'overview' | 'workflows' | 'subscribers' | 'channels' | 'activity' | 'alerts' | 'settings';
 
@@ -119,6 +120,11 @@ export class App implements OnDestroy {
   readonly permissionChange=signal<PermissionChange|null>(null);
   readonly permissionChangeChanged=signal<boolean|null>(null);
   readonly permissionChangeMessage=signal('');
+  permissionRequestId='';
+  readonly permissionRequestStatus=signal<'idle'|'loading'|'found'|'missing'|'error'>('idle');
+  readonly permissionRequestRecord=signal<PermissionRequestRecord|null>(null);
+  private permissionRequestSequence=0;
+  private permissionRequestAbort:AbortController|null=null;
 
   ngOnDestroy(): void {
     this.oidcSequence++;
@@ -209,7 +215,40 @@ export class App implements OnDestroy {
   clearPermissions(clearKey = false): void {
     this.permissionSequence++;this.permissionAbort?.abort();this.permissionAbort=null;
     this.permissionStatus.set('idle');this.permissionIdentity.set(null);this.permissionAudit.set([]);this.permissionNext.set(null);
+    this.clearPermissionRequest(clearKey);
     if (clearKey) this.permissionKey='';
+  }
+
+  clearPermissionRequest(clearInput=false):void {
+    this.permissionRequestSequence++;this.permissionRequestAbort?.abort();this.permissionRequestAbort=null;
+    this.permissionRequestStatus.set('idle');this.permissionRequestRecord.set(null);
+    if(clearInput)this.permissionRequestId='';
+  }
+
+  async lookupPermissionRequest():Promise<void> {
+    if(this.permissionChangeStatus()==='sending')return;
+    this.expireOidcIfNeeded();this.clearPermissionRequest();const sequence=this.permissionRequestSequence;
+    const key=this.permissionKey.trim(),env=this.permissionEnvironment.trim(),requestId=this.permissionRequestId.trim();
+    if(!this.validJwt(key)||!this.validEnvironment(env)||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId)){this.permissionRequestStatus.set('error');return;}
+    const controller=new AbortController();this.permissionRequestAbort=controller;this.permissionRequestStatus.set('loading');
+    try {
+      const params=new URLSearchParams({environmentId:env,requestId});
+      const response=await fetch(`${this.validatedOrigin()}/v1/experimental/operator/permissions/request?${params}`,{headers:{Authorization:`Bearer ${key}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      if(!response.ok)throw new Error('request unavailable');
+      const value:unknown=await response.json();if(typeof value!=='object'||value===null||!('found' in value)||typeof value.found!=='boolean')throw new Error('invalid response');
+      if(sequence!==this.permissionRequestSequence)return;
+      if(!value.found){this.permissionRequestStatus.set('missing');return;}
+      const r=value as Record<string,unknown>;
+      if(typeof r['requestId']!=='string'||r['requestId'].toLowerCase()!==requestId.toLowerCase()||['targetIssuer','targetSubject','targetClientId','reason','createdAt'].some(k=>typeof r[k]!=='string')||typeof r['changed']!=='boolean'||!(r['expected']===null||this.isPermissionFlags(r['expected']))||!this.isPermissionFlags(r['desired']))throw new Error('invalid response');
+      this.permissionRequestRecord.set({requestId:r['requestId'],targetIssuer:r['targetIssuer'] as string,targetSubject:r['targetSubject'] as string,targetClientId:r['targetClientId'] as string,expected:r['expected'] as PermissionFlags|null,desired:r['desired'],reason:r['reason'] as string,changed:r['changed'],createdAt:r['createdAt'] as string});this.permissionRequestStatus.set('found');
+    } catch {if(sequence===this.permissionRequestSequence)this.permissionRequestStatus.set('error');}
+    finally {if(sequence===this.permissionRequestSequence)this.permissionRequestAbort=null;}
+  }
+
+  private isPermissionFlags(value:unknown):value is PermissionFlags {
+    if(typeof value!=='object'||value===null)return false;
+    const record=value as Record<string,unknown>;
+    return ['enabled','subscriberRead','alertRead','alertRetry','alertAccepted'].every(key=>typeof record[key]==='boolean');
   }
 
   async loadPermissions(mode:'identity'|'audit', next=false): Promise<void> {

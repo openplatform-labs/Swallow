@@ -67,7 +67,7 @@ async fn change_is_scoped_compare_and_set_idempotent_and_audited() {
     let url = std::env::var("TEST_DATABASE_URL").unwrap();
     let mut db = connect(&url).await;
     let role = format!("permission_api_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_change_permissions(text,text,text,text,bigint,uuid,text,text,text,jsonb,jsonb,text),public.novu_rust_operator_jwt_permission_change_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_review_audit(text,text,text,text,bigint,bigint) TO {role}; INSERT INTO public.novu_rust_environments VALUES('change-a','org'),('change-b','org'); INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname='{role}'; INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES('https://issuer.test','admin','console','change-a'),('https://issuer.test','viewer','console','change-a'); INSERT INTO public.novu_rust_operator_jwt_permission_review_grants(issuer,subject,client_id,environment_id,permission_write,audit_read) VALUES('https://issuer.test','admin','console','change-a',true,true),('https://issuer.test','viewer','console','change-a',false,false);")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_change_permissions(text,text,text,text,bigint,uuid,text,text,text,jsonb,jsonb,text),public.novu_rust_operator_jwt_permission_change_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_review_audit(text,text,text,text,bigint,bigint) TO {role}; INSERT INTO public.novu_rust_environments VALUES('change-a','org'),('change-b','org'); INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname='{role}'; INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES('https://issuer.test','admin','console','change-a'),('https://issuer.test','viewer','console','change-a'),('https://issuer.test','other','console','change-a'); INSERT INTO public.novu_rust_operator_jwt_permission_review_grants(issuer,subject,client_id,environment_id,permission_write,audit_read) VALUES('https://issuer.test','admin','console','change-a',true,true),('https://issuer.test','viewer','console','change-a',false,false),('https://issuer.test','other','console','change-a',true,false);")).await.unwrap();
     let api_url = url.replacen("postgres://postgres@", &format!("postgres://{role}@"), 1);
     let verifier = Arc::new(
         AccessTokenVerifier::new("https://issuer.test", "swallow", &[("key", PUBLIC)]).unwrap(),
@@ -118,6 +118,12 @@ async fn change_is_scoped_compare_and_set_idempotent_and_audited() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["found"], true);
     assert_eq!(body["targetSubject"], "target");
+    let other = token("other");
+    let (status, other_result) =
+        response(app.clone().oneshot(get(&other, id)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(other_result["found"], false);
+
     let mut noop = input.clone();
     noop["requestId"] = json!(Uuid::new_v4());
     noop["expected"] = desired.clone();
