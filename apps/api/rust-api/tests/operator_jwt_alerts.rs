@@ -48,6 +48,7 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_read(text,text,text,text,bigint,text,text) TO {role}")).await.unwrap();
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_write(text,text,text,text,bigint,text,text,jsonb,jsonb,text) TO {role}")).await.unwrap();
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_audit_read(text,text,text,text,bigint,text,text,uuid) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_write_v2(text,text,text,text,bigint,uuid,text,text,jsonb,jsonb,text),public.novu_rust_operator_jwt_workflow_request_read(text,text,text,text,bigint,text,uuid) TO {role}")).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname::text=$1",&[&role]).await.unwrap();
     db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id,alert_read) VALUES('https://issuer.test','person','console','jwt-alert-a',true),('https://issuer.test','reader','console','jwt-alert-a',false); INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state,attempt_id) SELECT 'jwt-alert-a','slack','target-'||lpad(n::text,3,'0'),'unknown',gen_random_uuid() FROM generate_series(1,101) n; INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES('jwt-alert-b','email','private','unknown')").await.unwrap();
     db.batch_execute("WITH c AS (INSERT INTO public.novu_rust_console_credentials(token_hash,environment_id,expires_at,subscriber_read) VALUES(encode(sha256(convert_to(repeat('a',64),'UTF8')),'hex'),'jwt-alert-a',clock_timestamp()+interval '1 hour',false) RETURNING credential_id) INSERT INTO public.novu_rust_console_alert_grants SELECT credential_id FROM c").await.unwrap();
@@ -342,7 +343,7 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     assert_eq!(pending.await.unwrap(), StatusCode::UNAUTHORIZED);
     assert_eq!(db.query_one("SELECT chat_content FROM public.novu_rust_workflows WHERE environment_id='jwt-alert-a' AND identifier='wf'",&[]).await.unwrap().get::<_,String>(0),"competing");
     let tx = workflow_revoker.transaction().await.unwrap();
-    tx.batch_execute("DELETE FROM public.novu_rust_operator_jwt_workflow_grants WHERE subject='person' AND resource='email'").await.unwrap();
+    tx.batch_execute("DELETE FROM public.novu_rust_operator_jwt_workflow_grants WHERE subject='person' AND resource='email' AND permission='read'").await.unwrap();
     let workflow_http_request = workflow_request(&token, query);
     let pending = tokio::spawn({
         let app = app.clone();
@@ -359,6 +360,183 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     assert_eq!(
         app.clone()
             .oneshot(workflow_request(&token, query))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    db.batch_execute("INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,email_subject,email_html) VALUES('jwt-alert-a','wf-v2',true,true,'Old','Old body')").await.unwrap();
+    let request_id = Uuid::new_v4();
+    let v2_body = json!({"requestId":request_id,"workflow":"wf-v2","resource":"email","expected":{"title":"Old","content":"Old body","active":true},"desired":{"title":"New","content":"Private new body","active":true},"reason":"ticket-v2"});
+    let v2_request = |jwt: &str, body: Value| {
+        Request::builder()
+            .method("PUT")
+            .uri("/v1/experimental/operator/workflow-v2?environmentId=jwt-alert-a")
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let lookup_request = |jwt: &str, resource: &str, id: Uuid| {
+        Request::builder().uri(format!("/v1/experimental/operator/workflow-request?environmentId=jwt-alert-a&resource={resource}&requestId={id}")).header(header::AUTHORIZATION,format!("Bearer {jwt}")).body(Body::empty()).unwrap()
+    };
+    let before = app
+        .clone()
+        .oneshot(lookup_request(&token, "email", request_id))
+        .await
+        .unwrap();
+    assert_eq!(before.status(), StatusCode::OK);
+    let before: Value =
+        serde_json::from_slice(&before.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(before["found"], false);
+    let response = app
+        .clone()
+        .oneshot(v2_request(&token, v2_body.clone()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let first: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(first["replayed"], false);
+    let response = app
+        .clone()
+        .oneshot(v2_request(&token, v2_body.clone()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let replay: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(replay["replayed"], true);
+    let fresh_now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut fresh_header = Header::new(Algorithm::RS256);
+    fresh_header.typ = Some("at+jwt".into());
+    fresh_header.kid = Some("key".into());
+    let fresh_token=encode(&fresh_header,&json!({"iss":"https://issuer.test","sub":"person","aud":"swallow","exp":fresh_now+120,"iat":fresh_now,"jti":"fresh-workflow-token","client_id":"console"}),&EncodingKey::from_rsa_pem(PRIVATE).unwrap()).unwrap();
+    let fresh_response = app
+        .clone()
+        .oneshot(lookup_request(&fresh_token, "email", request_id))
+        .await
+        .unwrap();
+    assert_eq!(fresh_response.status(), StatusCode::OK);
+    let fresh_result: Value = serde_json::from_slice(
+        &fresh_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    assert_eq!(fresh_result["found"], true);
+    let mut altered = v2_body.clone();
+    altered["desired"]["content"] = json!("different");
+    assert_eq!(
+        app.clone()
+            .oneshot(v2_request(&token, altered))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let response = app
+        .clone()
+        .oneshot(lookup_request(&token, "email", request_id))
+        .await
+        .unwrap();
+    let found: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(found["found"], true);
+    assert_eq!(found["workflow"], "wf-v2");
+    assert!(!found.to_string().contains("Private new body"));
+    assert_eq!(
+        app.clone()
+            .oneshot(lookup_request(&make("reader"), "email", request_id))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_operator_jwt_workflow_audit WHERE workflow_identifier='wf-v2'",&[]).await.unwrap().get::<_,i64>(0),1);
+    let stored=db.query_one("SELECT request_digest,reason FROM public.novu_rust_operator_jwt_workflow_requests WHERE request_id=$1",&[&request_id]).await.unwrap();
+    assert_eq!(stored.get::<_, Vec<u8>>(0).len(), 32);
+    assert_eq!(stored.get::<_, String>(1), "ticket-v2");
+    let failed_id = Uuid::new_v4();
+    let mut failed = v2_body.clone();
+    failed["requestId"] = json!(failed_id);
+    failed["expected"] = v2_body["desired"].clone();
+    failed["desired"]["content"] = json!("other");
+    db.batch_execute("ALTER TABLE public.novu_rust_operator_jwt_workflow_audit ADD CONSTRAINT fixture_reject_v2_audit CHECK(false) NOT VALID").await.unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(v2_request(&token, failed))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    db.batch_execute("ALTER TABLE public.novu_rust_operator_jwt_workflow_audit DROP CONSTRAINT fixture_reject_v2_audit").await.unwrap();
+    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_operator_jwt_workflow_requests WHERE request_id=$1",&[&failed_id]).await.unwrap().get::<_,i64>(0),0);
+    assert_eq!(db.query_one("SELECT email_html FROM public.novu_rust_workflows WHERE environment_id='jwt-alert-a' AND identifier='wf-v2'",&[]).await.unwrap().get::<_,String>(0),"Private new body");
+    let concurrent_id = Uuid::new_v4();
+    let mut concurrent = v2_body.clone();
+    concurrent["requestId"] = json!(concurrent_id);
+    concurrent["expected"] = v2_body["desired"].clone();
+    concurrent["desired"]["content"] = json!("Concurrent update");
+    let api2 = connect(&api_url).await;
+    assert!(
+        api2.query(
+            "SELECT * FROM public.novu_rust_operator_jwt_workflow_requests",
+            &[]
+        )
+        .await
+        .is_err()
+    );
+    let app2 = novu_rust_api::router(Arc::new(api2)).layer(Extension(Arc::new(
+        AccessTokenVerifier::new("https://issuer.test", "swallow", &[("key", PUBLIC)]).unwrap(),
+    )));
+    let (one, two) = tokio::join!(
+        app.clone().oneshot(v2_request(&token, concurrent.clone())),
+        app2.oneshot(v2_request(&token, concurrent.clone()))
+    );
+    let one = one.unwrap();
+    let two = two.unwrap();
+    assert_eq!(one.status(), StatusCode::OK);
+    assert_eq!(two.status(), StatusCode::OK);
+    let one: Value =
+        serde_json::from_slice(&one.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let two: Value =
+        serde_json::from_slice(&two.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_ne!(one["replayed"], two["replayed"]);
+    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_operator_jwt_workflow_audit WHERE workflow_identifier='wf-v2'",&[]).await.unwrap().get::<_,i64>(0),2);
+    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_operator_jwt_workflow_requests WHERE request_id=$1",&[&concurrent_id]).await.unwrap().get::<_,i64>(0),1);
+    let mut different_resource = concurrent.clone();
+    different_resource["resource"] = json!("slack");
+    different_resource["expected"] = json!({"content":"competing","active":false});
+    different_resource["desired"] = json!({"content":"different","active":true});
+    assert_eq!(
+        app.clone()
+            .oneshot(v2_request(&token, different_resource))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    db.batch_execute("DELETE FROM public.novu_rust_operator_jwt_workflow_grants WHERE subject='person' AND resource='email' AND permission='write'").await.unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(lookup_request(&token, "email", request_id))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(v2_request(&token, v2_body.clone()))
             .await
             .unwrap()
             .status(),

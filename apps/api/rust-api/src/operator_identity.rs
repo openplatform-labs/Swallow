@@ -27,6 +27,7 @@ enum Lookup {
     ResendJobs,
     WorkflowRead,
     WorkflowAudit,
+    WorkflowRequest,
 }
 
 fn authenticate(
@@ -155,10 +156,29 @@ pub(super) async fn workflow_audit(
 ) -> Response {
     query(db, headers, uri, verifier, Lookup::WorkflowAudit).await
 }
+pub(super) async fn workflow_request(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::WorkflowRequest).await
+}
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WorkflowWriteBody {
+    workflow: String,
+    resource: String,
+    expected: serde_json::Value,
+    desired: serde_json::Value,
+    reason: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkflowWriteV2Body {
+    request_id: String,
     workflow: String,
     resource: String,
     expected: serde_json::Value,
@@ -174,6 +194,56 @@ fn json_contains_nul(value: &serde_json::Value) -> bool {
             .iter()
             .any(|(k, v)| k.contains('\0') || json_contains_nul(v)),
         _ => false,
+    }
+}
+
+pub(super) async fn workflow_write_v2(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+    body: Bytes,
+) -> Response {
+    let identity = match authenticate(&headers, verifier) {
+        Ok(v) => v,
+        Err(status) => return failure(status, uri.path()),
+    };
+    let params: Vec<_> = form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).collect();
+    if params.len() != 1
+        || params[0].0 != "environmentId"
+        || params[0].1.is_empty()
+        || params[0].1.len() > 512
+        || params[0].1.contains('\0')
+    {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    }
+    let Some(input) = (body.len() <= 1_000_000)
+        .then(|| serde_json::from_slice::<WorkflowWriteV2Body>(&body).ok())
+        .flatten()
+    else {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    };
+    if input.workflow.contains('\0')
+        || input.resource.contains('\0')
+        || input.reason.contains('\0')
+        || json_contains_nul(&input.expected)
+        || json_contains_nul(&input.desired)
+    {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    }
+    let (Ok(request), Ok(exp)) = (
+        Uuid::parse_str(&input.request_id),
+        i64::try_from(identity.expires_at),
+    ) else {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    };
+    let env = params[0].1.as_ref();
+    match db.query_one("SELECT public.novu_rust_operator_jwt_workflow_write_v2($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&input.workflow,&input.resource,&input.expected,&input.desired,&input.reason]).await {
+        Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
+        Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
+        Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
+        Err(e) if e.code().is_some_and(|c|c.code()=="P4090")=>failure(StatusCode::CONFLICT,uri.path()),
+        Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path()),
     }
 }
 
@@ -290,6 +360,7 @@ async fn query(
         Lookup::ResendJobs => &["environmentId", "after"],
         Lookup::WorkflowRead => &["environmentId", "workflow", "resource"],
         Lookup::WorkflowAudit => &["environmentId", "workflow", "resource", "after"],
+        Lookup::WorkflowRequest => &["environmentId", "resource", "requestId"],
     };
     if params.keys().any(|key| !allowed.contains(&key.as_str()))
         || params.get("limit").is_some_and(|limit| limit != "20")
@@ -306,6 +377,32 @@ async fn query(
         return failure(StatusCode::UNAUTHORIZED, "Unauthorized", "Unauthorized");
     };
     let result = match lookup {
+        Lookup::WorkflowRequest => {
+            let Some(resource) = params.get("resource").filter(|r| {
+                ["email", "sms", "push", "slack", "email-provider"].contains(&r.as_str())
+            }) else {
+                return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+            };
+            let Some(request) = params
+                .get("requestId")
+                .and_then(|id| Uuid::parse_str(id).ok())
+            else {
+                return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+            };
+            db.query_one(
+                "SELECT public.novu_rust_operator_jwt_workflow_request_read($1,$2,$3,$4,$5,$6,$7)",
+                &[
+                    &identity.issuer,
+                    &identity.subject,
+                    &identity.client_id,
+                    &env,
+                    &exp,
+                    &resource,
+                    &request,
+                ],
+            )
+            .await
+        }
         Lookup::WorkflowAudit => {
             let (Some(workflow), Some(resource)) = (params.get("workflow"), params.get("resource"))
             else {
