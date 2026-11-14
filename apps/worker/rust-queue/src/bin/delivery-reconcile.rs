@@ -5,8 +5,8 @@ use uuid::Uuid;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if ![2, 3, 4, 6, 7].contains(&args.len()) {
-        return Err("usage: delivery-reconcile check|check-slack ENV | slack-resolve ENV JOB retry|accepted OPERATOR REASON | check-alert-delivery ENV | alert-status ENV | alert-resolve ENV CHANNEL TARGET DECISION OPERATOR REASON | check-queue ENV MAX_WAIT_SECONDS | check-resend|check-resend-metrics|check-twilio|check-twilio-metrics ENV GRACE_SECONDS HEARTBEAT_MAX_SECONDS | list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | email-dispatch-evidence ENV EMAIL_JOB | resend-evidence|resend-check ENV EMAIL_JOB | sms-evidence|sms-delivery ENV SMS_JOB | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
+    if ![2, 3, 4, 5, 6, 7].contains(&args.len()) {
+        return Err("usage: delivery-reconcile operator-grant|operator-revoke ENV DB_LOGIN PERMISSION REASON | check|check-slack ENV | slack-resolve ENV JOB retry|accepted OPERATOR REASON | check-alert-delivery ENV | alert-status ENV | alert-resolve ENV CHANNEL TARGET DECISION OPERATOR REASON | check-queue ENV MAX_WAIT_SECONDS | check-resend|check-resend-metrics|check-twilio|check-twilio-metrics ENV GRACE_SECONDS HEARTBEAT_MAX_SECONDS | list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | email-dispatch-evidence ENV EMAIL_JOB | resend-evidence|resend-check ENV EMAIL_JOB | sms-evidence|sms-delivery ENV SMS_JOB | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
     }
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let (mut db, connection) = config.connect(tls).await?;
@@ -15,7 +15,28 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             eprintln!("database connection failed");
         }
     });
-    if args.len() == 2 && args[0] == "check" {
+    if args.len() == 5 && ["operator-grant", "operator-revoke"].contains(&args[0].as_str()) {
+        let action = if args[0] == "operator-grant" {
+            "grant"
+        } else {
+            "revoke"
+        };
+        let changed: bool = db
+            .query_one(
+                "SELECT public.novu_rust_manage_operator_grant($1,$2,$3,$4,$5)",
+                &[&args[1], &args[2], &args[3], &action, &args[4]],
+            )
+            .await?
+            .get(0);
+        println!(
+            "{}",
+            if changed {
+                "operator grant changed"
+            } else {
+                "operator grant unchanged"
+            }
+        );
+    } else if args.len() == 2 && args[0] == "check" {
         let health = novu_postgres_queue::reconciliation::health(&db, &args[1]).await?;
         println!("{}", serde_json::to_string(&health)?);
         if health["unknownAttempts"]

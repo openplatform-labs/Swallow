@@ -72,6 +72,10 @@ docker exec "$name" createdb -U postgres novu_grant_lock_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_grant_lock_test" \
   cargo test --locked --test operator_grant_lock -- --ignored
 
+docker exec "$name" createdb -U postgres novu_grant_management_test
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_grant_management_test" \
+  cargo test --locked --test operator_grant_management -- --ignored
+
 docker exec "$name" createdb -U postgres novu_slack_cli_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_slack_cli_test" \
   cargo test --locked --test slack_cli -- --ignored

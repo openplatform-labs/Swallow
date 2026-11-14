@@ -14,6 +14,14 @@ API 프로세스는 PostgreSQL 접속이 끊기거나 연결 상태 조회가 �
 
 인앱 워커는 DB 장애나 처리 오류·시간 초과 후 2초마다 재접속한다. `NOVU_IN_APP_DB_TIMEOUT_SECONDS`는 기본 30초이고 1~300초로 설정한다. DB 연결, 개별 쿼리와 스누즈 해제 또는 한 트리거 작업 전체에 적용된다. 트리거의 도메인 쓰기와 완료는 같은 트랜잭션으로 처리하며, 중단된 대기 작업은 임대 만료 후 기존 복구 정책으로 재처리한다. 영구 스키마·권한 오류도 재접속을 반복하므로 외부 감시와 프로세스 감독이 필요하고 DB 설정 변경 시 재시작해야 한다. Docker PostgreSQL에서 두 워커의 잠금 시간 초과 및 DB 재시작 후 재접속과 단일 트리거의 알림·인앱 메시지 단일 생성을 검증했다. 트리거 처리 중 실제 DB 승격·네트워크 분할, 지속 부하와 외부 채널까지의 전체 HA는 미검증이다.
 
+## 운영자 권한 위임 관리
+
+워커 0072는 환경별 DB 로그인에 운영 권한을 부여·회수하는 제한된 경로를 추가한다. 신뢰된 DB 소유자가 0064·0067·0068·0071 이후 0072를 적용하고, `novu_rust_operator_grant_admins`에 환경 ID와 관리자 **DB 로그인명**을 직접 등록한 다음 해당 로그인에 `GRANT EXECUTE ON FUNCTION public.novu_rust_manage_operator_grant(text,text,text,text,text)`를 부여한다. 관리자에게 권한·관리자·감사 테이블 직접 쓰기 권한은 주지 않는다. 관리자 지정·회수 자체는 신뢰된 DB 소유자만 수행한다.
+
+관리자는 `delivery-reconcile operator-grant ENV DB_LOGIN PERMISSION REASON` 또는 `operator-revoke`를 실행한다. 권한은 `retry`, `accepted`, `alert_send`, `alert_retry`, `alert_accepted`, `slack_retry`, `slack_accepted` 중 하나이며 신규 부여 대상은 실제 LOGIN 역할이어야 한다. 변경과 세션 사용자·대상·사유 감사는 한 트랜잭션으로 기록되고, 같은 상태로 반복한 요청은 변경 없이 반환하며 감사 행을 추가하지 않는다. 권한 회수는 해당 권한을 잠근 진행 중 작업이 끝날 때까지 대기하고 이후의 새 작업을 차단한다. 관리자 권한도 작업 중 잠그므로 동시 회수는 진행 중 변경을 기다린다. 사유에는 비밀이나 개인정보를 넣지 않는다. 관리자 계정의 위임 대상과 권한에는 별도 상한이 없으므로 해당 환경에서 모든 열거된 운영 권한을 부여할 수 있다.
+
+이는 DB 로그인 기반의 실험적 위임이며 사용자 SSO·역할 관리 API나 위변조 방지 감사가 아니다. 함수 소유자·스키마·권한 및 감사 테이블을 보호해야 하고 직접 SQL 권한이 있는 계정은 이 경로를 우회할 수 있다. 로그인 공유 시 개인을 식별하지 못한다. Docker PostgreSQL에서 제한된 계정의 환경 격리·직접 쓰기 거절·부여·회수·감사, 작업과 권한 회수의 경합 및 실제 CLI를 검증한다. 운영 DB 배포, 외부 인증 연동과 모든 동시성 사례는 미검증이다.
+
 ## 실험 Slack 채팅 발송
 
 `slack-worker`는 `experimental_slack_chat` 종류의 독립 PostgreSQL 작업을 Slack `chat.postMessage`로 발송한다. 워커 0070·0071까지 적용하고 환경별 `NOVU_SLACK_ENVIRONMENT_ID`, `DATABASE_URL`, `NOVU_SLACK_BOT_TOKEN` 또는 `NOVU_SLACK_BOT_TOKEN_FILE`을 설정한다. 토큰은 시작 시 읽고 작업·시도 테이블에 저장하지 않는다. 작업 payload는 `{"channel":"C123","text":"hello","blocks":[],"customData":{"thread_ts":"123.456"}}` 형식이며 blocks와 customData는 선택이다. 원본처럼 customData는 최종 요청 필드를 덮어쓰므로 channel도 변경할 수 있다. 덮어쓴 최종 channel·text·blocks는 크기와 타입을 검증하며, 이러한 제한은 원본과 다를 수 있다. 작업 생성자에게 환경과 최종 대상에 대한 인가 책임이 있고 customData를 포함한 내용은 DB에 저장되므로 접근을 보호해야 한다. **아직 워크플로 실행, 구독자 자격증명·삭제·수신 설정, 원본 채팅 관리 API에 연결되지 않았다.** 풍부한 카드 렌더링, bridge provider override, webhook 대상과 전체 원본 계약도 미구현이다. 운영용이 아닌 격리 평가 경로다.
