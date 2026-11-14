@@ -114,6 +114,8 @@ async fn main() -> Result<()> {
         queue: None,
         attempts: None,
         twilio: None,
+        sendgrid: None,
+        sendgrid_check_failed: false,
         slack_attempts: None,
         failed_checks: [false; 5],
         failed_jobs: None,

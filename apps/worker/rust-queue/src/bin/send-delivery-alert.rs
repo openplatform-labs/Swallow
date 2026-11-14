@@ -94,6 +94,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         (Some(grace), Some(heartbeat)) => Some((grace, heartbeat)),
         _ => return Err("both Twilio alert thresholds must be configured".into()),
     };
+    let sendgrid_thresholds = match (
+        env_optional_i32("SWALLOW_ALERT_SENDGRID_GRACE_SECONDS")?,
+        env_optional_i32("SWALLOW_ALERT_SENDGRID_HEARTBEAT_MAX_SECONDS")?,
+    ) {
+        (None, None) => None,
+        (Some(g), Some(h)) => Some((g, h)),
+        _ => return Err("both SendGrid alert thresholds must be configured".into()),
+    };
     let queue_wait = match std::env::var("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS") {
         Ok(value) => Some(value.parse::<i32>()?),
         Err(std::env::VarError::NotPresent) => None,
@@ -105,11 +113,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         && !failed_jobs_enabled
         && queue_wait.is_none()
         && twilio_thresholds.is_none()
+        && sendgrid_thresholds.is_none()
     {
         return Err("no alert checks configured".into());
     }
     if (resend_enabled && (!(1..=86_400).contains(&grace) || !(1..=86_400).contains(&heartbeat)))
         || queue_wait.is_some_and(|v| !(1..=86_400).contains(&v))
+        || sendgrid_thresholds
+            .is_some_and(|(g, h)| !(1..=86_400).contains(&g) || !(1..=86_400).contains(&h))
         || twilio_thresholds
             .is_some_and(|(g, h)| !(1..=86_400).contains(&g) || !(1..=86_400).contains(&h))
     {
@@ -210,6 +221,30 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     } else {
         None
     };
+    let mut sendgrid_check_failed = false;
+    let sendgrid = if let Some((grace, heartbeat)) = sendgrid_thresholds {
+        let result = tokio::time::timeout(operation_timeout, async {
+            if scoped_checks {
+                reconciliation::scoped_sendgrid_health(&db, &args[0], grace, heartbeat).await
+            } else {
+                reconciliation::sendgrid_health(&db, &args[0], grace, heartbeat).await
+            }
+        })
+        .await;
+        let values = result.ok().and_then(Result::ok).and_then(|health| {
+            Some((
+                health["overdueUndelivered"].as_u64()?,
+                health["projectorStale"].as_bool()?,
+            ))
+        });
+        if values.is_none() {
+            sendgrid_check_failed = true;
+            eprintln!("SendGrid health check failed");
+        }
+        values
+    } else {
+        None
+    };
     let slack_attempts = if slack_jobs_enabled {
         let scoped_slack = env_bool("SWALLOW_ALERT_SLACK_SCOPED_ACCESS", false)?;
         let result = tokio::time::timeout(operation_timeout, async {
@@ -259,7 +294,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     } else {
         None
     };
-    let unhealthy = failed_jobs_check_failed
+    let unhealthy = sendgrid_check_failed
+        || sendgrid.is_some_and(|(overdue, stale)| overdue > 0 || stale)
+        || failed_jobs_check_failed
         || failed_jobs.is_some_and(|n| n > 0)
         || failed_checks.iter().any(|failed| *failed)
         || resend.is_some_and(|(overdue, stale)| overdue > 0 || stale)
@@ -282,6 +319,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         queue,
         attempts,
         twilio,
+        sendgrid,
+        sendgrid_check_failed,
         slack_attempts,
         failed_checks,
         failed_jobs,

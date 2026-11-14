@@ -6,7 +6,7 @@ use uuid::Uuid;
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if ![2, 3, 4, 5, 6, 7].contains(&args.len()) {
-        return Err("usage: delivery-reconcile check-failed-jobs ENV | list-failed-jobs ENV [AFTER_JOB] | ack-failed-job ENV JOB OPERATOR REASON | list-slack ENV [AFTER_JOB] | slack-ack ENV JOB OPERATOR REASON | operator-grant|operator-revoke ENV DB_LOGIN PERMISSION REASON | check|check-slack ENV | slack-resolve ENV JOB retry|accepted OPERATOR REASON | check-alert-delivery ENV | alert-status ENV | alert-resolve ENV CHANNEL TARGET DECISION OPERATOR REASON | check-queue ENV MAX_WAIT_SECONDS | check-resend|check-resend-metrics|check-twilio|check-twilio-metrics ENV GRACE_SECONDS HEARTBEAT_MAX_SECONDS | list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | email-dispatch-evidence ENV EMAIL_JOB | resend-evidence|resend-check ENV EMAIL_JOB | sms-evidence|sms-delivery ENV SMS_JOB | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
+        return Err("usage: delivery-reconcile check-failed-jobs ENV | list-failed-jobs ENV [AFTER_JOB] | ack-failed-job ENV JOB OPERATOR REASON | list-slack ENV [AFTER_JOB] | slack-ack ENV JOB OPERATOR REASON | operator-grant|operator-revoke ENV DB_LOGIN PERMISSION REASON | check|check-slack ENV | slack-resolve ENV JOB retry|accepted OPERATOR REASON | check-alert-delivery ENV | alert-status ENV | alert-resolve ENV CHANNEL TARGET DECISION OPERATOR REASON | check-queue ENV MAX_WAIT_SECONDS | check-resend|check-resend-metrics|check-twilio|check-twilio-metrics|check-sendgrid|check-sendgrid-metrics ENV GRACE_SECONDS HEARTBEAT_MAX_SECONDS | list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | email-dispatch-evidence ENV EMAIL_JOB | resend-evidence|resend-check ENV EMAIL_JOB | sms-evidence|sms-delivery ENV SMS_JOB | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
     }
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let (mut db, connection) = config.connect(tls).await?;
@@ -168,15 +168,34 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             "check-resend-metrics",
             "check-twilio",
             "check-twilio-metrics",
+            "check-sendgrid",
+            "check-sendgrid-metrics",
         ]
         .contains(&args[0].as_str())
     {
         let twilio = args[0].starts_with("check-twilio");
-        let health = if monitor_scoped_access()? {
+        let sendgrid = args[0].starts_with("check-sendgrid");
+        let health = if monitor_scoped_access()? && sendgrid {
+            novu_postgres_queue::reconciliation::scoped_sendgrid_health(
+                &db,
+                &args[1],
+                args[2].parse()?,
+                args[3].parse()?,
+            )
+            .await?
+        } else if monitor_scoped_access()? {
             novu_postgres_queue::reconciliation::scoped_provider_health(
                 &db,
                 &args[1],
                 if twilio { "twilio" } else { "resend" },
+                args[2].parse()?,
+                args[3].parse()?,
+            )
+            .await?
+        } else if sendgrid {
+            novu_postgres_queue::reconciliation::sendgrid_health(
+                &db,
+                &args[1],
                 args[2].parse()?,
                 args[3].parse()?,
             )
@@ -205,7 +224,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             .as_bool()
             .ok_or("invalid health result")?;
         if args[0].ends_with("-metrics") {
-            let provider = if twilio { "twilio" } else { "resend" };
+            let provider = if sendgrid {
+                "sendgrid"
+            } else if twilio {
+                "twilio"
+            } else {
+                "resend"
+            };
             if args[1].chars().any(|c| c.is_control() && c != '\n') {
                 return Err("invalid environment for metrics".into());
             }

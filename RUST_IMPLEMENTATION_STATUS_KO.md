@@ -217,6 +217,9 @@ API 0020은 새 `bounce` 이벤트의 `type`이 `bounce` 또는 `blocked`일 때
 
 워커 0097과 선택적으로 실행하는 `sendgrid-projection-worker`는 현재 발송 시도의 증명값이 확인된 서명 웹훅과 정확히 일치하는 수신자 스냅샷을 연결해 수신자별 결과와 작업·이메일 메시지의 별도 `sendgrid_delivery_result`를 갱신한다. 영구 반송·dropped는 실패, 일시 blocked는 대기, 전달과 영구 실패의 상충은 conflicting으로 처리한다. 수신자별 결과가 혼합되면 partial이며 수신자 중 미확정이 있거나 미연결 이벤트, 중복 주소, bounce 유형 부재, 스냅샷 부재 등은 unknown으로 남긴다. 이전 발송·검증되지 않은 증거는 현재 결과에 적용하지 않는다. 발송 시도와 기존 작업 상태는 바꾸지 않으며 자동 재발송도 하지 않는다. 전달은 수신 서버의 접수 보고이며 읽음을 의미하지 않는다. 워커는 환경별로 전체 이력을 반복 순회하고 완료 heartbeat를 남긴다. 잠긴 작업은 건너뛸 수 있고 부하·장기 장애와 실제 SendGrid 웹훅은 미검증이다. API 0020과 워커 0096·0097을 먼저 적용하고 DB 권한 및 heartbeat 감시를 별도로 구성해야 한다. 합성 서명 웹훅의 실제 HTTP 수신부터 DB 갱신, 환경 격리·상충·불명·DB 재연결을 Docker PostgreSQL에서 검증했다. 이 별도 결과 열은 원본 Novu 상태 API와 동등하다고 검증된 기능이 아니다.
 
+워커 0098은 선택형 SendGrid 감시를 제공한다. `delivery-reconcile check-sendgrid ENV GRACE_SECONDS HEARTBEAT_MAX_SECONDS`는 유예기간이 지난 미전달 작업 또는 집계기 heartbeat 부재·지연 시 종료 코드 2를 반환하며 `check-sendgrid-metrics`는 집계 지표를 출력한다. 전달 실패·일부 전달·불명도 미전달로 집계한다. `send-delivery-alert`에서 `SWALLOW_ALERT_SENDGRID_GRACE_SECONDS`와 `SWALLOW_ALERT_SENDGRID_HEARTBEAT_MAX_SECONDS`를 모두 설정하면 기존 Slack·이메일 경보에 이 조건을 포함하고, 둘 다 생략하면 사용하지 않는다. 범위 제한 계정에는 `public.novu_rust_sendgrid_health(text,integer,integer)` 실행 권한과 해당 환경의 `alert_view` 권한이 필요하다. 스케줄러, 목적지와 명령 오류·미실행 감시는 운영자가 구성해야 한다. heartbeat는 잠긴 행까지 처리했다는 증거가 아니며 실서비스 경보 연동과 부하는 미검증이다.
+
+
 
 API 마이그레이션 `0004_sendgrid_webhooks.sql`은 환경별 SendGrid 공개키와 최소 이벤트 이력을 만든다. `POST /webhooks/organizations/{organizationId}/environments/{environmentId}/email/sendgrid`는 원본 바이트와 timestamp에 대한 ECDSA P-256 서명을 필수 검증하고 환경·조직을 확인한다. 활성 공개키는 `novu_rust_sendgrid_webhook_keys`에 SendGrid가 제공한 Base64 DER 공개키로 수동 등록한다. 하나의 활성 공개키를 두 환경이 공유하지 못한다. 같은 `sg_event_id`는 환경별로 한 번만 기록하고 다른 환경의 메시지 ID는 무시한다. 이메일 주소 원문과 이벤트 본문은 저장하지 않지만 주소의 SHA-256 해시는 추측될 수 있는 개인정보이므로 DB 접근을 제한해야 한다.
 

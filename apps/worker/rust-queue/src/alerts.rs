@@ -308,6 +308,8 @@ pub struct Alert {
     pub queue: Option<(u64, u64)>,
     pub attempts: Option<(u64, u64)>,
     pub twilio: Option<(u64, bool)>,
+    pub sendgrid: Option<(u64, bool)>,
+    pub sendgrid_check_failed: bool,
     pub slack_attempts: Option<(u64, u64, u64, u64, Option<u64>)>,
     pub failed_checks: [bool; 5], // resend, queue, attempts, twilio, Slack chat
     pub failed_jobs: Option<u64>,
@@ -356,6 +358,15 @@ impl Alert {
         }
         if self.alert_store_unavailable {
             mask |= 1 << 21;
+        }
+        if self.sendgrid.is_some_and(|v| v.0 > 0) {
+            mask |= 1 << 22;
+        }
+        if self.sendgrid.is_some_and(|v| v.1) {
+            mask |= 1 << 23;
+        }
+        if self.sendgrid_check_failed {
+            mask |= 1 << 24;
         }
         mask
     }
@@ -407,6 +418,12 @@ impl Alert {
         if self.alert_store_unavailable {
             known |= 1 << 21;
         }
+        if self.sendgrid.is_some() {
+            known |= (1 << 22) | (1 << 23);
+        }
+        if self.sendgrid.is_some() || self.sendgrid_check_failed {
+            known |= 1 << 24;
+        }
         known
     }
     pub fn text(&self) -> Result<String, AlertError> {
@@ -435,6 +452,14 @@ impl Alert {
             details.push(format!(
                 "unknown delivery attempts: {unknown}; stranded dispatches: {stranded}"
             ));
+        }
+        if let Some((overdue, stale)) = self.sendgrid {
+            details.push(format!(
+                "SendGrid overdue undelivered jobs: {overdue}; projector stale: {stale}"
+            ));
+        }
+        if self.sendgrid_check_failed {
+            details.push("SendGrid check failed".into());
         }
         if let Some((overdue, stale)) = self.twilio {
             details.push(format!(
@@ -802,6 +827,8 @@ mod tests {
             queue: None,
             attempts: None,
             twilio: None,
+            sendgrid: None,
+            sendgrid_check_failed: false,
             slack_attempts: None,
             failed_checks: [false; 5],
             failed_jobs: None,
@@ -809,6 +836,25 @@ mod tests {
             database_probe: None,
             alert_store_unavailable: false,
         }
+    }
+
+    #[test]
+    fn sendgrid_alert_conditions_are_independent_and_observed() {
+        let mut a = alert();
+        assert_eq!(a.observed_condition_mask() & (7 << 22), 0);
+        a.sendgrid = Some((2, true));
+        assert_eq!(a.condition_mask() & (7 << 22), 3 << 22);
+        assert_eq!(a.observed_condition_mask() & (7 << 22), 7 << 22);
+        assert!(
+            a.text()
+                .unwrap()
+                .contains("SendGrid overdue undelivered jobs: 2; projector stale: true")
+        );
+        a.sendgrid = None;
+        a.sendgrid_check_failed = true;
+        assert_eq!(a.condition_mask() & (7 << 22), 1 << 24);
+        assert_eq!(a.observed_condition_mask() & (7 << 22), 1 << 24);
+        assert!(a.text().unwrap().contains("SendGrid check failed"));
     }
 
     #[test]
@@ -1125,6 +1171,8 @@ mod tests {
             queue: None,
             attempts: None,
             twilio: None,
+            sendgrid: Some((1, true)),
+            sendgrid_check_failed: false,
             slack_attempts: None,
             failed_checks: [false; 5],
             failed_jobs: None,
@@ -1143,6 +1191,7 @@ mod tests {
         );
         let slack_request = slack_server.await.unwrap();
         assert!(slack_request.contains("projector stale: true"));
+        assert!(slack_request.contains("SendGrid overdue undelivered jobs: 1"));
         assert_eq!(
             dispatch_slack(&mut db, "ops", 60, &alert, &slack)
                 .await

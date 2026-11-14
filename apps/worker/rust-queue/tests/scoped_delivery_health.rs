@@ -71,8 +71,24 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
     )
     .await
     .unwrap();
+    let sendgrid = Uuid::new_v4();
+    queue::enqueue(
+        &db,
+        sendgrid,
+        "a",
+        queue::sendgrid_queue::JOB_KIND,
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE novu_queue_jobs SET available_at=clock_timestamp()-interval '1 hour' WHERE id=$1",
+        &[&sendgrid],
+    )
+    .await
+    .unwrap();
     let role = format!("monitor_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'scoped-fixture-password'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_delivery_health(text),public.novu_rust_queue_health(text,integer),public.novu_rust_provider_health(text,text,integer,integer),public.novu_rust_reserve_alert(text,text,text,integer,integer),public.novu_rust_finish_alert(text,text,text,uuid,text,integer),public.novu_rust_failed_queue_count(text),public.novu_rust_failed_queue_list(text,uuid),public.novu_rust_ack_failed_queue(text,uuid,text,text),public.novu_rust_observe_alert_conditions(text,text,text,integer,integer) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'scoped-fixture-password'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_delivery_health(text),public.novu_rust_queue_health(text,integer),public.novu_rust_provider_health(text,text,integer,integer),public.novu_rust_sendgrid_health(text,integer,integer),public.novu_rust_reserve_alert(text,text,text,integer,integer),public.novu_rust_finish_alert(text,text,text,uuid,text,integer),public.novu_rust_failed_queue_count(text),public.novu_rust_failed_queue_list(text,uuid),public.novu_rust_ack_failed_queue(text,uuid,text,text),public.novu_rust_observe_alert_conditions(text,text,text,integer,integer) TO {role}")).await.unwrap();
     let (actor, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move {
         let _ = driver.await;
@@ -109,6 +125,50 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
             .await
             .unwrap()
     );
+    let sg = reconciliation::scoped_sendgrid_health(&actor, "a", 300, 120)
+        .await
+        .unwrap();
+    assert_eq!(
+        sg,
+        reconciliation::sendgrid_health(&db, "a", 300, 120)
+            .await
+            .unwrap()
+    );
+    assert_eq!(sg["overdueUndelivered"], 1);
+    assert_eq!(sg["projectorStale"], true);
+    assert!(
+        reconciliation::scoped_sendgrid_health(&actor, "b", 300, 120)
+            .await
+            .is_err()
+    );
+    assert!(
+        reconciliation::scoped_sendgrid_health(&actor, "a", 0, 120)
+            .await
+            .is_err()
+    );
+    db.execute(
+        "UPDATE novu_queue_jobs SET sendgrid_delivery_result='delivered' WHERE id=$1",
+        &[&sendgrid],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO novu_rust_sendgrid_projection_heartbeat VALUES ('a',clock_timestamp())",
+        &[],
+    )
+    .await
+    .unwrap();
+    let healthy = reconciliation::scoped_sendgrid_health(&actor, "a", 300, 120)
+        .await
+        .unwrap();
+    assert_eq!(healthy["overdueUndelivered"], 0);
+    assert_eq!(healthy["projectorStale"], false);
+    db.execute(
+        "UPDATE novu_queue_jobs SET sendgrid_delivery_result='unknown' WHERE id=$1",
+        &[&sendgrid],
+    )
+    .await
+    .unwrap();
     assert!(reconciliation::scoped_health(&actor, "b").await.is_err());
     assert!(
         reconciliation::scoped_queue_health(&actor, "b", 300)
@@ -142,6 +202,7 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
         vec!["check-queue", "a", "300"],
         vec!["check-resend", "a", "300", "120"],
         vec!["check-twilio", "a", "300", "120"],
+        vec!["check-sendgrid", "a", "300", "120"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
             .args(args)
@@ -185,6 +246,8 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
             .env("SWALLOW_ALERT_SCOPED_DELIVERY", "true")
             .env("SWALLOW_ALERT_ATTEMPTS_ENABLED", "true")
             .env("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS", "300")
+            .env("SWALLOW_ALERT_SENDGRID_GRACE_SECONDS", "300")
+            .env("SWALLOW_ALERT_SENDGRID_HEARTBEAT_MAX_SECONDS", "120")
             .env("SWALLOW_ALERT_TWILIO_GRACE_SECONDS", "300")
             .env("SWALLOW_ALERT_TWILIO_HEARTBEAT_MAX_SECONDS", "120")
             .env("SWALLOW_ALERT_SLACK_JOBS_ENABLED", "false")
