@@ -102,7 +102,7 @@ describe('Swallow console', () => {
   });
 
   it('loads alert slots only with a restricted credential and clears them on leaving', async () => {
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[{channel:'slack',targetId:'ops',state:'unknown',lastStartedAt:null}],hasMore:true}),{status:200}));
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[{channel:'slack',targetId:'ops',state:'unknown',lastStartedAt:null}],hasMore:true,next:{channel:'slack',targetId:'ops'}}),{status:200}));
     const app = TestBed.createComponent(App).componentInstance;
     app.setSection('alerts');
     app.alertKey = 'a'.repeat(64);
@@ -115,6 +115,22 @@ describe('Swallow console', () => {
     expect(app.alertSlots()).toEqual([]);
   });
 
+  it('requests the next alert page and can return to the first', async () => {
+    const first = {data:[{channel:'email',targetId:'ops',state:'accepted',lastStartedAt:null}],hasMore:true,next:{channel:'email',targetId:'ops'}};
+    const second = {data:[{channel:'slack',targetId:'ops',state:'unknown',lastStartedAt:null}],hasMore:false,next:null};
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify(first),{status:200})).mockResolvedValueOnce(new Response(JSON.stringify(second),{status:200})).mockResolvedValueOnce(new Response(JSON.stringify(first),{status:200}));
+    const app = TestBed.createComponent(App).componentInstance;
+    app.alertKey = 'a'.repeat(64);
+    await app.loadAlerts();
+    await app.loadAlerts('next');
+    expect(fetchMock.mock.calls[1][0]).toContain('afterChannel=email&afterTarget=ops');
+    expect(app.alertPage()).toBe(2);
+    expect(app.alertSlots()[0].channel).toBe('slack');
+    await app.loadAlerts();
+    expect(app.alertPage()).toBe(1);
+    expect(fetchMock.mock.calls[2][0]).not.toContain('?');
+  });
+
   it('does not show an obsolete or unauthorized alert response', async () => {
     let resolve!: (response: Response) => void;
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockReturnValueOnce(new Promise<Response>((done) => { resolve = done; }));
@@ -122,7 +138,7 @@ describe('Swallow console', () => {
     app.alertKey = 'a'.repeat(64);
     const pending = app.loadAlerts();
     app.forgetAlertKey();
-    resolve(new Response(JSON.stringify({data:[{channel:'email',targetId:'old',state:'unknown',lastStartedAt:null}],hasMore:false}),{status:200}));
+    resolve(new Response(JSON.stringify({data:[{channel:'email',targetId:'old',state:'unknown',lastStartedAt:null}],hasMore:false,next:null}),{status:200}));
     await pending;
     expect(app.alertStatus()).toBe('idle');
     expect(app.alertSlots()).toEqual([]);

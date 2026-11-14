@@ -134,8 +134,8 @@ async fn issue_file_list_revoke_and_unknown_outcome_are_safe() {
     assert!(!failed.status.success());
     assert_eq!(
         db.query_one(
-            "SELECT count(*) FROM public.novu_rust_console_alert_grants",
-            &[]
+            "SELECT count(*) FROM public.novu_rust_console_alert_grants WHERE credential_id=$1",
+            &[&Uuid::parse_str(id).unwrap()]
         )
         .await
         .unwrap()

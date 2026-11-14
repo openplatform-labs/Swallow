@@ -45,7 +45,7 @@ async fn scoped_console_credentials_do_not_grant_api_key_access() {
     }
     assert!(db.execute("INSERT INTO public.novu_rust_console_credentials(token_hash,environment_id,expires_at) VALUES ($1,'ca','infinity')", &[&"f".repeat(64)]).await.is_err());
     let role = format!("console_{}", uuid::Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_console_subscribers(text,text,text,text),public.novu_rust_console_alerts(text) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_console_subscribers(text,text,text,text),public.novu_rust_console_alerts(text),public.novu_rust_console_alerts_page(text,text,text) TO {role}")).await.unwrap();
     let (actor, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move { driver.await.unwrap() });
     actor
@@ -131,6 +131,53 @@ async fn scoped_console_credentials_do_not_grant_api_key_access() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(alerts["data"].as_array().unwrap().len(), 100);
     assert_eq!(alerts["hasMore"], true);
+    assert_eq!(alerts["next"]["channel"], "slack");
+    assert_eq!(alerts["next"]["targetId"], "target-100");
+    let (status, page2) = call(
+        app.clone(),
+        "/v1/experimental/console/alerts?afterChannel=slack&afterTarget=target-100",
+        "SwallowConsole",
+        &token_a,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page2["data"].as_array().unwrap().len(), 1);
+    assert_eq!(page2["data"][0]["targetId"], "target-101");
+    assert_eq!(page2["next"], Value::Null);
+    assert_eq!(
+        call(
+            app.clone(),
+            "/v1/experimental/console/alerts?afterChannel=slack",
+            "SwallowConsole",
+            &token_a
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(
+            app.clone(),
+            "/v1/experimental/console/alerts?afterChannel=other&afterTarget=x",
+            "SwallowConsole",
+            &token_a
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(
+            app.clone(),
+            "/v1/experimental/console/alerts?afterChannel=slack&afterTarget=%20",
+            "SwallowConsole",
+            &token_a
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+
     assert!(!alerts.to_string().contains("other-env"));
     assert!(!alerts.to_string().contains("attemptId"));
     let (_, other_alerts) = call(app.clone(), alert_path, "SwallowConsole", &token_b).await;

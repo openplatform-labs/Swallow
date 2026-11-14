@@ -5,6 +5,7 @@ import { ClrAlertModule } from '@clr/angular/emphasis/alert';
 type ConnectionState = 'unchecked' | 'checking' | 'ready' | 'unavailable';
 type Subscriber = { id: string; firstName: string; lastName: string; email: string };
 type AlertSlot = { channel: string; targetId: string; state: string; lastStartedAt: string | null };
+type AlertCursor = { channel: string; targetId: string };
 type Section = 'overview' | 'workflows' | 'subscribers' | 'channels' | 'activity' | 'alerts' | 'settings';
 
 @Component({
@@ -36,6 +37,8 @@ export class App {
   readonly alertStatus = signal<'idle' | 'loading' | 'loaded' | 'error'>('idle');
   readonly alertError = signal('');
   readonly alertsHaveMore = signal(false);
+  readonly alertNext = signal<AlertCursor | null>(null);
+  readonly alertPage = signal(1);
   alertKey = '';
   private alertRequestId = 0;
   private alertAbort: AbortController | null = null;
@@ -89,6 +92,8 @@ export class App {
     this.alertAbort = null;
     this.alertSlots.set([]);
     this.alertsHaveMore.set(false);
+    this.alertNext.set(null);
+    this.alertPage.set(1);
     this.alertStatus.set('idle');
     this.alertError.set('');
   }
@@ -98,20 +103,23 @@ export class App {
     this.clearAlerts();
   }
 
-  async loadAlerts(): Promise<void> {
+  async loadAlerts(direction?: 'next'): Promise<void> {
+    const cursor = direction === 'next' ? this.alertNext() : null;
+    if (direction && !cursor) return;
+    const nextPage = direction ? this.alertPage() + 1 : 1;
     const id = ++this.alertRequestId;
     this.alertAbort?.abort();
     const controller = new AbortController();
     this.alertAbort = controller;
     this.alertSlots.set([]);
-    this.alertsHaveMore.set(false);
     this.alertError.set('');
     this.alertStatus.set('loading');
     try {
       const origin = this.validatedOrigin();
       const key = this.alertKey.trim();
       if (!/^[0-9a-f]{64}$/.test(key)) throw new Error('인증 값을 확인해 주세요.');
-      const response = await fetch(`${origin}/v1/experimental/console/alerts`, {
+      const query = cursor ? `?${new URLSearchParams({afterChannel:cursor.channel,afterTarget:cursor.targetId})}` : '';
+      const response = await fetch(`${origin}/v1/experimental/console/alerts${query}`, {
         method: 'GET', headers: { Authorization: `SwallowConsole ${key}` },
         cache: 'no-store', credentials: 'omit', redirect: 'error',
         signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10000)]),
@@ -119,7 +127,7 @@ export class App {
       if (response.status === 401 || response.status === 403) throw new Error('인증 값 또는 경보 조회 권한을 확인해 주세요.');
       if (!response.ok) throw new Error('경보 상태를 가져오지 못했습니다.');
       const body: unknown = await response.json();
-      if (typeof body !== 'object' || body === null || !('data' in body) || !Array.isArray(body.data) || !('hasMore' in body) || typeof body.hasMore !== 'boolean' || body.data.length > 100) throw new Error('API 응답 형식을 확인해 주세요.');
+      if (typeof body !== 'object' || body === null || !('data' in body) || !Array.isArray(body.data) || !('hasMore' in body) || typeof body.hasMore !== 'boolean' || body.data.length > 100 || !('next' in body) || !(body.next === null || (typeof body.next === 'object' && 'channel' in body.next && typeof body.next.channel === 'string' && 'targetId' in body.next && typeof body.next.targetId === 'string')) || (body.hasMore !== (body.next !== null))) throw new Error('API 응답 형식을 확인해 주세요.');
       const rows: AlertSlot[] = body.data.map((row: unknown) => {
         if (typeof row !== 'object' || row === null || !('channel' in row) || typeof row.channel !== 'string' || !('targetId' in row) || typeof row.targetId !== 'string' || !('state' in row) || typeof row.state !== 'string' || !('lastStartedAt' in row) || !(typeof row.lastStartedAt === 'string' || row.lastStartedAt === null)) throw new Error('API 응답 형식을 확인해 주세요.');
         return { channel: row.channel, targetId: row.targetId, state: row.state, lastStartedAt: row.lastStartedAt };
@@ -127,6 +135,8 @@ export class App {
       if (id !== this.alertRequestId) return;
       this.alertSlots.set(rows);
       this.alertsHaveMore.set(body.hasMore);
+      this.alertNext.set(body.next as AlertCursor | null);
+      this.alertPage.set(nextPage);
       this.alertStatus.set('loaded');
     } catch (error: unknown) {
       if (id !== this.alertRequestId) return;
