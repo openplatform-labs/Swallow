@@ -5,6 +5,12 @@ use novu_postgres_queue::{
 };
 use std::{error::Error, time::Duration};
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StateFailureMode {
+    ReportOnly,
+    Secondary,
+    Uncoordinated,
+}
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -74,8 +80,9 @@ async fn main() -> Result<()> {
         _ => return Err("invalid alert cooldown policy".into()),
     };
     let fallback = match std::env::var("SWALLOW_DB_ALERT_STATE_FAILURE_MODE").as_deref() {
-        Ok("send-uncoordinated") => true,
-        Ok("report-only") | Err(std::env::VarError::NotPresent) => false,
+        Ok("send-uncoordinated") => StateFailureMode::Uncoordinated,
+        Ok("secondary-store") => StateFailureMode::Secondary,
+        Ok("report-only") | Err(std::env::VarError::NotPresent) => StateFailureMode::ReportOnly,
         _ => return Err("invalid state database failure mode".into()),
     };
     let scoped = flag("SWALLOW_ALERT_SCOPED_DELIVERY", false)?;
@@ -125,6 +132,16 @@ async fn main() -> Result<()> {
     let (probe_config, probe_tls) =
         novu_rust_contracts::postgres::configure(&std::env::var("SWALLOW_DB_PROBE_URL")?)
             .map_err(|_| "invalid target database configuration")?;
+    let secondary_config = if fallback == StateFailureMode::Secondary {
+        Some(
+            novu_rust_contracts::postgres::configure(&std::env::var(
+                "SWALLOW_DB_ALERT_BACKUP_DATABASE_URL",
+            )?)
+            .map_err(|_| "invalid secondary database configuration")?,
+        )
+    } else {
+        None
+    };
     let probe = tokio::time::timeout(Duration::from_secs(seconds), async move {
         let (client, connection) = probe_config.connect(probe_tls).await?;
         let _driver = AbortOnDrop(tokio::spawn(async move {
@@ -134,16 +151,28 @@ async fn main() -> Result<()> {
         Ok::<(), tokio_postgres::Error>(())
     })
     .await;
-    let unhealthy = !matches!(probe, Ok(Ok(())));
-    alert.database_probe = Some((args[1].clone(), unhealthy));
+    let probe_unhealthy = !matches!(probe, Ok(Ok(())));
+    alert.database_probe = Some((args[1].clone(), probe_unhealthy));
     let monitor = tokio::time::timeout(
         Duration::from_secs(seconds),
         monitor_config.connect(monitor_tls),
     )
     .await;
+    let mut primary_unavailable = false;
     let (mut db, connection) = match monitor {
         Ok(Ok(value)) => value,
-        _ if fallback => {
+        _ if fallback == StateFailureMode::Secondary => {
+            primary_unavailable = true;
+            alert.alert_store_unavailable = true;
+            eprintln!("monitor database connection failed; using secondary alert state database");
+            let (config, tls) =
+                secondary_config.ok_or("secondary database configuration missing")?;
+            tokio::time::timeout(Duration::from_secs(seconds), config.connect(tls))
+                .await
+                .map_err(|_| "secondary database connection timed out")?
+                .map_err(|_| "secondary database connection failed")?
+        }
+        _ if fallback == StateFailureMode::Uncoordinated => {
             alert.alert_store_unavailable = true;
             eprintln!("monitor database connection failed; sending uncoordinated alerts");
             let result = alerts::send_uncoordinated(
@@ -174,7 +203,8 @@ async fn main() -> Result<()> {
     let _monitor_driver = AbortOnDrop(tokio::spawn(async move {
         let _ = connection.await;
     }));
-    let mut error = bad_config;
+    let unhealthy = probe_unhealthy || primary_unavailable;
+    let mut error = bad_config || primary_unavailable;
     if on_new {
         for (channel, target, enabled) in [
             ("slack", slack_id.as_str(), slack.is_some()),
