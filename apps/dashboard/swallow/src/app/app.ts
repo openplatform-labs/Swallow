@@ -3,6 +3,7 @@ import { FormsModule } from '@angular/forms';
 import { ClrAlertModule } from '@clr/angular/emphasis/alert';
 
 type ConnectionState = 'unchecked' | 'checking' | 'ready' | 'unavailable';
+type Subscriber = { id: string; firstName: string; lastName: string; email: string };
 type Section = 'overview' | 'workflows' | 'subscribers' | 'channels' | 'activity' | 'settings';
 
 @Component({
@@ -24,18 +25,116 @@ export class App {
   readonly status = signal<ConnectionState>('unchecked');
   readonly checkedAt = signal<string | null>(null);
   readonly detail = signal('');
+  readonly subscribers = signal<Subscriber[]>([]);
+  readonly subscriberStatus = signal<'idle' | 'loading' | 'loaded' | 'error'>('idle');
+  readonly subscriberError = signal('');
+  readonly nextCursor = signal<string | null>(null);
+  readonly previousCursor = signal<string | null>(null);
   apiOrigin = 'http://127.0.0.1:3000';
+  apiKey = '';
+  subscriberName = '';
+  private subscriberRequestId = 0;
+  private subscriberAbort: AbortController | null = null;
   private requestId = 0;
 
   get sectionName(): string {
     return this.sections.find((item) => item.id === this.section())?.label ?? '';
   }
 
+  setSection(next: Section): void {
+    if (this.section() === 'subscribers' && next !== 'subscribers') this.forgetKey();
+    this.section.set(next);
+  }
+
   connectionChanged(): void {
+    this.apiKey = '';
+    this.clearSubscribers();
     this.requestId++;
     this.status.set('unchecked');
     this.checkedAt.set(null);
     this.detail.set('');
+  }
+
+  clearSubscribers(): void {
+    this.subscriberRequestId++;
+    this.subscriberAbort?.abort();
+    this.subscriberAbort = null;
+    this.subscribers.set([]);
+    this.nextCursor.set(null);
+    this.previousCursor.set(null);
+    this.subscriberStatus.set('idle');
+    this.subscriberError.set('');
+  }
+
+  forgetKey(): void {
+    this.apiKey = '';
+    this.clearSubscribers();
+  }
+
+  private validatedOrigin(): string {
+    const origin = new URL(this.apiOrigin.trim());
+    if (!['http:', 'https:'].includes(origin.protocol) || origin.username || origin.password ||
+        origin.pathname !== '/' || origin.search || origin.hash) {
+      throw new Error('주소는 경로 없이 http 또는 https 출처로 입력해 주세요.');
+    }
+    if (origin.protocol === 'http:' && !['localhost', '127.0.0.1', '[::1]'].includes(origin.hostname)) {
+      throw new Error('원격 서버에는 HTTPS 주소를 사용해 주세요.');
+    }
+    return origin.origin;
+  }
+
+  async loadSubscribers(direction?: 'after' | 'before'): Promise<void> {
+    const cursor = direction === 'after' ? this.nextCursor() : direction === 'before' ? this.previousCursor() : null;
+    if (direction && !cursor) return;
+    const id = ++this.subscriberRequestId;
+    this.subscriberAbort?.abort();
+    const controller = new AbortController();
+    this.subscriberAbort = controller;
+    this.subscriberStatus.set('loading');
+    this.subscriberError.set('');
+    this.subscribers.set([]);
+    this.nextCursor.set(null);
+    this.previousCursor.set(null);
+    try {
+      const origin = this.validatedOrigin();
+      const key = this.apiKey.trim();
+      if (!key || /[^\x21-\x7e]/.test(key)) throw new Error('API 키를 확인해 주세요.');
+      const params = new URLSearchParams({ limit: '20' });
+      const name = this.subscriberName.trim();
+      if (name) params.set('name', name);
+      if (direction && cursor) params.set(direction, cursor);
+      const response = await fetch(`${origin}/v2/subscribers?${params}`, {
+        method: 'GET', headers: { Authorization: `ApiKey ${key}` },
+        cache: 'no-store', credentials: 'omit', redirect: 'error',
+        signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10000)]),
+      });
+      if (response.status === 401 || response.status === 403) throw new Error('API 키의 인증 또는 권한을 확인해 주세요.');
+      if (!response.ok) throw new Error('구독자 목록을 가져오지 못했습니다.');
+      const data: unknown = await response.json();
+      if (typeof data !== 'object' || data === null || !('data' in data) || !Array.isArray(data.data) ||
+          !('next' in data) || !(data.next === null || typeof data.next === 'string') ||
+          !('previous' in data) || !(data.previous === null || typeof data.previous === 'string')) {
+        throw new Error('API 응답 형식을 확인해 주세요.');
+      }
+      const rows: Subscriber[] = data.data.map((value: unknown) => {
+        if (typeof value !== 'object' || value === null || !('subscriberId' in value) || typeof value.subscriberId !== 'string') {
+          throw new Error('API 응답 형식을 확인해 주세요.');
+        }
+        const get = (key: string): string => key in value && typeof (value as Record<string, unknown>)[key] === 'string' ? (value as Record<string, string>)[key] : '';
+        return { id: value.subscriberId, firstName: get('firstName'), lastName: get('lastName'), email: get('email') };
+      });
+      if (id !== this.subscriberRequestId) return;
+      this.subscribers.set(rows);
+      this.nextCursor.set(data.next);
+      this.previousCursor.set(data.previous);
+      this.subscriberStatus.set('loaded');
+    } catch (error: unknown) {
+      if (id !== this.subscriberRequestId) return;
+      this.subscriberStatus.set('error');
+      this.subscriberError.set(error instanceof Error && (error.message.startsWith('주소') || error.message.startsWith('원격') || error.message.startsWith('API ') || error.message.startsWith('구독자')) ? error.message : '서버에 연결할 수 없습니다.');
+    } finally {
+      if (id === this.subscriberRequestId) this.subscriberAbort = null;
+    }
   }
 
   async checkConnection(): Promise<void> {
@@ -44,15 +143,8 @@ export class App {
     this.detail.set('');
     this.checkedAt.set(null);
     try {
-      const origin = new URL(this.apiOrigin.trim());
-      if (!['http:', 'https:'].includes(origin.protocol) || origin.username || origin.password ||
-          origin.pathname !== '/' || origin.search || origin.hash) {
-        throw new Error('주소는 경로 없이 http 또는 https 출처로 입력해 주세요.');
-      }
-      if (origin.protocol === 'http:' && !['localhost', '127.0.0.1', '[::1]'].includes(origin.hostname)) {
-        throw new Error('원격 서버에는 HTTPS 주소를 사용해 주세요.');
-      }
-      const response = await fetch(`${origin.origin}/health/ready`, {
+      const origin = this.validatedOrigin();
+      const response = await fetch(`${origin}/health/ready`, {
         cache: 'no-store', credentials: 'omit', signal: AbortSignal.timeout(5000),
       });
       const body: unknown = await response.json();
