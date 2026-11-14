@@ -60,11 +60,12 @@ async fn worker_supports_token_pem_and_integration_files() {
             .env_remove("NOVU_FCM_CLIENT_EMAIL")
             .env_remove("NOVU_FCM_PRIVATE_KEY")
             .env_remove("NOVU_FCM_PRIVATE_KEY_FILE")
+            .env_remove("SWALLOW_FCM_ALLOW_SHARED_PROVIDER")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         c
     };
-    for mode in 0..3 {
+    for mode in 0..4 {
         let mut c = command();
         match mode {
             0 => {
@@ -74,8 +75,12 @@ async fn worker_supports_token_pem_and_integration_files() {
                 c.env("NOVU_FCM_CLIENT_EMAIL", "example@example.test")
                     .env("NOVU_FCM_PRIVATE_KEY_FILE", &key);
             }
-            _ => {
+            2 => {
                 c.env("NOVU_FCM_INTEGRATIONS_FILE", &integrations);
+            }
+            _ => {
+                c.env("NOVU_FCM_ACCESS_TOKEN_FILE", &token)
+                    .env("SWALLOW_FCM_ALLOW_SHARED_PROVIDER", "true");
             }
         }
         let mut child = c.spawn().unwrap();
@@ -91,6 +96,19 @@ async fn worker_supports_token_pem_and_integration_files() {
         let log = String::from_utf8_lossy(&output.stderr);
         assert!(!log.contains("fixture-token") && !log.contains("BEGIN PRIVATE KEY"));
     }
+    for invalid in ["yes", "TRUE", ""] {
+        let result = command()
+            .env("SWALLOW_FCM_ALLOW_SHARED_PROVIDER", invalid)
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+    }
+    let result = command()
+        .env("NOVU_FCM_INTEGRATIONS_FILE", &integrations)
+        .env("SWALLOW_FCM_ALLOW_SHARED_PROVIDER", "true")
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
     for mode in 0..3 {
         let mut c = command();
         match mode {

@@ -60,7 +60,16 @@ pub async fn process_one(
     environment: &str,
     provider: &Fcm,
 ) -> Result<bool, Error> {
-    process_one_inner(client, environment, Some(provider), None).await
+    process_one_inner(client, environment, Some(provider), None, false).await
+}
+
+/// Explicitly use one configured FCM provider for all integration IDs.
+pub async fn process_one_with_shared_provider(
+    client: &mut Client,
+    environment: &str,
+    provider: &Fcm,
+) -> Result<bool, Error> {
+    process_one_inner(client, environment, Some(provider), None, true).await
 }
 
 /// Process workflow targets using an explicit integration-to-provider map.
@@ -70,7 +79,7 @@ pub async fn process_one_with_integrations(
     environment: &str,
     providers: &HashMap<String, Fcm>,
 ) -> Result<bool, Error> {
-    process_one_inner(client, environment, None, Some(providers)).await
+    process_one_inner(client, environment, None, Some(providers), false).await
 }
 
 async fn process_one_inner(
@@ -78,6 +87,7 @@ async fn process_one_inner(
     environment: &str,
     default_provider: Option<&Fcm>,
     providers: Option<&HashMap<String, Fcm>>,
+    allow_shared_provider: bool,
 ) -> Result<bool, Error> {
     let Some(job) = claim(client, environment).await? else {
         return Ok(false);
@@ -150,7 +160,12 @@ async fn process_one_inner(
             {
                 Some(("canceled", "cancelled", "push preference disabled"))
             }
-            Some(row) if route.is_none() && row.get::<_, bool>(10) && providers.is_none() => {
+            Some(row)
+                if route.is_none()
+                    && row.get::<_, bool>(10)
+                    && providers.is_none()
+                    && !allow_shared_provider =>
+            {
                 Some((
                     "failed",
                     "failed",
@@ -206,7 +221,9 @@ async fn process_one_inner(
                     channels.push((Some(active.get(0)), vec![String::new()], true));
                 }
             }
-            if channels.is_empty() || (channels.len() > 1 && providers.is_none()) {
+            if channels.is_empty()
+                || (channels.len() > 1 && providers.is_none() && !allow_shared_provider)
+            {
                 tx.execute("UPDATE novu_rust_push_step_outcomes SET status='failed',push_job_id=NULL WHERE environment_id=$1 AND push_job_id=$2",&[&environment,&job.id]).await?;
                 tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='FCM routing integration unavailable',lease_token=NULL,lease_until=NULL WHERE id=$1",&[&job.id]).await?;
                 tx.commit().await?;
@@ -418,6 +435,30 @@ async fn process_one_inner(
             }
         }
     };
+    if providers.is_none() && !allow_shared_provider {
+        let integrations: std::collections::HashSet<&str> = prepared_context
+            .as_ref()
+            .and_then(|value| value.get("target_metadata"))
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| {
+                item.get("integration_internal_id")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .collect();
+        if integrations.len() > 1 {
+            tx.rollback().await?;
+            crate::fail(
+                client,
+                job.id,
+                job.lease_token,
+                "multiple push integrations not configured for delivery",
+            )
+            .await?;
+            return Ok(true);
+        }
+    }
     let rows = tx
         .query(
             "SELECT target_index FROM novu_rust_fcm_attempts WHERE job_id=$1 AND environment_id=$2",
@@ -784,6 +825,9 @@ mod tests {
         for _ in 0..count.max(1) {
             let processed = if let Some(integrations) = integrations.as_ref() {
                 process_one_with_integrations(&mut db, "64a000000000000000000002", integrations)
+                    .await
+            } else if std::env::var("TEST_PUSH_ALLOW_SHARED_PROVIDER").as_deref() == Ok("true") {
+                process_one_with_shared_provider(&mut db, "64a000000000000000000002", &provider)
                     .await
             } else {
                 process_one(&mut db, "64a000000000000000000002", &provider).await

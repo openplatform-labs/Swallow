@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Compare per-integration FCM subscriber channels on disposable servers.
 
-The reference sends to each active integration. Rust requires explicit distinct
-provider credentials for multi-integration delivery.
+The reference sends to each active integration. Rust supports either explicit
+per-integration credentials or an explicitly selected shared provider.
 """
 import json
 import os
@@ -89,6 +89,32 @@ result=run('docker','exec',pg,'psql','-U','postgres','-d','novu_compat','-At','-
 assert sorted(sent)==['first-a','first-b','second-b'] and result=='failed',(sent,result)
 print('multi-integration delivery: source sent three targets; Rust safely rejected the unsupported routing')
 
+shared_tx=subscriber+'-shared'
+for base in bases:
+    status,response=request(base,'POST','/v1/events/trigger',{'name':'push-multi','to':subscriber,'transactionId':shared_tx})
+    assert status==201,(base,status,response)
+for _ in range(90):
+    job=run('docker','exec',pg,'psql','-U','postgres','-d','novu_compat','-At','-c',f"SELECT push_job_id FROM novu_rust_push_step_outcomes WHERE transaction_id='{shared_tx}' AND status='queued'")
+    log=subprocess.run(['docker','exec',worker,'cat','/tmp/novu-push-capture.jsonl'],capture_output=True,text=True).stdout.splitlines()
+    shared_reference=[json.loads(line) for line in log if json.loads(line).get('tokens',[None])[0] in ('first-a','first-b','second-b')]
+    if job and len(shared_reference)>=6:break
+    time.sleep(.5)
+else:raise AssertionError((job,len(shared_reference)))
+with tempfile.TemporaryDirectory(prefix='novu-shared-fcm-') as directory:
+    shared_actual=[];shared_auth=[]
+    for stage,count in enumerate((1,2)):
+        capture=Path(directory)/f'capture-{stage}.json';auth=Path(directory)/f'auth-{stage}.json'
+        subprocess.run(['cargo','test','--locked','--offline','--lib','capture_reference_workflow_push','--','--ignored'],cwd=Path(__file__).resolve().parents[3]/'worker'/'rust-queue',env=dict(os.environ,TEST_PUSH_CAPTURE_PATH=str(capture),TEST_PUSH_AUTH_CAPTURE_PATH=str(auth),TEST_PUSH_EXPECTED_COUNT=str(count),TEST_PUSH_ALLOW_SHARED_PROVIDER='true'),check=True)
+        shared_actual.extend(json.loads(capture.read_text()));shared_auth.extend(json.loads(auth.read_text()))
+    assert shared_auth==['Bearer fixture']*3
+assert [item['message']['token'] for item in shared_actual]==['first-a','first-b','second-b']
+for original,rust in zip(shared_reference[-3:],shared_actual):
+    original['token']=original.pop('tokens')[0]
+    original['data'].pop('__nvMessageId');rust['message']['data'].pop('__nvMessageId')
+    assert original==rust['message'],(original,rust)
+assert run('docker','exec',pg,'psql','-U','postgres','-d','novu_compat','-At','-c',f"SELECT status FROM novu_queue_jobs WHERE id='{job}'")=='completed'
+print('explicit shared FCM provider sends all three targets: match')
+
 transaction=subscriber+'-mapped'
 for base in bases:
     status,response=request(base,'POST','/v1/events/trigger',{'name':'push-multi','to':subscriber,'transactionId':transaction})
@@ -97,7 +123,7 @@ for _ in range(90):
     job=run('docker','exec',pg,'psql','-U','postgres','-d','novu_compat','-At','-c',f"SELECT push_job_id FROM novu_rust_push_step_outcomes WHERE transaction_id='{transaction}' AND status='queued'")
     log=subprocess.run(['docker','exec',worker,'cat','/tmp/novu-push-capture.jsonl'],capture_output=True,text=True).stdout.splitlines()
     requests=[json.loads(line) for line in log if json.loads(line).get('tokens',[None])[0] in ('first-a','first-b','second-b')]
-    if job and len(requests)>=6:break
+    if job and len(requests)>=9:break
     time.sleep(.5)
 else:raise AssertionError((job,len(requests)))
 reference=requests[-3:]
@@ -124,10 +150,28 @@ sort=lambda items:sorted(items,key=lambda item:json.dumps(item,sort_keys=True))
 assert sort(source_history)==sort(rust_history)==sort([{'deviceTokens':['first-a','first-b'],'status':'sent'},{'deviceTokens':['first-a','first-b'],'status':'sent'},{'deviceTokens':['second-b'],'status':'sent'}]),(source_history,rust_history)
 print('multi-integration requests match; Rust uses the configured test credential for each integration')
 
+# A strict single-provider worker must not consume a prepared multi-integration
+# job made by another worker after one target has already been sent.
+switched_tx=subscriber+'-switched'
+assert request(bases[1],'POST','/v1/events/trigger',{'name':'push-multi','to':subscriber,'transactionId':switched_tx})[0]==201
+for _ in range(90):
+    switched_job=run('docker','exec',pg,'psql','-U','postgres','-d','novu_compat','-At','-c',f"SELECT push_job_id FROM novu_rust_push_step_outcomes WHERE transaction_id='{switched_tx}' AND status='queued'")
+    if switched_job:break
+    time.sleep(.5)
+else:raise AssertionError('switched job not queued')
+with tempfile.TemporaryDirectory(prefix='novu-switch-fcm-') as directory:
+    first_capture=Path(directory)/'first.json';strict_capture=Path(directory)/'strict.json'
+    subprocess.run(['cargo','test','--locked','--offline','--lib','capture_reference_workflow_push','--','--ignored'],cwd=Path(__file__).resolve().parents[3]/'worker'/'rust-queue',env=dict(os.environ,TEST_PUSH_CAPTURE_PATH=str(first_capture),TEST_PUSH_EXPECTED_COUNT='1',TEST_PUSH_INTEGRATIONS=json.dumps({first:'first-fixture-secret',second:'second-fixture-secret'})),check=True)
+    subprocess.run(['cargo','test','--locked','--offline','--lib','capture_reference_workflow_push','--','--ignored'],cwd=Path(__file__).resolve().parents[3]/'worker'/'rust-queue',env=dict(os.environ,TEST_PUSH_CAPTURE_PATH=str(strict_capture),TEST_PUSH_EXPECTED_COUNT='0',TEST_PUSH_ALLOW_SHARED_PROVIDER='false'),check=True)
+    assert len(json.loads(first_capture.read_text()))==1 and json.loads(strict_capture.read_text())==[]
+assert run('docker','exec',pg,'psql','-U','postgres','-d','novu_compat','-At','-c',f"SELECT status FROM novu_queue_jobs WHERE id='{switched_job}'")=='failed'
+print('strict worker rejects prepared multi-integration job after configuration switch')
+
 # A provider-wide token is sent once per populated channel, while a topic or
 # a subscriber with no channels uses the most recently created integration.
 for label,target_user,route_key,count,expected_auth in [
     ('token-channels',subscriber,'token',2,['first-fixture-secret','second-fixture-secret']),
+    ('token-shared',subscriber,'token',2,['fixture','fixture']),
     ('topic-broadcast',subscriber,'topic',1,['second-fixture-secret']),
     ('token-no-channel','route-empty-'+uuid.uuid4().hex,'token',1,['second-fixture-secret']),
 ]:
@@ -149,7 +193,8 @@ for label,target_user,route_key,count,expected_auth in [
     with tempfile.TemporaryDirectory(prefix='novu-multi-route-') as directory:
         capture=Path(directory)/'capture.json';auth=Path(directory)/'auth.json'
         config={first:'first-fixture-secret',second:'second-fixture-secret'}
-        subprocess.run(['cargo','test','--locked','--offline','--lib','capture_reference_workflow_push','--','--ignored'],cwd=Path(__file__).resolve().parents[3]/'worker'/'rust-queue',env=dict(os.environ,TEST_PUSH_CAPTURE_PATH=str(capture),TEST_PUSH_AUTH_CAPTURE_PATH=str(auth),TEST_PUSH_EXPECTED_COUNT=str(count),TEST_PUSH_INTEGRATIONS=json.dumps(config)),check=True)
+        routing_env={'TEST_PUSH_ALLOW_SHARED_PROVIDER':'true'} if label=='token-shared' else {'TEST_PUSH_INTEGRATIONS':json.dumps(config)}
+        subprocess.run(['cargo','test','--locked','--offline','--lib','capture_reference_workflow_push','--','--ignored'],cwd=Path(__file__).resolve().parents[3]/'worker'/'rust-queue',env=dict(os.environ,TEST_PUSH_CAPTURE_PATH=str(capture),TEST_PUSH_AUTH_CAPTURE_PATH=str(auth),TEST_PUSH_EXPECTED_COUNT=str(count),**routing_env),check=True)
         actual=[item['message'] for item in json.loads(capture.read_text())]
         assert json.loads(auth.read_text())==['Bearer '+secret for secret in expected_auth],(label,auth.read_text())
     for original,rust in zip(reference,actual):

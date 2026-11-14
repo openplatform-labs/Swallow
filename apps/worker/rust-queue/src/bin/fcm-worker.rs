@@ -82,6 +82,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if environment.is_empty() {
         return Err("NOVU_FCM_ENVIRONMENT_ID must not be empty".into());
     }
+    let shared_provider = match std::env::var("SWALLOW_FCM_ALLOW_SHARED_PROVIDER").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid shared FCM provider setting".into()),
+    };
     let (provider, integrations) = if let Some(raw) = multiline_secret(
         "NOVU_FCM_INTEGRATIONS",
         "NOVU_FCM_INTEGRATIONS_FILE",
@@ -105,6 +110,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         };
         (Some(provider), None)
     };
+    if shared_provider && integrations.is_some() {
+        return Err("shared FCM provider cannot be combined with an integration map".into());
+    }
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let timeout = match std::env::var("NOVU_FCM_DB_TIMEOUT_SECONDS") {
         Ok(value) => value
@@ -154,6 +162,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                 &mut db,
                                 &environment,
                                 integrations,
+                            )
+                            .await
+                        } else if shared_provider {
+                            fcm_queue::process_one_with_shared_provider(
+                                &mut db,
+                                &environment,
+                                provider.as_ref().expect("single provider configured"),
                             )
                             .await
                         } else {
