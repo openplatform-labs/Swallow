@@ -1,0 +1,191 @@
+//! JWT alert scope, pagination and revocation in a disposable PostgreSQL database.
+use axum::{
+    Extension,
+    body::Body,
+    http::{Request, StatusCode, header},
+};
+use http_body_util::BodyExt;
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use novu_rust_api::operator_access_token::AccessTokenVerifier;
+use serde_json::{Value, json};
+use std::{
+    process::{Child, Command, Stdio},
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+use tokio_postgres::{Client, NoTls};
+use tower::ServiceExt;
+use uuid::Uuid;
+const PRIVATE: &[u8] = include_bytes!("fixtures/operator_jwt/test-only-private.pem");
+const PUBLIC: &[u8] = include_bytes!("fixtures/operator_jwt/test-only-public.pem");
+struct ApiProcess(Child);
+impl Drop for ApiProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+async fn connect(url: &str) -> Client {
+    let (client, driver) = tokio_postgres::connect(url, NoTls).await.unwrap();
+    tokio::spawn(async move { driver.await.unwrap() });
+    client
+}
+fn request(token: &str, query: &str) -> Request<Body> {
+    Request::builder()
+        .uri(format!("/v1/experimental/operator/alerts?{query}"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+#[tokio::test]
+#[ignore = "requires fully migrated disposable PostgreSQL and role creation"]
+async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
+    let url = std::env::var("TEST_DATABASE_URL").unwrap();
+    let db = connect(&url).await;
+    db.batch_execute("INSERT INTO public.novu_rust_environments VALUES('jwt-alert-a','org'),('jwt-alert-b','org')").await.unwrap();
+    let role = format!("jwt_alert_{}", Uuid::new_v4().simple());
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_alerts(text,text,text,text,bigint,text,text),public.novu_rust_console_alerts_page(text,text,text) TO {role}")).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname::text=$1",&[&role]).await.unwrap();
+    db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id,alert_read) VALUES('https://issuer.test','person','console','jwt-alert-a',true),('https://issuer.test','reader','console','jwt-alert-a',false); INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state,attempt_id) SELECT 'jwt-alert-a','slack','target-'||lpad(n::text,3,'0'),'unknown',gen_random_uuid() FROM generate_series(1,101) n; INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES('jwt-alert-b','email','private','unknown')").await.unwrap();
+    db.batch_execute("WITH c AS (INSERT INTO public.novu_rust_console_credentials(token_hash,environment_id,expires_at,subscriber_read) VALUES(encode(sha256(convert_to(repeat('a',64),'UTF8')),'hex'),'jwt-alert-a',clock_timestamp()+interval '1 hour',false) RETURNING credential_id) INSERT INTO public.novu_rust_console_alert_grants SELECT credential_id FROM c").await.unwrap();
+    let api_url = url.replacen("postgres://postgres@", &format!("postgres://{role}@"), 1);
+    let api = connect(&api_url).await;
+    assert!(
+        api.query("SELECT * FROM public.novu_rust_alert_delivery_slots", &[])
+            .await
+            .is_err()
+    );
+    let app = novu_rust_api::router(Arc::new(api)).layer(Extension(Arc::new(
+        AccessTokenVerifier::new("https://issuer.test", "swallow", &[("key", PUBLIC)]).unwrap(),
+    )));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let make = |sub: &str| {
+        let mut h = Header::new(Algorithm::RS256);
+        h.typ = Some("at+jwt".into());
+        h.kid = Some("key".into());
+        encode(&h,&json!({"iss":"https://issuer.test","sub":sub,"aud":"swallow","exp":now+120,"iat":now-1,"jti":"token","client_id":"console"}),&EncodingKey::from_rsa_pem(PRIVATE).unwrap()).unwrap()
+    };
+    let token = make("person");
+    assert_eq!(
+        app.clone()
+            .oneshot(request(&make("reader"), "environmentId=jwt-alert-a"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(request(&token, "environmentId=jwt-alert-b"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(request(
+                &token,
+                "environmentId=jwt-alert-a&afterChannel=slack"
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let first = app
+        .clone()
+        .oneshot(request(&token, "environmentId=jwt-alert-a"))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(first.headers()[header::CACHE_CONTROL], "no-store");
+    let first: Value =
+        serde_json::from_slice(&first.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(first["data"].as_array().unwrap().len(), 100);
+    assert_eq!(first["hasMore"], true);
+    assert_eq!(first["next"]["targetId"], "target-100");
+    assert!(first["data"][0]["attemptId"].is_string());
+    let legacy = Request::builder()
+        .uri("/v1/experimental/console/alerts")
+        .header(
+            header::AUTHORIZATION,
+            format!("SwallowConsole {}", "a".repeat(64)),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let legacy = app.clone().oneshot(legacy).await.unwrap();
+    assert_eq!(legacy.status(), StatusCode::OK);
+    let legacy: Value =
+        serde_json::from_slice(&legacy.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(first, legacy);
+    let second = app
+        .clone()
+        .oneshot(request(
+            &token,
+            "environmentId=jwt-alert-a&afterChannel=slack&afterTarget=target-100",
+        ))
+        .await
+        .unwrap();
+    let second: Value =
+        serde_json::from_slice(&second.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(second["data"].as_array().unwrap().len(), 1);
+    assert_eq!(second["data"][0]["targetId"], "target-101");
+    assert_eq!(second["hasMore"], false);
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    drop(socket);
+    let config=json!({"issuer":"https://issuer.test","audience":"swallow","keys":[{"kid":"key","pem":std::str::from_utf8(PUBLIC).unwrap()}]}).to_string();
+    let _server = ApiProcess(
+        Command::new(env!("CARGO_BIN_EXE_novu-rust-api"))
+            .env("DATABASE_URL", &api_url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("LISTEN_ADDR", format!("127.0.0.1:{port}"))
+            .env("SWALLOW_OPERATOR_JWT_CONFIG", config)
+            .env_remove("SWALLOW_OPERATOR_JWT_CONFIG_FILE")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut success = false;
+    for _ in 0..100 {
+        let output=Command::new("curl").args(["--silent","--max-time","1","--write-out","%{http_code}","--output","/dev/null","--header",&format!("Authorization: Bearer {token}"),&format!("http://127.0.0.1:{port}/v1/experimental/operator/alerts?environmentId=jwt-alert-a")]).output().unwrap();
+        if output.status.success() && output.stdout == b"200" {
+            success = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        success,
+        "configured API process failed to return JWT alert page"
+    );
+    let mut blocker = connect(&url).await;
+    let tx = blocker.transaction().await.unwrap();
+    tx.execute("UPDATE public.novu_rust_operator_jwt_identities SET alert_read=false WHERE subject='person' AND environment_id='jwt-alert-a'",&[]).await.unwrap();
+    let pending = tokio::spawn({
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            app.oneshot(request(&token, "environmentId=jwt-alert-a"))
+                .await
+                .unwrap()
+                .status()
+        }
+    });
+    let mut waiting = false;
+    for _ in 0..100 {
+        waiting=db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%novu_rust_operator_jwt_alerts%')",&[]).await.unwrap().get(0);
+        if waiting {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(waiting);
+    tx.commit().await.unwrap();
+    assert_eq!(pending.await.unwrap(), StatusCode::UNAUTHORIZED);
+}

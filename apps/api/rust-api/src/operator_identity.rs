@@ -9,13 +9,20 @@ use axum::{
 use std::{collections::HashMap, sync::Arc};
 use tokio_postgres::Client;
 
+#[derive(Clone, Copy)]
+enum Lookup {
+    Identity,
+    Subscribers,
+    Alerts,
+}
+
 pub(super) async fn me(
     State(db): State<Arc<Client>>,
     headers: HeaderMap,
     OriginalUri(uri): OriginalUri,
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
 ) -> Response {
-    query(db, headers, uri, verifier, false).await
+    query(db, headers, uri, verifier, Lookup::Identity).await
 }
 pub(super) async fn subscribers(
     State(db): State<Arc<Client>>,
@@ -23,14 +30,22 @@ pub(super) async fn subscribers(
     OriginalUri(uri): OriginalUri,
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
 ) -> Response {
-    query(db, headers, uri, verifier, true).await
+    query(db, headers, uri, verifier, Lookup::Subscribers).await
+}
+pub(super) async fn alerts(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::Alerts).await
 }
 async fn query(
     db: Arc<Client>,
     headers: HeaderMap,
     uri: Uri,
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
-    subscribers: bool,
+    lookup: Lookup,
 ) -> Response {
     let failure = |status, message, label| {
         let mut response = error_at(status, message, label, uri.path()).into_response();
@@ -67,10 +82,10 @@ async fn query(
             return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
         }
     }
-    let allowed: &[&str] = if subscribers {
-        &["environmentId", "name", "after", "before", "limit"]
-    } else {
-        &["environmentId"]
+    let allowed: &[&str] = match lookup {
+        Lookup::Subscribers => &["environmentId", "name", "after", "before", "limit"],
+        Lookup::Alerts => &["environmentId", "afterChannel", "afterTarget"],
+        Lookup::Identity => &["environmentId"],
     };
     if params.keys().any(|key| !allowed.contains(&key.as_str()))
         || params.get("limit").is_some_and(|limit| limit != "20")
@@ -86,36 +101,56 @@ async fn query(
     let Ok(exp) = i64::try_from(identity.expires_at) else {
         return failure(StatusCode::UNAUTHORIZED, "Unauthorized", "Unauthorized");
     };
-    let result = if subscribers {
-        let name = params.get("name").filter(|value| !value.is_empty());
-        let after = params.get("after");
-        let before = params.get("before");
-        db.query_one(
-            "SELECT public.novu_rust_operator_jwt_subscribers($1,$2,$3,$4,$5,$6,$7,$8)",
-            &[
-                &identity.issuer,
-                &identity.subject,
-                &identity.client_id,
-                &env,
-                &exp,
-                &name,
-                &after,
-                &before,
-            ],
-        )
-        .await
-    } else {
-        db.query_one(
-            "SELECT public.novu_rust_operator_jwt_self($1,$2,$3,$4,$5)",
-            &[
-                &identity.issuer,
-                &identity.subject,
-                &identity.client_id,
-                &env,
-                &exp,
-            ],
-        )
-        .await
+    let result = match lookup {
+        Lookup::Subscribers => {
+            let name = params.get("name").filter(|value| !value.is_empty());
+            let after = params.get("after");
+            let before = params.get("before");
+            db.query_one(
+                "SELECT public.novu_rust_operator_jwt_subscribers($1,$2,$3,$4,$5,$6,$7,$8)",
+                &[
+                    &identity.issuer,
+                    &identity.subject,
+                    &identity.client_id,
+                    &env,
+                    &exp,
+                    &name,
+                    &after,
+                    &before,
+                ],
+            )
+            .await
+        }
+        Lookup::Alerts => {
+            let channel = params.get("afterChannel");
+            let target = params.get("afterTarget");
+            db.query_one(
+                "SELECT public.novu_rust_operator_jwt_alerts($1,$2,$3,$4,$5,$6,$7)",
+                &[
+                    &identity.issuer,
+                    &identity.subject,
+                    &identity.client_id,
+                    &env,
+                    &exp,
+                    &channel,
+                    &target,
+                ],
+            )
+            .await
+        }
+        Lookup::Identity => {
+            db.query_one(
+                "SELECT public.novu_rust_operator_jwt_self($1,$2,$3,$4,$5)",
+                &[
+                    &identity.issuer,
+                    &identity.subject,
+                    &identity.client_id,
+                    &env,
+                    &exp,
+                ],
+            )
+            .await
+        }
     };
     match result {
         Ok(row) => (
