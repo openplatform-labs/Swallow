@@ -8,7 +8,7 @@ use std::{
     error::Error,
     future::IntoFuture,
     sync::{
-        Arc, RwLock,
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -22,12 +22,64 @@ struct Connected {
     db: Arc<tokio_postgres::Client>,
 }
 
+#[derive(Clone, Copy)]
+enum Routing {
+    RoundRobin,
+    LeastInflight,
+}
+
+struct ActiveRequest {
+    counts: Arc<Vec<AtomicUsize>>,
+    slot: usize,
+}
+impl Drop for ActiveRequest {
+    fn drop(&mut self) {
+        self.counts[self.slot].fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone)]
 struct ApiState {
     connections: Arc<Vec<Arc<RwLock<Option<Connected>>>>>,
     next: Arc<AtomicUsize>,
+    inflight: Arc<Vec<AtomicUsize>>,
+    selection: Arc<Mutex<()>>,
+    routing: Routing,
     timeout: Duration,
     draining: Arc<AtomicBool>,
+}
+
+impl ApiState {
+    // Serialize selection and increments to avoid sending concurrent arrivals
+    // to the same nominally idle connection. No lock is held across await.
+    fn select(&self) -> Option<(Connected, ActiveRequest)> {
+        let _selection = self.selection.lock().ok()?;
+        let len = self.connections.len();
+        let start = self.next.fetch_add(1, Ordering::Relaxed) % len;
+        let available = (0..len).filter_map(|offset| {
+            let index = (start + offset) % len;
+            self.connections[index]
+                .read()
+                .ok()
+                .and_then(|guard| guard.clone())
+                .filter(|current| !current.db.is_closed())
+                .map(|current| (index, current))
+        });
+        let selected = match self.routing {
+            Routing::RoundRobin => available.into_iter().next(),
+            Routing::LeastInflight => available
+                .into_iter()
+                .min_by_key(|(index, _)| self.inflight[*index].load(Ordering::Relaxed)),
+        }?;
+        self.inflight[selected.0].fetch_add(1, Ordering::Relaxed);
+        Some((
+            selected.1,
+            ActiveRequest {
+                counts: self.inflight.clone(),
+                slot: selected.0,
+            },
+        ))
+    }
 }
 
 async fn forward(State(shared): State<ApiState>, request: Request) -> Response {
@@ -39,16 +91,9 @@ async fn forward(State(shared): State<ApiState>, request: Request) -> Response {
         )
             .into_response();
     }
-    let start = shared.next.fetch_add(1, Ordering::Relaxed) % shared.connections.len();
-    let current = (0..shared.connections.len()).find_map(|offset| {
-        shared.connections[(start + offset) % shared.connections.len()]
-            .read()
-            .ok()
-            .and_then(|guard| guard.clone())
-            .filter(|c| !c.db.is_closed())
-    });
+    let current = shared.select();
     match current {
-        Some(current) => match current.router.oneshot(request).await {
+        Some((current, _active)) => match current.router.oneshot(request).await {
             Ok(response) => response,
             Err(never) => match never {},
         },
@@ -241,6 +286,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if !(1..=16).contains(&connections) {
         return Err("invalid API database connection count".into());
     }
+    let routing = match std::env::var("SWALLOW_API_DB_ROUTING").as_deref() {
+        Ok("round-robin") | Err(std::env::VarError::NotPresent) => Routing::RoundRobin,
+        Ok("least-inflight") => Routing::LeastInflight,
+        _ => return Err("invalid API database routing policy".into()),
+    };
     let health_endpoints = match std::env::var("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED").as_deref() {
         Ok("true") => true,
         Ok("false") | Err(std::env::VarError::NotPresent) => false,
@@ -255,6 +305,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 .collect(),
         ),
         next: Arc::new(AtomicUsize::new(0)),
+        inflight: Arc::new((0..connections).map(|_| AtomicUsize::new(0)).collect()),
+        selection: Arc::new(Mutex::new(())),
+        routing,
         timeout,
         draining: Arc::new(AtomicBool::new(false)),
     };

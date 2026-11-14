@@ -50,6 +50,20 @@ fn invalid_database_connection_counts_are_rejected() {
         );
     }
 }
+#[test]
+fn invalid_database_routing_is_rejected() {
+    let output = Command::new(env!("CARGO_BIN_EXE_novu-rust-api"))
+        .env("DATABASE_URL", "postgres://localhost/unused")
+        .env("SWALLOW_API_DB_ROUTING", "random-policy")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("invalid API database routing policy")
+    );
+}
 #[tokio::test]
 #[ignore = "requires fully migrated disposable PostgreSQL and curl"]
 async fn one_locked_connection_does_not_block_every_request_or_readiness() {
@@ -85,6 +99,7 @@ async fn one_locked_connection_does_not_block_every_request_or_readiness() {
         .env("LISTEN_ADDR", format!("127.0.0.1:{port}"))
         .env("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED", "true")
         .env("SWALLOW_API_DB_CONNECTIONS", "2")
+        .env("SWALLOW_API_DB_ROUTING", "least-inflight")
         .env("SWALLOW_API_DB_HEALTH_INTERVAL_SECONDS", "30")
         .env("SWALLOW_API_DB_HEALTH_TIMEOUT_SECONDS", "2")
         .env_remove("SWALLOW_API_STRICT_SECURITY_CONFIG")
@@ -154,17 +169,57 @@ async fn one_locked_connection_does_not_block_every_request_or_readiness() {
     let before = Instant::now();
     assert_eq!(http(port, "/health/ready", None, "1"), Some(200));
     assert!(before.elapsed() < Duration::from_secs(2));
-    let mut success = false;
-    for _ in 0..4 {
-        if http(port, "/v1/experimental/console/alerts", Some(&b), "1") == Some(200) {
-            success = true;
-            break;
-        }
+    for _ in 0..5 {
+        assert_eq!(
+            http(port, "/v1/experimental/console/alerts", Some(&b), "1"),
+            Some(200),
+            "an idle connection should serve repeated requests while the other is blocked"
+        );
     }
-    assert!(success, "idle DB connection never handled a request");
     assert!(pending.try_wait().unwrap().is_none());
     tx.commit().await.unwrap();
     assert_eq!(pending.wait_with_output().unwrap().stdout, b"200");
+    // Concurrent arrivals should occupy different idle connections rather
+    // than both selecting the same one before the counters are incremented.
+    let hash_b = format!("{:x}", Sha256::digest(b.as_bytes()));
+    let tx = db.transaction().await.unwrap();
+    tx.execute("UPDATE novu_rust_console_credentials SET enabled=true WHERE token_hash=$1 OR token_hash=$2", &[&hash,&hash_b]).await.unwrap();
+    let spawn_request = |token: &str| {
+        Command::new("curl")
+            .args([
+                "-s",
+                "--max-time",
+                "10",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "-H",
+                &format!("Authorization: SwallowConsole {token}"),
+                &format!("http://127.0.0.1:{port}/v1/experimental/console/alerts"),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    let one = spawn_request(&a);
+    let two = spawn_request(&b);
+    let mut both_blocked = false;
+    for _ in 0..100 {
+        both_blocked=observer.query_one("SELECT count(*)=2 FROM pg_stat_activity WHERE application_name='api_pool_test' AND wait_event_type='Lock'",&[]).await.unwrap().get(0);
+        if both_blocked {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        both_blocked,
+        "concurrent requests did not use both connections"
+    );
+    tx.commit().await.unwrap();
+    assert_eq!(one.wait_with_output().unwrap().stdout, b"200");
+    assert_eq!(two.wait_with_output().unwrap().stdout, b"200");
     assert!(
         Command::new("kill")
             .args(["-TERM", &server.0.id().to_string()])
