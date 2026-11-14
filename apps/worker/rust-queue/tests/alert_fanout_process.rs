@@ -92,28 +92,33 @@ fn terminating_fanout_bounds_wait_and_stops_its_active_child() {
     let child = dir.join("send-delivery-alert");
     std::fs::write(
         &child,
-        "#!/bin/sh\nprintf '%s' $$ > \"$FANOUT_TEST_CHILD_PID\"\nexec sleep 15\n",
+        "#!/bin/sh\nprintf '%s' $$ > \"$FANOUT_TEST_CHILD_PID.$SWALLOW_ALERT_SLACK_TARGET_ID\"\nexec sleep 15\n",
     )
     .unwrap();
     std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
     let config = dir.join("targets.json");
-    std::fs::write(&config,serde_json::to_vec(&serde_json::json!({"targets":[{"channel":"slack","id":"ops","webhook_file":dir.join("secret")}]})).unwrap()).unwrap();
+    std::fs::write(&config,serde_json::to_vec(&serde_json::json!({"targets":[{"channel":"slack","id":"a","webhook_file":dir.join("secret")},{"channel":"slack","id":"b","webhook_file":dir.join("secret")}]})).unwrap()).unwrap();
     let pid_file = dir.join("child-pid");
     let mut parent = Command::new(&fanout)
         .args(["delivery", "env", "300", "120", "60"])
         .arg(&config)
         .env("SWALLOW_ALERT_SHUTDOWN_GRACE_SECONDS", "1")
+        .env("SWALLOW_ALERT_FANOUT_CONCURRENCY", "2")
         .env("FANOUT_TEST_CHILD_PID", &pid_file)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !pid_file.exists() && Instant::now() < deadline {
+    let pid_files = [dir.join("child-pid.a"), dir.join("child-pid.b")];
+    while !pid_files.iter().all(|p| p.exists()) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
-    assert!(pid_file.exists());
-    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    assert!(pid_files.iter().all(|p| p.exists()));
+    let pids: Vec<_> = pid_files
+        .iter()
+        .map(|p| std::fs::read_to_string(p).unwrap())
+        .collect();
     assert!(
         Command::new("kill")
             .args(["-TERM", &parent.id().to_string()])
@@ -130,20 +135,153 @@ fn terminating_fanout_bounds_wait_and_stops_its_active_child() {
         std::thread::sleep(Duration::from_millis(25));
     };
     assert_eq!(status.code(), Some(1));
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Command::new("kill")
-        .args(["-0", &pid])
+    for pid in pids {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Command::new("kill")
+            .args(["-0", &pid])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "child was left running after fanout timeout"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn parallel_limit_allows_two_children_and_holds_the_third() {
+    use std::time::{Duration, Instant};
+    let dir = std::env::temp_dir().join(format!("swallow-fanout-parallel-{}", Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let fanout = dir.join("alert-fanout");
+    std::fs::copy(env!("CARGO_BIN_EXE_alert-fanout"), &fanout).unwrap();
+    let child = dir.join("send-delivery-alert");
+    std::fs::write(
+        &child,
+        r#"#!/bin/sh
+printf started > "$FANOUT_TEST_DIR/$SWALLOW_ALERT_SLACK_TARGET_ID"
+case "$SWALLOW_ALERT_SLACK_TARGET_ID" in
+  a|b) while [ ! -f "$FANOUT_TEST_DIR/release" ]; do sleep 0.05; done;;
+esac
+exit 0
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config = dir.join("targets.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({"targets":[
+            {"channel":"slack","id":"a","webhook_file":dir.join("secret")},
+            {"channel":"slack","id":"b","webhook_file":dir.join("secret")},
+            {"channel":"slack","id":"c","webhook_file":dir.join("secret")}
+        ]}))
+        .unwrap(),
+    )
+    .unwrap();
+    for value in ["0", "9", "bad"] {
+        let output = Command::new(&fanout)
+            .args(["delivery", "env", "300", "120", "60"])
+            .arg(&config)
+            .env("FANOUT_TEST_DIR", &dir)
+            .env("SWALLOW_ALERT_FANOUT_CONCURRENCY", value)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(!dir.join("a").exists());
+    }
+    let mut process = Command::new(&fanout)
+        .args(["delivery", "env", "300", "120", "60"])
+        .arg(&config)
+        .env("FANOUT_TEST_DIR", &dir)
+        .env("SWALLOW_ALERT_FANOUT_CONCURRENCY", "2")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-        .unwrap()
-        .success()
-    {
-        assert!(
-            Instant::now() < deadline,
-            "child was left running after fanout timeout"
-        );
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !(dir.join("a").exists() && dir.join("b").exists()) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
+    assert!(dir.join("a").exists() && dir.join("b").exists());
+    assert!(
+        !dir.join("c").exists(),
+        "third destination started before a slot was free"
+    );
+    std::fs::write(dir.join("release"), "").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(s) = process.try_wait().unwrap() {
+            break s;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(status.success());
+    assert!(dir.join("c").exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn shutdown_waits_for_active_targets_and_does_not_start_pending_targets() {
+    use std::time::{Duration, Instant};
+    let dir = std::env::temp_dir().join(format!("swallow-fanout-stop-{}", Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let fanout = dir.join("alert-fanout");
+    std::fs::copy(env!("CARGO_BIN_EXE_alert-fanout"), &fanout).unwrap();
+    let child = dir.join("send-delivery-alert");
+    std::fs::write(&child,"#!/bin/sh\nprintf started > \"$FANOUT_TEST_DIR/$SWALLOW_ALERT_SLACK_TARGET_ID\"\nsleep 0.8\nprintf done > \"$FANOUT_TEST_DIR/$SWALLOW_ALERT_SLACK_TARGET_ID.done\"\n").unwrap();
+    std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config = dir.join("targets.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({"targets":[
+            {"channel":"slack","id":"a","webhook_file":dir.join("secret")},
+            {"channel":"slack","id":"b","webhook_file":dir.join("secret")},
+            {"channel":"slack","id":"c","webhook_file":dir.join("secret")}
+        ]}))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut process = Command::new(&fanout)
+        .args(["delivery", "env", "300", "120", "60"])
+        .arg(&config)
+        .env("FANOUT_TEST_DIR", &dir)
+        .env("SWALLOW_ALERT_FANOUT_CONCURRENCY", "2")
+        .env("SWALLOW_ALERT_SHUTDOWN_GRACE_SECONDS", "4")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !(dir.join("a").exists() && dir.join("b").exists()) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(dir.join("a").exists() && dir.join("b").exists());
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &process.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(s) = process.try_wait().unwrap() {
+            break s;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(status.code(), Some(1));
+    assert!(dir.join("a.done").exists() && dir.join("b.done").exists());
+    assert!(!dir.join("c").exists());
     std::fs::remove_dir_all(dir).unwrap();
 }

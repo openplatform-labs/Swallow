@@ -1,7 +1,7 @@
 //! Run one existing alert command per explicitly configured destination.
 use serde::Deserialize;
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     error::Error,
     fs::File,
     io::Read,
@@ -200,33 +200,65 @@ async fn run(stop: novu_postgres_queue::shutdown::Stop) -> Result<()> {
         [mode,env,label,cooldown,file] if mode=="database" => ("send-database-alert",vec![env,label,cooldown],file),
         _ => return Err("usage: alert-fanout delivery ENV GRACE HEARTBEAT COOLDOWN CONFIG | database ENV LABEL COOLDOWN CONFIG".into()),
     };
+    let concurrency: usize = match std::env::var("SWALLOW_ALERT_FANOUT_CONCURRENCY") {
+        Ok(value) => value.parse().map_err(|_| "invalid fanout concurrency")?,
+        Err(std::env::VarError::NotPresent) => 1,
+        Err(_) => return Err("invalid fanout concurrency".into()),
+    };
+    if !(1..=8).contains(&concurrency) {
+        return Err("invalid fanout concurrency".into());
+    }
     let config = read_config(file)?;
     let binary = child_path(name)?;
+    let command_args: Vec<String> = command_args.into_iter().cloned().collect();
+    let mut remaining = VecDeque::from(config.targets);
+    let mut active = tokio::task::JoinSet::new();
     let mut failed = false;
     let mut review = false;
-    for target in config.targets {
-        if stop.requested() {
-            return Err("alert fanout interrupted before all destinations were attempted".into());
+    loop {
+        while active.len() < concurrency && !stop.requested() {
+            let Some(target) = remaining.pop_front() else {
+                break;
+            };
+            let mut command = Command::new(&binary);
+            command
+                .args(&command_args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            target.apply(&mut command);
+            let (channel, id) = target.key();
+            let (channel, id) = (channel.to_owned(), id.to_owned());
+            active.spawn(async move {
+                (
+                    channel,
+                    id,
+                    command.status().await.ok().and_then(|status| status.code()),
+                )
+            });
         }
-        let mut command = Command::new(&binary);
-        command
-            .args(&command_args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        target.apply(&mut command);
-        let (channel, id) = target.key();
-        match command.status().await {
-            Ok(status) if status.code() == Some(0) => println!("{channel} {id}: completed"),
-            Ok(status) if status.code() == Some(2) => {
+        if active.is_empty() {
+            break;
+        }
+        match active.join_next().await {
+            Some(Ok((channel, id, Some(0)))) => println!("{channel} {id}: completed"),
+            Some(Ok((channel, id, Some(2)))) => {
                 review = true;
                 println!("{channel} {id}: attention");
             }
-            _ => {
+            Some(Ok((channel, id, _))) => {
                 failed = true;
                 eprintln!("{channel} {id}: failed");
             }
+            Some(Err(_)) => {
+                failed = true;
+                eprintln!("alert target task failed");
+            }
+            None => unreachable!(),
         }
+    }
+    if !remaining.is_empty() {
+        return Err("alert fanout interrupted before all destinations were attempted".into());
     }
     if failed {
         std::process::exit(1);

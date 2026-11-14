@@ -30,7 +30,7 @@ async fn destinations_have_independent_slots_and_failures_do_not_suppress_others
         )
         .unwrap();
     };
-    let run = |mode: &str| {
+    let run = |mode: &str, concurrency: &str| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_alert-fanout"));
         if mode == "delivery" {
             command.args(["delivery", "fanout-env", "300", "120", "60"]);
@@ -41,6 +41,7 @@ async fn destinations_have_independent_slots_and_failures_do_not_suppress_others
             .arg(&config)
             .env("DATABASE_URL", &url)
             .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("SWALLOW_ALERT_FANOUT_CONCURRENCY", concurrency)
             .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
             .env("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS", "60")
             .env(
@@ -67,8 +68,13 @@ async fn destinations_have_independent_slots_and_failures_do_not_suppress_others
         {"channel":"email","id":"mail-b","provider":"sendgrid","to":"two@example.test","from":"sender@example.test","api_key_file":key,"region":"eu"}
     ]);
     write(targets.clone());
-    for mode in ["delivery", "database"] {
-        let out = run(mode);
+    for (mode, concurrency) in [
+        ("delivery", "1"),
+        ("database", "1"),
+        ("delivery", "4"),
+        ("database", "4"),
+    ] {
+        let out = run(mode, concurrency);
         assert_eq!(
             out.status.code(),
             Some(2),
@@ -91,12 +97,12 @@ async fn destinations_have_independent_slots_and_failures_do_not_suppress_others
     let mut broken = targets.as_array().unwrap().clone();
     broken[1]["api_key_file"] = serde_json::json!(dir.join("missing"));
     write(serde_json::json!(broken));
-    let out = run("delivery");
+    let out = run("delivery", "4");
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("email mail-a: failed"));
     assert!(String::from_utf8_lossy(&out.stdout).contains("slack ops-b: attention"));
     write(serde_json::json!([targets[0].clone(), targets[0].clone()]));
-    let out = run("delivery");
+    let out = run("delivery", "4");
     assert_eq!(out.status.code(), Some(1));
     assert!(!String::from_utf8_lossy(&out.stderr).contains("hooks.slack.com"));
     std::fs::remove_dir_all(dir).unwrap();
@@ -171,6 +177,7 @@ async fn provider_failures_are_recorded_per_destination() {
         .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
         .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
         .env("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS", "60")
+        .env("SWALLOW_ALERT_FANOUT_CONCURRENCY", "4")
         .env("SWALLOW_ALERT_OPERATION_TIMEOUT_SECONDS", "3")
         .env("HTTPS_PROXY", &proxy)
         .env("https_proxy", &proxy)
