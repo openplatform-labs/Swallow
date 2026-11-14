@@ -6,7 +6,11 @@ use axum::{
 };
 use std::{
     error::Error,
-    sync::{Arc, RwLock},
+    future::IntoFuture,
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tower::ServiceExt;
@@ -22,9 +26,18 @@ struct Connected {
 struct ApiState {
     current: Arc<RwLock<Option<Connected>>>,
     timeout: Duration,
+    draining: Arc<AtomicBool>,
 }
 
 async fn forward(State(shared): State<ApiState>, request: Request) -> Response {
+    if shared.draining.load(Ordering::Acquire) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(serde_json::json!({"message":"Server draining","statusCode":503})),
+        )
+            .into_response();
+    }
     let current = shared.current.read().ok().and_then(|guard| guard.clone());
     match current {
         Some(current) => match current.router.oneshot(request).await {
@@ -50,7 +63,9 @@ async fn live() -> Response {
 
 async fn ready(State(shared): State<ApiState>) -> Response {
     let current = shared.current.read().ok().and_then(|guard| guard.clone());
-    let ready = if let Some(current) = current {
+    let ready = if shared.draining.load(Ordering::Acquire) {
+        false
+    } else if let Some(current) = current {
         let query_ok = matches!(
             tokio::time::timeout(shared.timeout, current.db.simple_query("SELECT 1")).await,
             Ok(Ok(_))
@@ -65,7 +80,7 @@ async fn ready(State(shared): State<ApiState>) -> Response {
                     .map(|active| Arc::ptr_eq(&active.db, &current.db))
             })
             .unwrap_or(false);
-        query_ok && still_current
+        query_ok && still_current && !shared.draining.load(Ordering::Acquire)
     } else {
         false
     };
@@ -178,6 +193,17 @@ fn cors_from_env() -> Result<Option<CorsLayer>, Box<dyn Error + Send + Sync>> {
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let url = std::env::var("DATABASE_URL")?;
     let (config, tls) = novu_rust_contracts::postgres::configure(&url)?;
+    let grace = duration_env("SWALLOW_API_SHUTDOWN_GRACE_SECONDS", 30)?;
+    let drain: u64 = match std::env::var("SWALLOW_API_DRAIN_SECONDS") {
+        Ok(value) => value.parse().map_err(|_| "invalid drain setting")?,
+        Err(std::env::VarError::NotPresent) => 0,
+        Err(_) => return Err("invalid drain setting".into()),
+    };
+    if drain > 300 {
+        return Err("invalid drain setting".into());
+    }
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let interval = duration_env("SWALLOW_API_DB_HEALTH_INTERVAL_SECONDS", 10)?;
     let timeout = duration_env("SWALLOW_API_DB_HEALTH_TIMEOUT_SECONDS", 30)?;
     let health_endpoints = match std::env::var("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED").as_deref() {
@@ -190,6 +216,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let shared = ApiState {
         current: Arc::new(RwLock::new(None)),
         timeout,
+        draining: Arc::new(AtomicBool::new(false)),
     };
     let manager_state = shared.current.clone();
     tokio::spawn(async move {
@@ -238,7 +265,32 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if let Some(cors) = cors {
         app = app.layer(cors);
     }
-    axum::serve(listener, app.with_state(shared)).await?;
+    let draining = shared.draining.clone();
+    let (shutdown_started, shutdown_notice) = tokio::sync::oneshot::channel::<()>();
+    let shutdown = async move {
+        #[cfg(unix)]
+        tokio::select! { _ = sigterm.recv() => {}, _ = tokio::signal::ctrl_c() => {} }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+        draining.store(true, Ordering::Release);
+        if drain > 0 {
+            tokio::time::sleep(Duration::from_secs(drain)).await;
+        }
+        let _ = shutdown_started.send(());
+    };
+    let server = axum::serve(listener, app.with_state(shared))
+        .with_graceful_shutdown(shutdown)
+        .into_future();
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result?,
+        _ = shutdown_notice => {
+            match tokio::time::timeout(grace, &mut server).await {
+                Ok(result) => result?,
+                Err(_) => return Err("API graceful shutdown timed out".into()),
+            }
+        }
+    }
     Ok(())
 }
 
