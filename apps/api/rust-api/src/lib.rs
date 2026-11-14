@@ -3,6 +3,7 @@ mod contexts;
 mod inbox_context;
 mod inbox_data;
 mod preferences;
+pub mod resend_webhook;
 mod sendgrid_webhook;
 mod subscriber_credentials;
 mod subscriber_jwt;
@@ -73,7 +74,13 @@ pub fn router(db: Arc<Client>) -> Router {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
-    router_with_twilio_config(db, secret, keys, twilio_webhook::Config::from_env())
+    router_with_webhook_configs(
+        db,
+        secret,
+        keys,
+        twilio_webhook::Config::from_env(),
+        resend_webhook::Config::from_env(),
+    )
 }
 
 pub fn router_with_subscriber_secret(db: Arc<Client>, secret: Option<Vec<u8>>) -> Router {
@@ -94,7 +101,21 @@ pub fn router_with_twilio_config(
     keys: HashMap<String, Vec<String>>,
     twilio: Option<twilio_webhook::Config>,
 ) -> Router {
+    router_with_webhook_configs(db, secret, keys, twilio, None)
+}
+
+pub fn router_with_webhook_configs(
+    db: Arc<Client>,
+    secret: Option<Vec<u8>>,
+    keys: HashMap<String, Vec<String>>,
+    twilio: Option<twilio_webhook::Config>,
+    resend: Option<resend_webhook::Config>,
+) -> Router {
     Router::new()
+        .route(
+            "/webhooks/organizations/{organization}/environments/{environment}/email/resend",
+            post(resend_webhook::receive),
+        )
         .route(
             "/webhooks/organizations/{organization}/environments/{environment}/email/{provider}",
             post(sendgrid_webhook::receive),
@@ -248,6 +269,7 @@ pub fn router_with_twilio_config(
         .layer(Extension(Arc::new(secret)))
         .layer(Extension(Arc::new(InboxHmacKeys(keys))))
         .layer(Extension(Arc::new(twilio)))
+        .layer(Extension(Arc::new(resend)))
 }
 
 async fn authenticate_inbox(

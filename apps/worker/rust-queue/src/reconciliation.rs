@@ -132,6 +132,18 @@ pub async fn email_dispatch_evidence(
     Ok(rows.into_iter().map(|r|json!({"dispatchId":r.get::<_,Option<Uuid>>(0).map(|id|id.to_string()),"event":r.get::<_,String>(1),"eventCount":r.get::<_,i64>(2),"recipientCount":r.get::<_,i64>(3),"latestEventTimestamp":r.get::<_,Option<i64>>(4)})).collect())
 }
 
+/// Summarize signed Resend events for the provider ID of a recorded attempt.
+pub async fn resend_evidence(client: &Client, environment: &str, job: Uuid) -> Result<Value> {
+    if environment.trim().is_empty() {
+        return Err("environment is required".into());
+    }
+    let row = client.query_opt("SELECT a.state,a.provider_message_id,COALESCE((SELECT jsonb_object_agg(event_type,n) FROM (SELECT e.event_type,count(*) n FROM novu_rust_resend_delivery_events e WHERE e.environment_id=j.environment_id AND e.email_id=a.provider_message_id GROUP BY e.event_type) counts),'{}'::jsonb) FROM novu_queue_jobs j JOIN novu_rust_resend_attempts a ON a.job_id=j.id AND a.environment_id=j.environment_id WHERE j.environment_id=$1 AND j.id=$2 AND j.kind=$3", &[&environment,&job,&crate::resend_queue::JOB_KIND]).await?.ok_or("current Resend attempt not found")?;
+    let id: Option<String> = row.get(1);
+    Ok(
+        json!({"attemptState":row.get::<_,String>(0),"providerIdKnown":id.is_some(),"events":row.get::<_,Value>(2)}),
+    )
+}
+
 /// Show signed Twilio evidence explicitly bound to this job, without phone numbers.
 pub async fn sms_evidence(client: &Client, environment: &str, job: Uuid) -> Result<Vec<Value>> {
     if environment.is_empty() {

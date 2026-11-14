@@ -23,3 +23,6 @@ TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_api_test" \
 
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_api_test" \
   cargo test --locked --test twilio_webhook -- --ignored --test-threads=1
+
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_api_test" \
+  cargo test --locked --test resend_webhook -- --ignored
