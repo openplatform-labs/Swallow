@@ -101,13 +101,15 @@ async fn signed_events_are_scoped_deduplicated_and_private() {
     let key = format!("whsec_{}", STANDARD.encode(raw_secret));
     let config = novu_rust_api::resend_webhook::Config::new("env-a".into(), &key).unwrap();
     let db = Arc::new(db);
-    let app = novu_rust_api::router_with_webhook_configs(
-        db.clone(),
-        None,
-        HashMap::new(),
-        None,
-        Some(config),
-    );
+    let app = if std::env::var_os("TEST_RESEND_STRICT_CONFIG").is_some() {
+        novu_rust_api::RuntimeConfig::try_from_env()
+            .unwrap()
+            .router(db.clone())
+    } else {
+        novu_rust_api::router_with_webhook_configs(
+            db.clone(), None, HashMap::new(), None, Some(config),
+        )
+    };
     let path = "/webhooks/organizations/org-a/environments/env-a/email/resend";
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)

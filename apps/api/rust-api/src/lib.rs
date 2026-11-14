@@ -75,13 +75,43 @@ pub struct RuntimeConfig {
 }
 impl RuntimeConfig {
     pub fn from_env() -> Self {
-        Self::try_from_env().expect("invalid Inbox HMAC key configuration")
+        Self::try_from_env().expect("invalid API runtime configuration")
     }
     pub fn try_from_env() -> Result<Self, std::io::Error> {
-        let secret = novu_rust_contracts::secret::from_env("JWT_SECRET", "JWT_SECRET_FILE")
-            .ok()
-            .flatten()
-            .map(String::into_bytes);
+        let invalid = || {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid API security configuration",
+            )
+        };
+        let strict = match std::env::var("SWALLOW_API_STRICT_SECURITY_CONFIG").as_deref() {
+            Ok("true") => true,
+            Ok("false") | Err(std::env::VarError::NotPresent) => false,
+            _ => return Err(invalid()),
+        };
+        let required = match std::env::var("SWALLOW_API_REQUIRED_SECURITY") {
+            Ok(value) => {
+                let mut items = std::collections::HashSet::new();
+                for item in value.split(',') {
+                    if !["inbox-jwt", "resend-webhook", "twilio-webhook"].contains(&item)
+                        || !items.insert(item.to_owned())
+                    {
+                        return Err(invalid());
+                    }
+                }
+                items
+            }
+            Err(std::env::VarError::NotPresent) => Default::default(),
+            Err(_) => return Err(invalid()),
+        };
+        let jwt = novu_rust_contracts::secret::from_env("JWT_SECRET", "JWT_SECRET_FILE");
+        if (strict || required.contains("inbox-jwt")) && jwt.is_err() {
+            return Err(invalid());
+        }
+        let secret = jwt.ok().flatten().map(String::into_bytes);
+        if required.contains("inbox-jwt") && secret.is_none() {
+            return Err(invalid());
+        }
         let inline = match std::env::var("INBOX_HMAC_KEYS_JSON") {
             Ok(value) => Some(value),
             Err(std::env::VarError::NotPresent) => None,
@@ -114,11 +144,38 @@ impl RuntimeConfig {
             })?,
             None => HashMap::new(),
         };
+        let twilio = twilio_webhook::Config::from_env();
+        let resend = resend_webhook::Config::from_env();
+        let is_set = |names: &[&str]| names.iter().any(|name| std::env::var_os(name).is_some());
+        if (required.contains("twilio-webhook")
+            || (strict
+                && is_set(&[
+                    "NOVU_TWILIO_WEBHOOK_ENVIRONMENT_ID",
+                    "NOVU_TWILIO_WEBHOOK_ACCOUNT_SID",
+                    "NOVU_TWILIO_WEBHOOK_URL",
+                    "NOVU_TWILIO_WEBHOOK_AUTH_TOKEN",
+                    "NOVU_TWILIO_WEBHOOK_AUTH_TOKEN_FILE",
+                ])))
+            && twilio.is_none()
+        {
+            return Err(invalid());
+        }
+        if (required.contains("resend-webhook")
+            || (strict
+                && is_set(&[
+                    "NOVU_RESEND_WEBHOOK_ENVIRONMENT_ID",
+                    "NOVU_RESEND_WEBHOOK_SECRET",
+                    "NOVU_RESEND_WEBHOOK_SECRET_FILE",
+                ])))
+            && resend.is_none()
+        {
+            return Err(invalid());
+        }
         Ok(Self {
             secret,
             keys,
-            twilio: twilio_webhook::Config::from_env(),
-            resend: resend_webhook::Config::from_env(),
+            twilio,
+            resend,
         })
     }
     pub fn router(&self, db: Arc<Client>) -> Router {

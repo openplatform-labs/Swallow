@@ -100,8 +100,13 @@ async fn signed_status_events_are_scoped_deduplicated_and_private() {
         )
         .unwrap()
     };
-    let router =
-        novu_rust_api::router_with_twilio_config(db.clone(), None, HashMap::new(), Some(config));
+    let router = if std::env::var_os("TEST_TWILIO_FILE_CONFIG").is_some() {
+        novu_rust_api::RuntimeConfig::try_from_env()
+            .unwrap()
+            .router(db.clone())
+    } else {
+        novu_rust_api::router_with_twilio_config(db.clone(), None, HashMap::new(), Some(config))
+    };
     let form = "application/x-www-form-urlencoded";
     assert_eq!(
         post(router.clone(), PATH, BODY, SIGNATURE, form).await,
