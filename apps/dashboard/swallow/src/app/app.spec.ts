@@ -5,6 +5,50 @@ import { App } from './app';
 describe('Swallow console', () => {
   afterEach(() => vi.restoreAllMocks());
 
+  it('loads subscriber pages with an operator JWT and an explicit environment', async () => {
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValue(new Response(JSON.stringify({data:[{subscriberId:'alice',firstName:'Alice',email:'alice@example.test'}],next:'alice',previous:null}),{status:200}));
+    const app=TestBed.createComponent(App).componentInstance;
+    app.setSection('subscribers'); app.credentialMode='jwt'; app.apiKey='aaa.bbb.ccc'; app.subscriberEnvironment='env / one';
+    await app.loadSubscribers();
+    expect(app.subscribers()[0].id).toBe('alice');
+    const url=new URL(fetchMock.mock.calls[0][0] as string);
+    expect(url.pathname).toBe('/v1/experimental/operator/subscribers'); expect(url.searchParams.get('environmentId')).toBe('env / one');
+    expect(fetchMock.mock.calls[0][1]).toEqual(expect.objectContaining({headers:{Authorization:'Bearer aaa.bbb.ccc'},credentials:'omit',redirect:'error'}));
+    await app.loadSubscribers('after');
+    expect(new URL(fetchMock.mock.calls[1][0] as string).searchParams.get('after')).toBe('alice');
+    app.setSection('overview'); expect(app.apiKey).toBe(''); expect(app.subscribers()).toEqual([]);
+  });
+
+  it('uses JWT alert permissions for decisions and preserves the exact uncertain request', async () => {
+    const attempt='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[{channel:'slack',targetId:'ops',state:'unknown',lastStartedAt:null,attemptId:attempt}],hasMore:false,next:null}),{status:200})).mockRejectedValueOnce(new TypeError('network')).mockResolvedValueOnce(new Response(JSON.stringify({recorded:true,replayed:true}),{status:200}));
+    const app=TestBed.createComponent(App).componentInstance;
+    app.setSection('alerts'); app.alertAuthMode='jwt'; app.alertEnvironment='env-a'; app.alertKey='aaa.bbb.ccc';
+    await app.loadAlerts();
+    expect(fetchMock.mock.calls[0][0]).toBe('http://127.0.0.1:3000/v1/experimental/operator/alerts?environmentId=env-a');
+    app.selectAlert(app.alertSlots()[0]); app.decisionProtocol='legacy'; app.decisionKey='aaa.bbb.ccc'; app.decisionReason='verified'; app.decisionConfirmed=true;
+    await app.resolveAlert();
+    expect(app.decisionStatus()).toBe('unknown');
+    expect(fetchMock.mock.calls[1][0]).toBe('http://127.0.0.1:3000/v1/experimental/operator/alerts/resolve?environmentId=env-a');
+    expect(JSON.parse(fetchMock.mock.calls[1][1]?.body as string).requestId).toBe(app.decisionRequestId());
+    expect(fetchMock.mock.calls[1][1]?.headers).toEqual({Authorization:'Bearer aaa.bbb.ccc','Content-Type':'application/json'});
+    app.retryKey='aaa.bbb.ccc'; app.retryConfirmed=true; await app.retryDecision();
+    expect(fetchMock.mock.calls[2][0]).toBe(fetchMock.mock.calls[1][0]); expect(fetchMock.mock.calls[2][1]?.body).toBe(fetchMock.mock.calls[1][1]?.body);
+    expect(app.decisionStatus()).toBe('recorded'); expect(app.retryKey).toBe('');
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({found:false}),{status:200}));
+    app.lookupKey='ddd.eee.fff'; app.lookupId=app.decisionRequestId()!; await app.lookupDecisionRequest();
+    const url=new URL(fetchMock.mock.calls[3][0] as string); expect(url.pathname).toBe('/v1/experimental/operator/alerts/request'); expect(url.searchParams.get('environmentId')).toBe('env-a');
+    expect(fetchMock.mock.calls[3][1]?.headers).toEqual({Authorization:'Bearer ddd.eee.fff'});
+    app.setSection('overview'); expect(app.alertKey).toBe(''); expect(app.lookupKey).toBe('');
+  });
+
+  it('does not send a JWT without an environment or with malformed token bytes', async () => {
+    const fetchMock=vi.spyOn(globalThis,'fetch'); const app=TestBed.createComponent(App).componentInstance;
+    app.credentialMode='jwt'; app.apiKey='aaa.bbb.ccc'; app.subscriberEnvironment=''; await app.loadSubscribers();
+    app.alertAuthMode='jwt'; app.alertEnvironment='env-a'; app.alertKey='bad token'; await app.loadAlerts();
+    expect(fetchMock).not.toHaveBeenCalled(); expect(app.subscriberStatus()).toBe('error'); expect(app.alertStatus()).toBe('error');
+  });
+
   it('shows unimplemented management without invented operational data', async () => {
     const fixture = TestBed.createComponent(App);
     await fixture.whenStable();

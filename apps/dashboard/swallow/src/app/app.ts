@@ -8,7 +8,7 @@ type AlertSlot = { channel: string; targetId: string; state: string; lastStarted
 type AlertCursor = { channel: string; targetId: string };
 type DecisionHistory = { id: string; decision: string; reason: string; createdAt: string };
 type DecisionRequest = { requestId: string; channel: string; targetId: string; attemptId: string; decision: string; reason: string; createdAt: string };
-type RetrySnapshot = { origin: string; requestId: string; channel: string; targetId: string; attemptId: string; decision: string; reason: string; keyHash: string };
+type RetrySnapshot = { origin: string; endpoint: string; scheme: 'Bearer' | 'SwallowConsole'; requestId: string; channel: string; targetId: string; attemptId: string; decision: string; reason: string; keyHash: string };
 type Section = 'overview' | 'workflows' | 'subscribers' | 'channels' | 'activity' | 'alerts' | 'settings';
 
 @Component({
@@ -69,16 +69,29 @@ export class App {
   private historyRequestId = 0;
   private historyAbort: AbortController | null = null;
   alertKey = '';
+  alertAuthMode: 'restricted' | 'jwt' = 'restricted';
+  alertEnvironment = '';
   private alertHistory: (AlertCursor | null)[] = [null];
   private alertRequestId = 0;
   private alertAbort: AbortController | null = null;
   apiOrigin = 'http://127.0.0.1:3000';
   apiKey = '';
-  credentialMode: 'restricted' | 'api-key' = 'restricted';
+  credentialMode: 'restricted' | 'api-key' | 'jwt' = 'restricted';
+  subscriberEnvironment = '';
   subscriberName = '';
   private subscriberRequestId = 0;
   private subscriberAbort: AbortController | null = null;
   private requestId = 0;
+
+  private validJwt(key: string): boolean {
+    return key.length <= 16384 && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(key);
+  }
+  private validAlertKey(key: string): boolean {
+    return this.alertAuthMode === 'jwt' ? this.validJwt(key) : /^[0-9a-f]{64}$/.test(key);
+  }
+  private validEnvironment(value: string): boolean {
+    return value.length > 0 && new TextEncoder().encode(value).length <= 512;
+  }
 
   get sectionName(): string {
     return this.sections.find((item) => item.id === this.section())?.label ?? '';
@@ -164,16 +177,16 @@ export class App {
   async retryDecision(): Promise<void> {
     const snapshot = this.retrySnapshot();
     const key = this.retryKey.trim();
-    if (!snapshot || this.decisionStatus() !== 'unknown' || !this.retryConfirmed || !/^[0-9a-f]{64}$/.test(key)) return;
+    if (!snapshot || this.decisionStatus() !== 'unknown' || !this.retryConfirmed || !this.validAlertKey(key)) return;
     this.decisionStatus.set('sending'); this.retryError.set('');
     try {
       if (await this.credentialFingerprint(key) !== snapshot.keyHash || this.validatedOrigin() !== snapshot.origin) {
         this.retryError.set('원래 요청과 같은 인증과 API 주소가 필요합니다.');
         this.decisionStatus.set('unknown'); return;
       }
-      const {origin, keyHash: _keyHash, ...body} = snapshot;
-      const response = await fetch(`${origin}/v1/experimental/console/alerts/resolve-v2`, {
-        method: 'POST', headers: {Authorization: `SwallowConsole ${key}`, 'Content-Type': 'application/json'},
+      const {origin, endpoint, scheme, keyHash: _keyHash, ...body} = snapshot;
+      const response = await fetch(`${origin}${endpoint}`, {
+        method: 'POST', headers: {Authorization: `${scheme} ${key}`, 'Content-Type': 'application/json'},
         body: JSON.stringify(body), cache: 'no-store', credentials: 'omit', redirect: 'error', signal: AbortSignal.timeout(10000),
       });
       if (!response.ok) throw new Error('retry unavailable');
@@ -195,12 +208,17 @@ export class App {
     const sequence = this.lookupSequence;
     const key = this.lookupKey.trim();
     const requestId = this.lookupId.trim();
-    if (!/^[0-9a-f]{64}$/.test(key) || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId)) { this.lookupStatus.set('error'); return; }
+    const jwt = this.alertAuthMode === 'jwt';
+    const environment = this.alertEnvironment.trim();
+    if (!this.validAlertKey(key) || (jwt && !this.validEnvironment(environment)) || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId)) { this.lookupStatus.set('error'); return; }
     const controller = new AbortController();
     this.lookupAbort = controller;
     this.lookupStatus.set('loading');
     try {
-      const response = await fetch(`${this.validatedOrigin()}/v1/experimental/console/alerts/request?${new URLSearchParams({requestId})}`, {method:'GET',headers:{Authorization:`SwallowConsole ${key}`},cache:'no-store',credentials:'omit',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      const params = new URLSearchParams({requestId});
+      if (jwt) params.set('environmentId', environment);
+      const endpoint = jwt ? '/v1/experimental/operator/alerts/request' : '/v1/experimental/console/alerts/request';
+      const response = await fetch(`${this.validatedOrigin()}${endpoint}?${params}`, {method:'GET',headers:{Authorization:`${jwt ? 'Bearer' : 'SwallowConsole'} ${key}`},cache:'no-store',credentials:'omit',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
       if (!response.ok) throw new Error('request unavailable');
       const body: unknown = await response.json();
       if (typeof body !== 'object' || body === null || !('found' in body) || typeof body.found !== 'boolean') throw new Error('invalid response');
@@ -266,7 +284,7 @@ export class App {
   canResolve(): boolean {
     const slot = this.selectedAlert();
     const reason = this.decisionReason.trim();
-    return this.decisionStatus() === 'idle' && (this.decisionProtocol === 'legacy' || this.decisionProtocol === 'idempotent') && !!slot?.attemptId && this.decisionConfirmed && /^[0-9a-f]{64}$/.test(this.decisionKey.trim()) && !!reason && new TextEncoder().encode(reason).length <= 512 && (this.decision === 'retry' || (this.decision === 'accepted' && slot.state === 'unknown'));
+    return this.decisionStatus() === 'idle' && (this.decisionProtocol === 'legacy' || this.decisionProtocol === 'idempotent') && (this.alertAuthMode !== 'jwt' || this.validEnvironment(this.alertEnvironment.trim())) && !!slot?.attemptId && this.decisionConfirmed && this.validAlertKey(this.decisionKey.trim()) && !!reason && new TextEncoder().encode(reason).length <= 512 && (this.decision === 'retry' || (this.decision === 'accepted' && slot.state === 'unknown'));
   }
 
   async resolveAlert(): Promise<void> {
@@ -277,7 +295,8 @@ export class App {
     let origin: string;
     try { origin = this.validatedOrigin(); } catch { this.decisionStatus.set('rejected'); return; }
     let requestId: string | null = null;
-    if (this.decisionProtocol === 'idempotent') {
+    const jwt = this.alertAuthMode === 'jwt';
+    if (jwt || this.decisionProtocol === 'idempotent') {
       try { requestId = crypto.randomUUID(); } catch { this.decisionStatus.set('unavailable'); return; }
       this.clearRequestLookup(true);
       this.decisionRequestId.set(requestId);
@@ -286,16 +305,18 @@ export class App {
       this.clearRequestLookup(true);
     }
     const payload = { channel: slot.channel, targetId: slot.targetId, attemptId: slot.attemptId, decision: this.decision, reason, ...(requestId ? {requestId} : {}) };
+    const scheme = jwt ? 'Bearer' : 'SwallowConsole';
+    const endpoint = jwt ? `/v1/experimental/operator/alerts/resolve?${new URLSearchParams({environmentId:this.alertEnvironment.trim()})}` : `/v1/experimental/console/alerts/${requestId ? 'resolve-v2' : 'resolve'}`;
     this.decisionStatus.set('sending');
     try {
       if (requestId) {
         try {
           const keyHash = await this.credentialFingerprint(key);
-          this.retrySnapshot.set({origin, ...payload, requestId, keyHash});
+          this.retrySnapshot.set({origin, endpoint, scheme, ...payload, requestId, keyHash});
         } catch { this.decisionRequestId.set(null); this.lookupId = ''; this.decisionStatus.set('unavailable'); return; }
       }
-      const response = await fetch(`${origin}/v1/experimental/console/alerts/${requestId ? 'resolve-v2' : 'resolve'}`, {
-        method: 'POST', headers: { Authorization: `SwallowConsole ${key}`, 'Content-Type': 'application/json' },
+      const response = await fetch(`${origin}${endpoint}`, {
+        method: 'POST', headers: { Authorization: `${scheme} ${key}`, 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
         cache: 'no-store', credentials: 'omit', redirect: 'error', signal: AbortSignal.timeout(10000),
       });
@@ -350,10 +371,15 @@ export class App {
     try {
       const origin = this.validatedOrigin();
       const key = this.alertKey.trim();
-      if (!/^[0-9a-f]{64}$/.test(key)) throw new Error('인증 값을 확인해 주세요.');
-      const query = cursor ? `?${new URLSearchParams({afterChannel:cursor.channel,afterTarget:cursor.targetId})}` : '';
-      const response = await fetch(`${origin}/v1/experimental/console/alerts${query}`, {
-        method: 'GET', headers: { Authorization: `SwallowConsole ${key}` },
+      const jwt = this.alertAuthMode === 'jwt';
+      const environment = this.alertEnvironment.trim();
+      if (!this.validAlertKey(key) || (jwt && !this.validEnvironment(environment))) throw new Error('인증 값과 환경을 확인해 주세요.');
+      const params = new URLSearchParams();
+      if (jwt) params.set('environmentId',environment);
+      if (cursor) { params.set('afterChannel',cursor.channel); params.set('afterTarget',cursor.targetId); }
+      const query = params.size ? `?${params}` : '';
+      const response = await fetch(`${origin}${jwt ? '/v1/experimental/operator/alerts' : '/v1/experimental/console/alerts'}${query}`, {
+        method: 'GET', headers: { Authorization: `${jwt ? 'Bearer' : 'SwallowConsole'} ${key}` },
         cache: 'no-store', credentials: 'omit', redirect: 'error',
         signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10000)]),
       });
@@ -409,13 +435,16 @@ export class App {
     try {
       const origin = this.validatedOrigin();
       const key = this.apiKey.trim();
-      if (this.credentialMode === 'restricted' ? !/^[0-9a-f]{64}$/.test(key) : !key || /[^\x21-\x7e]/.test(key)) throw new Error('인증 값을 확인해 주세요.');
+      const jwt = this.credentialMode === 'jwt';
+      const environment = this.subscriberEnvironment.trim();
+      if ((jwt ? !this.validJwt(key) || !this.validEnvironment(environment) : this.credentialMode === 'restricted' ? !/^[0-9a-f]{64}$/.test(key) : !key || /[^\x21-\x7e]/.test(key))) throw new Error('인증 값과 환경을 확인해 주세요.');
       const params = new URLSearchParams({ limit: '20' });
+      if (jwt) params.set('environmentId', environment);
       const name = this.subscriberName.trim();
       if (name) params.set('name', name);
       if (direction && cursor) params.set(direction, cursor);
-      const endpoint = this.credentialMode === 'restricted' ? '/v1/experimental/console/subscribers' : '/v2/subscribers';
-      const scheme = this.credentialMode === 'restricted' ? 'SwallowConsole' : 'ApiKey';
+      const endpoint = jwt ? '/v1/experimental/operator/subscribers' : this.credentialMode === 'restricted' ? '/v1/experimental/console/subscribers' : '/v2/subscribers';
+      const scheme = jwt ? 'Bearer' : this.credentialMode === 'restricted' ? 'SwallowConsole' : 'ApiKey';
       const response = await fetch(`${origin}${endpoint}?${params}`, {
         method: 'GET', headers: { Authorization: `${scheme} ${key}` },
         cache: 'no-store', credentials: 'omit', redirect: 'error',
