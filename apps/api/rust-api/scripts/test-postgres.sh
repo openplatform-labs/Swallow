@@ -42,6 +42,10 @@ TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_fcm_integration_
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_api_test" \
   cargo test --locked --test sendgrid_webhook -- --ignored
 
+docker exec "$name" createdb -U postgres novu_resend_invalidation_test
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_resend_invalidation_test" \
+  cargo test --locked --test resend_invalidation -- --ignored
+
 docker exec "$name" createdb -U postgres novu_sendgrid_projection_test
 cargo build --locked --manifest-path ../../worker/rust-queue/Cargo.toml --bin sendgrid-projection-worker --target-dir "$PWD/target/sendgrid-projection-test"
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_sendgrid_projection_test" \

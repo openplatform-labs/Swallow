@@ -253,11 +253,12 @@ mod tests {
         let (mut db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
         tokio::spawn(async move { driver.await.unwrap() });
         db.batch_execute("CREATE TABLE novu_rust_environments (id text PRIMARY KEY, organization_id text NOT NULL); INSERT INTO novu_rust_environments VALUES ('env-a','org-a'); CREATE TABLE novu_rust_workflows (environment_id text, identifier text, in_app_content text, has_steps boolean NOT NULL DEFAULT true, PRIMARY KEY (environment_id, identifier))").await.unwrap();
-        // Worker 0100 installs a trigger on the API-owned SendGrid events table.
+        // Workers 0100 and 0102 install triggers on API-owned webhook event tables.
         for sql in [
             include_str!("../../../api/rust-api/migrations/0004_sendgrid_webhooks.sql"),
             include_str!("../../../api/rust-api/migrations/0008_sendgrid_dispatch_identity.sql"),
             include_str!("../../../api/rust-api/migrations/0009_sendgrid_dispatch_proof.sql"),
+            include_str!("../../../api/rust-api/migrations/0010_resend_webhooks.sql"),
         ] {
             db.batch_execute(sql).await.unwrap();
         }
@@ -310,11 +311,12 @@ mod tests {
         let (mut db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
         tokio::spawn(async move { driver.await.unwrap() });
         db.batch_execute("CREATE TABLE novu_rust_environments (id text PRIMARY KEY, organization_id text NOT NULL); INSERT INTO novu_rust_environments VALUES ('env-a','org-a'); CREATE TABLE novu_rust_workflows (environment_id text, identifier text, in_app_content text, has_steps boolean NOT NULL DEFAULT true, PRIMARY KEY (environment_id, identifier))").await.unwrap();
-        // Worker 0100 installs a trigger on the API-owned SendGrid events table.
+        // Workers 0100 and 0102 install triggers on API-owned webhook event tables.
         for sql in [
             include_str!("../../../api/rust-api/migrations/0004_sendgrid_webhooks.sql"),
             include_str!("../../../api/rust-api/migrations/0008_sendgrid_dispatch_identity.sql"),
             include_str!("../../../api/rust-api/migrations/0009_sendgrid_dispatch_proof.sql"),
+            include_str!("../../../api/rust-api/migrations/0010_resend_webhooks.sql"),
         ] {
             db.batch_execute(sql).await.unwrap();
         }
