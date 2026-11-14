@@ -21,6 +21,7 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
         queue::fcm_queue::MIGRATION,
         queue::resend_queue::MIGRATION,
         queue::in_app::EMAIL_MESSAGES_MIGRATION,
+        queue::resend_projection::MIGRATION,
         queue::in_app::EMAIL_PROVIDER_RESULT_MIGRATION,
         queue::in_app::SMS_MESSAGES_MIGRATION,
         queue::in_app::PUSH_MESSAGES_MIGRATION,
@@ -980,6 +981,13 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
         .await
         .is_err()
     );
+    db.execute(
+        "UPDATE novu_queue_jobs SET resend_delivery_result='delivered' WHERE id=$1",
+        &[&resend_retry],
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO novu_rust_email_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,subject,status,email_job_id,resend_delivery_result) VALUES ('retry-projection','tenant-resend','s','s','n','w','t','subject','sent',$1,'delivered')", &[&resend_retry]).await.unwrap();
     reconciliation::resolve(
         &mut db,
         "tenant-resend",
@@ -1010,6 +1018,9 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     );
     assert_eq!(rows[1].get::<_, String>(0), "pending");
     assert!(rows[1].get::<_, Option<String>>(1).is_none());
+    let row=db.query_one("SELECT j.resend_delivery_result,m.resend_delivery_result FROM novu_queue_jobs j JOIN novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1", &[&resend_retry]).await.unwrap();
+    assert!(row.get::<_, Option<String>>(0).is_none());
+    assert!(row.get::<_, Option<String>>(1).is_none());
     assert_eq!(
         reconciliation::health(&db, "tenant-resend").await.unwrap()["unknownAttempts"],
         0

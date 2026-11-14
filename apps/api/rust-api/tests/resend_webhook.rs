@@ -248,7 +248,7 @@ async fn signed_events_are_scoped_deduplicated_and_private() {
     let hash = novu_postgres_queue::resend_queue::recipient_hash("private@example.test");
     let hash_b = novu_postgres_queue::resend_queue::recipient_hash("other@example.test");
     db.execute("INSERT INTO novu_rust_resend_recipients VALUES ($1,'env-a','to',0,$2),($1,'env-a','to',1,$3)", &[&job,&hash,&hash_b]).await.unwrap();
-    let evidence = novu_postgres_queue::reconciliation::resend_evidence(&db, "env-a", job)
+    let evidence = novu_postgres_queue::reconciliation::resend_evidence(db.as_ref(), "env-a", job)
         .await
         .unwrap();
     assert_eq!(evidence["providerIdKnown"], false);
@@ -260,7 +260,7 @@ async fn signed_events_are_scoped_deduplicated_and_private() {
     )
     .await
     .unwrap();
-    let evidence = novu_postgres_queue::reconciliation::resend_evidence(&db, "env-a", job)
+    let evidence = novu_postgres_queue::reconciliation::resend_evidence(db.as_ref(), "env-a", job)
         .await
         .unwrap();
     assert_eq!(evidence["providerIdKnown"], true);
@@ -282,7 +282,7 @@ async fn signed_events_are_scoped_deduplicated_and_private() {
         .await,
         StatusCode::NO_CONTENT
     );
-    let evidence = novu_postgres_queue::reconciliation::resend_evidence(&db, "env-a", job)
+    let evidence = novu_postgres_queue::reconciliation::resend_evidence(db.as_ref(), "env-a", job)
         .await
         .unwrap();
     assert_eq!(evidence["recipients"][0]["result"], "delivered");
@@ -300,7 +300,7 @@ async fn signed_events_are_scoped_deduplicated_and_private() {
         .await,
         StatusCode::NO_CONTENT
     );
-    let evidence = novu_postgres_queue::reconciliation::resend_evidence(&db, "env-a", job)
+    let evidence = novu_postgres_queue::reconciliation::resend_evidence(db.as_ref(), "env-a", job)
         .await
         .unwrap();
     assert_eq!(evidence["recipients"][0]["result"], "delivered");
@@ -317,7 +317,7 @@ async fn signed_events_are_scoped_deduplicated_and_private() {
         .await,
         StatusCode::NO_CONTENT
     );
-    let evidence = novu_postgres_queue::reconciliation::resend_evidence(&db, "env-a", job)
+    let evidence = novu_postgres_queue::reconciliation::resend_evidence(db.as_ref(), "env-a", job)
         .await
         .unwrap();
     assert_eq!(evidence["recipients"][0]["result"], "conflicting");
@@ -347,7 +347,7 @@ async fn signed_events_are_scoped_deduplicated_and_private() {
         .await,
         StatusCode::NO_CONTENT
     );
-    let evidence = novu_postgres_queue::reconciliation::resend_evidence(&db, "env-a", job)
+    let evidence = novu_postgres_queue::reconciliation::resend_evidence(db.as_ref(), "env-a", job)
         .await
         .unwrap();
     assert_eq!(evidence["recipients"][1]["result"], "bounced");
@@ -379,9 +379,10 @@ async fn signed_events_are_scoped_deduplicated_and_private() {
             .await,
             StatusCode::NO_CONTENT
         );
-        let evidence = novu_postgres_queue::reconciliation::resend_evidence(&db, "env-a", job)
-            .await
-            .unwrap();
+        let evidence =
+            novu_postgres_queue::reconciliation::resend_evidence(db.as_ref(), "env-a", job)
+                .await
+                .unwrap();
         assert_eq!(evidence["recipients"][index as usize]["result"], kind);
     }
     let job2 = uuid::Uuid::new_v4();
@@ -395,13 +396,13 @@ async fn signed_events_are_scoped_deduplicated_and_private() {
     .await
     .unwrap();
     db.execute("INSERT INTO novu_rust_resend_attempts(job_id,environment_id,state,provider_message_id) VALUES ($1,'env-a','accepted','email-123')", &[&job2]).await.unwrap();
-    let evidence = novu_postgres_queue::reconciliation::resend_evidence(&db, "env-a", job)
+    let evidence = novu_postgres_queue::reconciliation::resend_evidence(db.as_ref(), "env-a", job)
         .await
         .unwrap();
     assert_eq!(evidence["recipients"][0]["result"], "ambiguous");
     assert!(evidence["recipients"][0]["complained"].is_null());
     assert!(
-        novu_postgres_queue::reconciliation::resend_evidence(&db, "env-b", job)
+        novu_postgres_queue::reconciliation::resend_evidence(db.as_ref(), "env-b", job)
             .await
             .is_err()
     );

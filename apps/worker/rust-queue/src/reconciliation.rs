@@ -141,7 +141,11 @@ pub async fn email_dispatch_evidence(
 }
 
 /// Summarize signed Resend events for the provider ID of a recorded attempt.
-pub async fn resend_evidence(client: &Client, environment: &str, job: Uuid) -> Result<Value> {
+pub async fn resend_evidence<C: tokio_postgres::GenericClient + Sync>(
+    client: &C,
+    environment: &str,
+    job: Uuid,
+) -> Result<Value> {
     if environment.trim().is_empty() {
         return Err("environment is required".into());
     }
@@ -323,7 +327,8 @@ pub async fn resolve(
                 &[&environment, &job],
             )
             .await?;
-            tx.execute("UPDATE novu_rust_email_messages SET delivery_state='not_attempted',status='sent',error_id=NULL,error_text=NULL,identifier=NULL WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job]).await?;
+            tx.execute("UPDATE novu_queue_jobs SET resend_delivery_result=NULL WHERE environment_id=$1 AND id=$2", &[&environment,&job]).await?;
+            tx.execute("UPDATE novu_rust_email_messages SET delivery_state='not_attempted',status='sent',error_id=NULL,error_text=NULL,identifier=NULL,resend_delivery_result=NULL WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job]).await?;
         }
         (crate::resend_queue::JOB_KIND, None, "accepted") => {
             tx.execute("UPDATE novu_rust_resend_attempts SET state='accepted',updated_at=clock_timestamp() WHERE environment_id=$1 AND job_id=$2", &[&environment, &job]).await?;
