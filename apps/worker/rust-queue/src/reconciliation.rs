@@ -6,6 +6,8 @@ use uuid::Uuid;
 pub const MIGRATION: &str = include_str!("../migrations/0054_delivery_reconciliation.sql");
 pub const RETRY_DISPATCH_MIGRATION: &str =
     include_str!("../migrations/0056_retry_dispatch_identity.sql");
+pub const OPERATOR_GRANTS_MIGRATION: &str =
+    include_str!("../migrations/0064_delivery_operator_grants.sql");
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Count unresolved and stranded attempts for one environment in one snapshot.
@@ -273,6 +275,10 @@ pub async fn resolve(
         return Err("invalid reconciliation parameters".into());
     }
     let tx = client.transaction().await?;
+    let allowed: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_delivery_operator_grants WHERE environment_id=$1 AND database_principal=session_user AND decision=$2)", &[&environment,&decision]).await?.get(0);
+    if !allowed {
+        return Err("reconciliation permission denied".into());
+    }
     let row=tx.query_opt("SELECT kind,status,payload,last_error FROM novu_queue_jobs WHERE environment_id=$1 AND id=$2 FOR UPDATE", &[&environment,&job]).await?.ok_or("job not found")?;
     let kind: String = row.get(0);
     let status: String = row.get(1);
@@ -319,7 +325,7 @@ pub async fn resolve(
             return Err("SMS retry refused: authenticated provider callback already exists; inspect sms-evidence".into());
         }
     }
-    tx.execute("INSERT INTO novu_rust_delivery_reconciliations(id,environment_id,job_id,target_index,decision,operator_name,reason,previous_http_status,retry_dispatch_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",&[&Uuid::new_v4(),&environment,&job,&target,&decision,&operator,&reason,&http_status,&retry_dispatch]).await?;
+    tx.execute("INSERT INTO novu_rust_delivery_reconciliations(id,environment_id,job_id,target_index,decision,operator_name,reason,previous_http_status,retry_dispatch_id,database_session_user) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,session_user)",&[&Uuid::new_v4(),&environment,&job,&target,&decision,&operator,&reason,&http_status,&retry_dispatch]).await?;
     match (kind.as_str(), target, decision) {
         (crate::resend_queue::JOB_KIND, None, "retry") => {
             tx.execute(

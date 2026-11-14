@@ -12,7 +12,7 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     tokio::spawn(async move {
         connection.await.unwrap();
     });
-    db.batch_execute("DROP TABLE IF EXISTS novu_rust_resend_attempts,novu_rust_sendgrid_dispatch_ids,novu_rust_twilio_dispatch_ids,novu_rust_delivery_reconciliations,novu_rust_sendgrid_attempts,novu_rust_twilio_attempts,novu_rust_fcm_attempts,novu_rust_email_messages,novu_rust_sms_messages,novu_rust_push_messages,novu_queue_jobs CASCADE").await.unwrap();
+    db.batch_execute("DROP TABLE IF EXISTS novu_rust_delivery_operator_grants,novu_rust_resend_attempts,novu_rust_sendgrid_dispatch_ids,novu_rust_twilio_dispatch_ids,novu_rust_delivery_reconciliations,novu_rust_sendgrid_attempts,novu_rust_twilio_attempts,novu_rust_fcm_attempts,novu_rust_email_messages,novu_rust_sms_messages,novu_rust_push_messages,novu_queue_jobs CASCADE").await.unwrap();
     for migration in [
         queue::MIGRATION,
         queue::sendgrid_queue::MIGRATION,
@@ -85,6 +85,22 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     .await
     .unwrap();
     db.execute("INSERT INTO novu_rust_delivery_reconciliations(id,environment_id,job_id,decision,operator_name,reason) VALUES ($1,'legacy',$2,'retry','operator','legacy')", &[&Uuid::new_v4(),&legacy_job]).await.unwrap();
+    db.batch_execute(reconciliation::OPERATOR_GRANTS_MIGRATION)
+        .await
+        .unwrap();
+    db.batch_execute(reconciliation::OPERATOR_GRANTS_MIGRATION)
+        .await
+        .unwrap();
+    assert!(
+        db.query_one(
+            "SELECT database_session_user FROM novu_rust_delivery_reconciliations WHERE job_id=$1",
+            &[&legacy_job]
+        )
+        .await
+        .unwrap()
+        .get::<_, Option<String>>(0)
+        .is_none()
+    );
     db.batch_execute(reconciliation::RETRY_DISPATCH_MIGRATION)
         .await
         .unwrap();
@@ -501,6 +517,75 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
             .await
             .is_err()
     );
+    let denied = reconciliation::resolve(
+        &mut db,
+        "tenant-a",
+        email,
+        None,
+        "accepted",
+        "claimed-name",
+        "verified",
+    )
+    .await
+    .unwrap_err();
+    assert!(denied.to_string().contains("permission denied"));
+    db.execute("INSERT INTO novu_rust_delivery_operator_grants VALUES ('tenant-a',session_user,'accepted')", &[]).await.unwrap();
+    let denied = reconciliation::resolve(
+        &mut db,
+        "tenant-a",
+        email,
+        None,
+        "retry",
+        "claimed-name",
+        "verified",
+    )
+    .await
+    .unwrap_err();
+    assert!(denied.to_string().contains("permission denied"));
+    db.execute("INSERT INTO novu_rust_delivery_operator_grants VALUES ('tenant-a',session_user,'retry'),('tenant-resend',session_user,'retry'),('tenant-resend',session_user,'accepted')", &[]).await.unwrap();
+    db.batch_execute("CREATE ROLE swallow_fixture_operator NOLOGIN; GRANT SELECT ON novu_rust_delivery_operator_grants TO swallow_fixture_operator; GRANT SELECT,UPDATE ON novu_queue_jobs TO swallow_fixture_operator; INSERT INTO novu_rust_delivery_operator_grants VALUES ('tenant-a','swallow_fixture_operator','accepted')").await.unwrap();
+    let (mut restricted, restricted_driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move { restricted_driver.await.unwrap() });
+    restricted
+        .batch_execute("SET SESSION AUTHORIZATION swallow_fixture_operator")
+        .await
+        .unwrap();
+    let denied = reconciliation::resolve(
+        &mut restricted,
+        "tenant-a",
+        email,
+        None,
+        "retry",
+        "postgres",
+        "ticket",
+    )
+    .await
+    .unwrap_err();
+    assert!(denied.to_string().contains("permission denied"));
+    let denied = reconciliation::resolve(
+        &mut restricted,
+        "tenant-b",
+        email,
+        None,
+        "accepted",
+        "postgres",
+        "ticket",
+    )
+    .await
+    .unwrap_err();
+    assert!(denied.to_string().contains("permission denied"));
+    let not_found = reconciliation::resolve(
+        &mut restricted,
+        "tenant-a",
+        Uuid::new_v4(),
+        None,
+        "accepted",
+        "someone-else",
+        "ticket",
+    )
+    .await
+    .unwrap_err();
+    assert!(not_found.to_string().contains("job not found"));
     // A previously authenticated event rejects retry without changing state.
     let denied = reconciliation::resolve(
         &mut db, "tenant-a", email, None, "retry", "operator", "ticket",
@@ -631,7 +716,7 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
             .unwrap()
             .is_empty()
     );
-    let audits:i64=db.query_one("SELECT count(*) FROM novu_rust_delivery_reconciliations WHERE environment_id='tenant-a' AND operator_name='operator' AND database_user=current_user", &[]).await.unwrap().get(0);
+    let audits:i64=db.query_one("SELECT count(*) FROM novu_rust_delivery_reconciliations WHERE environment_id='tenant-a' AND operator_name='operator' AND database_user=current_user AND database_session_user=session_user", &[]).await.unwrap().get(0);
     assert_eq!(audits, 4);
     let pending = Uuid::new_v4();
     queue::enqueue(&db,pending,"tenant-a",queue::fcm_queue::JOB_KIND,&json!({"prepared_messages":[{},{}],"prepared_context":{"target_metadata":[{"history_index":0,"group_size":2},{"history_index":0,"group_size":2}]}})).await.unwrap();

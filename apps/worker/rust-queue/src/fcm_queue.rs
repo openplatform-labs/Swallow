@@ -860,6 +860,10 @@ mod tests {
         db.batch_execute(crate::reconciliation::RETRY_DISPATCH_MIGRATION)
             .await
             .unwrap();
+        db.batch_execute(crate::reconciliation::OPERATOR_GRANTS_MIGRATION)
+            .await
+            .unwrap();
+        db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision) VALUES ('test',session_user,'retry'),('test',session_user,'accepted') ON CONFLICT DO NOTHING", &[]).await.unwrap();
         let payload = json!({"title":"Hi","content":"Hello","targets":["a","b","c"]});
         let other = Uuid::new_v4();
         let id = Uuid::new_v4();
