@@ -93,7 +93,7 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     let row = db.query_one("SELECT retry_dispatch_id,decision_order FROM novu_rust_delivery_reconciliations WHERE job_id=$1", &[&legacy_job]).await.unwrap();
     assert_eq!(row.get::<_, Option<Uuid>>(0), None);
     assert!(row.get::<_, i64>(1) > 0);
-    db.batch_execute("DROP TABLE IF EXISTS novu_rust_sendgrid_delivery_events,novu_rust_sendgrid_webhook_keys,novu_rust_environments CASCADE; CREATE TABLE novu_rust_environments(id text PRIMARY KEY,organization_id text NOT NULL); INSERT INTO novu_rust_environments VALUES ('tenant-a','org-a'),('tenant-b','org-b')").await.unwrap();
+    db.batch_execute("DROP TABLE IF EXISTS novu_rust_sendgrid_delivery_events,novu_rust_sendgrid_webhook_keys,novu_rust_environments CASCADE; CREATE TABLE novu_rust_environments(id text PRIMARY KEY,organization_id text NOT NULL); INSERT INTO novu_rust_environments VALUES ('tenant-a','org-a'),('tenant-b','org-b'),('tenant-queue','org-a'),('tenant-resend','org-a')").await.unwrap();
     db.batch_execute(include_str!(
         "../../../api/rust-api/migrations/0004_sendgrid_webhooks.sql"
     ))
@@ -211,6 +211,28 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     assert_eq!(clean["strandedDispatches"], 0);
     assert!(clean["oldestUnknownUpdatedAt"].is_null());
     assert!(reconciliation::health(&db, " ").await.is_err());
+    assert!(reconciliation::health(&db, "missing-env").await.is_err());
+    assert!(
+        reconciliation::queue_health(&db, "missing-env", 300)
+            .await
+            .is_err()
+    );
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .args(["check", "missing-env"])
+        .env("DATABASE_URL", &url)
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .args(["check-queue", "missing-env", "300"])
+        .env("DATABASE_URL", &url)
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
     db.execute("DELETE FROM novu_queue_jobs WHERE id=$1", &[&stranded])
         .await
         .unwrap();

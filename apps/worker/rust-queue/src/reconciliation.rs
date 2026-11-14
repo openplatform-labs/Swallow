@@ -17,7 +17,8 @@ pub async fn health(client: &Client, environment: &str) -> Result<Value> {
         "SELECT count(*) FILTER (WHERE a.state='unknown'), \
          count(*) FILTER (WHERE a.state='dispatching' AND (j.status <> 'running' OR j.lease_until <= statement_timestamp())), \
          min(a.updated_at) FILTER (WHERE a.state='unknown')::text, \
-         min(a.updated_at) FILTER (WHERE a.state='dispatching' AND (j.status <> 'running' OR j.lease_until <= statement_timestamp()))::text \
+         min(a.updated_at) FILTER (WHERE a.state='dispatching' AND (j.status <> 'running' OR j.lease_until <= statement_timestamp()))::text, \
+         EXISTS(SELECT 1 FROM novu_rust_environments WHERE id=$1) \
          FROM novu_queue_jobs j JOIN ( \
          SELECT job_id,environment_id,state,updated_at FROM novu_rust_sendgrid_attempts \
          UNION ALL SELECT job_id,environment_id,state,updated_at FROM novu_rust_resend_attempts \
@@ -26,6 +27,9 @@ pub async fn health(client: &Client, environment: &str) -> Result<Value> {
          ) a ON a.job_id=j.id AND a.environment_id=j.environment_id WHERE j.environment_id=$1",
         &[&environment],
     ).await?;
+    if !row.get::<_, bool>(4) {
+        return Err("environment not found".into());
+    }
     Ok(json!({
         "unknownAttempts": row.get::<_, i64>(0),
         "strandedDispatches": row.get::<_, i64>(1),
@@ -47,10 +51,14 @@ pub async fn queue_health(
         "SELECT count(*) FILTER (WHERE status='pending' AND available_at <= statement_timestamp() - $2::integer * interval '1 second'), \
          count(*) FILTER (WHERE status='running' AND lease_until <= statement_timestamp()), \
          min(available_at) FILTER (WHERE status='pending' AND available_at <= statement_timestamp() - $2::integer * interval '1 second')::text, \
-         min(lease_until) FILTER (WHERE status='running' AND lease_until <= statement_timestamp())::text \
+         min(lease_until) FILTER (WHERE status='running' AND lease_until <= statement_timestamp())::text, \
+         EXISTS(SELECT 1 FROM novu_rust_environments WHERE id=$1) \
          FROM novu_queue_jobs WHERE environment_id=$1",
         &[&environment, &max_wait_seconds],
     ).await?;
+    if !row.get::<_, bool>(4) {
+        return Err("environment not found".into());
+    }
     Ok(json!({
         "overdueJobs": row.get::<_, i64>(0),
         "expiredLeases": row.get::<_, i64>(1),
