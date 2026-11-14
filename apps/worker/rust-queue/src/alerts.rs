@@ -213,7 +213,8 @@ pub struct Alert {
     pub resend_enabled: bool,
     pub queue: Option<(u64, u64)>,
     pub attempts: Option<(u64, u64)>,
-    pub failed_checks: [bool; 3], // resend, queue, attempts
+    pub twilio: Option<(u64, bool)>,
+    pub failed_checks: [bool; 4], // resend, queue, attempts, twilio
 }
 impl Alert {
     pub fn text(&self) -> Result<String, AlertError> {
@@ -243,10 +244,15 @@ impl Alert {
                 "unknown delivery attempts: {unknown}; stranded dispatches: {stranded}"
             ));
         }
+        if let Some((overdue, stale)) = self.twilio {
+            details.push(format!(
+                "Twilio overdue undelivered jobs: {overdue}; projector stale: {stale}"
+            ));
+        }
         for (failed, name) in
             self.failed_checks
                 .iter()
-                .zip(["Resend", "queue", "delivery attempts"])
+                .zip(["Resend", "queue", "delivery attempts", "Twilio"])
         {
             if *failed {
                 details.push(format!("{name} check failed"));
@@ -460,7 +466,8 @@ mod tests {
             resend_enabled: true,
             queue: None,
             attempts: None,
-            failed_checks: [false; 3],
+            twilio: None,
+            failed_checks: [false; 4],
         }
     }
 
@@ -528,17 +535,21 @@ mod tests {
         a.resend_enabled = false;
         a.queue = Some((3, 1));
         a.attempts = Some((2, 4));
+        a.twilio = Some((5, true));
         let text = a.text().unwrap();
         assert!(text.contains("queue overdue jobs: 3; expired leases: 1"));
         assert!(text.contains("unknown delivery attempts: 2; stranded dispatches: 4"));
+        assert!(text.contains("Twilio overdue undelivered jobs: 5; projector stale: true"));
         assert!(!text.contains("Resend"));
         a.queue = None;
         a.attempts = None;
+        a.twilio = None;
         assert!(a.text().is_err());
-        a.failed_checks = [true, false, true];
+        a.failed_checks = [true, false, true, true];
         let text = a.text().unwrap();
         assert!(text.contains("Resend check failed"));
         assert!(text.contains("delivery attempts check failed"));
+        assert!(text.contains("Twilio check failed"));
         assert!(!text.contains("projector stale"));
     }
 
@@ -652,7 +663,8 @@ mod tests {
             resend_enabled: true,
             queue: None,
             attempts: None,
-            failed_checks: [false; 3],
+            twilio: None,
+            failed_checks: [false; 4],
         };
         assert!(alert.projector_stale);
         let (url, slack_server) = mock_server("200 OK", "ok").await;

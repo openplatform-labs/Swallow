@@ -149,4 +149,130 @@ async fn projects_only_matching_current_attempt_and_recovers_on_rescan() {
         completed,
         "worker did not complete projection and heartbeat"
     );
+    drop(_worker);
+    db.execute("UPDATE novu_queue_jobs SET available_at=clock_timestamp()-interval '10 minutes' WHERE id=$1", &[&job]).await.unwrap();
+    let health = queue::reconciliation::twilio_health(&db, "a", 300, 120)
+        .await
+        .unwrap();
+    assert_eq!(health["overdueUndelivered"], 0);
+    assert_eq!(health["eligibleJobs"], 1);
+    assert_eq!(health["projectorStale"], false);
+    assert!(
+        queue::reconciliation::twilio_health(&db, "missing", 300, 120)
+            .await
+            .is_err()
+    );
+    assert!(
+        queue::reconciliation::twilio_health(&db, "a", 0, 120)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        queue::reconciliation::twilio_health(&db, "b", 300, 120)
+            .await
+            .unwrap()["projectorStale"],
+        true
+    );
+    let check = |command: &str, environment: &str| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+            .args([command, environment, "300", "120"])
+            .env("DATABASE_URL", &url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .output()
+            .unwrap()
+    };
+    assert_eq!(check("check-twilio", "a").status.code(), Some(0));
+    db.execute(
+        "UPDATE novu_queue_jobs SET twilio_delivery_result='failed' WHERE id=$1",
+        &[&job],
+    )
+    .await
+    .unwrap();
+    assert_eq!(check("check-twilio", "a").status.code(), Some(2));
+    let metrics = check("check-twilio-metrics", "a");
+    assert_eq!(metrics.status.code(), Some(0));
+    assert!(
+        String::from_utf8(metrics.stdout)
+            .unwrap()
+            .contains("swallow_twilio_overdue_undelivered{environment=\"a\"} 1")
+    );
+    assert_eq!(check("check-twilio", "missing").status.code(), Some(1));
+    db.execute(
+        "UPDATE novu_queue_jobs SET status='cancelled' WHERE id=$1",
+        &[&job],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        queue::reconciliation::twilio_health(&db, "a", 300, 120)
+            .await
+            .unwrap()["overdueUndelivered"],
+        0
+    );
+    db.execute(
+        "UPDATE novu_queue_jobs SET status='pending' WHERE id=$1",
+        &[&job],
+    )
+    .await
+    .unwrap();
+    for sql in [
+        queue::reconciliation::MIGRATION,
+        queue::reconciliation::OPERATOR_GRANTS_MIGRATION,
+        queue::alerts::MIGRATION,
+        queue::alerts::RESOLUTION_MIGRATION,
+        queue::reconciliation::OPERATOR_GRANT_LOCK_MIGRATION,
+    ] {
+        db.batch_execute(sql).await.unwrap();
+    }
+    db.execute(
+        "INSERT INTO novu_rust_delivery_operator_grants VALUES ('a',session_user,'alert_send')",
+        &[],
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES ('a','slack','check','rejected')", &[]).await.unwrap();
+    let alert = |resend: &str, twilio_heartbeat: Option<&str>| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"));
+        cmd.args(["a", "300", "120", "60"])
+            .env("DATABASE_URL", &url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env(
+                "SWALLOW_ALERT_SLACK_WEBHOOK",
+                "https://hooks.slack.com/services/A/B/C",
+            )
+            .env_remove("SWALLOW_ALERT_SLACK_WEBHOOK_FILE")
+            .env("SWALLOW_ALERT_SLACK_TARGET_ID", "check")
+            .env_remove("SWALLOW_ALERT_EMAIL_TO")
+            .env("SWALLOW_ALERT_RESEND_ENABLED", resend)
+            .env("SWALLOW_ALERT_ATTEMPTS_ENABLED", "false")
+            .env_remove("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS")
+            .env("SWALLOW_ALERT_TWILIO_GRACE_SECONDS", "300");
+        if let Some(value) = twilio_heartbeat {
+            cmd.env("SWALLOW_ALERT_TWILIO_HEARTBEAT_MAX_SECONDS", value);
+        } else {
+            cmd.env_remove("SWALLOW_ALERT_TWILIO_HEARTBEAT_MAX_SECONDS");
+        }
+        cmd.output().unwrap()
+    };
+    assert_eq!(alert("false", Some("120")).status.code(), Some(2));
+    assert_eq!(alert("false", None).status.code(), Some(1));
+    assert_eq!(alert("false", Some("0")).status.code(), Some(1));
+    // Resend tables are absent; Twilio still reaches the blocked destination.
+    let partial = alert("true", Some("120"));
+    assert_eq!(partial.status.code(), Some(1));
+    let log = String::from_utf8(partial.stderr).unwrap();
+    assert!(
+        log.contains("Resend health check failed")
+            && log.contains("Slack alert requires operator review")
+    );
+    db.batch_execute("DROP TABLE novu_rust_twilio_projection_heartbeat")
+        .await
+        .unwrap();
+    let failed = alert("false", Some("120"));
+    assert_eq!(failed.status.code(), Some(1));
+    let log = String::from_utf8(failed.stderr).unwrap();
+    assert!(
+        log.contains("Twilio health check failed")
+            && log.contains("Slack alert requires operator review")
+    );
 }

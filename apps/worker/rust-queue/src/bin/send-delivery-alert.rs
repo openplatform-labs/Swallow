@@ -54,20 +54,29 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     });
     let resend_enabled = env_bool("SWALLOW_ALERT_RESEND_ENABLED", true)?;
     let attempts_enabled = env_bool("SWALLOW_ALERT_ATTEMPTS_ENABLED", false)?;
+    let twilio_grace = env_optional_i32("SWALLOW_ALERT_TWILIO_GRACE_SECONDS")?;
+    let twilio_heartbeat = env_optional_i32("SWALLOW_ALERT_TWILIO_HEARTBEAT_MAX_SECONDS")?;
+    let twilio_thresholds = match (twilio_grace, twilio_heartbeat) {
+        (None, None) => None,
+        (Some(grace), Some(heartbeat)) => Some((grace, heartbeat)),
+        _ => return Err("both Twilio alert thresholds must be configured".into()),
+    };
     let queue_wait = match std::env::var("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS") {
         Ok(value) => Some(value.parse::<i32>()?),
         Err(std::env::VarError::NotPresent) => None,
         Err(_) => return Err("invalid queue wait threshold".into()),
     };
-    if !resend_enabled && !attempts_enabled && queue_wait.is_none() {
+    if !resend_enabled && !attempts_enabled && queue_wait.is_none() && twilio_thresholds.is_none() {
         return Err("no alert checks configured".into());
     }
     if (resend_enabled && (!(1..=86_400).contains(&grace) || !(1..=86_400).contains(&heartbeat)))
         || queue_wait.is_some_and(|v| !(1..=86_400).contains(&v))
+        || twilio_thresholds
+            .is_some_and(|(g, h)| !(1..=86_400).contains(&g) || !(1..=86_400).contains(&h))
     {
         return Err("invalid alert check threshold (1-86400 seconds)".into());
     }
-    let mut failed_checks = [false; 3];
+    let mut failed_checks = [false; 4];
     let resend = if resend_enabled {
         let result = reconciliation::resend_health(&db, &args[0], grace, heartbeat).await;
         let values = result.ok().and_then(|health| {
@@ -116,10 +125,27 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     } else {
         None
     };
+    let twilio = if let Some((grace, heartbeat)) = twilio_thresholds {
+        let result = reconciliation::twilio_health(&db, &args[0], grace, heartbeat).await;
+        let values = result.ok().and_then(|health| {
+            Some((
+                health["overdueUndelivered"].as_u64()?,
+                health["projectorStale"].as_bool()?,
+            ))
+        });
+        if values.is_none() {
+            failed_checks[3] = true;
+            eprintln!("Twilio health check failed");
+        }
+        values
+    } else {
+        None
+    };
     let unhealthy = failed_checks.iter().any(|failed| *failed)
         || resend.is_some_and(|(overdue, stale)| overdue > 0 || stale)
         || queue.is_some_and(|(overdue, expired)| overdue > 0 || expired > 0)
-        || attempts.is_some_and(|(unknown, stranded)| unknown > 0 || stranded > 0);
+        || attempts.is_some_and(|(unknown, stranded)| unknown > 0 || stranded > 0)
+        || twilio.is_some_and(|(overdue, stale)| overdue > 0 || stale);
     let (overdue, stale) = resend.unwrap_or((0, false));
     let alert = Alert {
         environment: args[0].clone(),
@@ -128,6 +154,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         resend_enabled: resend.is_some(),
         queue,
         attempts,
+        twilio,
         failed_checks,
     };
     alert.text().map_err(|_| "invalid alert environment")?;
@@ -181,6 +208,14 @@ fn env_bool(name: &str, default: bool) -> Result<bool, Box<dyn Error + Send + Sy
         Ok(value) if value == "false" => Ok(false),
         Err(std::env::VarError::NotPresent) => Ok(default),
         _ => Err(format!("{name} must be true or false").into()),
+    }
+}
+
+fn env_optional_i32(name: &str) -> Result<Option<i32>, Box<dyn Error + Send + Sync>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value.parse()?)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(_) => Err(format!("invalid {name}").into()),
     }
 }
 
