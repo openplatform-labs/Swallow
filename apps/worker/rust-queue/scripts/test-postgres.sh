@@ -52,6 +52,10 @@ docker exec "$name" createdb -U postgres novu_twilio_secret_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_twilio_secret_test" \
   cargo test --locked --test twilio_secret_files -- --ignored
 
+docker exec "$name" createdb -U postgres novu_sendgrid_secret_test
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_sendgrid_secret_test" \
+  cargo test --locked --test sendgrid_secret_files -- --ignored
+
 docker exec "$name" createdb -U postgres novu_fcm_secret_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_fcm_secret_test" \
   cargo test --locked --test fcm_secret_files -- --ignored

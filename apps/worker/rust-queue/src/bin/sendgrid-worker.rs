@@ -17,7 +17,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         _ => return Err("invalid NOVU_SENDGRID_REGION".into()),
     };
     let mut provider = Sendgrid::new(Config {
-        api_key: std::env::var("NOVU_SENDGRID_API_KEY")?,
+        api_key: novu_rust_contracts::secret::from_env(
+            "NOVU_SENDGRID_API_KEY",
+            "NOVU_SENDGRID_API_KEY_FILE",
+        )?
+        .ok_or("SendGrid API key is required")?,
         from: std::env::var("NOVU_SENDGRID_FROM")?,
         sender_name: std::env::var("NOVU_SENDGRID_SENDER_NAME")?,
         region,
