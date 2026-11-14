@@ -64,8 +64,8 @@ fn read_secret(_path: &str) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: console-credential issue ENV SECONDS NEW_FILE REASON | issue-scoped ENV SECONDS NEW_FILE subscriber|none REASON | subscriber-access ENV CREDENTIAL_ID grant|revoke REASON | subscriber-access-list ENV [AFTER_ID] | subscriber-access-audit ENV [AFTER_ID] | inspect ENV TOKEN_FILE | revoke ENV CREDENTIAL_ID REASON | list ENV [AFTER_ID] | audit ENV [AFTER_ID] | alert-access ENV CREDENTIAL_ID grant|revoke REASON | alert-access-list ENV [AFTER_ID] | alert-access-audit ENV [AFTER_ID]";
-    let valid = matches!(args.as_slice(),[action,_,_,_,_,_] if action=="issue-scoped")
+    let usage = "usage: console-credential issue ENV SECONDS NEW_FILE REASON | issue-scoped ENV SECONDS NEW_FILE subscriber|none REASON | issue-permissions ENV SECONDS NEW_FILE none|subscriber|alert|both REASON | subscriber-access ENV CREDENTIAL_ID grant|revoke REASON | subscriber-access-list ENV [AFTER_ID] | subscriber-access-audit ENV [AFTER_ID] | inspect ENV TOKEN_FILE | revoke ENV CREDENTIAL_ID REASON | list ENV [AFTER_ID] | audit ENV [AFTER_ID] | alert-access ENV CREDENTIAL_ID grant|revoke REASON | alert-access-list ENV [AFTER_ID] | alert-access-audit ENV [AFTER_ID]";
+    let valid = matches!(args.as_slice(),[action,_,_,_,_,_] if action=="issue-scoped" || action=="issue-permissions")
         || matches!(args.as_slice(),[action,_,_,_,_] if action=="issue" || action=="alert-access" || action=="subscriber-access")
         || matches!(args.as_slice(),[action,_,_,_] if action=="revoke")
         || matches!(args.as_slice(),[action,_,_] if action=="inspect")
@@ -81,16 +81,25 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let _ = connection.await;
     });
     match args[0].as_str() {
-        "issue" | "issue-scoped" => {
-            let scoped = args[0] == "issue-scoped";
-            let subscriber_read = if scoped {
+        "issue" | "issue-scoped" | "issue-permissions" => {
+            let scoped = args[0] != "issue";
+            let permissions = args[0] == "issue-permissions";
+            let (subscriber_read, alert_read) = if permissions {
                 match args[4].as_str() {
-                    "subscriber" => true,
-                    "none" => false,
+                    "none" => (false, false),
+                    "subscriber" => (true, false),
+                    "alert" => (false, true),
+                    "both" => (true, true),
+                    _ => return Err("invalid initial permissions".into()),
+                }
+            } else if scoped {
+                match args[4].as_str() {
+                    "subscriber" => (true, false),
+                    "none" => (false, false),
                     _ => return Err("invalid subscriber scope".into()),
                 }
             } else {
-                true
+                (true, false)
             };
             let reason = if scoped { &args[5] } else { &args[4] };
             let seconds: i64 = args[2].parse()?;
@@ -108,7 +117,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             write_secret(&args[3], token.as_bytes())
                 .map_err(|_| "token file creation failed; inspect the destination safely")?;
             let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
-            let result = if scoped {
+            let result = if permissions {
+                tokio::time::timeout(std::time::Duration::from_secs(30), db.query_one("SELECT public.novu_rust_issue_console_credential_permissions($1,$2,clock_timestamp()+($3::bigint * interval '1 second'),$4,$5,$6)",&[&args[1],&hash,&seconds,&subscriber_read,&alert_read,reason])).await
+            } else if scoped {
                 tokio::time::timeout(std::time::Duration::from_secs(30), db.query_one("SELECT public.novu_rust_issue_console_credential_scoped($1,$2,clock_timestamp()+($3::bigint * interval '1 second'),$4,$5)",&[&args[1],&hash,&seconds,&subscriber_read,reason])).await
             } else {
                 tokio::time::timeout(std::time::Duration::from_secs(30), db.query_one("SELECT public.novu_rust_issue_console_credential($1,$2,clock_timestamp()+($3::bigint * interval '1 second'),$4)",&[&args[1],&hash,&seconds,reason])).await

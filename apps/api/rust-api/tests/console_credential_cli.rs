@@ -12,6 +12,115 @@ use uuid::Uuid;
 
 #[tokio::test]
 #[ignore = "requires migrated disposable PostgreSQL and role creation"]
+async fn initial_permissions_are_atomic_and_independent() {
+    let url = std::env::var("TEST_DATABASE_URL").unwrap();
+    let (db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move { driver.await.unwrap() });
+    db.batch_execute(
+        "INSERT INTO public.novu_rust_environments VALUES ('initial-a','org'),('initial-b','org')",
+    )
+    .await
+    .unwrap();
+    let role = format!("console_initial_{}", Uuid::new_v4().simple());
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_issue_console_credential_permissions(text,text,timestamptz,boolean,boolean,text) TO {role}")).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_console_credential_admins(environment_id,database_principal,principal_oid) SELECT 'initial-a',rolname,oid FROM pg_roles WHERE rolname::text=$1", &[&role]).await.unwrap();
+    let actor_url = url.replacen("postgres://postgres@", &format!("postgres://{role}@"), 1);
+    let directory = std::env::temp_dir().join(format!("swallow-initial-{}", Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let (api_db, api_driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move { api_driver.await.unwrap() });
+    let router = novu_rust_api::router(Arc::new(api_db));
+    let run = |env: &str, choice: &str, path: &std::path::Path| {
+        Command::new(env!("CARGO_BIN_EXE_console-credential"))
+            .args([
+                "issue-permissions",
+                env,
+                "3600",
+                path.to_str().unwrap(),
+                choice,
+                "initial-test",
+            ])
+            .env("DATABASE_URL", &actor_url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .output()
+            .unwrap()
+    };
+    for (choice, subscriber, alert) in [
+        ("none", false, false),
+        ("subscriber", true, false),
+        ("alert", false, true),
+        ("both", true, true),
+    ] {
+        let path = directory.join(choice);
+        let result = run("initial-a", choice, &path);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+        let id = Uuid::parse_str(value["credentialId"].as_str().unwrap()).unwrap();
+        let token = std::fs::read_to_string(&path).unwrap();
+        let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+        let row = db.query_one("SELECT c.subscriber_read, EXISTS(SELECT 1 FROM public.novu_rust_console_alert_grants g WHERE g.credential_id=c.credential_id), (SELECT count(*) FROM public.novu_rust_console_credential_audit a WHERE a.credential_id=c.credential_id), (SELECT count(*) FROM public.novu_rust_console_subscriber_scope_audit a WHERE a.credential_id=c.credential_id), (SELECT count(*) FROM public.novu_rust_console_alert_grant_audit a WHERE a.credential_id=c.credential_id) FROM public.novu_rust_console_credentials c WHERE c.credential_id=$1", &[&id]).await.unwrap();
+        assert_eq!(
+            (row.get::<_, bool>(0), row.get::<_, bool>(1)),
+            (subscriber, alert)
+        );
+        assert_eq!(
+            (
+                row.get::<_, i64>(2),
+                row.get::<_, i64>(3),
+                row.get::<_, i64>(4)
+            ),
+            (1, 1, i64::from(alert))
+        );
+        assert_eq!(db.query_one("SELECT token_hash=$2 FROM public.novu_rust_console_credentials WHERE credential_id=$1", &[&id,&hash]).await.unwrap().get::<_,bool>(0), true);
+        for (endpoint, allowed) in [("subscribers", subscriber), ("alerts", alert)] {
+            let request = Request::builder()
+                .uri(format!("/v1/experimental/console/{endpoint}"))
+                .header("authorization", format!("SwallowConsole {token}"))
+                .body(Body::empty())
+                .unwrap();
+            let status = router.clone().oneshot(request).await.unwrap().status();
+            assert_eq!(
+                status,
+                if allowed {
+                    StatusCode::OK
+                } else {
+                    StatusCode::UNAUTHORIZED
+                }
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+    db.batch_execute("CREATE FUNCTION public.test_initial_reject_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$; CREATE TRIGGER test_initial_reject_audit BEFORE INSERT ON public.novu_rust_console_alert_grant_audit FOR EACH ROW EXECUTE FUNCTION public.test_initial_reject_audit()").await.unwrap();
+    let failed = directory.join("failed");
+    assert!(!run("initial-a", "both", &failed).status.success());
+    let hash = format!("{:x}", Sha256::digest(std::fs::read(&failed).unwrap()));
+    assert_eq!(
+        db.query_one(
+            "SELECT count(*) FROM public.novu_rust_console_credentials WHERE token_hash=$1",
+            &[&hash]
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0),
+        0
+    );
+    db.batch_execute("DROP TRIGGER test_initial_reject_audit ON public.novu_rust_console_alert_grant_audit; DROP FUNCTION public.test_initial_reject_audit()").await.unwrap();
+    let denied = directory.join("denied");
+    assert!(!run("initial-b", "both", &denied).status.success());
+    let invalid = directory.join("invalid");
+    assert!(!run("initial-a", "all", &invalid).status.success());
+    assert!(!invalid.exists());
+    std::fs::remove_file(failed).unwrap();
+    std::fs::remove_file(denied).unwrap();
+    std::fs::remove_dir(directory).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires migrated disposable PostgreSQL and role creation"]
 async fn issue_file_list_revoke_and_unknown_outcome_are_safe() {
     let url = std::env::var("TEST_DATABASE_URL").unwrap();
     let (mut db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();

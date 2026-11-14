@@ -3,6 +3,12 @@
 > 기준: 원본 Novu 커밋 `895388f37efe9e06de0aa333e5727303e6ad6853` · 작성: 2026-11-12.
 > **현재 구현은 실험용이며 Novu와 100% 호환되지 않는다. 운영에 사용하거나 기존 Novu의 대체품으로 배포하지 않는다.**
 
+### 콘솔 인증의 초기 권한 선택 (API 0032)
+
+환경별 관리자는 `console-credential issue-permissions ENV 초 파일 none|subscriber|alert|both 사유`로 구독자와 경보의 조회 권한을 각각 선택해 인증을 발급할 수 있다. 인증·구독자 권한 및 감사·선택한 경보 권한 및 감사는 한 트랜잭션에서 반영된다. 경보 미선택은 권한 행과 경보 감사 행을 만들지 않는다. 환경별 관리자 등록과 `public.novu_rust_issue_console_credential_permissions(text,text,timestamptz,boolean,boolean,text)`의 별도 EXECUTE 권한이 필요하다. 이전 발급 명령과 함수는 그대로 유지되므로 초기 권한 명시를 강제하려면 기존 함수의 관리자 실행 권한도 별도로 검토·회수해야 한다.
+
+파일은 DB 발급 전 생성되며 오류나 응답 유실 시 보존된다. 재시도 전 해당 파일의 inspect 결과, 권한과 감사 기록을 확인해야 한다. 감사는 DB 로그인에 귀속되며 공유 DB 계정은 개인 신원을 증명하지 못한다. 개인 로그인·SSO·안전한 비밀 전달·외부 불변 감사는 미구현이다. Docker PostgreSQL에서 제한 관리자 계정으로 네 조합의 실제 HTTP 접근과 환경 간 거절, 경보 감사 실패 시 발급 롤백 및 기존 CLI 회귀를 검증했다. 실제 운영 배포와 외부 인증 연계는 미검증이다. 상세 설정은 [API README](apps/api/rust-api/README.md)를 참고한다.
+
 ### API DB 연결 배정 방식 선택
 
 `SWALLOW_API_MAX_INFLIGHT_PER_CONNECTION`으로 API 프로세스의 DB 연결 슬롯별 활성 HTTP 처리 한도를 선택할 수 있다. 기본값 0은 무제한이며 1–1000을 지정하면 두 배정 방식 모두에서 한도에 도달한 슬롯을 건너뛴다. 연결된 슬롯이 모두 포화되면 대기시키지 않고 `503 Server busy`, `Retry-After: 1`, `Cache-Control: no-store`를 반환한다. health 엔드포인트는 이 제한을 우회하고 DB 연결이 없으면 기존의 별도 503을 반환한다. 한도는 프로세스별이며 재접속 시 이전 요청이 종료되기 전에는 해당 슬롯의 수에 포함된다. 취소 후 계속 실행되는 SQL과 health 검사는 세지 않으므로 PostgreSQL 작업 수를 엄격히 제한하지 않는다. 자동 재시도는 없고 클라이언트는 작업의 재시도 안전성과 응답 유실 시 커밋 가능성을 고려해야 한다. 워커·Socket.IO 및 전체 HA를 보호하는 설정은 아니다.
