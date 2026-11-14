@@ -700,6 +700,78 @@ mod tests {
     use tokio_postgres::NoTls;
 
     #[tokio::test]
+    #[ignore = "requires migrated disposable PostgreSQL, token cleanup enabled, and loopback"]
+    async fn invalid_token_policy_controls_actual_cleanup() {
+        assert_eq!(
+            std::env::var("IS_EXPIRED_TOKENS_REMOVAL_ENABLED").as_deref(),
+            Ok("true")
+        );
+        let (mut db, connection) =
+            tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(), NoTls)
+                .await
+                .unwrap();
+        tokio::spawn(async move { connection.await.unwrap() });
+        db.batch_execute("INSERT INTO novu_rust_environments(id,organization_id) VALUES ('test','org'),('other','org'); INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id) VALUES ('test','alice','subscriber'),('other','alice','other-subscriber'); INSERT INTO novu_rust_fcm_integrations(environment_id,internal_id,identifier) VALUES ('test','integration','fcm'),('other','integration','fcm'); INSERT INTO novu_rust_fcm_devices(environment_id,subscriber_id,integration_internal_id,device_tokens) VALUES ('test','alice','integration',ARRAY['token']),('other','alice','integration',ARRAY['token'])").await.unwrap();
+        let structured = r#"{"error":{"details":[{"@type":"type.googleapis.com/google.firebase.fcm.v1.FcmError","errorCode":"UNREGISTERED"}]}}"#;
+        for (policy, status, body, removed) in [
+            (
+                fcm::InvalidTokenPolicy::Reference,
+                404,
+                "Requested entity was not found.",
+                true,
+            ),
+            (
+                fcm::InvalidTokenPolicy::Unregistered,
+                404,
+                "Requested entity was not found.",
+                false,
+            ),
+            (fcm::InvalidTokenPolicy::Unregistered, 404, structured, true),
+            (
+                fcm::InvalidTokenPolicy::Unregistered,
+                500,
+                structured,
+                false,
+            ),
+        ] {
+            db.execute("UPDATE novu_rust_fcm_devices SET device_tokens=ARRAY['token'] WHERE environment_id='test' AND subscriber_id='alice'", &[]).await.unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let body = body.to_owned();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 8192];
+                assert!(socket.read(&mut buf).await.unwrap() > 0);
+                socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            });
+            let provider = Fcm::with_origin("demo", "fixture".into(), &origin)
+                .unwrap()
+                .with_invalid_token_policy(policy);
+            let id = Uuid::new_v4();
+            let message_id = Uuid::new_v4().simple().to_string();
+            let payload = json!({"prepared_messages":[{"message":{"token":"token","notification":{"title":"hi","body":"body"},"data":{}}}],"prepared_context":{"subscriber_id":"alice","subscriber_internal_id":"subscriber","notification_internal_id":"notification","workflow_identifier":"workflow","transaction_id":id.to_string(),"title":"hi","content":"body","target_metadata":[{"integration_internal_id":"integration","message_id":message_id,"device_tokens":["token"]}]}});
+            crate::enqueue(&db, id, "test", JOB_KIND, &payload)
+                .await
+                .unwrap();
+            assert!(process_one(&mut db, "test", &provider).await.unwrap());
+            server.await.unwrap();
+            let tokens: Vec<String> = db.query_one("SELECT device_tokens FROM novu_rust_fcm_devices WHERE environment_id='test' AND subscriber_id='alice'", &[]).await.unwrap().get(0);
+            assert_eq!(tokens.is_empty(), removed);
+            assert_eq!(
+                db.query_one(
+                    "SELECT state FROM novu_rust_fcm_attempts WHERE job_id=$1",
+                    &[&id]
+                )
+                .await
+                .unwrap()
+                .get::<_, String>(0),
+                if status == 500 { "unknown" } else { "rejected" }
+            );
+            assert_eq!(db.query_one("SELECT device_tokens FROM novu_rust_fcm_devices WHERE environment_id='other' AND subscriber_id='alice'", &[]).await.unwrap().get::<_,Vec<String>>(0),vec!["token"]);
+        }
+    }
+
+    #[tokio::test]
     #[ignore = "requires differential harness PostgreSQL and loopback access"]
     async fn capture_reference_workflow_push() {
         let count: usize = std::env::var("TEST_PUSH_EXPECTED_COUNT")

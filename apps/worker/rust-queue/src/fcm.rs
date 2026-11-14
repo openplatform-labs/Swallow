@@ -406,13 +406,52 @@ enum Auth {
     ServiceAccount(Box<crate::google_oauth::ServiceAccount>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InvalidTokenPolicy {
+    Reference,
+    Unregistered,
+}
+impl InvalidTokenPolicy {
+    pub fn from_env() -> Result<Self, &'static str> {
+        match std::env::var("SWALLOW_FCM_INVALID_TOKEN_POLICY").as_deref() {
+            Ok("reference") | Err(std::env::VarError::NotPresent) => Ok(Self::Reference),
+            Ok("unregistered") => Ok(Self::Unregistered),
+            _ => Err("invalid FCM invalid token policy"),
+        }
+    }
+}
+
+fn unregistered_device_token_response(status: u16, body: &[u8]) -> bool {
+    if status != 404 {
+        return false;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    value
+        .pointer("/error/details")
+        .and_then(Value::as_array)
+        .is_some_and(|details| {
+            details.iter().any(|item| {
+                item.get("@type").and_then(Value::as_str)
+                    == Some("type.googleapis.com/google.firebase.fcm.v1.FcmError")
+                    && item.get("errorCode").and_then(Value::as_str) == Some("UNREGISTERED")
+            })
+        })
+}
+
 pub struct Fcm {
     http: Client,
     endpoint: String,
     auth: Auth,
     project_id: String,
+    invalid_token_policy: InvalidTokenPolicy,
 }
 impl Fcm {
+    pub fn with_invalid_token_policy(mut self, policy: InvalidTokenPolicy) -> Self {
+        self.invalid_token_policy = policy;
+        self
+    }
     pub fn project_id(&self) -> &str {
         &self.project_id
     }
@@ -458,6 +497,7 @@ impl Fcm {
             endpoint: format!("{origin}/v1/projects/{project_id}/messages:send"),
             auth: Auth::Bearer(access_token),
             project_id: project_id.to_owned(),
+            invalid_token_policy: InvalidTokenPolicy::Reference,
         })
     }
     /// One request per target, each attempted once. Failures may be ambiguous.
@@ -503,7 +543,13 @@ impl Fcm {
                 }
                 bytes.extend_from_slice(&chunk);
             }
-            if invalid_device_token_response(&bytes) {
+            let invalid = match self.invalid_token_policy {
+                InvalidTokenPolicy::Reference => invalid_device_token_response(&bytes),
+                InvalidTokenPolicy::Unregistered => {
+                    unregistered_device_token_response(status, &bytes)
+                }
+            };
+            if invalid {
                 return Err(SendError::InvalidDeviceToken(status));
             }
             return Err(SendError::Provider(status));
@@ -525,6 +571,24 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+    #[test]
+    fn structured_unregistered_is_narrowly_classified() {
+        let valid = br#"{"error":{"details":[{"@type":"type.googleapis.com/google.firebase.fcm.v1.FcmError","errorCode":"UNREGISTERED"}]}}"#;
+        assert!(unregistered_device_token_response(404, valid));
+        assert!(!unregistered_device_token_response(500, valid));
+        for body in [
+            r#"Requested entity was not found."#,
+            r#"{"error":{"message":"Requested entity was not found."}}"#,
+            r#"{"error":{"details":[{"@type":"other","errorCode":"UNREGISTERED"}]}}"#,
+            r#"{"error":{"details":[{"@type":"type.googleapis.com/google.firebase.fcm.v1.FcmError","errorCode":"INVALID_ARGUMENT"}]}}"#,
+            r#"{"error":{"status":"UNREGISTERED"}}"#,
+        ] {
+            assert!(
+                !unregistered_device_token_response(404, body.as_bytes()),
+                "{body}"
+            );
+        }
+    }
     #[test]
     #[ignore = "requires the built pinned Firebase SDK and Node.js"]
     fn original_firebase_error_classification_matches() {

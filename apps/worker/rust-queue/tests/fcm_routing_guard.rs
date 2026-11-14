@@ -52,6 +52,7 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
             .env_remove("NOVU_FCM_INTEGRATIONS")
             .env_remove("NOVU_FCM_INTEGRATIONS_FILE")
             .env_remove("SWALLOW_FCM_ALLOW_SHARED_PROVIDER")
+            .env_remove("SWALLOW_FCM_INVALID_TOKEN_POLICY")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         c
@@ -88,6 +89,24 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
         .output()
         .unwrap();
     assert!(!mismatched_mode.status.success());
+    let mismatched_policy = command("guard-env", "project-a", "fixture-token")
+        .env("SWALLOW_FCM_INVALID_TOKEN_POLICY", "unregistered")
+        .output()
+        .unwrap();
+    assert!(!mismatched_policy.status.success());
+    assert!(
+        String::from_utf8_lossy(&mismatched_policy.stderr)
+            .contains("different routing configurations")
+    );
+    let invalid_policy = command("guard-env", "project-a", "fixture-token")
+        .env("SWALLOW_FCM_INVALID_TOKEN_POLICY", "invalid")
+        .output()
+        .unwrap();
+    assert!(!invalid_policy.status.success());
+    assert!(
+        String::from_utf8_lossy(&invalid_policy.stderr)
+            .contains("invalid FCM invalid token policy")
+    );
     let stored:String=db.query_one("SELECT routing_hash FROM novu_rust_fcm_routing_config WHERE environment_id='guard-env'",&[]).await.unwrap().get(0);
     assert_eq!(stored.len(), 64);
     assert!(!stored.contains("fixture"));
@@ -118,6 +137,7 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
     assert_eq!(db.query_one("SELECT count(*) FROM novu_rust_fcm_routing_audit WHERE environment_id='guard-env' AND actor=session_user AND reason='configuration change'",&[]).await.unwrap().get::<_,i64>(0),1);
     let mut changed = Worker(
         command("guard-env", "project-b", "fixture-token-three")
+            .env("SWALLOW_FCM_INVALID_TOKEN_POLICY", "unregistered")
             .spawn()
             .unwrap(),
     );
@@ -126,6 +146,18 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(changed.0.try_wait().unwrap().is_none());
+    let wrong = command("guard-env", "project-b", "fixture-token")
+        .output()
+        .unwrap();
+    assert!(!wrong.status.success());
+    let mut matching = Worker(
+        command("guard-env", "project-b", "fixture-token")
+            .env("SWALLOW_FCM_INVALID_TOKEN_POLICY", "unregistered")
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(matching.0.try_wait().unwrap().is_none());
     let map = |value: &str| {
         let mut c = command("map-env", "unused", "unused");
         c.env_remove("NOVU_FCM_ACCESS_TOKEN")

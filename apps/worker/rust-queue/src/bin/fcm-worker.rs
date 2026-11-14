@@ -1,5 +1,8 @@
 //! Experimental environment-scoped FCM worker; not a full Novu worker.
-use novu_postgres_queue::{fcm::Fcm, fcm_queue};
+use novu_postgres_queue::{
+    fcm::{Fcm, InvalidTokenPolicy},
+    fcm_queue,
+};
 use std::{
     collections::{BTreeMap, HashMap},
     error::Error,
@@ -78,6 +81,7 @@ fn build_integrations(raw: &str) -> Result<HashMap<String, Fcm>, Box<dyn Error +
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let invalid_token_policy = InvalidTokenPolicy::from_env()?;
     let environment = std::env::var("NOVU_FCM_ENVIRONMENT_ID")?;
     if environment.is_empty() {
         return Err("NOVU_FCM_ENVIRONMENT_ID must not be empty".into());
@@ -110,6 +114,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         };
         (Some(provider), None)
     };
+    let provider = provider.map(|p| p.with_invalid_token_policy(invalid_token_policy));
+    let integrations = integrations.map(|items| {
+        items
+            .into_iter()
+            .map(|(id, p)| (id, p.with_invalid_token_policy(invalid_token_policy)))
+            .collect::<HashMap<_, _>>()
+    });
     if shared_provider && integrations.is_some() {
         return Err("shared FCM provider cannot be combined with an integration map".into());
     }
@@ -136,7 +147,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 )]),
             )
         };
-        let value = serde_json::to_vec(&serde_json::json!({"mode":mode,"projects":projects}))?;
+        let mut routing = serde_json::json!({"mode":mode,"projects":projects});
+        if invalid_token_policy == InvalidTokenPolicy::Unregistered {
+            routing["invalidTokenPolicy"] = serde_json::json!("unregistered");
+        }
+        let value = serde_json::to_vec(&routing)?;
         Some(
             ring::digest::digest(&ring::digest::SHA256, &value)
                 .as_ref()
