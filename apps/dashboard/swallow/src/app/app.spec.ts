@@ -101,6 +101,38 @@ describe('Swallow console', () => {
     expect(app.subscribers()).toEqual([]);
   });
 
+  it('loads alert slots only with a restricted credential and clears them on leaving', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[{channel:'slack',targetId:'ops',state:'unknown',lastStartedAt:null}],hasMore:true}),{status:200}));
+    const app = TestBed.createComponent(App).componentInstance;
+    app.setSection('alerts');
+    app.alertKey = 'a'.repeat(64);
+    await app.loadAlerts();
+    expect(app.alertSlots()).toEqual([{channel:'slack',targetId:'ops',state:'unknown',lastStartedAt:null}]);
+    expect(app.alertsHaveMore()).toBe(true);
+    expect(fetchMock).toHaveBeenCalledWith('http://127.0.0.1:3000/v1/experimental/console/alerts',expect.objectContaining({headers:{Authorization:`SwallowConsole ${'a'.repeat(64)}`},credentials:'omit',redirect:'error'}));
+    app.setSection('overview');
+    expect(app.alertKey).toBe('');
+    expect(app.alertSlots()).toEqual([]);
+  });
+
+  it('does not show an obsolete or unauthorized alert response', async () => {
+    let resolve!: (response: Response) => void;
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockReturnValueOnce(new Promise<Response>((done) => { resolve = done; }));
+    const app = TestBed.createComponent(App).componentInstance;
+    app.alertKey = 'a'.repeat(64);
+    const pending = app.loadAlerts();
+    app.forgetAlertKey();
+    resolve(new Response(JSON.stringify({data:[{channel:'email',targetId:'old',state:'unknown',lastStartedAt:null}],hasMore:false}),{status:200}));
+    await pending;
+    expect(app.alertStatus()).toBe('idle');
+    expect(app.alertSlots()).toEqual([]);
+    fetchMock.mockResolvedValueOnce(new Response('',{status:401}));
+    app.alertKey = 'b'.repeat(64);
+    await app.loadAlerts();
+    expect(app.alertStatus()).toBe('error');
+    expect(app.alertError()).toContain('권한');
+  });
+
   it('rejects insecure remote API addresses without sending a request', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch');
     const app = TestBed.createComponent(App).componentInstance;

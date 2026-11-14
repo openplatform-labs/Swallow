@@ -45,7 +45,7 @@ async fn scoped_console_credentials_do_not_grant_api_key_access() {
     }
     assert!(db.execute("INSERT INTO public.novu_rust_console_credentials(token_hash,environment_id,expires_at) VALUES ($1,'ca','infinity')", &[&"f".repeat(64)]).await.is_err());
     let role = format!("console_{}", uuid::Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_console_subscribers(text,text,text,text) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_console_subscribers(text,text,text,text),public.novu_rust_console_alerts(text) TO {role}")).await.unwrap();
     let (actor, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move { driver.await.unwrap() });
     actor
@@ -119,6 +119,52 @@ async fn scoped_console_credentials_do_not_grant_api_key_access() {
         .0,
         StatusCode::BAD_REQUEST
     );
+    let alert_path = "/v1/experimental/console/alerts";
+    assert_eq!(
+        call(app.clone(), alert_path, "SwallowConsole", &token_a)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    db.batch_execute("INSERT INTO public.novu_rust_console_alert_grants(credential_id) SELECT credential_id FROM public.novu_rust_console_credentials WHERE environment_id IN ('ca','cb'); INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) SELECT 'ca','slack','target-'||lpad(n::text,3,'0'),'unknown' FROM generate_series(1,101) n; INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES ('cb','email','other-env','rejected')").await.unwrap();
+    let (status, alerts) = call(app.clone(), alert_path, "SwallowConsole", &token_a).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(alerts["data"].as_array().unwrap().len(), 100);
+    assert_eq!(alerts["hasMore"], true);
+    assert!(!alerts.to_string().contains("other-env"));
+    assert!(!alerts.to_string().contains("attemptId"));
+    let (_, other_alerts) = call(app.clone(), alert_path, "SwallowConsole", &token_b).await;
+    assert_eq!(other_alerts["data"][0]["targetId"], "other-env");
+    assert_eq!(
+        call(app.clone(), alert_path, "ApiKey", &token_a).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(
+            app.clone(),
+            "/v1/experimental/console/alerts?env=cb",
+            "SwallowConsole",
+            &token_a
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert!(actor_direct_access_denied(&url, &role).await);
+    let tx = db.transaction().await.unwrap();
+    tx.execute("DELETE FROM public.novu_rust_console_alert_grants WHERE credential_id=(SELECT credential_id FROM public.novu_rust_console_credentials WHERE token_hash=$1)",&[&format!("{:x}", Sha256::digest(token_a.as_bytes()))]).await.unwrap();
+    let pending_app = app.clone();
+    let pending_token = token_a.clone();
+    let pending = tokio::spawn(async move {
+        call(pending_app, alert_path, "SwallowConsole", &pending_token)
+            .await
+            .0
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!pending.is_finished());
+    tx.commit().await.unwrap();
+    assert_eq!(pending.await.unwrap(), StatusCode::UNAUTHORIZED);
+
     let hash = format!("{:x}", Sha256::digest(token_a.as_bytes()));
     let tx = db.transaction().await.unwrap();
     tx.execute(
@@ -142,4 +188,21 @@ async fn scoped_console_credentials_do_not_grant_api_key_access() {
     assert!(!pending.is_finished());
     tx.commit().await.unwrap();
     assert_eq!(pending.await.unwrap(), StatusCode::UNAUTHORIZED);
+}
+
+async fn actor_direct_access_denied(url: &str, role: &str) -> bool {
+    let (actor, driver) = tokio_postgres::connect(url, NoTls).await.unwrap();
+    tokio::spawn(async move { driver.await.unwrap() });
+    actor
+        .batch_execute(&format!("SET SESSION AUTHORIZATION {role}"))
+        .await
+        .unwrap();
+    actor
+        .query("SELECT * FROM public.novu_rust_console_alert_grants", &[])
+        .await
+        .is_err()
+        && actor
+            .query("SELECT * FROM public.novu_rust_alert_delivery_slots", &[])
+            .await
+            .is_err()
 }

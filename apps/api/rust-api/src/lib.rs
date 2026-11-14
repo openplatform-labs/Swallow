@@ -1,6 +1,7 @@
 //! Experimental, deliberately incomplete Novu trigger endpoint.
 mod contexts;
 mod console_subscribers;
+mod console_alerts;
 mod channel_workflow_management;
 mod fcm_integrations;
 mod inbox_context;
@@ -302,6 +303,7 @@ fn router_with_webhook_configs_and_jwt_policy(
             post(twilio_webhook::receive_dispatch),
         )
         .route("/v1/experimental/console/subscribers", get(console_subscribers::list))
+        .route("/v1/experimental/console/alerts", get(console_alerts::list))
         .route("/v1/events/trigger", post(trigger))
         .route("/v1/experimental/fcm-integrations", get(fcm_integrations::list).post(fcm_integrations::create))
         .route("/v1/experimental/fcm-integrations/{identifier}", get(fcm_integrations::get).patch(fcm_integrations::update))

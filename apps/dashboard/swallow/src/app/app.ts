@@ -4,7 +4,8 @@ import { ClrAlertModule } from '@clr/angular/emphasis/alert';
 
 type ConnectionState = 'unchecked' | 'checking' | 'ready' | 'unavailable';
 type Subscriber = { id: string; firstName: string; lastName: string; email: string };
-type Section = 'overview' | 'workflows' | 'subscribers' | 'channels' | 'activity' | 'settings';
+type AlertSlot = { channel: string; targetId: string; state: string; lastStartedAt: string | null };
+type Section = 'overview' | 'workflows' | 'subscribers' | 'channels' | 'activity' | 'alerts' | 'settings';
 
 @Component({
   imports: [FormsModule, ClrAlertModule],
@@ -19,6 +20,7 @@ export class App {
     { id: 'subscribers', label: '구독자', short: 'SU' },
     { id: 'channels', label: '발송 채널', short: 'CH' },
     { id: 'activity', label: '발송 이력', short: 'AC' },
+    { id: 'alerts', label: '운영 경보', short: 'AL' },
     { id: 'settings', label: '설정', short: 'ST' },
   ];
   readonly section = signal<Section>('overview');
@@ -30,6 +32,13 @@ export class App {
   readonly subscriberError = signal('');
   readonly nextCursor = signal<string | null>(null);
   readonly previousCursor = signal<string | null>(null);
+  readonly alertSlots = signal<AlertSlot[]>([]);
+  readonly alertStatus = signal<'idle' | 'loading' | 'loaded' | 'error'>('idle');
+  readonly alertError = signal('');
+  readonly alertsHaveMore = signal(false);
+  alertKey = '';
+  private alertRequestId = 0;
+  private alertAbort: AbortController | null = null;
   apiOrigin = 'http://127.0.0.1:3000';
   apiKey = '';
   credentialMode: 'restricted' | 'api-key' = 'restricted';
@@ -44,12 +53,14 @@ export class App {
 
   setSection(next: Section): void {
     if (this.section() === 'subscribers' && next !== 'subscribers') this.forgetKey();
+    if (this.section() === 'alerts' && next !== 'alerts') this.forgetAlertKey();
     this.section.set(next);
   }
 
   connectionChanged(): void {
     this.apiKey = '';
     this.clearSubscribers();
+    this.forgetAlertKey();
     this.requestId++;
     this.status.set('unchecked');
     this.checkedAt.set(null);
@@ -70,6 +81,60 @@ export class App {
   forgetKey(): void {
     this.apiKey = '';
     this.clearSubscribers();
+  }
+
+  clearAlerts(): void {
+    this.alertRequestId++;
+    this.alertAbort?.abort();
+    this.alertAbort = null;
+    this.alertSlots.set([]);
+    this.alertsHaveMore.set(false);
+    this.alertStatus.set('idle');
+    this.alertError.set('');
+  }
+
+  forgetAlertKey(): void {
+    this.alertKey = '';
+    this.clearAlerts();
+  }
+
+  async loadAlerts(): Promise<void> {
+    const id = ++this.alertRequestId;
+    this.alertAbort?.abort();
+    const controller = new AbortController();
+    this.alertAbort = controller;
+    this.alertSlots.set([]);
+    this.alertsHaveMore.set(false);
+    this.alertError.set('');
+    this.alertStatus.set('loading');
+    try {
+      const origin = this.validatedOrigin();
+      const key = this.alertKey.trim();
+      if (!/^[0-9a-f]{64}$/.test(key)) throw new Error('인증 값을 확인해 주세요.');
+      const response = await fetch(`${origin}/v1/experimental/console/alerts`, {
+        method: 'GET', headers: { Authorization: `SwallowConsole ${key}` },
+        cache: 'no-store', credentials: 'omit', redirect: 'error',
+        signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10000)]),
+      });
+      if (response.status === 401 || response.status === 403) throw new Error('인증 값 또는 경보 조회 권한을 확인해 주세요.');
+      if (!response.ok) throw new Error('경보 상태를 가져오지 못했습니다.');
+      const body: unknown = await response.json();
+      if (typeof body !== 'object' || body === null || !('data' in body) || !Array.isArray(body.data) || !('hasMore' in body) || typeof body.hasMore !== 'boolean' || body.data.length > 100) throw new Error('API 응답 형식을 확인해 주세요.');
+      const rows: AlertSlot[] = body.data.map((row: unknown) => {
+        if (typeof row !== 'object' || row === null || !('channel' in row) || typeof row.channel !== 'string' || !('targetId' in row) || typeof row.targetId !== 'string' || !('state' in row) || typeof row.state !== 'string' || !('lastStartedAt' in row) || !(typeof row.lastStartedAt === 'string' || row.lastStartedAt === null)) throw new Error('API 응답 형식을 확인해 주세요.');
+        return { channel: row.channel, targetId: row.targetId, state: row.state, lastStartedAt: row.lastStartedAt };
+      });
+      if (id !== this.alertRequestId) return;
+      this.alertSlots.set(rows);
+      this.alertsHaveMore.set(body.hasMore);
+      this.alertStatus.set('loaded');
+    } catch (error: unknown) {
+      if (id !== this.alertRequestId) return;
+      this.alertStatus.set('error');
+      this.alertError.set(error instanceof Error && ['주소', '원격', '인증', '경보', 'API '].some(prefix => error.message.startsWith(prefix)) ? error.message : '서버에 연결할 수 없습니다.');
+    } finally {
+      if (id === this.alertRequestId) this.alertAbort = null;
+    }
   }
 
   private validatedOrigin(): string {
