@@ -68,6 +68,14 @@ fn original_firebase_http_conversion() {
             multicast: false,
             message: json!({"token":"led-b","android":{"notification":{"lightSettings":{"color":"#11223344","lightOnDurationMillis":0,"lightOffDurationMillis":2500}}}}),
         },
+        Plan {
+            multicast: false,
+            message: json!({"token":"sticky-a","android":{"notification":{"sticky":true}}}),
+        },
+        Plan {
+            multicast: false,
+            message: json!({"token":"sticky-b","android":{"notification":{"sticky":false}}}),
+        },
     ];
     for (index, plan) in plans.iter().enumerate() {
         assert_eq!(wire_messages(plan).unwrap(), vec![original[index].clone()]);

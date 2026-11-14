@@ -574,8 +574,13 @@ fn android_notification(value: &Value) -> Result<Value, SendError> {
                 }
                 ("image", value.clone())
             }
-            "localOnly" | "defaultVibrateTimings" | "defaultSound" | "defaultLightSettings" => (
+            "sticky"
+            | "localOnly"
+            | "defaultVibrateTimings"
+            | "defaultSound"
+            | "defaultLightSettings" => (
                 match key.as_str() {
+                    "sticky" => "sticky",
                     "localOnly" => "local_only",
                     "defaultVibrateTimings" => "default_vibrate_timings",
                     "defaultSound" => "default_sound",
@@ -1191,6 +1196,7 @@ mod tests {
             json!({"android":{"notification":{"imageUrl":"bad url"}}}),
             json!({"android":{"notification":{"vibrateTimingsMillis":[-1]}}}),
             json!({"android":{"notification":{"notificationCount":-1}}}),
+            json!({"android":{"notification":{"sticky":"true"}}}),
             json!({"android":{"notification":{"lightSettings":{}}}}),
             json!({"android":{"notification":{"lightSettings":{"color":"#abcxyz","lightOnDurationMillis":1,"lightOffDurationMillis":2}}}}),
             json!({"android":{"notification":{"lightSettings":{"color":"#123456","lightOnDurationMillis":-1,"lightOffDurationMillis":2}}}}),
