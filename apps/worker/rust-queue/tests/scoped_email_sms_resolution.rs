@@ -126,6 +126,9 @@ async fn scoped_email_sms_decisions_are_authorized_atomic_and_fenced() {
         );
     }
     let mut db = connect(&url).await;
+    db.batch_execute(include_str!("../migrations/0135_resend_correlation_retry.sql"))
+        .await
+        .unwrap();
     db.batch_execute("INSERT INTO novu_rust_environments VALUES ('a','org'),('b','org')")
         .await
         .unwrap();
@@ -352,6 +355,49 @@ async fn scoped_email_sms_decisions_are_authorized_atomic_and_fenced() {
         );
         let prior:Option<String>=db.query_one("SELECT retry_provider_message_id FROM novu_rust_delivery_reconciliations WHERE job_id=$1 AND decision='retry'", &[&blocked]).await.unwrap().get(0);
         assert_eq!(prior.as_deref(), Some(provider.as_str()));
+    }
+    // A signed callback can identify an attempt even if its HTTP response and
+    // provider ID were lost. Both operator paths must refuse that retry.
+    for scoped in [false, true] {
+        let blocked = create_job(&db, queue::resend_queue::JOB_KIND).await;
+        let tag = Uuid::new_v4();
+        db.execute(
+            "UPDATE novu_rust_resend_attempts SET correlation_id=$2 WHERE job_id=$1",
+            &[&blocked, &tag],
+        )
+        .await
+        .unwrap();
+        db.execute("INSERT INTO novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type,correlation_id) VALUES ('a',$1,'tagged-id','email.delivered',$2)", &[&format!("tag-{blocked}"),&tag]).await.unwrap();
+        let denied = if scoped {
+            resolve(&actor, "a", blocked, "retry").await.is_err()
+        } else {
+            queue::reconciliation::resolve(
+                &mut db, "a", blocked, None, "retry", "operator", "ticket",
+            )
+            .await
+            .is_err()
+        };
+        assert!(denied);
+        let row=db.query_one("SELECT j.status,a.state,a.correlation_id,(SELECT count(*) FROM novu_rust_delivery_reconciliations WHERE job_id=j.id) FROM novu_queue_jobs j JOIN novu_rust_resend_attempts a ON a.job_id=j.id WHERE j.id=$1", &[&blocked]).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), "failed");
+        assert_eq!(row.get::<_, String>(1), "unknown");
+        assert_eq!(row.get::<_, Uuid>(2), tag);
+        assert_eq!(row.get::<_, i64>(3), 0);
+        db.execute("DELETE FROM novu_rust_resend_delivery_events WHERE environment_id='a' AND correlation_id=$1", &[&tag]).await.unwrap();
+        db.execute("INSERT INTO novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type,correlation_id) VALUES ('b',$1,'tagged-id','email.delivered',$2),('a',$3,'different','email.delivered',$4)", &[&format!("cross-tag-{blocked}"),&tag,&format!("other-tag-{blocked}"),&Uuid::new_v4()]).await.unwrap();
+        if scoped {
+            resolve(&actor, "a", blocked, "retry").await.unwrap();
+        } else {
+            queue::reconciliation::resolve(
+                &mut db, "a", blocked, None, "retry", "operator", "ticket",
+            )
+            .await
+            .unwrap();
+        }
+        let row=db.query_one("SELECT j.status,(SELECT count(*) FROM novu_rust_resend_attempts WHERE job_id=j.id),r.retry_correlation_id FROM novu_queue_jobs j JOIN novu_rust_delivery_reconciliations r ON r.job_id=j.id WHERE j.id=$1", &[&blocked]).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), "pending");
+        assert_eq!(row.get::<_, i64>(1), 0);
+        assert_eq!(row.get::<_, Uuid>(2), tag);
     }
     // FCM target/group state is compared to the existing implementation.
     let no_function = fcm_job(
