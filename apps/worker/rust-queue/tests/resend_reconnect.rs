@@ -1,10 +1,11 @@
-//! Restarts the disposable PostgreSQL container; never use with a shared database.
+//! Restarts only a dedicated disposable PostgreSQL container.
 use novu_postgres_queue as queue;
 use serde_json::json;
-use tokio_postgres::NoTls;
+use std::time::Duration;
+use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
 
-async fn connect(url: &str) -> tokio_postgres::Client {
+async fn connect(url: &str) -> Client {
     for _ in 0..100 {
         if let Ok((db, driver)) = tokio_postgres::connect(url, NoTls).await {
             tokio::spawn(async move {
@@ -12,11 +13,10 @@ async fn connect(url: &str) -> tokio_postgres::Client {
             });
             return db;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("PostgreSQL did not become ready")
+    panic!("database did not become ready");
 }
-
 struct Worker(std::process::Child);
 impl Drop for Worker {
     fn drop(&mut self) {
@@ -24,14 +24,42 @@ impl Drop for Worker {
         let _ = self.0.wait();
     }
 }
+fn worker(url: &str, app: &str) -> Worker {
+    Worker(
+        std::process::Command::new(env!("CARGO_BIN_EXE_resend-projection-worker"))
+            .env("DATABASE_URL", format!("{url}?application_name={app}"))
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("NOVU_RESEND_ENVIRONMENT_ID", "env")
+            .env("NOVU_RESEND_PROJECTION_DB_TIMEOUT_SECONDS", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    )
+}
+
+#[test]
+fn invalid_timeout_is_rejected_before_connecting() {
+    for timeout in ["0", "301", "bad"] {
+        let status = std::process::Command::new(env!("CARGO_BIN_EXE_resend-projection-worker"))
+            .env("DATABASE_URL", "postgresql://localhost/unused")
+            .env("NOVU_RESEND_ENVIRONMENT_ID", "env")
+            .env("NOVU_RESEND_PROJECTION_DB_TIMEOUT_SECONDS", timeout)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success());
+    }
+}
 
 #[tokio::test]
 #[ignore = "restarts a disposable PostgreSQL container"]
-async fn projector_reconnects_after_database_restart() {
+async fn workers_reconnect_after_timeout_and_database_restart() {
     let url = std::env::var("TEST_DATABASE_URL").unwrap();
     let container = std::env::var("TEST_PG_CONTAINER").unwrap();
-    let db = connect(&url).await;
-    db.batch_execute("CREATE TABLE novu_rust_environments(id text PRIMARY KEY, organization_id text NOT NULL); INSERT INTO novu_rust_environments VALUES ('env','org')").await.unwrap();
+    let mut db = connect(&url).await;
+    db.batch_execute("CREATE TABLE novu_rust_environments(id text PRIMARY KEY,organization_id text NOT NULL); INSERT INTO novu_rust_environments VALUES ('env','org')").await.unwrap();
     for sql in [
         queue::MIGRATION,
         queue::resend_queue::MIGRATION,
@@ -56,33 +84,53 @@ async fn projector_reconnects_after_database_restart() {
     )
     .await
     .unwrap();
-    let mut worker = Worker(
-        std::process::Command::new(env!("CARGO_BIN_EXE_resend-projection-worker"))
-            .env("DATABASE_URL", &url)
-            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
-            .env("NOVU_RESEND_ENVIRONMENT_ID", "env")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    let mut ready = false;
+    db.execute("INSERT INTO novu_rust_resend_projection_heartbeat VALUES ('env',clock_timestamp()-interval '1 hour')", &[]).await.unwrap();
+    let lock = db.transaction().await.unwrap();
+    lock.query_one("SELECT environment_id FROM novu_rust_resend_projection_heartbeat WHERE environment_id='env' FOR UPDATE", &[]).await.unwrap();
+    let observer = connect(&url).await;
+    let mut first = worker(&url, "swallow_resend_ha_1");
+    let mut blocked = false;
     for _ in 0..100 {
-        let result: Option<String> = db
-            .query_one(
-                "SELECT resend_delivery_result FROM novu_queue_jobs WHERE id=$1",
-                &[&job],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        if result.as_deref() == Some("pending") {
-            ready = true;
+        blocked=observer.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='swallow_resend_ha_1' AND wait_event_type='Lock')", &[]).await.unwrap().get(0);
+        if blocked {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(ready);
+    assert!(blocked, "worker did not wait on heartbeat lock");
+    let mut disconnected = false;
+    for _ in 0..100 {
+        disconnected = !observer.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='swallow_resend_ha_1')", &[]).await.unwrap().get::<_,bool>(0);
+        if disconnected {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        disconnected,
+        "worker did not abandon the timed-out DB connection"
+    );
+    lock.commit().await.unwrap();
+    let mut recovered = false;
+    for _ in 0..150 {
+        recovered=observer.query_one("SELECT last_completed_at>clock_timestamp()-interval '10 seconds' FROM novu_rust_resend_projection_heartbeat WHERE environment_id='env'", &[]).await.unwrap().get(0);
+        if recovered {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(recovered, "worker did not reconnect after timeout");
+    let mut second = worker(&url, "swallow_resend_ha_2");
+    let mut both = false;
+    for _ in 0..100 {
+        let count:i64=observer.query_one("SELECT count(*) FROM pg_stat_activity WHERE application_name IN ('swallow_resend_ha_1','swallow_resend_ha_2')", &[]).await.unwrap().get(0);
+        if count == 2 {
+            both = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(both, "two worker connections did not start");
     assert!(
         std::process::Command::new("docker")
             .args(["restart", &container])
@@ -94,24 +142,29 @@ async fn projector_reconnects_after_database_restart() {
     let db = connect(&url).await;
     db.execute("INSERT INTO novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type,recipient_hash) VALUES ('env','event','id','email.delivered','hash')", &[]).await.unwrap();
     let mut delivered = false;
-    for _ in 0..150 {
-        let result: Option<String> = db
+    let mut reconnected = false;
+    for _ in 0..400 {
+        delivered = db
             .query_one(
-                "SELECT resend_delivery_result FROM novu_queue_jobs WHERE id=$1",
+                "SELECT resend_delivery_result='delivered' FROM novu_queue_jobs WHERE id=$1",
                 &[&job],
             )
             .await
             .unwrap()
-            .get(0);
-        if result.as_deref() == Some("delivered") {
-            delivered = true;
+            .get::<_, Option<bool>>(0)
+            == Some(true);
+        let count: i64 = db.query_one("SELECT count(*) FROM pg_stat_activity WHERE application_name IN ('swallow_resend_ha_1','swallow_resend_ha_2')", &[]).await.unwrap().get(0);
+        reconnected = count == 2;
+        if delivered && reconnected {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let alive = worker.0.try_wait().unwrap().is_none();
     assert!(
-        alive && delivered,
-        "projector did not recover after PostgreSQL restart"
+        delivered
+            && reconnected
+            && first.0.try_wait().unwrap().is_none()
+            && second.0.try_wait().unwrap().is_none(),
+        "workers did not recover after database restart"
     );
 }
