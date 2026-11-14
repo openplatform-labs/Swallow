@@ -74,6 +74,7 @@ async fn target_outage_is_reported_using_independent_alert_database() {
             .env("DATABASE_URL", role_url.as_str())
             .env("SWALLOW_DB_PROBE_URL", &probe)
             .env("SWALLOW_DB_PROBE_ROLE", probe_role)
+            .env_remove("SWALLOW_DB_PROBE_MIN_SYNC_STANDBYS")
             .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
             .env("SWALLOW_DB_PROBE_TIMEOUT_SECONDS", "2")
             .env("SWALLOW_DB_ALERT_OPERATION_TIMEOUT_SECONDS", "1")
@@ -101,7 +102,21 @@ async fn target_outage_is_reported_using_independent_alert_database() {
     assert_eq!(db.query_one("SELECT last_condition_mask FROM novu_rust_alert_delivery_slots WHERE environment_id='monitor' AND target_id='db-primary'",&[]).await.unwrap().get::<_,i32>(0),0);
     assert_eq!(run("writable-primary").status.code(), Some(0));
     assert_eq!(run("invalid").status.code(), Some(1));
+    for count in ["0", "33", "bad"] {
+        let invalid = Command::new(env!("CARGO_BIN_EXE_send-database-alert"))
+            .args(["monitor", "primary", "60"])
+            .env("SWALLOW_DB_PROBE_ROLE", "synchronous-primary")
+            .env("SWALLOW_DB_PROBE_MIN_SYNC_STANDBYS", count)
+            .output()
+            .unwrap();
+        assert_eq!(invalid.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&invalid.stderr)
+                .contains("invalid minimum synchronous standbys")
+        );
+    }
     db.execute("UPDATE novu_rust_alert_delivery_slots SET state='rejected' WHERE environment_id='monitor' AND target_id='db-primary'",&[]).await.unwrap();
+    assert_eq!(run("synchronous-primary").status.code(), Some(2));
     let mismatched = run("standby");
     assert_eq!(mismatched.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&mismatched.stderr).contains("requires operator review"));
