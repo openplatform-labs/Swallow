@@ -18,7 +18,7 @@ async fn issue_file_list_revoke_and_unknown_outcome_are_safe() {
     tokio::spawn(async move { driver.await.unwrap() });
     db.batch_execute("INSERT INTO public.novu_rust_environments VALUES ('cli-a','org'),('cli-b','org'); INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES ('cli-a','alice','id-a','{\"firstName\":\"Alice\"}')").await.unwrap();
     let role = format!("console_cli_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_inspect_console_credential(text,text),public.novu_rust_issue_console_credential(text,text,timestamptz,text),public.novu_rust_revoke_console_credential(text,uuid,text),public.novu_rust_list_console_credentials(text,uuid),public.novu_rust_list_console_credential_audit(text,bigint) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_manage_console_alert_grant(text,uuid,text,text),public.novu_rust_list_console_alert_grants(text,uuid),public.novu_rust_list_console_alert_grant_audit(text,bigint),public.novu_rust_inspect_console_credential(text,text),public.novu_rust_issue_console_credential(text,text,timestamptz,text),public.novu_rust_revoke_console_credential(text,uuid,text),public.novu_rust_list_console_credentials(text,uuid),public.novu_rust_list_console_credential_audit(text,bigint) TO {role}")).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_console_credential_admins(environment_id,database_principal,principal_oid) SELECT 'cli-a',rolname,oid FROM pg_roles WHERE rolname::text=$1",&[&role]).await.unwrap();
     let actor_url = url.replacen("postgres://postgres@", &format!("postgres://{role}@"), 1);
     let run = |args: &[&str]| {
@@ -128,7 +128,133 @@ async fn issue_file_list_revoke_and_unknown_outcome_are_safe() {
             .windows(token.len())
             .any(|v| v == token.as_bytes())
     );
+    // A failed audit write must roll the permission change back.
+    db.batch_execute("CREATE FUNCTION public.test_reject_alert_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$; CREATE TRIGGER test_reject_alert_audit BEFORE INSERT ON public.novu_rust_console_alert_grant_audit FOR EACH ROW EXECUTE FUNCTION public.test_reject_alert_audit()").await.unwrap();
+    let failed = run(&["alert-access", "cli-a", id, "grant", "test"]);
+    assert!(!failed.status.success());
+    assert_eq!(
+        db.query_one(
+            "SELECT count(*) FROM public.novu_rust_console_alert_grants",
+            &[]
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0),
+        0
+    );
+    db.batch_execute("DROP TRIGGER test_reject_alert_audit ON public.novu_rust_console_alert_grant_audit; DROP FUNCTION public.test_reject_alert_audit()").await.unwrap();
+    assert!(
+        !run(&["alert-access", "cli-b", id, "grant", "test"])
+            .status
+            .success()
+    );
+    let grant = run(&["alert-access", "cli-a", id, "grant", "test-ticket"]);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&grant.stdout).unwrap()["changed"],
+        true
+    );
+    let again = run(&["alert-access", "cli-a", id, "grant", "test-ticket"]);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&again.stdout).unwrap()["changed"],
+        false
+    );
+    let list = run(&["alert-access-list", "cli-a"]);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&list.stdout).unwrap()[0]["credentialId"],
+        id
+    );
+    assert!(!run(&["alert-access-list", "cli-b"]).status.success());
+    let grant_audit = run(&["alert-access-audit", "cli-a"]);
+    let audit: serde_json::Value = serde_json::from_slice(&grant_audit.stdout).unwrap();
+    assert_eq!(audit.as_array().unwrap().len(), 1);
+    assert_eq!(audit[0]["action"], "grant");
+    assert_eq!(audit[0]["actor"], role);
+    assert!(!String::from_utf8_lossy(&grant_audit.stdout).contains(&token));
+    let revoke = run(&["alert-access", "cli-a", id, "revoke", "test-ticket"]);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&revoke.stdout).unwrap()["changed"],
+        true
+    );
+    let audit = run(&["alert-access-audit", "cli-a"]);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&audit.stdout)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    // A revocation waits for an in-flight read holding the credential row.
+    assert!(
+        run(&["alert-access", "cli-a", id, "grant", "lock-test"])
+            .status
+            .success()
+    );
+    let tx = db.transaction().await.unwrap();
+    let credential_id = Uuid::parse_str(id).unwrap();
+    tx.query_one("SELECT credential_id FROM public.novu_rust_console_credentials WHERE credential_id=$1 FOR SHARE", &[&credential_id]).await.unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_console-credential"))
+        .args(["alert-access", "cli-a", id, "revoke", "lock-test"])
+        .env("DATABASE_URL", &actor_url)
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(child.try_wait().unwrap().is_none());
+    tx.commit().await.unwrap();
+    let finished = child.wait_with_output().unwrap();
+    assert!(finished.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&finished.stdout).unwrap()["changed"],
+        true
+    );
     let router = novu_rust_api::router_with_subscriber_secret(Arc::new(db), None);
+    let alert_request = || {
+        Request::builder()
+            .uri("/v1/experimental/console/alerts")
+            .header("authorization", format!("SwallowConsole {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(alert_request())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(
+        run(&["alert-access", "cli-a", id, "grant", "http-test"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(alert_request())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert!(
+        run(&["alert-access", "cli-a", id, "revoke", "http-test"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(alert_request())
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
     let request = || {
         Request::builder()
             .uri("/v1/experimental/console/subscribers")
@@ -145,6 +271,11 @@ async fn issue_file_list_revoke_and_unknown_outcome_are_safe() {
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&revoked.stdout).unwrap()["changed"],
         true
+    );
+    assert!(
+        !run(&["alert-access", "cli-a", id, "grant", "test"])
+            .status
+            .success()
     );
     let inspected = run(&["inspect", "cli-a", path_string]);
     assert_eq!(
