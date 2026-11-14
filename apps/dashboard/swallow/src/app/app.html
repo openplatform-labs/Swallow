@@ -437,6 +437,17 @@
             <p>{{ grantAuditPage() }} 페이지</p><button type="button" class="btn btn-sm btn-outline" [disabled]="grantAuditPage() <= 1" (click)="loadGrantAudit('previous')">이전</button><button type="button" class="btn btn-sm btn-outline" [disabled]="!grantAuditNext()" (click)="loadGrantAudit('next')">다음</button>
           }
         </div></section>
+        <section class="card decision-card"><div class="card-block"><div class="card-eyebrow">SUBSCRIBER ACTIVITY AUDIT</div><h2>구독자 변경 이력</h2>
+          <p>작업 종류별 별도 감사 조회 권한이 필요합니다. JWT 관리 경로의 기록만 표시하며 UUID순으로 조회하므로 시간순이 아닙니다.</p>
+          <label for="activity-kind">작업 종류</label><select id="activity-kind" name="activityKind" [(ngModel)]="activityKind" (ngModelChange)="clearActivityAudit()" [disabled]="grantChangeStatus() === 'sending' || permissionChangeStatus() === 'sending'"><option value="create">구독자 생성</option><option value="profile">프로필 변경</option><option value="delete">구독자 삭제</option></select><button type="button" class="btn btn-outline" [disabled]="activityAuditStatus() === 'loading' || grantChangeStatus() === 'sending' || permissionChangeStatus() === 'sending'" (click)="loadActivityAudit()">구독자 이력 조회</button>
+          @if(activityAuditStatus() === 'loading'){<p role="status">조회 중입니다.</p>}
+          @else if(activityAuditStatus() === 'error'){<p class="subscriber-error" role="alert">조회하지 못했습니다. 인증과 해당 작업의 감사 조회 권한을 확인하세요.</p>}
+          @else if(activityAuditStatus() === 'loaded'){
+            @if(activityAuditRows().length === 0){<p>조회된 이력이 없습니다.</p>}
+            @else {<div class="table-wrap"><table class="table"><thead><tr><th>기록</th><th>운영자</th><th>구독자</th><th>변경</th><th>사유</th></tr></thead><tbody>@for(row of activityAuditRows();track row.id){<tr><td>{{ row.recordedAt }}<br>기록: {{ row.id }}@if(row.requestId){<br>요청: {{ row.requestId }}}</td><td>{{ row.issuer }}<br>{{ row.subject }} · {{ row.clientId }}<br>DB: {{ row.databasePrincipal }}</td><td>{{ row.subscriberId }}<br>세대: {{ row.generation }}</td><td>revision {{ row.previousRevision ?? '—' }} → {{ row.revision ?? '—' }}<br>필드: {{ row.fields.join(', ') || '—' }}</td><td>{{ row.reason }}</td></tr>}</tbody></table></div>}
+            <p>{{ activityAuditPage() }} 페이지</p><button type="button" class="btn btn-sm btn-outline" [disabled]="activityAuditPage() <= 1" (click)="loadActivityAudit('previous')">이전</button><button type="button" class="btn btn-sm btn-outline" [disabled]="!activityAuditNext()" (click)="loadActivityAudit('next')">다음</button>
+          }
+        </div></section>
         <section class="card decision-card"><div class="card-block"><div class="card-eyebrow">AUDIT</div><h2>권한 변경 이력</h2><p>페이지마다 조회 시점이 다르며 기록 ID 순서는 커밋 순서를 보장하지 않습니다.</p>
           <button type="button" class="btn btn-outline" [disabled]="permissionStatus() === 'loading' || (permissionChangeStatus() === 'sending' || grantChangeStatus() === 'sending')" (click)="loadPermissions('audit')">최근 이력 조회</button>
           @if (permissionStatus() === 'audit') {

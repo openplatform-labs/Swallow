@@ -32,6 +32,7 @@ type PermissionFlags = { enabled:boolean; subscriberRead:boolean; alertRead:bool
 type PermissionChange = { origin:string; environment:string; keyHash:string; body:{ requestId:string; targetIssuer:string; targetSubject:string; targetClientId:string; expected:PermissionFlags|null; desired:PermissionFlags; reason:string } };
 type GrantBody = {requestId:string;targetIssuer:string;targetSubject:string;targetClientId:string;resource?:string;permission:string;expected:boolean;desired:boolean;reason:string};
 type GrantSnapshot = {origin:string;environment:string;keyHash:string;body:GrantBody};
+type SubscriberActivity = {id:string;subscriberId:string;generation:string;issuer:string;subject:string;clientId:string;databasePrincipal:string;requestId:string|null;previousRevision:string|null;revision:string|null;fields:string[];reason:string;recordedAt:string};
 type GrantAudit = {id:string;actorIssuer:string;actorSubject:string;actorClientId:string;databasePrincipal:string;requestId:string;targetIssuer:string;targetSubject:string;targetClientId:string;resource:string;permission:string;previous:boolean;current:boolean;reason:string;recordedAt:string};
 type GrantRecord = GrantBody & {changed:boolean;createdAt:string};
 type PermissionRequestRecord = {requestId:string; targetIssuer:string; targetSubject:string; targetClientId:string; expected:PermissionFlags|null; desired:PermissionFlags; reason:string; changed:boolean; createdAt:string};
@@ -264,6 +265,14 @@ export class App implements OnDestroy {
   readonly grantChange=signal<GrantSnapshot|null>(null);
   readonly grantChanged=signal<boolean|null>(null);
   readonly grantMessage=signal('');
+  activityKind:'create'|'profile'|'delete'='create';
+  readonly activityAuditStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');
+  readonly activityAuditRows=signal<SubscriberActivity[]>([]);
+  readonly activityAuditNext=signal<string|null>(null);
+  readonly activityAuditPage=signal(1);
+  private activityAuditHistory:(string|null)[]=[null];
+  private activityAuditSequence=0;
+  private activityAuditAbort:AbortController|null=null;
   grantAuditScope:'workflow'|'subscriber'='workflow';
   readonly grantAuditStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');
   readonly grantAuditRows=signal<GrantAudit[]>([]);
@@ -391,7 +400,7 @@ export class App implements OnDestroy {
     this.permissionSequence++;this.permissionAbort?.abort();this.permissionAbort=null;
     this.permissionStatus.set('idle');this.permissionIdentity.set(null);this.permissionAudit.set([]);this.permissionNext.set(null);
     this.clearPermissionRequest(clearKey);
-    this.clearGrantRead();this.clearGrantRequest(clearKey);this.clearGrantAudit();
+    this.clearGrantRead();this.clearGrantRequest(clearKey);this.clearGrantAudit();this.clearActivityAudit();
     if (clearKey) this.permissionKey='';
   }
 
@@ -422,6 +431,36 @@ export class App implements OnDestroy {
     finally {if(sequence===this.permissionRequestSequence)this.permissionRequestAbort=null;}
   }
 
+  clearActivityAudit():void {
+    this.activityAuditSequence++;this.activityAuditAbort?.abort();this.activityAuditAbort=null;this.activityAuditRows.set([]);this.activityAuditNext.set(null);this.activityAuditPage.set(1);this.activityAuditHistory=[null];this.activityAuditStatus.set('idle');
+  }
+  async loadActivityAudit(direction?:'next'|'previous'):Promise<void> {
+    this.expireOidcIfNeeded();if(this.grantChangeStatus()==='sending'||this.permissionChangeStatus()==='sending')return;
+    if(direction==='previous'&&this.activityAuditPage()<=1)return;
+    const cursor=direction==='next'?this.activityAuditNext():direction==='previous'?this.activityAuditHistory[this.activityAuditPage()-2]:null;
+    if((direction==='next'&&!cursor)||cursor===undefined)return;
+    const page=direction==='next'?this.activityAuditPage()+1:direction==='previous'?this.activityAuditPage()-1:1;
+    const sequence=++this.activityAuditSequence;this.activityAuditAbort?.abort();const controller=new AbortController();this.activityAuditAbort=controller;this.activityAuditRows.set([]);this.activityAuditNext.set(null);this.activityAuditStatus.set('loading');
+    try {
+      const key=this.permissionKey.trim(),environment=this.permissionEnvironment.trim(),kind=this.activityKind;
+      if(!this.validJwt(key)||!this.validEnvironment(environment)||!['create','profile','delete'].includes(kind))throw new Error('invalid input');
+      const params=new URLSearchParams({environmentId:environment,kind});if(cursor)params.set('after',cursor);
+      const response=await fetch(`${this.validatedOrigin()}/v1/experimental/operator/subscriber-activity?${params}`,{headers:{Authorization:`Bearer ${key}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      if(!response.ok)throw new Error('request failed');const value:unknown=await response.json();if(typeof value!=='object'||value===null)throw new Error('invalid response');const result=value as Record<string,unknown>;
+      if(!Array.isArray(result['data'])||result['data'].length>50||typeof result['hasMore']!=='boolean'||!(result['next']===null||typeof result['next']==='string'))throw new Error('invalid response');
+      const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,revision=(v:unknown)=>v===null||(typeof v==='string'&&/^(0|[1-9][0-9]*)$/.test(v));
+      const rows:SubscriberActivity[]=result['data'].map((entry:unknown)=>{
+        if(typeof entry!=='object'||entry===null)throw new Error('invalid row');const r=entry as Record<string,unknown>;
+        if(['id','subscriberId','generation','issuer','subject','clientId','databasePrincipal','reason','recordedAt'].some(k=>typeof r[k]!=='string')||!uuid.test(r['id'] as string)||!uuid.test(r['generation'] as string)||!(r['requestId']===null||(typeof r['requestId']==='string'&&uuid.test(r['requestId'])))||!revision(r['previousRevision'])||!revision(r['revision'])||!Array.isArray(r['fields'])||r['fields'].some((f:unknown)=>typeof f!=='string'||!['firstName','lastName','email','phone'].includes(f)))throw new Error('invalid row');
+        if((kind==='create'&&(r['requestId']===null||r['previousRevision']!==null||r['revision']!=='0'))||(kind==='delete'&&(r['requestId']===null||r['previousRevision']===null||r['revision']!==null))||(kind==='profile'&&(r['requestId']!==null||r['previousRevision']===null||r['revision']===null)))throw new Error('invalid kind');
+        return {id:r['id'] as string,subscriberId:r['subscriberId'] as string,generation:r['generation'] as string,issuer:r['issuer'] as string,subject:r['subject'] as string,clientId:r['clientId'] as string,databasePrincipal:r['databasePrincipal'] as string,requestId:r['requestId'] as string|null,previousRevision:r['previousRevision'] as string|null,revision:r['revision'] as string|null,fields:r['fields'] as string[],reason:r['reason'] as string,recordedAt:r['recordedAt'] as string};
+      });
+      const ids=rows.map(r=>r.id.toLowerCase());if(ids.some((id,i)=>(i>0&&ids[i-1]>=id)||(!!cursor&&id<=cursor.toLowerCase()))||(result['hasMore']?rows.length!==50||typeof result['next']!=='string'||result['next'].toLowerCase()!==ids[ids.length-1]:result['next']!==null))throw new Error('invalid page');
+      this.expireOidcIfNeeded();if(sequence!==this.activityAuditSequence)return;
+      this.activityAuditRows.set(rows);this.activityAuditNext.set(result['next'] as string|null);this.activityAuditPage.set(page);this.activityAuditHistory=this.activityAuditHistory.slice(0,page-1);this.activityAuditHistory.push(cursor);this.activityAuditStatus.set('loaded');
+    }catch{this.expireOidcIfNeeded();if(sequence===this.activityAuditSequence)this.activityAuditStatus.set('error');}
+    finally{if(sequence===this.activityAuditSequence)this.activityAuditAbort=null;}
+  }
   clearGrantAudit():void {
     this.grantAuditSequence++;this.grantAuditAbort?.abort();this.grantAuditAbort=null;this.grantAuditRows.set([]);this.grantAuditNext.set(null);this.grantAuditPage.set(1);this.grantAuditHistory=[null];this.grantAuditStatus.set('idle');
   }

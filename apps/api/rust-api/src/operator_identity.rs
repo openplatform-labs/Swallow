@@ -38,6 +38,7 @@ enum Lookup {
     SubscriberGrantRead,
     SubscriberGrantRequest,
     SubscriberGrantAudit,
+    SubscriberActivityAudit,
 }
 
 fn authenticate(
@@ -189,6 +190,15 @@ pub(super) async fn workflow_grant_request(
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
 ) -> Response {
     query(db, headers, uri, verifier, Lookup::WorkflowGrantRequest).await
+}
+
+pub(super) async fn subscriber_activity_audit(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::SubscriberActivityAudit).await
 }
 
 pub(super) async fn subscriber_grant_audit(
@@ -856,6 +866,7 @@ async fn query(
         Lookup::SubscriberDeleteRequest => &["environmentId", "requestId"],
         Lookup::SubscriberGrantRequest => &["environmentId", "requestId"],
         Lookup::SubscriberGrantAudit => &["environmentId", "after"],
+        Lookup::SubscriberActivityAudit => &["environmentId", "kind", "after"],
         Lookup::SubscriberGrantRead => &[
             "environmentId",
             "targetIssuer",
@@ -879,6 +890,24 @@ async fn query(
         return failure(StatusCode::UNAUTHORIZED, "Unauthorized", "Unauthorized");
     };
     let result = match lookup {
+        Lookup::SubscriberActivityAudit => {
+            let Some(kind) = params
+                .get("kind")
+                .filter(|s| ["create", "profile", "delete"].contains(&s.as_str()))
+            else {
+                return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+            };
+            let after = match params.get("after") {
+                Some(value) => match Uuid::parse_str(value) {
+                    Ok(id) => Some(id),
+                    Err(_) => {
+                        return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+                    }
+                },
+                None => None,
+            };
+            db.query_one("SELECT public.novu_rust_operator_jwt_subscriber_activity_read($1,$2,$3,$4,$5,$6,$7)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&kind,&after]).await
+        }
         Lookup::SubscriberGrantAudit => {
             let after = match params.get("after") {
                 Some(value) => match Uuid::parse_str(value) {
