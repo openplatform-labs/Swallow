@@ -188,6 +188,44 @@ describe('Swallow console', () => {
     fixture.destroy();
   });
 
+  it('discards pending subscriber, alert and decision lookup responses after delayed OIDC expiry', async () => {
+    vi.useFakeTimers();vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));
+    vi.spyOn(OperatorOidc.prototype,'signIn').mockImplementation(async()=>({token:'aaa.bbb.ccc',subject:'alice',environmentId:'env-a',expiresAt:Math.floor(Date.now()/1000)+2}));
+    let finish!:(response:Response)=>void;
+    const fetchMock=vi.spyOn(globalThis,'fetch');
+    for (const kind of ['subscribers','alerts','lookup'] as const) {
+      vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+      const fixture=TestBed.createComponent(App);const app=fixture.componentInstance;
+      app.oidcIssuer='https://issuer.test';app.oidcClientId='console';app.oidcEnvironment='env-a';await app.prepareOidc();await app.signInOidc();
+      app.useOidc(kind==='subscribers'?'subscribers':'alerts');
+      fetchMock.mockReturnValueOnce(new Promise(done=>{finish=done;}));
+      if (kind==='lookup') {app.useOidcForDecision('lookup');app.lookupId='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';}
+      const pending=kind==='subscribers'?app.loadSubscribers():kind==='alerts'?app.loadAlerts():app.lookupDecisionRequest();
+      app.decisionStatus.set('unknown');app.decisionRequestId.set('preserved');
+      vi.setSystemTime(new Date('2026-01-01T00:00:03Z'));
+      const body=kind==='subscribers'?{data:[{subscriberId:'person',email:'private@example.test'}],next:null,previous:null}:kind==='alerts'?{data:[{channel:'slack',targetId:'ops',state:'unknown',lastStartedAt:null}],hasMore:false,next:null}:{found:false};
+      finish(new Response(JSON.stringify(body),{status:200}));await pending;
+      expect(app.oidcStatus()).toBe('expired');expect(app.subscribers()).toEqual([]);expect(app.alertSlots()).toEqual([]);expect(app.lookupStatus()).toBe('idle');
+      expect(app.decisionStatus()).toBe('unknown');expect(app.decisionRequestId()).toBe('preserved');fixture.destroy();
+    }
+  });
+
+  it('removes already displayed subscriber and alert data when their OIDC session expires', async () => {
+    vi.useFakeTimers();vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));
+    vi.spyOn(OperatorOidc.prototype,'signIn').mockResolvedValue({token:'aaa.bbb.ccc',subject:'alice',environmentId:'env-a',expiresAt:Math.floor(Date.now()/1000)+2});
+    const fixture=TestBed.createComponent(App);const app=fixture.componentInstance;
+    app.oidcIssuer='https://issuer.test';app.oidcClientId='console';app.oidcEnvironment='env-a';await app.prepareOidc();await app.signInOidc();
+    app.apiKey='aaa.bbb.ccc';app.alertKey='aaa.bbb.ccc';app.lookupKey='aaa.bbb.ccc';app.lookupId='preserved-lookup';
+    app.subscribers.set([{id:'person',firstName:'',lastName:'',email:'private@example.test'}]);app.subscriberStatus.set('loaded');
+    app.alertSlots.set([{channel:'slack',targetId:'ops',state:'unknown',lastStartedAt:null}]);app.alertStatus.set('loaded');
+    app.decisionStatus.set('unknown');app.decisionRequestId.set('preserved-request');
+    vi.advanceTimersByTime(2000);
+    expect(app.subscribers()).toEqual([]);expect(app.subscriberStatus()).toBe('idle');expect(app.alertSlots()).toEqual([]);expect(app.alertStatus()).toBe('idle');
+    expect(app.lookupId).toBe('preserved-lookup');expect(app.decisionStatus()).toBe('unknown');expect(app.decisionRequestId()).toBe('preserved-request');fixture.destroy();
+  });
+
   it('checks expiry before applying a session even if the browser delayed its timer', async () => {
     vi.useFakeTimers();vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
     vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));

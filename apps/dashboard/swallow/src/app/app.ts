@@ -159,11 +159,17 @@ export class App implements OnDestroy {
     if (this.oidcExpiryTimer !== null) clearTimeout(this.oidcExpiryTimer);
     this.oidcExpiryTimer=null; this.oidcSession=null; this.oidcSubject.set(''); this.oidcStatus.set('expired');
     // Preserve decision outcome and request ID, including an in-flight or uncertain decision.
-    if (this.apiKey===session.token) this.apiKey='';
-    if (this.alertKey===session.token) { this.alertKey=''; this.clearResend(); this.clearResendJobs(); }
+    if (this.apiKey===session.token) { this.apiKey=''; this.clearSubscribers(); }
+    if (this.alertKey===session.token) {
+      this.alertKey=''; this.clearResend(); this.clearResendJobs();
+      this.alertRequestId++; this.alertAbort?.abort(); this.alertAbort=null;
+      this.alertSlots.set([]); this.alertStatus.set('idle'); this.alertError.set('');
+      this.alertsHaveMore.set(false); this.alertNext.set(null); this.alertPage.set(1); this.alertHistory=[null];
+      if (this.decisionStatus()!=='sending') this.selectedAlert.set(null);
+    }
     if (this.decisionKey===session.token) this.decisionKey='';
     if (this.retryKey===session.token) this.retryKey='';
-    if (this.lookupKey===session.token) this.lookupKey='';
+    if (this.lookupKey===session.token) { this.lookupKey=''; this.clearRequestLookup(); }
     if (this.permissionKey===session.token) this.clearPermissions(true);
     return true;
   }
@@ -613,12 +619,14 @@ export class App implements OnDestroy {
       if (!response.ok) throw new Error('request unavailable');
       const body: unknown = await response.json();
       if (typeof body !== 'object' || body === null || !('found' in body) || typeof body.found !== 'boolean') throw new Error('invalid response');
+      this.expireOidcIfNeeded();
       if (sequence !== this.lookupSequence) return;
       if (!body.found) { this.lookupStatus.set('not-found'); return; }
       if (!('requestId' in body) || typeof body.requestId !== 'string' || body.requestId.toLowerCase() !== requestId.toLowerCase() || !('channel' in body) || (body.channel !== 'slack' && body.channel !== 'email') || !('targetId' in body) || typeof body.targetId !== 'string' || !('attemptId' in body) || typeof body.attemptId !== 'string' || !('decision' in body) || (body.decision !== 'retry' && body.decision !== 'accepted') || !('reason' in body) || typeof body.reason !== 'string' || !('createdAt' in body) || typeof body.createdAt !== 'string') throw new Error('invalid response');
       this.lookupResult.set({requestId:body.requestId,channel:body.channel,targetId:body.targetId,attemptId:body.attemptId,decision:body.decision,reason:body.reason,createdAt:body.createdAt});
       this.lookupStatus.set('found');
     } catch {
+      this.expireOidcIfNeeded();
       if (sequence === this.lookupSequence) this.lookupStatus.set('error');
     } finally {
       if (sequence === this.lookupSequence) this.lookupAbort = null;
@@ -786,6 +794,7 @@ export class App implements OnDestroy {
         if ('attemptId' in row && row.attemptId !== null && (typeof row.attemptId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(row.attemptId))) throw new Error('API 응답 형식을 확인해 주세요.');
         return { channel: row.channel, targetId: row.targetId, state: row.state, lastStartedAt: row.lastStartedAt, ...('attemptId' in row ? { attemptId: row.attemptId as string | null } : {}) };
       });
+      this.expireOidcIfNeeded();
       if (id !== this.alertRequestId) return;
       this.alertSlots.set(rows);
       this.alertsHaveMore.set(body.hasMore);
@@ -794,6 +803,7 @@ export class App implements OnDestroy {
       this.alertPage.set(nextPage);
       this.alertStatus.set('loaded');
     } catch (error: unknown) {
+      this.expireOidcIfNeeded();
       if (id !== this.alertRequestId) return;
       this.alertStatus.set('error');
       this.alertError.set(error instanceof Error && ['주소', '원격', '인증', '경보', 'API '].some(prefix => error.message.startsWith(prefix)) ? error.message : '서버에 연결할 수 없습니다.');
@@ -860,12 +870,14 @@ export class App implements OnDestroy {
         const get = (key: string): string => key in value && typeof (value as Record<string, unknown>)[key] === 'string' ? (value as Record<string, string>)[key] : '';
         return { id: value.subscriberId, firstName: get('firstName'), lastName: get('lastName'), email: get('email') };
       });
+      this.expireOidcIfNeeded();
       if (id !== this.subscriberRequestId) return;
       this.subscribers.set(rows);
       this.nextCursor.set(data.next);
       this.previousCursor.set(data.previous);
       this.subscriberStatus.set('loaded');
     } catch (error: unknown) {
+      this.expireOidcIfNeeded();
       if (id !== this.subscriberRequestId) return;
       this.subscriberStatus.set('error');
       this.subscriberError.set(error instanceof Error && (error.message.startsWith('주소') || error.message.startsWith('원격') || error.message.startsWith('API ') || error.message.startsWith('구독자') || error.message.startsWith('인증')) ? error.message : '서버에 연결할 수 없습니다.');
