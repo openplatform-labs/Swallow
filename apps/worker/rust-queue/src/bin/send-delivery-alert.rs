@@ -62,55 +62,73 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if !resend_enabled && !attempts_enabled && queue_wait.is_none() {
         return Err("no alert checks configured".into());
     }
-    let (overdue, stale) = if resend_enabled {
-        let health = reconciliation::resend_health(&db, &args[0], grace, heartbeat).await?;
-        (
-            health["overdueUndelivered"]
-                .as_u64()
-                .ok_or("invalid health result")?,
-            health["projectorStale"]
-                .as_bool()
-                .ok_or("invalid health result")?,
-        )
+    if (resend_enabled && (!(1..=86_400).contains(&grace) || !(1..=86_400).contains(&heartbeat)))
+        || queue_wait.is_some_and(|v| !(1..=86_400).contains(&v))
+    {
+        return Err("invalid alert check threshold (1-86400 seconds)".into());
+    }
+    let mut failed_checks = [false; 3];
+    let resend = if resend_enabled {
+        let result = reconciliation::resend_health(&db, &args[0], grace, heartbeat).await;
+        let values = result.ok().and_then(|health| {
+            Some((
+                health["overdueUndelivered"].as_u64()?,
+                health["projectorStale"].as_bool()?,
+            ))
+        });
+        if values.is_none() {
+            failed_checks[0] = true;
+            eprintln!("Resend health check failed");
+        }
+        values
     } else {
-        (0, false)
+        None
     };
     let queue = if let Some(wait) = queue_wait {
-        let health = reconciliation::queue_health(&db, &args[0], wait).await?;
-        Some((
-            health["overdueJobs"]
-                .as_u64()
-                .ok_or("invalid queue health")?,
-            health["expiredLeases"]
-                .as_u64()
-                .ok_or("invalid queue health")?,
-        ))
+        let result = reconciliation::queue_health(&db, &args[0], wait).await;
+        let values = result.ok().and_then(|health| {
+            Some((
+                health["overdueJobs"].as_u64()?,
+                health["expiredLeases"].as_u64()?,
+            ))
+        });
+        if values.is_none() {
+            failed_checks[1] = true;
+            eprintln!("queue health check failed");
+        }
+        values
     } else {
         None
     };
     let attempts = if attempts_enabled {
-        let health = reconciliation::health(&db, &args[0]).await?;
-        Some((
-            health["unknownAttempts"]
-                .as_u64()
-                .ok_or("invalid attempt health")?,
-            health["strandedDispatches"]
-                .as_u64()
-                .ok_or("invalid attempt health")?,
-        ))
+        let result = reconciliation::health(&db, &args[0]).await;
+        let values = result.ok().and_then(|health| {
+            Some((
+                health["unknownAttempts"].as_u64()?,
+                health["strandedDispatches"].as_u64()?,
+            ))
+        });
+        if values.is_none() {
+            failed_checks[2] = true;
+            eprintln!("delivery attempts health check failed");
+        }
+        values
     } else {
         None
     };
-    let unhealthy = (resend_enabled && (overdue > 0 || stale))
+    let unhealthy = failed_checks.iter().any(|failed| *failed)
+        || resend.is_some_and(|(overdue, stale)| overdue > 0 || stale)
         || queue.is_some_and(|(overdue, expired)| overdue > 0 || expired > 0)
         || attempts.is_some_and(|(unknown, stranded)| unknown > 0 || stranded > 0);
+    let (overdue, stale) = resend.unwrap_or((0, false));
     let alert = Alert {
         environment: args[0].clone(),
         overdue_undelivered: overdue,
         projector_stale: stale,
-        resend_enabled,
+        resend_enabled: resend.is_some(),
         queue,
         attempts,
+        failed_checks,
     };
     alert.text().map_err(|_| "invalid alert environment")?;
     if !unhealthy {
@@ -120,7 +138,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         println!("{{\"status\":\"healthy\"}}");
         return Ok(());
     }
-    let mut error = configuration_error;
+    let mut error = configuration_error || failed_checks.iter().any(|failed| *failed);
     let mut needs_review = false;
     if let Some(provider) = slack {
         match alerts::dispatch_slack(&mut db, &slack_id, cooldown, &alert, &provider).await {

@@ -213,6 +213,7 @@ pub struct Alert {
     pub resend_enabled: bool,
     pub queue: Option<(u64, u64)>,
     pub attempts: Option<(u64, u64)>,
+    pub failed_checks: [bool; 3], // resend, queue, attempts
 }
 impl Alert {
     pub fn text(&self) -> Result<String, AlertError> {
@@ -241,6 +242,15 @@ impl Alert {
             details.push(format!(
                 "unknown delivery attempts: {unknown}; stranded dispatches: {stranded}"
             ));
+        }
+        for (failed, name) in
+            self.failed_checks
+                .iter()
+                .zip(["Resend", "queue", "delivery attempts"])
+        {
+            if *failed {
+                details.push(format!("{name} check failed"));
+            }
         }
         if details.is_empty() {
             return Err(AlertError::InvalidConfiguration);
@@ -450,6 +460,7 @@ mod tests {
             resend_enabled: true,
             queue: None,
             attempts: None,
+            failed_checks: [false; 3],
         }
     }
 
@@ -524,6 +535,11 @@ mod tests {
         a.queue = None;
         a.attempts = None;
         assert!(a.text().is_err());
+        a.failed_checks = [true, false, true];
+        let text = a.text().unwrap();
+        assert!(text.contains("Resend check failed"));
+        assert!(text.contains("delivery attempts check failed"));
+        assert!(!text.contains("projector stale"));
     }
 
     #[tokio::test]
@@ -636,6 +652,7 @@ mod tests {
             resend_enabled: true,
             queue: None,
             attempts: None,
+            failed_checks: [false; 3],
         };
         assert!(alert.projector_stale);
         let (url, slack_server) = mock_server("200 OK", "ok").await;

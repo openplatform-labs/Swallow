@@ -294,6 +294,22 @@ async fn alert_reservations_fence_concurrency_and_ambiguous_recovery() {
         run("missing", Some("60"), "false", "false").status.code(),
         Some(1)
     );
+    // Resend projection tables are absent: this check fails, but the queue
+    // result still reaches the blocked Slack slot and the process exits 1.
+    let partial = run("env-a", Some("60"), "false", "true");
+    assert_eq!(partial.status.code(), Some(1));
+    let log = String::from_utf8(partial.stderr).unwrap();
+    assert!(log.contains("Resend health check failed"));
+    assert!(log.contains("Slack alert requires operator review"));
+    // A failed attempts check likewise must not suppress the queue result.
+    a.batch_execute("DROP TABLE novu_rust_fcm_attempts")
+        .await
+        .unwrap();
+    let partial = run("env-a", Some("60"), "true", "false");
+    assert_eq!(partial.status.code(), Some(1));
+    let log = String::from_utf8(partial.stderr).unwrap();
+    assert!(log.contains("delivery attempts health check failed"));
+    assert!(log.contains("Slack alert requires operator review"));
     a.execute("INSERT INTO novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES ('env-a','email','check','rejected')", &[]).await.unwrap();
     let both = |environment: &str, slack_url: &str, slack_id: &str, email_key: &str| {
         std::process::Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"))
