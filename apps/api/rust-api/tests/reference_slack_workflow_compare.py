@@ -24,12 +24,21 @@ d.notificationtemplates.insertOne({_id:w,_environmentId:e,_organizationId:o,name
 d.preferences.insertOne({_environmentId:e,_organizationId:o,_templateId:w,type:"WORKFLOW_RESOURCE",preferences:{all:{enabled:true,readOnly:false},channels:{chat:{enabled:true}}},deleted:false});
 ''')
 run('docker','exec',pg,'psql','-v','ON_ERROR_STOP=1','-U','postgres','-d','novu_compat','-c','''
-INSERT INTO novu_rust_workflows(environment_id,identifier,active,has_steps,chat_content,inbox_metadata) VALUES ('64a000000000000000000002','slack-compare',true,true,'Hello {{subscriber.firstName}}','{"id":"64a000000000000000000071","name":"Slack Compare","critical":false,"tags":[]}');
+INSERT INTO novu_rust_workflows(environment_id,identifier,active,has_steps,chat_content,inbox_metadata) VALUES ('64a000000000000000000002','slack-compare',true,true,NULL,'{"id":"64a000000000000000000071","name":"Slack Compare","critical":false,"tags":[]}');
 INSERT INTO novu_rust_workflow_preferences(environment_id,workflow_identifier,all_enabled,read_only,chat_enabled) VALUES ('64a000000000000000000002','slack-compare',true,false,true);
 INSERT INTO novu_rust_slack_endpoint_integrations VALUES ('64a000000000000000000002','slack-main');
 INSERT INTO novu_rust_slack_endpoint_connections VALUES ('64a000000000000000000002','slack-main','slack-connection');
 INSERT INTO novu_rust_slack_endpoint_permissions(key_hash,permission) VALUES ('4a453798dcb87778c40d2f5daceb0f28cf67e559b7bfbe865878995c64e575fe','read'),('4a453798dcb87778c40d2f5daceb0f28cf67e559b7bfbe865878995c64e575fe','write');
+INSERT INTO novu_rust_slack_workflow_permissions(key_hash,permission) VALUES ('4a453798dcb87778c40d2f5daceb0f28cf67e559b7bfbe865878995c64e575fe','read'),('4a453798dcb87778c40d2f5daceb0f28cf67e559b7bfbe865878995c64e575fe','write');
 ''')
+# The original workflow is seeded directly; Swallow's separate extension
+# configures the equivalent step through its authorized management API.
+step_path='/v1/experimental/workflows/slack-compare/slack-step'
+status,body=request(os.environ['NOVU_RUST_URL'],'PUT',step_path,{'content':'Hello {{subscriber.firstName}}','active':True})
+assert status==200 and body['data']['content']=='Hello {{subscriber.firstName}}' and body['data']['active'] is True,(status,body)
+status,body=request(os.environ['NOVU_RUST_URL'],'GET',step_path,None)
+assert status==200 and body['data']['content']=='Hello {{subscriber.firstName}}',(status,body)
+assert run('docker','exec',pg,'psql','-U','postgres','-d','novu_compat','-At','-c',"SELECT count(*) FROM novu_rust_slack_workflow_audit WHERE environment_id='64a000000000000000000002' AND workflow_identifier='slack-compare'")=='1'
 endpoints=[{'identifier':'slack-endpoint','subscriberId':'alice','integrationIdentifier':'slack-main','connectionIdentifier':'slack-connection','type':'slack_channel','endpoint':{'channelId':'C123'}},{'identifier':'slack-user-endpoint','subscriberId':'alice','integrationIdentifier':'slack-main','connectionIdentifier':'slack-connection','type':'slack_user','endpoint':{'userId':'U456'}}]
 for base in [os.environ['NOVU_REFERENCE_URL'],os.environ['NOVU_RUST_URL']]:
     for endpoint in endpoints:
@@ -62,9 +71,9 @@ if len(original.splitlines())<2 or queued!='1':
     raise AssertionError(f'missing capture: original={bool(original)} fanout={queued}; logs={logs.stderr[-5000:]}')
 with tempfile.TemporaryDirectory(prefix='swallow-slack-compare-') as directory:
     capture=Path(directory)/'capture.json'
-    subprocess.run(['cargo','test','--locked','--offline','--lib','capture_reference_slack_workflow','--','--ignored'],cwd=Path(__file__).resolve().parents[3]/'worker'/'rust-queue',env=dict(os.environ,TEST_SLACK_CAPTURE_PATH=str(capture)),check=True)
+    subprocess.run(['cargo','test','--locked','--offline','--lib','capture_reference_slack_workflow','--','--ignored'],cwd=Path(__file__).resolve().parents[3]/'worker'/'rust-queue',env=dict(os.environ,TEST_SLACK_CAPTURE_PATH=str(capture),NOVU_SLACK_WORKFLOW_STEP_POLICY="unchanged"),check=True)
     rust=json.loads(capture.read_text())
 reference=sorted((json.loads(line) for line in original.splitlines()),key=lambda item:item['channel'])
 rust=sorted(rust,key=lambda item:item['channel'])
 assert reference==rust==[{'channel':'C123','text':'Hello Jane'},{'channel':'U456','text':'Hello Jane'}],(reference,rust)
-print('original and Rust HTTP trigger -> workflow -> mock Slack request: match')
+print('original and Rust HTTP trigger -> workflow -> mock Slack request: match; Rust step set via management API with unchanged guard')

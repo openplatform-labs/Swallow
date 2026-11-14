@@ -738,14 +738,15 @@ mod tests {
             ("slack-main".into(), "slack-connection".into()),
             Slack::test_endpoint("fixture-token".into(), &url).unwrap(),
         );
+        let policy = StepPolicy::from_env().unwrap();
         assert!(
-            fanout_one(&mut db, "64a000000000000000000002")
+            fanout_one_with_policy(&mut db, "64a000000000000000000002", policy)
                 .await
                 .unwrap()
         );
         for _ in 0..2 {
             assert!(
-                delivery_one(&mut db, "64a000000000000000000002", &providers)
+                delivery_one_with_policy(&mut db, "64a000000000000000000002", &providers, policy)
                     .await
                     .unwrap()
             );
