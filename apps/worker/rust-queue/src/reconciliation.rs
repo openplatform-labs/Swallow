@@ -554,13 +554,37 @@ pub async fn resend_evidence_snapshot(
     environment: &str,
     job: Uuid,
 ) -> Result<Value> {
+    resend_evidence_snapshot_with_auto(client, environment, job, false).await
+}
+
+pub async fn resend_evidence_with_auto<C: tokio_postgres::GenericClient + Sync>(
+    client: &C,
+    environment: &str,
+    job: Uuid,
+) -> Result<Value> {
+    let mut evidence = resend_evidence(client, environment, job).await?;
+    let conflict: bool = client.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_resend_auto_correlations c WHERE c.environment_id=$1 AND c.job_id=$2 AND (NOT EXISTS(SELECT 1 FROM novu_rust_resend_delivery_events e JOIN novu_rust_resend_recipients r ON r.environment_id=e.environment_id AND r.job_id=c.job_id AND r.recipient_hash=e.recipient_hash WHERE e.environment_id=c.environment_id AND e.correlation_id=c.correlation_id AND e.email_id=c.provider_message_id) OR EXISTS(SELECT 1 FROM novu_rust_resend_delivery_events e WHERE e.environment_id=c.environment_id AND ((e.correlation_id=c.correlation_id AND e.email_id<>c.provider_message_id) OR (e.email_id=c.provider_message_id AND e.correlation_id IS DISTINCT FROM c.correlation_id))) OR EXISTS(SELECT 1 FROM novu_rust_resend_attempts a WHERE a.environment_id=c.environment_id AND a.provider_message_id=c.provider_message_id AND a.job_id<>c.job_id) OR EXISTS(SELECT 1 FROM novu_rust_delivery_reconciliations r WHERE r.environment_id=c.environment_id AND r.retry_provider_message_id=c.provider_message_id)))", &[&environment,&job]).await?.get(0);
+    evidence["autoCorrelationConflict"] = json!(conflict);
+    Ok(evidence)
+}
+
+pub async fn resend_evidence_snapshot_with_auto(
+    client: &mut Client,
+    environment: &str,
+    job: Uuid,
+    auto: bool,
+) -> Result<Value> {
     let tx = client
         .build_transaction()
         .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
         .read_only(true)
         .start()
         .await?;
-    let evidence = resend_evidence(&tx, environment, job).await?;
+    let evidence = if auto {
+        resend_evidence_with_auto(&tx, environment, job).await?
+    } else {
+        resend_evidence(&tx, environment, job).await?
+    };
     tx.commit().await?;
     Ok(evidence)
 }

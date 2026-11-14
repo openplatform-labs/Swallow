@@ -61,7 +61,10 @@ async fn events_invalidate_only_matching_results_and_serialize_with_projector() 
         novu_rust_api::MIGRATION,
         novu_postgres_queue::MIGRATION,
         novu_postgres_queue::resend_queue::MIGRATION,
+        novu_postgres_queue::resend_queue::RECIPIENT_MIGRATION,
         novu_postgres_queue::in_app::EMAIL_MESSAGES_MIGRATION,
+        novu_postgres_queue::in_app::EMAIL_PROVIDER_RESULT_MIGRATION,
+        "ALTER TABLE novu_rust_email_messages ADD COLUMN delivery_state text NOT NULL DEFAULT 'not_attempted'",
         novu_postgres_queue::resend_projection::MIGRATION,
         include_str!("../migrations/0010_resend_webhooks.sql"),
         include_str!("../migrations/0012_resend_event_fingerprint.sql"),
@@ -81,6 +84,7 @@ async fn events_invalidate_only_matching_results_and_serialize_with_projector() 
         include_str!(
             "../../../worker/rust-queue/migrations/0136_resend_correlation_webhook_lock.sql"
         ),
+        include_str!("../../../worker/rust-queue/migrations/0137_resend_auto_correlation.sql"),
     ] {
         db.batch_execute(sql).await.unwrap();
     }
@@ -437,12 +441,14 @@ async fn events_invalidate_only_matching_results_and_serialize_with_projector() 
     .await
     .unwrap();
     db.execute(
-        "UPDATE novu_queue_jobs SET status='failed' WHERE id=$1",
+        "UPDATE novu_queue_jobs SET status='failed',last_error='Resend outcome unknown' WHERE id=$1",
         &[&race_job],
     )
     .await
     .unwrap();
     db.execute("INSERT INTO novu_rust_resend_attempts(job_id,environment_id,state,correlation_id) VALUES ($1,'env-a','unknown','96df49d1-0f4d-4bce-9290-666dd8fc908c')", &[&race_job]).await.unwrap();
+    db.execute("INSERT INTO novu_rust_resend_recipients(job_id,environment_id,recipient_kind,recipient_index,recipient_hash) VALUES ($1,'env-a','to',0,$2)", &[&race_job,&novu_postgres_queue::resend_queue::recipient_hash("one@example.test")]).await.unwrap();
+    db.execute("INSERT INTO novu_rust_email_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,subject,status,email_job_id,delivery_state) VALUES ('race-message','env-a','s','s','n','w','t','subject','error',$1,'unknown')", &[&race_job]).await.unwrap();
     db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision) VALUES ('env-a',session_user,'retry')", &[]).await.unwrap();
     db.batch_execute("CREATE FUNCTION public.test_pause_resend_event() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.event_id='evt-callback-first' THEN PERFORM pg_advisory_xact_lock(762019); END IF; RETURN NEW; END $$; CREATE TRIGGER test_pause_resend_event BEFORE INSERT ON public.novu_rust_resend_delivery_events FOR EACH ROW EXECUTE FUNCTION public.test_pause_resend_event();").await.unwrap();
     let (blocker, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
@@ -506,4 +512,19 @@ async fn events_invalidate_only_matching_results_and_serialize_with_projector() 
         .get::<_, i64>(0),
         0
     );
+    assert!(
+        novu_postgres_queue::resend_projection::project_with_auto_correlation(
+            &mut db, "env-a", race_job, true
+        )
+        .await
+        .unwrap()
+    );
+    let row=db.query_one("SELECT j.status,j.resend_delivery_result,a.state,a.provider_message_id,m.delivery_state,m.resend_delivery_result,(SELECT count(*) FROM novu_rust_resend_auto_correlations c WHERE c.job_id=j.id) FROM novu_queue_jobs j JOIN novu_rust_resend_attempts a ON a.job_id=j.id JOIN novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1", &[&race_job]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "completed");
+    assert_eq!(row.get::<_, String>(1), "delivered");
+    assert_eq!(row.get::<_, String>(2), "accepted");
+    assert_eq!(row.get::<_, String>(3), "race-provider-id");
+    assert_eq!(row.get::<_, String>(4), "accepted");
+    assert_eq!(row.get::<_, String>(5), "delivered");
+    assert_eq!(row.get::<_, i64>(6), 1);
 }

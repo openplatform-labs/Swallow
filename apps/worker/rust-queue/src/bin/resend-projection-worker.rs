@@ -29,6 +29,11 @@ async fn run(
             Ok("false") | Err(std::env::VarError::NotPresent) => false,
             _ => return Err("invalid full scan policy".into()),
         };
+    let auto_correlation = match std::env::var("NOVU_RESEND_PROJECTION_AUTO_CORRELATE").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid Resend automatic correlation setting".into()),
+    };
     let scan_seconds: u64 = match std::env::var("NOVU_RESEND_PROJECTION_SCAN_INTERVAL_SECONDS") {
         Ok(value) => value.parse()?,
         Err(std::env::VarError::NotPresent) => 30,
@@ -120,7 +125,12 @@ async fn run(
                         }
                         let processed = tokio::time::timeout(
                             timeout,
-                            resend_projection::project(&mut db, &environment, job),
+                            resend_projection::project_with_auto_correlation(
+                                &mut db,
+                                &environment,
+                                job,
+                                auto_correlation,
+                            ),
                         )
                         .await??;
                         skipped |= !processed;

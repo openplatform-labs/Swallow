@@ -534,10 +534,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .await?;
         println!("{}", serde_json::to_string(&result)?);
     } else if args.len() == 3 && args[0] == "resend-check" {
-        let evidence = novu_postgres_queue::reconciliation::resend_evidence_snapshot(
+        let auto = match std::env::var("NOVU_RESEND_CHECK_AUTO_CORRELATION").as_deref() {
+            Ok("true") => true,
+            Ok("false") | Err(std::env::VarError::NotPresent) => false,
+            _ => return Err("invalid Resend correlation check setting".into()),
+        };
+        let evidence = novu_postgres_queue::reconciliation::resend_evidence_snapshot_with_auto(
             &mut db,
             &args[1],
             Uuid::parse_str(&args[2])?,
+            auto,
         )
         .await?;
         let attention = novu_postgres_queue::reconciliation::resend_needs_attention(&evidence)?;
@@ -551,13 +557,19 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             std::process::exit(2);
         }
     } else if args.len() == 3 && args[0] == "resend-evidence" {
+        let auto = match std::env::var("NOVU_RESEND_CHECK_AUTO_CORRELATION").as_deref() {
+            Ok("true") => true,
+            Ok("false") | Err(std::env::VarError::NotPresent) => false,
+            _ => return Err("invalid Resend correlation check setting".into()),
+        };
         println!(
             "{}",
             serde_json::to_string(
-                &novu_postgres_queue::reconciliation::resend_evidence_snapshot(
+                &novu_postgres_queue::reconciliation::resend_evidence_snapshot_with_auto(
                     &mut db,
                     &args[1],
-                    Uuid::parse_str(&args[2])?
+                    Uuid::parse_str(&args[2])?,
+                    auto
                 )
                 .await?
             )?
