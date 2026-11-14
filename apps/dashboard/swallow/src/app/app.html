@@ -377,13 +377,13 @@
           @else if(permissionRequestRecord(); as request){<p role="status">기록됨: {{ request.requestId }} · {{ request.createdAt }}<br>대상: {{ request.targetIssuer }} · {{ request.targetSubject }} · {{ request.targetClientId }}<br>사유: {{ request.reason }}<br>{{ request.changed ? '권한 변경됨' : '동일한 상태로 변경 없음' }}</p>
             <p>이전: @if(request.expected; as previous){ {{ previous.enabled ? '활성' : '비활성' }} / 구독자 {{ previous.subscriberRead ? '허용' : '없음' }} / 경보 {{ previous.alertRead ? '허용' : '없음' }} / 재시도 {{ previous.alertRetry ? '허용' : '없음' }} / 접수 {{ previous.alertAccepted ? '허용' : '없음' }} } @else {없음}<br>변경: {{ request.desired.enabled ? '활성' : '비활성' }} / 구독자 {{ request.desired.subscriberRead ? '허용' : '없음' }} / 경보 {{ request.desired.alertRead ? '허용' : '없음' }} / 재시도 {{ request.desired.alertRetry ? '허용' : '없음' }} / 접수 {{ request.desired.alertAccepted ? '허용' : '없음' }}</p><p>보관한 원래 요청의 대상과 내용을 비교하세요.</p>}
         </div></section>
-        <section class="card decision-card"><div class="card-block"><div class="card-eyebrow">WORKFLOW ACCESS</div><h2>워크플로 권한 위임</h2>
+        <section class="card decision-card"><div class="card-block"><div class="card-eyebrow">DELEGATED ACCESS</div><h2>워크플로·구독자 권한 위임</h2>
           <p>위에서 입력한 운영자를 대상으로 환경별 권한을 조회하고 변경합니다. 이 기능에는 별도의 위임 관리 권한이 필요합니다.</p>
           <form class="decision-form" (ngSubmit)="loadGrant()">
             <label for="grant-kind">리소스와 권한</label><select id="grant-kind" name="grantKind" [(ngModel)]="grantKind" (ngModelChange)="clearGrantRead()" [disabled]="grantChangeStatus() === 'sending' || permissionChangeStatus() === 'sending'">
-              <option value="email:read">이메일 조회</option><option value="email:write">이메일 변경</option><option value="sms:read">SMS 조회</option><option value="sms:write">SMS 변경</option><option value="push:read">푸시 조회</option><option value="push:write">푸시 변경</option><option value="slack:read">Slack 조회</option><option value="slack:write">Slack 변경</option><option value="email-provider:read">이메일 공급자 조회</option><option value="email-provider:write">이메일 공급자 변경</option><option value="audit:read">워크플로 감사 조회</option>
+              <option value="email:read">이메일 조회</option><option value="email:write">이메일 변경</option><option value="sms:read">SMS 조회</option><option value="sms:write">SMS 변경</option><option value="push:read">푸시 조회</option><option value="push:write">푸시 변경</option><option value="slack:read">Slack 조회</option><option value="slack:write">Slack 변경</option><option value="email-provider:read">이메일 공급자 조회</option><option value="email-provider:write">이메일 공급자 변경</option><option value="audit:read">워크플로 감사 조회</option><option value="subscriber:read">구독자 프로필 조회</option><option value="subscriber:write">구독자 프로필 변경</option><option value="subscriber:create">구독자 생성</option><option value="subscriber:delete">구독자 삭제</option>
             </select>
-            <button type="submit" class="btn btn-outline" [disabled]="grantStatus() === 'loading' || grantChangeStatus() === 'sending' || permissionChangeStatus() === 'sending'">워크플로 권한 조회</button>
+            <button type="submit" class="btn btn-outline" [disabled]="grantStatus() === 'loading' || grantChangeStatus() === 'sending' || permissionChangeStatus() === 'sending'">선택 권한 조회</button>
           </form>
           @if(grantStatus() === 'loading'){<p role="status">조회 중입니다.</p>}
           @else if(grantStatus() === 'missing'){<p>대상 운영자를 찾지 못했습니다. 먼저 운영자를 등록하세요.</p>}
@@ -395,14 +395,14 @@
                 <label class="decision-confirm"><input type="checkbox" name="grantDesired" [(ngModel)]="grantDesired"> 이 권한 허용</label>
                 <label for="grant-reason">변경 사유</label><textarea id="grant-reason" name="grantReason" [(ngModel)]="grantReason" maxlength="1000" required></textarea><small>비밀을 제외하고 1000바이트 이내로 입력하세요. 이전 상태가 달라지면 요청이 거절됩니다.</small>
                 <label class="decision-confirm"><input type="checkbox" name="grantConfirmed" [(ngModel)]="grantConfirmed"> 대상과 권한을 확인했습니다.</label>
-                <button type="submit" class="btn btn-primary" [disabled]="!canChangeGrant()">워크플로 권한 변경</button>
+                <button type="submit" class="btn btn-primary" [disabled]="!canChangeGrant()">선택 권한 변경</button>
               </form>
             }
           }
         </div></section>
         @if(grantChange(); as change){
-          <section class="card decision-card"><div class="card-block"><h2>워크플로 권한 변경 요청</h2>
-            <p>요청 ID: {{ change.body.requestId }}<br>대상: {{ change.environment }} · {{ change.body.targetIssuer }} · {{ change.body.targetSubject }} · {{ change.body.targetClientId }}<br>{{ change.body.resource }} / {{ change.body.permission }}: {{ change.body.expected ? '허용' : '없음' }} → {{ change.body.desired ? '허용' : '없음' }}<br>사유: {{ change.body.reason }}</p>
+          <section class="card decision-card"><div class="card-block"><h2>위임 권한 변경 요청</h2>
+            <p>요청 ID: {{ change.body.requestId }}<br>대상: {{ change.environment }} · {{ change.body.targetIssuer }} · {{ change.body.targetSubject }} · {{ change.body.targetClientId }}<br>{{ change.body.resource || 'subscriber' }} / {{ change.body.permission }}: {{ change.body.expected ? '허용' : '없음' }} → {{ change.body.desired ? '허용' : '없음' }}<br>사유: {{ change.body.reason }}</p>
             @if(grantChangeStatus() === 'sending'){<p role="status">요청을 처리 중입니다.</p>}
             @else if(grantChangeStatus() === 'recorded'){<p role="status">요청이 기록됐습니다. {{ grantChanged() ? '권한이 변경됐습니다.' : '변경은 없었습니다.' }}</p>}
             @else if(grantChangeStatus() === 'rejected'){<p class="subscriber-error" role="alert">요청이 거절됐습니다. 권한과 최신 상태를 확인하세요.</p>}
@@ -418,7 +418,7 @@
         @if(grantChangeStatus() === 'unavailable'){<p class="subscriber-error" role="alert">안전한 요청을 준비하지 못해 전송하지 않았습니다.</p><button type="button" class="btn btn-outline" (click)="clearGrantChange()">닫기</button>}
         <section class="card decision-card"><div class="card-block"><div class="card-eyebrow">WORKFLOW GRANT RECOVERY</div><h2>보관한 위임 요청 확인</h2>
           <p>같은 운영자·클라이언트·환경의 유효한 토큰과 요청 ID로 확인합니다. 기록이 없어도 요청이 진행 중일 수 있습니다.</p>
-          <form class="decision-form" (ngSubmit)="lookupGrantRequest()"><label for="grant-request-id">요청 ID</label><input id="grant-request-id" name="grantRequestId" [(ngModel)]="grantRequestId" (ngModelChange)="clearGrantRequest()" [disabled]="grantChangeStatus() === 'sending'" autocomplete="off" required>
+          <form class="decision-form" (ngSubmit)="lookupGrantRequest()"><label for="grant-request-scope">요청 종류</label><select id="grant-request-scope" name="grantRequestScope" [(ngModel)]="grantRequestScope" (ngModelChange)="clearGrantRequest()" [disabled]="grantChangeStatus() === 'sending'"><option value="workflow">워크플로 권한</option><option value="subscriber">구독자 권한</option></select><label for="grant-request-id">요청 ID</label><input id="grant-request-id" name="grantRequestId" [(ngModel)]="grantRequestId" (ngModelChange)="clearGrantRequest()" [disabled]="grantChangeStatus() === 'sending'" autocomplete="off" required>
             <button type="submit" class="btn btn-outline" [disabled]="grantRequestStatus() === 'loading' || grantChangeStatus() === 'sending'">위임 요청 조회</button>
           </form>
           @if(grantRequestStatus() === 'loading'){<p role="status">조회 중입니다.</p>}

@@ -55,6 +55,7 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_subscriber_profile_write_v2(text,text,text,text,bigint,uuid,text,uuid,bigint,jsonb,text),public.novu_rust_operator_jwt_subscriber_profile_request_read(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_subscriber_create(text,text,text,text,bigint,uuid,text,jsonb,text),public.novu_rust_operator_jwt_subscriber_create_request_read(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_subscriber_delete(text,text,text,text,bigint,uuid,text,uuid,bigint,text),public.novu_rust_operator_jwt_subscriber_delete_request_read(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_subscriber_grant_read(text,text,text,text,bigint,text,text,text,text),public.novu_rust_operator_jwt_subscriber_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_subscriber_grant_request(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname::text=$1",&[&role]).await.unwrap();
     db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id,alert_read) VALUES('https://issuer.test','person','console','jwt-alert-a',true),('https://issuer.test','reader','console','jwt-alert-a',false); INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state,attempt_id) SELECT 'jwt-alert-a','slack','target-'||lpad(n::text,3,'0'),'unknown',gen_random_uuid() FROM generate_series(1,101) n; INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES('jwt-alert-b','email','private','unknown')").await.unwrap();
     db.batch_execute("WITH c AS (INSERT INTO public.novu_rust_console_credentials(token_hash,environment_id,expires_at,subscriber_read) VALUES(encode(sha256(convert_to(repeat('a',64),'UTF8')),'hex'),'jwt-alert-a',clock_timestamp()+interval '1 hour',false) RETURNING credential_id) INSERT INTO public.novu_rust_console_alert_grants SELECT credential_id FROM c").await.unwrap();
@@ -124,6 +125,195 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
         encode(&h,&json!({"iss":"https://issuer.test","sub":sub,"aud":"swallow","exp":now+120,"iat":now-1,"jti":"token","client_id":"console"}),&EncodingKey::from_rsa_pem(PRIVATE).unwrap()).unwrap()
     };
     let token = make("person");
+    let sub_grant_get = |jwt: &str, env: &str, permission: &str| {
+        Request::builder().uri(format!("/v1/experimental/operator/subscriber-grants?environmentId={env}&targetIssuer=https%3A%2F%2Fissuer.test&targetSubject=reader&targetClientId=console&permission={permission}")).header(header::AUTHORIZATION,format!("Bearer {jwt}")).body(Body::empty()).unwrap()
+    };
+    let sub_grant_put = |jwt: &str, body: Value| {
+        Request::builder()
+            .method("PUT")
+            .uri("/v1/experimental/operator/subscriber-grants?environmentId=jwt-alert-a")
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let sub_grant_request = |jwt: &str, id: Uuid| {
+        Request::builder().uri(format!("/v1/experimental/operator/subscriber-grants/request?environmentId=jwt-alert-a&requestId={id}")).header(header::AUTHORIZATION,format!("Bearer {jwt}")).body(Body::empty()).unwrap()
+    };
+    assert_eq!(
+        app.clone()
+            .oneshot(sub_grant_get(&token, "jwt-alert-a", "create"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(
+        connect(&api_url)
+            .await
+            .query(
+                "SELECT * FROM public.novu_rust_operator_jwt_subscriber_grant_audit",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_subscriber_grant_admins VALUES('https://issuer.test','person','console','jwt-alert-a',true,true)").await.unwrap();
+    let response = app
+        .clone()
+        .oneshot(sub_grant_get(&token, "jwt-alert-a", "create"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let current: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(current["targetExists"], true);
+    assert_eq!(current["granted"], false);
+    let grant_id = Uuid::new_v4();
+    let grant = json!({"requestId":grant_id.to_string(),"targetIssuer":"https://issuer.test","targetSubject":"reader","targetClientId":"console","permission":"create","expected":false,"desired":true,"reason":"ticket"});
+    let app2 = novu_rust_api::router(Arc::new(connect(&api_url).await)).layer(Extension(Arc::new(
+        AccessTokenVerifier::new("https://issuer.test", "swallow", &[("key", PUBLIC)]).unwrap(),
+    )));
+    let (a, b) = tokio::join!(
+        app.clone().oneshot(sub_grant_put(&token, grant.clone())),
+        app2.oneshot(sub_grant_put(&token, grant.clone()))
+    );
+    let a = a.unwrap();
+    let b = b.unwrap();
+    assert_eq!(a.status(), StatusCode::OK);
+    assert_eq!(b.status(), StatusCode::OK);
+    let a: Value =
+        serde_json::from_slice(&a.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let b: Value =
+        serde_json::from_slice(&b.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_ne!(a["replayed"], b["replayed"]);
+    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_operator_jwt_subscriber_grant_audit WHERE request_id=$1",&[&grant_id]).await.unwrap().get::<_,i64>(0),1);
+    let response = app
+        .clone()
+        .oneshot(sub_grant_request(&token, grant_id))
+        .await
+        .unwrap();
+    let recorded: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(recorded["found"], true);
+    assert_eq!(recorded["permission"], "create");
+    let mut self_grant = grant.clone();
+    self_grant["requestId"] = json!(Uuid::new_v4().to_string());
+    self_grant["targetSubject"] = json!("person");
+    assert_eq!(
+        app.clone()
+            .oneshot(sub_grant_put(&token, self_grant))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let mut conflicting = grant.clone();
+    conflicting["desired"] = json!(false);
+    assert_eq!(
+        app.clone()
+            .oneshot(sub_grant_put(&token, conflicting))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let reader_create = json!({"requestId":Uuid::new_v4().to_string(),"subscriberId":"delegated-create","profile":{},"reason":"ticket"});
+    let reader_req = || {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/experimental/operator/subscriber-create?environmentId=jwt-alert-a")
+            .header(header::AUTHORIZATION, format!("Bearer {}", make("reader")))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(reader_create.to_string()))
+            .unwrap()
+    };
+    assert_eq!(
+        app.clone().oneshot(reader_req()).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let mut revoke = grant.clone();
+    revoke["requestId"] = json!(Uuid::new_v4().to_string());
+    revoke["expected"] = json!(true);
+    revoke["desired"] = json!(false);
+    assert_eq!(
+        app.clone()
+            .oneshot(sub_grant_put(&token, revoke))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.clone().oneshot(reader_req()).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    for permission in ["read", "write", "delete"] {
+        let request = json!({"requestId":Uuid::new_v4().to_string(),"targetIssuer":"https://issuer.test","targetSubject":"reader","targetClientId":"console","permission":permission,"expected":false,"desired":true,"reason":"ticket"});
+        assert_eq!(
+            app.clone()
+                .oneshot(sub_grant_put(&token, request.clone()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let response = app
+            .clone()
+            .oneshot(sub_grant_get(&token, "jwt-alert-a", permission))
+            .await
+            .unwrap();
+        let data: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(data["granted"], true);
+        let mut revoke = request.clone();
+        revoke["requestId"] = json!(Uuid::new_v4().to_string());
+        revoke["expected"] = json!(true);
+        revoke["desired"] = json!(false);
+        assert_eq!(
+            app.clone()
+                .oneshot(sub_grant_put(&token, revoke))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+    db.batch_execute("ALTER TABLE public.novu_rust_operator_jwt_subscriber_grant_audit ADD CONSTRAINT fixture_sub_grant_failure CHECK(false) NOT VALID").await.unwrap();
+    let rollback = json!({"requestId":Uuid::new_v4().to_string(),"targetIssuer":"https://issuer.test","targetSubject":"reader","targetClientId":"console","permission":"delete","expected":false,"desired":true,"reason":"rollback"});
+    assert_eq!(
+        app.clone()
+            .oneshot(sub_grant_put(&token, rollback))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    db.batch_execute("ALTER TABLE public.novu_rust_operator_jwt_subscriber_grant_audit DROP CONSTRAINT fixture_sub_grant_failure").await.unwrap();
+    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_operator_jwt_subscriber_delete_grants WHERE subject='reader'",&[]).await.unwrap().get::<_,i64>(0),0);
+    assert_eq!(
+        app.clone()
+            .oneshot(sub_grant_get(&token, "jwt-alert-b", "create"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    db.batch_execute(
+        "DELETE FROM public.novu_rust_operator_jwt_subscriber_grant_admins WHERE subject='person'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(sub_grant_request(&token, grant_id))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
     let create = |jwt: &str, body: Value| {
         Request::builder()
             .method("POST")
