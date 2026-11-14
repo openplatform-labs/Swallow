@@ -6,7 +6,7 @@ use uuid::Uuid;
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if ![2, 3, 4, 6].contains(&args.len()) {
-        return Err("usage: delivery-reconcile list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | email-dispatch-evidence ENV EMAIL_JOB | sms-evidence ENV SMS_JOB | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
+        return Err("usage: delivery-reconcile check ENV | list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | email-dispatch-evidence ENV EMAIL_JOB | sms-evidence ENV SMS_JOB | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
     }
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let (mut db, connection) = config.connect(tls).await?;
@@ -15,7 +15,21 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             eprintln!("database connection failed");
         }
     });
-    if args.len() == 2 && args[0] == "list" {
+    if args.len() == 2 && args[0] == "check" {
+        let health = novu_postgres_queue::reconciliation::health(&db, &args[1]).await?;
+        println!("{}", serde_json::to_string(&health)?);
+        if health["unknownAttempts"]
+            .as_i64()
+            .ok_or("invalid health result")?
+            > 0
+            || health["strandedDispatches"]
+                .as_i64()
+                .ok_or("invalid health result")?
+                > 0
+        {
+            std::process::exit(2);
+        }
+    } else if args.len() == 2 && args[0] == "list" {
         println!(
             "{}",
             serde_json::to_string(

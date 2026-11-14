@@ -8,6 +8,31 @@ pub const RETRY_DISPATCH_MIGRATION: &str =
     include_str!("../migrations/0056_retry_dispatch_identity.sql");
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// Count unresolved and stranded attempts for one environment in one snapshot.
+pub async fn health(client: &Client, environment: &str) -> Result<Value> {
+    if environment.trim().is_empty() {
+        return Err("environment is required".into());
+    }
+    let row = client.query_one(
+        "SELECT count(*) FILTER (WHERE a.state='unknown'), \
+         count(*) FILTER (WHERE a.state='dispatching' AND (j.status <> 'running' OR j.lease_until <= statement_timestamp())), \
+         min(a.updated_at) FILTER (WHERE a.state='unknown')::text, \
+         min(a.updated_at) FILTER (WHERE a.state='dispatching' AND (j.status <> 'running' OR j.lease_until <= statement_timestamp()))::text \
+         FROM novu_queue_jobs j JOIN ( \
+         SELECT job_id,environment_id,state,updated_at FROM novu_rust_sendgrid_attempts \
+         UNION ALL SELECT job_id,environment_id,state,updated_at FROM novu_rust_twilio_attempts \
+         UNION ALL SELECT job_id,environment_id,state,updated_at FROM novu_rust_fcm_attempts \
+         ) a ON a.job_id=j.id AND a.environment_id=j.environment_id WHERE j.environment_id=$1",
+        &[&environment],
+    ).await?;
+    Ok(json!({
+        "unknownAttempts": row.get::<_, i64>(0),
+        "strandedDispatches": row.get::<_, i64>(1),
+        "oldestUnknownUpdatedAt": row.get::<_, Option<String>>(2),
+        "oldestStrandedUpdatedAt": row.get::<_, Option<String>>(3),
+    }))
+}
+
 /// List bounded unknown attempts without returning recipient data or payloads.
 pub async fn list(client: &Client, environment: &str) -> Result<Vec<Value>> {
     list_after(client, environment, None).await

@@ -162,6 +162,57 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     db.execute("INSERT INTO novu_rust_sendgrid_attempts(job_id,environment_id,state,http_status) VALUES ($1,'tenant-a','unknown',500)", &[&email]).await.unwrap();
     db.execute("INSERT INTO novu_rust_twilio_attempts(job_id,environment_id,state) VALUES ($1,'tenant-a','unknown')", &[&sms]).await.unwrap();
     db.execute("INSERT INTO novu_rust_fcm_attempts(job_id,environment_id,target_index,state) VALUES ($1,'tenant-a',0,'unknown'),($1,'tenant-a',1,'accepted')", &[&push]).await.unwrap();
+    let stranded = Uuid::new_v4();
+    queue::enqueue(
+        &db,
+        stranded,
+        "tenant-a",
+        queue::sendgrid_queue::JOB_KIND,
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO novu_rust_sendgrid_attempts(job_id,environment_id,state) VALUES ($1,'tenant-a','dispatching')", &[&stranded]).await.unwrap();
+    db.execute("UPDATE novu_queue_jobs SET status='running',lease_token=$2,lease_until=clock_timestamp()+interval '1 hour' WHERE id=$1", &[&stranded,&Uuid::new_v4()]).await.unwrap();
+    let health = reconciliation::health(&db, "tenant-a").await.unwrap();
+    assert_eq!(health["unknownAttempts"], 3);
+    assert_eq!(health["strandedDispatches"], 0);
+    db.execute(
+        "UPDATE novu_queue_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1",
+        &[&stranded],
+    )
+    .await
+    .unwrap();
+    let health = reconciliation::health(&db, "tenant-a").await.unwrap();
+    assert_eq!(health["strandedDispatches"], 1);
+    assert!(health["oldestUnknownUpdatedAt"].is_string());
+    assert!(health["oldestStrandedUpdatedAt"].is_string());
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .args(["check", "tenant-a"])
+        .env("DATABASE_URL", &url)
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        health
+    );
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .args(["check", "tenant-b"])
+        .env("DATABASE_URL", &url)
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let clean: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(clean["unknownAttempts"], 0);
+    assert_eq!(clean["strandedDispatches"], 0);
+    assert!(clean["oldestUnknownUpdatedAt"].is_null());
+    assert!(reconciliation::health(&db, " ").await.is_err());
+    db.execute("DELETE FROM novu_queue_jobs WHERE id=$1", &[&stranded])
+        .await
+        .unwrap();
     db.execute(
         "UPDATE novu_queue_jobs SET last_error='push delivery outcome unknown' WHERE id=$1",
         &[&push],
@@ -578,6 +629,10 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
     .await
     .unwrap();
     db.execute("INSERT INTO novu_rust_fcm_attempts(job_id,environment_id,target_index,state) SELECT $1,'tenant-a',n,'unknown' FROM generate_series(0,104) n", &[&bulk]).await.unwrap();
+    assert_eq!(
+        reconciliation::health(&db, "tenant-a").await.unwrap()["unknownAttempts"],
+        106
+    );
     let first = reconciliation::list(&db, "tenant-a").await.unwrap();
     assert_eq!(first.len(), 100);
     let tail = first.last().unwrap();
