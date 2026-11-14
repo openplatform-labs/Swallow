@@ -239,12 +239,16 @@ pub async fn process_one(
             Some(receipt.id.chars().take(1024).collect::<String>()),
             None,
         ),
-        Err(SendError::Provider(code)) if code >= 500 => (
-            "unknown",
-            Some(i32::from(code)),
-            None,
-            Some("sms provider outcome unknown"),
-        ),
+        Err(SendError::Provider(code))
+            if !(400..500).contains(&code) || [408, 409].contains(&code) =>
+        {
+            (
+                "unknown",
+                Some(i32::from(code)),
+                None,
+                Some("sms provider outcome unknown"),
+            )
+        }
         Err(SendError::Provider(code)) => (
             "rejected",
             Some(i32::from(code)),
@@ -522,6 +526,9 @@ mod tests {
         for (status, expected, malformed) in [
             (201, "accepted", false),
             (429, "rejected", false),
+            (302, "unknown", false),
+            (408, "unknown", false),
+            (409, "unknown", false),
             (500, "unknown", false),
             (201, "unknown", true),
         ] {
