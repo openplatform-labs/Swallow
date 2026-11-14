@@ -215,6 +215,36 @@ async fn scoped_console_credentials_do_not_grant_api_key_access() {
     let hash = format!("{:x}", Sha256::digest(token_a.as_bytes()));
     let tx = db.transaction().await.unwrap();
     tx.execute(
+        "UPDATE public.novu_rust_console_credentials SET subscriber_read=false WHERE token_hash=$1",
+        &[&hash],
+    )
+    .await
+    .unwrap();
+    let request_app = app.clone();
+    let request_token = token_a.clone();
+    let pending = tokio::spawn(async move {
+        call(
+            request_app,
+            "/v1/experimental/console/subscribers",
+            "SwallowConsole",
+            &request_token,
+        )
+        .await
+        .0
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!pending.is_finished());
+    tx.commit().await.unwrap();
+    assert_eq!(pending.await.unwrap(), StatusCode::UNAUTHORIZED);
+    db.execute(
+        "UPDATE public.novu_rust_console_credentials SET subscriber_read=true WHERE token_hash=$1",
+        &[&hash],
+    )
+    .await
+    .unwrap();
+    let hash = format!("{:x}", Sha256::digest(token_a.as_bytes()));
+    let tx = db.transaction().await.unwrap();
+    tx.execute(
         "UPDATE public.novu_rust_console_credentials SET enabled=false WHERE token_hash=$1",
         &[&hash],
     )

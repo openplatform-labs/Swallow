@@ -18,7 +18,7 @@ async fn issue_file_list_revoke_and_unknown_outcome_are_safe() {
     tokio::spawn(async move { driver.await.unwrap() });
     db.batch_execute("INSERT INTO public.novu_rust_environments VALUES ('cli-a','org'),('cli-b','org'); INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES ('cli-a','alice','id-a','{\"firstName\":\"Alice\"}')").await.unwrap();
     let role = format!("console_cli_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_manage_console_alert_grant(text,uuid,text,text),public.novu_rust_list_console_alert_grants(text,uuid),public.novu_rust_list_console_alert_grant_audit(text,bigint),public.novu_rust_inspect_console_credential(text,text),public.novu_rust_issue_console_credential(text,text,timestamptz,text),public.novu_rust_revoke_console_credential(text,uuid,text),public.novu_rust_list_console_credentials(text,uuid),public.novu_rust_list_console_credential_audit(text,bigint) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_issue_console_credential_scoped(text,text,timestamptz,boolean,text),public.novu_rust_manage_console_subscriber_scope(text,uuid,text,text),public.novu_rust_list_console_subscriber_scopes(text,uuid),public.novu_rust_list_console_subscriber_scope_audit(text,bigint),public.novu_rust_manage_console_alert_grant(text,uuid,text,text),public.novu_rust_list_console_alert_grants(text,uuid),public.novu_rust_list_console_alert_grant_audit(text,bigint),public.novu_rust_inspect_console_credential(text,text),public.novu_rust_issue_console_credential(text,text,timestamptz,text),public.novu_rust_revoke_console_credential(text,uuid,text),public.novu_rust_list_console_credentials(text,uuid),public.novu_rust_list_console_credential_audit(text,bigint) TO {role}")).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_console_credential_admins(environment_id,database_principal,principal_oid) SELECT 'cli-a',rolname,oid FROM pg_roles WHERE rolname::text=$1",&[&role]).await.unwrap();
     let actor_url = url.replacen("postgres://postgres@", &format!("postgres://{role}@"), 1);
     let run = |args: &[&str]| {
@@ -181,7 +181,9 @@ async fn issue_file_list_revoke_and_unknown_outcome_are_safe() {
             .unwrap()
             .as_array()
             .unwrap()
-            .len(),
+            .iter()
+            .filter(|v| v["credentialId"] == id)
+            .count(),
         2
     );
     // A revocation waits for an in-flight read holding the credential row.
@@ -210,7 +212,211 @@ async fn issue_file_list_revoke_and_unknown_outcome_are_safe() {
         serde_json::from_slice::<serde_json::Value>(&finished.stdout).unwrap()["changed"],
         true
     );
+    // Scope choice and issuance audit are atomic even if the scope audit fails.
+    db.batch_execute("CREATE FUNCTION public.test_reject_scope_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$; CREATE TRIGGER test_reject_scope_audit BEFORE INSERT ON public.novu_rust_console_subscriber_scope_audit FOR EACH ROW EXECUTE FUNCTION public.test_reject_scope_audit()").await.unwrap();
+    let failed_path = directory.join("scope-failure");
+    let failed_scope = run(&[
+        "issue-scoped",
+        "cli-a",
+        "3600",
+        failed_path.to_str().unwrap(),
+        "none",
+        "failure-test",
+    ]);
+    assert!(!failed_scope.status.success());
+    let failed_secret = std::fs::read_to_string(&failed_path).unwrap();
+    let failed_hash = format!("{:x}", Sha256::digest(failed_secret.as_bytes()));
+    assert!(
+        db.query_opt(
+            "SELECT 1 FROM public.novu_rust_console_credentials WHERE token_hash=$1",
+            &[&failed_hash]
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    std::fs::remove_file(failed_path).unwrap();
+    db.batch_execute("DROP TRIGGER test_reject_scope_audit ON public.novu_rust_console_subscriber_scope_audit; DROP FUNCTION public.test_reject_scope_audit()").await.unwrap();
+    let scoped_path = directory.join("alert-only");
+    let scoped = run(&[
+        "issue-scoped",
+        "cli-a",
+        "3600",
+        scoped_path.to_str().unwrap(),
+        "none",
+        "alert-only",
+    ]);
+    assert!(scoped.status.success());
+    let scoped_id =
+        serde_json::from_slice::<serde_json::Value>(&scoped.stdout).unwrap()["credentialId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    let scoped_token = std::fs::read_to_string(&scoped_path).unwrap();
+    let listing = run(&["subscriber-access-list", "cli-a"]);
+    let scopes: serde_json::Value = serde_json::from_slice(&listing.stdout).unwrap();
+    assert!(
+        scopes
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["credentialId"] == scoped_id && v["subscriberRead"] == false)
+    );
+    assert!(
+        !run(&["subscriber-access", "cli-b", &scoped_id, "grant", "test"])
+            .status
+            .success()
+    );
+    let audit = run(&["subscriber-access-audit", "cli-a"]);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&audit.stdout).unwrap()[0]["action"],
+        "initial_none"
+    );
+    db.batch_execute("CREATE FUNCTION public.test_reject_scope_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$; CREATE TRIGGER test_reject_scope_audit BEFORE INSERT ON public.novu_rust_console_subscriber_scope_audit FOR EACH ROW EXECUTE FUNCTION public.test_reject_scope_audit()").await.unwrap();
+    assert!(
+        !run(&[
+            "subscriber-access",
+            "cli-a",
+            &scoped_id,
+            "grant",
+            "failure-test"
+        ])
+        .status
+        .success()
+    );
+    let scoped_uuid = Uuid::parse_str(&scoped_id).unwrap();
+    assert!(!db.query_one("SELECT subscriber_read FROM public.novu_rust_console_credentials WHERE credential_id=$1", &[&scoped_uuid]).await.unwrap().get::<_,bool>(0));
+    db.batch_execute("DROP TRIGGER test_reject_scope_audit ON public.novu_rust_console_subscriber_scope_audit; DROP FUNCTION public.test_reject_scope_audit()").await.unwrap();
+    let subscriber_path = directory.join("subscriber-only");
+    let subscriber_result = run(&[
+        "issue-scoped",
+        "cli-a",
+        "3600",
+        subscriber_path.to_str().unwrap(),
+        "subscriber",
+        "subscriber-only",
+    ]);
+    assert!(subscriber_result.status.success());
+    let subscriber_token = std::fs::read_to_string(&subscriber_path).unwrap();
     let router = novu_rust_api::router_with_subscriber_secret(Arc::new(db), None);
+    let subscriber_request = |path: &str| {
+        Request::builder()
+            .uri(path)
+            .header(
+                "authorization",
+                format!("SwallowConsole {subscriber_token}"),
+            )
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(subscriber_request("/v1/experimental/console/subscribers"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(subscriber_request("/v1/experimental/console/alerts"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    std::fs::remove_file(subscriber_path).unwrap();
+    let scoped_request = |path: &str| {
+        Request::builder()
+            .uri(path)
+            .header("authorization", format!("SwallowConsole {scoped_token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(scoped_request("/v1/experimental/console/subscribers"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(
+        run(&["alert-access", "cli-a", &scoped_id, "grant", "test"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(scoped_request("/v1/experimental/console/alerts"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(scoped_request("/v1/experimental/console/subscribers"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(
+        run(&["subscriber-access", "cli-a", &scoped_id, "grant", "test"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(scoped_request("/v1/experimental/console/subscribers"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert!(
+        run(&["subscriber-access", "cli-a", &scoped_id, "revoke", "test"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(scoped_request("/v1/experimental/console/subscribers"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(scoped_request("/v1/experimental/console/alerts"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let scope_audit = run(&["subscriber-access-audit", "cli-a"]);
+    let scope_events: serde_json::Value = serde_json::from_slice(&scope_audit.stdout).unwrap();
+    assert_eq!(
+        scope_events
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| v["credentialId"] == scoped_id)
+            .count(),
+        3
+    );
+    assert!(!String::from_utf8_lossy(&scope_audit.stdout).contains(&scoped_token));
+    std::fs::remove_file(scoped_path).unwrap();
     let alert_request = || {
         Request::builder()
             .uri("/v1/experimental/console/alerts")
@@ -293,7 +499,9 @@ async fn issue_file_list_revoke_and_unknown_outcome_are_safe() {
             .unwrap()
             .as_array()
             .unwrap()
-            .len(),
+            .iter()
+            .filter(|v| v["credentialId"] == id)
+            .count(),
         2
     );
     let denied = directory.join("denied");
