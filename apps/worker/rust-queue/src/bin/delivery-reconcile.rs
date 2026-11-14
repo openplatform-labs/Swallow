@@ -6,7 +6,7 @@ use uuid::Uuid;
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if ![2, 3, 4, 5, 6, 7].contains(&args.len()) {
-        return Err("usage: delivery-reconcile check-failed-jobs ENV | list-failed-jobs ENV [AFTER_JOB] | ack-failed-job ENV JOB OPERATOR REASON | list-slack ENV [AFTER_JOB] | slack-ack ENV JOB OPERATOR REASON | operator-grant|operator-revoke ENV DB_LOGIN PERMISSION REASON | check|check-slack ENV | slack-resolve ENV JOB retry|accepted OPERATOR REASON | check-alert-delivery ENV | alert-status ENV | alert-resolve ENV CHANNEL TARGET DECISION OPERATOR REASON | check-queue ENV MAX_WAIT_SECONDS | check-resend|check-resend-metrics|check-twilio|check-twilio-metrics|check-sendgrid|check-sendgrid-metrics ENV GRACE_SECONDS HEARTBEAT_MAX_SECONDS | list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | email-dispatch-evidence|sendgrid-result ENV EMAIL_JOB | resend-evidence|resend-check|resend-result ENV EMAIL_JOB | sms-evidence|sms-delivery|twilio-result ENV SMS_JOB | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
+        return Err("usage: delivery-reconcile check-failed-jobs ENV | list-failed-jobs ENV [AFTER_JOB] | ack-failed-job ENV JOB OPERATOR REASON | list-slack ENV [AFTER_JOB] | slack-ack ENV JOB OPERATOR REASON | operator-grants ENV [AFTER_LOGIN AFTER_PERMISSION] | operator-grant-audit ENV [AFTER_ID] | operator-grant|operator-revoke ENV DB_LOGIN PERMISSION REASON | check|check-slack ENV | slack-resolve ENV JOB retry|accepted OPERATOR REASON | check-alert-delivery ENV | alert-status ENV | alert-resolve ENV CHANNEL TARGET DECISION OPERATOR REASON | check-queue ENV MAX_WAIT_SECONDS | check-resend|check-resend-metrics|check-twilio|check-twilio-metrics|check-sendgrid|check-sendgrid-metrics ENV GRACE_SECONDS HEARTBEAT_MAX_SECONDS | list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | email-dispatch-evidence|sendgrid-result ENV EMAIL_JOB | resend-evidence|resend-check|resend-result ENV EMAIL_JOB | sms-evidence|sms-delivery|twilio-result ENV SMS_JOB | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
     }
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let (mut db, connection) = config.connect(tls).await?;
@@ -64,6 +64,27 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 "Slack workflow acknowledgement unchanged"
             }
         );
+    } else if (args.len() == 2 || args.len() == 4) && args[0] == "operator-grants" {
+        let after_principal = args.get(2).map(String::as_str);
+        let after_permission = args.get(3).map(String::as_str);
+        let rows = db
+            .query(
+                "SELECT * FROM public.novu_rust_list_operator_grants($1,$2,$3)",
+                &[&args[1], &after_principal, &after_permission],
+            )
+            .await?;
+        let grants: Vec<_> = rows.iter().map(|r| serde_json::json!({"databasePrincipal":r.get::<_,String>(0),"permission":r.get::<_,String>(1),"identityCurrent":r.get::<_,bool>(2)})).collect();
+        println!("{}", serde_json::to_string(&grants)?);
+    } else if (args.len() == 2 || args.len() == 3) && args[0] == "operator-grant-audit" {
+        let after = args.get(2).map(|s| s.parse::<i64>()).transpose()?;
+        let rows = db
+            .query(
+                "SELECT * FROM public.novu_rust_list_operator_grant_audit($1,$2)",
+                &[&args[1], &after],
+            )
+            .await?;
+        let audit: Vec<_> = rows.iter().map(|r| serde_json::json!({"id":r.get::<_,i64>(0).to_string(),"actor":r.get::<_,String>(1),"target":r.get::<_,String>(2),"permission":r.get::<_,String>(3),"action":r.get::<_,String>(4),"reason":r.get::<_,String>(5),"createdAt":r.get::<_,String>(6)})).collect();
+        println!("{}", serde_json::to_string(&audit)?);
     } else if args.len() == 5 && ["operator-grant", "operator-revoke"].contains(&args[0].as_str()) {
         let action = if args[0] == "operator-grant" {
             "grant"
