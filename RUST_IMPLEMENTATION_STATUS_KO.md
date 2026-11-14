@@ -1,3 +1,9 @@
+## 운영자 JWT의 Resend 결과 조회 API (API 0048)
+
+`GET /v1/experimental/operator/resend-result`는 환경과 작업 UUID로 Resend 발송·전달 결과, 자동 복구 여부와 증거 충돌을 조회한다. 기존 경보 조회와 독립적인 JWT 주체·환경별 별도 권한과 API DB 함수 실행 권한이 필요하다. 응답에는 공급자 ID·태그·수신자 주소·본문을 넣지 않으며, 증거가 충돌하면 저장된 전달 결과가 정상이어도 `unknown`을 반환한다. 권한 부여와 배포 순서는 [API README](apps/api/rust-api/README.md)를 참고한다.
+
+Docker PostgreSQL과 JWT 서명 HTTP 라우터에서 별도 권한, 환경 격리, 감사 테이블 직접 접근 차단, 충돌 판정, 권한 회수 중 대기와 대기 중 토큰 만료를 검증했다. 이 API에 대한 Angular 화면은 아직 연결되지 않았고 외부 IdP·실제 공급자·운영 HA는 미검증이다. 이 조회는 작업 목록이나 결과 변경을 제공하지 않는다.
+
 ## Resend 자동 복구의 제한 권한 조회와 안전한 단건 검사 (워커 0140)
 
 `delivery-reconcile resend-result ENV JOB`은 기존 환경별 `alert_view` 권한으로 자동 복구 여부, 증거 충돌 여부와 복구 시각을 추가로 반환한다. 현재 증거가 충돌하면 저장된 결과와 관계없이 `unknown`을 반환한다. 공급자 ID·태그·주소·본문은 반환하지 않는다. 기존 Twilio 결과 형식은 유지한다.

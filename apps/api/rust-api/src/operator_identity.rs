@@ -23,6 +23,7 @@ enum Lookup {
     PermissionIdentity,
     PermissionAudit,
     PermissionChangeRequest,
+    ResendResult,
 }
 
 fn authenticate(
@@ -118,6 +119,14 @@ pub(super) async fn permission_change_request(
 ) -> Response {
     query(db, headers, uri, verifier, Lookup::PermissionChangeRequest).await
 }
+pub(super) async fn resend_result(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::ResendResult).await
+}
 async fn query(
     db: Arc<Client>,
     headers: HeaderMap,
@@ -154,6 +163,7 @@ async fn query(
         Lookup::PermissionIdentity => &["environmentId", "issuer", "subject", "clientId"],
         Lookup::PermissionAudit => &["environmentId", "before"],
         Lookup::PermissionChangeRequest => &["environmentId", "requestId"],
+        Lookup::ResendResult => &["environmentId", "jobId"],
     };
     if params.keys().any(|key| !allowed.contains(&key.as_str()))
         || params.get("limit").is_some_and(|limit| limit != "20")
@@ -170,6 +180,23 @@ async fn query(
         return failure(StatusCode::UNAUTHORIZED, "Unauthorized", "Unauthorized");
     };
     let result = match lookup {
+        Lookup::ResendResult => {
+            let Some(job) = params.get("jobId").and_then(|id| Uuid::parse_str(id).ok()) else {
+                return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+            };
+            db.query_one(
+                "SELECT public.novu_rust_operator_jwt_resend_result($1,$2,$3,$4,$5,$6)",
+                &[
+                    &identity.issuer,
+                    &identity.subject,
+                    &identity.client_id,
+                    &env,
+                    &exp,
+                    &job,
+                ],
+            )
+            .await
+        }
         Lookup::PermissionChangeRequest => {
             let Some(request) = params
                 .get("requestId")
