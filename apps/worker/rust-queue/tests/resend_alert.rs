@@ -131,10 +131,33 @@ async fn resend_check_exits_for_unmatched_and_missing_evidence() {
     db.execute("INSERT INTO novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type) VALUES ('env','event2','id','email.bounced')", &[]).await.unwrap();
     let alert = check();
     assert_eq!(alert.status.code(), Some(2));
-    assert!(
-        queue::resend_projection::project(&mut db, "env", job)
+    let mut restarted = std::process::Command::new(env!("CARGO_BIN_EXE_resend-projection-worker"))
+        .env("DATABASE_URL", &url)
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .env("NOVU_RESEND_ENVIRONMENT_ID", "env")
+        .spawn()
+        .unwrap();
+    let mut observed = false;
+    for _ in 0..50 {
+        let result: Option<String> = db
+            .query_one(
+                "SELECT resend_delivery_result FROM novu_queue_jobs WHERE id=$1",
+                &[&job],
+            )
             .await
             .unwrap()
+            .get(0);
+        if result.as_deref() == Some("unknown") {
+            observed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let _ = restarted.kill();
+    let _ = restarted.wait();
+    assert!(
+        observed,
+        "restarted projection worker did not refresh the job"
     );
     assert_eq!(
         db.query_one(
