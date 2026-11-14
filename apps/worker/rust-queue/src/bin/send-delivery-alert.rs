@@ -87,6 +87,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let slack_jobs_enabled = env_bool("SWALLOW_ALERT_SLACK_JOBS_ENABLED", false)?;
     let failed_jobs_enabled = env_bool("SWALLOW_ALERT_FAILED_JOBS_ENABLED", false)?;
     let slack_missing_enabled = env_bool("SWALLOW_ALERT_SLACK_MISSING_ENDPOINTS_ENABLED", false)?;
+    let slack_policy_enabled = env_bool("SWALLOW_ALERT_SLACK_POLICY_CANCELLED_ENABLED", false)?;
     let twilio_grace = env_optional_i32("SWALLOW_ALERT_TWILIO_GRACE_SECONDS")?;
     let twilio_heartbeat = env_optional_i32("SWALLOW_ALERT_TWILIO_HEARTBEAT_MAX_SECONDS")?;
     let twilio_thresholds = match (twilio_grace, twilio_heartbeat) {
@@ -110,6 +111,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if !resend_enabled
         && !attempts_enabled
         && !slack_jobs_enabled
+        && !slack_policy_enabled
         && !failed_jobs_enabled
         && queue_wait.is_none()
         && twilio_thresholds.is_none()
@@ -276,6 +278,24 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     } else {
         None
     };
+    let slack_policy_cancelled = if slack_policy_enabled {
+        let scoped = env_bool("SWALLOW_ALERT_SLACK_SCOPED_ACCESS", false)?;
+        let result = tokio::time::timeout(
+            operation_timeout,
+            novu_postgres_queue::slack_queue::policy_cancellations(&db, &args[0], scoped),
+        )
+        .await;
+        match result {
+            Ok(Ok(value)) if value >= 0 => Some(value as u64),
+            _ => {
+                failed_checks[4] = true;
+                eprintln!("Slack policy cancellation check failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut failed_jobs_check_failed = false;
     let failed_jobs = if failed_jobs_enabled {
         match tokio::time::timeout(
@@ -303,6 +323,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         || queue.is_some_and(|(overdue, expired)| overdue > 0 || expired > 0)
         || attempts.is_some_and(|(unknown, stranded)| unknown > 0 || stranded > 0)
         || twilio.is_some_and(|(overdue, stale)| overdue > 0 || stale)
+        || slack_policy_cancelled.is_some_and(|n| n > 0)
         || slack_attempts.is_some_and(|(unknown, rejected, stranded, pre_dispatch, missing)| {
             unknown > 0
                 || rejected > 0
@@ -322,6 +343,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         sendgrid,
         sendgrid_check_failed,
         slack_attempts,
+        slack_policy_cancelled,
         failed_checks,
         failed_jobs,
         failed_jobs_check_failed,

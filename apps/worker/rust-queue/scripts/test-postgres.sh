@@ -109,6 +109,10 @@ docker exec "$name" createdb -U postgres novu_slack_endpoint_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_slack_endpoint_test" \
   cargo test --locked --test slack_channel_endpoints -- --ignored
 
+docker exec "$name" createdb -U postgres novu_slack_policy_attention_test
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_slack_policy_attention_test" \
+  cargo test --locked --test slack_policy_attention -- --ignored
+
 docker exec "$name" createdb -U postgres novu_slack_step_policy_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_slack_step_policy_test" \
   cargo test --locked --lib slack_workflow::tests::step_policies_recheck_and_fence_workflow_updates -- --ignored

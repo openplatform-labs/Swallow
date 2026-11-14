@@ -311,6 +311,7 @@ pub struct Alert {
     pub sendgrid: Option<(u64, bool)>,
     pub sendgrid_check_failed: bool,
     pub slack_attempts: Option<(u64, u64, u64, u64, Option<u64>)>,
+    pub slack_policy_cancelled: Option<u64>,
     pub failed_checks: [bool; 5], // resend, queue, attempts, twilio, Slack chat
     pub failed_jobs: Option<u64>,
     pub failed_jobs_check_failed: bool,
@@ -368,6 +369,9 @@ impl Alert {
         if self.sendgrid_check_failed {
             mask |= 1 << 24;
         }
+        if self.slack_policy_cancelled.is_some_and(|n| n > 0) {
+            mask |= 1 << 25;
+        }
         mask
     }
     /// Bits whose current state was actually observed, excluding unavailable or disabled checks.
@@ -396,7 +400,7 @@ impl Alert {
             self.queue.is_some(),
             self.attempts.is_some(),
             self.twilio.is_some(),
-            self.slack_attempts.is_some(),
+            self.slack_attempts.is_some() || self.slack_policy_cancelled.is_some(),
         ]
         .into_iter()
         .zip(self.failed_checks)
@@ -423,6 +427,9 @@ impl Alert {
         }
         if self.sendgrid.is_some() || self.sendgrid_check_failed {
             known |= 1 << 24;
+        }
+        if self.slack_policy_cancelled.is_some() {
+            known |= 1 << 25;
         }
         known
     }
@@ -471,6 +478,9 @@ impl Alert {
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "disabled".into());
             details.push(format!("Slack chat unknown attempts: {unknown}; rejected attempts: {rejected}; stranded dispatches: {stranded}; pre-dispatch failures: {pre_dispatch}; missing endpoint alerts: {missing}"));
+        }
+        if let Some(count) = self.slack_policy_cancelled {
+            details.push(format!("Slack workflow policy cancellations: {count}"));
         }
         for (failed, name) in self.failed_checks.iter().zip([
             "Resend",
@@ -1085,6 +1095,7 @@ mod tests {
             sendgrid: None,
             sendgrid_check_failed: false,
             slack_attempts: None,
+            slack_policy_cancelled: None,
             failed_checks: [false; 5],
             failed_jobs: None,
             failed_jobs_check_failed: false,
@@ -1110,6 +1121,27 @@ mod tests {
         assert_eq!(a.condition_mask() & (7 << 22), 1 << 24);
         assert_eq!(a.observed_condition_mask() & (7 << 22), 1 << 24);
         assert!(a.text().unwrap().contains("SendGrid check failed"));
+    }
+
+    #[test]
+    fn slack_policy_alert_tracks_observed_and_failed_states() {
+        let mut a = alert();
+        assert_eq!(a.observed_condition_mask() & (1 << 25), 0);
+        a.slack_policy_cancelled = Some(2);
+        assert_ne!(a.condition_mask() & (1 << 25), 0);
+        assert_ne!(a.observed_condition_mask() & (1 << 25), 0);
+        assert_ne!(a.observed_condition_mask() & (1 << 17), 0);
+        assert!(
+            a.text()
+                .unwrap()
+                .contains("Slack workflow policy cancellations: 2")
+        );
+        a.slack_policy_cancelled = Some(0);
+        assert_eq!(a.condition_mask() & (1 << 25), 0);
+        a.slack_policy_cancelled = None;
+        a.failed_checks[4] = true;
+        assert_ne!(a.condition_mask() & (1 << 17), 0);
+        assert_eq!(a.observed_condition_mask() & (1 << 25), 0);
     }
 
     #[test]
@@ -1611,6 +1643,7 @@ mod tests {
             sendgrid: Some((1, true)),
             sendgrid_check_failed: false,
             slack_attempts: None,
+            slack_policy_cancelled: None,
             failed_checks: [false; 5],
             failed_jobs: None,
             failed_jobs_check_failed: false,

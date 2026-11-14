@@ -84,6 +84,31 @@ pub async fn scoped_health(
     )
 }
 
+/// Optional count of unacknowledged workflow-policy cancellations.
+pub async fn policy_cancellations(
+    client: &Client,
+    environment: &str,
+    scoped: bool,
+) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+    if environment.trim().is_empty() {
+        return Err("environment required".into());
+    }
+    if scoped {
+        return Ok(client
+            .query_one(
+                "SELECT public.novu_rust_slack_policy_cancelled($1)",
+                &[&environment],
+            )
+            .await?
+            .get(0));
+    }
+    let row = client.query_one("SELECT EXISTS(SELECT 1 FROM public.novu_rust_environments WHERE id=$1),(SELECT count(*) FROM public.novu_queue_jobs j WHERE j.environment_id=$1 AND j.kind IN ('experimental_slack_workflow_fanout','experimental_slack_workflow_delivery') AND j.status='cancelled' AND j.last_error IN ('Slack workflow step disabled','Slack workflow content changed') AND NOT EXISTS(SELECT 1 FROM public.novu_rust_slack_attempts a WHERE a.job_id=j.id) AND NOT EXISTS(SELECT 1 FROM public.novu_rust_slack_workflow_acknowledgements z WHERE z.environment_id=j.environment_id AND z.job_id=j.id AND z.job_attempts=j.attempts AND z.job_status=j.status AND z.job_error=j.last_error AND z.job_attention_revision=j.slack_attention_revision))", &[&environment]).await?;
+    if !row.get::<_, bool>(0) {
+        return Err("environment not found".into());
+    }
+    Ok(row.get(1))
+}
+
 /// List the same Slack attention categories as health, without payloads or error text.
 /// The UUID cursor is exclusive; each page contains at most 100 jobs.
 pub async fn list_attention(

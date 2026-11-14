@@ -130,7 +130,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             Ok("false") | Err(std::env::VarError::NotPresent) => false,
             _ => return Err("invalid Slack scoped access setting".into()),
         };
-        let health = if scoped {
+        let mut health = if scoped {
             novu_postgres_queue::slack_queue::scoped_health(&db, &args[1]).await?
         } else {
             novu_postgres_queue::slack_queue::health(&db, &args[1]).await?
@@ -140,6 +140,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             Ok("false") | Err(std::env::VarError::NotPresent) => false,
             _ => return Err("invalid Slack missing endpoint check".into()),
         };
+        let policy = match std::env::var("SWALLOW_SLACK_CHECK_POLICY_CANCELLED").as_deref() {
+            Ok("true") => true,
+            Ok("false") | Err(std::env::VarError::NotPresent) => false,
+            _ => return Err("invalid Slack policy cancellation check".into()),
+        };
+        if policy {
+            let count =
+                novu_postgres_queue::slack_queue::policy_cancellations(&db, &args[1], scoped)
+                    .await?;
+            health["policyCancelled"] = serde_json::json!(count);
+        }
         println!("{}", serde_json::to_string(&health)?);
         if [
             "unknownAttempts",
@@ -150,6 +161,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .iter()
         .any(|key| health[*key].as_i64().is_none_or(|n| n > 0))
             || (missing && health["missingEndpoints"].as_i64().is_none_or(|n| n > 0))
+            || (policy && health["policyCancelled"].as_i64().is_none_or(|n| n > 0))
         {
             std::process::exit(2);
         }

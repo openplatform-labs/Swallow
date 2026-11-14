@@ -102,6 +102,7 @@ async fn main() -> Result<()> {
         sendgrid: None,
         sendgrid_check_failed: false,
         slack_attempts: None,
+        slack_policy_cancelled: None,
         failed_checks: [false; 5],
         failed_jobs: None,
         failed_jobs_check_failed: false,
