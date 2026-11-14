@@ -1,4 +1,4 @@
-//! Explicit, transactional worker migration history. API migrations are managed separately.
+//! Explicit, transactional database migration histories for each service.
 use ring::digest::{SHA256, digest};
 use std::{error::Error, fs, path::Path};
 use tokio_postgres::Client;
@@ -75,26 +75,79 @@ fn transaction_body(m: &Migration) -> Result<String> {
     }
     Ok(result)
 }
-async fn run(db: &mut Client, files: &[Migration], adopt: Option<i32>) -> Result<usize> {
+#[derive(Clone, Copy)]
+enum Stream {
+    Api,
+    Worker,
+    Ws,
+}
+impl Stream {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "api" => Ok(Self::Api),
+            "worker" => Ok(Self::Worker),
+            "ws" => Ok(Self::Ws),
+            _ => Err("invalid migration service".into()),
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::Worker => "worker",
+            Self::Ws => "ws",
+        }
+    }
+    fn history(self) -> &'static str {
+        match self {
+            Self::Api => "public.novu_rust_api_migration_history",
+            Self::Worker => "public.novu_rust_worker_migration_history",
+            Self::Ws => "public.novu_rust_ws_migration_history",
+        }
+    }
+    fn anchor(self) -> &'static str {
+        match self {
+            Self::Api => "public.novu_rust_users",
+            Self::Worker => "public.novu_queue_jobs",
+            Self::Ws => "public.novu_rust_ws_connections",
+        }
+    }
+}
+async fn run(
+    db: &mut Client,
+    stream: Stream,
+    files: &[Migration],
+    adopt: Option<i32>,
+) -> Result<usize> {
     let tx = db.transaction().await?;
     tx.query_one(
         "SELECT pg_catalog.pg_advisory_xact_lock(736915402,871)",
         &[],
     )
     .await?;
-    let existing=tx.query_one("SELECT to_regclass('public.novu_rust_worker_migration_history') IS NOT NULL, to_regclass('public.novu_queue_jobs') IS NOT NULL",&[]).await?;
+    let history = stream.history();
+    let existing = tx
+        .query_one(
+            "SELECT to_regclass($1) IS NOT NULL,to_regclass($2) IS NOT NULL",
+            &[&history, &stream.anchor()],
+        )
+        .await?;
     let tracked: bool = existing.get(0);
-    let queue: bool = existing.get(1);
-    if adopt.is_some() && (tracked || !queue) {
-        return Err("baseline requires an untracked existing worker schema".into());
+    let anchor: bool = existing.get(1);
+    if adopt.is_some() && (tracked || !anchor) {
+        return Err("baseline requires an untracked existing service schema".into());
     }
-    if !tracked && queue && adopt.is_none() {
-        return Err("existing worker schema has no migration history; review it and explicitly baseline first".into());
+    if !tracked && anchor && adopt.is_none() {
+        return Err("existing service schema has no migration history; review it and explicitly baseline first".into());
     }
     if !tracked {
-        tx.batch_execute("CREATE TABLE public.novu_rust_worker_migration_history(version integer PRIMARY KEY,filename text NOT NULL UNIQUE,checksum bytea NOT NULL CHECK(octet_length(checksum)=32),method text NOT NULL CHECK(method IN ('applied','baseline')),applied_by text NOT NULL DEFAULT session_user,applied_at timestamptz NOT NULL DEFAULT clock_timestamp()); REVOKE ALL ON public.novu_rust_worker_migration_history FROM PUBLIC;").await?;
+        tx.batch_execute(&format!("CREATE TABLE {history}(version integer PRIMARY KEY,filename text NOT NULL UNIQUE,checksum bytea NOT NULL CHECK(octet_length(checksum)=32),method text NOT NULL CHECK(method IN ('applied','baseline')),applied_by text NOT NULL DEFAULT session_user,applied_at timestamptz NOT NULL DEFAULT clock_timestamp()); REVOKE ALL ON {history} FROM PUBLIC;")).await?;
     }
-    let rows=tx.query("SELECT version,filename,checksum FROM public.novu_rust_worker_migration_history ORDER BY version",&[]).await?;
+    let rows = tx
+        .query(
+            &format!("SELECT version,filename,checksum FROM {history} ORDER BY version"),
+            &[],
+        )
+        .await?;
     if rows.len() > files.len() {
         return Err("migration history is newer than migration files".into());
     }
@@ -111,7 +164,7 @@ async fn run(db: &mut Client, files: &[Migration], adopt: Option<i32>) -> Result
             return Err("invalid baseline version".into());
         }
         for m in files.iter().take(version as usize) {
-            tx.execute("INSERT INTO public.novu_rust_worker_migration_history(version,filename,checksum,method) VALUES ($1,$2,$3,'baseline')",&[&m.version,&m.name,&m.checksum]).await?;
+            tx.execute(&format!("INSERT INTO {history}(version,filename,checksum,method) VALUES ($1,$2,$3,'baseline')"),&[&m.version,&m.name,&m.checksum]).await?;
         }
         tx.commit().await?;
         return Ok(version as usize);
@@ -120,7 +173,7 @@ async fn run(db: &mut Client, files: &[Migration], adopt: Option<i32>) -> Result
     for m in files.iter().skip(rows.len()) {
         let sql = transaction_body(m)?;
         tx.batch_execute(&sql).await?;
-        tx.execute("INSERT INTO public.novu_rust_worker_migration_history(version,filename,checksum,method) VALUES ($1,$2,$3,'applied')",&[&m.version,&m.name,&m.checksum]).await?;
+        tx.execute(&format!("INSERT INTO {history}(version,filename,checksum,method) VALUES ($1,$2,$3,'applied')"),&[&m.version,&m.name,&m.checksum]).await?;
         count += 1;
     }
     tx.commit().await?;
@@ -129,12 +182,14 @@ async fn run(db: &mut Client, files: &[Migration], adopt: Option<i32>) -> Result
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let adopt=match args.as_slice() {
-        [command,_] if command=="apply"=>None,
-        [command,_,version,confirmation] if command=="baseline" && confirmation=="I-VERIFIED-THE-EXISTING-SCHEMA"=>Some(version.parse()?),
-        _=>return Err("usage: migrate-worker apply MIGRATION_DIR | baseline MIGRATION_DIR VERSION I-VERIFIED-THE-EXISTING-SCHEMA".into()),
+    let (stream,path,adopt)=match args.as_slice() {
+        [command,path] if command=="apply" => (Stream::Worker,path,None),
+        [command,service,path] if command=="apply" => (Stream::parse(service)?,path,None),
+        [command,path,version,confirmation] if command=="baseline" && confirmation=="I-VERIFIED-THE-EXISTING-SCHEMA" => (Stream::Worker,path,Some(version.parse()?)),
+        [command,service,path,version,confirmation] if command=="baseline" && confirmation=="I-VERIFIED-THE-EXISTING-SCHEMA" => (Stream::parse(service)?,path,Some(version.parse()?)),
+        _=>return Err("usage: migrate-worker apply [api|worker|ws] MIGRATION_DIR | baseline [api|worker|ws] MIGRATION_DIR VERSION I-VERIFIED-THE-EXISTING-SCHEMA".into()),
     };
-    let files = read_migrations(Path::new(&args[1]))?;
+    let files = read_migrations(Path::new(path))?;
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let (mut db, connection) = config.connect(tls).await?;
     tokio::spawn(async move {
@@ -142,15 +197,16 @@ async fn main() -> Result<()> {
             eprintln!("database connection failed");
         }
     });
-    let count = run(&mut db, &files, adopt).await?;
+    let count = run(&mut db, stream, &files, adopt).await?;
     println!(
-        "{} {} worker migrations",
+        "{} {} {} migrations",
         if adopt.is_some() {
             "baselined"
         } else {
             "applied"
         },
-        count
+        count,
+        stream.label()
     );
     Ok(())
 }
