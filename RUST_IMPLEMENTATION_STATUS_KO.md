@@ -3,6 +3,12 @@
 > 기준: 원본 Novu 커밋 `895388f37efe9e06de0aa333e5727303e6ad6853` · 작성: 2026-11-12.
 > **현재 구현은 실험용이며 Novu와 100% 호환되지 않는다. 운영에 사용하거나 기존 Novu의 대체품으로 배포하지 않는다.**
 
+### Dashboard의 현재 상태와 원본 화면 미리보기
+
+Swallow Rust 백엔드와 통합된 관리 UI는 아직 없다. 저장소의 `apps/dashboard`는 원본 Novu Dashboard 소스다. 원본 community compose가 지정한 공개 이미지 `ghcr.io/novuhq/novu/dashboard:3.19.0`을 별도 로컬 컨테이너로 실행해 로그인 화면 표시를 확인했다. 이 이미지는 기준 소스 커밋과 동일하다고 검증한 빌드가 아니며, 미리보기에서 API·WebSocket 주소는 의도적으로 연결되지 않는 로컬 주소로 지정했다. 따라서 로그인, 데이터 조회·변경, Swallow 연동이나 보안을 확인한 결과가 아니다. 원본 Dashboard 이미지를 Swallow UI 완성으로 간주하지 않는다.
+
+원본 self-hosted 로그인은 `POST /v1/auth/login`의 이메일·비밀번호 응답에 든 토큰을 사용하고, 공통 API 클라이언트는 `Authorization: Bearer` 및 선택적인 `Novu-Environment-Id`를 보낸다. 조직 조회 `GET /v1/organizations/me`와 환경 목록 `GET /v1/environments` 등도 필요하다. 현재 Rust API는 해당 사용자 로그인·조직/환경 UI 경로가 없고 관리 API의 `authenticate`는 `ApiKey`를 사용하며 Bearer를 거절한다. Inbox의 구독자 Bearer 인증은 관리자 로그인과 다른 계약이다. 화면 통합에는 사용자 인증·세션·권한과 환경 격리, 대시보드가 호출하는 관리 API, CORS·배포 구성 및 실제 브라우저 종단 간 검증이 필요하다. 단순 인증 우회나 API 키를 브라우저에 심는 방식은 관리 UI 완성을 입증하지 않는다.
+
 ### Android 알림 표시 옵션
 
 FCM의 `overrides.fcm.android.notification`과 provider override에서 제목·본문·아이콘·사운드·색상·태그·ticker, 클릭 동작과 채널 ID, 본문·제목 현지화 키와 인수, 이미지, 우선순위·공개 범위·proxy, 진동 패턴·기본 옵션과 알림 수를 지원한다. Firebase Admin SDK와 같이 해당 필드명을 wire 형식으로 바꾸고 정수 밀리초 진동 길이를 초 단위로 변환한다. 이미지 URL은 http/https로 제한한다. `lightSettings`는 `#RRGGBB` 또는 `#RRGGBBAA` 색상과 정수 밀리초 점등·소등 시간을 Firebase SDK 형식의 RGBA·초 단위 시간으로 변환한다. `eventTimestamp`, 그 밖의 미지원 필드, 소수 밀리초 및 잘못된 입력은 거절한다. API는 객체 수준만 검사하므로 잘못된 옵션이 접수 후 발송 단계에서 실패할 수 있다.
