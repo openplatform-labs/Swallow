@@ -50,11 +50,11 @@ Slack 워커는 PostgreSQL 연결 실패나 처리 오류·시간 초과 뒤 2�
 
 이 마이그레이션은 저장 기반이며, 아래의 제한된 관리 API를 제외한 원본 channel-endpoints API, 암호화된 웹훅·토큰 저장, context 정합성 검증, 워크플로 발송 연결 및 엔드포인트 변경 시 대기 작업 정책은 아직 구현되지 않았다. 현재 독립 Slack 발송 워커는 이 테이블을 사용하지 않는다. Docker PostgreSQL에서 환경 격리, 잘못된 내부 ID·비밀 필드 거절, 구독자 삭제·같은 ID 재생성, 삭제와 엔드포인트 삽입 경합을 검증한다. 원본 API·워크플로와의 종단 간 비교는 수행하지 않았다.
 
-API는 `POST /v1/channel-endpoints`, `GET /v1/channel-endpoints/{identifier}`, `DELETE /v1/channel-endpoints/{identifier}`에서 비밀이 없는 `slack_channel`·`slack_user`의 생성·조회·삭제를 제한적으로 지원한다. 워커 0075·0076과 API 0016을 적용해야 한다. 0076의 Slack 통합·연결 메타데이터는 신뢰된 관리자가 DB에 사전 등록해야 하며, 같은 환경의 구독자와 통합, 지정했다면 그 통합의 연결이 존재해야 생성된다. 기존 0075 데이터에 등록되지 않은 통합·연결이 있으면 0076 외래 키 생성이 실패하므로 배포 전 확인한다. 통합·연결 삭제는 참조 중인 엔드포인트가 있으면 차단한다.
+API는 `POST /v1/channel-endpoints`, `GET /v1/channel-endpoints/{identifier}`, `PATCH /v1/channel-endpoints/{identifier}`, `DELETE /v1/channel-endpoints/{identifier}`에서 비밀이 없는 `slack_channel`·`slack_user`의 생성·조회·수정·삭제를 제한적으로 지원한다. 워커 0075·0076과 API 0016·0017을 적용해야 한다. 0076의 Slack 통합·연결 메타데이터는 신뢰된 관리자가 DB에 사전 등록해야 하며, 같은 환경의 구독자와 통합, 지정했다면 그 통합의 연결이 존재해야 생성된다. 기존 0075 데이터에 등록되지 않은 통합·연결이 있으면 0076 외래 키 생성이 실패하므로 배포 전 확인한다. 통합·연결 삭제는 참조 중인 엔드포인트가 있으면 차단한다.
 
-API 키별 `novu_rust_slack_endpoint_permissions`의 `read`·`write` 권한은 기본 부여되지 않으며 신뢰된 DB 관리자가 키 해시에 명시적으로 부여한다. API DB 로그인에 `GRANT EXECUTE ON FUNCTION public.novu_rust_lock_slack_endpoint_grant(text,text,text)` 및 필요한 메타데이터·엔드포인트 읽기/쓰기, 감사 삽입 권한을 별도로 부여해야 한다. 최종 조회·변경에서 권한, 키 활성화 및 사용자 존재를 다시 잠그고 생성·삭제와 감사 삽입을 같은 SQL 트랜잭션에 수행한다. API 인스턴스가 이 경로를 실행하기 전에 마이그레이션과 DB 권한을 준비해야 한다. 직접 DB 접근은 우회할 수 있으므로 테이블 권한을 제한한다.
+API 키별 `novu_rust_slack_endpoint_permissions`의 `read`·`write` 권한은 기본 부여되지 않으며 신뢰된 DB 관리자가 키 해시에 명시적으로 부여한다. API DB 로그인에 `GRANT EXECUTE ON FUNCTION public.novu_rust_lock_slack_endpoint_grant(text,text,text)` 및 필요한 메타데이터·엔드포인트 읽기/쓰기, 감사 삽입 권한을 별도로 부여해야 한다. 최종 조회·변경에서 권한, 키 활성화 및 사용자 존재를 다시 잠그고 생성·수정·삭제와 감사 삽입을 같은 SQL 트랜잭션에 수행한다. API 인스턴스가 이 경로를 실행하기 전에 마이그레이션과 DB 권한을 준비해야 한다. 직접 DB 접근은 우회할 수 있으므로 테이블 권한을 제한한다.
 
-명시된 identifier가 없으면 Rust가 UUID 기반 ID를 생성한다. context, 구독자 자동 생성, webhook 등 다른 엔드포인트 유형과 목록·수정은 미구현이며 입력 검증·오류 문구와 권한 정책은 원본과 다르다. 통합·연결 관리 API 및 워크플로 발송도 미구현이다. Docker PostgreSQL과 Rust HTTP 핸들러에서 생성·조회·삭제, 환경·읽기/쓰기 권한 격리, 구독자 삭제 연동, 잘못된 입력과 권한 회수 경합을 확인했다. 기준 원본의 DTO mapper와 선택된 정상 응답 필드를 비교했으며 시각은 제외했다. 원본 서버·SDK와 종단 간 비교, 사용자 JWT/SSO, 전체 감사 보호와 운영 DB 적용은 미검증이다.
+명시된 identifier가 없으면 Rust가 UUID 기반 ID를 생성한다. context, 구독자 자동 생성, webhook 등 다른 엔드포인트 유형과 목록은 미구현이며 입력 검증·오류 문구와 권한 정책은 원본과 다르다. 통합·연결 관리 API 및 워크플로 발송도 미구현이다. Docker PostgreSQL과 Rust HTTP 핸들러에서 생성·조회·수정·삭제, 환경·읽기/쓰기 권한 격리, 구독자 삭제 연동, 잘못된 입력과 권한 회수 경합을 확인했다. 기준 원본의 DTO mapper와 선택된 정상 응답 필드를 비교했으며 시각은 제외했다. 원본 서버·SDK와 종단 간 비교, 사용자 JWT/SSO, 전체 감사 보호와 운영 DB 적용은 미검증이다.
 
 ## Resend 발송 응답 판정
 

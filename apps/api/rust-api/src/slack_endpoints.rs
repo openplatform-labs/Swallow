@@ -221,6 +221,67 @@ pub(super) async fn get(
         ),
     }
 }
+pub(super) async fn update(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+    OriginalUri(uri): OriginalUri,
+    bytes: Bytes,
+) -> ApiError {
+    let path = uri.to_string();
+    let (env, hash) = match access(&db, &headers, &path, "write").await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let input: Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => return failure(StatusCode::BAD_REQUEST, "Invalid JSON", &path),
+    };
+    let Some(fields) = input.as_object().filter(|v| v.len() == 1) else {
+        return failure(StatusCode::BAD_REQUEST, "Invalid endpoint", &path);
+    };
+    let Some(endpoint) = fields
+        .get("endpoint")
+        .and_then(Value::as_object)
+        .filter(|o| {
+            o.len() == 1
+                && ["channelId", "userId"].iter().any(|k| {
+                    o.get(*k)
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.is_empty() && s.len() <= 255)
+                })
+        })
+    else {
+        return failure(StatusCode::BAD_REQUEST, "Invalid endpoint", &path);
+    };
+    let endpoint = Value::Object(endpoint.clone());
+    let audit = Uuid::new_v4();
+    let sql = format!(
+        "WITH auth AS MATERIALIZED (SELECT public.novu_rust_lock_slack_endpoint_grant($1,$2,'write') AS ok), e AS (UPDATE novu_rust_slack_channel_endpoints x SET endpoint=$4,updated_at=clock_timestamp() FROM auth a WHERE a.ok AND x.environment_id=$2 AND x.identifier=$3 RETURNING x.*), audit AS (INSERT INTO public.novu_rust_slack_endpoint_audit(id,environment_id,identifier,action,key_hash,user_id) SELECT $5,$2,$3,'update',$1,k.user_id FROM e JOIN novu_rust_api_keys k ON k.key_hash=$1 RETURNING 1) SELECT {DTO} FROM e CROSS JOIN audit"
+    );
+    match db
+        .query_opt(&sql, &[&hash, &env, &identifier, &endpoint, &audit])
+        .await
+    {
+        Ok(Some(row)) => (StatusCode::OK, Json(json!({"data":row.get::<_,Value>(0)}))),
+        Ok(None) => failure(
+            StatusCode::NOT_FOUND,
+            "Endpoint not found or permission revoked",
+            &path,
+        ),
+        Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::CHECK_VIOLATION) => failure(
+            StatusCode::BAD_REQUEST,
+            "Endpoint does not match type",
+            &path,
+        ),
+        Err(_) => failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal server error",
+            &path,
+        ),
+    }
+}
+
 pub(super) async fn delete(
     State(db): State<Arc<Client>>,
     headers: HeaderMap,

@@ -51,6 +51,7 @@ async fn scoped_slack_endpoint_crud_and_subscriber_deletion() {
         include_str!("../../../worker/rust-queue/migrations/0075_slack_channel_endpoints.sql"),
         include_str!("../../../worker/rust-queue/migrations/0076_slack_endpoint_integrations.sql"),
         include_str!("../migrations/0016_slack_endpoint_permissions.sql"),
+        include_str!("../migrations/0017_slack_endpoint_update_audit.sql"),
     ] {
         db.batch_execute(migration).await.unwrap();
     }
@@ -150,6 +151,53 @@ async fn scoped_slack_endpoint_crud_and_subscriber_deletion() {
         .0,
         StatusCode::OK
     );
+    let (status, updated) = request(
+        app.clone(),
+        "PATCH",
+        "/v1/channel-endpoints/endpoint",
+        "key-a",
+        json!({"endpoint":{"channelId":"C456"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(updated["data"]["endpoint"]["channelId"], "C456");
+    assert_eq!(setup.query_one("SELECT count(*) FROM novu_rust_slack_endpoint_audit WHERE action='update' AND identifier='endpoint' AND key_hash=$1", &[&hash]).await.unwrap().get::<_,i64>(0),1);
+    assert_eq!(
+        request(
+            app.clone(),
+            "PATCH",
+            "/v1/channel-endpoints/endpoint",
+            "key-a",
+            json!({"endpoint":{"userId":"U123"}})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        request(
+            app.clone(),
+            "PATCH",
+            "/v1/channel-endpoints/endpoint",
+            "key-b",
+            json!({"endpoint":{"channelId":"C789"}})
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request(
+            app.clone(),
+            "PATCH",
+            "/v1/channel-endpoints/missing",
+            "key-a",
+            json!({"endpoint":{"userId":"U123"}})
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
     assert_eq!(
         request(
             app.clone(),
@@ -210,7 +258,7 @@ async fn scoped_slack_endpoint_crud_and_subscriber_deletion() {
             .await
             .unwrap()
             .get::<_, i64>(0),
-        2
+        3
     );
     assert_eq!(
         request(

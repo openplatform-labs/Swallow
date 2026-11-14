@@ -156,7 +156,7 @@ pub fn router_with_webhook_configs(
         )
         .route("/v1/events/trigger", post(trigger))
         .route("/v1/channel-endpoints", post(slack_endpoints::create))
-        .route("/v1/channel-endpoints/{identifier}", get(slack_endpoints::get).delete(slack_endpoints::delete))
+        .route("/v1/channel-endpoints/{identifier}", get(slack_endpoints::get).patch(slack_endpoints::update).delete(slack_endpoints::delete))
         .route(
             "/v1/experimental/workflows/{workflow}/email-provider",
             get(get_workflow_email_provider).put(set_workflow_email_provider),
