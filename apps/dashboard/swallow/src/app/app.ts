@@ -8,6 +8,7 @@ type Subscriber = { id: string; firstName: string; lastName: string; email: stri
 type AlertSlot = { channel: string; targetId: string; state: string; lastStartedAt: string | null; attemptId?: string | null };
 type AlertCursor = { channel: string; targetId: string };
 type ResendResult = { jobId:string; jobStatus:string; result:string; attemptState:string|null; providerIdKnown:boolean; providerIdAmbiguous:boolean; autoCorrelated:boolean; autoCorrelationConflict:boolean; autoCorrelatedAt:string|null; lastCompletedScanAt:string|null };
+type WorkflowChannel = 'email'|'sms'|'push'|'slack';
 type DecisionHistory = { id: string; decision: string; reason: string; createdAt: string };
 type DecisionRequest = { requestId: string; channel: string; targetId: string; attemptId: string; decision: string; reason: string; createdAt: string };
 type RetrySnapshot = { origin: string; endpoint: string; scheme: 'Bearer' | 'SwallowConsole'; requestId: string; channel: string; targetId: string; attemptId: string; decision: string; reason: string; keyHash: string };
@@ -38,6 +39,18 @@ export class App implements OnDestroy {
   readonly status = signal<ConnectionState>('unchecked');
   readonly checkedAt = signal<string | null>(null);
   readonly detail = signal('');
+  workflowKey='';
+  workflowIdentifier='';
+  workflowChannel:WorkflowChannel='email';
+  workflowTitle='';
+  workflowContent='';
+  workflowHasContent=false;
+  workflowActive=false;
+  workflowConfirmed=false;
+  readonly workflowStatus=signal<'idle'|'loading'|'loaded'|'saving'|'saved'|'error'|'unknown'>('idle');
+  readonly workflowMessage=signal('');
+  private workflowSequence=0;
+  private workflowAbort:AbortController|null=null;
   readonly subscribers = signal<Subscriber[]>([]);
   readonly subscriberStatus = signal<'idle' | 'loading' | 'loaded' | 'error'>('idle');
   readonly subscriberError = signal('');
@@ -142,6 +155,7 @@ export class App implements OnDestroy {
   private permissionRequestAbort:AbortController|null=null;
 
   ngOnDestroy(): void {
+    this.clearWorkflow(true);
     this.oidcSequence++;
     if (this.oidcExpiryTimer !== null) clearTimeout(this.oidcExpiryTimer);
     this.oidcExpiryTimer = null;
@@ -391,8 +405,61 @@ export class App implements OnDestroy {
     return this.sections.find((item) => item.id === this.section())?.label ?? '';
   }
 
+  clearWorkflow(clearKey=false): void {
+    this.workflowSequence++;this.workflowAbort?.abort();this.workflowAbort=null;
+    this.workflowStatus.set('idle');this.workflowMessage.set('');this.workflowTitle='';this.workflowContent='';this.workflowHasContent=false;this.workflowActive=false;this.workflowConfirmed=false;
+    if(clearKey){this.workflowKey='';this.workflowIdentifier='';}
+  }
+
+  private workflowEndpoint(): string {
+    const identifier=this.workflowIdentifier.trim();
+    if (!/^[A-Za-z0-9_-][A-Za-z0-9._-]{0,255}$/.test(identifier) || !this.workflowKey.trim() || /[^\x21-\x7e]/.test(this.workflowKey.trim())) throw new Error('워크플로 식별자와 API 키를 확인해 주세요.');
+    if (!['email','sms','push','slack'].includes(this.workflowChannel)) throw new Error('채널을 확인해 주세요.');
+    const path=`/v1/experimental/workflows/${encodeURIComponent(identifier)}`;
+    return `${this.validatedOrigin()}${path}${this.workflowChannel==='slack'?'/slack-step':`/channel-steps/${this.workflowChannel}`}`;
+  }
+
+  private applyWorkflow(value:unknown, identifier:string, channel:WorkflowChannel): void {
+    if(typeof value!=='object'||value===null||!('data' in value)||typeof value.data!=='object'||value.data===null) throw new Error('invalid response');
+    const data=value.data as Record<string,unknown>;
+    if(data['workflowIdentifier']!==identifier || (channel!=='slack' && data['channel']!==channel) || typeof data['active']!=='boolean' || !(data['content']===null || typeof data['content']==='string') || (channel!=='slack' && !(data['title']===null || typeof data['title']==='string')) || (channel==='sms' && data['title']!==null) || ((channel==='email'||channel==='push') && ((data['title']===null)!==(data['content']===null)))) throw new Error('invalid response');
+    this.workflowHasContent=data['content']!==null;this.workflowContent=(data['content'] as string|null)??'';this.workflowTitle=(data['title'] as string|null)??'';this.workflowActive=data['active'];this.workflowConfirmed=false;
+  }
+
+  async loadWorkflow():Promise<void> {
+    if(this.workflowStatus()==='saving')return;
+    this.clearWorkflow();const sequence=this.workflowSequence;const controller=new AbortController();this.workflowAbort=controller;this.workflowStatus.set('loading');
+    try {
+      const endpoint=this.workflowEndpoint(), identifier=this.workflowIdentifier.trim(), channel=this.workflowChannel;
+      const response=await fetch(endpoint,{headers:{Authorization:`ApiKey ${this.workflowKey.trim()}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      if(!response.ok)throw new Error('조회하지 못했습니다. 워크플로와 읽기 권한을 확인해 주세요.');
+      const value:unknown=await response.json();if(sequence!==this.workflowSequence)return;
+      this.applyWorkflow(value,identifier,channel);this.workflowStatus.set('loaded');
+    } catch(error:unknown) {if(sequence!==this.workflowSequence)return;this.workflowStatus.set('error');this.workflowMessage.set(error instanceof Error && ['워크플로','채널','주소','원격','조회'].some(prefix=>error.message.startsWith(prefix))?error.message:'조회 응답 또는 서버 연결을 확인해 주세요.');}
+    finally {if(sequence===this.workflowSequence)this.workflowAbort=null;}
+  }
+
+  async saveWorkflow():Promise<void> {
+    if(this.workflowStatus()!=='loaded'||!this.workflowConfirmed)return;
+    let endpoint:string;
+    try {endpoint=this.workflowEndpoint();} catch {this.workflowStatus.set('error');this.workflowMessage.set('워크플로 식별자와 API 키를 확인해 주세요.');return;}
+    const bytes=(s:string)=>new TextEncoder().encode(s).length;
+    if(this.workflowHasContent && (bytes(this.workflowContent)>40000 || this.workflowContent.includes('\0') || ((this.workflowChannel==='email'||this.workflowChannel==='push') && (bytes(this.workflowTitle)>40000 || this.workflowTitle.includes('\0'))))) {this.workflowMessage.set('제목과 내용은 각각 40,000바이트 이하여야 하며 NUL 문자를 포함할 수 없습니다.');return;}
+    const identifier=this.workflowIdentifier.trim(),channel=this.workflowChannel;
+    const content=this.workflowHasContent?this.workflowContent:null;
+    const body=channel==='slack'?{content,active:this.workflowActive}:{title:this.workflowHasContent&&(channel==='email'||channel==='push')?this.workflowTitle:null,content,active:this.workflowActive};
+    this.workflowStatus.set('saving');this.workflowMessage.set('');
+    try {
+      const response=await fetch(endpoint,{method:'PUT',headers:{Authorization:`ApiKey ${this.workflowKey.trim()}`,'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
+      if(!response.ok){this.workflowStatus.set([400,401,403,404].includes(response.status)?'error':'unknown');this.workflowMessage.set(this.workflowStatus()==='error'?'변경이 거절되었습니다. 입력과 쓰기 권한을 확인해 주세요.':'변경 결과를 확인할 수 없습니다. 재시도 전에 현재 설정과 감사 기록을 확인하세요.');return;}
+      const value:unknown=await response.json();this.applyWorkflow(value,identifier,channel);this.workflowStatus.set('saved');
+    } catch {this.workflowStatus.set('unknown');this.workflowMessage.set('변경 결과를 확인할 수 없습니다. 재시도 전에 현재 설정과 감사 기록을 확인하세요.');}
+    finally {this.workflowConfirmed=false;}
+  }
+
   setSection(next: Section): void {
-    if (this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending') return;
+    if (this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.workflowStatus()==='saving') return;
+    if (this.section()==='workflows' && next!=='workflows') this.clearWorkflow(true);
     if (this.section() === 'subscribers' && next !== 'subscribers') this.forgetKey();
     if (this.section() === 'alerts' && next !== 'alerts') this.forgetAlertKey();
     if (this.section() === 'settings' && next !== 'settings') {this.clearPermissions(true);this.clearPermissionChange();}
@@ -400,6 +467,7 @@ export class App implements OnDestroy {
   }
 
   connectionChanged(): void {
+    this.clearWorkflow(true);
     this.resetOidc();
     this.apiKey = '';
     this.clearSubscribers();

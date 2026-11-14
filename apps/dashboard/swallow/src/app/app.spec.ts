@@ -6,6 +6,36 @@ import { OperatorOidc } from './operator-oidc';
 describe('Swallow console', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
+  it('loads and updates each supported workflow channel with the correct API contract', async () => {
+    const fetchMock=vi.spyOn(globalThis,'fetch');
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('workflows');app.workflowIdentifier='welcome';app.workflowKey='test-key';
+    for(const channel of ['email','sms','push','slack'] as const){
+      app.workflowChannel=channel;
+      const data={workflowIdentifier:'welcome',...(channel==='slack'?{}:{channel,title:channel==='sms'?null:'title'}),content:'old',active:true};
+      fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({data}),{status:200})).mockResolvedValueOnce(new Response(JSON.stringify({data:{...data,content:'new'}}),{status:200}));
+      await app.loadWorkflow();expect(app.workflowStatus()).toBe('loaded');app.workflowContent='new';app.workflowConfirmed=true;await app.saveWorkflow();expect(app.workflowStatus()).toBe('saved');
+      const calls=fetchMock.mock.calls.slice(-2);expect((calls[0][0] as string)).toContain(channel==='slack'?'/slack-step':`/channel-steps/${channel}`);
+      expect(calls[1][1]?.headers).toEqual({Authorization:'ApiKey test-key','Content-Type':'application/json'});
+      expect(JSON.parse(calls[1][1]?.body as string)).toEqual(channel==='slack'?{content:'new',active:true}:{title:channel==='sms'?null:'title',content:'new',active:true});
+    }
+    app.setSection('overview');expect(app.workflowKey).toBe('');expect(app.workflowContent).toBe('');
+  });
+
+  it('requires confirmation and treats an interrupted workflow update as unknown', async () => {
+    let finish!:(response:Response)=>void;
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:{workflowIdentifier:'welcome',channel:'email',title:'title',content:'old',active:true}}))).mockReturnValueOnce(new Promise(done=>{finish=done;}));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('workflows');app.workflowIdentifier='welcome';app.workflowKey='key';await app.loadWorkflow();await app.saveWorkflow();expect(fetchMock).toHaveBeenCalledTimes(1);
+    app.workflowConfirmed=true;const pending=app.saveWorkflow();app.setSection('overview');expect(app.section()).toBe('workflows');finish(new Response('',{status:500}));await pending;
+    expect(app.workflowStatus()).toBe('unknown');expect(app.workflowMessage()).toContain('감사');expect(app.workflowConfirmed).toBe(false);
+  });
+
+  it('does not apply an outdated workflow read after credentials change', async () => {
+    let finish!:(response:Response)=>void;vi.spyOn(globalThis,'fetch').mockReturnValueOnce(new Promise(done=>{finish=done;}));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('workflows');app.workflowIdentifier='welcome';app.workflowKey='key';const pending=app.loadWorkflow();app.workflowKey='other';app.clearWorkflow();
+    finish(new Response(JSON.stringify({data:{workflowIdentifier:'welcome',channel:'email',title:'secret',content:'private',active:true}})));await pending;
+    expect(app.workflowStatus()).toBe('idle');expect(app.workflowContent).toBe('');
+  });
+
   it('pages Resend jobs and selects a job using a fresh result request', async () => {
     const row=(n:number)=>({jobId:`00000000-0000-0000-0000-${n.toString().padStart(12,'0')}`,jobStatus:'completed',result:'unknown',attemptState:null,providerIdKnown:false,providerIdAmbiguous:false,autoCorrelated:false,autoCorrelationConflict:false,autoCorrelatedAt:null,lastCompletedScanAt:null,secret:'hidden'});
     const page1=Array.from({length:20},(_,i)=>row(i+1)); const page2=[row(21)];

@@ -7,7 +7,7 @@
     <nav class="sidenav" aria-label="주 메뉴">
       <div class="nav-heading">WORKSPACE</div>
       @for (item of sections; track item.id) {
-        <button class="nav-entry" [class.active]="section() === item.id" [attr.aria-current]="section() === item.id ? 'page' : null" [disabled]="decisionStatus() === 'sending' || permissionChangeStatus() === 'sending'" (click)="setSection(item.id)">
+        <button class="nav-entry" [class.active]="section() === item.id" [attr.aria-current]="section() === item.id ? 'page' : null" [disabled]="decisionStatus() === 'sending' || permissionChangeStatus() === 'sending' || workflowStatus() === 'saving'" (click)="setSection(item.id)">
           <span class="nav-icon" aria-hidden="true">{{ item.short }}</span><span>{{ item.label }}</span>
         </button>
       }
@@ -21,7 +21,7 @@
         <clr-alert clrAlertType="info" [clrAlertClosable]="false"><clr-alert-item><span class="alert-text">선택적 운영자 로그인과 조회 기능을 제공하며 대부분의 관리 기능은 개발 중입니다. API 준비 상태, 구독자 목록과 권한이 부여된 운영 경보 상태를 확인할 수 있습니다.</span></clr-alert-item></clr-alert>
         <div class="dashboard-grid">
           <section class="card connection-card"><div class="card-block"><div class="card-eyebrow">CONNECTION</div><h2>API 연결</h2><p>연결할 Swallow API의 주소를 입력하고 준비 상태를 확인하세요.</p><form (ngSubmit)="checkConnection()"><label for="api-origin">API 주소</label><div class="connection-form"><input id="api-origin" class="clr-input" name="apiOrigin" [(ngModel)]="apiOrigin" (ngModelChange)="connectionChanged()" autocomplete="url" spellcheck="false" required><button class="btn btn-primary" type="submit" [disabled]="status() === 'checking'">{{ status() === 'checking' ? '확인 중' : '연결 확인' }}</button></div></form><p class="connection-feedback" aria-live="polite">@if(status() === 'ready'){준비 상태를 확인했습니다. {{ checkedAt() }}} @else if(status() === 'unavailable'){ {{ detail() }} } @else {서버에서 준비 상태 API가 활성화되어 있어야 합니다.}</p></div></section>
-          <section class="card summary-card"><div class="card-block"><div class="card-eyebrow">GETTING STARTED</div><h2>시작하기</h2><p>서비스 연결 후 관리 기능을 이 화면에서 사용할 수 있도록 준비하고 있습니다.</p><div class="setup-row"><span class="step-number">01</span><div><strong>API 연결 확인</strong><small>서버의 준비 상태를 확인합니다</small></div></div><div class="setup-row"><span class="step-number">02</span><div><strong>운영자 로그인</strong><small>등록된 OIDC 공급자를 연결합니다</small></div></div><div class="setup-row"><span class="step-number muted">03</span><div><strong>채널과 워크플로 설정</strong><small>구현 예정</small></div></div></div></section>
+          <section class="card summary-card"><div class="card-block"><div class="card-eyebrow">GETTING STARTED</div><h2>시작하기</h2><p>서비스 연결 후 관리 기능을 이 화면에서 사용할 수 있도록 준비하고 있습니다.</p><div class="setup-row"><span class="step-number">01</span><div><strong>API 연결 확인</strong><small>서버의 준비 상태를 확인합니다</small></div></div><div class="setup-row"><span class="step-number">02</span><div><strong>운영자 로그인</strong><small>등록된 OIDC 공급자를 연결합니다</small></div></div><div class="setup-row"><span class="step-number muted">03</span><div><strong>채널과 워크플로 설정</strong><small>채널별 단일 단계 설정 제공</small></div></div></div></section>
         </div>
         <section class="card subscriber-card"><div class="card-block">
           <div class="card-eyebrow">OPERATOR SIGN IN</div><h2>운영자 로그인</h2>
@@ -44,10 +44,38 @@
         </div></section>
         <div class="section-title"><div><div class="eyebrow">YOUR WORKSPACE</div><h2>관리 기능</h2></div><span>순차적으로 연결 예정</span></div>
         <div class="feature-grid">
-          <button class="feature-card" (click)="setSection('workflows')"><span class="feature-icon">WF</span><strong>워크플로</strong><small>알림 흐름과 템플릿 관리</small><span class="feature-status">준비 중 →</span></button>
+          <button class="feature-card" (click)="setSection('workflows')"><span class="feature-icon">WF</span><strong>워크플로</strong><small>채널별 단일 단계 설정</small><span class="feature-status">설정하기 →</span></button>
           <button class="feature-card" (click)="setSection('subscribers')"><span class="feature-icon teal">SU</span><strong>구독자</strong><small>수신자와 알림 설정 관리</small><span class="feature-status">준비 중 →</span></button>
           <button class="feature-card" (click)="setSection('channels')"><span class="feature-icon amber">CH</span><strong>발송 채널</strong><small>이메일, SMS, 푸시 연결</small><span class="feature-status">준비 중 →</span></button>
         </div>
+      } @else if (section() === 'workflows') {
+        <div class="page-heading"><div><div class="eyebrow">WORKFLOWS</div><h1>워크플로</h1><p>기존 워크플로의 채널별 단일 단계를 조회하고 설정합니다.</p></div></div>
+        <clr-alert clrAlertType="warning" [clrAlertClosable]="false"><clr-alert-item><span class="alert-text">실험 기능입니다. API 키와 채널별 읽기·쓰기 권한이 필요합니다. 동시 편집 감지가 없으므로 다른 변경을 덮어쓸 수 있습니다.</span></clr-alert-item></clr-alert>
+        <section class="card subscriber-card"><div class="card-block"><div class="card-eyebrow">STEP SETTINGS</div><h2>단계 조회</h2>
+          <form class="subscriber-form" (ngSubmit)="loadWorkflow()">
+            <div><label for="workflow-id">워크플로 식별자</label><input id="workflow-id" name="workflowIdentifier" [(ngModel)]="workflowIdentifier" (ngModelChange)="clearWorkflow()" [disabled]="workflowStatus()==='saving'" autocomplete="off" required></div>
+            <div><label for="workflow-channel">채널</label><select id="workflow-channel" class="clr-select" name="workflowChannel" [(ngModel)]="workflowChannel" (ngModelChange)="clearWorkflow()" [disabled]="workflowStatus()==='saving'"><option value="email">이메일</option><option value="sms">SMS</option><option value="push">푸시</option><option value="slack">Slack</option></select></div>
+            <div><label for="workflow-key">환경 API 키</label><input id="workflow-key" type="password" name="workflowKey" [(ngModel)]="workflowKey" (ngModelChange)="clearWorkflow()" [disabled]="workflowStatus()==='saving'" autocomplete="off" spellcheck="false" required></div>
+            <button type="submit" class="btn btn-primary" [disabled]="workflowStatus()==='loading' || workflowStatus()==='saving'">단계 조회</button><button type="button" class="btn btn-outline" [disabled]="workflowStatus()==='saving'" (click)="clearWorkflow(true)">지우기</button>
+          </form><p class="subscriber-hint">조회·수정은 위 API 키의 환경에 적용됩니다. 키와 템플릿은 이 화면의 메모리에만 남고 화면을 떠나면 지워집니다.</p>
+          @if (workflowStatus()==='loading') {<p role="status">설정을 불러오는 중입니다.</p>}
+          @if (workflowMessage()) {<p class="subscriber-error" role="alert">{{ workflowMessage() }}</p>}
+          @if (workflowStatus()==='saved') {<p role="status">변경 응답을 받았습니다. 현재 설정을 다시 조회해 확인하세요.</p>}
+        </div></section>
+        @if (workflowStatus()==='loaded' || workflowStatus()==='saving') {
+          <section class="card decision-card"><div class="card-block"><h2>단계 설정</h2><p>이미 생성된 작업은 이전 템플릿을 사용할 수 있습니다. 활성화는 단계에만 적용되며 워크플로 전체 활성화와 별개입니다.</p>
+            <form class="decision-form" (ngSubmit)="saveWorkflow()">
+              <label class="decision-confirm"><input type="checkbox" name="workflowHasContent" [(ngModel)]="workflowHasContent" [disabled]="workflowStatus()==='saving'"> 템플릿 사용</label>
+              @if (workflowHasContent) {
+                @if (workflowChannel==='email'||workflowChannel==='push') {<label for="workflow-title">{{ workflowChannel==='email' ? '메일 제목' : '푸시 제목' }}</label><input id="workflow-title" name="workflowTitle" [(ngModel)]="workflowTitle" [disabled]="workflowStatus()==='saving'">}
+                <label for="workflow-content">내용</label><textarea id="workflow-content" name="workflowContent" [(ngModel)]="workflowContent" [disabled]="workflowStatus()==='saving'"></textarea>
+              }
+              <label class="decision-confirm"><input type="checkbox" name="workflowActive" [(ngModel)]="workflowActive" [disabled]="workflowStatus()==='saving'"> 이 단계 활성화</label>
+              <label class="decision-confirm"><input type="checkbox" name="workflowConfirmed" [(ngModel)]="workflowConfirmed" [disabled]="workflowStatus()==='saving'"> 선택한 환경과 채널의 설정을 변경합니다</label>
+              <button type="submit" class="btn btn-primary" [disabled]="!workflowConfirmed || workflowStatus()==='saving'">{{ workflowStatus()==='saving' ? '저장 중' : '단계 저장' }}</button>
+            </form><p>통신 오류나 시간 초과 시 저장 여부가 불명일 수 있습니다. 요청이 아직 진행 중일 수 있으므로 다시 저장하기 전에 현재 설정과 감사 기록을 확인하세요.</p>
+          </div></section>
+        }
       } @else if (section() === 'subscribers') {
         <div class="page-heading"><div><div class="eyebrow">AUDIENCE</div><h1>구독자</h1><p>선택한 환경의 구독자 목록을 조회합니다.</p></div></div>
         <clr-alert clrAlertType="warning" [clrAlertClosable]="false"><clr-alert-item><span class="alert-text">@if (credentialMode === 'api-key') {API 키 방식은 개발 검증용입니다. 기존 키는 더 넓은 권한을 가질 수 있으므로 격리된 테스트 키만 사용해 주세요.} @else if (credentialMode === 'jwt') {인증 공급자가 발급한 접근 토큰과 해당 환경의 구독자 조회 권한이 필요합니다. 개요에서 운영자 로그인 후 사용하거나 토큰을 직접 입력할 수 있습니다.} @else {구독자 조회 권한을 부여받은 인증이 필요하며 경보 권한은 별도로 부여됩니다. 정식 관리자 로그인은 아직 준비 중입니다.}</span></clr-alert-item></clr-alert>
