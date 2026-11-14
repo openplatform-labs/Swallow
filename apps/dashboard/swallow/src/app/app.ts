@@ -5,6 +5,9 @@ import { OperatorOidc, type PreparedOidc, type VerifiedSession } from './operato
 
 type ConnectionState = 'unchecked' | 'checking' | 'ready' | 'unavailable';
 type SubscriberProfile = {firstName:string;lastName:string;email:string;phone:string};
+type SubscriberCreateBody = {requestId:string;subscriberId:string;profile:Record<string,string>;reason:string};
+type SubscriberCreateRetry = {origin:string;environment:string;keyHash:string;body:SubscriberCreateBody};
+type SubscriberCreateRecord = {requestId:string;subscriberId:string;generation:string;fields:string[];reason:string;createdAt:string};
 type SubscriberProfileRequestBody = {requestId:string;subscriberId:string;generation:string;revision:string;profile:Record<string,string|null>;reason:string};
 type SubscriberProfileRetry = {origin:string;environment:string;keyHash:string;body:SubscriberProfileRequestBody};
 type SubscriberProfileRecord = {requestId:string;subscriberId:string;generation:string;previousRevision:string;revision:string;changed:boolean;fields:string[];reason:string;createdAt:string};
@@ -156,6 +159,16 @@ export class App implements OnDestroy {
   credentialMode: 'restricted' | 'api-key' | 'jwt' = 'restricted';
   subscriberEnvironment = '';
   subscriberName = '';
+  readonly subscriberCreateRetry=signal<SubscriberCreateRetry|null>(null);
+  readonly subscriberCreateRetryStatus=signal<'idle'|'unknown'|'retrying'|'recorded'>('idle');
+  readonly subscriberCreateRetryMessage=signal('');
+  subscriberCreateRetryConfirmed=false;
+  subscriberCreateRequestId='';
+  readonly subscriberCreateRequestStatus=signal<'idle'|'loading'|'found'|'missing'|'error'>('idle');
+  readonly subscriberCreateRequestRecord=signal<SubscriberCreateRecord|null>(null);
+  private subscriberCreateRequestSequence=0;
+  private subscriberCreateRequestAbort:AbortController|null=null;
+  createReason='';
   createSubscriberId='';
   createFirstName='';
   createLastName='';
@@ -263,7 +276,7 @@ export class App implements OnDestroy {
     this.clearResend();
     this.clearResendJobs();
     this.clearPermissions(true);
-    this.resetSubscriberEdit(true);this.forgetSubscriberProfileRequest();
+    this.resetSubscriberEdit(true);this.forgetSubscriberProfileRequest();this.forgetSubscriberCreateRequest();
   }
 
   private expireOidcIfNeeded(): boolean {
@@ -272,7 +285,7 @@ export class App implements OnDestroy {
     if (this.oidcExpiryTimer !== null) clearTimeout(this.oidcExpiryTimer);
     this.oidcExpiryTimer=null; this.oidcSession=null; this.oidcSubject.set(''); this.oidcStatus.set('expired');
     // Preserve decision outcome and request ID, including an in-flight or uncertain decision.
-    if (this.apiKey===session.token) { this.apiKey=''; this.clearSubscribers(); this.resetSubscriberEdit(); this.clearSubscriberProfileLookup(); }
+    if (this.apiKey===session.token) { this.apiKey=''; this.clearSubscribers(); this.resetSubscriberEdit(); this.clearSubscriberProfileLookup(); this.clearSubscriberCreateLookup(); }
     if (this.alertKey===session.token) {
       this.alertKey=''; this.clearResend(); this.clearResendJobs();
       this.alertRequestId++; this.alertAbort?.abort(); this.alertAbort=null;
@@ -302,7 +315,7 @@ export class App implements OnDestroy {
   }
 
   resetOidc(): void {
-    if ((this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
+    if ((this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     if (this.oidcExpiryTimer !== null) clearTimeout(this.oidcExpiryTimer);
     this.oidcExpiryTimer=null;
     this.oidcSequence++; this.oidcPrepared = null; this.oidcSession = null;
@@ -332,7 +345,7 @@ export class App implements OnDestroy {
 
   useOidc(section: 'subscribers' | 'alerts' | 'workflows'): void {
     this.expireOidcIfNeeded();
-    if (!this.oidcSession || (this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
+    if (!this.oidcSession || (this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     const session=this.oidcSession;
     this.setSection(section);
     if (section === 'subscribers') { this.forgetKey(); this.credentialMode='jwt'; this.subscriberEnvironment=session.environmentId; this.apiKey=session.token; }
@@ -868,7 +881,7 @@ export class App implements OnDestroy {
   }
 
   setSection(next: Section): void {
-    if ((this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
+    if ((this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     if (this.section()==='workflows' && next!=='workflows') {this.clearWorkflow(true);this.forgetWorkflowRequest();}
     if (this.section() === 'subscribers' && next !== 'subscribers') this.forgetKey();
     if (this.section() === 'alerts' && next !== 'alerts') this.forgetAlertKey();
@@ -900,8 +913,8 @@ export class App implements OnDestroy {
   }
 
   forgetKey(): void {
-    if(this.createStatus()==='sending'||this.subscriberEditStatus()==='saving'||this.subscriberProfileRetryStatus()==='retrying')return;
-    this.resetSubscriberEdit(true);this.forgetSubscriberProfileRequest();this.resetCreateSubscriber();
+    if(this.createStatus()==='sending'||this.subscriberEditStatus()==='saving'||this.subscriberProfileRetryStatus()==='retrying'||this.subscriberCreateRetryStatus()==='retrying')return;
+    this.resetSubscriberEdit(true);this.forgetSubscriberProfileRequest();this.forgetSubscriberCreateRequest();this.resetCreateSubscriber();
     this.apiKey = '';
     this.clearSubscribers();
   }
@@ -1356,10 +1369,10 @@ export class App implements OnDestroy {
     finally{if(sequence===this.subscriberEditSequence)this.subscriberEditAbort=null;}
   }
   canEditSubscriber():boolean {
-    const snapshot=this.subscriberEditSnapshot();return ['api-key','jwt'].includes(this.credentialMode)&&this.subscriberEditStatus()==='loaded'&&this.createStatus()!=='sending'&&!!snapshot&&this.subscriberEditConfirmed&&(this.credentialMode!=='jwt'||this.subscriberProfileRetryStatus()==='idle')&&(this.credentialMode!=='jwt'||(!!this.subscriberEditReason.trim()&&new TextEncoder().encode(this.subscriberEditReason.trim()).length<=1000))&&(Object.keys(snapshot.profile) as (keyof SubscriberProfile)[]).some(k=>this.subscriberEditProfile[k]!==snapshot.profile[k]);
+    const snapshot=this.subscriberEditSnapshot();return ['api-key','jwt'].includes(this.credentialMode)&&this.subscriberEditStatus()==='loaded'&&this.createStatus()!=='sending'&&this.subscriberCreateRetryStatus()!=='retrying'&&!!snapshot&&this.subscriberEditConfirmed&&(this.credentialMode!=='jwt'||this.subscriberProfileRetryStatus()==='idle')&&(this.credentialMode!=='jwt'||(!!this.subscriberEditReason.trim()&&new TextEncoder().encode(this.subscriberEditReason.trim()).length<=1000))&&(Object.keys(snapshot.profile) as (keyof SubscriberProfile)[]).some(k=>this.subscriberEditProfile[k]!==snapshot.profile[k]);
   }
   canDeleteSubscriber():boolean {
-    const snapshot=this.subscriberEditSnapshot();return this.credentialMode==='api-key'&&this.subscriberEditStatus()==='loaded'&&this.createStatus()!=='sending'&&!!snapshot&&this.subscriberDeleteConfirmation===snapshot.id;
+    const snapshot=this.subscriberEditSnapshot();return this.credentialMode==='api-key'&&this.subscriberEditStatus()==='loaded'&&this.createStatus()!=='sending'&&this.subscriberCreateRetryStatus()!=='retrying'&&!!snapshot&&this.subscriberDeleteConfirmation===snapshot.id;
   }
   async changeSubscriberEdit(deleting:boolean):Promise<void> {
     const snapshot=this.subscriberEditSnapshot();if(!snapshot||(deleting?!this.canDeleteSubscriber():!this.canEditSubscriber()))return;
@@ -1388,31 +1401,71 @@ export class App implements OnDestroy {
 
   resetCreateSubscriber():void {
     if(this.createStatus()==='sending')return;
-    this.createSubscriberId='';this.createFirstName='';this.createLastName='';this.createEmail='';this.createPhone='';this.createConfirmed=false;this.createdSubscriberId.set('');this.createMessage.set('');this.createStatus.set('idle');
+    this.createReason='';this.createSubscriberId='';this.createFirstName='';this.createLastName='';this.createEmail='';this.createPhone='';this.createConfirmed=false;this.createdSubscriberId.set('');this.createMessage.set('');this.createStatus.set('idle');
+  }
+  clearSubscriberCreateLookup(clearId=false):void {
+    this.subscriberCreateRequestSequence++;this.subscriberCreateRequestAbort?.abort();this.subscriberCreateRequestAbort=null;this.subscriberCreateRequestStatus.set('idle');this.subscriberCreateRequestRecord.set(null);if(clearId)this.subscriberCreateRequestId='';
+  }
+  forgetSubscriberCreateRequest():void {
+    if(this.subscriberCreateRetryStatus()==='retrying')return;
+    this.clearSubscriberCreateLookup(true);this.subscriberCreateRetry.set(null);this.subscriberCreateRetryStatus.set('idle');this.subscriberCreateRetryMessage.set('');this.subscriberCreateRetryConfirmed=false;
+  }
+  async lookupSubscriberCreateRequest():Promise<void> {
+    if(this.createStatus()==='sending'||this.subscriberCreateRetryStatus()==='retrying'||this.credentialMode!=='jwt')return;
+    this.expireOidcIfNeeded();this.clearSubscriberCreateLookup();const sequence=this.subscriberCreateRequestSequence;
+    const key=this.apiKey.trim(),environment=this.subscriberEnvironment.trim(),requestId=this.subscriberCreateRequestId.trim();
+    if(!this.validJwt(key)||!this.validEnvironment(environment)||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId)){this.subscriberCreateRequestStatus.set('error');return;}
+    const controller=new AbortController();this.subscriberCreateRequestAbort=controller;this.subscriberCreateRequestStatus.set('loading');
+    try {
+      const params=new URLSearchParams({environmentId:environment,requestId});const response=await fetch(`${this.validatedOrigin()}/v1/experimental/operator/subscriber-create-request?${params}`,{headers:{Authorization:`Bearer ${key}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      if(!response.ok)throw new Error('request failed');const value:unknown=await response.json();if(typeof value!=='object'||value===null||!('found' in value)||typeof value.found!=='boolean')throw new Error('invalid response');
+      this.expireOidcIfNeeded();if(sequence!==this.subscriberCreateRequestSequence)return;if(!value.found){this.subscriberCreateRequestStatus.set('missing');return;}
+      const r=value as Record<string,unknown>;if(typeof r['requestId']!=='string'||r['requestId'].toLowerCase()!==requestId.toLowerCase()||['subscriberId','generation','reason','createdAt'].some(k=>typeof r[k]!=='string')||!Array.isArray(r['fields'])||r['fields'].some((f:unknown)=>typeof f!=='string'||!['firstName','lastName','email','phone'].includes(f)))throw new Error('invalid response');
+      this.subscriberCreateRequestRecord.set({requestId:r['requestId'],subscriberId:r['subscriberId'] as string,generation:r['generation'] as string,fields:r['fields'] as string[],reason:r['reason'] as string,createdAt:r['createdAt'] as string});this.subscriberCreateRequestStatus.set('found');
+    }catch{this.expireOidcIfNeeded();if(sequence===this.subscriberCreateRequestSequence)this.subscriberCreateRequestStatus.set('error');}
+    finally{if(sequence===this.subscriberCreateRequestSequence)this.subscriberCreateRequestAbort=null;}
+  }
+  async retrySubscriberCreateRequest():Promise<void> {
+    this.expireOidcIfNeeded();const snapshot=this.subscriberCreateRetry(),key=this.apiKey.trim();
+    if(!snapshot||this.subscriberCreateRetryStatus()!=='unknown'||!this.subscriberCreateRetryConfirmed||this.credentialMode!=='jwt'||!this.validJwt(key))return;
+    this.subscriberCreateRetryStatus.set('retrying');this.subscriberCreateRetryMessage.set('');
+    try {
+      const hash=await this.credentialFingerprint(key);this.expireOidcIfNeeded();if(this.apiKey.trim()!==key||hash!==snapshot.keyHash||this.subscriberEnvironment.trim()!==snapshot.environment||this.validatedOrigin()!==snapshot.origin){this.subscriberCreateRetryMessage.set('원래 토큰, 환경과 API 주소가 필요합니다.');return;}
+      const response=await fetch(`${snapshot.origin}/v1/experimental/operator/subscriber-create?${new URLSearchParams({environmentId:snapshot.environment})}`,{method:'POST',headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},body:JSON.stringify(snapshot.body),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
+      if(!response.ok)throw new Error('request failed');const value:unknown=await response.json();if(typeof value!=='object'||value===null||!('requestId' in value)||value.requestId!==snapshot.body.requestId||!('subscriberId' in value)||value.subscriberId!==snapshot.body.subscriberId||!('generation' in value)||typeof value.generation!=='string'||!('replayed' in value)||typeof value.replayed!=='boolean')throw new Error('invalid response');
+      this.subscriberCreateRetryStatus.set('recorded');this.createStatus.set('created');this.clearSubscribers();
+    }catch{this.subscriberCreateRetryMessage.set('재제출 결과가 불명확합니다. 요청 ID로 조회하세요.');}
+    finally{this.subscriberCreateRetryConfirmed=false;if(this.subscriberCreateRetryStatus()==='retrying')this.subscriberCreateRetryStatus.set('unknown');}
   }
   canCreateSubscriber():boolean {
-    const id=this.createSubscriberId.trim(),key=this.apiKey.trim();
-    return this.credentialMode==='api-key'&&this.createStatus()==='idle'&&this.subscriberEditStatus()!=='saving'&&this.createConfirmed&&!!id&&new TextEncoder().encode(id).length<=512&&!id.includes('\0')&&!!key&&!/[^\x21-\x7e]/.test(key);
+    const id=this.createSubscriberId.trim(),key=this.apiKey.trim(),jwt=this.credentialMode==='jwt',reason=this.createReason.trim();
+    return ['api-key','jwt'].includes(this.credentialMode)&&this.createStatus()==='idle'&&this.subscriberEditStatus()!=='saving'&&this.subscriberProfileRetryStatus()!=='retrying'&&this.subscriberCreateRetryStatus()==='idle'&&this.createConfirmed&&!!id&&new TextEncoder().encode(id).length<=512&&!id.includes('\0')&&(jwt?this.validJwt(key)&&this.validEnvironment(this.subscriberEnvironment.trim())&&!!reason&&new TextEncoder().encode(reason).length<=1000:!!key&&!/[^\x21-\x7e]/.test(key));
   }
   async createSubscriber():Promise<void> {
-    if(!this.canCreateSubscriber())return;
+    this.expireOidcIfNeeded();if(!this.canCreateSubscriber())return;
     let origin:string;try{origin=this.validatedOrigin();}catch{this.createStatus.set('rejected');this.createMessage.set('API 주소를 확인하세요.');return;}
-    const key=this.apiKey.trim(),subscriberId=this.createSubscriberId.trim();
-    const body:Record<string,string>={subscriberId};
-    for(const [name,value] of [['firstName',this.createFirstName],['lastName',this.createLastName],['email',this.createEmail],['phone',this.createPhone]])if(value.trim())body[name]=value.trim();
-    this.createdSubscriberId.set(subscriberId);this.createStatus.set('sending');this.createMessage.set('');
+    const key=this.apiKey.trim(),subscriberId=this.createSubscriberId.trim(),jwt=this.credentialMode==='jwt',environment=this.subscriberEnvironment.trim();
+    const profile:Record<string,string>={};for(const [name,value] of [['firstName',this.createFirstName],['lastName',this.createLastName],['email',this.createEmail],['phone',this.createPhone]])if(value.trim())profile[name]=value.trim();
+    let body:object={subscriberId,...profile};this.createdSubscriberId.set(subscriberId);this.createStatus.set('sending');this.createMessage.set('');
     try {
-      const response=await fetch(`${origin}/v2/subscribers?failIfExists=true`,{method:'POST',headers:{Authorization:`ApiKey ${key}`,'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
-      if(!response.ok){
-        if([400,401,403,409,501].includes(response.status)){this.createStatus.set('rejected');this.createMessage.set(response.status===409?'이미 존재하는 구독자 ID입니다. 기존 구독자는 변경되지 않았습니다.':'입력 값, 인증과 API 지원 여부를 확인하세요.');}
-        else {this.createStatus.set('unknown');this.createMessage.set('요청 결과를 확인할 수 없습니다. 같은 ID를 조회해 확인하세요.');}
-        return;
+      if(jwt){
+        let requestId:string,keyHash:string;try{requestId=crypto.randomUUID();keyHash=await this.credentialFingerprint(key);}catch{this.createStatus.set('rejected');this.createMessage.set('안전한 요청 정보를 만들지 못해 전송하지 않았습니다.');return;}
+        this.expireOidcIfNeeded();if(this.apiKey.trim()!==key||this.subscriberEnvironment.trim()!==environment||this.validatedOrigin()!==origin){this.createStatus.set('rejected');this.createMessage.set('인증이 변경되어 요청을 전송하지 않았습니다.');return;}
+        const request:SubscriberCreateBody={requestId,subscriberId,profile,reason:this.createReason.trim()};body=request;this.subscriberCreateRetry.set({origin,environment,keyHash,body:request});this.subscriberCreateRequestId=requestId;
       }
-      const value:unknown=await response.json();
-      if(response.status!==201||typeof value!=='object'||value===null||!('data' in value)||typeof value.data!=='object'||value.data===null||!('subscriberId' in value.data)||value.data.subscriberId!==subscriberId)throw new Error('invalid response');
+      const endpoint=jwt?`/v1/experimental/operator/subscriber-create?${new URLSearchParams({environmentId:environment})}`:'/v2/subscribers?failIfExists=true';
+      const response=await fetch(`${origin}${endpoint}`,{method:'POST',headers:{Authorization:`${jwt?'Bearer':'ApiKey'} ${key}`,'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
+      if(!response.ok){
+        if(jwt&&[400,401,403,409,501].includes(response.status)){this.subscriberCreateRetry.set(null);this.subscriberCreateRetryStatus.set('idle');}else if(jwt)this.subscriberCreateRetryStatus.set('unknown');
+        if([400,401,403,409,501].includes(response.status)){this.createStatus.set('rejected');this.createMessage.set(response.status===409?'이미 존재하는 구독자 ID 또는 충돌한 요청입니다. 기존 구독자는 변경되지 않았습니다.':'입력 값, 인증과 API 지원 여부를 확인하세요.');}
+        else {this.createStatus.set('unknown');this.createMessage.set('요청 결과를 확인할 수 없습니다. 같은 ID를 조회해 확인하세요.');}return;
+      }
+      const value:unknown=await response.json();if(typeof value!=='object'||value===null)throw new Error('invalid response');
+      if(jwt){if(!('subscriberId' in value)||value.subscriberId!==subscriberId||!('requestId' in value)||value.requestId!==this.subscriberCreateRetry()?.body.requestId||!('generation' in value)||typeof value.generation!=='string'||!('replayed' in value)||typeof value.replayed!=='boolean')throw new Error('invalid response');this.subscriberCreateRetry.set(null);this.subscriberCreateRetryStatus.set('idle');}
+      else if(response.status!==201||!('data' in value)||typeof value.data!=='object'||value.data===null||!('subscriberId' in value.data)||value.data.subscriberId!==subscriberId)throw new Error('invalid response');
       this.createStatus.set('created');this.clearSubscribers();
-    }catch{this.createStatus.set('unknown');this.createMessage.set('요청 결과를 확인할 수 없습니다. 같은 ID를 조회해 확인하세요.');}
-    finally{this.createConfirmed=false;}
+    }catch{if(jwt&&this.subscriberCreateRetry())this.subscriberCreateRetryStatus.set('unknown');this.createStatus.set('unknown');this.createMessage.set('요청 결과를 확인할 수 없습니다. 같은 ID를 조회해 확인하세요.');}
+    finally{this.createConfirmed=false;this.createReason='';}
   }
 
   private validatedOrigin(): string {
