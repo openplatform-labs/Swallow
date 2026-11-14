@@ -25,6 +25,11 @@ INSERT INTO novu_rust_workflows(environment_id,identifier,active,has_steps,push_
 ('64a000000000000000000002','push-workflow-recreated',true,true,'Original','Original {{subscriber.subscriberId}}','{"id":"64a000000000000000000045"}');''')
 labels=['changed','disabled','deleted','recreated','enabled_later','device_added','device_removed','actor_context','template_changed','workflow_deleted','workflow_recreated']
 cases=[(label,'push-queued-'+label+'-'+uuid.uuid4().hex) for label in labels]
+# Allow the Rust monitoring tool to inspect and acknowledge only this fixture environment.
+pq("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT '64a000000000000000000002',session_user,decision,oid FROM pg_roles CROSS JOIN unnest(ARRAY['alert_view','queue_ack']) decision WHERE rolname=session_user ON CONFLICT DO NOTHING")
+queue_root=Path(__file__).resolve().parents[3]/'worker'/'rust-queue'
+def monitor(*args):
+    return subprocess.run(['cargo','run','--quiet','--locked','--offline','--bin','delivery-reconcile','--',*args],cwd=queue_root,env=dict(os.environ,DATABASE_URL=os.environ['TEST_DATABASE_URL'],NOVU_POSTGRES_ALLOW_INSECURE='true'),capture_output=True,text=True,check=False)
 actor='push-actor-'+uuid.uuid4().hex; context='push-tenant-'+uuid.uuid4().hex;jobs={}
 def set_tokens(base,subscriber,tokens):
     return request(base,'PUT','/v1/subscribers/'+subscriber+'/credentials',{'providerId':'fcm','credentials':{'deviceTokens':tokens}})[0]
@@ -102,6 +107,15 @@ for label,subscriber in cases:
     else:
         assert not captured and not rust_requests and rust['status']=='failed' and rust['outcome']=='failed' and rust['messages']==0,(label,ref,rust)
         assert any(j['status']=='failed' for j in ref['jobs']),ref
+        if label=='deleted':
+            environment='64a000000000000000000002'
+            check=monitor('check-failed-jobs',environment);assert check.returncode==2,(check.stdout,check.stderr)
+            listed=monitor('list-failed-jobs',environment);assert listed.returncode==0,listed.stderr
+            assert jobs[label] in [row['jobId'] for row in json.loads(listed.stdout)],listed.stdout
+            ack=monitor('ack-failed-job',environment,jobs[label],'fixture-operator','verified test');assert ack.returncode==0,ack.stderr
+            listed=monitor('list-failed-jobs',environment);assert listed.returncode==0 and jobs[label] not in [row['jobId'] for row in json.loads(listed.stdout)],listed.stdout
+            assert pq(f"SELECT status FROM novu_queue_jobs WHERE id='{jobs[label]}'")=='failed'
+            print('HTTP trigger through FCM failure, monitoring and acknowledgement verified on Rust')
     print(label+': selected queued push behavior matched')
 
 # Integration selection is evaluated after the channel job has been created.
