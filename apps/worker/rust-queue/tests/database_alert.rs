@@ -46,6 +46,7 @@ async fn target_outage_is_reported_using_independent_alert_database() {
             .env("SWALLOW_DB_PROBE_URL", &probe)
             .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
             .env("SWALLOW_DB_PROBE_TIMEOUT_SECONDS", "2")
+            .env("SWALLOW_DB_ALERT_OPERATION_TIMEOUT_SECONDS", "1")
             .env("SWALLOW_ALERT_COOLDOWN_POLICY", "new-condition")
             .env("SWALLOW_ALERT_SCOPED_DELIVERY", "true")
             .env(
@@ -76,6 +77,22 @@ async fn target_outage_is_reported_using_independent_alert_database() {
             .status
             .success()
     );
+    db.execute("UPDATE novu_rust_alert_delivery_slots SET state='accepted' WHERE environment_id='monitor' AND target_id='db-primary'",&[]).await.unwrap();
+    let (mut locker, driver) = tokio_postgres::connect(&monitor, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    let tx = locker.transaction().await.unwrap();
+    tx.query_one("SELECT target_id FROM novu_rust_alert_delivery_slots WHERE environment_id='monitor' AND target_id='db-primary' FOR UPDATE",&[]).await.unwrap();
+    let started = std::time::Instant::now();
+    let locked = run();
+    assert_eq!(locked.status.code(), Some(1));
+    assert!(started.elapsed() < std::time::Duration::from_secs(8));
+    let log = String::from_utf8_lossy(&locked.stderr);
+    assert!(log.contains("observation failed or timed out"));
+    assert!(log.contains("dispatch failed or timed out"));
+    tx.rollback().await.unwrap();
+    db.execute("UPDATE novu_rust_alert_delivery_slots SET state='rejected' WHERE environment_id='monitor' AND target_id='db-primary'",&[]).await.unwrap();
     let down = run();
     assert_eq!(
         down.status.code(),

@@ -61,6 +61,13 @@ async fn main() -> Result<()> {
     if !(1..=60).contains(&seconds) {
         return Err("invalid database probe timeout".into());
     }
+    let operation_seconds: u64 = std::env::var("SWALLOW_DB_ALERT_OPERATION_TIMEOUT_SECONDS")
+        .unwrap_or_else(|_| "30".into())
+        .parse()?;
+    if !(1..=300).contains(&operation_seconds) {
+        return Err("invalid alert operation timeout".into());
+    }
+    let operation_timeout = Duration::from_secs(operation_seconds);
     let on_new = match std::env::var("SWALLOW_ALERT_COOLDOWN_POLICY").as_deref() {
         Ok("new-condition") => true,
         Ok("destination") | Err(std::env::VarError::NotPresent) => false,
@@ -139,20 +146,23 @@ async fn main() -> Result<()> {
             ("slack", slack_id.as_str(), slack.is_some()),
             ("email", email_id.as_str(), email.is_some()),
         ] {
-            if enabled
-                && alerts::observe_conditions(
-                    &db,
-                    &args[0],
-                    channel,
-                    target,
-                    alert.condition_mask(),
-                    alert.observed_condition_mask(),
+            if enabled {
+                let result = tokio::time::timeout(
+                    operation_timeout,
+                    alerts::observe_conditions(
+                        &db,
+                        &args[0],
+                        channel,
+                        target,
+                        alert.condition_mask(),
+                        alert.observed_condition_mask(),
+                    ),
                 )
-                .await
-                .is_err()
-            {
-                error = true;
-                eprintln!("{channel} alert observation failed");
+                .await;
+                if !matches!(result, Ok(Ok(()))) {
+                    error = true;
+                    eprintln!("{channel} alert observation failed or timed out");
+                }
             }
         }
     }
@@ -164,36 +174,42 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if let Some(provider) = slack {
-        match alerts::dispatch_slack_with_options(
-            &mut db, &slack_id, cooldown, &alert, &provider, on_new, scoped,
+        match tokio::time::timeout(
+            operation_timeout,
+            alerts::dispatch_slack_with_options(
+                &mut db, &slack_id, cooldown, &alert, &provider, on_new, scoped,
+            ),
         )
         .await
         {
-            Ok(Dispatch::NeedsReview) => eprintln!("Slack alert requires operator review"),
-            Ok(result) => println!("Slack alert: {result:?}"),
-            Err(_) => {
+            Ok(Ok(Dispatch::NeedsReview)) => eprintln!("Slack alert requires operator review"),
+            Ok(Ok(result)) => println!("Slack alert: {result:?}"),
+            _ => {
                 error = true;
-                eprintln!("Slack alert dispatch failed");
+                eprintln!("Slack alert dispatch failed or timed out");
             }
         }
     }
     if let Some((to, provider)) = email {
-        match alerts::dispatch_email_with_options(
-            &mut db,
-            &email_id,
-            cooldown,
-            &alert,
-            &provider,
-            &to,
-            (on_new, scoped),
+        match tokio::time::timeout(
+            operation_timeout,
+            alerts::dispatch_email_with_options(
+                &mut db,
+                &email_id,
+                cooldown,
+                &alert,
+                &provider,
+                &to,
+                (on_new, scoped),
+            ),
         )
         .await
         {
-            Ok(Dispatch::NeedsReview) => eprintln!("email alert requires operator review"),
-            Ok(result) => println!("email alert: {result:?}"),
-            Err(_) => {
+            Ok(Ok(Dispatch::NeedsReview)) => eprintln!("email alert requires operator review"),
+            Ok(Ok(result)) => println!("email alert: {result:?}"),
+            _ => {
                 error = true;
-                eprintln!("email alert dispatch failed");
+                eprintln!("email alert dispatch failed or timed out");
             }
         }
     }

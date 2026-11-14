@@ -1262,6 +1262,56 @@ mod tests {
                 .is_err()
         );
         assert_eq!(db.query_one("SELECT count(*) FROM novu_rust_alert_delivery_attempts WHERE sender_session_user=$1 AND state='accepted'",&[&role]).await.unwrap().get::<_,i64>(0),2);
+        // An operation timeout after the HTTP request starts must not cause an automatic retry.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let blocked_server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            let _ = seen_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let stalled = SlackWebhook::with_endpoint(endpoint).unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                dispatch_slack_with_options(
+                    &mut restricted,
+                    "stalled",
+                    60,
+                    &alert,
+                    &stalled,
+                    true,
+                    true
+                )
+            )
+            .await
+            .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(2), seen_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(db.query_one("SELECT state FROM novu_rust_alert_delivery_slots WHERE environment_id='env-a' AND target_id='stalled'",&[]).await.unwrap().get::<_,String>(0),"dispatching");
+        db.execute("UPDATE novu_rust_alert_delivery_slots SET lease_until=clock_timestamp()-interval '1 second' WHERE environment_id='env-a' AND target_id='stalled'",&[]).await.unwrap();
+        assert_eq!(
+            reserve_scoped(
+                &restricted,
+                "env-a",
+                "slack",
+                "stalled",
+                60,
+                Some(alert.condition_mask())
+            )
+            .await
+            .unwrap(),
+            Reservation::Blocked
+        );
+        assert_eq!(db.query_one("SELECT state FROM novu_rust_alert_delivery_slots WHERE environment_id='env-a' AND target_id='stalled'",&[]).await.unwrap().get::<_,String>(0),"unknown");
+        blocked_server.abort();
         restricted
             .batch_execute("RESET SESSION AUTHORIZATION")
             .await
