@@ -21,47 +21,13 @@ pub async fn acknowledge_workflow(
     operator: &str,
     reason: &str,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    if environment.trim().is_empty()
-        || operator.trim().is_empty()
-        || operator.len() > 128
-        || reason.trim().is_empty()
-        || reason.len() > 512
-    {
-        return Err("invalid Slack acknowledgement".into());
-    }
-    let tx = client.transaction().await?;
-    let allowed: bool = tx
+    let row = client
         .query_one(
-            "SELECT public.novu_rust_lock_operator_grant($1,'slack_ack')",
-            &[&environment],
+            "SELECT public.novu_rust_ack_slack_workflow($1,$2,$3,$4)",
+            &[&environment, &job, &operator, &reason],
         )
-        .await?
-        .get(0);
-    if !allowed {
-        return Err("Slack acknowledgement permission denied".into());
-    }
-    let row=tx.query_opt("SELECT j.attempts,j.status,j.last_error FROM novu_queue_jobs j WHERE j.environment_id=$1 AND j.id=$2 AND j.kind=ANY($3) FOR UPDATE OF j",&[&environment,&job,&vec![crate::slack_workflow::FANOUT_KIND,crate::slack_workflow::DELIVERY_KIND]]).await?.ok_or("Slack workflow job not found")?;
-    let attempts: i32 = row.get(0);
-    let status: String = row.get(1);
-    let error: Option<String> = row.get(2);
-    let has_attempt: bool = tx
-        .query_one(
-            "SELECT EXISTS(SELECT 1 FROM novu_rust_slack_attempts WHERE job_id=$1)",
-            &[&job],
-        )
-        .await?
-        .get(0);
-    let Some(error) = error else {
-        return Err("Slack workflow job is not eligible for acknowledgement".into());
-    };
-    if has_attempt
-        || !(status == "failed" || (status == "cancelled" && error == "no Slack endpoints"))
-    {
-        return Err("Slack workflow job is not eligible for acknowledgement".into());
-    }
-    let inserted=tx.execute("INSERT INTO public.novu_rust_slack_workflow_acknowledgements(id,environment_id,job_id,job_attempts,job_status,job_error,operator_name,reason) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(job_id,job_attempts,job_status,job_error) DO NOTHING",&[&Uuid::new_v4(),&environment,&job,&attempts,&status,&error,&operator,&reason]).await?;
-    tx.commit().await?;
-    Ok(inserted == 1)
+        .await?;
+    Ok(row.get(0))
 }
 
 /// Operator assertion after independently checking the provider. Retry can duplicate a message.

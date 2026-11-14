@@ -28,6 +28,7 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
         slack_queue::WORKFLOW_ATTENTION_MIGRATION,
         include_str!("../migrations/0080_slack_ack_permission.sql"),
         include_str!("../migrations/0081_slack_view_permission.sql"),
+        include_str!("../migrations/0082_slack_ack_function.sql"),
     ] {
         db.batch_execute(sql).await.unwrap();
     }
@@ -41,6 +42,9 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
         .await
         .unwrap();
     db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT e.id,session_user,'slack_view',r.oid FROM novu_rust_environments e CROSS JOIN pg_roles r WHERE r.rolname=session_user",&[]).await.unwrap();
+    db.batch_execute(include_str!("../migrations/0082_slack_ack_function.sql"))
+        .await
+        .unwrap();
     let failed = Uuid::new_v4();
     let missing = Uuid::new_v4();
     let other = Uuid::new_v4();
@@ -130,8 +134,8 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
     let granted: bool = db.query_one("SELECT public.novu_rust_manage_operator_grant('a',session_user::text,'slack_ack','grant','fixture')",&[]).await.unwrap().get(0);
     assert!(granted);
     let viewer = format!("slack_viewer_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {viewer} LOGIN; GRANT USAGE ON SCHEMA public TO {viewer}; GRANT EXECUTE ON FUNCTION public.novu_rust_list_slack_attention(text,uuid) TO {viewer}")).await.unwrap();
-    let (viewer_db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {viewer} LOGIN; GRANT USAGE ON SCHEMA public TO {viewer}; GRANT EXECUTE ON FUNCTION public.novu_rust_list_slack_attention(text,uuid) TO {viewer}; GRANT EXECUTE ON FUNCTION public.novu_rust_ack_slack_workflow(text,uuid,text,text) TO {viewer}")).await.unwrap();
+    let (mut viewer_db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move {
         let _ = driver.await;
     });
@@ -178,6 +182,81 @@ async fn predispatch_failures_and_optional_missing_endpoints_are_actionable() {
             .await
             .is_err()
     );
+    let viewer_job = Uuid::new_v4();
+    queue::enqueue(
+        &db,
+        viewer_job,
+        "a",
+        slack_workflow::DELIVERY_KIND,
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE novu_queue_jobs SET status='failed',last_error='viewer fixture' WHERE id=$1",
+        &[&viewer_job],
+    )
+    .await
+    .unwrap();
+    assert!(
+        slack_queue::acknowledge_workflow(&mut viewer_db, "a", viewer_job, "operator", "reviewed")
+            .await
+            .is_err()
+    );
+    assert!(db.query_one("SELECT public.novu_rust_manage_operator_grant('a',$1,'slack_ack','grant','ack fixture')",&[&viewer]).await.unwrap().get::<_,bool>(0));
+    assert!(
+        slack_queue::acknowledge_workflow(&mut viewer_db, "b", other, "operator", "reviewed")
+            .await
+            .is_err()
+    );
+    assert!(
+        slack_queue::acknowledge_workflow(&mut viewer_db, "a", attempted, "operator", "reviewed")
+            .await
+            .is_err()
+    );
+    assert!(
+        slack_queue::acknowledge_workflow(&mut viewer_db, "a", viewer_job, "operator", " ")
+            .await
+            .is_err()
+    );
+    assert!(
+        slack_queue::acknowledge_workflow(&mut viewer_db, "a", viewer_job, "operator", "reviewed")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !slack_queue::acknowledge_workflow(&mut viewer_db, "a", viewer_job, "operator", "reviewed")
+            .await
+            .unwrap()
+    );
+    assert_eq!(db.query_one("SELECT database_session_user FROM novu_rust_slack_workflow_acknowledgements WHERE job_id=$1",&[&viewer_job]).await.unwrap().get::<_,String>(0),viewer);
+    assert!(
+        viewer_db
+            .execute(
+                "DELETE FROM public.novu_rust_slack_workflow_acknowledgements WHERE job_id=$1",
+                &[&viewer_job]
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        viewer_db
+            .execute(
+                "UPDATE public.novu_queue_jobs SET status='pending' WHERE id=$1",
+                &[&viewer_job]
+            )
+            .await
+            .is_err()
+    );
+    assert!(db.query_one("SELECT public.novu_rust_manage_operator_grant('a',$1,'slack_ack','revoke','ack fixture')",&[&viewer]).await.unwrap().get::<_,bool>(0));
+    assert!(
+        slack_queue::acknowledge_workflow(&mut viewer_db, "a", viewer_job, "operator", "reviewed")
+            .await
+            .is_err()
+    );
+    db.execute("DELETE FROM novu_queue_jobs WHERE id=$1", &[&viewer_job])
+        .await
+        .unwrap();
     viewer_db
         .batch_execute("RESET SESSION AUTHORIZATION")
         .await
