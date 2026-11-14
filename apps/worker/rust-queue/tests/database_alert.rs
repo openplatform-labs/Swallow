@@ -75,6 +75,7 @@ async fn target_outage_is_reported_using_independent_alert_database() {
             .env("SWALLOW_DB_PROBE_URL", &probe)
             .env("SWALLOW_DB_PROBE_ROLE", probe_role)
             .env_remove("SWALLOW_DB_PROBE_MIN_SYNC_STANDBYS")
+            .env_remove("SWALLOW_DB_PROBE_MAX_REPLAY_LAG_BYTES")
             .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
             .env("SWALLOW_DB_PROBE_TIMEOUT_SECONDS", "2")
             .env("SWALLOW_DB_ALERT_OPERATION_TIMEOUT_SECONDS", "1")
@@ -114,6 +115,17 @@ async fn target_outage_is_reported_using_independent_alert_database() {
             String::from_utf8_lossy(&invalid.stderr)
                 .contains("invalid minimum synchronous standbys")
         );
+    }
+    for lag in ["-1", "1099511627777", "bad"] {
+        let invalid = Command::new(env!("CARGO_BIN_EXE_send-database-alert"))
+            .args(["monitor", "primary", "60"])
+            .env("SWALLOW_DB_PROBE_ROLE", "synchronous-primary")
+            .env("SWALLOW_DB_PROBE_MIN_SYNC_STANDBYS", "1")
+            .env("SWALLOW_DB_PROBE_MAX_REPLAY_LAG_BYTES", lag)
+            .output()
+            .unwrap();
+        assert_eq!(invalid.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&invalid.stderr).contains("invalid maximum replay lag"));
     }
     db.execute("UPDATE novu_rust_alert_delivery_slots SET state='rejected' WHERE environment_id='monitor' AND target_id='db-primary'",&[]).await.unwrap();
     assert_eq!(run("synchronous-primary").status.code(), Some(2));

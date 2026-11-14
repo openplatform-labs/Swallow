@@ -1,3 +1,9 @@
+## PostgreSQL 동기 대기 서버 재생 지연 경보
+
+동기 주 서버 검사에 `SWALLOW_DB_PROBE_MAX_REPLAY_LAG_BYTES`를 선택적으로 지정하면 현재 주 서버 WAL 위치와 각 동기 물리 대기 서버의 보고된 재생 위치 간 차이가 상한 이하인 서버만 최소 개수에 포함한다. 설정하지 않으면 기존 연결 수 검사를 유지한다. 범위는 0~1 TiB이며 해당 기능은 `synchronous-primary`에서만 적용된다. 재생 위치가 없거나 주 서버 위치보다 앞서는 보고는 해당 대기 서버를 세지 않는다.
+
+Docker PostgreSQL 주·대기 서버에서 대기 서버의 WAL 재생을 멈추고 주 서버에 WAL을 생성했다. 지연 상한 이하는 통과하고 더 낮은 상한은 거절됐으며, 상한을 사용하지 않은 기존 방식은 통과했다. 잘못된 상한 설정, 대기 서버를 주 서버로 검사한 경우와 인앱 장애 전환 회귀도 검증했다. 측정값은 순간적인 바이트 차이와 PostgreSQL이 보고한 위치로, 경과 시간·복제 데이터의 완전성·승격 가능성·자동 펜싱을 증명하지 않는다. 실제 운영 부하와 외부 경보 수신은 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
 ## PostgreSQL 동기 복제 상태 경보 검사
 
 `send-database-alert`의 `SWALLOW_DB_PROBE_ROLE=synchronous-primary`는 선택적으로 현재 연결이 쓰기 가능한 주 서버인지, 검사 세션의 `synchronous_commit`이 `on` 또는 `remote_apply`인지, 동기 복제가 설정됐는지, 최소 지정 개수의 동기 스트리밍 복제 연결이 있는지 확인한다. `SWALLOW_DB_PROBE_MIN_SYNC_STANDBYS`는 기본 1, 범위 1~32다. 논리 복제 슬롯에 연결된 발신자는 제외한다. 검사 계정에는 `pg_read_all_stats` 멤버십 또는 슈퍼유저 권한이 필요하며 없으면 정상으로 판정하지 않는다. 기존 `any`, `writable-primary`, `standby` 선택은 유지된다.

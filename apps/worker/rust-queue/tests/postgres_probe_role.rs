@@ -35,28 +35,52 @@ async fn detects_actual_primary_standby_and_session_read_only() {
     assert!(!healthy(&standby, Role::WritablePrimary).await.unwrap());
     assert!(healthy(&standby, Role::Standby).await.unwrap());
     assert!(
-        healthy(&primary, Role::SynchronousPrimary { min_standbys: 1 })
-            .await
-            .unwrap()
+        healthy(
+            &primary,
+            Role::SynchronousPrimary {
+                min_standbys: 1,
+                max_replay_lag_bytes: None
+            }
+        )
+        .await
+        .unwrap()
     );
     assert!(
-        !healthy(&primary, Role::SynchronousPrimary { min_standbys: 2 })
-            .await
-            .unwrap()
+        !healthy(
+            &primary,
+            Role::SynchronousPrimary {
+                min_standbys: 2,
+                max_replay_lag_bytes: None
+            }
+        )
+        .await
+        .unwrap()
     );
     assert!(
-        !healthy(&standby, Role::SynchronousPrimary { min_standbys: 1 })
-            .await
-            .unwrap()
+        !healthy(
+            &standby,
+            Role::SynchronousPrimary {
+                min_standbys: 1,
+                max_replay_lag_bytes: None
+            }
+        )
+        .await
+        .unwrap()
     );
     primary
         .batch_execute("SET synchronous_commit=local")
         .await
         .unwrap();
     assert!(
-        !healthy(&primary, Role::SynchronousPrimary { min_standbys: 1 })
-            .await
-            .unwrap()
+        !healthy(
+            &primary,
+            Role::SynchronousPrimary {
+                min_standbys: 1,
+                max_replay_lag_bytes: None
+            }
+        )
+        .await
+        .unwrap()
     );
     primary
         .batch_execute("RESET synchronous_commit; CREATE ROLE fixture_probe LOGIN")
@@ -68,19 +92,118 @@ async fn detects_actual_primary_standby_and_session_read_only() {
             .replacen("postgres@", "fixture_probe@", 1);
     let limited = connect(&probe_url).await;
     assert!(
-        !healthy(&limited, Role::SynchronousPrimary { min_standbys: 1 })
-            .await
-            .unwrap()
+        !healthy(
+            &limited,
+            Role::SynchronousPrimary {
+                min_standbys: 1,
+                max_replay_lag_bytes: None
+            }
+        )
+        .await
+        .unwrap()
     );
     primary
         .batch_execute("GRANT pg_read_all_stats TO fixture_probe")
         .await
         .unwrap();
     assert!(
-        healthy(&limited, Role::SynchronousPrimary { min_standbys: 1 })
+        healthy(
+            &limited,
+            Role::SynchronousPrimary {
+                min_standbys: 1,
+                max_replay_lag_bytes: None
+            }
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        !healthy(
+            &standby,
+            Role::SynchronousPrimary {
+                min_standbys: 1,
+                max_replay_lag_bytes: Some(0)
+            }
+        )
+        .await
+        .unwrap()
+    );
+    // Pause replay while still allowing WAL reception and flush, then write
+    // asynchronously so the primary does not wait on the paused standby.
+    standby
+        .query_one("SELECT pg_catalog.pg_wal_replay_pause()", &[])
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if standby
+            .query_one("SELECT pg_catalog.pg_is_wal_replay_paused()", &[])
             .await
             .unwrap()
+            .get::<_, bool>(0)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let writer = connect(&std::env::var("TEST_PRIMARY_URL").unwrap()).await;
+    writer
+        .batch_execute("SET synchronous_commit=off")
+        .await
+        .unwrap();
+    writer
+        .query_one(
+            "SELECT pg_catalog.pg_logical_emit_message(true,'probe',repeat('x',200000))",
+            &[],
+        )
+        .await
+        .unwrap();
+    let mut lagged = false;
+    for _ in 0..100 {
+        let row=primary.query_one("SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_stat_replication WHERE application_name='standby1' AND replay_lsn IS NOT NULL AND pg_catalog.pg_wal_lsn_diff(pg_catalog.pg_current_wal_lsn(),replay_lsn)>1000)",&[]).await.unwrap();
+        if row.get::<_, bool>(0) {
+            lagged = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(lagged, "standby replay lag did not appear");
+    assert!(
+        healthy(
+            &limited,
+            Role::SynchronousPrimary {
+                min_standbys: 1,
+                max_replay_lag_bytes: None
+            }
+        )
+        .await
+        .unwrap()
     );
+    assert!(
+        !healthy(
+            &limited,
+            Role::SynchronousPrimary {
+                min_standbys: 1,
+                max_replay_lag_bytes: Some(1000)
+            }
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        healthy(
+            &limited,
+            Role::SynchronousPrimary {
+                min_standbys: 1,
+                max_replay_lag_bytes: Some(10_000_000)
+            }
+        )
+        .await
+        .unwrap()
+    );
+    standby
+        .query_one("SELECT pg_catalog.pg_wal_replay_resume()", &[])
+        .await
+        .unwrap();
     // Make one physical standby and one logical receiver synchronous quorum
     // members. A logical subscriber is not a promotable physical standby.
     primary.query_one("SELECT * FROM pg_catalog.pg_create_logical_replication_slot('fixture_probe_slot','test_decoding')",&[]).await.unwrap();
@@ -130,14 +253,26 @@ async fn detects_actual_primary_standby_and_session_read_only() {
         "physical and logical senders did not become synchronous quorum members"
     );
     assert!(
-        healthy(&limited, Role::SynchronousPrimary { min_standbys: 1 })
-            .await
-            .unwrap()
+        healthy(
+            &limited,
+            Role::SynchronousPrimary {
+                min_standbys: 1,
+                max_replay_lag_bytes: None
+            }
+        )
+        .await
+        .unwrap()
     );
     assert!(
-        !healthy(&limited, Role::SynchronousPrimary { min_standbys: 2 })
-            .await
-            .unwrap(),
+        !healthy(
+            &limited,
+            Role::SynchronousPrimary {
+                min_standbys: 2,
+                max_replay_lag_bytes: None
+            }
+        )
+        .await
+        .unwrap(),
         "logical receiver counted as a physical standby"
     );
     primary
@@ -150,9 +285,15 @@ async fn detects_actual_primary_standby_and_session_read_only() {
         .unwrap();
     let mut restored = false;
     for _ in 0..100 {
-        if healthy(&limited, Role::SynchronousPrimary { min_standbys: 1 })
-            .await
-            .unwrap()
+        if healthy(
+            &limited,
+            Role::SynchronousPrimary {
+                min_standbys: 1,
+                max_replay_lag_bytes: None,
+            },
+        )
+        .await
+        .unwrap()
         {
             restored = true;
             break;
@@ -177,9 +318,15 @@ async fn detects_actual_primary_standby_and_session_read_only() {
         .await
         .unwrap();
     assert!(
-        !healthy(&limited, Role::SynchronousPrimary { min_standbys: 1 })
-            .await
-            .unwrap()
+        !healthy(
+            &limited,
+            Role::SynchronousPrimary {
+                min_standbys: 1,
+                max_replay_lag_bytes: None
+            }
+        )
+        .await
+        .unwrap()
     );
     primary
         .batch_execute("SET default_transaction_read_only = on")
@@ -187,9 +334,15 @@ async fn detects_actual_primary_standby_and_session_read_only() {
         .unwrap();
     assert!(!healthy(&primary, Role::WritablePrimary).await.unwrap());
     assert!(
-        !healthy(&primary, Role::SynchronousPrimary { min_standbys: 1 })
-            .await
-            .unwrap()
+        !healthy(
+            &primary,
+            Role::SynchronousPrimary {
+                min_standbys: 1,
+                max_replay_lag_bytes: None
+            }
+        )
+        .await
+        .unwrap()
     );
     assert!(healthy(&primary, Role::Any).await.unwrap());
 }
