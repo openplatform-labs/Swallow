@@ -52,6 +52,14 @@ export class App implements OnDestroy {
   readonly resendResult = signal<ResendResult|null>(null);
   private resendSequence = 0;
   private resendAbort: AbortController|null = null;
+  readonly resendJobs = signal<ResendResult[]>([]);
+  readonly resendJobsStatus = signal<'idle'|'loading'|'loaded'|'error'>('idle');
+  readonly resendJobsError = signal('');
+  readonly resendJobsNext = signal<string|null>(null);
+  readonly resendJobsPage = signal(1);
+  private resendJobsHistory: (string|null)[] = [null];
+  private resendJobsSequence = 0;
+  private resendJobsAbort: AbortController|null = null;
   readonly alertsHaveMore = signal(false);
   readonly alertNext = signal<AlertCursor | null>(null);
   readonly alertPage = signal(1);
@@ -141,6 +149,7 @@ export class App implements OnDestroy {
     this.alertKey='';
     this.resendJobId='';
     this.clearResend();
+    this.clearResendJobs();
     this.clearPermissions(true);
   }
 
@@ -151,7 +160,7 @@ export class App implements OnDestroy {
     this.oidcExpiryTimer=null; this.oidcSession=null; this.oidcSubject.set(''); this.oidcStatus.set('expired');
     // Preserve decision outcome and request ID, including an in-flight or uncertain decision.
     if (this.apiKey===session.token) this.apiKey='';
-    if (this.alertKey===session.token) { this.alertKey=''; this.clearResend(); }
+    if (this.alertKey===session.token) { this.alertKey=''; this.clearResend(); this.clearResendJobs(); }
     if (this.decisionKey===session.token) this.decisionKey='';
     if (this.retryKey===session.token) this.retryKey='';
     if (this.lookupKey===session.token) this.lookupKey='';
@@ -424,6 +433,7 @@ export class App implements OnDestroy {
     this.alertStatus.set('idle');
     this.alertError.set('');
     this.clearResend();
+    this.clearResendJobs();
     this.clearDecision();
     this.clearHistory(true);
   }
@@ -458,14 +468,10 @@ export class App implements OnDestroy {
       if (response.status===401 || response.status===403) throw new Error('인증 값 또는 Resend 결과 조회 권한을 확인해 주세요.');
       if (!response.ok) throw new Error('작업 결과를 가져오지 못했습니다. 환경과 작업 ID를 확인해 주세요.');
       const value:unknown=await response.json();
-      if (typeof value!=='object' || value===null) throw new Error('API 응답 형식을 확인해 주세요.');
-      const row=value as Record<string,unknown>;
-      if (typeof row['jobId']!=='string' || row['jobId'].toLowerCase()!==job.toLowerCase() || typeof row['jobStatus']!=='string' || !['pending','running','completed','failed','cancelled'].includes(row['jobStatus']) || typeof row['result']!=='string' || !['unknown','pending','delivered','failed','partial','conflicting','complained'].includes(row['result']) || !(row['attemptState']===null || (typeof row['attemptState']==='string' && ['dispatching','accepted','rejected','unknown'].includes(row['attemptState']))) || typeof row['providerIdKnown']!=='boolean' || typeof row['providerIdAmbiguous']!=='boolean' || typeof row['autoCorrelated']!=='boolean' || typeof row['autoCorrelationConflict']!=='boolean' || !(row['autoCorrelatedAt']===null || typeof row['autoCorrelatedAt']==='string') || !(row['lastCompletedScanAt']===null || typeof row['lastCompletedScanAt']==='string')) throw new Error('API 응답 형식을 확인해 주세요.');
-      if (((row['autoCorrelationConflict'] || row['providerIdAmbiguous']) && row['result']==='delivered') || (row['autoCorrelationConflict'] && !row['autoCorrelated']) || (row['autoCorrelated'] !== (typeof row['autoCorrelatedAt']==='string'))) throw new Error('API 응답 형식을 확인해 주세요.');
+      const result=this.parseResendResult(value,job);
       this.expireOidcIfNeeded();
       if (sequence!==this.resendSequence) return;
-      const result=row as ResendResult;
-      this.resendResult.set({jobId:result.jobId,jobStatus:result.jobStatus,result:result.result,attemptState:result.attemptState,providerIdKnown:result.providerIdKnown,providerIdAmbiguous:result.providerIdAmbiguous,autoCorrelated:result.autoCorrelated,autoCorrelationConflict:result.autoCorrelationConflict,autoCorrelatedAt:result.autoCorrelatedAt,lastCompletedScanAt:result.lastCompletedScanAt});
+      this.resendResult.set(result);
       this.resendStatus.set('loaded');
     } catch (error:unknown) {
       if (sequence!==this.resendSequence) return;
@@ -475,6 +481,59 @@ export class App implements OnDestroy {
       if (sequence===this.resendSequence) this.resendAbort=null;
     }
   }
+
+  private parseResendResult(value:unknown,job?:string): ResendResult {
+      if (typeof value!=='object' || value===null) throw new Error('API 응답 형식을 확인해 주세요.');
+      const row=value as Record<string,unknown>;
+      if (typeof row['jobId']!=='string' || (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(row['jobId']) || (job!==undefined && row['jobId'].toLowerCase()!==job.toLowerCase())) || typeof row['jobStatus']!=='string' || !['pending','running','completed','failed','cancelled'].includes(row['jobStatus']) || typeof row['result']!=='string' || !['unknown','pending','delivered','failed','partial','conflicting','complained'].includes(row['result']) || !(row['attemptState']===null || (typeof row['attemptState']==='string' && ['dispatching','accepted','rejected','unknown'].includes(row['attemptState']))) || typeof row['providerIdKnown']!=='boolean' || typeof row['providerIdAmbiguous']!=='boolean' || typeof row['autoCorrelated']!=='boolean' || typeof row['autoCorrelationConflict']!=='boolean' || !(row['autoCorrelatedAt']===null || typeof row['autoCorrelatedAt']==='string') || !(row['lastCompletedScanAt']===null || typeof row['lastCompletedScanAt']==='string')) throw new Error('API 응답 형식을 확인해 주세요.');
+      if (((row['autoCorrelationConflict'] || row['providerIdAmbiguous']) && row['result']==='delivered') || (row['autoCorrelationConflict'] && !row['autoCorrelated']) || (row['autoCorrelated'] !== (typeof row['autoCorrelatedAt']==='string'))) throw new Error('API 응답 형식을 확인해 주세요.');
+      const result=row as ResendResult;
+      return {jobId:result.jobId,jobStatus:result.jobStatus,result:result.result,attemptState:result.attemptState,providerIdKnown:result.providerIdKnown,providerIdAmbiguous:result.providerIdAmbiguous,autoCorrelated:result.autoCorrelated,autoCorrelationConflict:result.autoCorrelationConflict,autoCorrelatedAt:result.autoCorrelatedAt,lastCompletedScanAt:result.lastCompletedScanAt};
+  }
+
+  clearResendJobs(): void {
+    this.resendJobsSequence++;
+    this.resendJobsAbort?.abort(); this.resendJobsAbort=null;
+    this.resendJobs.set([]); this.resendJobsNext.set(null); this.resendJobsPage.set(1);
+    this.resendJobsHistory=[null]; this.resendJobsStatus.set('idle'); this.resendJobsError.set('');
+  }
+
+  async loadResendJobs(direction?: 'next'|'previous'): Promise<void> {
+    this.expireOidcIfNeeded();
+    if (direction==='previous' && this.resendJobsPage()<=1) return;
+    const cursor=direction==='next' ? this.resendJobsNext() : direction==='previous' ? this.resendJobsHistory[this.resendJobsPage()-2] : null;
+    if ((direction==='next' && !cursor) || cursor===undefined) return;
+    const page=direction==='next' ? this.resendJobsPage()+1 : direction==='previous' ? this.resendJobsPage()-1 : 1;
+    const sequence=++this.resendJobsSequence;
+    this.resendJobsAbort?.abort();
+    const controller=new AbortController(); this.resendJobsAbort=controller;
+    this.resendJobs.set([]); this.resendJobsNext.set(null); this.resendJobsError.set(''); this.resendJobsStatus.set('loading');
+    try {
+      const origin=this.validatedOrigin(), key=this.alertKey.trim(), environment=this.alertEnvironment.trim();
+      if (this.alertAuthMode!=='jwt' || !this.validJwt(key) || !this.validEnvironment(environment)) throw new Error('운영자 JWT와 환경 ID를 확인해 주세요.');
+      const params=new URLSearchParams({environmentId:environment}); if (cursor) params.set('after',cursor);
+      const response=await fetch(`${origin}/v1/experimental/operator/resend-jobs?${params}`, {method:'GET',headers:{Authorization:`Bearer ${key}`},cache:'no-store',credentials:'omit',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      if (response.status===401 || response.status===403) throw new Error('인증 값 또는 Resend 목록 및 결과 조회 권한을 확인해 주세요.');
+      if (!response.ok) throw new Error('작업 목록을 가져오지 못했습니다.');
+      const value:unknown=await response.json();
+      if (typeof value!=='object' || value===null) throw new Error('API 응답 형식을 확인해 주세요.');
+      const data=value as Record<string,unknown>;
+      if (!Array.isArray(data['data']) || data['data'].length>20 || typeof data['hasMore']!=='boolean' || !(data['next']===null || typeof data['next']==='string')) throw new Error('API 응답 형식을 확인해 주세요.');
+      const rows=data['data'].map((row:unknown)=>this.parseResendResult(row));
+      const ids=rows.map(row=>row.jobId.toLowerCase());
+      if (ids.some((id:string,i:number)=> (i>0 && ids[i-1]>=id) || (!!cursor && id<=cursor.toLowerCase())) || (data['hasMore'] ? rows.length!==20 || typeof data['next']!=='string' || data['next'].toLowerCase()!==ids[ids.length-1] : data['next']!==null)) throw new Error('API 응답 형식을 확인해 주세요.');
+      this.expireOidcIfNeeded(); if (sequence!==this.resendJobsSequence) return;
+      this.resendJobs.set(rows); this.resendJobsNext.set(data['next'] as string|null); this.resendJobsPage.set(page);
+      this.resendJobsHistory=this.resendJobsHistory.slice(0,page-1); this.resendJobsHistory.push(cursor);
+      this.resendJobsStatus.set('loaded');
+    } catch (error:unknown) {
+      if (sequence!==this.resendJobsSequence) return;
+      this.resendJobsStatus.set('error');
+      this.resendJobsError.set(error instanceof Error && ['주소','원격','운영자','인증','작업','API '].some(prefix=>error.message.startsWith(prefix)) ? error.message : '서버에 연결할 수 없습니다.');
+    } finally { if (sequence===this.resendJobsSequence) this.resendJobsAbort=null; }
+  }
+
+  selectResendJob(job: ResendResult): void { this.resendJobId=job.jobId; void this.loadResend(); }
 
   clearHistory(clearKey = false): void {
     this.historyRequestId++;

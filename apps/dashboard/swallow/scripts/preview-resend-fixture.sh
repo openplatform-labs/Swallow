@@ -29,10 +29,12 @@ docker exec -i "$name" psql -q -v ON_ERROR_STOP=1 -U postgres -d ui_test <<'SQL'
 CREATE ROLE ui_resend_fixture LOGIN;
 GRANT USAGE ON SCHEMA public TO ui_resend_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_result(text,text,text,text,bigint,uuid) TO ui_resend_fixture;
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_jobs(text,text,text,text,bigint,uuid) TO ui_resend_fixture;
 INSERT INTO public.novu_rust_environments VALUES ('ui-fixture-env','org');
 INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname='ui_resend_fixture';
 INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
 INSERT INTO public.novu_rust_operator_jwt_resend_result_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
+INSERT INTO public.novu_rust_operator_jwt_resend_jobs_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
 INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES ('1889f88e-c0a3-4ab5-b861-2fdc1f26f254','ui-fixture-env','experimental_resend_email','{}','completed');
 INSERT INTO public.novu_rust_resend_attempts(job_id,environment_id,state,provider_message_id,correlation_id) VALUES ('1889f88e-c0a3-4ab5-b861-2fdc1f26f254','ui-fixture-env','accepted','fixture-provider','96df49d1-0f4d-4bce-9290-666dd8fc908c');
 INSERT INTO public.novu_rust_resend_recipients VALUES ('1889f88e-c0a3-4ab5-b861-2fdc1f26f254','ui-fixture-env','to',0,'fixture-hash');

@@ -6,6 +6,29 @@ import { OperatorOidc } from './operator-oidc';
 describe('Swallow console', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
+  it('pages Resend jobs and selects a job using a fresh result request', async () => {
+    const row=(n:number)=>({jobId:`00000000-0000-0000-0000-${n.toString().padStart(12,'0')}`,jobStatus:'completed',result:'unknown',attemptState:null,providerIdKnown:false,providerIdAmbiguous:false,autoCorrelated:false,autoCorrelationConflict:false,autoCorrelatedAt:null,lastCompletedScanAt:null,secret:'hidden'});
+    const page1=Array.from({length:20},(_,i)=>row(i+1)); const page2=[row(21)];
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:page1,hasMore:true,next:page1[19].jobId}))).mockResolvedValueOnce(new Response(JSON.stringify({data:page2,hasMore:false,next:null}))).mockResolvedValueOnce(new Response(JSON.stringify({data:page1,hasMore:true,next:page1[19].jobId}))).mockResolvedValueOnce(new Response(JSON.stringify(page1[0])));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('alerts');app.alertAuthMode='jwt';app.alertEnvironment='env-a';app.alertKey='aaa.bbb.ccc';
+    await app.loadResendJobs();expect(app.resendJobs().length).toBe(20);expect(JSON.stringify(app.resendJobs())).not.toContain('hidden');
+    await app.loadResendJobs('next');expect(app.resendJobsPage()).toBe(2);expect(new URL(fetchMock.mock.calls[1][0] as string).searchParams.get('after')).toBe(page1[19].jobId);
+    await app.loadResendJobs('previous');expect(app.resendJobsPage()).toBe(1);expect(new URL(fetchMock.mock.calls[2][0] as string).searchParams.has('after')).toBe(false);
+    app.selectResendJob(app.resendJobs()[0]);await vi.waitFor(()=>expect(app.resendStatus()).toBe('loaded'));expect(app.resendResult()?.jobId).toBe(page1[0].jobId);
+    expect(new URL(fetchMock.mock.calls[3][0] as string).pathname).toBe('/v1/experimental/operator/resend-result');
+    app.setSection('overview');expect(app.resendJobs()).toEqual([]);expect(app.resendJobsStatus()).toBe('idle');
+  });
+
+  it('rejects unauthorized and malformed lists and ignores a late response after logout', async () => {
+    let finish!:(response:Response)=>void;
+    vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response('',{status:401})).mockResolvedValueOnce(new Response(JSON.stringify({data:[],hasMore:true,next:'bad'}))).mockReturnValueOnce(new Promise(done=>{finish=done;}));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('alerts');app.alertAuthMode='jwt';app.alertEnvironment='env-a';app.alertKey='aaa.bbb.ccc';
+    await app.loadResendJobs();expect(app.resendJobsError()).toContain('권한');
+    await app.loadResendJobs();expect(app.resendJobsError()).toContain('응답');
+    const pending=app.loadResendJobs();app.forgetAlertKey();finish(new Response(JSON.stringify({data:[],hasMore:false,next:null})));await pending;
+    expect(app.resendJobsStatus()).toBe('idle');expect(app.resendJobs()).toEqual([]);
+  });
+
   it('loads the scoped Resend result using the operator JWT and keeps only display fields', async () => {
     const job='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
     const body={jobId:job,jobStatus:'completed',result:'unknown',attemptState:'accepted',providerIdKnown:true,providerIdAmbiguous:false,autoCorrelated:true,autoCorrelationConflict:true,autoCorrelatedAt:'2026-01-01',lastCompletedScanAt:null,unexpectedSecret:'private'};
