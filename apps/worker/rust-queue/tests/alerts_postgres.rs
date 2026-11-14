@@ -30,6 +30,12 @@ async fn alert_reservations_fence_concurrency_and_ambiguous_recovery() {
     a.batch_execute(alerts::MIGRATION).await.unwrap();
     a.batch_execute(alerts::MIGRATION).await.unwrap();
     a.batch_execute(alerts::RESOLUTION_MIGRATION).await.unwrap();
+    a.batch_execute(alerts::RESOLVE_FUNCTION_MIGRATION)
+        .await
+        .unwrap();
+    a.batch_execute(alerts::RESOLVE_FUNCTION_MIGRATION)
+        .await
+        .unwrap();
     a.batch_execute(include_str!(
         "../migrations/0085_alert_condition_cooldown.sql"
     ))

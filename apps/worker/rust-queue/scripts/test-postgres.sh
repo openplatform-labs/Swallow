@@ -112,6 +112,9 @@ docker exec "$name" createdb -U postgres novu_slack_workflow_cli_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_slack_workflow_cli_test" \
   cargo test --locked --test slack_workflow_cli -- --ignored
 
+docker exec "$name" createdb -U postgres novu_alert_resolution_permission_test
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_alert_resolution_permission_test" \
+  cargo test --locked --test alert_resolution_permission -- --ignored
 docker exec "$name" createdb -U postgres novu_slack_workflow_attention_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_slack_workflow_attention_test" \
   cargo test --locked --test slack_workflow_attention -- --ignored

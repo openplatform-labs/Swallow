@@ -9,6 +9,8 @@ use uuid::Uuid;
 pub const MIGRATION: &str = include_str!("../migrations/0066_alert_delivery.sql");
 pub const RESOLUTION_MIGRATION: &str =
     include_str!("../migrations/0067_alert_delivery_resolution.sql");
+pub const RESOLVE_FUNCTION_MIGRATION: &str =
+    include_str!("../migrations/0086_alert_resolve_function.sql");
 type DbResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -149,44 +151,18 @@ pub async fn resolve(
     operator: &str,
     reason: &str,
 ) -> DbResult<()> {
-    if !["slack", "email"].contains(&channel)
-        || !["retry", "accepted"].contains(&decision)
-        || operator.trim().is_empty()
-        || operator.len() > 128
-        || reason.trim().is_empty()
-        || reason.len() > 512
-    {
-        return Err("invalid alert resolution".into());
-    }
-    let permission = format!("alert_{decision}");
-    let tx = db.transaction().await?;
-    let allowed: bool = tx
-        .query_one(
-            "SELECT public.novu_rust_lock_operator_grant($1,$2)",
-            &[&environment, &permission],
-        )
-        .await?
-        .get(0);
-    if !allowed {
-        return Err("alert resolution permission denied".into());
-    }
-    let row=tx.query_opt("SELECT state,attempt_id FROM novu_rust_alert_delivery_slots WHERE environment_id=$1 AND channel=$2 AND target_id=$3 FOR UPDATE", &[&environment,&channel,&target]).await?.ok_or("alert destination not found")?;
-    let state: String = row.get(0);
-    let attempt: Option<Uuid> = row.get(1);
-    if !["unknown", "rejected"].contains(&state.as_str())
-        || (decision == "accepted" && state != "unknown")
-    {
-        return Err("alert outcome is not eligible for this decision".into());
-    }
-    let attempt = attempt.ok_or("alert attempt not found")?;
-    tx.execute("INSERT INTO novu_rust_alert_delivery_resolutions(id,environment_id,channel,target_id,attempt_id,previous_state,decision,operator_name,reason) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)", &[&Uuid::new_v4(),&environment,&channel,&target,&attempt,&state,&decision,&operator,&reason]).await?;
-    let new_state = if decision == "retry" {
-        "idle"
-    } else {
-        "accepted"
-    };
-    tx.execute("UPDATE novu_rust_alert_delivery_slots SET state=$4,lease_until=NULL,last_started_at=CASE WHEN $4='accepted' THEN clock_timestamp() ELSE last_started_at END WHERE environment_id=$1 AND channel=$2 AND target_id=$3", &[&environment,&channel,&target,&new_state]).await?;
-    tx.commit().await?;
+    db.query_one(
+        "SELECT public.novu_rust_resolve_alert($1,$2,$3,$4,$5,$6)",
+        &[
+            &environment,
+            &channel,
+            &target,
+            &decision,
+            &operator,
+            &reason,
+        ],
+    )
+    .await?;
     Ok(())
 }
 
