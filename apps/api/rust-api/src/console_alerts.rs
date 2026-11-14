@@ -8,7 +8,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::{collections::HashMap, sync::Arc};
 use tokio_postgres::Client;
 use uuid::Uuid;
@@ -21,15 +20,7 @@ pub(super) async fn request_status(
 ) -> Response {
     let path = uri.to_string();
     let failure = |status, message, label| error_at(status, message, label, &path).into_response();
-    let token = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("SwallowConsole "));
-    let Some(token) = token.filter(|v| {
-        v.len() == 64
-            && v.bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    }) else {
+    let Some(hash) = crate::console_auth::credential_hash(&headers) else {
         return failure(StatusCode::UNAUTHORIZED, "Unauthorized", "Unauthorized");
     };
     let request = params
@@ -38,7 +29,6 @@ pub(super) async fn request_status(
     let Some(request) = request.filter(|_| params.len() == 1) else {
         return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
     };
-    let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
     match db
         .query_one(
             "SELECT public.novu_rust_console_decision_request($1,$2)",
@@ -73,15 +63,7 @@ pub(super) async fn history(
 ) -> Response {
     let path = uri.to_string();
     let failure = |status, message, label| error_at(status, message, label, &path).into_response();
-    let token = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("SwallowConsole "));
-    let Some(token) = token.filter(|v| {
-        v.len() == 64
-            && v.bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    }) else {
+    let Some(hash) = crate::console_auth::credential_hash(&headers) else {
         return failure(StatusCode::UNAUTHORIZED, "Unauthorized", "Unauthorized");
     };
     let fields = (
@@ -97,7 +79,6 @@ pub(super) async fn history(
     if params.len() != 3 {
         return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
     }
-    let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
     match db
         .query_one(
             "SELECT public.novu_rust_console_decision_history($1,$2,$3,$4)",
@@ -151,15 +132,7 @@ async fn resolve_inner(
 ) -> Response {
     let path = uri.to_string();
     let failure = |status, message, label| error_at(status, message, label, &path).into_response();
-    let token = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("SwallowConsole "));
-    let Some(token) = token.filter(|v| {
-        v.len() == 64
-            && v.bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    }) else {
+    let Some(hash) = crate::console_auth::credential_hash(&headers) else {
         return failure(StatusCode::UNAUTHORIZED, "Unauthorized", "Unauthorized");
     };
     let parsed = if body.len() <= 4096 {
@@ -199,7 +172,6 @@ async fn resolve_inner(
     } else {
         None
     };
-    let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
     let result = if let Some(request) = request {
         db.query_one(
             "SELECT public.novu_rust_console_resolve_alert_v2($1,$2,$3,$4,$5,$6,$7)",
@@ -249,15 +221,7 @@ pub(super) async fn list(
 ) -> Response {
     let path = uri.to_string();
     let failure = |status, message, label| error_at(status, message, label, &path).into_response();
-    let token = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("SwallowConsole "));
-    let Some(token) = token.filter(|v| {
-        v.len() == 64
-            && v.bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    }) else {
+    let Some(hash) = crate::console_auth::credential_hash(&headers) else {
         return failure(StatusCode::UNAUTHORIZED, "Unauthorized", "Unauthorized");
     };
     if params
@@ -268,7 +232,6 @@ pub(super) async fn list(
     }
     let after_channel = params.get("afterChannel");
     let after_target = params.get("afterTarget");
-    let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
     match db
         .query_one(
             "SELECT public.novu_rust_console_alerts_page($1,$2,$3)",

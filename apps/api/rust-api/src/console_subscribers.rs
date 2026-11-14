@@ -7,7 +7,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::{collections::HashMap, sync::Arc};
 use tokio_postgres::Client;
 
@@ -19,15 +18,7 @@ pub(super) async fn list(
 ) -> Response {
     let path = uri.to_string();
     let failure = |status, message, label| error_at(status, message, label, &path).into_response();
-    let token = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("SwallowConsole "));
-    let Some(token) = token.filter(|v| {
-        v.len() == 64
-            && v.bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-    }) else {
+    let Some(hash) = crate::console_auth::credential_hash(&headers) else {
         return failure(StatusCode::UNAUTHORIZED, "Unauthorized", "Unauthorized");
     };
     if params
@@ -40,7 +31,6 @@ pub(super) async fn list(
     let name = params.get("name").filter(|v| !v.is_empty());
     let after = params.get("after");
     let before = params.get("before");
-    let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
     match db
         .query_one(
             "SELECT public.novu_rust_console_subscribers($1,$2,$3,$4)",

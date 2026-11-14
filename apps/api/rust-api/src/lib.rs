@@ -1,5 +1,6 @@
 //! Experimental, deliberately incomplete Novu trigger endpoint.
 mod contexts;
+mod console_auth;
 mod console_subscribers;
 mod console_alerts;
 mod channel_workflow_management;
