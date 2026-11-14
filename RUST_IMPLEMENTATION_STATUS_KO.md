@@ -3,15 +3,15 @@
 > 기준: 원본 Novu 커밋 `895388f37efe9e06de0aa333e5727303e6ad6853` · 작성: 2026-11-12.
 > **현재 구현은 실험용이며 Novu와 100% 호환되지 않는다. 운영에 사용하거나 기존 Novu의 대체품으로 배포하지 않는다.**
 
-### 이메일·SMS 정책 취소 감시와 확인 (워커 0122)
+### 이메일·SMS 정책 취소 감시와 확인 (워커 0122·0123)
 
-`active` 또는 `unchanged` 정책으로 취소한 SendGrid·Resend·Twilio 작업을 운영자가 선택해 감시하고 확인할 수 있다. 워커 0122와 새 운영 명령·경보 바이너리를 배포한다. `delivery-reconcile check-channel-policy ENV email|sms|all`은 미확인 건수를 JSON으로 출력하고 0건이면 종료 0, 있으면 2, 오류면 1이다. `list-channel-policy ENV email|sms|all [AFTER_JOB]`은 UUID 기준 최대 100건의 작업 ID·종류·고정 사유 코드·시도 수·생성 시각만 반환한다. `ack-channel-policy ENV JOB OPERATOR REASON`은 현재 취소 건을 확인 기록하며 발송이나 재시도는 수행하지 않는다. 작업이 다시 취소되면 새 revision으로 집계된다. 단 상태·사유·시도 수가 변하지 않는 반복 UPDATE는 새 건이 아니다. 원래 취소 전에 이미 발생한 공급자 시도는 지우거나 결과를 판정하지 않는다.
+`active` 또는 `unchanged` 정책으로 취소한 SendGrid·Resend·Twilio 작업을 운영자가 선택해 감시하고 확인할 수 있다. 워커 0122·0123과 새 운영 명령·경보 바이너리를 배포한다. `delivery-reconcile check-channel-policy ENV email|sms|all`은 미확인 건수를 JSON으로 출력하고 0건이면 종료 0, 있으면 2, 오류면 1이다. `list-channel-policy ENV email|sms|all [AFTER_JOB]`은 UUID 기준 최대 100건의 작업 ID·종류·고정 사유 코드·시도 수·생성 시각·문자열 revision을 반환한다. `ack-channel-policy ENV JOB REVISION OPERATOR REASON`은 조회한 revision만 확인하며 발송이나 재시도는 수행하지 않는다. 조회 후 취소가 재발생했다면 확인을 거절하므로 목록을 다시 조회하고 검토해야 한다. 작업이 다시 취소되면 새 revision으로 집계된다. 단 상태·사유·시도 수가 변하지 않는 반복 UPDATE는 새 건이 아니다. 원래 취소 전에 이미 발생한 공급자 시도는 지우거나 결과를 판정하지 않는다.
 
-조회·목록은 환경별 `alert_view`와 각각 `public.novu_rust_count_channel_policy_attention(text,text)`, `public.novu_rust_list_channel_policy_attention(text,text,uuid)` 실행 권한이 필요하다. 확인은 별도 `queue_ack`와 `public.novu_rust_ack_channel_policy(text,uuid,text,text)` 실행 권한이 필요하다. 함수와 확인 테이블에는 PUBLIC 권한이 없다. 확인에는 DB 로그인과 운영자 입력·사유가 기록되며 운영자 입력은 로그인 신원 인증이 아니다. 신뢰된 관리자가 권한을 부여하고 DB 직접 변경·감사 테이블을 보호한다. 인덱스 생성은 마이그레이션 중 잠금과 쓰기 비용을 수반한다.
+조회·목록은 환경별 `alert_view`와 각각 `public.novu_rust_count_channel_policy_attention(text,text)`, `public.novu_rust_list_channel_policy_attention(text,text,uuid)` 실행 권한이 필요하다. 확인은 별도 `queue_ack`와 `public.novu_rust_ack_channel_policy(text,uuid,bigint,text,text)` 실행 권한이 필요하다. 0123은 기존의 버전 미지정 확인 함수를 삭제하고 목록 함수를 교체하므로 이전 목록 함수의 EXECUTE 권한이 사라진다. 목록 함수와 새 확인 함수에 필요한 EXECUTE를 다시 부여하고 CLI를 함께 교체한다. 0123 이후 0122를 수동 재적용하면 안전하지 않은 구 함수를 되살릴 수 있으므로 마이그레이션 순서와 접근 권한을 보호한다. 함수와 확인 테이블에는 PUBLIC 권한이 없다. 확인에는 DB 로그인과 운영자 입력·사유가 기록되며 운영자 입력은 로그인 신원 인증이 아니다. 신뢰된 관리자가 권한을 부여하고 DB 직접 변경·감사 테이블을 보호한다. 인덱스 생성은 마이그레이션 중 잠금과 쓰기 비용을 수반한다.
 
 `send-delivery-alert`의 `SWALLOW_ALERT_EMAIL_POLICY_CANCELLED_ENABLED=true`와 `SWALLOW_ALERT_SMS_POLICY_CANCELLED_ENABLED=true`를 각각 선택하면 기존 Slack·이메일 경보 경로와 재전송 억제 정책에 건수를 포함한다. 기본은 둘 다 false다. 경보 DB 로그인에도 위 count 함수 실행 및 해당 환경 `alert_view`가 필요하며, 기존 경보 발송 권한과 대상 설정은 별도다. 조회 실패는 오류로 보고하며 독립적인 실행·DB 장애 감시가 필요하다. 확인은 전달 증명이 아니고 자동 재발송·확인 후 재처리는 없다. 기존 취소도 집계하지만 0122 적용 전의 반복 이력은 복구하지 못한다. 여러 인스턴스에서 결과는 조회 시점의 스냅샷이며 직접 SQL이나 권한 있는 사용자의 변경은 보호를 우회할 수 있다. 페이지 사이 데이터 변경과 대량 데이터 성능은 미검증이다.
 
-Docker PostgreSQL에서 실제 API·워크플로 워커의 취소, 제한 로그인·환경 격리, 경보 예약 차단, 중복 확인, 재발생 및 권한 회수 경합을 검증했다. Slack·이메일 외부 수신과 원본 Novu의 경보 기능과의 비교는 수행하지 않았다. 이 기능은 Swallow 운영 확장이다.
+Docker PostgreSQL에서 실제 API·워크플로 워커의 취소, 제한 로그인·환경 격리, 경보 예약 차단, 중복 확인, 재발생, 오래된 revision의 확인 거절, 취소 변경·권한 회수 경합과 0122에서 0123으로의 업그레이드를 검증했다. Slack·이메일 외부 수신과 원본 Novu의 경보 기능과의 비교는 수행하지 않았다. 이 기능은 Swallow 운영 확장이다.
 
 ### 대기 SMS 단계 변경 정책 (워커 0121)
 

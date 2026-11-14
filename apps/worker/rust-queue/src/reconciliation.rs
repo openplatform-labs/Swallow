@@ -139,19 +139,20 @@ pub async fn channel_policy_list(
             &[&environment, &channel, &after],
         )
         .await?;
-    Ok(rows.into_iter().map(|r| json!({"jobId":r.get::<_,Uuid>(0).to_string(),"kind":r.get::<_,String>(1),"reasonCode":r.get::<_,String>(2),"attempts":r.get::<_,i32>(3),"createdAt":r.get::<_,String>(4)})).collect())
+    Ok(rows.into_iter().map(|r| json!({"jobId":r.get::<_,Uuid>(0).to_string(),"kind":r.get::<_,String>(1),"reasonCode":r.get::<_,String>(2),"attempts":r.get::<_,i32>(3),"createdAt":r.get::<_,String>(4),"revision":r.get::<_,String>(5)})).collect())
 }
 pub async fn acknowledge_channel_policy(
     client: &Client,
     environment: &str,
     job: Uuid,
+    expected_revision: i64,
     operator: &str,
     reason: &str,
 ) -> Result<bool> {
     Ok(client
         .query_one(
-            "SELECT public.novu_rust_ack_channel_policy($1,$2,$3,$4)",
-            &[&environment, &job, &operator, &reason],
+            "SELECT public.novu_rust_ack_channel_policy($1,$2,$3,$4,$5)",
+            &[&environment, &job, &expected_revision, &operator, &reason],
         )
         .await?
         .get(0))

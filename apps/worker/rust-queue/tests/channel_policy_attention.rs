@@ -14,7 +14,13 @@ async fn cancellation_alerts_are_scoped_and_acknowledge_each_revision() {
     let worker = root.join("migrations");
     for args in [
         vec!["apply", "api", api.to_str().unwrap(), "--through", "17"],
-        vec!["apply", "worker", worker.to_str().unwrap()],
+        vec![
+            "apply",
+            "worker",
+            worker.to_str().unwrap(),
+            "--through",
+            "122",
+        ],
         vec!["apply", "api", api.to_str().unwrap()],
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_migrate-worker"))
@@ -37,7 +43,21 @@ async fn cancellation_alerts_are_scoped_and_acknowledge_each_revision() {
         .await
         .unwrap();
     let role = format!("channel_policy_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'fixture-password'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_count_channel_policy_attention(text,text),public.novu_rust_list_channel_policy_attention(text,text,uuid),public.novu_rust_ack_channel_policy(text,uuid,text,text),public.novu_rust_reserve_alert(text,text,text,integer,integer),public.novu_rust_finish_alert(text,text,text,uuid,text,integer) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'fixture-password'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_list_channel_policy_attention(text,text,uuid),public.novu_rust_ack_channel_policy(text,uuid,text,text) TO {role}")).await.unwrap();
+    let upgrade = Command::new(env!("CARGO_BIN_EXE_migrate-worker"))
+        .args(["apply", "worker", worker.to_str().unwrap()])
+        .env("DATABASE_URL", &url)
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .output()
+        .unwrap();
+    assert!(
+        upgrade.status.success(),
+        "{}",
+        String::from_utf8_lossy(&upgrade.stderr)
+    );
+    assert!(db.query_one("SELECT to_regprocedure('public.novu_rust_ack_channel_policy(text,uuid,text,text)') IS NULL", &[]).await.unwrap().get::<_,bool>(0));
+    assert!(!db.query_one("SELECT has_function_privilege($1,'public.novu_rust_list_channel_policy_attention(text,text,uuid)','execute')", &[&role]).await.unwrap().get::<_,bool>(0));
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_count_channel_policy_attention(text,text),public.novu_rust_list_channel_policy_attention(text,text,uuid),public.novu_rust_ack_channel_policy(text,uuid,bigint,text,text),public.novu_rust_reserve_alert(text,text,text,integer,integer),public.novu_rust_finish_alert(text,text,text,uuid,text,integer) TO {role}")).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'a',$1,p.permission,r.oid FROM pg_roles r CROSS JOIN (VALUES ('alert_view'),('queue_ack'),('alert_send')) p(permission) WHERE r.rolname::text=$1", &[&role]).await.unwrap();
     let email = Uuid::new_v4();
     let sms = Uuid::new_v4();
@@ -155,14 +175,14 @@ async fn cancellation_alerts_are_scoped_and_acknowledge_each_revision() {
     assert!(String::from_utf8_lossy(&alert.stderr).contains("requires operator review"));
     assert!(
         queue::reconciliation::acknowledge_channel_policy(
-            &operator, "a", sms, "operator", "ticket"
+            &operator, "a", sms, 1, "operator", "ticket"
         )
         .await
         .unwrap()
     );
     assert!(
         !queue::reconciliation::acknowledge_channel_policy(
-            &operator, "a", sms, "operator", "ticket"
+            &operator, "a", sms, 1, "operator", "ticket"
         )
         .await
         .unwrap()
@@ -173,22 +193,90 @@ async fn cancellation_alerts_are_scoped_and_acknowledge_each_revision() {
             .unwrap(),
         0
     );
-    db.execute(
-        "UPDATE public.novu_queue_jobs SET status='pending' WHERE id=$1",
-        &[&sms],
-    )
-    .await
-    .unwrap();
-    db.execute("UPDATE public.novu_queue_jobs SET status='cancelled',last_error='sms workflow step disabled' WHERE id=$1", &[&sms]).await.unwrap();
+    let (concurrent_operator, driver) = tokio_postgres::connect(role_url.as_str(), NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    let transaction = db.transaction().await.unwrap();
+    transaction
+        .execute(
+            "UPDATE public.novu_queue_jobs SET status='pending' WHERE id=$1",
+            &[&sms],
+        )
+        .await
+        .unwrap();
+    transaction.execute("UPDATE public.novu_queue_jobs SET status='cancelled',last_error='sms workflow step disabled' WHERE id=$1", &[&sms]).await.unwrap();
+    let pending_ack = tokio::spawn(async move {
+        queue::reconciliation::acknowledge_channel_policy(
+            &concurrent_operator,
+            "a",
+            sms,
+            1,
+            "operator",
+            "ticket",
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !pending_ack.is_finished(),
+        "acknowledgement must wait for the changed job"
+    );
+    transaction.commit().await.unwrap();
+    let concurrent_error = pending_ack.await.unwrap().unwrap_err();
+    assert_eq!(
+        concurrent_error
+            .downcast_ref::<tokio_postgres::Error>()
+            .unwrap()
+            .code(),
+        Some(&tokio_postgres::error::SqlState::T_R_SERIALIZATION_FAILURE)
+    );
     assert_eq!(
         queue::reconciliation::channel_policy_count(&operator, "a", "sms")
             .await
             .unwrap(),
         1
     );
+    let stale = queue::reconciliation::acknowledge_channel_policy(
+        &operator, "a", sms, 1, "operator", "ticket",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        stale
+            .downcast_ref::<tokio_postgres::Error>()
+            .unwrap()
+            .code(),
+        Some(&tokio_postgres::error::SqlState::T_R_SERIALIZATION_FAILURE)
+    );
+    let current = queue::reconciliation::channel_policy_list(&operator, "a", "sms", None)
+        .await
+        .unwrap();
+    assert_eq!(current[0]["revision"], "2");
+    let changed = run(&[
+        "ack-channel-policy",
+        "a",
+        &sms.to_string(),
+        "2",
+        "operator",
+        "ticket",
+    ]);
+    assert!(
+        changed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&changed.stderr)
+    );
+    assert_eq!(
+        queue::reconciliation::channel_policy_count(&operator, "a", "sms")
+            .await
+            .unwrap(),
+        0
+    );
     assert!(
         queue::reconciliation::acknowledge_channel_policy(
-            &operator, "b", other, "operator", "ticket"
+            &operator, "b", other, 1, "operator", "ticket"
         )
         .await
         .is_err()
@@ -197,7 +285,7 @@ async fn cancellation_alerts_are_scoped_and_acknowledge_each_revision() {
     revoke.execute("DELETE FROM public.novu_rust_delivery_operator_grants WHERE environment_id='a' AND database_principal=$1 AND decision='queue_ack'", &[&role]).await.unwrap();
     let pending = tokio::spawn(async move {
         queue::reconciliation::acknowledge_channel_policy(
-            &operator, "a", email, "operator", "ticket",
+            &operator, "a", email, 1, "operator", "ticket",
         )
         .await
     });

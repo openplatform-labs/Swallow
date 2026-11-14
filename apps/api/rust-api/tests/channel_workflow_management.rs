@@ -792,7 +792,12 @@ async fn channels_are_authorized_audited_and_create_delivery_jobs() {
     let job = uuid::Uuid::parse_str(sms_alerts[0]["jobId"].as_str().unwrap()).unwrap();
     assert!(
         novu_postgres_queue::reconciliation::acknowledge_channel_policy(
-            &setup, "a", job, "operator", "reviewed"
+            &setup,
+            "a",
+            job,
+            sms_alerts[0]["revision"].as_str().unwrap().parse().unwrap(),
+            "operator",
+            "reviewed"
         )
         .await
         .unwrap()
