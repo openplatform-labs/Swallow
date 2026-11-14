@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     extract::{Request, State},
-    http::{StatusCode, header},
+    http::{HeaderValue, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
 use std::{
@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 use tower::ServiceExt;
+use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Clone)]
 struct Connected {
@@ -93,6 +94,86 @@ fn duration_env(name: &str, default: u64) -> Result<Duration, Box<dyn Error + Se
     Ok(Duration::from_secs(seconds))
 }
 
+// Browser access is opt-in; this is not an authentication or authorization check.
+fn cors_config(raw: Option<&str>, credentials: bool) -> Result<Option<CorsLayer>, &'static str> {
+    let Some(raw) = raw else {
+        return if credentials {
+            Err("CORS credentials require allowed origins")
+        } else {
+            Ok(None)
+        };
+    };
+    if raw.trim().is_empty() {
+        return Err("invalid CORS origin list");
+    }
+    let entries: Vec<&str> = raw.split(',').map(str::trim).collect();
+    if entries.len() > 64 || entries.iter().any(|v| v.is_empty()) {
+        return Err("invalid CORS origin list");
+    }
+    let wildcard = entries == ["*"];
+    if wildcard && credentials {
+        return Err("CORS wildcard cannot allow credentials");
+    }
+    let mut allowed = Vec::new();
+    if !wildcard {
+        for origin in entries {
+            let uri: Uri = origin.parse().map_err(|_| "invalid CORS origin")?;
+            let scheme = uri
+                .scheme_str()
+                .filter(|s| *s == "http" || *s == "https")
+                .ok_or("invalid CORS origin")?;
+            let authority = uri.authority().ok_or("invalid CORS origin")?;
+            if authority.host().is_empty()
+                || authority.as_str().contains('@')
+                || format!("{scheme}://{authority}") != origin
+            {
+                return Err("invalid CORS origin");
+            }
+            let header = HeaderValue::from_str(origin).map_err(|_| "invalid CORS origin")?;
+            if allowed.contains(&header) {
+                return Err("duplicate CORS origin");
+            }
+            allowed.push(header);
+        }
+    }
+    let cors = CorsLayer::new()
+        .allow_methods([
+            Method::GET,
+            Method::HEAD,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+            header::HeaderName::from_static("novu-environment-id"),
+        ])
+        .allow_credentials(credentials)
+        .max_age(Duration::from_secs(300));
+    Ok(Some(if wildcard {
+        cors.allow_origin(Any)
+    } else {
+        cors.allow_origin(allowed)
+    }))
+}
+fn cors_from_env() -> Result<Option<CorsLayer>, Box<dyn Error + Send + Sync>> {
+    let credentials = match std::env::var("SWALLOW_CORS_ALLOW_CREDENTIALS").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid CORS credentials setting".into()),
+    };
+    let raw = match std::env::var("SWALLOW_CORS_ALLOWED_ORIGINS") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => return Err("invalid CORS origin list".into()),
+    };
+    cors_config(raw.as_deref(), credentials).map_err(Into::into)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let url = std::env::var("DATABASE_URL")?;
@@ -105,6 +186,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         _ => return Err("invalid health endpoint setting".into()),
     };
     let runtime = novu_rust_api::RuntimeConfig::try_from_env()?;
+    let cors = cors_from_env()?;
     let shared = ApiState {
         current: Arc::new(RwLock::new(None)),
         timeout,
@@ -153,6 +235,164 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             .route("/health/live", axum::routing::get(live))
             .route("/health/ready", axum::routing::get(ready));
     }
+    if let Some(cors) = cors {
+        app = app.layer(cors);
+    }
     axum::serve(listener, app.with_state(shared)).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod cors_tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    #[test]
+    fn validates_origin_configuration() {
+        assert!(cors_config(None, false).unwrap().is_none());
+        assert!(cors_config(None, true).is_err());
+        assert!(cors_config(Some("*"), false).unwrap().is_some());
+        assert!(cors_config(Some("*"), true).is_err());
+        for bad in [
+            "",
+            "null",
+            "https://example.com/",
+            "https://example.com/path",
+            "https://user@example.com",
+            "https://example.com,*",
+            "https://x.test,https://x.test",
+        ] {
+            assert!(cors_config(Some(bad), false).is_err(), "{bad}");
+        }
+        assert!(
+            cors_config(
+                Some("https://console.example.com,http://localhost:4200"),
+                true
+            )
+            .unwrap()
+            .is_some()
+        );
+    }
+    #[tokio::test]
+    async fn wildcard_and_credential_modes_are_distinct() {
+        let make = |value: &str, credentials| {
+            Router::new()
+                .route("/resource", axum::routing::get(|| async { StatusCode::OK }))
+                .layer(cors_config(Some(value), credentials).unwrap().unwrap())
+        };
+        let request = || {
+            Request::builder()
+                .uri("/resource")
+                .header("origin", "https://console.example.com")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let wildcard = make("*", false).oneshot(request()).await.unwrap();
+        assert_eq!(wildcard.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+        assert!(
+            wildcard
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .is_none()
+        );
+        let explicit = make("https://console.example.com", true)
+            .oneshot(request())
+            .await
+            .unwrap();
+        assert_eq!(
+            explicit.headers()[header::ACCESS_CONTROL_ALLOW_CREDENTIALS],
+            "true"
+        );
+        assert_eq!(
+            explicit.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://console.example.com"
+        );
+        let none = Router::new()
+            .route("/resource", axum::routing::get(|| async { StatusCode::OK }))
+            .oneshot(request())
+            .await
+            .unwrap();
+        assert!(
+            none.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
+    }
+    #[tokio::test]
+    async fn preflight_and_responses_obey_selected_origins() {
+        let cors = cors_config(Some("https://console.example.com"), false)
+            .unwrap()
+            .unwrap();
+        let app = Router::new()
+            .route(
+                "/resource",
+                axum::routing::get(|| async { StatusCode::UNAUTHORIZED }),
+            )
+            .layer(cors);
+        let request = |origin: &str, headers: &str| {
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/resource")
+                .header("origin", origin)
+                .header("access-control-request-method", "GET")
+                .header("access-control-request-headers", headers)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let ok = app
+            .clone()
+            .oneshot(request(
+                "https://console.example.com",
+                "authorization,content-type,novu-environment-id",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(
+            ok.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://console.example.com"
+        );
+        assert!(
+            ok.headers()
+                .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .is_none()
+        );
+        let denied = app
+            .clone()
+            .oneshot(request("https://other.example.com", "authorization"))
+            .await
+            .unwrap();
+        assert!(
+            denied
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .is_none()
+        );
+        let denied_headers = app
+            .clone()
+            .oneshot(request("https://console.example.com", "x-unknown"))
+            .await
+            .unwrap();
+        assert!(
+            !denied_headers.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS]
+                .to_str()
+                .unwrap()
+                .contains("x-unknown")
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/resource")
+                    .header("origin", "https://console.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            "https://console.example.com"
+        );
+        assert!(response.headers().contains_key(header::VARY));
+    }
 }

@@ -3,6 +3,12 @@
 > 기준: 원본 Novu 커밋 `895388f37efe9e06de0aa333e5727303e6ad6853` · 작성: 2026-11-12.
 > **현재 구현은 실험용이며 Novu와 100% 호환되지 않는다. 운영에 사용하거나 기존 Novu의 대체품으로 배포하지 않는다.**
 
+### API 브라우저 출처 설정
+
+Rust API 프로세스는 기본적으로 CORS 응답을 추가하지 않는다. 별도 출처의 관리 화면이나 클라이언트에는 `SWALLOW_CORS_ALLOWED_ORIGINS=https://console.example.com,http://localhost:4200`처럼 정확한 출처 목록을 설정한다. 단독 `*`도 선택할 수 있으며, `SWALLOW_CORS_ALLOW_CREDENTIALS=true`는 명시적 출처에서만 허용한다. 비어 있는 값, 경로·사용자 정보가 포함된 출처, 와일드카드와 자격증명 조합, 중복 및 64개 초과 출처는 시작 시 거절한다. CORS 응답은 health 경로를 포함한 API 프로세스 전체에 적용된다. GET·HEAD·POST·PUT·PATCH·DELETE·OPTIONS와 Authorization·Content-Type·Accept·Novu-Environment-Id 헤더를 허용하고 사전 요청 캐시는 300초다.
+
+CORS는 브라우저에 응답을 공개하는 규칙이지 인증이나 권한 검사가 아니다. 와일드카드 또는 자격증명 허용은 신뢰 경계에 맞게 선택해야 하며 클라이언트 인증과 서버 권한은 별개다. 설정 변경은 프로세스 재시작이 필요하다. 라우터 단위 테스트에서 허용·비허용 출처, 사전 요청, 인증 실패 응답, 자격증명과 와일드카드 조합 및 기본 비활성화를 확인했다. 원본 Novu의 경로별 CORS 정책과 완전히 동일하지 않으며, 기존 API의 사용자 로그인·권한과 전체 Dashboard 연결은 여전히 미구현이다.
+
 ### Dashboard의 현재 상태와 원본 화면 미리보기
 
 Swallow Rust 백엔드와 통합된 관리 UI는 아직 없다. 저장소의 `apps/dashboard`는 원본 Novu Dashboard 소스다. 원본 community compose가 지정한 공개 이미지 `ghcr.io/novuhq/novu/dashboard:3.19.0`을 별도 로컬 컨테이너로 실행해 로그인 화면 표시를 확인했다. 이 이미지는 기준 소스 커밋과 동일하다고 검증한 빌드가 아니며, 미리보기에서 API·WebSocket 주소는 의도적으로 연결되지 않는 로컬 주소로 지정했다. 따라서 로그인, 데이터 조회·변경, Swallow 연동이나 보안을 확인한 결과가 아니다. 원본 Dashboard 이미지를 Swallow UI 완성으로 간주하지 않는다.
