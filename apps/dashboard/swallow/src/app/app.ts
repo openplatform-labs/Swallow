@@ -7,6 +7,7 @@ type ConnectionState = 'unchecked' | 'checking' | 'ready' | 'unavailable';
 type Subscriber = { id: string; firstName: string; lastName: string; email: string };
 type AlertSlot = { channel: string; targetId: string; state: string; lastStartedAt: string | null; attemptId?: string | null };
 type AlertCursor = { channel: string; targetId: string };
+type ResendResult = { jobId:string; jobStatus:string; result:string; attemptState:string|null; providerIdKnown:boolean; providerIdAmbiguous:boolean; autoCorrelated:boolean; autoCorrelationConflict:boolean; autoCorrelatedAt:string|null; lastCompletedScanAt:string|null };
 type DecisionHistory = { id: string; decision: string; reason: string; createdAt: string };
 type DecisionRequest = { requestId: string; channel: string; targetId: string; attemptId: string; decision: string; reason: string; createdAt: string };
 type RetrySnapshot = { origin: string; endpoint: string; scheme: 'Bearer' | 'SwallowConsole'; requestId: string; channel: string; targetId: string; attemptId: string; decision: string; reason: string; keyHash: string };
@@ -45,6 +46,12 @@ export class App implements OnDestroy {
   readonly alertSlots = signal<AlertSlot[]>([]);
   readonly alertStatus = signal<'idle' | 'loading' | 'loaded' | 'error'>('idle');
   readonly alertError = signal('');
+  resendJobId = '';
+  readonly resendStatus = signal<'idle'|'loading'|'loaded'|'error'>('idle');
+  readonly resendError = signal('');
+  readonly resendResult = signal<ResendResult|null>(null);
+  private resendSequence = 0;
+  private resendAbort: AbortController|null = null;
   readonly alertsHaveMore = signal(false);
   readonly alertNext = signal<AlertCursor | null>(null);
   readonly alertPage = signal(1);
@@ -131,6 +138,9 @@ export class App implements OnDestroy {
     if (this.oidcExpiryTimer !== null) clearTimeout(this.oidcExpiryTimer);
     this.oidcExpiryTimer = null;
     this.oidcSession = null;
+    this.alertKey='';
+    this.resendJobId='';
+    this.clearResend();
     this.clearPermissions(true);
   }
 
@@ -141,7 +151,7 @@ export class App implements OnDestroy {
     this.oidcExpiryTimer=null; this.oidcSession=null; this.oidcSubject.set(''); this.oidcStatus.set('expired');
     // Preserve decision outcome and request ID, including an in-flight or uncertain decision.
     if (this.apiKey===session.token) this.apiKey='';
-    if (this.alertKey===session.token) this.alertKey='';
+    if (this.alertKey===session.token) { this.alertKey=''; this.clearResend(); }
     if (this.decisionKey===session.token) this.decisionKey='';
     if (this.retryKey===session.token) this.retryKey='';
     if (this.lookupKey===session.token) this.lookupKey='';
@@ -413,8 +423,57 @@ export class App implements OnDestroy {
     this.alertHistory = [null];
     this.alertStatus.set('idle');
     this.alertError.set('');
+    this.clearResend();
     this.clearDecision();
     this.clearHistory(true);
+  }
+
+  clearResend(): void {
+    this.resendSequence++;
+    this.resendAbort?.abort();
+    this.resendAbort=null;
+    this.resendResult.set(null);
+    this.resendError.set('');
+    this.resendStatus.set('idle');
+  }
+
+  async loadResend(): Promise<void> {
+    this.expireOidcIfNeeded();
+    this.clearResend();
+    const sequence=this.resendSequence;
+    const controller=new AbortController();
+    this.resendAbort=controller;
+    this.resendStatus.set('loading');
+    try {
+      const origin=this.validatedOrigin();
+      const key=this.alertKey.trim();
+      const environment=this.alertEnvironment.trim();
+      const job=this.resendJobId.trim();
+      if (this.alertAuthMode!=='jwt' || !this.validJwt(key) || !this.validEnvironment(environment) || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(job)) throw new Error('운영자 JWT, 환경 ID와 작업 UUID를 확인해 주세요.');
+      const params=new URLSearchParams({environmentId:environment,jobId:job});
+      const response=await fetch(`${origin}/v1/experimental/operator/resend-result?${params}`, {
+        method:'GET', headers:{Authorization:`Bearer ${key}`}, cache:'no-store', credentials:'omit', redirect:'error',
+        signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)]),
+      });
+      if (response.status===401 || response.status===403) throw new Error('인증 값 또는 Resend 결과 조회 권한을 확인해 주세요.');
+      if (!response.ok) throw new Error('작업 결과를 가져오지 못했습니다. 환경과 작업 ID를 확인해 주세요.');
+      const value:unknown=await response.json();
+      if (typeof value!=='object' || value===null) throw new Error('API 응답 형식을 확인해 주세요.');
+      const row=value as Record<string,unknown>;
+      if (typeof row['jobId']!=='string' || row['jobId'].toLowerCase()!==job.toLowerCase() || typeof row['jobStatus']!=='string' || !['pending','running','completed','failed','cancelled'].includes(row['jobStatus']) || typeof row['result']!=='string' || !['unknown','pending','delivered','failed','partial','conflicting','complained'].includes(row['result']) || !(row['attemptState']===null || (typeof row['attemptState']==='string' && ['dispatching','accepted','rejected','unknown'].includes(row['attemptState']))) || typeof row['providerIdKnown']!=='boolean' || typeof row['providerIdAmbiguous']!=='boolean' || typeof row['autoCorrelated']!=='boolean' || typeof row['autoCorrelationConflict']!=='boolean' || !(row['autoCorrelatedAt']===null || typeof row['autoCorrelatedAt']==='string') || !(row['lastCompletedScanAt']===null || typeof row['lastCompletedScanAt']==='string')) throw new Error('API 응답 형식을 확인해 주세요.');
+      if (((row['autoCorrelationConflict'] || row['providerIdAmbiguous']) && row['result']==='delivered') || (row['autoCorrelationConflict'] && !row['autoCorrelated']) || (row['autoCorrelated'] !== (typeof row['autoCorrelatedAt']==='string'))) throw new Error('API 응답 형식을 확인해 주세요.');
+      this.expireOidcIfNeeded();
+      if (sequence!==this.resendSequence) return;
+      const result=row as ResendResult;
+      this.resendResult.set({jobId:result.jobId,jobStatus:result.jobStatus,result:result.result,attemptState:result.attemptState,providerIdKnown:result.providerIdKnown,providerIdAmbiguous:result.providerIdAmbiguous,autoCorrelated:result.autoCorrelated,autoCorrelationConflict:result.autoCorrelationConflict,autoCorrelatedAt:result.autoCorrelatedAt,lastCompletedScanAt:result.lastCompletedScanAt});
+      this.resendStatus.set('loaded');
+    } catch (error:unknown) {
+      if (sequence!==this.resendSequence) return;
+      this.resendStatus.set('error');
+      this.resendError.set(error instanceof Error && ['주소','원격','운영자','인증','작업','API '].some(prefix=>error.message.startsWith(prefix)) ? error.message : '서버에 연결할 수 없습니다.');
+    } finally {
+      if (sequence===this.resendSequence) this.resendAbort=null;
+    }
   }
 
   clearHistory(clearKey = false): void {
@@ -623,6 +682,7 @@ export class App implements OnDestroy {
 
   forgetAlertKey(): void {
     this.alertKey = '';
+    this.resendJobId = '';
     this.clearAlerts();
     this.clearRequestLookup(true);
   }

@@ -6,6 +6,36 @@ import { OperatorOidc } from './operator-oidc';
 describe('Swallow console', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
+  it('loads the scoped Resend result using the operator JWT and keeps only display fields', async () => {
+    const job='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
+    const body={jobId:job,jobStatus:'completed',result:'unknown',attemptState:'accepted',providerIdKnown:true,providerIdAmbiguous:false,autoCorrelated:true,autoCorrelationConflict:true,autoCorrelatedAt:'2026-01-01',lastCompletedScanAt:null,unexpectedSecret:'private'};
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValue(new Response(JSON.stringify(body),{status:200}));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('alerts');app.alertAuthMode='jwt';app.alertEnvironment='env-a';app.alertKey='aaa.bbb.ccc';app.resendJobId=job;
+    await app.loadResend();
+    expect(app.resendStatus()).toBe('loaded');expect(app.resendResult()?.autoCorrelationConflict).toBe(true);
+    expect(JSON.stringify(app.resendResult())).not.toContain('private');
+    const url=new URL(fetchMock.mock.calls[0][0] as string);expect(url.pathname).toBe('/v1/experimental/operator/resend-result');expect(url.searchParams.get('environmentId')).toBe('env-a');expect(url.searchParams.get('jobId')).toBe(job);
+    expect(fetchMock.mock.calls[0][1]).toEqual(expect.objectContaining({headers:{Authorization:'Bearer aaa.bbb.ccc'},credentials:'omit',cache:'no-store',redirect:'error'}));
+    app.setSection('overview');expect(app.resendResult()).toBeNull();expect(app.alertKey).toBe('');expect(app.resendJobId).toBe('');
+  });
+
+  it('rejects malformed Resend requests and results without retaining stale data', async () => {
+    const job='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response('',{status:401})).mockResolvedValueOnce(new Response(JSON.stringify({jobId:job,result:'delivered'}),{status:200})).mockResolvedValueOnce(new Response(JSON.stringify({jobId:job,jobStatus:'completed',result:'delivered',attemptState:'accepted',providerIdKnown:true,providerIdAmbiguous:false,autoCorrelated:true,autoCorrelationConflict:true,autoCorrelatedAt:'today',lastCompletedScanAt:null}),{status:200}));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('alerts');app.alertAuthMode='jwt';app.alertEnvironment='env-a';app.alertKey='aaa.bbb.ccc';
+    app.resendJobId='not-a-uuid';await app.loadResend();expect(fetchMock).not.toHaveBeenCalled();expect(app.resendStatus()).toBe('error');
+    app.resendJobId=job;await app.loadResend();expect(app.resendStatus()).toBe('error');expect(app.resendError()).toContain('권한');
+    await app.loadResend();expect(app.resendStatus()).toBe('error');expect(app.resendResult()).toBeNull();
+    await app.loadResend();expect(app.resendStatus()).toBe('error');expect(app.resendError()).toContain('응답');expect(app.resendResult()).toBeNull();
+  });
+
+  it('discards a late Resend response after credentials or section change', async () => {
+    let finish!:(response:Response)=>void;vi.spyOn(globalThis,'fetch').mockReturnValueOnce(new Promise(done=>{finish=done;}));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('alerts');app.alertAuthMode='jwt';app.alertEnvironment='env-a';app.alertKey='aaa.bbb.ccc';app.resendJobId='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
+    const pending=app.loadResend();app.setSection('overview');finish(new Response(JSON.stringify({jobId:'1889f88e-c0a3-4ab5-b861-2fdc1f26f254',jobStatus:'completed',result:'delivered',attemptState:'accepted',providerIdKnown:true,providerIdAmbiguous:false,autoCorrelated:true,autoCorrelationConflict:false,autoCorrelatedAt:'today',lastCompletedScanAt:null}),{status:200}));await pending;
+    expect(app.resendStatus()).toBe('idle');expect(app.resendResult()).toBeNull();expect(app.alertKey).toBe('');
+  });
+
   it('looks up a saved permission request using the current token after a reload', async () => {
     const id='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';const desired={enabled:true,subscriberRead:true,alertRead:false,alertRetry:false,alertAccepted:false};
     const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({found:true,requestId:id,targetIssuer:'https://issuer.test',targetSubject:'alice',targetClientId:'console',expected:null,desired,reason:'ticket',changed:true,createdAt:'2026-01-01'}),{status:200})).mockResolvedValueOnce(new Response(JSON.stringify({found:false}),{status:200})).mockResolvedValueOnce(new Response('',{status:401}));
