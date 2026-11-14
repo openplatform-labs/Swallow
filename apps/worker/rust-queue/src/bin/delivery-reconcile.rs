@@ -407,14 +407,19 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             _ => return Err("invalid reconciliation scoped access setting".into()),
         };
         if scoped {
-            if target.is_some() {
-                return Err("scoped reconciliation currently supports email and SMS only".into());
+            if let Some(target) = target {
+                db.query_one(
+                    "SELECT public.novu_rust_resolve_fcm($1,$2,$3,$4,$5,$6)",
+                    &[&args[1], &job, &target, &args[0], &args[4], &args[5]],
+                )
+                .await?;
+            } else {
+                db.query_one(
+                    "SELECT public.novu_rust_resolve_email_sms($1,$2,$3,$4,$5)",
+                    &[&args[1], &job, &args[0], &args[4], &args[5]],
+                )
+                .await?;
             }
-            db.query_one(
-                "SELECT public.novu_rust_resolve_email_sms($1,$2,$3,$4,$5)",
-                &[&args[1], &job, &args[0], &args[4], &args[5]],
-            )
-            .await?;
         } else {
             novu_postgres_queue::reconciliation::resolve(
                 &mut db, &args[1], job, target, &args[0], &args[4], &args[5],

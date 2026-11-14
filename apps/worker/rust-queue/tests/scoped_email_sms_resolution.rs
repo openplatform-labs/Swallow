@@ -53,6 +53,41 @@ async fn snapshot(db: &Client, job: Uuid, kind: &str) -> serde_json::Value {
     );
     db.query_one(&query, &[&job]).await.unwrap().get(0)
 }
+async fn fcm_job(db: &Client, payload: serde_json::Value, error: &str, states: &[&str]) -> Uuid {
+    let job = Uuid::new_v4();
+    queue::enqueue(db, job, "a", queue::fcm_queue::JOB_KIND, &payload)
+        .await
+        .unwrap();
+    db.execute(
+        "UPDATE novu_queue_jobs SET status='failed',last_error=$2 WHERE id=$1",
+        &[&job, &error],
+    )
+    .await
+    .unwrap();
+    for (index, state) in states.iter().enumerate() {
+        db.execute("INSERT INTO novu_rust_fcm_attempts(job_id,environment_id,target_index,state,http_status) VALUES ($1,'a',$2,$3,500)", &[&job,&(index as i32),state]).await.unwrap();
+    }
+    db.execute("INSERT INTO novu_rust_push_messages(internal_id,environment_id,subscriber_id,subscriber_internal_id,notification_internal_id,workflow_identifier,transaction_id,device_tokens,title,status,push_job_id,target_index,delivery_state) VALUES ($1,'a','s','s','n','w','t',ARRAY['secret-token'],'title','error',$2,0,'unknown')", &[&job.to_string(),&job]).await.unwrap();
+    job
+}
+async fn fcm_snapshot(db: &Client, job: Uuid) -> serde_json::Value {
+    db.query_one("SELECT jsonb_build_object('status',j.status,'error',j.last_error,'attempts',(SELECT jsonb_agg(jsonb_build_array(target_index,state,http_status) ORDER BY target_index) FROM novu_rust_fcm_attempts WHERE job_id=j.id),'message',(SELECT jsonb_build_array(status,delivery_state,error_id,error_text,identifier IS NOT NULL) FROM novu_rust_push_messages WHERE push_job_id=j.id),'audit',(SELECT jsonb_build_array(target_index,decision,previous_http_status) FROM novu_rust_delivery_reconciliations WHERE job_id=j.id)) FROM novu_queue_jobs j WHERE j.id=$1", &[&job]).await.unwrap().get(0)
+}
+async fn scoped_fcm(
+    db: &Client,
+    env: &str,
+    job: Uuid,
+    target: i32,
+    decision: &str,
+) -> Result<(), tokio_postgres::Error> {
+    db.query_one(
+        "SELECT public.novu_rust_resolve_fcm($1,$2,$3,$4,'operator','ticket')",
+        &[&env, &job, &target, &decision],
+    )
+    .await
+    .map(|_| ())
+}
+
 async fn resolve(
     db: &Client,
     env: &str,
@@ -220,6 +255,158 @@ async fn scoped_email_sms_decisions_are_authorized_atomic_and_fenced() {
             );
         }
     }
+    // FCM target/group state is compared to the existing implementation.
+    let no_function = fcm_job(
+        &db,
+        json!({}),
+        "push delivery outcome unknown",
+        &["unknown"],
+    )
+    .await;
+    assert!(
+        scoped_fcm(&actor, "a", no_function, 0, "retry")
+            .await
+            .is_err()
+    );
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_resolve_fcm(text,uuid,integer,text,text,text) TO {role}")).await.unwrap();
+    db.execute("DELETE FROM novu_rust_delivery_operator_grants WHERE environment_id='a' AND database_principal=$1 AND decision='retry'", &[&role]).await.unwrap();
+    assert!(
+        scoped_fcm(&actor, "a", no_function, 0, "retry")
+            .await
+            .is_err()
+    );
+    db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'a',$1,'retry',oid FROM pg_roles WHERE rolname::text=$1", &[&role]).await.unwrap();
+    let grouped = json!({"prepared_messages":[{},{},{}],"prepared_context":{"target_metadata":[{"history_index":0,"group_size":3},{"history_index":0,"group_size":3},{"history_index":0,"group_size":3}]}});
+    let cases = [
+        (
+            "accepted",
+            "push delivery outcome unknown",
+            vec!["unknown", "accepted", "accepted"],
+            grouped.clone(),
+        ),
+        (
+            "accepted",
+            "push delivery outcome unknown",
+            vec!["unknown", "accepted"],
+            grouped.clone(),
+        ),
+        (
+            "accepted",
+            "push delivery outcome unknown",
+            vec!["unknown", "unknown"],
+            grouped.clone(),
+        ),
+        (
+            "accepted",
+            "subscriber identity changed",
+            vec!["unknown", "accepted"],
+            grouped.clone(),
+        ),
+        (
+            "retry",
+            "push delivery outcome unknown",
+            vec!["unknown", "unknown"],
+            grouped.clone(),
+        ),
+        (
+            "retry",
+            "push delivery outcome unknown",
+            vec!["unknown", "accepted"],
+            grouped.clone(),
+        ),
+        (
+            "accepted",
+            "push delivery outcome unknown",
+            vec!["unknown"],
+            json!({}),
+        ),
+        (
+            "accepted",
+            "push delivery outcome unknown",
+            vec!["unknown", "accepted"],
+            json!({"prepared_messages":[{},{}],"prepared_context":{"target_metadata":[{"history_index":0.5,"group_size":999999999999_i64}]}}),
+        ),
+    ];
+    for (decision, error, states, payload) in cases {
+        let legacy = fcm_job(&db, payload.clone(), error, &states).await;
+        let scoped = fcm_job(&db, payload, error, &states).await;
+        queue::reconciliation::resolve(
+            &mut db,
+            "a",
+            legacy,
+            Some(0),
+            decision,
+            "operator",
+            "ticket",
+        )
+        .await
+        .unwrap();
+        scoped_fcm(&actor, "a", scoped, 0, decision).await.unwrap();
+        assert_eq!(
+            fcm_snapshot(&db, legacy).await,
+            fcm_snapshot(&db, scoped).await,
+            "FCM {decision} {error} {states:?}"
+        );
+    }
+    let refused = fcm_job(
+        &db,
+        grouped.clone(),
+        "subscriber identity changed",
+        &["unknown"],
+    )
+    .await;
+    assert!(scoped_fcm(&actor, "a", refused, 0, "retry").await.is_err());
+    assert!(
+        scoped_fcm(&actor, "b", refused, 0, "accepted")
+            .await
+            .is_err()
+    );
+    assert!(
+        scoped_fcm(&actor, "a", refused, -1, "accepted")
+            .await
+            .is_err()
+    );
+    assert!(
+        actor
+            .query(
+                "SELECT device_tokens FROM public.novu_rust_push_messages",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    let race = fcm_job(&db, grouped, "push delivery outcome unknown", &["unknown"]).await;
+    let (one, two) = tokio::join!(
+        scoped_fcm(&actor, "a", race, 0, "accepted"),
+        scoped_fcm(&actor2, "a", race, 0, "accepted")
+    );
+    assert_ne!(one.is_ok(), two.is_ok());
+    let cli_fcm = fcm_job(
+        &db,
+        json!({"prepared_messages":[{}]}),
+        "push delivery outcome unknown",
+        &["unknown"],
+    )
+    .await;
+    let output = Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .args([
+            "retry",
+            "a",
+            &cli_fcm.to_string(),
+            "0",
+            "operator",
+            "ticket",
+        ])
+        .env("DATABASE_URL", role_url.as_str())
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .env("SWALLOW_RECONCILIATION_SCOPED_ACCESS", "true")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let fcm = Uuid::new_v4();
     queue::enqueue(&db, fcm, "a", queue::fcm_queue::JOB_KIND, &json!({}))
         .await
