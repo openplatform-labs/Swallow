@@ -96,6 +96,10 @@ docker exec "$name" createdb -U postgres novu_slack_webhook_cli_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_slack_webhook_cli_test" \
   cargo test --locked --test slack_webhook_cli -- --ignored
 
+docker exec "$name" createdb -U postgres novu_slack_endpoint_test
+TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_slack_endpoint_test" \
+  cargo test --locked --test slack_channel_endpoints -- --ignored
+
 docker exec "$name" createdb -U postgres novu_slack_reconnect_test
 TEST_DATABASE_URL="postgresql://postgres@127.0.0.1:${port}/novu_slack_reconnect_test" TEST_PG_CONTAINER="$name" \
   cargo test --locked --test slack_reconnect -- --ignored
