@@ -268,6 +268,20 @@ pub async fn process_one(
     environment: &str,
     provider: &Sendgrid,
 ) -> Result<bool, Error> {
+    process_one_with_step_policy(
+        client,
+        environment,
+        provider,
+        crate::email_step_policy::Policy::Snapshot,
+    )
+    .await
+}
+pub async fn process_one_with_step_policy(
+    client: &mut Client,
+    environment: &str,
+    provider: &Sendgrid,
+    policy: crate::email_step_policy::Policy,
+) -> Result<bool, Error> {
     let Some(job) = claim(client, environment, Duration::from_secs(60)).await? else {
         return Ok(false);
     };
@@ -297,6 +311,17 @@ pub async fn process_one(
         tx.commit().await?;
         return Ok(true);
     }
+    match crate::email_step_policy::check(&tx, environment, &job, &email, policy).await? {
+        crate::email_step_policy::Check::Continue => {}
+        crate::email_step_policy::Check::Cancelled => {
+            tx.commit().await?;
+            return Ok(true);
+        }
+        crate::email_step_policy::Check::LeaseLost => {
+            tx.rollback().await?;
+            return Ok(true);
+        }
+    }
     if !prepare_workflow_email(&tx, environment, &job, &mut email, subscriber).await? {
         tx.commit().await?;
         return Ok(true);
@@ -308,6 +333,10 @@ pub async fn process_one(
         tx.execute("UPDATE novu_rust_email_messages SET delivery_state='rejected',status='error',error_id='mail_unexpected_error',error_text='reserved SendGrid custom argument' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
         tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='reserved SendGrid custom argument',lease_token=NULL,lease_until=NULL WHERE id=$1 AND environment_id=$2", &[&job.id,&environment]).await?;
         tx.commit().await?;
+        return Ok(true);
+    }
+    if policy != crate::email_step_policy::Policy::Snapshot && !lock_live(&tx, &job).await? {
+        tx.rollback().await?;
         return Ok(true);
     }
     let dispatch = provider.tracks_dispatches().then(Uuid::new_v4);
@@ -347,6 +376,10 @@ pub async fn process_one(
             .insert(DISPATCH_PROOF_ARGUMENT.into(), proof.into());
     }
     tx.execute("UPDATE novu_rust_email_messages SET delivery_state='dispatching' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
+    if policy != crate::email_step_policy::Policy::Snapshot && !lock_live(&tx, &job).await? {
+        tx.rollback().await?;
+        return Ok(true);
+    }
     tx.commit().await?;
     let (state, status, provider_id, diagnostic) = match provider.send(&email).await {
         Ok(receipt) => (
@@ -509,8 +542,16 @@ mod tests {
             &endpoint,
         )
         .unwrap();
+        let policy = match std::env::var("TEST_EMAIL_STEP_POLICY").as_deref() {
+            Ok("unchanged") => crate::email_step_policy::Policy::Unchanged,
+            Ok("active") => crate::email_step_policy::Policy::Active,
+            Err(std::env::VarError::NotPresent) | Ok("snapshot") => {
+                crate::email_step_policy::Policy::Snapshot
+            }
+            _ => panic!("invalid test email policy"),
+        };
         assert!(
-            process_one(&mut db, "64a000000000000000000002", &provider)
+            process_one_with_step_policy(&mut db, "64a000000000000000000002", &provider, policy)
                 .await
                 .unwrap()
         );

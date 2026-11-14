@@ -21,6 +21,8 @@ async fn file_secret_starts_and_conflicts_are_rejected() {
     tokio::spawn(async move {
         let _ = driver.await;
     });
+    db.batch_execute("CREATE TABLE novu_rust_environments(id text PRIMARY KEY,organization_id text NOT NULL); INSERT INTO novu_rust_environments VALUES ('env','org')").await.unwrap();
+    db.batch_execute(include_str!("../migrations/0120_email_workflow_worker_policy.sql")).await.unwrap();
     db.batch_execute(novu_postgres_queue::MIGRATION)
         .await
         .unwrap();

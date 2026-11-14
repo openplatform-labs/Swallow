@@ -71,6 +71,7 @@ async fn channels_are_authorized_audited_and_create_delivery_jobs() {
     .await;
     migrate(&db, &root.join("migrations"), 18..=u32::MAX).await;
     db.batch_execute("INSERT INTO novu_rust_users VALUES ('u'); INSERT INTO novu_rust_environments VALUES ('a','org'),('b','org'); INSERT INTO novu_rust_workflows(environment_id,identifier,active,has_steps,in_app_step_active) VALUES ('a','workflow',true,true,false),('b','workflow',true,true,false); INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES ('a','alice','alice-id','{\"firstName\":\"Jane\",\"email\":\"test@example.test\",\"phone\":\"+15555550123\"}'); INSERT INTO novu_rust_fcm_integrations(environment_id,internal_id,identifier) VALUES ('a','fcm-id','fcm'); INSERT INTO novu_rust_fcm_devices(environment_id,subscriber_id,integration_internal_id,device_tokens) VALUES ('a','alice','fcm-id',ARRAY['fixture-token'])").await.unwrap();
+    db.batch_execute("UPDATE novu_rust_workflows SET inbox_metadata='{\"id\":\"workflow-id\"}'::jsonb WHERE environment_id='a' AND identifier='workflow'").await.unwrap();
     let hash = |s: &[u8]| format!("{:x}", Sha256::digest(s));
     let (a, b, reader) = (hash(b"a-key"), hash(b"b-key"), hash(b"read-key"));
     db.execute("INSERT INTO novu_rust_api_keys(key_hash,environment_id,user_id) VALUES ($1,'a','u'),($2,'b','u'),($3,'a','u')",&[&a,&b,&reader]).await.unwrap();
@@ -305,6 +306,48 @@ async fn channels_are_authorized_audited_and_create_delivery_jobs() {
             "{kind}"
         );
     }
+    use novu_postgres_queue::{
+        email_step_policy::Policy,
+        sendgrid::{Config as SendgridConfig, Region, Sendgrid},
+    };
+    let provider = Sendgrid::new(SendgridConfig {
+        api_key: "fixture".into(),
+        from: "sender@example.test".into(),
+        sender_name: "Fixture".into(),
+        region: Region::Global,
+    })
+    .unwrap();
+    assert_eq!(
+        call(
+            app.clone(),
+            "PUT",
+            email,
+            "a-key",
+            json!({"title":"Changed","content":"Email {{subscriber.firstName}}","active":true})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert!(
+        novu_postgres_queue::sendgrid_queue::process_one_with_step_policy(
+            &mut setup,
+            "a",
+            &provider,
+            Policy::Unchanged
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(setup.query_one("SELECT last_error FROM novu_queue_jobs WHERE environment_id='a' AND kind=$1 AND status='cancelled'",&[&novu_postgres_queue::sendgrid_queue::JOB_KIND]).await.unwrap().get::<_,String>(0),"email workflow step changed");
+    assert_eq!(
+        setup
+            .query_one("SELECT count(*) FROM novu_rust_sendgrid_attempts", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
     assert_eq!(
         call(
             app.clone(),
@@ -344,5 +387,206 @@ async fn channels_are_authorized_audited_and_create_delivery_jobs() {
             .unwrap()
             .get::<_, i64>(0),
         1
+    );
+    assert_eq!(
+        call(
+            app.clone(),
+            "PUT",
+            email,
+            "a-key",
+            json!({"title":"Changed","content":"Email {{subscriber.firstName}}","active":false})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert!(
+        novu_postgres_queue::sendgrid_queue::process_one_with_step_policy(
+            &mut setup,
+            "a",
+            &provider,
+            Policy::Active
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(setup.query_one("SELECT count(*) FROM novu_queue_jobs WHERE environment_id='a' AND kind=$1 AND last_error='email workflow step disabled'",&[&novu_postgres_queue::sendgrid_queue::JOB_KIND]).await.unwrap().get::<_,i64>(0),1);
+    assert_eq!(
+        call(
+            app.clone(),
+            "PUT",
+            email,
+            "a-key",
+            json!({"title":"Changed","content":"Email {{subscriber.firstName}}","active":true})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    setup.batch_execute("UPDATE novu_rust_workflows SET email_provider='resend' WHERE environment_id='a' AND identifier='workflow'").await.unwrap();
+    assert_eq!(
+        call(
+            app.clone(),
+            "POST",
+            "/v1/events/trigger",
+            "a-key",
+            json!({"name":"workflow","to":"alice","transactionId":"channels-3","payload":{}})
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    assert!(
+        novu_postgres_queue::in_app::process_one(&mut setup)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        call(
+            app.clone(),
+            "PUT",
+            email,
+            "a-key",
+            json!({"title":"Changed","content":"Email {{subscriber.firstName}}","active":false})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let resend = novu_postgres_queue::resend::Resend::new(novu_postgres_queue::resend::Config {
+        api_key: "fixture".into(),
+        from: "sender@example.test".into(),
+        sender_name: "Fixture".into(),
+    })
+    .unwrap();
+    assert!(
+        novu_postgres_queue::resend_queue::process_one_with_policies(
+            &mut setup,
+            "a",
+            &resend,
+            false,
+            Policy::Active
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(setup.query_one("SELECT count(*) FROM novu_queue_jobs WHERE environment_id='a' AND kind=$1 AND last_error='email workflow step disabled'",&[&novu_postgres_queue::resend_queue::JOB_KIND]).await.unwrap().get::<_,i64>(0),1);
+    assert_eq!(
+        setup
+            .query_one("SELECT count(*) FROM novu_rust_resend_attempts", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    assert_eq!(
+        call(
+            app.clone(),
+            "PUT",
+            email,
+            "a-key",
+            json!({"title":"Changed","content":"Email {{subscriber.firstName}}","active":true})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(
+            app.clone(),
+            "POST",
+            "/v1/events/trigger",
+            "a-key",
+            json!({"name":"workflow","to":"alice","transactionId":"channels-4","payload":{}})
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    assert!(
+        novu_postgres_queue::in_app::process_one(&mut setup)
+            .await
+            .unwrap()
+    );
+    let tx = setup.transaction().await.unwrap();
+    tx.execute("UPDATE novu_rust_workflows SET email_step_active=false WHERE environment_id='a' AND identifier='workflow'",&[]).await.unwrap();
+    let (mut other, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    let waiting = tokio::spawn(async move {
+        let provider =
+            novu_postgres_queue::resend::Resend::new(novu_postgres_queue::resend::Config {
+                api_key: "fixture".into(),
+                from: "sender@example.test".into(),
+                sender_name: "Fixture".into(),
+            })
+            .unwrap();
+        novu_postgres_queue::resend_queue::process_one_with_policies(
+            &mut other,
+            "a",
+            &provider,
+            false,
+            Policy::Active,
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !waiting.is_finished(),
+        "worker must wait for workflow update"
+    );
+    tx.commit().await.unwrap();
+    assert!(waiting.await.unwrap().unwrap());
+    assert_eq!(setup.query_one("SELECT count(*) FROM novu_queue_jobs WHERE environment_id='a' AND kind=$1 AND last_error='email workflow step disabled'",&[&novu_postgres_queue::resend_queue::JOB_KIND]).await.unwrap().get::<_,i64>(0),2);
+    assert_eq!(
+        call(
+            app.clone(),
+            "PUT",
+            email,
+            "a-key",
+            json!({"title":"Changed","content":"Email {{subscriber.firstName}}","active":true})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    setup.batch_execute("UPDATE novu_rust_workflows SET email_provider='sendgrid' WHERE environment_id='a' AND identifier='workflow'").await.unwrap();
+    assert_eq!(
+        call(
+            app.clone(),
+            "POST",
+            "/v1/events/trigger",
+            "a-key",
+            json!({"name":"workflow","to":"alice","transactionId":"channels-5","payload":{}})
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    assert!(
+        novu_postgres_queue::in_app::process_one(&mut setup)
+            .await
+            .unwrap()
+    );
+    setup.execute("UPDATE novu_queue_jobs SET payload=payload #- '{workflow_context,workflow_internal_id}' WHERE environment_id='a' AND kind=$1 AND status='pending'",&[&novu_postgres_queue::sendgrid_queue::JOB_KIND]).await.unwrap();
+    assert!(
+        novu_postgres_queue::sendgrid_queue::process_one_with_step_policy(
+            &mut setup,
+            "a",
+            &provider,
+            Policy::Active
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(setup.query_one("SELECT count(*) FROM novu_queue_jobs WHERE environment_id='a' AND kind=$1 AND last_error='email workflow identity missing'",&[&novu_postgres_queue::sendgrid_queue::JOB_KIND]).await.unwrap().get::<_,i64>(0),1);
+    assert_eq!(
+        setup
+            .query_one("SELECT count(*) FROM novu_rust_resend_attempts", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
     );
 }

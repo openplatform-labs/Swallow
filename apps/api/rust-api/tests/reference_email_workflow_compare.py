@@ -56,7 +56,7 @@ if not original or queued!='1':
 
 with tempfile.TemporaryDirectory(prefix='novu-email-compare-') as directory:
     capture=Path(directory)/'capture.json'
-    envvars=dict(os.environ,TEST_EMAIL_CAPTURE_PATH=str(capture))
+    envvars=dict(os.environ,TEST_EMAIL_CAPTURE_PATH=str(capture),TEST_EMAIL_STEP_POLICY='unchanged')
     subprocess.run(['cargo','test','--locked','--offline','--lib','capture_reference_workflow_email','--','--ignored'],cwd=Path(__file__).resolve().parents[3]/'worker'/'rust-queue',env=envvars,check=True)
     rust=json.loads(capture.read_text())
 original=json.loads(original.splitlines()[0])

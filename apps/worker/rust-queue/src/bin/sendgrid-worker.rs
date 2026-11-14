@@ -7,6 +7,7 @@ use std::{error::Error, time::Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let step_policy = novu_postgres_queue::email_step_policy::Policy::from_env()?;
     let environment = std::env::var("NOVU_SENDGRID_ENVIRONMENT_ID")?;
     if environment.is_empty() {
         return Err("NOVU_SENDGRID_ENVIRONMENT_ID must not be empty".into());
@@ -60,6 +61,29 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             );
             let mut recovery = tokio::time::Instant::now();
             if configured {
+                match tokio::time::timeout(
+                    timeout,
+                    novu_postgres_queue::email_step_policy::register(
+                        &db,
+                        &environment,
+                        step_policy,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(true)) => {}
+                    Ok(Ok(false)) => {
+                        task.abort();
+                        return Err("email workers have different workflow step policies".into());
+                    }
+                    _ => {
+                        task.abort();
+                        let _ = task.await;
+                        eprintln!("email workflow policy registration failed; reconnecting");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                }
                 loop {
                     if tokio::time::Instant::now() >= recovery {
                         if !matches!(
@@ -76,7 +100,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     }
                     match tokio::time::timeout(
                         timeout,
-                        sendgrid_queue::process_one(&mut db, &environment, &provider),
+                        sendgrid_queue::process_one_with_step_policy(
+                            &mut db,
+                            &environment,
+                            &provider,
+                            step_policy,
+                        ),
                     )
                     .await
                     {

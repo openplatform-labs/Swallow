@@ -51,6 +51,23 @@ pub async fn process_one_with_retry_guard(
     provider: &Resend,
     retry_guard: bool,
 ) -> Result<bool, Error> {
+    process_one_with_policies(
+        client,
+        environment,
+        provider,
+        retry_guard,
+        crate::email_step_policy::Policy::Snapshot,
+    )
+    .await
+}
+
+pub async fn process_one_with_policies(
+    client: &mut Client,
+    environment: &str,
+    provider: &Resend,
+    retry_guard: bool,
+    policy: crate::email_step_policy::Policy,
+) -> Result<bool, Error> {
     let Some(job) = claim(client, environment).await? else {
         return Ok(false);
     };
@@ -81,6 +98,17 @@ pub async fn process_one_with_retry_guard(
             return Ok(true);
         }
     }
+    match crate::email_step_policy::check(&tx, environment, &job, &email, policy).await? {
+        crate::email_step_policy::Check::Continue => {}
+        crate::email_step_policy::Check::Cancelled => {
+            tx.commit().await?;
+            return Ok(true);
+        }
+        crate::email_step_policy::Check::LeaseLost => {
+            tx.rollback().await?;
+            return Ok(true);
+        }
+    }
     if !crate::sendgrid_queue::prepare_workflow_email(
         &tx,
         environment,
@@ -91,6 +119,10 @@ pub async fn process_one_with_retry_guard(
     .await?
     {
         tx.commit().await?;
+        return Ok(true);
+    }
+    if policy != crate::email_step_policy::Policy::Snapshot && !live(&tx, &job).await? {
+        tx.rollback().await?;
         return Ok(true);
     }
     let inserted=tx.execute("INSERT INTO novu_rust_resend_attempts(job_id,environment_id,state) VALUES ($1,$2,'dispatching') ON CONFLICT(job_id) DO NOTHING", &[&job.id,&environment]).await?;
