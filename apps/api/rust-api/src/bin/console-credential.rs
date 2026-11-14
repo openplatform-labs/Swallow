@@ -2,7 +2,11 @@
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::{error::Error, fs::OpenOptions, io::Write};
+use std::{
+    error::Error,
+    fs::OpenOptions,
+    io::{Read, Write},
+};
 use uuid::Uuid;
 
 #[cfg(unix)]
@@ -22,12 +26,48 @@ fn write_secret(_path: &str, _bytes: &[u8]) -> Result<(), Box<dyn Error + Send +
     Err("secure token file creation is unavailable on this platform".into())
 }
 
+#[cfg(unix)]
+fn read_secret(path: &str) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    // Safety: geteuid has no preconditions and does not mutate process state.
+    let owner = unsafe { libc::geteuid() };
+    if !metadata.is_file()
+        || metadata.uid() != owner
+        || metadata.mode() & 0o077 != 0
+        || metadata.len() != 64
+    {
+        return Err("token file must be a private 64-byte regular file owned by the caller".into());
+    }
+    let mut bytes = Vec::with_capacity(64);
+    std::io::Read::by_ref(&mut file)
+        .take(65)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() != 64
+        || !bytes
+            .iter()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err("invalid token file contents".into());
+    }
+    Ok(bytes)
+}
+#[cfg(not(unix))]
+fn read_secret(_path: &str) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    Err("secure token file reading is unavailable on this platform".into())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: console-credential issue ENV SECONDS NEW_FILE REASON | revoke ENV CREDENTIAL_ID REASON | list ENV [AFTER_ID] | audit ENV [AFTER_ID]";
+    let usage = "usage: console-credential issue ENV SECONDS NEW_FILE REASON | inspect ENV TOKEN_FILE | revoke ENV CREDENTIAL_ID REASON | list ENV [AFTER_ID] | audit ENV [AFTER_ID]";
     let valid = matches!(args.as_slice(),[action,_,_,_,_] if action=="issue")
         || matches!(args.as_slice(),[action,_,_,_] if action=="revoke")
+        || matches!(args.as_slice(),[action,_,_] if action=="inspect")
         || matches!(args.as_slice(),[action,_] if action=="list" || action=="audit")
         || matches!(args.as_slice(),[action,_,_] if action=="list" || action=="audit");
     if !valid {
@@ -60,6 +100,27 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             match result {
                 Ok(Ok(row)) => println!("{}",json!({"credentialId":row.get::<_,Uuid>(0).to_string(),"tokenFileCreated":true})),
                 _ => return Err("issuance result unavailable; token file retained; investigate database and audit before retrying".into()),
+            }
+        }
+        "inspect" => {
+            let token =
+                read_secret(&args[2]).map_err(|_| "token file is unavailable or invalid")?;
+            let hash = format!("{:x}", Sha256::digest(&token));
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                db.query_opt(
+                    "SELECT * FROM public.novu_rust_inspect_console_credential($1,$2)",
+                    &[&args[1], &hash],
+                ),
+            )
+            .await;
+            match result {
+                Ok(Ok(Some(row))) => println!(
+                    "{}",
+                    json!({"found":true,"credentialId":row.get::<_,Uuid>(0).to_string(),"enabled":row.get::<_,bool>(1),"expiresAt":row.get::<_,String>(2),"createdAt":row.get::<_,String>(3)})
+                ),
+                Ok(Ok(None)) => println!("{}", json!({"found":false})),
+                _ => return Err("inspection unavailable; do not infer issuance outcome".into()),
             }
         }
         "revoke" => {

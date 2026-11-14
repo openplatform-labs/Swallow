@@ -1,13 +1,24 @@
-`console-credential` is an optional Unix operator CLI for the audited 0026 functions. Build with `cargo build --locked --bin console-credential`; configure `DATABASE_URL` and the same TLS settings as the API, then run:
+`console-credential` is an optional Unix operator CLI for the environment-scoped 0026 and 0027 functions. Build with `cargo build --locked --bin console-credential`; configure `DATABASE_URL` and the same TLS settings as the API, then run:
 
 ```text
 console-credential issue ENV 3600 /secure/new-token-file "ticket number"
+console-credential inspect ENV /secure/token-file
 console-credential list ENV [AFTER_ID]
 console-credential revoke ENV CREDENTIAL_ID "ticket number"
 console-credential audit ENV [AFTER_ID]
 ```
 
-Issue generates 32 bytes using the OS cryptographic random source, writes 64 lowercase hex characters to a **new** file with Unix mode 0600, flushes it, and sends only its SHA-256 hash to the database. It prints the credential UUID, never the token. Existing files and symlinks are not overwritten. The chosen directory, filesystem, backups, secret transfer and deletion remain the operator's responsibility; 0600 assumes a filesystem enforcing Unix permissions. The output filename and reason are command arguments, so do not put secrets in either. Connection and issuance are each bounded to 30 seconds. Any issuance error or timeout after the file is created is reported as outcome unknown and the file is retained: a trusted DBA must independently inspect the hash/credential and audit before retrying, deleting or delivering the file. A failed/partial file write may also leave a file. Output loss after a successful commit has the same ambiguity. Other commands do not have an application-level deadline; a lost revoke response also requires reviewing the credential and audit. No automatic retries, secure deletion or external immutable audit are provided. The CLI does not implement web login or replace SSO.
+Issue generates 32 bytes using the OS cryptographic random source, writes 64 lowercase hex characters to a **new** file with Unix mode 0600, flushes it, and sends only its SHA-256 hash to the database. It prints the credential UUID, never the token. Existing files and symlinks are not overwritten. The chosen directory, filesystem, backups, secret transfer and deletion remain the operator's responsibility; 0600 assumes a filesystem enforcing Unix permissions. The output filename and reason are command arguments, so do not put secrets in either. Connection and issuance are each bounded to 30 seconds. Any issuance error or timeout after the file is created is reported as outcome unknown and the file is retained: use the inspection procedure below and independently reconcile the audit before retrying, deleting or delivering the file. A failed/partial file write may also leave a file. Output loss after a successful commit has the same ambiguity. Other commands do not have an application-level deadline; a lost revoke response also requires reviewing the credential and audit. No automatic retries, secure deletion or external immutable audit are provided. The CLI does not implement web login or replace SSO.
+
+API migration `0027` adds `inspect` for a retained token file. An authorized database administrator grants the registered environment administrator the additional permission:
+
+```sql
+GRANT EXECUTE ON FUNCTION public.novu_rust_inspect_console_credential(text,text) TO "<admin-login>";
+```
+
+`inspect ENV /secure/token-file` opens a regular file owned by the effective user, rejects a final-component symlink and group/other permissions, and requires exactly 64 lowercase hex bytes. It sends only the SHA-256 hash as a database parameter and reports the matching credential UUID, enabled flag and timestamps, or `found:false`. An enabled credential may already be expired. Protect the containing directory, file, filesystem permissions and ACLs; this check does not prevent hard links or changes by a trusted file owner. Database parameter logging can expose the hash. Inspection itself is not audited, and its result is a point-in-time view that can immediately become stale.
+
+A `found:false` response is **not proof that issuance failed**: the original transaction may still be in progress, the environment or database may differ, or privileged modifications may have occurred. Resolve the original connection/transaction, check the intended database and environment, and independently reconcile the audit before deciding whether to issue again or handle the retained file. An unavailable inspection gives no outcome. No automatic retry or recovery is provided.
 
 API migration `0026` adds environment-scoped console credential administration with an audit trail. A trusted DBA registers each PostgreSQL LOGIN and its current role OID in `public.novu_rust_console_credential_admins`, and grants that login EXECUTE on the four public functions below. The administrator must not receive direct table access. Register using a parameterized administrative session, for example:
 

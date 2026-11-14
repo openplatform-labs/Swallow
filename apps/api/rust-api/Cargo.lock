@@ -965,6 +965,7 @@ dependencies = [
  "form_urlencoded",
  "hmac",
  "http-body-util",
+ "libc",
  "novu-postgres-queue",
  "novu-rust-contracts",
  "ring",
