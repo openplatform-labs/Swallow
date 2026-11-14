@@ -45,6 +45,7 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     db.batch_execute("INSERT INTO public.novu_rust_environments VALUES('jwt-alert-a','org'),('jwt-alert-b','org')").await.unwrap();
     let role = format!("jwt_alert_{}", Uuid::new_v4().simple());
     db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_alerts(text,text,text,text,bigint,text,text),public.novu_rust_console_alerts_page(text,text,text),public.novu_rust_operator_jwt_resend_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_resend_jobs(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_read(text,text,text,text,bigint,text,text) TO {role}")).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname::text=$1",&[&role]).await.unwrap();
     db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id,alert_read) VALUES('https://issuer.test','person','console','jwt-alert-a',true),('https://issuer.test','reader','console','jwt-alert-a',false); INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state,attempt_id) SELECT 'jwt-alert-a','slack','target-'||lpad(n::text,3,'0'),'unknown',gen_random_uuid() FROM generate_series(1,101) n; INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES('jwt-alert-b','email','private','unknown')").await.unwrap();
     db.batch_execute("WITH c AS (INSERT INTO public.novu_rust_console_credentials(token_hash,environment_id,expires_at,subscriber_read) VALUES(encode(sha256(convert_to(repeat('a',64),'UTF8')),'hex'),'jwt-alert-a',clock_timestamp()+interval '1 hour',false) RETURNING credential_id) INSERT INTO public.novu_rust_console_alert_grants SELECT credential_id FROM c").await.unwrap();
@@ -58,6 +59,19 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     assert!(
         api.query(
             "SELECT * FROM public.novu_rust_resend_auto_correlations",
+            &[]
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        api.query("SELECT * FROM public.novu_rust_workflows", &[])
+            .await
+            .is_err()
+    );
+    assert!(
+        api.query(
+            "SELECT * FROM public.novu_rust_operator_jwt_workflow_grants",
             &[]
         )
         .await
@@ -77,6 +91,100 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
         encode(&h,&json!({"iss":"https://issuer.test","sub":sub,"aud":"swallow","exp":now+120,"iat":now-1,"jti":"token","client_id":"console"}),&EncodingKey::from_rsa_pem(PRIVATE).unwrap()).unwrap()
     };
     let token = make("person");
+    db.batch_execute("INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,email_subject,email_html,sms_content,push_title,push_content,chat_content,email_provider) VALUES ('jwt-alert-a','wf',true,true,'Subject','Email','SMS','Push title','Push','Slack','resend'),('jwt-alert-b','wf',true,true,'other','other','other','other','other','other','sendgrid')").await.unwrap();
+    let workflow_request = |jwt: &str, query: &str| {
+        Request::builder()
+            .uri(format!("/v1/experimental/operator/workflow?{query}"))
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let query = "environmentId=jwt-alert-a&workflow=wf&resource=email";
+    assert_eq!(
+        app.clone()
+            .oneshot(workflow_request(&token, query))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_workflow_grants SELECT 'https://issuer.test','person','console','jwt-alert-a',r,'read' FROM unnest(ARRAY['email','sms','push','slack','email-provider']) r").await.unwrap();
+    for (resource, field, value) in [
+        ("email", "content", "Email"),
+        ("sms", "content", "SMS"),
+        ("push", "content", "Push"),
+        ("slack", "content", "Slack"),
+        ("email-provider", "provider", "resend"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(workflow_request(
+                &token,
+                &format!("environmentId=jwt-alert-a&workflow=wf&resource={resource}"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["data"][field], value);
+    }
+    assert_eq!(
+        app.clone()
+            .oneshot(workflow_request(&make("reader"), query))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(workflow_request(
+                &token,
+                "environmentId=jwt-alert-b&workflow=wf&resource=email"
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(workflow_request(
+                &token,
+                "environmentId=jwt-alert-a&workflow=wf&resource=bad"
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let mut workflow_revoker = connect(&url).await;
+    let tx = workflow_revoker.transaction().await.unwrap();
+    tx.batch_execute("DELETE FROM public.novu_rust_operator_jwt_workflow_grants WHERE subject='person' AND resource='email'").await.unwrap();
+    let workflow_http_request = workflow_request(&token, query);
+    let pending = tokio::spawn({
+        let app = app.clone();
+        async move { app.oneshot(workflow_http_request).await.unwrap().status() }
+    });
+    let mut waiting = false;
+    for _ in 0..100 {
+        if db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%novu_rust_operator_jwt_workflow_read%')",&[]).await.unwrap().get::<_,bool>(0){waiting=true;break;}
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(waiting && !pending.is_finished());
+    tx.commit().await.unwrap();
+    assert_eq!(pending.await.unwrap(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        app.clone()
+            .oneshot(workflow_request(&token, query))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
     let job = Uuid::new_v4();
     let tag = Uuid::new_v4();
     novu_postgres_queue::enqueue(
@@ -137,9 +245,23 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
             .body(Body::empty())
             .unwrap()
     };
-    assert_eq!(app.clone().oneshot(jobs_request(&token, "environmentId=jwt-alert-a")).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        app.clone()
+            .oneshot(jobs_request(&token, "environmentId=jwt-alert-a"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
     db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_resend_jobs_grants VALUES('https://issuer.test','person','console','jwt-alert-a')").await.unwrap();
-    assert_eq!(app.clone().oneshot(jobs_request(&make("reader"), "environmentId=jwt-alert-a")).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        app.clone()
+            .oneshot(jobs_request(&make("reader"), "environmentId=jwt-alert-a"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
     let first = app
         .clone()
         .oneshot(jobs_request(&token, "environmentId=jwt-alert-a"))

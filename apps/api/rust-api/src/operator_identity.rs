@@ -25,6 +25,7 @@ enum Lookup {
     PermissionChangeRequest,
     ResendResult,
     ResendJobs,
+    WorkflowRead,
 }
 
 fn authenticate(
@@ -136,6 +137,14 @@ pub(super) async fn resend_jobs(
 ) -> Response {
     query(db, headers, uri, verifier, Lookup::ResendJobs).await
 }
+pub(super) async fn workflow_read(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::WorkflowRead).await
+}
 async fn query(
     db: Arc<Client>,
     headers: HeaderMap,
@@ -174,6 +183,7 @@ async fn query(
         Lookup::PermissionChangeRequest => &["environmentId", "requestId"],
         Lookup::ResendResult => &["environmentId", "jobId"],
         Lookup::ResendJobs => &["environmentId", "after"],
+        Lookup::WorkflowRead => &["environmentId", "workflow", "resource"],
     };
     if params.keys().any(|key| !allowed.contains(&key.as_str()))
         || params.get("limit").is_some_and(|limit| limit != "20")
@@ -190,6 +200,31 @@ async fn query(
         return failure(StatusCode::UNAUTHORIZED, "Unauthorized", "Unauthorized");
     };
     let result = match lookup {
+        Lookup::WorkflowRead => {
+            let (Some(workflow), Some(resource)) = (params.get("workflow"), params.get("resource"))
+            else {
+                return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+            };
+            if workflow.is_empty()
+                || workflow.len() > 512
+                || !["email", "sms", "push", "slack", "email-provider"].contains(&resource.as_str())
+            {
+                return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+            }
+            db.query_one(
+                "SELECT public.novu_rust_operator_jwt_workflow_read($1,$2,$3,$4,$5,$6,$7)",
+                &[
+                    &identity.issuer,
+                    &identity.subject,
+                    &identity.client_id,
+                    &env,
+                    &exp,
+                    &workflow,
+                    &resource,
+                ],
+            )
+            .await
+        }
         Lookup::ResendJobs => {
             let after = match params.get("after") {
                 None => None,
