@@ -78,6 +78,8 @@ async fn lost_provider_response_is_recovered_from_signed_tag_before_or_after_res
         "ALTER TABLE novu_rust_delivery_reconciliations ADD COLUMN retry_provider_message_id text",
         include_str!("../../../worker/rust-queue/migrations/0134_resend_correlation.sql"),
         include_str!("../../../worker/rust-queue/migrations/0137_resend_auto_correlation.sql"),
+        include_str!("../../../worker/rust-queue/migrations/0138_resend_auto_projection_guard.sql"),
+        include_str!("../../../worker/rust-queue/migrations/0139_resend_provider_collision_invalidation.sql"),
     ] {
         db.batch_execute(sql).await.unwrap();
     }

@@ -86,6 +86,7 @@ async fn events_invalidate_only_matching_results_and_serialize_with_projector() 
         ),
         include_str!("../../../worker/rust-queue/migrations/0137_resend_auto_correlation.sql"),
         include_str!("../../../worker/rust-queue/migrations/0138_resend_auto_projection_guard.sql"),
+        include_str!("../../../worker/rust-queue/migrations/0139_resend_provider_collision_invalidation.sql"),
     ] {
         db.batch_execute(sql).await.unwrap();
     }

@@ -74,7 +74,11 @@ pub async fn project_with_auto_correlation(
 ) -> Result<bool> {
     let tx = client
         .build_transaction()
-        .isolation_level(IsolationLevel::RepeatableRead)
+        .isolation_level(if auto {
+            IsolationLevel::ReadCommitted
+        } else {
+            IsolationLevel::RepeatableRead
+        })
         .start()
         .await?;
     let found=tx.query_opt("SELECT id FROM novu_queue_jobs WHERE id=$1 AND environment_id=$2 AND kind=$3 FOR UPDATE SKIP LOCKED", &[&job,&environment,&resend_queue::JOB_KIND]).await?;
@@ -86,17 +90,26 @@ pub async fn project_with_auto_correlation(
         // Do not auto-resolve retries: an older attempt may also have reached
         // the provider. Require every tagged event to identify a recorded
         // recipient and a single provider ID, with no competing evidence.
-        let candidate = tx.query_opt("SELECT a.correlation_id,min(e.email_id),count(*) FROM novu_rust_resend_attempts a JOIN novu_queue_jobs j ON j.id=a.job_id AND j.environment_id=a.environment_id JOIN novu_rust_resend_delivery_events e ON e.environment_id=a.environment_id AND e.correlation_id=a.correlation_id WHERE a.environment_id=$1 AND a.job_id=$2 AND a.state='unknown' AND a.provider_message_id IS NULL AND a.correlation_id IS NOT NULL AND j.status='failed' AND j.last_error='Resend outcome unknown' AND NOT EXISTS(SELECT 1 FROM novu_rust_delivery_reconciliations r WHERE r.environment_id=a.environment_id AND r.job_id=a.job_id AND r.decision='retry' AND r.target_index IS NULL) GROUP BY a.correlation_id HAVING count(DISTINCT e.email_id)=1 AND bool_and(e.recipient_hash IS NOT NULL AND EXISTS(SELECT 1 FROM novu_rust_resend_recipients r WHERE r.environment_id=a.environment_id AND r.job_id=a.job_id AND r.recipient_hash=e.recipient_hash)) AND bool_or(e.event_type IN ('email.sent','email.delivered','email.bounced','email.failed','email.suppressed','email.complained'))", &[&environment,&job]).await?;
+        let candidate_sql = "SELECT a.correlation_id,min(e.email_id),count(*) FROM novu_rust_resend_attempts a JOIN novu_queue_jobs j ON j.id=a.job_id AND j.environment_id=a.environment_id JOIN novu_rust_resend_delivery_events e ON e.environment_id=a.environment_id AND e.correlation_id=a.correlation_id WHERE a.environment_id=$1 AND a.job_id=$2 AND a.state='unknown' AND a.provider_message_id IS NULL AND a.correlation_id IS NOT NULL AND j.status='failed' AND j.last_error='Resend outcome unknown' AND NOT EXISTS(SELECT 1 FROM novu_rust_delivery_reconciliations r WHERE r.environment_id=a.environment_id AND r.job_id=a.job_id AND r.decision='retry' AND r.target_index IS NULL) GROUP BY a.correlation_id HAVING count(DISTINCT e.email_id)=1 AND bool_and(e.recipient_hash IS NOT NULL AND EXISTS(SELECT 1 FROM novu_rust_resend_recipients r WHERE r.environment_id=a.environment_id AND r.job_id=a.job_id AND r.recipient_hash=e.recipient_hash)) AND bool_or(e.event_type IN ('email.sent','email.delivered','email.bounced','email.failed','email.suppressed','email.complained'))";
+        let candidate = tx.query_opt(candidate_sql, &[&environment, &job]).await?;
         if let Some(row) = candidate {
             let tag: Uuid = row.get(0);
             let provider_id: String = row.get(1);
-            let count: i64 = row.get(2);
-            let conflict: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_resend_attempts a WHERE a.environment_id=$1 AND a.provider_message_id=$3 AND a.job_id<>$2) OR EXISTS(SELECT 1 FROM novu_rust_delivery_reconciliations r WHERE r.environment_id=$1 AND r.retry_provider_message_id=$3) OR EXISTS(SELECT 1 FROM novu_rust_resend_delivery_events e WHERE e.environment_id=$1 AND e.email_id=$3 AND e.correlation_id IS DISTINCT FROM $4)", &[&environment,&job,&provider_id,&tag]).await?.get(0);
-            if !conflict {
-                tx.execute("INSERT INTO novu_rust_resend_auto_correlations(job_id,environment_id,correlation_id,provider_message_id,evidence_count) VALUES ($1,$2,$3,$4,$5)", &[&job,&environment,&tag,&provider_id,&count]).await?;
-                tx.execute("UPDATE novu_rust_resend_attempts SET state='accepted',provider_message_id=$3,updated_at=clock_timestamp() WHERE environment_id=$1 AND job_id=$2 AND state='unknown' AND provider_message_id IS NULL", &[&environment,&job,&provider_id]).await?;
-                tx.execute("UPDATE novu_queue_jobs SET status='completed',last_error=NULL WHERE environment_id=$1 AND id=$2", &[&environment,&job]).await?;
-                tx.execute("UPDATE novu_rust_email_messages SET delivery_state='accepted',status='sent',error_id=NULL,error_text=NULL,identifier=$3 WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job,&provider_id]).await?;
+            // Re-read after advisory locks: a collision may have committed while waiting.
+            tx.query_one("SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('resend-tag/'||pg_catalog.length($1::text)::text||'/'||$1||'/'||$2::uuid::text,0))", &[&environment,&tag]).await?;
+            tx.query_one("SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended('resend-provider/'||pg_catalog.length($1::text)::text||'/'||$1||'/'||$2::text,0))", &[&environment,&provider_id]).await?;
+            let confirmed = tx.query_opt(candidate_sql, &[&environment, &job]).await?;
+            if let Some(confirmed) = confirmed
+                .filter(|r| r.get::<_, Uuid>(0) == tag && r.get::<_, String>(1) == provider_id)
+            {
+                let count: i64 = confirmed.get(2);
+                let conflict: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_resend_attempts a WHERE a.environment_id=$1 AND a.provider_message_id=$3 AND a.job_id<>$2) OR EXISTS(SELECT 1 FROM novu_rust_delivery_reconciliations r WHERE r.environment_id=$1 AND r.retry_provider_message_id=$3) OR EXISTS(SELECT 1 FROM novu_rust_resend_delivery_events e WHERE e.environment_id=$1 AND e.email_id=$3 AND e.correlation_id IS DISTINCT FROM $4)", &[&environment,&job,&provider_id,&tag]).await?.get(0);
+                if !conflict {
+                    tx.execute("INSERT INTO novu_rust_resend_auto_correlations(job_id,environment_id,correlation_id,provider_message_id,evidence_count) VALUES ($1,$2,$3,$4,$5)", &[&job,&environment,&tag,&provider_id,&count]).await?;
+                    tx.execute("UPDATE novu_rust_resend_attempts SET state='accepted',provider_message_id=$3,updated_at=clock_timestamp() WHERE environment_id=$1 AND job_id=$2 AND state='unknown' AND provider_message_id IS NULL", &[&environment,&job,&provider_id]).await?;
+                    tx.execute("UPDATE novu_queue_jobs SET status='completed',last_error=NULL WHERE environment_id=$1 AND id=$2", &[&environment,&job]).await?;
+                    tx.execute("UPDATE novu_rust_email_messages SET delivery_state='accepted',status='sent',error_id=NULL,error_text=NULL,identifier=$3 WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job,&provider_id]).await?;
+                }
             }
         }
     }
