@@ -240,6 +240,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         failed_checks,
         failed_jobs,
         failed_jobs_check_failed,
+        database_probe: None,
     };
     alert.text().map_err(|_| "invalid alert environment")?;
     let mut observation_error = false;

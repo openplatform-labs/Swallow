@@ -312,6 +312,7 @@ pub struct Alert {
     pub failed_checks: [bool; 5], // resend, queue, attempts, twilio, Slack chat
     pub failed_jobs: Option<u64>,
     pub failed_jobs_check_failed: bool,
+    pub database_probe: Option<(String, bool)>,
 }
 impl Alert {
     /// Bit flags describe problem categories, not counts or sensitive content.
@@ -344,6 +345,13 @@ impl Alert {
         }
         if self.failed_jobs_check_failed {
             mask |= 1 << 19;
+        }
+        if self
+            .database_probe
+            .as_ref()
+            .is_some_and(|(_, unhealthy)| *unhealthy)
+        {
+            mask |= 1 << 20;
         }
         mask
     }
@@ -388,6 +396,9 @@ impl Alert {
         }
         if self.failed_jobs.is_some() || self.failed_jobs_check_failed {
             known |= 1 << 19;
+        }
+        if self.database_probe.is_some() {
+            known |= 1 << 20;
         }
         known
     }
@@ -445,6 +456,17 @@ impl Alert {
         }
         if self.failed_jobs_check_failed {
             details.push("failed jobs check failed".into());
+        }
+        if let Some((name, unhealthy)) = &self.database_probe {
+            if name.is_empty()
+                || name.len() > 48
+                || !name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+            {
+                return Err(AlertError::InvalidConfiguration);
+            }
+            details.push(format!("database {name} probe failed: {unhealthy}"));
         }
         if details.is_empty() {
             return Err(AlertError::InvalidConfiguration);
@@ -742,6 +764,7 @@ mod tests {
             failed_checks: [false; 5],
             failed_jobs: None,
             failed_jobs_check_failed: false,
+            database_probe: None,
         }
     }
 
@@ -906,6 +929,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn database_probe_alert_uses_both_mock_transports() {
+        let mut a = alert();
+        a.resend_enabled = false;
+        a.database_probe = Some(("primary".into(), true));
+        assert_eq!(a.condition_mask(), 1 << 20);
+        assert_ne!(a.observed_condition_mask() & (1 << 20), 0);
+        let (url, server) = mock_server("200 OK", "ok").await;
+        assert_eq!(
+            SlackWebhook::with_endpoint(url).unwrap().send(&a).await,
+            Ok(())
+        );
+        assert!(
+            server
+                .await
+                .unwrap()
+                .contains("database primary probe failed: true")
+        );
+        let (url, server) = mock_server("200 OK", r#"{"id":"fixture"}"#).await;
+        let provider = Resend::test_endpoint(
+            crate::resend::Config {
+                api_key: "fixture-key".into(),
+                from: "from@example.test".into(),
+                sender_name: String::new(),
+            },
+            url.as_str(),
+        )
+        .unwrap();
+        assert_eq!(
+            send_email(&provider, "ops@example.test", &a, "db-alert-fixture").await,
+            Ok(())
+        );
+        assert!(
+            server
+                .await
+                .unwrap()
+                .contains("database primary probe failed: true")
+        );
+        a.database_probe = Some(("bad\nlabel".into(), true));
+        assert!(a.text().is_err());
+    }
+
+    #[tokio::test]
     async fn resend_alert_is_separate_from_slack_and_has_idempotency_key() {
         let (url, server) = mock_server("200 OK", r#"{"id":"mock-id"}"#).await;
         let provider = Resend::test_endpoint(
@@ -980,6 +1045,7 @@ mod tests {
             failed_checks: [false; 5],
             failed_jobs: None,
             failed_jobs_check_failed: false,
+            database_probe: None,
         };
         assert!(alert.projector_stale);
         let (url, slack_server) = mock_server("200 OK", "ok").await;
