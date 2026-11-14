@@ -234,4 +234,61 @@ async fn alert_reservations_fence_concurrency_and_ambiguous_recovery() {
             .await
             .is_err()
     );
+    // Exercise the actual alert command without contacting Slack: a deliberately
+    // blocked slot proves unhealthy checks reached the durable dispatch path.
+    for sql in [
+        novu_postgres_queue::sendgrid_queue::MIGRATION,
+        novu_postgres_queue::twilio_queue::MIGRATION,
+        novu_postgres_queue::fcm_queue::MIGRATION,
+        novu_postgres_queue::resend_queue::MIGRATION,
+    ] {
+        a.batch_execute(sql).await.unwrap();
+    }
+    a.execute("INSERT INTO novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES ('env-a','slack','check','rejected')", &[]).await.unwrap();
+    let job = uuid::Uuid::new_v4();
+    novu_postgres_queue::enqueue(&a, job, "env-a", "fixture", &serde_json::json!({}))
+        .await
+        .unwrap();
+    a.execute("UPDATE novu_queue_jobs SET available_at=clock_timestamp()-interval '5 minutes' WHERE id=$1", &[&job]).await.unwrap();
+    a.execute("INSERT INTO novu_rust_sendgrid_attempts(job_id,environment_id,state) VALUES ($1,'env-a','unknown')", &[&job]).await.unwrap();
+    let run = |env: &str, queue: Option<&str>, attempts: &str, resend: &str| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"));
+        cmd.args([env, "300", "120", "60"])
+            .env("DATABASE_URL", &url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env(
+                "SWALLOW_ALERT_SLACK_WEBHOOK",
+                "https://hooks.slack.com/services/A/B/C",
+            )
+            .env_remove("SWALLOW_ALERT_SLACK_WEBHOOK_FILE")
+            .env_remove("SWALLOW_ALERT_EMAIL_TO")
+            .env("SWALLOW_ALERT_SLACK_TARGET_ID", "check")
+            .env("SWALLOW_ALERT_RESEND_ENABLED", resend)
+            .env("SWALLOW_ALERT_ATTEMPTS_ENABLED", attempts);
+        if let Some(value) = queue {
+            cmd.env("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS", value);
+        } else {
+            cmd.env_remove("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS");
+        }
+        cmd.output().unwrap()
+    };
+    assert_eq!(
+        run("env-a", Some("60"), "false", "false").status.code(),
+        Some(2)
+    );
+    assert_eq!(run("env-a", None, "true", "false").status.code(), Some(2));
+    assert_eq!(
+        run("env-b", Some("60"), "true", "false").status.code(),
+        Some(0)
+    );
+    assert_eq!(run("env-a", None, "false", "false").status.code(), Some(1));
+    assert_eq!(
+        run("env-a", Some("0"), "false", "false").status.code(),
+        Some(1)
+    );
+    assert_eq!(run("env-a", None, "yes", "false").status.code(), Some(1));
+    assert_eq!(
+        run("missing", Some("60"), "false", "false").status.code(),
+        Some(1)
+    );
 }

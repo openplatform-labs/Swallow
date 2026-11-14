@@ -198,6 +198,9 @@ pub struct Alert {
     pub environment: String,
     pub overdue_undelivered: u64,
     pub projector_stale: bool,
+    pub resend_enabled: bool,
+    pub queue: Option<(u64, u64)>,
+    pub attempts: Option<(u64, u64)>,
 }
 impl Alert {
     pub fn text(&self) -> Result<String, AlertError> {
@@ -210,9 +213,30 @@ impl Alert {
         {
             return Err(AlertError::InvalidConfiguration);
         }
+        let mut details = Vec::new();
+        if self.resend_enabled {
+            details.push(format!(
+                "Resend overdue undelivered jobs: {}; projector stale: {}",
+                self.overdue_undelivered, self.projector_stale
+            ));
+        }
+        if let Some((overdue, expired)) = self.queue {
+            details.push(format!(
+                "queue overdue jobs: {overdue}; expired leases: {expired}"
+            ));
+        }
+        if let Some((unknown, stranded)) = self.attempts {
+            details.push(format!(
+                "unknown delivery attempts: {unknown}; stranded dispatches: {stranded}"
+            ));
+        }
+        if details.is_empty() {
+            return Err(AlertError::InvalidConfiguration);
+        }
         Ok(format!(
-            "Swallow Resend alert: environment {}; overdue undelivered jobs: {}; projector stale: {}",
-            self.environment, self.overdue_undelivered, self.projector_stale
+            "Swallow delivery alert: environment {}; {}",
+            self.environment,
+            details.join("; ")
         ))
     }
 }
@@ -411,6 +435,9 @@ mod tests {
             environment: "env-a".into(),
             overdue_undelivered: 2,
             projector_stale: true,
+            resend_enabled: true,
+            queue: None,
+            attempts: None,
         }
     }
 
@@ -470,6 +497,21 @@ mod tests {
             .text()
             .is_err()
         );
+    }
+
+    #[test]
+    fn combined_alerts_only_report_enabled_aggregate_checks() {
+        let mut a = alert();
+        a.resend_enabled = false;
+        a.queue = Some((3, 1));
+        a.attempts = Some((2, 4));
+        let text = a.text().unwrap();
+        assert!(text.contains("queue overdue jobs: 3; expired leases: 1"));
+        assert!(text.contains("unknown delivery attempts: 2; stranded dispatches: 4"));
+        assert!(!text.contains("Resend"));
+        a.queue = None;
+        a.attempts = None;
+        assert!(a.text().is_err());
     }
 
     #[tokio::test]
@@ -578,6 +620,9 @@ mod tests {
             environment: "env-a".into(),
             overdue_undelivered: health["overdueUndelivered"].as_u64().unwrap(),
             projector_stale: health["projectorStale"].as_bool().unwrap(),
+            resend_enabled: true,
+            queue: None,
+            attempts: None,
         };
         assert!(alert.projector_stale);
         let (url, slack_server) = mock_server("200 OK", "ok").await;
