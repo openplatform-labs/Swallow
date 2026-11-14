@@ -6,6 +6,32 @@ import { OperatorOidc } from './operator-oidc';
 describe('Swallow console', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
+  it('uses the selected login for authorized alert decisions and request lookup without copying the token', async () => {
+    vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));
+    vi.spyOn(OperatorOidc.prototype,'signIn').mockResolvedValue({token:'aaa.bbb.ccc',subject:'alice',environmentId:'env-a',expiresAt:Math.floor(Date.now()/1000)+600});
+    const attempt='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[{channel:'slack',targetId:'ops',state:'unknown',lastStartedAt:null,attemptId:attempt}],hasMore:false,next:null}),{status:200})).mockResolvedValueOnce(new Response(JSON.stringify({recorded:true,replayed:false}),{status:200})).mockResolvedValueOnce(new Response(JSON.stringify({found:false}),{status:200}));
+    const fixture=TestBed.createComponent(App);const app=fixture.componentInstance;
+    app.oidcIssuer='https://issuer.test';app.oidcClientId='console';app.oidcEnvironment='env-a';await app.prepareOidc();await app.signInOidc();app.useOidc('alerts');
+    await app.loadAlerts();app.selectAlert(app.alertSlots()[0]);app.decisionReason='checked';app.decisionConfirmed=true;app.useOidcForDecision('decision');
+    await app.resolveAlert();expect(app.decisionStatus()).toBe('recorded');expect(fetchMock.mock.calls[1][1]?.headers).toEqual({Authorization:'Bearer aaa.bbb.ccc','Content-Type':'application/json'});
+    app.useOidcForDecision('lookup');await app.lookupDecisionRequest();expect(app.lookupStatus()).toBe('not-found');expect(fetchMock.mock.calls[2][1]?.headers).toEqual({Authorization:'Bearer aaa.bbb.ccc'});
+    app.alertEnvironment='other';app.lookupKey='';app.useOidcForDecision('lookup');expect(app.lookupKey).toBe('');
+    app.alertEnvironment='env-a';app.alertAuthMode='restricted';app.useOidcForDecision('decision');expect(app.decisionKey).toBe('');fixture.destroy();
+  });
+
+  it('reuses the login for an uncertain decision only with the original token', async () => {
+    vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));
+    vi.spyOn(OperatorOidc.prototype,'signIn').mockResolvedValue({token:'aaa.bbb.ccc',subject:'alice',environmentId:'env-a',expiresAt:Math.floor(Date.now()/1000)+600});
+    const attempt='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[{channel:'slack',targetId:'ops',state:'unknown',lastStartedAt:null,attemptId:attempt}],hasMore:false,next:null}),{status:200})).mockRejectedValueOnce(new TypeError('network')).mockResolvedValueOnce(new Response(JSON.stringify({recorded:true,replayed:true}),{status:200}));
+    const fixture=TestBed.createComponent(App);const app=fixture.componentInstance;
+    app.oidcIssuer='https://issuer.test';app.oidcClientId='console';app.oidcEnvironment='env-a';await app.prepareOidc();await app.signInOidc();app.useOidc('alerts');await app.loadAlerts();app.selectAlert(app.alertSlots()[0]);
+    app.decisionReason='checked';app.decisionConfirmed=true;app.useOidcForDecision('decision');await app.resolveAlert();expect(app.decisionStatus()).toBe('unknown');
+    app.useOidcForDecision('retry');app.retryConfirmed=true;await app.retryDecision();expect(app.decisionStatus()).toBe('recorded');
+    expect(fetchMock.mock.calls[2][1]?.body).toBe(fetchMock.mock.calls[1][1]?.body);fixture.destroy();
+  });
+
   it('expires the popup token without losing an uncertain decision or a different credential', async () => {
     vi.useFakeTimers(); vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
     vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));
@@ -13,9 +39,11 @@ describe('Swallow console', () => {
     const fixture=TestBed.createComponent(App); const app=fixture.componentInstance;
     app.oidcIssuer='https://issuer.test';app.oidcClientId='console';app.oidcEnvironment='env-a';
     await app.prepareOidc();await app.signInOidc();app.useOidc('alerts');
+    app.useOidcForDecision('decision');app.useOidcForDecision('lookup');app.useOidcForDecision('retry');
     app.apiKey='different.credential.value';app.decisionStatus.set('unknown');app.decisionRequestId.set('retained-request');
     vi.advanceTimersByTime(2000);
     expect(app.oidcStatus()).toBe('expired');expect(app.oidcSubject()).toBe('');expect(app.alertKey).toBe('');
+    expect(app.decisionKey).toBe('');expect(app.lookupKey).toBe('');expect(app.retryKey).toBe('');
     expect(app.apiKey).toBe('different.credential.value');expect(app.decisionStatus()).toBe('unknown');expect(app.decisionRequestId()).toBe('retained-request');
     app.useOidc('alerts');expect(app.alertKey).toBe('');
     fixture.destroy();

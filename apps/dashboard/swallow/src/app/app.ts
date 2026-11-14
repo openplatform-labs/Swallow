@@ -112,6 +112,9 @@ export class App implements OnDestroy {
     // Preserve decision outcome and request ID, including an in-flight or uncertain decision.
     if (this.apiKey===session.token) this.apiKey='';
     if (this.alertKey===session.token) this.alertKey='';
+    if (this.decisionKey===session.token) this.decisionKey='';
+    if (this.retryKey===session.token) this.retryKey='';
+    if (this.lookupKey===session.token) this.lookupKey='';
     return true;
   }
 
@@ -157,6 +160,18 @@ export class App implements OnDestroy {
     this.setSection(section);
     if (section === 'subscribers') { this.forgetKey(); this.credentialMode='jwt'; this.subscriberEnvironment=session.environmentId; this.apiKey=session.token; }
     else { this.forgetAlertKey(); this.alertAuthMode='jwt'; this.alertEnvironment=session.environmentId; this.alertKey=session.token; }
+  }
+
+  canUseOidcForDecision(): boolean {
+    return this.alertAuthMode==='jwt' && this.oidcSession !== null && this.oidcSession.environmentId===this.alertEnvironment.trim() && Date.now()<this.oidcSession.expiresAt*1000 && this.decisionStatus()!=='sending';
+  }
+
+  useOidcForDecision(target: 'decision' | 'retry' | 'lookup'): void {
+    this.expireOidcIfNeeded();
+    if (!this.canUseOidcForDecision() || !this.oidcSession) return;
+    if (target==='decision') this.decisionKey=this.oidcSession.token;
+    else if (target==='retry') this.retryKey=this.oidcSession.token;
+    else { this.clearRequestLookup(); this.lookupKey=this.oidcSession.token; }
   }
 
   private validJwt(key: string): boolean {
@@ -252,6 +267,7 @@ export class App implements OnDestroy {
   }
 
   async retryDecision(): Promise<void> {
+    this.expireOidcIfNeeded();
     const snapshot = this.retrySnapshot();
     const key = this.retryKey.trim();
     if (!snapshot || this.decisionStatus() !== 'unknown' || !this.retryConfirmed || !this.validAlertKey(key)) return;
@@ -281,6 +297,7 @@ export class App implements OnDestroy {
 
   async lookupDecisionRequest(): Promise<void> {
     if (this.decisionStatus() === 'sending') return;
+    this.expireOidcIfNeeded();
     this.clearRequestLookup();
     const sequence = this.lookupSequence;
     const key = this.lookupKey.trim();
@@ -365,6 +382,7 @@ export class App implements OnDestroy {
   }
 
   async resolveAlert(): Promise<void> {
+    this.expireOidcIfNeeded();
     const slot = this.selectedAlert();
     const reason = this.decisionReason.trim();
     const key = this.decisionKey.trim();
