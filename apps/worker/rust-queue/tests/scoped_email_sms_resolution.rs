@@ -299,6 +299,58 @@ async fn scoped_email_sms_decisions_are_authorized_atomic_and_fenced() {
             assert_eq!(untouched.get::<_, String>(2), "delivered");
         }
     }
+    // Known Resend callbacks block a full retry in both operator modes.
+    for scoped in [false, true] {
+        let blocked = create_job(&db, queue::resend_queue::JOB_KIND).await;
+        let provider = format!("evidence-{blocked}");
+        db.execute(
+            "UPDATE novu_rust_resend_attempts SET provider_message_id=$2 WHERE job_id=$1",
+            &[&blocked, &provider],
+        )
+        .await
+        .unwrap();
+        db.execute("INSERT INTO novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type) VALUES ('a',$1,$2,'email.delivered')", &[&format!("same-{blocked}"),&provider]).await.unwrap();
+        let denied = if scoped {
+            resolve(&actor, "a", blocked, "retry").await.is_err()
+        } else {
+            queue::reconciliation::resolve(
+                &mut db, "a", blocked, None, "retry", "operator", "ticket",
+            )
+            .await
+            .is_err()
+        };
+        assert!(denied);
+        let row=db.query_one("SELECT j.status,a.state,(SELECT count(*) FROM novu_rust_delivery_reconciliations WHERE job_id=j.id) FROM novu_queue_jobs j JOIN novu_rust_resend_attempts a ON a.job_id=j.id WHERE j.id=$1", &[&blocked]).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), "failed");
+        assert_eq!(row.get::<_, String>(1), "unknown");
+        assert_eq!(row.get::<_, i64>(2), 0);
+        db.execute(
+            "DELETE FROM novu_rust_resend_delivery_events WHERE environment_id='a' AND email_id=$1",
+            &[&provider],
+        )
+        .await
+        .unwrap();
+        db.execute("INSERT INTO novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type) VALUES ('b',$1,$2,'email.delivered')", &[&format!("cross-{blocked}"),&provider]).await.unwrap();
+        if scoped {
+            resolve(&actor, "a", blocked, "retry").await.unwrap();
+        } else {
+            queue::reconciliation::resolve(
+                &mut db, "a", blocked, None, "retry", "operator", "ticket",
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            db.query_one(
+                "SELECT status FROM novu_queue_jobs WHERE id=$1",
+                &[&blocked]
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+            "pending"
+        );
+    }
     // FCM target/group state is compared to the existing implementation.
     let no_function = fcm_job(
         &db,

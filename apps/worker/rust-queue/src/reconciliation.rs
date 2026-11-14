@@ -540,7 +540,7 @@ pub async fn resolve(
     }
     let attempt=match (kind.as_str(),target) {
         (crate::sendgrid_queue::JOB_KIND,None)=>tx.query_opt("SELECT http_status,dispatch_id FROM novu_rust_sendgrid_attempts WHERE environment_id=$1 AND job_id=$2 AND state='unknown' FOR UPDATE", &[&environment,&job]).await?,
-        (crate::resend_queue::JOB_KIND,None)=>tx.query_opt("SELECT http_status,NULL::uuid FROM novu_rust_resend_attempts WHERE environment_id=$1 AND job_id=$2 AND state='unknown' FOR UPDATE", &[&environment,&job]).await?,
+        (crate::resend_queue::JOB_KIND,None)=>tx.query_opt("SELECT http_status,NULL::uuid,provider_message_id FROM novu_rust_resend_attempts WHERE environment_id=$1 AND job_id=$2 AND state='unknown' FOR UPDATE", &[&environment,&job]).await?,
         (crate::twilio_queue::JOB_KIND,None)=>tx.query_opt("SELECT http_status,dispatch_id FROM novu_rust_twilio_attempts WHERE environment_id=$1 AND job_id=$2 AND state='unknown' FOR UPDATE", &[&environment,&job]).await?,
         (crate::fcm_queue::JOB_KIND,Some(index))=>tx.query_opt("SELECT http_status,NULL::uuid FROM novu_rust_fcm_attempts WHERE environment_id=$1 AND job_id=$2 AND target_index=$3 AND state='unknown' FOR UPDATE", &[&environment,&job,&index]).await?,
         _=>return Err("job kind and target do not match".into()),
@@ -558,6 +558,16 @@ pub async fn resolve(
         if evidence {
             tx.rollback().await?;
             return Err("email retry refused: authenticated provider callback already exists; inspect evidence".into());
+        }
+    }
+    if kind == crate::resend_queue::JOB_KIND && decision == "retry" {
+        let provider_id: Option<String> = attempt.get(2);
+        if let Some(provider_id) = provider_id.as_ref().filter(|id| !id.is_empty()) {
+            let evidence: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_resend_delivery_events WHERE environment_id=$1 AND email_id=$2)", &[&environment,provider_id]).await?.get(0);
+            if evidence {
+                tx.rollback().await?;
+                return Err("Resend retry refused: authenticated provider callback already exists; inspect evidence".into());
+            }
         }
     }
     if kind == crate::twilio_queue::JOB_KIND && decision == "retry" {
