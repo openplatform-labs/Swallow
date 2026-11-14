@@ -1,8 +1,14 @@
+## Resend 운영 화면의 실제 API 연결 검증
+
+Angular 브라우저에서 테스트 JWT를 사용해 실제 Rust API와 Docker PostgreSQL의 제한 DB 로그인으로 Resend 결과를 조회했다. 합성 충돌 이벤트 삽입 후 `unknown`과 충돌 안내가 표시되고, DB에서 조회 권한을 회수하면 재조회가 거절되며 이전 결과가 지워지는 것을 확인했다. 메뉴 이탈 시 토큰과 작업 ID도 지워졌다. 재현용 [격리된 테스트 환경 스크립트](apps/dashboard/swallow/scripts/preview-resend-fixture.sh)와 [실행 방법](apps/dashboard/swallow/README.md)을 추가했다.
+
+이 시험은 공개된 테스트 키로 생성한 JWT와 DB에 직접 넣은 합성 이벤트를 사용했다. 외부 IdP 로그인, 실제 Resend 발송·웹훅, 원본 Novu 비교와 운영 HA·부하는 검증하지 않았다. 테스트 DB·API·임시 토큰은 종료 후 정리했다.
+
 ## Angular 운영 화면의 Resend 결과 조회
 
 운영 경보 화면에서 운영자 JWT·환경을 선택하고 작업 UUID를 입력하면 Resend 작업·시도 상태, 수신자별 집계 결과, 자동 복구와 증거 충돌을 확인할 수 있다. 기존 경보 조회와 독립적인 API 0048 권한이 필요하며 해당 권한은 현재 DB에서 부여한다. 작업 목록 검색과 결과 변경은 제공하지 않는다. [화면 README](apps/dashboard/swallow/README.md)에 실행 및 제한을 정리했다.
 
-Angular 빌드와 단위 테스트 53개가 통과했고 실제 브라우저에서 모의 API 응답으로 증거 충돌 표시를 확인했다. API의 JWT·DB 권한은 별도의 통합 테스트로 확인했으며, 이 화면에서 실제 API·외부 IdP까지 연결한 종단 간 시험, 실제 Resend와 운영 HA는 미검증이다. 기존 CSS 크기 경고가 남아 있다.
+Angular 빌드와 단위 테스트 53개가 통과했고 실제 브라우저에서 모의 API 응답으로 증거 충돌 표시를 확인했다. API의 JWT·DB 권한은 별도의 통합 테스트로 확인했다. 아래 최신 항목에서 테스트 JWT와 실제 Rust API·PostgreSQL을 연결한 브라우저 시험을 추가했으며, 외부 IdP·실제 Resend와 운영 HA는 미검증이다. 기존 CSS 크기 경고가 남아 있다.
 
 ## 운영자 JWT의 Resend 결과 조회 API (API 0048)
 
