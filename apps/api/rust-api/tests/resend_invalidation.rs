@@ -66,6 +66,8 @@ async fn events_invalidate_only_matching_results_and_serialize_with_projector() 
         ),
         novu_postgres_queue::reconciliation::MIGRATION,
         novu_postgres_queue::reconciliation::RETRY_DISPATCH_MIGRATION,
+        novu_postgres_queue::reconciliation::OPERATOR_GRANTS_MIGRATION,
+        novu_postgres_queue::reconciliation::OPERATOR_GRANT_LOCK_MIGRATION,
         "ALTER TABLE novu_rust_delivery_reconciliations ADD COLUMN retry_provider_message_id text",
         include_str!("../../../worker/rust-queue/migrations/0111_resend_webhook_job_lock.sql"),
     ] {
@@ -361,5 +363,92 @@ async fn events_invalidate_only_matching_results_and_serialize_with_projector() 
             )
             .await
             .is_err()
+    );
+
+    // A callback that acquired the job lock first must commit before a retry
+    // decision can inspect its evidence. Pause the insert after the lock CTE.
+    let race_job = Uuid::new_v4();
+    novu_postgres_queue::enqueue(
+        &db,
+        race_job,
+        "env-a",
+        novu_postgres_queue::resend_queue::JOB_KIND,
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE novu_queue_jobs SET status='failed' WHERE id=$1",
+        &[&race_job],
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO novu_rust_resend_attempts(job_id,environment_id,state,provider_message_id) VALUES ($1,'env-a','unknown','race-provider-id')", &[&race_job]).await.unwrap();
+    db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision) VALUES ('env-a',session_user,'retry')", &[]).await.unwrap();
+    db.batch_execute("CREATE FUNCTION public.test_pause_resend_event() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.event_id='evt-callback-first' THEN PERFORM pg_advisory_xact_lock(762019); END IF; RETURN NEW; END $$; CREATE TRIGGER test_pause_resend_event BEFORE INSERT ON public.novu_rust_resend_delivery_events FOR EACH ROW EXECUTE FUNCTION public.test_pause_resend_event();").await.unwrap();
+    let (blocker, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move { driver.await.unwrap() });
+    blocker
+        .query_one("SELECT pg_advisory_lock(762019)", &[])
+        .await
+        .unwrap();
+    let callback = tokio::spawn(event(
+        app.clone(),
+        secret,
+        "evt-callback-first",
+        "email.delivered",
+        "race-provider-id",
+    ));
+    let mut callback_blocked = false;
+    for _ in 0..100 {
+        if observer.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='resend_invalidation_webhook' AND wait_event='advisory')", &[]).await.unwrap().get::<_,bool>(0) { callback_blocked = true; break; }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(callback_blocked, "callback did not reach the paused insert");
+    let (mut retry_db, driver) =
+        tokio_postgres::connect(&format!("{url}?application_name=resend_retry_race"), NoTls)
+            .await
+            .unwrap();
+    tokio::spawn(async move { driver.await.unwrap() });
+    let retry = tokio::spawn(async move {
+        novu_postgres_queue::reconciliation::resolve(
+            &mut retry_db,
+            "env-a",
+            race_job,
+            None,
+            "retry",
+            "operator",
+            "test",
+        )
+        .await
+    });
+    let mut retry_blocked = false;
+    for _ in 0..100 {
+        if observer.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='resend_retry_race' AND wait_event_type='Lock')", &[]).await.unwrap().get::<_,bool>(0) { retry_blocked = true; break; }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        retry_blocked && !retry.is_finished(),
+        "retry did not wait for callback's job lock"
+    );
+    blocker
+        .query_one("SELECT pg_advisory_unlock(762019)", &[])
+        .await
+        .unwrap();
+    assert_eq!(callback.await.unwrap(), StatusCode::NO_CONTENT);
+    let error = retry.await.unwrap().unwrap_err().to_string();
+    assert!(
+        error.contains("authenticated provider callback already exists"),
+        "{error}"
+    );
+    assert_eq!(
+        db.query_one(
+            "SELECT count(*) FROM novu_rust_delivery_reconciliations WHERE job_id=$1",
+            &[&race_job]
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0),
+        0
     );
 }
