@@ -61,6 +61,22 @@ fn invalid_request_timeout_is_rejected() {
         assert!(String::from_utf8_lossy(&out.stderr).contains("invalid API request timeout"));
     }
 }
+#[test]
+fn invalid_database_statement_timeout_is_rejected() {
+    for value in ["0", "300001", "invalid"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_novu-rust-api"))
+            .env("DATABASE_URL", "postgres://localhost/unused")
+            .env("SWALLOW_API_DB_STATEMENT_TIMEOUT_MS", value)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("invalid API database statement timeout")
+        );
+    }
+}
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL and curl"]
 async fn times_out_slow_body_and_reports_indeterminate_blocked_write() {
@@ -110,6 +126,7 @@ async fn times_out_slow_body_and_reports_indeterminate_blocked_write() {
             .env("SWALLOW_API_MAX_INFLIGHT_PER_CONNECTION", "1")
             .env("SWALLOW_API_READY_REQUIRE_CAPACITY", "true")
             .env("SWALLOW_API_REQUEST_TIMEOUT_SECONDS", "1")
+            .env_remove("SWALLOW_API_DB_STATEMENT_TIMEOUT_MS")
             .env("SWALLOW_API_DB_HEALTH_INTERVAL_SECONDS", "30")
             .env_remove("SWALLOW_API_STRICT_SECURITY_CONFIG")
             .env_remove("SWALLOW_API_REQUIRED_SECURITY")
@@ -198,4 +215,126 @@ async fn times_out_slow_body_and_reports_indeterminate_blocked_write() {
         1
     );
     wait_status(port, "/health/ready", 200).await;
+
+    // The independent database deadline remains effective after the HTTP
+    // handler has timed out and its future has been dropped.
+    drop(_server);
+    let second_port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let _bounded = Server(
+        Command::new(env!("CARGO_BIN_EXE_novu-rust-api"))
+            .env(
+                "DATABASE_URL",
+                format!("{url}?application_name=bounded_timeout_test"),
+            )
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("LISTEN_ADDR", format!("127.0.0.1:{second_port}"))
+            .env("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED", "true")
+            .env("SWALLOW_API_DB_CONNECTIONS", "1")
+            .env("SWALLOW_API_REQUEST_TIMEOUT_SECONDS", "1")
+            .env("SWALLOW_API_DB_STATEMENT_TIMEOUT_MS", "1800")
+            .env("SWALLOW_API_DB_HEALTH_INTERVAL_SECONDS", "30")
+            .env_remove("SWALLOW_API_STRICT_SECURITY_CONFIG")
+            .env_remove("SWALLOW_API_REQUIRED_SECURITY")
+            .env_remove("JWT_SECRET")
+            .env_remove("JWT_SECRET_FILE")
+            .env_remove("INBOX_HMAC_KEYS_JSON")
+            .env_remove("INBOX_HMAC_KEYS_JSON_FILE")
+            .env_remove("NOVU_RESEND_WEBHOOK_SECRET")
+            .env_remove("NOVU_RESEND_WEBHOOK_SECRET_FILE")
+            .env_remove("NOVU_TWILIO_WEBHOOK_AUTH_TOKEN")
+            .env_remove("NOVU_TWILIO_WEBHOOK_AUTH_TOKEN_FILE")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_status(second_port, "/health/ready", 200).await;
+    for round in 0..2 {
+        if round == 1 {
+            let pid:i32=observer.query_one("SELECT pid FROM pg_stat_activity WHERE application_name='bounded_timeout_test'",&[]).await.unwrap().get(0);
+            assert!(
+                observer
+                    .query_one("SELECT pg_terminate_backend($1)", &[&pid])
+                    .await
+                    .unwrap()
+                    .get::<_, bool>(0)
+            );
+            let mut reconnected = false;
+            for _ in 0..150 {
+                reconnected=observer.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='bounded_timeout_test' AND pid<>$1)",&[&pid]).await.unwrap().get(0);
+                if reconnected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(reconnected);
+            wait_status(second_port, "/health/ready", 200).await;
+        }
+        let tx = db.transaction().await.unwrap();
+        tx.execute("UPDATE novu_rust_workflows SET email_provider='resend' WHERE environment_id='e' AND identifier='w'",&[]).await.unwrap();
+        let write = Command::new("curl")
+            .args([
+                "-s",
+                "--max-time",
+                "5",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "-X",
+                "PUT",
+                "-H",
+                "Authorization: ApiKey fixture-key",
+                "-H",
+                "Content-Type: application/json",
+                "--data",
+                r#"{"provider":"sendgrid"}"#,
+                &format!(
+                    "http://127.0.0.1:{second_port}/v1/experimental/workflows/w/email-provider"
+                ),
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut locked = false;
+        for _ in 0..100 {
+            locked=observer.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='bounded_timeout_test' AND wait_event_type='Lock')",&[]).await.unwrap().get(0);
+            if locked {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(locked);
+        assert_eq!(write.wait_with_output().unwrap().stdout, b"504");
+        let mut cancelled = false;
+        for _ in 0..100 {
+            cancelled=!observer.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='bounded_timeout_test' AND wait_event_type='Lock')",&[]).await.unwrap().get::<_,bool>(0);
+            if cancelled {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            cancelled,
+            "database statement timeout must end the lock wait"
+        );
+        tx.commit().await.unwrap();
+        wait_status(second_port, "/health/ready", 200).await;
+        assert_eq!(observer.query_one("SELECT email_provider FROM novu_rust_workflows WHERE environment_id='e' AND identifier='w'",&[]).await.unwrap().get::<_,String>(0),"resend");
+        assert_eq!(
+        observer
+            .query_one(
+                "SELECT count(*) FROM novu_rust_workflow_provider_audit WHERE environment_id='e'",
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1
+    );
+    }
 }

@@ -339,6 +339,19 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let interval = duration_env("SWALLOW_API_DB_HEALTH_INTERVAL_SECONDS", 10)?;
     let timeout = duration_env("SWALLOW_API_DB_HEALTH_TIMEOUT_SECONDS", 30)?;
+    let statement_timeout = match std::env::var("SWALLOW_API_DB_STATEMENT_TIMEOUT_MS") {
+        Ok(value) => {
+            let milliseconds: u64 = value
+                .parse()
+                .map_err(|_| "invalid API database statement timeout")?;
+            if !(1..=300_000).contains(&milliseconds) {
+                return Err("invalid API database statement timeout".into());
+            }
+            Some(format!("{milliseconds}ms"))
+        }
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => return Err("invalid API database statement timeout".into()),
+    };
     let request_timeout = match std::env::var("SWALLOW_API_REQUEST_TIMEOUT_SECONDS") {
         Ok(value) => {
             let seconds: u64 = value.parse().map_err(|_| "invalid API request timeout")?;
@@ -411,6 +424,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let config = config.clone();
         let tls = tls.clone();
         let runtime = runtime.clone();
+        let statement_timeout = statement_timeout.clone();
         tokio::spawn(async move {
             loop {
                 let (db, connection) =
@@ -424,6 +438,22 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     };
                 let db = Arc::new(db);
                 let mut driver = tokio::spawn(connection);
+                if let Some(setting) = &statement_timeout {
+                    let configured = tokio::time::timeout(
+                        timeout,
+                        db.query_one(
+                            "SELECT set_config('statement_timeout',$1,false)",
+                            &[setting],
+                        ),
+                    )
+                    .await;
+                    if !matches!(configured, Ok(Ok(_))) {
+                        driver.abort();
+                        eprintln!("database session configuration failed; retrying");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                }
                 if let Ok(mut guard) = manager_state.write() {
                     *guard = Some(Connected {
                         router: runtime.router(db.clone()),
