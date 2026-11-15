@@ -1,7 +1,42 @@
 //! Optional fixed-delay scheduler for the existing multi-destination alert command.
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::{error::Error, process::Stdio, time::Duration};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
+
+// A forced scheduler shutdown must not leave the fanout tree sending after its
+// supervisor has reported termination. The group is private to this run.
+struct FanoutChild {
+    child: Child,
+    #[cfg(unix)]
+    group: Option<i32>,
+    finished: bool,
+}
+impl FanoutChild {
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait().await;
+        if status.is_ok() {
+            self.finished = true;
+        }
+        status
+    }
+}
+impl Drop for FanoutChild {
+    fn drop(&mut self) {
+        if !self.finished {
+            #[cfg(unix)]
+            if let Some(group) = self.group {
+                // A negative PID addresses the private process group. The group
+                // remains present while the child or its descendants are alive.
+                unsafe {
+                    libc::kill(-group, libc::SIGKILL);
+                }
+            }
+            let _ = self.child.start_kill();
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -33,11 +68,27 @@ async fn run(stop: novu_postgres_queue::shutdown::Stop) -> Result<()> {
     let mut binary = std::env::current_exe()?;
     binary.set_file_name(format!("alert-fanout{}", std::env::consts::EXE_SUFFIX));
     while !stop.requested() {
-        let status = Command::new(&binary)
+        let mut command = Command::new(&binary);
+        command
             .args(alert_args)
             .stdin(Stdio::null())
-            .status()
-            .await;
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.as_std_mut().process_group(0);
+        let status = match command.spawn() {
+            Ok(child) => {
+                #[cfg(unix)]
+                let group = child.id().and_then(|id| i32::try_from(id).ok());
+                let mut child = FanoutChild {
+                    child,
+                    #[cfg(unix)]
+                    group,
+                    finished: false,
+                };
+                child.wait().await
+            }
+            Err(error) => Err(error),
+        };
         match status {
             Ok(status) if status.success() => println!("alert scheduler: completed"),
             Ok(status) if status.code() == Some(2) => {

@@ -793,6 +793,7 @@ dependencies = [
  "chrono",
  "css-inline",
  "jsonlogic",
+ "libc",
  "novu-rust-contracts",
  "reqwest",
  "ring",

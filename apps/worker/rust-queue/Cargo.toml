@@ -21,3 +21,6 @@ css-inline = { version = "0.18.0", default-features = false }
 serde_urlencoded = "0.7"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 ring = "0.17"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
