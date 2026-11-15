@@ -32,6 +32,11 @@ INSERT INTO public.novu_rust_operator_jwt_smtp_transport_grant_audit_viewers VAL
 INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname='smtp_ui_fixture';
 INSERT INTO public.novu_rust_operator_jwt_smtp_transport_policy_grants VALUES('https://issuer.test','admin','console','fixture-env',true,true,true);
 INSERT INTO public.novu_rust_smtp_transport_admins SELECT 'fixture-env',rolname,oid,true,true,false FROM pg_roles WHERE rolname='smtp_ui_fixture';
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_smtp_auto_policy_read(text,text,text,text,bigint),public.novu_rust_operator_jwt_smtp_auto_policy_change(text,text,text,text,bigint,uuid,bigint,boolean,integer,integer,text,text),public.novu_rust_operator_jwt_smtp_auto_policy_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_smtp_auto_policy_audit_read(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_smtp_auto_history(text,text,text,text,bigint,bigint) TO smtp_ui_fixture;
+INSERT INTO public.novu_rust_operator_jwt_smtp_auto_policy_grants VALUES('https://issuer.test','admin','console','fixture-env',true,true,true,true);
+INSERT INTO public.novu_rust_smtp_auto_admins SELECT 'fixture-env',rolname,oid,true,true,true FROM pg_roles WHERE rolname='smtp_ui_fixture';
+INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) VALUES('11111111-1111-4111-8111-111111111111','fixture-env','experimental_smtp_email','{"secret":"fixture-secret"}');
+INSERT INTO public.novu_rust_smtp_auto_retries(environment_id,job_id,attempt_revision,failure_revision,database_principal,principal_oid,policy_max,policy_delay_seconds) SELECT 'fixture-env','11111111-1111-4111-8111-111111111111','22222222-2222-4222-8222-222222222222',1,rolname,oid,2,60 FROM pg_roles WHERE rolname='smtp_ui_fixture';
 SQL
 python3 - "$API/tests/fixtures/operator_jwt/test-only-public.pem" "$API/tests/fixtures/operator_jwt/test-only-private.pem" "$DIR" <<'PY'
 import base64,json,subprocess,sys,time
@@ -48,7 +53,8 @@ cargo build --quiet --locked --manifest-path "$API/Cargo.toml" --bin novu-rust-a
 env -i PATH="$PATH" DATABASE_URL="postgres://smtp_ui_fixture@127.0.0.1:$DB_PORT/postgres" NOVU_POSTGRES_ALLOW_INSECURE=true LISTEN_ADDR="127.0.0.1:$API_PORT" SWALLOW_OPERATOR_JWT_CONFIG_FILE="$DIR/keys.json" SWALLOW_API_HEALTH_ENDPOINTS_ENABLED=true "$API/target/debug/novu-rust-api" >"$DIR/api.log" 2>&1 & API_PID=$!
 for _ in $(seq 1 100); do curl -fsS "http://127.0.0.1:$API_PORT/health/ready" >/dev/null 2>&1 && break; kill -0 "$API_PID"; sleep 0.1; done
 curl -fsS "http://127.0.0.1:$API_PORT/health/ready" >/dev/null
-(cd "$UI" && SWALLOW_UI_TEST_API="http://127.0.0.1:$API_PORT" SWALLOW_UI_TEST_JWT="$(cat "$DIR/jwt")" npm test -- --watch=false --include src/app/smtp-transport-integration.spec.ts --include src/app/smtp-transport-grants-integration.spec.ts)
+(cd "$UI" && SWALLOW_UI_TEST_API="http://127.0.0.1:$API_PORT" SWALLOW_UI_TEST_JWT="$(cat "$DIR/jwt")" npm test -- --watch=false --include src/app/smtp-transport-integration.spec.ts --include src/app/smtp-transport-grants-integration.spec.ts --include src/app/smtp-auto-integration.spec.ts)
 [[ $("$TEST_PG_BIN/psql" "$DATABASE_URL" -qAtc "SELECT count(*) FROM public.novu_rust_operator_jwt_smtp_transport_policy_audit WHERE environment_id='fixture-env' AND actor_subject='admin'") == 1 ]]
 [[ $("$TEST_PG_BIN/psql" "$DATABASE_URL" -qAtc "SELECT count(*) FROM public.novu_rust_operator_jwt_smtp_transport_grant_audit WHERE environment_id='fixture-env' AND target_subject='target'") == 2 ]]
-echo 'Angular components and restricted local API SMTP policy and grants tests passed.'
+[[ $("$TEST_PG_BIN/psql" "$DATABASE_URL" -qAtc "SELECT count(*) FROM public.novu_rust_operator_jwt_smtp_auto_policy_audit WHERE environment_id='fixture-env' AND actor_subject='admin'") == 1 ]]
+echo 'Angular components and restricted local API SMTP policy, retry and grants tests passed.'
