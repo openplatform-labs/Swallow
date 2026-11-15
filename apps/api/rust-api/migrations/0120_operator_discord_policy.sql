@@ -6,7 +6,7 @@ CREATE TABLE public.novu_rust_operator_jwt_discord_policy_grants (
  FOREIGN KEY(issuer,subject,client_id,environment_id) REFERENCES public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) ON DELETE CASCADE
 );
 CREATE TABLE public.novu_rust_operator_jwt_discord_policy_requests (
- issuer text NOT NULL,subject text NOT NULL,client_id text NOT NULL,environment_id text NOT NULL,request_id uuid NOT NULL,
+ issuer text NOT NULL,subject text NOT NULL,client_id text NOT NULL,environment_id text NOT NULL REFERENCES public.novu_rust_environments(id) ON DELETE CASCADE,request_id uuid NOT NULL,
  expected_revision bigint NOT NULL,enabled boolean NOT NULL,reason text NOT NULL,
  policy jsonb NOT NULL,created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
  PRIMARY KEY(issuer,subject,client_id,environment_id,request_id)
@@ -27,7 +27,7 @@ BEGIN
   WHERE g.issuer=p_issuer AND g.subject=p_subject AND g.client_id=p_client AND g.environment_id=p_env
    AND CASE p_access WHEN 'read' THEN g.can_read WHEN 'write' THEN g.can_write ELSE g.can_audit END FOR SHARE OF g;
  IF NOT FOUND OR to_timestamp(p_exp::double precision)<=clock_timestamp() THEN RAISE EXCEPTION 'operator access denied' USING ERRCODE='42501'; END IF;
- IF p_access IN ('read','write') THEN PERFORM public.novu_rust_discord_policy_access(p_env,p_access); END IF;
+ PERFORM public.novu_rust_discord_policy_access(p_env,p_access);
  IF to_timestamp(p_exp::double precision)<=clock_timestamp() THEN RAISE EXCEPTION 'operator access denied' USING ERRCODE='42501'; END IF;
 END; $$;
 REVOKE ALL ON FUNCTION public.novu_rust_operator_jwt_discord_policy_access(text,text,text,text,bigint,text) FROM PUBLIC;

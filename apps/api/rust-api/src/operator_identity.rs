@@ -61,6 +61,9 @@ enum Lookup {
     ResendCooldownPolicyRead,
     ResendCooldownPolicyRequest,
     ResendCooldownPolicyAudit,
+    DiscordPolicyRead,
+    DiscordPolicyRequest,
+    DiscordPolicyAudit,
     Resend429GrantRead,
     Resend429GrantRequest,
     Resend429GrantAudit,
@@ -634,6 +637,31 @@ pub(super) async fn resend_cooldown_policy_audit(
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
 ) -> Response {
     query(db, headers, uri, verifier, Lookup::ResendCooldownPolicyAudit).await
+}
+
+pub(super) async fn discord_policy_read(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::DiscordPolicyRead).await
+}
+pub(super) async fn discord_policy_request(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::DiscordPolicyRequest).await
+}
+pub(super) async fn discord_policy_audit(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::DiscordPolicyAudit).await
 }
 
 pub(super) async fn resend_429_grant_read(
@@ -1410,6 +1438,65 @@ pub(super) async fn resend_cooldown_policy_change(
     }
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DiscordPolicyChange {
+    request_id: String,
+    expected_revision: String,
+    enabled: bool,
+    reason: String,
+}
+pub(super) async fn discord_policy_change(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+    body: Bytes,
+) -> Response {
+    let identity = match authenticate(&db, &headers, verifier).await {
+        Ok(v) => v,
+        Err(status) => return failure(status, uri.path()),
+    };
+    let params: Vec<_> = form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).collect();
+    if params.len() != 1
+        || params[0].0 != "environmentId"
+        || params[0].1.is_empty()
+        || params[0].1.len() > 512
+        || params[0].1.contains('\0')
+    {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    }
+    let Some(input) = (body.len() <= 4096)
+        .then(|| serde_json::from_slice::<DiscordPolicyChange>(&body).ok())
+        .flatten()
+    else {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    };
+    let (Ok(request), Ok(exp), Ok(expected)) = (
+        Uuid::parse_str(&input.request_id),
+        i64::try_from(identity.expires_at),
+        input.expected_revision.parse::<i64>(),
+    ) else {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    };
+    if expected < 0
+        || expected.to_string() != input.expected_revision
+        || input.reason.trim().is_empty()
+        || input.reason.len() > 512
+        || input.reason.contains('\0')
+    {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    }
+    let env = params[0].1.as_ref();
+    match guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_discord_policy_change($1,$2,$3,$4,$5,$6,$7,$8,$9)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&expected,&input.enabled,&input.reason]).await {
+        Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
+        Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
+        Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
+        Err(e) if e.code().is_some_and(|c|c.code()=="P4090")=>failure(StatusCode::CONFLICT,uri.path()),
+        Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path()),
+    }
+}
+
 pub(super) async fn resend_429_grant_change(
     State(db): State<Arc<Client>>,
     headers: HeaderMap,
@@ -1834,10 +1921,10 @@ async fn query(
         Lookup::Subscribers => &["environmentId", "name", "after", "before", "limit"],
         Lookup::Alerts => &["environmentId", "afterChannel", "afterTarget"],
         Lookup::DecisionRequest | Lookup::SlackDecisionRequest | Lookup::Resend429Request | Lookup::TwilioRetryRequest | Lookup::FcmReviewRequest => &["environmentId", "requestId"],
-        Lookup::Identity | Lookup::ResendAutoPolicyRead | Lookup::ResendCooldownPolicyRead => &["environmentId"],
+        Lookup::Identity | Lookup::ResendAutoPolicyRead | Lookup::ResendCooldownPolicyRead | Lookup::DiscordPolicyRead => &["environmentId"],
         Lookup::PermissionIdentity => &["environmentId", "issuer", "subject", "clientId"],
         Lookup::PermissionAudit => &["environmentId", "before"],
-        Lookup::PermissionChangeRequest | Lookup::ResendAutoPolicyRequest | Lookup::ResendCooldownPolicyRequest => {
+        Lookup::PermissionChangeRequest | Lookup::ResendAutoPolicyRequest | Lookup::ResendCooldownPolicyRequest | Lookup::DiscordPolicyRequest => {
             &["environmentId", "requestId"]
         }
         Lookup::ResendResult
@@ -1883,7 +1970,7 @@ async fn query(
         | Lookup::Resend429GrantAudit
         | Lookup::FcmReviewGrantAudit
         | Lookup::DiscordReviewGrantAudit
-        | Lookup::ResendAutoPolicyAudit | Lookup::ResendCooldownPolicyAudit | Lookup::Resend429Audit => &["environmentId", "after"],
+        | Lookup::ResendAutoPolicyAudit | Lookup::ResendCooldownPolicyAudit | Lookup::DiscordPolicyAudit | Lookup::Resend429Audit => &["environmentId", "after"],
         Lookup::ChannelAccessGrantAudit => &["environmentId", "after", "resource"],
         Lookup::SubscriberProfileRead => &["environmentId", "subscriberId"],
         Lookup::SubscriberProfileRequest => &["environmentId", "requestId"],
@@ -2157,6 +2244,42 @@ async fn query(
                 None => None,
             };
             guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_resend_cooldown_policy_audit_read($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&after]).await
+        }
+        Lookup::DiscordPolicyRead => {
+            guarded_query(
+                &db,
+                &identity,
+                "SELECT public.novu_rust_operator_jwt_discord_policy_read($1,$2,$3,$4,$5)",
+                &[
+                    &identity.issuer,
+                    &identity.subject,
+                    &identity.client_id,
+                    &env,
+                    &exp,
+                ],
+            )
+            .await
+        }
+        Lookup::DiscordPolicyRequest => {
+            let Some(request) = params
+                .get("requestId")
+                .and_then(|s| Uuid::parse_str(s).ok())
+            else {
+                return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+            };
+            guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_discord_policy_request($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request]).await
+        }
+        Lookup::DiscordPolicyAudit => {
+            let after = match params.get("after") {
+                Some(value) => match Uuid::parse_str(value) {
+                    Ok(v) => Some(v),
+                    Err(_) => {
+                        return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+                    }
+                },
+                None => None,
+            };
+            guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_discord_policy_audit_read($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&after]).await
         }
         Lookup::SubscriberActivityAudit => {
             let Some(kind) = params
