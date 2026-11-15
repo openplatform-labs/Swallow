@@ -11,9 +11,11 @@ export function startSocketRecovery(novu, {
   backoffFactor = 1,
   maxRetryDelayMs = Math.max(retryDelayMs, 30000),
   jitterRatio = 0,
+  recoverInitialConnection = false,
 } = {}) {
   if (typeof refresh !== 'function') throw new TypeError('refresh is required');
   if (typeof onError !== 'function') throw new TypeError('onError must be a function');
+  if (typeof recoverInitialConnection !== 'boolean') throw new TypeError('recoverInitialConnection must be a boolean');
   const maxTimerMs = 2147483647;
   if (!Number.isFinite(retryDelayMs) || retryDelayMs < 1 || retryDelayMs > maxTimerMs
     || !Number.isFinite(connectTimeoutMs) || connectTimeoutMs < 1 || connectTimeoutMs > maxTimerMs
@@ -24,6 +26,7 @@ export function startSocketRecovery(novu, {
   }
   let stopped = false;
   let connected = false;
+  let everConnected = false;
   let resetting = false;
   let recovering = false;
   let epoch = 0;
@@ -50,9 +53,17 @@ export function startSocketRecovery(novu, {
   const unsubscribeConnect = novu.on('socket.connect.resolved', ({ error } = {}) => {
     if (error) {
       if (recovering && !stopped) report(error);
+      else if (recoverInitialConnection && !everConnected && !stopped) {
+        // Mark first so a synchronous error callback cannot start a second loop.
+        recovering = true;
+        report(error);
+        if (!stopped) void recover();
+        else recovering = false;
+      }
       return;
     }
     connected = true;
+    everConnected = true;
     cancelWait();
   });
   const unsubscribeDisconnect = novu.on('socket.disconnect.resolved', () => {

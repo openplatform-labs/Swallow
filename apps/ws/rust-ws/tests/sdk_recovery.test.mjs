@@ -146,4 +146,45 @@ test('rejects invalid recovery delay settings', () => {
     { jitterRatio: 1.1 }, { retryDelayMs: Infinity }, { connectTimeoutMs: 2147483648 },
   ]) assert.throws(() => startSocketRecovery(sdk, {refresh: () => {}, ...options}), RangeError);
   assert.throws(() => startSocketRecovery(sdk, {refresh: () => {}, onError: null}), TypeError);
+  assert.throws(() => startSocketRecovery(sdk, {refresh: () => {}, recoverInitialConnection: 'true'}), TypeError);
+});
+
+test('initial socket errors are retried only when explicitly enabled', async () => {
+  const disabled=client();
+  let disabledAttempts=0, disabledErrors=0;
+  disabled.sdk.socket.connect=async()=>{ disabledAttempts++; return {}; };
+  const stopDisabled=startSocketRecovery(disabled.sdk,{
+    retryDelayMs:5, refresh:()=>{}, onError:()=>disabledErrors++,
+  });
+  disabled.emit('socket.connect.resolved',{error:new Error('initial failure')});
+  await delay(20);
+  assert.equal(disabledAttempts,0);
+  assert.equal(disabledErrors,0);
+  stopDisabled();
+
+  const enabled=client();
+  let attempts=0, reports=0, refreshes=0;
+  const originalConnect=enabled.sdk.socket.connect;
+  enabled.sdk.socket.connect=async()=>{ attempts++; return originalConnect(); };
+  const stopEnabled=startSocketRecovery(enabled.sdk,{
+    retryDelayMs:5, recoverInitialConnection:true,
+    refresh:()=>refreshes++, onError:()=>reports++,
+  });
+  enabled.emit('socket.connect.resolved',{error:new Error('initial failure')});
+  await until(()=>refreshes===1);
+  assert.equal(attempts,1);
+  assert.equal(reports,1);
+  stopEnabled();
+});
+
+test('initial error callback can stop before retry starts', async () => {
+  const {sdk,emit}=client();
+  let attempts=0, stop;
+  sdk.socket.connect=async()=>{attempts++; return {};};
+  stop=startSocketRecovery(sdk,{
+    retryDelayMs:5,recoverInitialConnection:true,refresh:()=>{},onError:()=>stop(),
+  });
+  emit('socket.connect.resolved',{error:new Error('authorization failed')});
+  await delay(20);
+  assert.equal(attempts,0);
 });

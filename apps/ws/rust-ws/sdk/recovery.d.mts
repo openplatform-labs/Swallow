@@ -11,6 +11,8 @@ export interface SocketRecoveryOptions {
   maxRetryDelayMs?: number;
   /** Symmetric randomization from 0 to 1, capped at maxRetryDelayMs. */
   jitterRatio?: number;
+  /** Also retry SDK socket errors before the first successful connection; default false. */
+  recoverInitialConnection?: boolean;
 }
 
 /** Start optional recovery; return an idempotent stop function. */
