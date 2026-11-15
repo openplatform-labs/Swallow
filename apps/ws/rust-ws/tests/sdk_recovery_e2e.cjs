@@ -9,7 +9,10 @@ async function until(fn, message, timeout=15000) {
   throw Error(message);
 }
 function sql(query) {
-  const result=spawnSync('docker',['exec',process.env.PG_CONTAINER,'psql','-q','-v','ON_ERROR_STOP=1','-U','postgres','-d','novu_recovery','-At','-c',query],{encoding:'utf8'});
+  const local=process.env.TEST_POSTGRES_MODE==='local';
+  const cmd=local?process.env.TEST_PSQL:'docker';
+  const args=local?[process.env.DATABASE_URL,'-q','-v','ON_ERROR_STOP=1','-At','-c',query]:['exec',process.env.PG_CONTAINER,'psql','-q','-v','ON_ERROR_STOP=1','-U','postgres','-d','novu_recovery','-At','-c',query];
+  const result=spawnSync(cmd,args,{encoding:'utf8'});
   assert.equal(result.status,0,result.stderr);
   return result.stdout.trim();
 }
