@@ -870,7 +870,7 @@ async fn process_claimed(
             if snapshot_slack_endpoints {
                 // Subscriber row is held above. API inserts also acquire that lock;
                 // share-lock existing endpoint rows against concurrent edits/deletes.
-                let rows=tx.query("SELECT internal_id,endpoint_type,endpoint,integration_identifier,connection_identifier FROM public.novu_rust_slack_channel_endpoints WHERE environment_id=$1 AND subscriber_internal_id=$2 AND context_keys @> $3 AND context_keys <@ $3 AND cardinality(context_keys)=cardinality($3) ORDER BY created_at,internal_id FOR SHARE LIMIT 1001", &[&job.environment_id,&subscriber_internal_id,&context_keys]).await?;
+                let rows=tx.query("SELECT internal_id,endpoint_type,endpoint,integration_identifier,connection_identifier,revision FROM public.novu_rust_slack_channel_endpoints WHERE environment_id=$1 AND subscriber_internal_id=$2 AND context_keys @> $3 AND context_keys <@ $3 AND cardinality(context_keys)=cardinality($3) ORDER BY created_at,internal_id FOR SHARE LIMIT 1001", &[&job.environment_id,&subscriber_internal_id,&context_keys]).await?;
                 if rows.len() > 1000 {
                     return Err(InvalidJob("too many Slack endpoints for snapshot").into());
                 }
@@ -882,6 +882,7 @@ async fn process_claimed(
                         endpoint: r.get(2),
                         integration: r.get(3),
                         connection: r.get(4),
+                        revision: Some(r.get(5)),
                     })
                     .collect();
                 chat_payload["endpoint_snapshot"] =

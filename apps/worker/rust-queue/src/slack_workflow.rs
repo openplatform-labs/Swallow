@@ -43,6 +43,8 @@ pub struct EndpointSnapshot {
     pub endpoint: Value,
     pub integration: String,
     pub connection: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<Uuid>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,6 +94,8 @@ struct Delivery {
     target: String,
     integration: String,
     connection: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    endpoint_revision: Option<Uuid>,
 }
 
 async fn claim(db: &Client, environment: &str, kind: &str) -> Result<Option<ClaimedJob>, Error> {
@@ -279,9 +283,9 @@ pub async fn fanout_one_with_policies(
         None
     };
     let query = if captured.is_some() {
-        "SELECT internal_id,endpoint_type,endpoint,integration_identifier,connection_identifier FROM novu_rust_slack_channel_endpoints WHERE environment_id=$1 AND subscriber_internal_id=$2 AND context_keys @> $3 AND context_keys <@ $3 AND cardinality(context_keys)=cardinality($3) ORDER BY created_at,internal_id LIMIT 1001"
+        "SELECT internal_id,endpoint_type,endpoint,integration_identifier,connection_identifier,revision FROM novu_rust_slack_channel_endpoints WHERE environment_id=$1 AND subscriber_internal_id=$2 AND context_keys @> $3 AND context_keys <@ $3 AND cardinality(context_keys)=cardinality($3) ORDER BY created_at,internal_id LIMIT 1001"
     } else {
-        "SELECT internal_id,endpoint_type,endpoint,integration_identifier,connection_identifier FROM novu_rust_slack_channel_endpoints WHERE environment_id=$1 AND subscriber_internal_id=$2 AND context_keys @> $3 AND context_keys <@ $3 AND cardinality(context_keys)=cardinality($3) ORDER BY created_at,internal_id"
+        "SELECT internal_id,endpoint_type,endpoint,integration_identifier,connection_identifier,revision FROM novu_rust_slack_channel_endpoints WHERE environment_id=$1 AND subscriber_internal_id=$2 AND context_keys @> $3 AND context_keys <@ $3 AND cardinality(context_keys)=cardinality($3) ORDER BY created_at,internal_id"
     };
     let endpoints = tx
         .query(
@@ -322,6 +326,10 @@ pub async fn fanout_one_with_policies(
         let endpoint: Value = row.get(2);
         let integration: String = row.get(3);
         let connection: Option<String> = row.get(4);
+        let captured_revision = captured
+            .as_ref()
+            .and_then(|snapshot| snapshot.get(&id))
+            .and_then(|original| original.revision);
         if let Some(snapshot) = captured.as_ref() {
             let current = EndpointSnapshot {
                 endpoint_id: id,
@@ -329,6 +337,7 @@ pub async fn fanout_one_with_policies(
                 endpoint: endpoint.clone(),
                 integration: integration.clone(),
                 connection: connection.clone(),
+                revision: captured_revision.map(|_| row.get::<_, Uuid>(5)),
             };
             if snapshot
                 .get(&id)
@@ -355,6 +364,7 @@ pub async fn fanout_one_with_policies(
             target: target.to_owned(),
             integration,
             connection,
+            endpoint_revision: captured_revision,
         };
         let payload = serde_json::to_value(delivery).expect("serializable Slack workflow context");
         let child = Uuid::new_v4();
@@ -441,7 +451,7 @@ pub async fn delivery_one_with_policy(
         tx.commit().await?;
         return Ok(true);
     }
-    let endpoint=tx.query_opt("SELECT endpoint_type,endpoint,integration_identifier,connection_identifier FROM novu_rust_slack_channel_endpoints WHERE environment_id=$1 AND internal_id=$2 AND subscriber_internal_id=$3 AND context_keys @> $4 AND context_keys <@ $4 AND cardinality(context_keys)=cardinality($4) FOR SHARE",&[&environment,&delivery.endpoint_id,&ctx.subscriber_internal_id,&ctx.context_keys]).await?;
+    let endpoint=tx.query_opt("SELECT endpoint_type,endpoint,integration_identifier,connection_identifier,revision FROM novu_rust_slack_channel_endpoints WHERE environment_id=$1 AND internal_id=$2 AND subscriber_internal_id=$3 AND context_keys @> $4 AND context_keys <@ $4 AND cardinality(context_keys)=cardinality($4) FOR SHARE",&[&environment,&delivery.endpoint_id,&ctx.subscriber_internal_id,&ctx.context_keys]).await?;
     let unchanged = endpoint.as_ref().is_some_and(|r| {
         let kind: String = r.get(0);
         let value: Value = r.get(1);
@@ -457,6 +467,9 @@ pub async fn delivery_one_with_policy(
             == Some(delivery.target.as_str())
             && integration == delivery.integration
             && connection == delivery.connection
+            && delivery
+                .endpoint_revision
+                .is_none_or(|revision| r.get::<_, Uuid>(4) == revision)
     });
     if !unchanged {
         terminal(
@@ -636,6 +649,7 @@ mod tests {
             crate::slack_queue::MIGRATION,
             include_str!("../migrations/0075_slack_channel_endpoints.sql"),
             include_str!("../migrations/0076_slack_endpoint_integrations.sql"),
+            include_str!("../migrations/0147_slack_endpoint_revision.sql"),
             MIGRATION,
         ] {
             db.batch_execute(migration).await.unwrap();
@@ -896,6 +910,7 @@ mod tests {
             crate::slack_queue::MIGRATION,
             include_str!("../migrations/0075_slack_channel_endpoints.sql"),
             include_str!("../migrations/0076_slack_endpoint_integrations.sql"),
+            include_str!("../migrations/0147_slack_endpoint_revision.sql"),
             MIGRATION,
             crate::reconciliation::MIGRATION,
             crate::reconciliation::OPERATOR_GRANTS_MIGRATION,
@@ -1258,6 +1273,7 @@ mod tests {
             crate::slack_queue::MIGRATION,
             include_str!("../migrations/0075_slack_channel_endpoints.sql"),
             include_str!("../migrations/0076_slack_endpoint_integrations.sql"),
+            include_str!("../migrations/0147_slack_endpoint_revision.sql"),
             MIGRATION,
         ] {
             db.batch_execute(migration).await.unwrap();
