@@ -25,6 +25,7 @@ fn server() -> Command {
         .env_remove("NOVU_RESEND_WEBHOOK_LOCK_RETRY_JOBS")
         .env_remove("NOVU_RESEND_WEBHOOK_CAPTURE_CORRELATION")
         .env_remove("NOVU_RESEND_WEBHOOK_LOCK_CORRELATION_JOBS")
+        .env_remove("NOVU_TWILIO_WEBHOOK_REQUIRE_DISPATCH_ACCOUNT")
         .env_remove("NOVU_TWILIO_WEBHOOK_ENVIRONMENT_ID")
         .env_remove("NOVU_TWILIO_WEBHOOK_ACCOUNT_SID")
         .env_remove("NOVU_TWILIO_WEBHOOK_URL")
@@ -134,6 +135,11 @@ fn strict_and_required_security_settings_control_startup() {
         ),
     ];
     check(&twilio, true);
+    check(&[("NOVU_TWILIO_WEBHOOK_REQUIRE_DISPATCH_ACCOUNT", "true")], false);
+    check(&[("NOVU_TWILIO_WEBHOOK_REQUIRE_DISPATCH_ACCOUNT", "yes")], false);
+    let mut bound = twilio.to_vec();
+    bound.push(("NOVU_TWILIO_WEBHOOK_REQUIRE_DISPATCH_ACCOUNT", "true"));
+    check(&bound, true);
     let mut duplicate = twilio;
     duplicate[5].1 = "sensitive-test-token";
     check(&duplicate, false);

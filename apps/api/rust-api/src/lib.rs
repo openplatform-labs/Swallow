@@ -192,7 +192,12 @@ impl RuntimeConfig {
                 || std::env::var("NOVU_RESEND_WEBHOOK_CAPTURE_CORRELATION").as_deref() != Ok("true")) {
             return Err(invalid());
         }
+        match std::env::var("NOVU_TWILIO_WEBHOOK_REQUIRE_DISPATCH_ACCOUNT").as_deref() {
+            Ok("true" | "false") | Err(std::env::VarError::NotPresent) => {},
+            _ => return Err(invalid()),
+        }
         let twilio = twilio_webhook::Config::from_env();
+        if std::env::var("NOVU_TWILIO_WEBHOOK_REQUIRE_DISPATCH_ACCOUNT").as_deref() == Ok("true") && twilio.is_none() { return Err(invalid()); }
         let resend = resend_webhook::Config::from_env();
         if std::env::var("NOVU_RESEND_WEBHOOK_LOCK_CORRELATION_JOBS").as_deref() == Ok("true") && resend.is_none() {
             return Err(invalid());

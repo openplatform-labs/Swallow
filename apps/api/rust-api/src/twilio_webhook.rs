@@ -19,6 +19,7 @@ pub struct Config {
     public_url: String,
     public_path: String,
     auth_tokens: Vec<Vec<u8>>,
+    require_dispatch_account: bool,
 }
 
 impl Config {
@@ -61,8 +62,14 @@ impl Config {
             public_url,
             public_path,
             auth_tokens,
+            require_dispatch_account: false,
         })
     }
+    pub fn require_dispatch_account(mut self, required: bool) -> Self {
+        self.require_dispatch_account = required;
+        self
+    }
+
     pub fn from_env() -> Option<Self> {
         let current = novu_rust_contracts::secret::from_env(
             "NOVU_TWILIO_WEBHOOK_AUTH_TOKEN",
@@ -78,12 +85,17 @@ impl Config {
         if let Some(previous) = previous {
             tokens.push(previous.into_bytes());
         }
+        let required = match std::env::var("NOVU_TWILIO_WEBHOOK_REQUIRE_DISPATCH_ACCOUNT").as_deref() {
+            Ok("true") => true,
+            Ok("false") | Err(std::env::VarError::NotPresent) => false,
+            _ => return None,
+        };
         Self::new_with_tokens(
             std::env::var("NOVU_TWILIO_WEBHOOK_ENVIRONMENT_ID").ok()?,
             std::env::var("NOVU_TWILIO_WEBHOOK_ACCOUNT_SID").ok()?,
             std::env::var("NOVU_TWILIO_WEBHOOK_URL").ok()?,
             tokens,
-        )
+        ).map(|config| config.require_dispatch_account(required))
     }
 }
 
@@ -286,8 +298,11 @@ async fn receive_inner(
     {
         return StatusCode::BAD_REQUEST;
     }
+    if config.require_dispatch_account && dispatch.is_none() {
+        return StatusCode::NOT_FOUND;
+    }
     if let (Some(job), Some(dispatch)) = (job, dispatch) {
-        let rows = db.execute("WITH locked_job AS MATERIALIZED (SELECT id,environment_id FROM novu_queue_jobs WHERE id=$7 AND environment_id=$1 AND kind='experimental_twilio_sms' FOR UPDATE) INSERT INTO novu_rust_twilio_delivery_events(environment_id,account_sid,message_sid,status,error_code,job_id,dispatch_id) SELECT e.id,$3,$4,$5,$6,j.id,d.id FROM novu_rust_environments e JOIN locked_job j ON j.environment_id=e.id JOIN novu_rust_twilio_dispatch_ids d ON d.job_id=j.id AND d.environment_id=e.id AND d.id=$8 AND (d.account_sid IS NULL OR d.account_sid=$3) WHERE e.id=$1 AND e.organization_id=$2 ON CONFLICT(environment_id,account_sid,message_sid,status,error_code) DO UPDATE SET job_id=EXCLUDED.job_id,dispatch_id=EXCLUDED.dispatch_id WHERE (novu_rust_twilio_delivery_events.job_id IS NULL OR novu_rust_twilio_delivery_events.job_id=EXCLUDED.job_id) AND (novu_rust_twilio_delivery_events.dispatch_id IS NULL OR novu_rust_twilio_delivery_events.dispatch_id=EXCLUDED.dispatch_id)", &[&environment,&organization,&account,&message,&status,&error,&job,&dispatch]).await;
+        let rows = db.execute("WITH locked_job AS MATERIALIZED (SELECT id,environment_id FROM novu_queue_jobs WHERE id=$7 AND environment_id=$1 AND kind='experimental_twilio_sms' FOR UPDATE) INSERT INTO novu_rust_twilio_delivery_events(environment_id,account_sid,message_sid,status,error_code,job_id,dispatch_id) SELECT e.id,$3,$4,$5,$6,j.id,d.id FROM novu_rust_environments e JOIN locked_job j ON j.environment_id=e.id JOIN novu_rust_twilio_dispatch_ids d ON d.job_id=j.id AND d.environment_id=e.id AND d.id=$8 AND (d.account_sid=$3 OR (d.account_sid IS NULL AND NOT $9)) WHERE e.id=$1 AND e.organization_id=$2 ON CONFLICT(environment_id,account_sid,message_sid,status,error_code) DO UPDATE SET job_id=EXCLUDED.job_id,dispatch_id=EXCLUDED.dispatch_id WHERE (novu_rust_twilio_delivery_events.job_id IS NULL OR novu_rust_twilio_delivery_events.job_id=EXCLUDED.job_id) AND (novu_rust_twilio_delivery_events.dispatch_id IS NULL OR novu_rust_twilio_delivery_events.dispatch_id=EXCLUDED.dispatch_id)", &[&environment,&organization,&account,&message,&status,&error,&job,&dispatch,&config.require_dispatch_account]).await;
         match rows {
             Ok(0) => StatusCode::NOT_FOUND,
             Ok(_) => StatusCode::NO_CONTENT,
