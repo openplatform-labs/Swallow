@@ -36,27 +36,53 @@ cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-wo
 cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply worker "$WORKER/migrations"
 cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply api "$API/migrations"
 db_sql -q -v ON_ERROR_STOP=1 <<'SQL'
+CREATE ROLE smtp_fixture_worker LOGIN;
+GRANT USAGE ON SCHEMA public TO smtp_fixture_worker;
+GRANT SELECT,UPDATE ON public.novu_queue_jobs TO smtp_fixture_worker;
+GRANT SELECT,INSERT,UPDATE ON public.novu_rust_smtp_attempts,public.novu_rust_email_workflow_worker_config TO smtp_fixture_worker;
+GRANT SELECT,UPDATE ON public.novu_rust_subscribers TO smtp_fixture_worker;
+GRANT SELECT ON public.novu_rust_workflow_preferences,public.novu_rust_subscriber_preferences,public.novu_rust_subscriber_workflow_preferences,public.novu_rust_workflows,public.novu_rust_contexts TO smtp_fixture_worker;
+GRANT SELECT,INSERT,UPDATE,DELETE ON public.novu_rust_email_messages TO smtp_fixture_worker;
+GRANT SELECT,UPDATE ON public.novu_rust_email_step_outcomes TO smtp_fixture_worker;
 INSERT INTO public.novu_rust_users VALUES('attachment-user');
-INSERT INTO public.novu_rust_environments VALUES('attachment-env','fixture-org');
+INSERT INTO public.novu_rust_environments VALUES('attachment-env','fixture-org'),('other-env','fixture-org');
+INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) VALUES('11111111-1111-4111-8111-000000000099','other-env','experimental_smtp_email','{"to":["other@example.test"],"subject":"other","html":"other"}');
 INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,in_app_content,email_subject,email_html,email_provider,inbox_metadata) VALUES('attachment-env','smtp-attachment',true,true,'Hello','SMTP attachments','<p>hello</p>','smtp','{"id":"fixture-workflow"}');
 INSERT INTO public.novu_rust_api_keys(key_hash,environment_id,user_id) VALUES(encode(sha256(convert_to('fixture-api-key','UTF8')),'hex'),'attachment-env','attachment-user');
+REVOKE INSERT ON public.novu_rust_smtp_attempts FROM smtp_fixture_worker;
 SQL
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost -addext subjectAltName=DNS:localhost -addext basicConstraints=critical,CA:FALSE -keyout "$TEST_DIR/key" -out "$TEST_DIR/cert" >"$TEST_DIR/openssl.log" 2>&1
 printf '%s' fixture-password > "$TEST_DIR/password"
 cargo build --quiet --locked --manifest-path "$API/Cargo.toml" --bin novu-rust-api
 cargo build --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin in-app-worker --bin smtp-worker
-python3 "$WORKER/tests/fixtures/smtp_starttls_fixture.py" "$TEST_DIR/cert" "$TEST_DIR/key" "$TEST_DIR/message" > "$TEST_DIR/smtp-port" 2>"$TEST_DIR/smtp-fixture.log" & FIXTURE_PID=$!
+python3 "$WORKER/tests/fixtures/smtp_starttls_fixture.py" "$TEST_DIR/cert" "$TEST_DIR/key" "$TEST_DIR/message" "$TEST_DIR/connected" > "$TEST_DIR/smtp-port" 2>"$TEST_DIR/smtp-fixture.log" & FIXTURE_PID=$!
 for _ in $(seq 1 100); do [[ -s "$TEST_DIR/smtp-port" ]] && break; kill -0 "$FIXTURE_PID"; sleep 0.1; done
 SMTP_PORT=$(cat "$TEST_DIR/smtp-port")
 env -i PATH="$PATH" DATABASE_URL="$DATABASE_URL" NOVU_POSTGRES_ALLOW_INSECURE=true LISTEN_ADDR="127.0.0.1:$API_PORT" SWALLOW_API_HEALTH_ENDPOINTS_ENABLED=true "$API/target/debug/novu-rust-api" >"$TEST_DIR/api.log" 2>&1 & API_PID=$!
 env -i PATH="$PATH" DATABASE_URL="$DATABASE_URL" NOVU_POSTGRES_ALLOW_INSECURE=true "$WORKER/target/debug/in-app-worker" >"$TEST_DIR/in-app.log" 2>&1 & INAPP_PID=$!
-env -i PATH="$PATH" DATABASE_URL="$DATABASE_URL" NOVU_POSTGRES_ALLOW_INSECURE=true NOVU_SMTP_ENVIRONMENT_ID=attachment-env SWALLOW_SMTP_HOST=localhost SWALLOW_SMTP_PORT="$SMTP_PORT" SWALLOW_SMTP_FROM=sender@example.test SWALLOW_SMTP_TLS=starttls SWALLOW_SMTP_USERNAME=fixture-user SWALLOW_SMTP_PASSWORD_FILE="$TEST_DIR/password" SWALLOW_SMTP_CA_FILE="$TEST_DIR/cert" "$WORKER/target/debug/smtp-worker" >"$TEST_DIR/smtp.log" 2>&1 & SMTP_PID=$!
+env -i PATH="$PATH" DATABASE_URL="postgres://smtp_fixture_worker@127.0.0.1:$DB_PORT/postgres" NOVU_POSTGRES_ALLOW_INSECURE=true NOVU_SMTP_ENVIRONMENT_ID=attachment-env SWALLOW_SMTP_HOST=localhost SWALLOW_SMTP_PORT="$SMTP_PORT" SWALLOW_SMTP_FROM=sender@example.test SWALLOW_SMTP_TLS=starttls SWALLOW_SMTP_USERNAME=fixture-user SWALLOW_SMTP_PASSWORD_FILE="$TEST_DIR/password" SWALLOW_SMTP_CA_FILE="$TEST_DIR/cert" "$WORKER/target/debug/smtp-worker" >"$TEST_DIR/smtp.log" 2>&1 & SMTP_PID=$!
 for _ in $(seq 1 100); do curl -fsS "http://127.0.0.1:$API_PORT/health/ready" >/dev/null 2>&1 && break; kill -0 "$API_PID"; sleep 0.1; done
 cat > "$TEST_DIR/request.json" <<'JSON'
 {"name":"smtp-attachment","to":{"subscriberId":"recipient","email":"recipient@example.test"},"transactionId":"smtp-attachment-http","overrides":{"email":{"headers":{"X-Swallow-Test":"fixture-value","List-Unsubscribe":"<https://example.test/unsubscribe>"}}},"payload":{"attachments":[{"file":"aGVsbG8=","name":"hello.txt","mime":"text/plain"},{"file":{"type":"Buffer","data":[0,1,255]},"name":"logo.png","mime":"image/png","cid":"logo","channels":["email"]}]}}
 JSON
 STATUS=$(curl -sS -o "$TEST_DIR/response" -w '%{http_code}' -H 'Authorization: ApiKey fixture-api-key' -H 'Content-Type: application/json' --data-binary @"$TEST_DIR/request.json" "http://127.0.0.1:$API_PORT/v1/events/trigger")
 [[ "$STATUS" == 201 ]] || { echo "trigger returned $STATUS" >&2; cat "$TEST_DIR/response" >&2; exit 1; }
+# The worker may claim a job, but without attempt INSERT it must not contact the relay.
+for _ in $(seq 1 100); do
+  CLAIMED=$(db_sql -At -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM public.novu_queue_jobs WHERE environment_id='attachment-env' AND kind='experimental_smtp_email' AND status='running'")
+  [[ "$CLAIMED" == 1 ]] && break
+  kill -0 "$SMTP_PID"; sleep 0.1
+done
+[[ "$CLAIMED" == 1 ]] || { echo 'SMTP worker did not claim the fixture job' >&2; exit 1; }
+for _ in $(seq 1 100); do
+  rg -q 'SMTP worker unavailable; reconnecting' "$TEST_DIR/smtp.log" && break
+  kill -0 "$SMTP_PID"; sleep 0.1
+done
+rg -q 'SMTP worker unavailable; reconnecting' "$TEST_DIR/smtp.log"
+[[ $(db_sql -At -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM public.novu_rust_smtp_attempts WHERE environment_id='attachment-env'") == 0 ]]
+[[ ! -e "$TEST_DIR/connected" && ! -s "$TEST_DIR/message" ]]
+db_sql -q -v ON_ERROR_STOP=1 -c "GRANT INSERT ON public.novu_rust_smtp_attempts TO smtp_fixture_worker"
+db_sql -q -v ON_ERROR_STOP=1 -c "UPDATE public.novu_queue_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE environment_id='attachment-env' AND kind='experimental_smtp_email' AND status='running'"
 for _ in $(seq 1 200); do
   DONE=$(db_sql -At -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM public.novu_queue_jobs j JOIN public.novu_rust_smtp_attempts a ON a.job_id=j.id WHERE j.environment_id='attachment-env' AND j.kind='experimental_smtp_email' AND j.status='completed' AND a.state='accepted'")
   [[ "$DONE" == 1 && -s "$TEST_DIR/message" ]] && break
@@ -76,4 +102,8 @@ assert p['logo.png'].get_payload(decode=True)==bytes([0,1,255])
 assert p['logo.png'].get('Content-ID')=='<logo>'
 PY2
 [[ $(db_sql -At -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM public.novu_queue_jobs WHERE environment_id='attachment-env' AND status='completed' AND attachment_completed_at IS NOT NULL AND ((kind='experimental_static_in_app_attachments_v1' AND payload ? 'emailAttachments') OR (kind='experimental_smtp_email' AND payload ? 'attachments'))") == 2 ]]
-echo 'HTTP trigger, actual workers, SMTP attachment MIME and retention timestamps passed'
+[[ $(db_sql -At -v ON_ERROR_STOP=1 -c "SELECT status='pending' AND NOT EXISTS(SELECT 1 FROM public.novu_rust_smtp_attempts WHERE job_id='11111111-1111-4111-8111-000000000099') FROM public.novu_queue_jobs WHERE id='11111111-1111-4111-8111-000000000099'") == t ]]
+# Table grants are intentionally broad: prove the remaining cross-environment risk.
+[[ $(db_sql -qAt -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_worker; SELECT count(*) FROM public.novu_queue_jobs WHERE environment_id='other-env'") == 1 ]]
+[[ $(db_sql -qAt -v ON_ERROR_STOP=1 -c "SELECT has_table_privilege('smtp_fixture_worker','public.novu_rust_subscribers','DELETE')") == f ]]
+echo 'HTTP trigger, restricted SMTP worker, revoked attempt permission, recovery and environment filtering passed'

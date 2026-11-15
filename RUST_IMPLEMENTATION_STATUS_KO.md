@@ -1,3 +1,5 @@
+SMTP 워커 제한 로그인 시험: 실제 HTTP·인앱·SMTP 워커와 모의 STARTTLS 서버에서 SMTP 워커만 별도 제한 DB 로그인으로 실행했다. 시도 INSERT 권한을 회수하면 릴레이에 연결하지 않고, 권한 복원과 강제 임대 만료 후 작업을 복구해 발송한다. 일반 실행은 설정된 환경만 처리했으나 해당 로그인으로 다른 환경 큐를 직접 조회할 수 있음을 확인했다. **DB 수준 테넌트 격리는 아직 미완성**이며 API·인앱 워커는 시험에서 관리자 계정을 사용했다. 실제 공급자·운영 부하·HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
 SMTP 사용자 지정 헤더: 워크플로 이메일 override의 문자열 헤더를 제한적으로 MIME에 반영한다. 발신·수신·MIME 구조 관련 필드, 제어 문자, 잘못된 이름, 대소문자만 다른 중복 헤더는 발송 전에 거절한다. 임시 로컬 PostgreSQL·실제 HTTP API와 워커·모의 STARTTLS 서버에서 일반 헤더와 List-Unsubscribe를 확인하고 주입 및 기존 워커 회귀 시험을 통과했다. 관리자 DB 계정·모의 릴레이 시험이며 실제 SMTP 공급자, 원본 Novu 전체 계약 및 운영 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
 SMTP 동기 DB 장애 전환 시험: 단일 호스트 PostgreSQL 17 동기 복제에서 실제 SMTP 워커와 모의 STARTTLS 서버를 실행했다. 본문 수신 후 응답 전 시도 기록이 대기 DB에 복제된 것을 확인하고 워커와 주 DB를 종료·대기 DB를 승격했다. 장애 전부터 실행 중이던 다른 워커가 재연결해 강제로 만료한 시도를 `unknown`으로 보존하고 별도 작업을 발송했으며 짧은 관찰 기간에 추가 연결은 없었다. 관리자 DB 계정·모의 릴레이 시험으로 실제 공급자, 비동기 복제·분할 뇌·다중 호스트 HA는 미검증이다. Docker를 사용할 수 없어 격리 로컬 DB를 사용했다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.

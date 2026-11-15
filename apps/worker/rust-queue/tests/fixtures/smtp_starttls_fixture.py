@@ -1,11 +1,14 @@
 import socket, ssl, sys
-cert, key, output = sys.argv[1:]
+cert, key, output = sys.argv[1:4]
+connection_marker = sys.argv[4] if len(sys.argv) > 4 else None
 listener = socket.socket()
 listener.bind(('127.0.0.1', 0))
 listener.listen(1)
 listener.settimeout(10)
 print(listener.getsockname()[1], flush=True)
 conn, _ = listener.accept()
+if connection_marker:
+    open(connection_marker, "w").close()
 conn.settimeout(10)
 reader = conn.makefile('rb')
 conn.sendall(b'220 localhost ESMTP\r\n')
