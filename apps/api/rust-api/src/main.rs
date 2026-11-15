@@ -53,6 +53,7 @@ struct ApiState {
     routing: Routing,
     max_inflight_per_connection: usize,
     ready_require_capacity: bool,
+    ready_require_writable: bool,
     timeout: Duration,
     request_timeout: Option<Duration>,
     draining: Arc<AtomicBool>,
@@ -187,11 +188,15 @@ async fn ready(State(shared): State<ApiState>) -> Response {
                 let inflight = shared.inflight.clone();
                 let require_capacity = shared.ready_require_capacity;
                 let limit = shared.max_inflight_per_connection;
+                let require_writable = shared.ready_require_writable;
                 probes.spawn(async move {
-                    let query_ok = matches!(
-                        tokio::time::timeout(timeout, current.db.simple_query("SELECT 1")).await,
-                        Ok(Ok(_))
-                    );
+                    let query_ok = if require_writable {
+                        matches!(tokio::time::timeout(timeout, current.db.query_one(
+                            "SELECT NOT pg_is_in_recovery() AND current_setting('transaction_read_only') = 'off'", &[],
+                        )).await, Ok(Ok(row)) if row.get::<_, bool>(0))
+                    } else {
+                        matches!(tokio::time::timeout(timeout, current.db.simple_query("SELECT 1")).await, Ok(Ok(_)))
+                    };
                     let still_current = slot
                         .read()
                         .ok()
@@ -396,6 +401,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if ready_require_capacity && max_inflight_per_connection == 0 {
         return Err("API readiness capacity requires an inflight limit".into());
     }
+    let ready_require_writable =
+        match std::env::var("SWALLOW_API_READY_REQUIRE_WRITABLE").as_deref() {
+            Ok("true") => true,
+            Ok("false") | Err(std::env::VarError::NotPresent) => false,
+            _ => return Err("invalid API readiness writable setting".into()),
+        };
     let health_endpoints = match std::env::var("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED").as_deref() {
         Ok("true") => true,
         Ok("false") | Err(std::env::VarError::NotPresent) => false,
@@ -415,6 +426,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         routing,
         max_inflight_per_connection,
         ready_require_capacity,
+        ready_require_writable,
         timeout,
         request_timeout,
         draining: Arc::new(AtomicBool::new(false)),

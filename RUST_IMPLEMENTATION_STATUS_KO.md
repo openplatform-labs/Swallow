@@ -1,5 +1,7 @@
 ## Slack 공유 대기 상태 조회와 경보
 
+- API 쓰기 가능 준비 상태: `SWALLOW_API_READY_REQUIRE_WRITABLE=true`를 선택하면 PostgreSQL 복제 중이거나 세션이 읽기 전용인 연결은 준비 상태에서 제외한다. 임시 PostgreSQL 17의 읽기 전용 세션과 실제 로컬 복제본 승격 전후를 시험했다. 처음 테스트 실행은 별도의 복제본 환경 변수가 필요한 시험까지 함께 실행해 실패했으며, 각 시험을 분리해 재실행했다. 판정은 순간 상태이며 쓰기 권한·스키마 검증, 분리된 주 서버 차단이나 모든 연결의 쓰기 가능성을 보장하지 않는다. 운영 로드밸런서·다중 호스트 HA는 미검증이다. 설정과 재현 조건은 [API README](apps/api/rust-api/README.md)를 참고한다.
+
 - 64비트 경보 상태 장애 전환 시험: 로컬 PostgreSQL 17 동기 복제에서 V2 조건과 대상 버전이 복제된 뒤 주 서버를 종료·대기 서버를 승격했다. 기존 조건 쿨다운 유지, 기존 범위 제한 경로 거절 및 신규 조건의 두 DB 클라이언트 동시 예약 중 한 건만 성공함을 확인했다. 첫 실행은 테스트 코드의 Rust 참조 수명 오류로 컴파일 실패했고 수정 후 통과했다. 합성 접수와 DB 함수만 사용했으며 실제 전송, 제한 DB 계정·다중 호스트·운영 HA는 미검증이다. 재현은 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
 - Twilio 지연 재시도 상태 화면: API 0102와 Angular 운영 경보 화면에서 기한 초과·임대 만료·콜백 차단 집계를 조회한다. 별도 JWT 조회 권한과 DB `alert_view`가 필요하다. 시험 JWT·제한 DB 계정·임시 PostgreSQL에서 권한 회수와 환경 격리를, Angular 테스트 200건과 실제 로컬 브라우저에서 집계 표시·권한 회수 후 값 제거를 확인했다. 실제 IdP·운영 HA는 미검증이며 상태는 수신을 증명하지 않는다. [API README](apps/api/rust-api/README.md)와 [관리 화면 README](apps/dashboard/swallow/README.md)를 참고한다.
