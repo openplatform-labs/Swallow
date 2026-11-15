@@ -474,13 +474,18 @@ async fn run(
                 match tokio::time::timeout(
                     timeout,
                     db.query_one(
-                        "SELECT public.novu_rust_fcm_cooldown_check($1)",
+                        "SELECT public.novu_rust_fcm_cooldown_check($1), pg_catalog.has_function_privilege(session_user,'public.novu_rust_fcm_cooldown_record_429(text,integer)','EXECUTE'), pg_catalog.has_function_privilege(session_user,'public.novu_rust_fcm_cooldown_record_503(text,integer)','EXECUTE')",
                         &[&environment],
                     ),
                 )
                 .await
                 {
-                    Ok(Ok(_)) => {}
+                    Ok(Ok(row)) if row.get::<_,bool>(1) && (!shared_unavailable || row.get::<_,bool>(2)) => {}
+                    Ok(Ok(_)) => {
+                        task.abort();
+                        let _ = task.await;
+                        return Err("FCM shared cooldown recording permission denied".into());
+                    }
                     Ok(Err(error)) if error.as_db_error().is_some() => {
                         task.abort();
                         let _ = task.await;

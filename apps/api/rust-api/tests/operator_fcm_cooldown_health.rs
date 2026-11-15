@@ -116,6 +116,16 @@ async fn health_is_scoped_and_requires_independent_operator_and_database_grants(
     assert_eq!(result.1["fallbackSeconds"], 60);
     assert_eq!(result.1["deferred"], 1);
     assert_eq!(result.1["overdue"], 1);
+    assert_eq!(result.1["deadlineSource"], Value::Null);
+    db.execute("UPDATE public.novu_rust_fcm_cooldown_policies SET deadline_source=503,deadline_recorded_at=clock_timestamp() WHERE environment_id=$1", &[&env]).await.unwrap();
+    let detail = response(app.clone(), &token, "GET", &path, None).await;
+    assert_eq!(detail.0, StatusCode::OK);
+    assert_eq!(detail.1["deadlineSource"], 503);
+    assert!(detail.1["deadlineRecordedAt"].is_string());
+    db.execute("UPDATE public.novu_rust_fcm_cooldown_policies SET not_before=clock_timestamp()-interval '1 second' WHERE environment_id=$1", &[&env]).await.unwrap();
+    let inactive = response(app.clone(), &token, "GET", &path, None).await;
+    assert_eq!(inactive.1["deadlineSource"], Value::Null);
+    assert_eq!(inactive.1["deadlineRecordedAt"], Value::Null);
     for suffix in ["0", "86401", "01", "-1"] {
         let invalid = format!(
             "/v1/experimental/operator/fcm-cooldown-health?environmentId={env}&graceSeconds={suffix}"

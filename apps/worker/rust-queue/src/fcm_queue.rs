@@ -1081,10 +1081,12 @@ async fn process_one_inner(
     let updated=tx.execute("UPDATE novu_rust_fcm_attempts SET state=$4,http_status=$5,provider_message_id=$6,updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$2 AND target_index=$3 AND state='dispatching'",&[&job.id,&environment,&index_i32,&state,&status,&id]).await?;
     if updated == 1 {
         if shared_cooldown && (status == Some(429) || (shared_unavailable && status == Some(503))) {
-            tx.query_one(
-                "SELECT public.novu_rust_fcm_cooldown_record($1,$2)",
-                &[&environment, &retry_after],
-            )
+            let sql = if status == Some(503) {
+                "SELECT public.novu_rust_fcm_cooldown_record_503($1,$2)"
+            } else {
+                "SELECT public.novu_rust_fcm_cooldown_record_429($1,$2)"
+            };
+            tx.query_one(sql, &[&environment, &retry_after])
             .await?;
         }
         if let Some(seconds) = retry_after {
@@ -2319,6 +2321,7 @@ mod tests {
         db.batch_execute(include_str!("../migrations/0188_fcm_shared_cooldown.sql"))
             .await
             .unwrap();
+        db.batch_execute(include_str!("../migrations/0193_fcm_cooldown_source.sql")).await.unwrap();
         db.execute("INSERT INTO public.novu_rust_fcm_cooldown_policies(environment_id,fallback_seconds) VALUES('shared-fcm',60)",&[]).await.unwrap();
         db.execute("INSERT INTO public.novu_rust_fcm_cooldown_workers SELECT 'shared-fcm',rolname,oid FROM pg_roles WHERE rolname=session_user",&[]).await.unwrap();
         let first = Uuid::new_v4();
@@ -2398,6 +2401,8 @@ mod tests {
             assert!(process_one_with_shared_unavailable(&mut db, env, Some(&provider), None, false, crate::push_step_policy::Policy::Snapshot, crate::push_step_policy::PreferencePolicy::Snapshot, crate::push_step_policy::TargetPolicy::Reference, RateLimitPolicy::Continue, UnavailablePolicy::Continue, true, enabled).await.unwrap());
             let first_state=db.query_one("SELECT state,http_status FROM public.novu_rust_fcm_attempts WHERE job_id=$1", &[&first]).await.unwrap();
             assert_eq!(first_state.get::<_,String>(0), "unknown"); assert_eq!(first_state.get::<_,Option<i32>>(1), Some(503));
+            let source: Option<i32> = db.query_one("SELECT deadline_source FROM public.novu_rust_fcm_cooldown_policies WHERE environment_id=$1", &[&env]).await.unwrap().get(0);
+            assert_eq!(source, if enabled { Some(503) } else { None });
             crate::enqueue(&db, second, env, JOB_KIND, &shared_payload).await.unwrap();
             assert!(process_one_with_shared_unavailable(&mut other_db, env, Some(&provider), None, false, crate::push_step_policy::Policy::Snapshot, crate::push_step_policy::PreferencePolicy::Snapshot, crate::push_step_policy::TargetPolicy::Reference, RateLimitPolicy::Continue, UnavailablePolicy::Continue, true, enabled).await.unwrap());
             let row=db.query_one("SELECT status,available_at>clock_timestamp()+make_interval(secs=>$2::double precision),(SELECT count(*) FROM public.novu_rust_fcm_attempts WHERE job_id=$1) FROM public.novu_queue_jobs WHERE id=$1", &[&second,&minimum]).await.unwrap();

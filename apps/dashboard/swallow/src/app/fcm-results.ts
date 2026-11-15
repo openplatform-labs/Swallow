@@ -1,7 +1,7 @@
 import { Component, EventEmitter, Input, OnChanges, OnDestroy, Output, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { validChannelPage } from './channel-page';
-type FcmCooldown={active:boolean;notBefore:string|null;fallbackSeconds:number;deferred:number;overdue:number};
+type FcmCooldown={active:boolean;notBefore:string|null;fallbackSeconds:number;deferred:number;overdue:number;deadlineSource:429|503|null;deadlineRecordedAt:string|null};
 type ReviewJob={jobId:string;acceptedCount:number;rejectedCount:number;revision:string};
 type ReviewRequest={requestId:string;jobId:string;revision:string;reason:string};
 type PartialJob={jobId:string;acceptedCount:number;rejectedCount:number};
@@ -28,7 +28,9 @@ export class FcmResults implements OnChanges,OnDestroy {
     try {const params=this.params(),grace=this.cooldownGraceSeconds;if(!Number.isInteger(grace)||grace<1||grace>86400)throw new Error('input');params.set('graceSeconds',String(grace));
       const response=await fetch(`${this.origin()}/v1/experimental/operator/fcm-cooldown-health?${params}`,{headers:{Authorization:`Bearer ${this.token.trim()}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});if(!response.ok)throw new Error('request');const value:unknown=await response.json();if(!value||typeof value!=='object')throw new Error('response');const row=value as Record<string,unknown>;
       if(typeof row['active']!=='boolean'||!(row['notBefore']===null||(typeof row['notBefore']==='string'&&row['notBefore'].length>0&&row['notBefore'].length<=128))||(row['active']&&row['notBefore']===null)||!Number.isSafeInteger(row['fallbackSeconds'])||(row['fallbackSeconds'] as number)<60||(row['fallbackSeconds'] as number)>86400||['deferred','overdue'].some(k=>!Number.isSafeInteger(row[k])||(row[k] as number)<0)||(row['overdue'] as number)>(row['deferred'] as number))throw new Error('response');
-      if(seq!==this.cooldownSequence)return;this.cooldownHealth.set({active:row['active'],notBefore:row['notBefore'] as string|null,fallbackSeconds:row['fallbackSeconds'] as number,deferred:row['deferred'] as number,overdue:row['overdue'] as number});this.cooldownStatus.set('loaded');
+      const source=row['deadlineSource']??null, recorded=row['deadlineRecordedAt']??null;
+      if(![null,429,503].includes(source as number|null)||!(recorded===null||(typeof recorded==='string'&&recorded.length<=128&&!Number.isNaN(Date.parse(recorded)))))throw new Error('response');
+      if(seq!==this.cooldownSequence)return;this.cooldownHealth.set({active:row['active'],notBefore:row['notBefore'] as string|null,fallbackSeconds:row['fallbackSeconds'] as number,deferred:row['deferred'] as number,overdue:row['overdue'] as number,deadlineSource:source as 429|503|null,deadlineRecordedAt:recorded as string|null});this.cooldownStatus.set('loaded');
     }catch{if(seq===this.cooldownSequence){this.cooldownHealth.set(null);this.cooldownStatus.set('error');}}finally{if(seq===this.cooldownSequence)this.cooldownAbort=null;}
   }
   clearReviewList():void {this.reviewListSequence++;this.reviewListAbort?.abort();this.reviewListAbort=null;this.reviewRows.set([]);this.reviewNext.set(null);this.reviewListStatus.set('idle');}
