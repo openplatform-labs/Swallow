@@ -2,7 +2,8 @@
 """Exercise JWT automatic retry policy and grant changes across a local synchronous promotion."""
 import base64,json,os,pathlib,socket,subprocess,time,urllib.error,urllib.request,uuid
 root=pathlib.Path(os.environ['TEST_ROOT']);directory=pathlib.Path(os.environ['TEST_FIXTURE_DIR'])
-primary=os.environ['TEST_PRIMARY_URL'];standby=os.environ['TEST_STANDBY_URL'];psql=os.environ['TEST_PSQL'];pgctl=os.environ['TEST_LOCAL_PG_CTL'];api=None;worker=None
+primary=os.environ['TEST_PRIMARY_URL'];standby=os.environ['TEST_STANDBY_URL'];psql=os.environ['TEST_PSQL'];pgctl=os.environ['TEST_LOCAL_PG_CTL'];api=None;worker=None;transaction=None
+inflight=os.environ.get('TEST_SMTP_AUTO_INFLIGHT')=='true'
 
 def sql(url,query):
     p=subprocess.run([psql,url,'-q','-At','-v','ON_ERROR_STOP=1','-c',query],capture_output=True,text=True,timeout=15)
@@ -58,9 +59,23 @@ INSERT INTO public.novu_rust_smtp_auto_retry_workers SELECT 'smtp-policy-ha',rol
     assert call(policy,target)[0]==200
     until(lambda:sql(standby,"SELECT count(*) FROM public.novu_rust_operator_jwt_smtp_auto_policy_audit WHERE environment_id='smtp-policy-ha'")=='1' and sql(standby,"SELECT count(*) FROM public.novu_rust_operator_jwt_smtp_auto_grant_audit WHERE environment_id='smtp-policy-ha'")=='1','changes did not replicate')
     worker_cfg={**os.environ,'DATABASE_URL':os.environ['TEST_FAILOVER_URL'].replace('postgres://postgres@','postgres://smtp_auto_ha_worker@',1),'NOVU_POSTGRES_ALLOW_INSECURE':'true','NOVU_SMTP_ENVIRONMENT_ID':'smtp-policy-ha','SWALLOW_SMTP_AUTO_RETRY_INTERVAL_SECONDS':'1'}
-    worker=subprocess.Popen([os.environ['TEST_AUTO_WORKER']],env=worker_cfg,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-    time.sleep(2);assert worker.poll() is None
+    job_sql="""INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES('11111111-1111-4111-8111-111111111111','smtp-policy-ha','experimental_smtp_email','{}','failed');
+INSERT INTO public.novu_rust_smtp_attempts(job_id,environment_id,state,updated_at) VALUES('11111111-1111-4111-8111-111111111111','smtp-policy-ha','unknown',clock_timestamp()-interval '1 hour');"""
+    if inflight:
+        sql(primary,job_sql)
+        role_primary=primary.replace('postgres://postgres@','postgres://smtp_auto_ha_worker@',1)
+        txn_sql="SET application_name='smtp_auto_inflight_fixture'; BEGIN; DO $$ BEGIN IF public.novu_rust_smtp_auto_retry_batch('smtp-policy-ha',1)<>1 THEN RAISE EXCEPTION 'expected one retry'; END IF; END $$; SELECT pg_sleep(90); COMMIT;"
+        transaction=subprocess.Popen([psql,role_primary,'-q','-v','ON_ERROR_STOP=1','-c',txn_sql],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        until(lambda:sql(primary,"SELECT count(*) FROM pg_stat_activity WHERE application_name='smtp_auto_inflight_fixture' AND wait_event='PgSleep'")=='1','retry transaction did not reach uncommitted state')
+    else:
+        worker=subprocess.Popen([os.environ['TEST_AUTO_WORKER']],env=worker_cfg,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        time.sleep(2);assert worker.poll() is None
     control(os.environ['TEST_LOCAL_PRIMARY_DATA'],'-m','immediate','stop');control(os.environ['TEST_LOCAL_STANDBY_DATA'],'promote')
+    if inflight:
+        assert transaction.wait(timeout=10)!=0
+        assert sql(standby,"SELECT count(*) FROM public.novu_rust_smtp_auto_retries WHERE environment_id='smtp-policy-ha'")=='0'
+        assert sql(standby,"SELECT status FROM public.novu_queue_jobs WHERE id='11111111-1111-4111-8111-111111111111'")=='failed'
+        assert sql(standby,"SELECT state FROM public.novu_rust_smtp_attempts WHERE job_id='11111111-1111-4111-8111-111111111111'")=='unknown'
     until(lambda:call(policy,target)[0]==200,'API did not reconnect with target grant')
     status,value=call(policy,admin);assert status==200 and value=={'enabled':True,'maxRetries':2,'delaySeconds':10,'eligibleSince':'-infinity','revision':'1'}
     status,value=call(policy,admin,'PUT',change);assert status==200 and value['replayed'] is True
@@ -70,14 +85,20 @@ INSERT INTO public.novu_rust_smtp_auto_retry_workers SELECT 'smtp-policy-ha',rol
     status,value=call(grants,admin,'PUT',revoke);assert status==200 and value['changed'] is True
     assert call(policy,target)[0]==401
     assert sql(standby,"SELECT count(*) FROM public.novu_rust_operator_jwt_smtp_auto_grant_audit WHERE environment_id='smtp-policy-ha'")=='2'
-    sql(standby,"""INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES('11111111-1111-4111-8111-111111111111','smtp-policy-ha','experimental_smtp_email','{}','failed');
-INSERT INTO public.novu_rust_smtp_attempts(job_id,environment_id,state,updated_at) VALUES('11111111-1111-4111-8111-111111111111','smtp-policy-ha','unknown',clock_timestamp()-interval '1 hour');""")
+    if inflight:
+        worker=subprocess.Popen([os.environ['TEST_AUTO_WORKER']],env=worker_cfg,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    else:
+        sql(standby,job_sql)
     until(lambda:sql(standby,"SELECT count(*) FROM public.novu_rust_smtp_auto_retries WHERE environment_id='smtp-policy-ha'")=='1','retry did not run after promotion')
     assert worker.poll() is None
     assert sql(standby,"SELECT status FROM public.novu_queue_jobs WHERE id='11111111-1111-4111-8111-111111111111'")=='pending'
     assert sql(standby,"SELECT count(*) FROM public.novu_rust_smtp_attempts WHERE job_id='11111111-1111-4111-8111-111111111111'")=='0'
     print('SMTP automatic retry policy, delegated rights and recovery survived synchronous promotion.')
 finally:
+    if transaction is not None and transaction.poll() is None:
+        transaction.terminate()
+        try:transaction.wait(timeout=10)
+        except subprocess.TimeoutExpired:transaction.kill();transaction.wait()
     if worker is not None:
         worker.terminate()
         try:worker.wait(timeout=10)
