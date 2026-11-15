@@ -101,6 +101,27 @@ async fn delayed_retry_is_fenced_audited_and_blocks_callback_evidence() {
     assert_eq!(unchanged.get::<_, String>(0), "failed");
     assert_eq!(unchanged.get::<_, i64>(1), 1);
     assert_eq!(unchanged.get::<_, i64>(2), 0);
+    // Simulate the legacy worker's dispatch insert after claiming a scheduled job.
+    let (legacy_job, legacy_dispatch) = rejected(&db, &env, Some(0)).await;
+    assert!(
+        cli(role_url, &env, legacy_job, legacy_dispatch)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let lease = Uuid::new_v4();
+    db.execute("UPDATE public.novu_queue_jobs SET status='running',lease_token=$2,lease_until=clock_timestamp()+interval '1 minute' WHERE id=$1", &[&legacy_job,&lease]).await.unwrap();
+    assert!(db.execute("INSERT INTO public.novu_rust_twilio_attempts(job_id,environment_id,state,dispatch_id) VALUES($1,$2,'dispatching',$3)", &[&legacy_job,&env,&Uuid::new_v4()]).await.is_err());
+    assert_eq!(
+        db.query_one(
+            "SELECT count(*) FROM public.novu_rust_twilio_attempts WHERE job_id=$1",
+            &[&legacy_job]
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0),
+        0
+    );
     let mut first = cli(role_url, &env, job, dispatch).spawn().unwrap();
     let mut second = cli(role_url, &env, job, dispatch).spawn().unwrap();
     let outcomes = [
@@ -113,7 +134,15 @@ async fn delayed_retry_is_fenced_audited_and_blocks_callback_evidence() {
     assert!(row.get::<_, bool>(1));
     assert_eq!(row.get::<_, i64>(2), 0);
     assert_eq!(row.get::<_, i64>(3), 1);
-    assert!(db.query_one("SELECT twilio_delayed_retry FROM public.novu_queue_jobs WHERE id=$1", &[&job]).await.unwrap().get::<_,bool>(0));
+    assert!(
+        db.query_one(
+            "SELECT twilio_delayed_retry FROM public.novu_queue_jobs WHERE id=$1",
+            &[&job]
+        )
+        .await
+        .unwrap()
+        .get::<_, bool>(0)
+    );
     db.execute("DELETE FROM public.novu_rust_delivery_operator_grants WHERE environment_id=$1 AND database_principal=$2 AND decision='retry'",&[&env,&role]).await.unwrap();
     let (revoked, id) = rejected(&db, &env, Some(120)).await;
     assert!(!cli(role_url, &env, revoked, id).status().unwrap().success());

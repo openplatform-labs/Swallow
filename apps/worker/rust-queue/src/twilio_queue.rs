@@ -109,12 +109,8 @@ pub async fn process_one_with_step_policy(
     }
     // Serialize with callback inserts on the queue row. Legacy decisions and
     // job-only callbacks lack a dispatch ID and are handled conservatively.
-    let protect_delayed = if provider.tracks_status_callbacks() {
-        true
-    } else {
-        tx.query_one("SELECT twilio_delayed_retry FROM public.novu_queue_jobs WHERE id=$1 AND environment_id=$2", &[&job.id,&environment]).await?.get::<_,bool>(0)
-    };
-    if protect_delayed {
+    let delayed_retry = tx.query_one("SELECT twilio_delayed_retry FROM public.novu_queue_jobs WHERE id=$1 AND environment_id=$2", &[&job.id,&environment]).await?.get::<_,bool>(0);
+    if provider.tracks_status_callbacks() || delayed_retry {
         let evidence = tx.query_opt("SELECT r.retry_dispatch_id FROM (SELECT retry_dispatch_id FROM novu_rust_delivery_reconciliations WHERE environment_id=$1 AND job_id=$2 AND target_index IS NULL AND decision='retry' ORDER BY decision_order DESC LIMIT 1) r WHERE EXISTS(SELECT 1 FROM novu_rust_twilio_delivery_events e WHERE e.environment_id=$1 AND e.job_id=$2 AND (r.retry_dispatch_id IS NULL OR e.dispatch_id IS NULL OR e.dispatch_id=r.retry_dispatch_id))", &[&environment,&job.id]).await?;
         if let Some(evidence) = evidence {
             let dispatch: Option<Uuid> = evidence.get(0);
@@ -254,6 +250,12 @@ pub async fn process_one_with_step_policy(
     if policy != crate::sms_step_policy::Policy::Snapshot && !lock_live(&tx, &job).await? {
         tx.rollback().await?;
         return Ok(true);
+    }
+    // Transaction-local marker prevents legacy workers from creating a dispatch
+    // for delayed retries; it is not an authorization boundary against SQL access.
+    if delayed_retry {
+        let marker = format!("{}:{}", job.id, job.lease_token);
+        tx.query_one("SELECT set_config('swallow.twilio_delayed_retry_fence',$1,true)", &[&marker]).await?;
     }
     let dispatch = Uuid::new_v4();
     let inserted = tx.execute("INSERT INTO novu_rust_twilio_attempts(job_id,environment_id,state,dispatch_id) VALUES ($1,$2,'dispatching',$3) ON CONFLICT(job_id) DO NOTHING", &[&job.id,&job.environment_id,&dispatch]).await?;
