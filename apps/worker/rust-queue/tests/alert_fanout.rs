@@ -39,6 +39,25 @@ async fn per_target_delivery_checks_control_real_alert_children() {
     let text=String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("slack failed: attention"),"{text}");
     assert!(text.contains("slack attempts: completed"),"{text}");
+    let resend_job=Uuid::new_v4();
+    novu_postgres_queue::enqueue(&db,resend_job,env,novu_postgres_queue::resend_queue::JOB_KIND,&serde_json::json!({})).await.unwrap();
+    db.execute("UPDATE novu_queue_jobs SET available_at=clock_timestamp()-interval '120 seconds' WHERE id=$1", &[&resend_job]).await.unwrap();
+    db.execute("INSERT INTO novu_rust_resend_projection_heartbeat(environment_id,last_completed_at) VALUES ($1,clock_timestamp())", &[&env]).await.unwrap();
+    for heartbeat_test in [false,true] {
+        if heartbeat_test {
+            db.execute("UPDATE novu_queue_jobs SET status='cancelled' WHERE id=$1", &[&resend_job]).await.unwrap();
+            db.execute("UPDATE novu_rust_resend_projection_heartbeat SET last_completed_at=clock_timestamp()-interval '120 seconds' WHERE environment_id=$1", &[&env]).await.unwrap();
+        }
+        let (fast,slow)=if heartbeat_test { (serde_json::json!({"resend_heartbeat_max_seconds":60}),serde_json::json!({"resend_heartbeat_max_seconds":600})) } else { (serde_json::json!({"resend_grace_seconds":60}),serde_json::json!({"resend_grace_seconds":600})) };
+        std::fs::write(&config,serde_json::to_vec(&serde_json::json!({"targets":[
+          {"channel":"slack","id":"failed","webhook_file":secret,"delivery_checks":{"resend":true},"alert_timing":fast},
+          {"channel":"slack","id":"attempts","webhook_file":secret,"delivery_checks":{"resend":true},"alert_timing":slow}
+        ]})).unwrap()).unwrap();
+        let output=Command::new(env!("CARGO_BIN_EXE_alert-fanout")).args(["delivery",env,"300","300","60"]).arg(&config).env("DATABASE_URL",&url).env("NOVU_POSTGRES_ALLOW_INSECURE","true").env_remove("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS").env_remove("SWALLOW_ALERT_BINDING_KEY").env_remove("SWALLOW_ALERT_BINDING_KEY_FILE").output().unwrap();
+        assert_eq!(output.status.code(),Some(2),"{}",String::from_utf8_lossy(&output.stderr));
+        let text=String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("slack failed: attention"),"{text}");assert!(text.contains("slack attempts: completed"),"{text}");
+    }
     std::fs::remove_dir_all(dir).unwrap();
 }
 #[tokio::test]

@@ -133,6 +133,20 @@ impl DeliveryThresholds {
         }
     }
 }
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct AlertTiming {
+    resend_grace_seconds: Option<u32>,
+    resend_heartbeat_max_seconds: Option<u32>,
+    cooldown_seconds: Option<u32>,
+}
+impl AlertTiming {
+    fn valid(&self) -> bool {
+        self.resend_grace_seconds.is_none_or(|v| (1..=86400).contains(&v))
+            && self.resend_heartbeat_max_seconds.is_none_or(|v| (1..=86400).contains(&v))
+            && self.cooldown_seconds.is_none_or(|v| (60..=86400).contains(&v))
+    }
+}
 #[derive(Deserialize)]
 #[serde(tag = "channel", rename_all = "lowercase", deny_unknown_fields)]
 enum Target {
@@ -141,6 +155,7 @@ enum Target {
         webhook_file: String,
         delivery_checks: Option<DeliveryChecks>,
         delivery_thresholds: Option<DeliveryThresholds>,
+        alert_timing: Option<AlertTiming>,
     },
     Email {
         id: String,
@@ -159,6 +174,7 @@ enum Target {
         ip_pool_name: Option<String>,
         delivery_checks: Option<DeliveryChecks>,
         delivery_thresholds: Option<DeliveryThresholds>,
+        alert_timing: Option<AlertTiming>,
     },
 }
 #[derive(Deserialize)]
@@ -197,8 +213,12 @@ impl Target {
         let thresholds = match self {
             Self::Slack { delivery_thresholds, .. } | Self::Email { delivery_thresholds, .. } => delivery_thresholds,
         };
+        let timing = match self {
+            Self::Slack { alert_timing, .. } | Self::Email { alert_timing, .. } => alert_timing,
+        };
         valid_id
             && thresholds.as_ref().is_none_or(DeliveryThresholds::valid)
+            && timing.as_ref().is_none_or(AlertTiming::valid)
             && match self {
                 Self::Slack { webhook_file, .. } => path(webhook_file),
                 Self::Email {
@@ -271,6 +291,23 @@ impl Target {
                         }
                 }
             }
+    }
+    fn command_args(&self, default: &[String], delivery: bool) -> Vec<String> {
+        let mut args = default.to_vec();
+        let timing = match self {
+            Self::Slack { alert_timing, .. } | Self::Email { alert_timing, .. } => alert_timing,
+        };
+        if let Some(timing) = timing {
+            if delivery {
+                if let Some(value) = timing.resend_grace_seconds { args[1] = value.to_string(); }
+                if let Some(value) = timing.resend_heartbeat_max_seconds { args[2] = value.to_string(); }
+            }
+            if let Some(value) = timing.cooldown_seconds {
+                let last = args.len() - 1;
+                args[last] = value.to_string();
+            }
+        }
+        args
     }
     fn apply(&self, cmd: &mut Command) {
         for key in [
@@ -490,7 +527,7 @@ async fn run(stop: novu_postgres_queue::shutdown::Stop) -> Result<()> {
             };
             let mut command = Command::new(&binary);
             command
-                .args(&command_args)
+                .args(target.command_args(&command_args, name == "send-delivery-alert"))
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .kill_on_drop(true);

@@ -3,6 +3,35 @@
 use std::{os::unix::fs::PermissionsExt, process::Command};
 use uuid::Uuid;
 #[test]
+fn alert_timing_overrides_are_isolated_for_delivery_and_database() {
+    let dir=std::env::temp_dir().join(format!("swallow-alert-timing-{}",Uuid::new_v4()));std::fs::create_dir(&dir).unwrap();
+    let fanout=dir.join("alert-fanout");std::fs::copy(env!("CARGO_BIN_EXE_alert-fanout"),&fanout).unwrap();
+    for name in ["send-delivery-alert","send-database-alert"] {
+        let child=dir.join(name);std::fs::write(&child,"#!/bin/sh\nprintf '%s:%s\\n' \"$SWALLOW_ALERT_SLACK_TARGET_ID\" \"$*\" >> \"$FANOUT_TEST_LOG\"\n").unwrap();std::fs::set_permissions(child,std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let config=dir.join("config.json");let log=dir.join("log");
+    let targets=serde_json::json!({"targets":[
+        {"channel":"slack","id":"a","webhook_file":dir.join("key"),"alert_timing":{"resend_grace_seconds":30,"resend_heartbeat_max_seconds":40,"cooldown_seconds":90}},
+        {"channel":"slack","id":"b","webhook_file":dir.join("key"),"alert_timing":{"resend_heartbeat_max_seconds":70}},
+        {"channel":"slack","id":"c","webhook_file":dir.join("key")}
+    ]});
+    std::fs::write(&config,serde_json::to_vec(&targets).unwrap()).unwrap();
+    for (mode,args,expected) in [
+        ("delivery",vec!["env","300","120","60"],"a:env 30 40 90\nb:env 300 70 60\nc:env 300 120 60\n"),
+        ("database",vec!["env","probe","60"],"a:env probe 90\nb:env probe 60\nc:env probe 60\n"),
+    ] {
+        std::fs::write(&log,"").unwrap();let output=Command::new(&fanout).arg(mode).args(args).arg(&config).env("FANOUT_TEST_LOG",&log).output().unwrap();
+        assert!(output.status.success());assert_eq!(std::fs::read_to_string(&log).unwrap(),expected);
+    }
+    for timing in [serde_json::json!({"cooldown_seconds":59}),serde_json::json!({"resend_grace_seconds":0}),serde_json::json!({"resend_heartbeat_max_seconds":86401}),serde_json::json!({"cooldown_seconds":"90"}),serde_json::json!({"cooldown":90})] {
+        let mut bad=targets.clone();bad["targets"][2]["alert_timing"]=timing;
+        std::fs::write(&config,serde_json::to_vec(&bad).unwrap()).unwrap();std::fs::write(&log,"").unwrap();
+        let output=Command::new(&fanout).args(["delivery","env","300","120","60"]).arg(&config).env("FANOUT_TEST_LOG",&log).output().unwrap();
+        assert_eq!(output.status.code(),Some(1));assert_eq!(std::fs::read_to_string(&log).unwrap(),"");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[test]
 fn all_target_thresholds_are_forwarded_to_the_matching_child_variables() {
     let names = ["discord_cooldown_grace_seconds","discord_retry_grace_seconds","smtp_credential_max_age_seconds","smtp_credential_min_healthy","smtp_ca_max_age_seconds","smtp_ca_min_healthy","fcm_credential_max_age_seconds","fcm_credential_min_healthy","fcm_unrecorded_claim_min_gap","fcm_unrecorded_claim_grace_seconds","fcm_cooldown_grace_seconds","fcm_partial_window_seconds","twilio_delayed_grace_seconds","resend_cooldown_grace_seconds","slack_cooldown_grace_seconds","resend_auto_grace_seconds","twilio_grace_seconds","twilio_heartbeat_max_seconds","sendgrid_grace_seconds","sendgrid_heartbeat_max_seconds","queue_max_wait_seconds"];
     let dir=std::env::temp_dir().join(format!("swallow-alert-thresholds-{}",Uuid::new_v4()));std::fs::create_dir(&dir).unwrap();
