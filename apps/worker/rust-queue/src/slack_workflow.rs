@@ -596,7 +596,7 @@ pub async fn delivery_one_with_cooldown(
         tx.commit().await?;
         return Ok(true);
     }
-    if policy != StepPolicy::Snapshot && !live(&tx, &job).await? {
+    if !live(&tx, &job).await? {
         tx.rollback().await?;
         return Ok(true);
     }
@@ -608,6 +608,10 @@ pub async fn delivery_one_with_cooldown(
     if inserted != 1 {
         terminal(&tx, &job, "failed", Some("Slack attempt requires review")).await?;
         tx.commit().await?;
+        return Ok(true);
+    }
+    if !live(&tx, &job).await? {
+        tx.rollback().await?;
         return Ok(true);
     }
     tx.commit().await?;
@@ -1410,6 +1414,47 @@ mod tests {
         assert!(delivery_one(&mut db,"slack-429-test",&providers).await.unwrap());server.await.unwrap();
         let rows=db.query("SELECT j.kind,j.status,a.state,a.http_status,a.retry_after_seconds,a.retry_not_before>clock_timestamp()+interval '100 seconds' FROM public.novu_queue_jobs j JOIN public.novu_rust_slack_attempts a ON a.job_id=j.id WHERE j.environment_id='slack-429-test' ORDER BY j.kind",&[]).await.unwrap();
         assert_eq!(rows.len(),3);for row in rows {assert_eq!(row.get::<_,String>(1),"failed");assert_eq!(row.get::<_,String>(2),"rejected");assert_eq!(row.get::<_,i32>(3),429);assert_eq!(row.get::<_,i32>(4),120);assert!(row.get::<_,bool>(5));}
+    }
+
+    #[tokio::test]
+    #[ignore = "requires fully migrated disposable PostgreSQL and loopback HTTP"]
+    async fn chat_reservation_expired_lease_rolls_back_without_send() {
+        let (mut db, driver) = tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(), NoTls).await.unwrap();
+        tokio::spawn(async move { let _ = driver.await; });
+        let env = "chat-lease-test";
+        db.batch_execute("INSERT INTO public.novu_rust_environments VALUES('chat-lease-test','org'); INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps) VALUES('chat-lease-test','flow',true,true); INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES('chat-lease-test','alice','alice-internal','{}'); INSERT INTO public.novu_rust_slack_endpoint_integrations VALUES('chat-lease-test','main'); INSERT INTO public.novu_rust_slack_channel_endpoints(environment_id,identifier,subscriber_id,subscriber_internal_id,integration_identifier,endpoint_type,endpoint) VALUES('chat-lease-test','one','alice','alice-internal','main','slack_channel','{\"channelId\":\"C1\"}')").await.unwrap();
+        let app_job=Uuid::new_v4(); let hook_job=Uuid::new_v4(); let discord_job=Uuid::new_v4();
+        crate::enqueue(&db,app_job,env,crate::slack_queue::JOB_KIND,&json!({"channel":"C1","text":"hello"})).await.unwrap();
+        crate::enqueue(&db,hook_job,env,crate::slack_webhook_queue::JOB_KIND,&json!({"destination":"ops","text":"hello"})).await.unwrap();
+        crate::enqueue(&db,discord_job,env,crate::discord_queue::JOB_KIND,&json!({"destination":"ops","content":"hello"})).await.unwrap();
+        let ctx=Context {subscriber_id:"alice".into(),subscriber_internal_id:"alice-internal".into(),workflow_identifier:"flow".into(),workflow_internal_id:None,content_template:"hello".into(),payload:json!({}),context_keys:vec![],actor:None,actor_internal_id:None,endpoint_snapshot:None};
+        crate::enqueue(&db,Uuid::new_v4(),env,FANOUT_KIND,&serde_json::to_value(ctx).unwrap()).await.unwrap();
+        assert!(fanout_one(&mut db,env).await.unwrap());
+        let workflow_job:Uuid=db.query_one("SELECT id FROM novu_queue_jobs WHERE environment_id=$1 AND kind=$2", &[&env,&DELIVERY_KIND]).await.unwrap().get(0);
+        db.batch_execute("CREATE FUNCTION public.test_expire_chat_lease() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN UPDATE public.novu_queue_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=NEW.job_id; RETURN NEW; END $$; CREATE TRIGGER test_expire_slack_lease BEFORE INSERT ON public.novu_rust_slack_attempts FOR EACH ROW EXECUTE FUNCTION public.test_expire_chat_lease(); CREATE TRIGGER test_expire_discord_lease BEFORE INSERT ON public.novu_rust_discord_attempts FOR EACH ROW EXECUTE FUNCTION public.test_expire_chat_lease()").await.unwrap();
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap(); let url=format!("http://{}/",listener.local_addr().unwrap());
+        let app=Slack::test_endpoint("fixture".into(),&url).unwrap();
+        let hook=crate::slack_webhook::Webhook::test_endpoint(&url).unwrap();
+        let discord=crate::discord::Webhook::test_endpoint(&url).unwrap();
+        assert!(crate::slack_queue::process_one(&mut db,env,&app).await.unwrap());
+        assert!(crate::slack_webhook_queue::process_one(&mut db,env,"ops",&hook).await.unwrap());
+        assert!(crate::discord_queue::process_one(&mut db,env,"ops",&discord).await.unwrap());
+        let mut providers=Providers::new(); providers.insert(("main".into(),String::new()),app);
+        assert!(delivery_one(&mut db,env,&providers).await.unwrap());
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(200),listener.accept()).await.is_err());
+        for id in [app_job,hook_job,discord_job,workflow_job] {
+            let row=db.query_one("SELECT status,(SELECT count(*) FROM novu_rust_slack_attempts WHERE job_id=$1)+(SELECT count(*) FROM novu_rust_discord_attempts WHERE job_id=$1) FROM novu_queue_jobs WHERE id=$1", &[&id]).await.unwrap();
+            assert_eq!(row.get::<_,String>(0),"running"); assert_eq!(row.get::<_,i64>(1),0);
+        }
+        db.batch_execute("DROP TRIGGER test_expire_slack_lease ON public.novu_rust_slack_attempts; DROP TRIGGER test_expire_discord_lease ON public.novu_rust_discord_attempts; DROP FUNCTION public.test_expire_chat_lease()").await.unwrap();
+        db.execute("UPDATE novu_queue_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=ANY($1)", &[&vec![app_job,hook_job,discord_job,workflow_job]]).await.unwrap();
+        assert_eq!(crate::slack_queue::recover_expired(&mut db,env).await.unwrap(),1);
+        assert_eq!(crate::slack_webhook_queue::recover_expired(&mut db,env,"ops").await.unwrap(),1);
+        assert_eq!(crate::discord_queue::recover_expired(&mut db,env,"ops").await.unwrap(),1);
+        assert_eq!(recover_expired(&mut db,env).await.unwrap(),1);
+        for id in [app_job,hook_job,discord_job,workflow_job] {
+            assert_eq!(db.query_one("SELECT status FROM novu_queue_jobs WHERE id=$1", &[&id]).await.unwrap().get::<_,String>(0),"pending");
+        }
     }
 
 }

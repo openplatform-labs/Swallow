@@ -83,6 +83,10 @@ pub async fn process_one_with_cooldown(
         tx.commit().await?;
         return Ok(true);
     }
+    if !live(&tx, &job).await? {
+        tx.rollback().await?;
+        return Ok(true);
+    }
     tx.commit().await?;
     let (state, code, id, diagnostic, retry_after) = match provider.send(&message).await {
         Ok(id) => ("accepted", None, Some(id), None, None),

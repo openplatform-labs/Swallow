@@ -221,6 +221,10 @@ pub async fn process_one(
         tx.commit().await?;
         return Ok(true);
     }
+    if !live(&tx, &job).await? {
+        tx.rollback().await?;
+        return Ok(true);
+    }
     tx.commit().await?;
     let (state, code, id, timestamp, diagnostic, retry_after) = match provider.send(&body).await {
         Ok(result) => (
