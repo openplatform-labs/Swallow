@@ -63,6 +63,7 @@ async fn destinations_have_independent_slots_and_failures_do_not_suppress_others
                 "bad-secret-should-not-appear",
             )
             .env("NOVU_RESEND_API_KEY", "inherited-secret")
+            .env("NOVU_SENDGRID_IP_POOL_NAME", "inherited-pool")
             .env_remove("SWALLOW_ALERT_CHECK_SCOPED_ACCESS")
             .env_remove("SWALLOW_ALERT_SCOPED_DELIVERY")
             .env_remove("SWALLOW_ALERT_COOLDOWN_POLICY")
@@ -73,7 +74,7 @@ async fn destinations_have_independent_slots_and_failures_do_not_suppress_others
         {"channel":"slack","id":"ops-a","webhook_file":slack},
         {"channel":"email","id":"mail-a","provider":"resend","to":"one@example.test","from":"sender@example.test","api_key_file":key},
         {"channel":"slack","id":"ops-b","webhook_file":slack},
-        {"channel":"email","id":"mail-b","provider":"sendgrid","to":"two@example.test","from":"sender@example.test","api_key_file":key,"region":"eu"}
+        {"channel":"email","id":"mail-b","provider":"sendgrid","to":"two@example.test","from":"sender@example.test","api_key_file":key,"region":"eu","ip_pool_name":"ops-pool"}
     ]);
     write(targets.clone());
     for (mode, concurrency) in [

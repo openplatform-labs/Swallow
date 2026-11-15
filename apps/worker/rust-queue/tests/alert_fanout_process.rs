@@ -10,12 +10,13 @@ fn routes_each_destination_and_continues_after_a_failure() {
     std::fs::copy(env!("CARGO_BIN_EXE_alert-fanout"), &fanout).unwrap();
     let script = r#"#!/bin/sh
 case "${SWALLOW_ALERT_SLACK_TARGET_ID:-}" in
-  ops-a) test -z "${SWALLOW_ALERT_EMAIL_TO:-}" || exit 8; printf '%s\n' 'slack ops-a' >> "$FANOUT_TEST_LOG"; exit 2;;
+  ops-a) test -z "${NOVU_SENDGRID_IP_POOL_NAME:-}" || exit 8; test -z "${SWALLOW_ALERT_EMAIL_TO:-}" || exit 8; printf '%s\n' 'slack ops-a' >> "$FANOUT_TEST_LOG"; exit 2;;
   ops-b) test -z "${SWALLOW_ALERT_EMAIL_TO:-}" || exit 8; printf '%s\n' 'slack ops-b' >> "$FANOUT_TEST_LOG"; exit 0;;
 esac
 case "${SWALLOW_ALERT_EMAIL_TARGET_ID:-}" in
-  mail-a) test -z "${SWALLOW_ALERT_SLACK_WEBHOOK:-}" || exit 8; test -z "${NOVU_RESEND_API_KEY:-}" || exit 8; test "$SWALLOW_ALERT_EMAIL_PROVIDER" = resend || exit 8; printf '%s\n' 'email mail-a' >> "$FANOUT_TEST_LOG"; exit 1;;
-  mail-b) test -z "${SWALLOW_ALERT_SLACK_WEBHOOK:-}" || exit 8; test -z "${NOVU_SENDGRID_API_KEY:-}" || exit 8; test "$SWALLOW_ALERT_EMAIL_PROVIDER" = sendgrid || exit 8; test "$NOVU_SENDGRID_REGION" = eu || exit 8; printf '%s\n' 'email mail-b' >> "$FANOUT_TEST_LOG"; exit 0;;
+  mail-a) test -z "${NOVU_SENDGRID_IP_POOL_NAME:-}" || exit 8; test -z "${SWALLOW_ALERT_SLACK_WEBHOOK:-}" || exit 8; test -z "${NOVU_RESEND_API_KEY:-}" || exit 8; test "$SWALLOW_ALERT_EMAIL_PROVIDER" = resend || exit 8; printf '%s\n' 'email mail-a' >> "$FANOUT_TEST_LOG"; exit 1;;
+  mail-b) test -z "${SWALLOW_ALERT_SLACK_WEBHOOK:-}" || exit 8; test -z "${NOVU_SENDGRID_API_KEY:-}" || exit 8; test "$SWALLOW_ALERT_EMAIL_PROVIDER" = sendgrid || exit 8; test "$NOVU_SENDGRID_REGION" = eu || exit 8; test "$NOVU_SENDGRID_IP_POOL_NAME" = pool-b || exit 8; printf '%s\n' 'email mail-b' >> "$FANOUT_TEST_LOG"; exit 0;;
+  mail-c) test -z "${NOVU_SENDGRID_IP_POOL_NAME:-}" || exit 8; printf '%s\n' 'email mail-c' >> "$FANOUT_TEST_LOG"; exit 0;;
 esac
 exit 9
 "#;
@@ -30,7 +31,8 @@ exit 9
       {"channel":"slack","id":"ops-a","webhook_file":dir.join("slack")},
       {"channel":"email","id":"mail-a","provider":"resend","to":"one@example.test","from":"sender@example.test","api_key_file":dir.join("key-a")},
       {"channel":"slack","id":"ops-b","webhook_file":dir.join("slack")},
-      {"channel":"email","id":"mail-b","provider":"sendgrid","to":"two@example.test","from":"sender@example.test","api_key_file":dir.join("key-b"),"region":"eu"}
+      {"channel":"email","id":"mail-b","provider":"sendgrid","to":"two@example.test","from":"sender@example.test","api_key_file":dir.join("key-b"),"region":"eu","ip_pool_name":"pool-b"},
+      {"channel":"email","id":"mail-c","provider":"sendgrid","to":"three@example.test","from":"sender@example.test","api_key_file":dir.join("key-c")}
     ]});
     std::fs::write(&config, serde_json::to_vec(&targets).unwrap()).unwrap();
     for mode in ["delivery", "database"] {
@@ -47,12 +49,13 @@ exit 9
             .env("SWALLOW_ALERT_SLACK_WEBHOOK", "inherited-slack-secret")
             .env("NOVU_RESEND_API_KEY", "inherited-email-secret")
             .env("NOVU_SENDGRID_API_KEY", "inherited-sendgrid-secret")
+            .env("NOVU_SENDGRID_IP_POOL_NAME", "inherited-pool")
             .output()
             .unwrap();
         assert_eq!(out.status.code(), Some(1));
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
-            "slack ops-a\nemail mail-a\nslack ops-b\nemail mail-b\n"
+            "slack ops-a\nemail mail-a\nslack ops-b\nemail mail-b\nemail mail-c\n"
         );
         let stdout = String::from_utf8(out.stdout).unwrap();
         let stderr = String::from_utf8(out.stderr).unwrap();
@@ -79,6 +82,14 @@ exit 9
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(std::fs::read_to_string(&log).unwrap(), "");
+    let invalid = serde_json::json!({"targets":[{"channel":"email","id":"invalid","provider":"resend","to":"one@example.test","from":"sender@example.test","api_key_file":dir.join("key-a"),"ip_pool_name":"pool"}]});
+    std::fs::write(&config, serde_json::to_vec(&invalid).unwrap()).unwrap();
+    let out = Command::new(&fanout)
+        .args(["delivery", "env", "300", "120", "60"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
     std::fs::remove_dir_all(dir).unwrap();
 }
 

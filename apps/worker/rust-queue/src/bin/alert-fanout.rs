@@ -32,6 +32,7 @@ enum Target {
         api_key_file: String,
         sender_name: Option<String>,
         region: Option<String>,
+        ip_pool_name: Option<String>,
     },
 }
 #[derive(Deserialize)]
@@ -76,6 +77,7 @@ impl Target {
                     sender_name,
                     region,
                     provider,
+                    ip_pool_name,
                     ..
                 } => {
                     email(to)
@@ -85,9 +87,12 @@ impl Target {
                             .as_ref()
                             .is_none_or(|v| v.len() <= 256 && !v.contains(['\r', '\n', '\0']))
                         && match provider {
-                            Provider::Resend => region.is_none(),
+                            Provider::Resend => region.is_none() && ip_pool_name.is_none(),
                             Provider::Sendgrid => {
                                 region.as_ref().is_none_or(|v| v == "global" || v == "eu")
+                                    && ip_pool_name.as_ref().is_none_or(|v| {
+                                        v.len() <= 256 && !v.contains(['\r', '\n', '\0'])
+                                    })
                             }
                         }
                 }
@@ -112,6 +117,7 @@ impl Target {
             "NOVU_SENDGRID_FROM",
             "NOVU_SENDGRID_SENDER_NAME",
             "NOVU_SENDGRID_REGION",
+            "NOVU_SENDGRID_IP_POOL_NAME",
         ] {
             cmd.env_remove(key);
         }
@@ -129,6 +135,7 @@ impl Target {
                 api_key_file,
                 sender_name,
                 region,
+                ip_pool_name,
             } => {
                 cmd.env("SWALLOW_ALERT_EMAIL_TARGET_ID", id)
                     .env("SWALLOW_DB_ALERT_EMAIL_TARGET_ID", id)
@@ -152,6 +159,9 @@ impl Target {
                             );
                         if let Some(region) = region {
                             cmd.env("NOVU_SENDGRID_REGION", region);
+                        }
+                        if let Some(pool) = ip_pool_name {
+                            cmd.env("NOVU_SENDGRID_IP_POOL_NAME", pool);
                         }
                     }
                 }

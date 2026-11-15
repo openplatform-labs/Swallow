@@ -638,19 +638,25 @@ pub fn email_from_env() -> DbResult<Option<(String, AlertEmailProvider)>> {
                 Ok("eu") => crate::sendgrid::Region::Eu,
                 _ => return Err("invalid SendGrid region".into()),
             };
-            AlertEmailProvider::Sendgrid(
-                crate::sendgrid::Sendgrid::new(crate::sendgrid::Config {
-                    api_key: novu_rust_contracts::secret::from_env(
-                        "NOVU_SENDGRID_API_KEY",
-                        "NOVU_SENDGRID_API_KEY_FILE",
-                    )?
-                    .ok_or("SendGrid API key is required")?,
-                    from: std::env::var("NOVU_SENDGRID_FROM")?,
-                    sender_name: std::env::var("NOVU_SENDGRID_SENDER_NAME").unwrap_or_default(),
-                    region,
-                })
-                .map_err(|_| "invalid email configuration")?,
-            )
+            let mut provider = crate::sendgrid::Sendgrid::new(crate::sendgrid::Config {
+                api_key: novu_rust_contracts::secret::from_env(
+                    "NOVU_SENDGRID_API_KEY",
+                    "NOVU_SENDGRID_API_KEY_FILE",
+                )?
+                .ok_or("SendGrid API key is required")?,
+                from: std::env::var("NOVU_SENDGRID_FROM")?,
+                sender_name: std::env::var("NOVU_SENDGRID_SENDER_NAME").unwrap_or_default(),
+                region,
+            })
+            .map_err(|_| "invalid email configuration")?;
+            match std::env::var("NOVU_SENDGRID_IP_POOL_NAME") {
+                Ok(pool) if pool.len() <= 256 && !pool.contains(['\r', '\n', '\0']) => {
+                    provider = provider.with_default_ip_pool(pool);
+                }
+                Err(std::env::VarError::NotPresent) => {}
+                _ => return Err("invalid SendGrid IP pool setting".into()),
+            }
+            AlertEmailProvider::Sendgrid(provider)
         }
         _ => return Err("invalid email alert provider".into()),
     };
@@ -1861,7 +1867,8 @@ mod tests {
                     },
                     url.as_str(),
                 )
-                .unwrap(),
+                .unwrap()
+                .with_default_ip_pool("ops-pool".into()),
             );
             assert_eq!(
                 send_selected_email(&provider, "ops@example.test", &alert(), "ignored").await,
@@ -1875,6 +1882,7 @@ mod tests {
                 "ops@example.test"
             );
             assert_eq!(body["subject"], "Swallow delivery alert");
+            assert_eq!(body["ip_pool_name"], "ops-pool");
             assert!(!body.to_string().contains("fixture-key"));
             assert!(!request.to_ascii_lowercase().contains("idempotency-key:"));
         }
