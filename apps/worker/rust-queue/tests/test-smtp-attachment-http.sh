@@ -53,7 +53,7 @@ GRANT SELECT,UPDATE ON public.novu_rust_email_step_outcomes TO smtp_fixture_work
 INSERT INTO public.novu_rust_users VALUES('attachment-user');
 INSERT INTO public.novu_rust_environments VALUES('attachment-env','fixture-org'),('other-env','fixture-org');
 INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) VALUES('11111111-1111-4111-8111-000000000099','other-env','experimental_smtp_email','{"to":["other@example.test"],"subject":"other","html":"other"}');
-INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,in_app_content,email_subject,email_html,email_provider,inbox_metadata) VALUES('attachment-env','smtp-attachment',true,true,'Hello','SMTP attachments','<p>hello</p>','smtp','{"id":"fixture-workflow"}');
+INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,in_app_content,email_subject,email_html,email_provider,inbox_metadata,email_step_id) VALUES('attachment-env','smtp-attachment',true,true,'Hello','SMTP attachments','<p>hello</p>','smtp','{"id":"fixture-workflow"}','email-step');
 INSERT INTO public.novu_rust_api_keys(key_hash,environment_id,user_id) VALUES(encode(sha256(convert_to('fixture-api-key','UTF8')),'hex'),'attachment-env','attachment-user');
 REVOKE INSERT ON public.novu_rust_smtp_attempts FROM smtp_fixture_worker;
 SQL
@@ -109,7 +109,7 @@ env -i PATH="$PATH" DATABASE_URL="$DATABASE_URL" NOVU_POSTGRES_ALLOW_INSECURE=tr
 env -i PATH="$PATH" DATABASE_URL="postgres://smtp_fixture_worker@127.0.0.1:$DB_PORT/postgres" NOVU_POSTGRES_ALLOW_INSECURE=true NOVU_SMTP_ENVIRONMENT_ID=attachment-env SWALLOW_SMTP_SCOPED_RLS="${TEST_SMTP_RLS:-false}" SWALLOW_EMAIL_WORKFLOW_STEP_POLICY="${TEST_EMAIL_POLICY:-snapshot}" SWALLOW_SMTP_HOST=localhost SWALLOW_SMTP_PORT="$SMTP_PORT" SWALLOW_SMTP_FROM=sender@example.test SWALLOW_SMTP_TLS=starttls SWALLOW_SMTP_USERNAME=fixture-user SWALLOW_SMTP_PASSWORD_FILE="$TEST_DIR/password" SWALLOW_SMTP_CA_FILE="$TEST_DIR/cert" "$WORKER/target/debug/smtp-worker" >"$TEST_DIR/smtp.log" 2>&1 & SMTP_PID=$!
 for _ in $(seq 1 100); do curl -fsS "http://127.0.0.1:$API_PORT/health/ready" >/dev/null 2>&1 && break; kill -0 "$API_PID"; sleep 0.1; done
 cat > "$TEST_DIR/request.json" <<'JSON'
-{"name":"smtp-attachment","to":{"subscriberId":"recipient","email":"recipient@example.test"},"transactionId":"smtp-attachment-http","overrides":{"email":{"alternatives":[{"contentType":"text/calendar; method=REQUEST; charset=utf-8","content":"BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n"}],"headers":{"X-Swallow-Test":"fixture-value","List-Unsubscribe":"<https://example.test/unsubscribe>"}}},"payload":{"attachments":[{"file":"aGVsbG8=","name":"hello.txt","mime":"text/plain"},{"file":{"type":"Buffer","data":[0,1,255]},"name":"logo.png","mime":"image/png","cid":"logo","channels":["email"]}]}}
+{"name":"smtp-attachment","to":{"subscriberId":"recipient","email":"recipient@example.test"},"transactionId":"smtp-attachment-http","overrides":{"email":{"alternatives":[{"contentType":"text/calendar; method=REQUEST; charset=utf-8","content":"BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n"}],"headers":{"X-Swallow-Test":"fixture-value","List-Unsubscribe":"<https://example.test/unsubscribe>"}},"providers":{"smtp":{"alternatives":[{"contentType":"text/calendar","content":"PROVIDER"}]},"sendgrid":{"alternatives":[{"contentType":"text/calendar","content":"OTHER-PROVIDER"}]}},"steps":{"email-step":{"providers":{"smtp":{"alternatives":[{"contentType":"text/calendar; method=REQUEST; charset=utf-8","content":"BEGIN:VCALENDAR\r\nX-SOURCE:STEP\r\nEND:VCALENDAR\r\n"}]}}}}},"payload":{"attachments":[{"file":"aGVsbG8=","name":"hello.txt","mime":"text/plain"},{"file":{"type":"Buffer","data":[0,1,255]},"name":"logo.png","mime":"image/png","cid":"logo","channels":["email"]}]}}
 JSON
 python3 - "$TEST_DIR/request.json" "$TEST_DIR/invalid.json" <<'PY2'
 import json,sys
@@ -148,7 +148,7 @@ import email,sys
 m=email.message_from_binary_file(open(sys.argv[1],'rb'))
 assert m['X-Swallow-Test']=='fixture-value'
 assert m['List-Unsubscribe']=='<https://example.test/unsubscribe>'
-c=[x for x in m.walk() if x.get_content_type()=='text/calendar']; assert len(c)==1 and c[0].get_param('method')=='REQUEST' and b'BEGIN:VCALENDAR' in c[0].get_payload(decode=True)
+c=[x for x in m.walk() if x.get_content_type()=='text/calendar']; assert len(c)==1 and c[0].get_param('method')=='REQUEST' and b'X-SOURCE:STEP' in c[0].get_payload(decode=True)
 p={x.get_filename():x for x in m.walk() if x.get_filename()}
 assert set(p)=={'hello.txt','logo.png'}
 assert p['hello.txt'].get_payload(decode=True)==b'hello'
@@ -265,6 +265,6 @@ python3 - "$TEST_DIR/alternative-retention.json" <<'PY2'
 import json,sys
 assert len(json.load(open(sys.argv[1])))==2
 PY2
-[[ $(db_sql -At -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM public.novu_queue_jobs WHERE environment_id='attachment-env' AND alternative_scrubbed_at IS NOT NULL AND ((kind='experimental_static_in_app_attachments_v1' AND NOT (payload->'emailOverride' ? 'alternatives') AND payload ? 'emailAttachments') OR (kind='experimental_smtp_email' AND NOT (payload ? 'alternatives') AND NOT (payload#>'{workflow_context,overrides}' ? 'alternatives') AND payload ? 'attachments'))") == 2 ]]
+[[ $(db_sql -At -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM public.novu_queue_jobs WHERE environment_id='attachment-env' AND alternative_scrubbed_at IS NOT NULL AND ((kind='experimental_static_in_app_attachments_v1' AND NOT (payload->'emailOverride' ? 'alternatives') AND payload ? 'emailAttachments' AND NOT payload::text LIKE '%OTHER-PROVIDER%' AND NOT payload::text LIKE '%X-SOURCE:STEP%') OR (kind='experimental_smtp_email' AND NOT (payload ? 'alternatives') AND NOT (payload#>'{workflow_context,overrides}' ? 'alternatives') AND payload ? 'attachments'))") == 2 ]]
 if db_sql -q -v ON_ERROR_STOP=1 -c "UPDATE public.novu_queue_jobs SET status='pending' WHERE environment_id='attachment-env' AND alternative_scrubbed_at IS NOT NULL" >/dev/null 2>&1; then echo 'scrubbed alternatives were requeued' >&2; exit 1; fi
 echo 'HTTP trigger, restricted SMTP worker, revoked attempt permission, recovery and environment filtering passed'

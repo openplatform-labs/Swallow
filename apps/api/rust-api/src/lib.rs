@@ -3721,6 +3721,11 @@ async fn trigger(
             "Not Implemented",
         );
     }
+    let valid_email_alternatives = |value: &Value| value.as_array().is_some_and(|items| {
+        items.len() <= 10 && items.iter().all(|item| item.as_object().is_some_and(|part| {
+            part.len() == 2 && part.get("contentType").and_then(Value::as_str).is_some_and(|v| !v.is_empty() && v.len() <= 255 && !v.chars().any(char::is_control)) && part.get("content").and_then(Value::as_str).is_some()
+        })) && items.iter().filter_map(|item| item.get("content").and_then(Value::as_str)).map(str::len).sum::<usize>() <= 1_048_576
+    });
     let (override_severity, email_override, sms_override) = match object.get("overrides") {
         None | Some(Value::Null) => (None, None, None),
         Some(Value::Object(overrides))
@@ -3765,15 +3770,7 @@ async fn trigger(
                                 .all(|v| v.as_str().is_some_and(|s| !s.is_empty()))
                         }),
                         "replaceToRecipient" => value.is_boolean(),
-                        "alternatives" => value.as_array().is_some_and(|items| {
-                            items.len() <= 10 && items.iter().all(|item| {
-                                item.as_object().is_some_and(|part| {
-                                    part.len() == 2
-                                        && part.get("contentType").and_then(Value::as_str).is_some_and(|v| !v.is_empty() && v.len() <= 255 && !v.chars().any(char::is_control))
-                                        && part.get("content").and_then(Value::as_str).is_some()
-                                })
-                            }) && items.iter().filter_map(|item| item.get("content").and_then(Value::as_str)).map(str::len).sum::<usize>() <= 1_048_576
-                        }),
+                        "alternatives" => valid_email_alternatives(value),
                         "headers" => value
                             .as_object()
                             .is_some_and(|items| items.values().all(Value::is_string)),
@@ -3833,6 +3830,7 @@ async fn trigger(
             fields.iter().all(|(key, value)| match key.as_str() {
                 "subject" | "html" | "senderName" => value.is_string(),
                 "ipPoolName" => allow_ip_pool && value.is_string(),
+                "alternatives" => valid_email_alternatives(value),
                 "from" => value.as_str().is_some_and(|s| !s.is_empty()),
                 "to" | "cc" | "bcc" => value.as_array().is_some_and(|items| {
                     items
@@ -3943,6 +3941,7 @@ async fn trigger(
             entries.iter().all(|(key, layer)| match key.as_str() {
                 "sendgrid" => valid_layer(layer, true),
                 "resend" => valid_layer(layer, false),
+                "smtp" => layer.as_object().is_some_and(|fields| fields.iter().all(|(key,value)| key == "alternatives" && valid_email_alternatives(value))),
                 "twilio" => valid_sms_layer(layer),
                 "fcm" => valid_fcm_layer(layer),
                 _ => false,
