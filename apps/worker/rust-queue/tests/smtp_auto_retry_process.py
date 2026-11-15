@@ -37,7 +37,7 @@ server=Server(('127.0.0.1',0),Relay);thread=threading.Thread(target=server.serve
 try:
     env='smtp-auto-fixture';other='smtp-auto-other';first=str(uuid.uuid4());second=str(uuid.uuid4());old=str(uuid.uuid4());reviewed=str(uuid.uuid4())
     sql("""CREATE ROLE smtp_auto_fixture LOGIN; GRANT USAGE ON SCHEMA public TO smtp_auto_fixture;
-GRANT EXECUTE ON FUNCTION public.novu_rust_smtp_auto_retry_batch(text,integer),public.novu_rust_smtp_auto_history(text,bigint),public.novu_rust_smtp_auto_retry_health(text,integer) TO smtp_auto_fixture;
+GRANT EXECUTE ON FUNCTION public.novu_rust_smtp_auto_retry_batch(text,integer),public.novu_rust_smtp_auto_retry_batch_observed(text,integer),public.novu_rust_smtp_auto_worker_health_check(text,integer),public.novu_rust_smtp_auto_history(text,bigint),public.novu_rust_smtp_auto_retry_health(text,integer) TO smtp_auto_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_reserve_alert_v3(text,text,text,integer,bigint,bigint,bigint,bigint),public.novu_rust_observe_alert_conditions_v3(text,text,text,bigint,bigint,bigint,bigint) TO smtp_auto_fixture;
 INSERT INTO public.novu_rust_environments VALUES('smtp-auto-fixture','org'),('smtp-auto-other','org');
 INSERT INTO public.novu_rust_smtp_auto_retry_workers SELECT 'smtp-auto-fixture',rolname,oid FROM pg_roles WHERE rolname='smtp_auto_fixture';
@@ -60,7 +60,7 @@ INSERT INTO public.novu_rust_smtp_attempts(job_id,environment_id,state,updated_a
 INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'smtp-auto-fixture',rolname,'queue_ack',oid FROM pg_roles WHERE rolname='postgres';
 SELECT public.novu_rust_ack_smtp('smtp-auto-fixture','%s',a.revision,j.failure_revision,'fixture','reviewed') FROM public.novu_queue_jobs j JOIN public.novu_rust_smtp_attempts a ON a.job_id=j.id WHERE j.id='%s';"""%(reviewed,reviewed,reviewed,reviewed))
     runner_url=db.replace('postgres://postgres@','postgres://smtp_auto_fixture@',1)
-    runner={**os.environ,'DATABASE_URL':runner_url,'NOVU_POSTGRES_ALLOW_INSECURE':'true','NOVU_SMTP_ENVIRONMENT_ID':env,'SWALLOW_SMTP_AUTO_RETRY_INTERVAL_SECONDS':'1'}
+    runner={**os.environ,'DATABASE_URL':runner_url,'NOVU_POSTGRES_ALLOW_INSECURE':'true','NOVU_SMTP_ENVIRONMENT_ID':env,'SWALLOW_SMTP_AUTO_RETRY_INTERVAL_SECONDS':'1','SWALLOW_SMTP_AUTO_WORKER_HEALTH':'true'}
     def health(grace='1'):
         p=subprocess.run([str(pathlib.Path(work)/'delivery-reconcile'),'check-smtp-auto',env,grace],env=runner,capture_output=True,text=True,timeout=10)
         return p.returncode,json.loads(p.stdout) if p.stdout else None
@@ -69,6 +69,11 @@ SELECT public.novu_rust_ack_smtp('smtp-auto-fixture','%s',a.revision,j.failure_r
     denied=subprocess.run([psql,runner_url,'-q','-At','-v','ON_ERROR_STOP=1','-c',"SELECT public.novu_rust_smtp_auto_retry_batch('smtp-auto-other',1)"],capture_output=True,timeout=10)
     assert denied.returncode!=0
     for _ in range(2):children.append(subprocess.Popen([str(pathlib.Path(work)/'smtp-auto-retry-worker')],env=runner,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL))
+    def worker_health(minimum='2'):
+        p=subprocess.run([str(pathlib.Path(work)/'delivery-reconcile'),'check-smtp-auto-workers',env,'10',minimum],env=runner,capture_output=True,text=True,timeout=10)
+        return p.returncode,json.loads(p.stdout) if p.stdout else None
+    until(lambda:worker_health()[1]['healthy']==2,'worker heartbeats missing')
+    assert worker_health()[0]==0
     time.sleep(2);assert sql("SELECT count(*) FROM public.novu_rust_smtp_auto_retries")=='0'
     sql("CREATE FUNCTION public.fixture_smtp_retry_audit_fail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$; CREATE TRIGGER fixture_smtp_retry_audit_fail BEFORE INSERT ON public.novu_rust_smtp_auto_retries FOR EACH ROW EXECUTE FUNCTION public.fixture_smtp_retry_audit_fail(); UPDATE public.novu_rust_smtp_auto_retry_policy SET enabled=true,max_retries=1,delay_seconds=10,eligible_since=clock_timestamp()-interval '1 hour' WHERE environment_id='smtp-auto-fixture'")
     time.sleep(2)
@@ -100,6 +105,12 @@ SELECT public.novu_rust_ack_smtp('smtp-auto-fixture','%s',a.revision,j.failure_r
     rows=json.loads(history.stdout)['data'];assert len(rows)==2 and {row['jobId'] for row in rows}=={first,second}
     assert 'example.test' not in history.stdout
     with lock:assert messages.count('successful')==2 and messages.count('repeated')==2, messages
+    children[-1].terminate();children[-1].wait(timeout=10)
+    status,counts=worker_health();assert status==2 and counts['healthy']==1 and counts['stale']>=1
+    sql("DELETE FROM public.novu_rust_smtp_auto_retry_workers WHERE environment_id='smtp-auto-fixture' AND database_principal='smtp_auto_fixture'")
+    status,counts=worker_health();assert status==2 and counts['healthy']==0
+    denied=subprocess.run([str(pathlib.Path(work)/'delivery-reconcile'),'check-smtp-auto-workers','smtp-auto-other','10','1'],env=runner,capture_output=True,timeout=10)
+    assert denied.returncode==1
     print('Explicit SMTP auto retry duplicated a lost reply, respected cutoff and retry limit with two workers.')
 finally:
     for p in children:
