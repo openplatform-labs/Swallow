@@ -15,3 +15,11 @@ PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print
 "$TEST_PG_BIN/pg_ctl" -D "$TEST_DIR/data" -o "-h 127.0.0.1 -p $PORT -k $TEST_DIR" -l "$TEST_DIR/postgres.log" start >/dev/null
 export TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/postgres" CARGO_INCREMENTAL=0
 cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test smtp_resolution -- --ignored
+
+# The process test needs the complete schema in a separate disposable database.
+"$TEST_PG_BIN/createdb" -h 127.0.0.1 -p "$PORT" -U postgres smtp_worker_test
+export DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/smtp_worker_test" TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/smtp_worker_test" NOVU_POSTGRES_ALLOW_INSECURE=true
+cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply api "$ROOT/apps/api/rust-api/migrations" --through 17
+cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply worker "$WORKER/migrations"
+cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply api "$ROOT/apps/api/rust-api/migrations"
+cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test smtp_resolution_worker -- --ignored
