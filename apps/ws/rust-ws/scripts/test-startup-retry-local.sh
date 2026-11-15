@@ -34,4 +34,5 @@ if curl -fsS --max-time 1 "http://127.0.0.1:$ws_port/health/ready" >/dev/null 2>
 "$pgbin/pg_ctl" -D "$dir/data" -o "-h 127.0.0.1 -p $pg_port" -l "$dir/postgres.log" -w start >/dev/null
 for ((i=0;i<100;i++)); do curl -fsS --max-time 1 "http://127.0.0.1:$ws_port/health/ready" >/dev/null 2>&1 && break; kill -0 "$ws_pid"; ((i<99)) || { echo 'WS did not become ready' >&2; exit 1; }; sleep 0.1; done
 kill -TERM "$ws_pid"; wait "$ws_pid"; ws_pid=
+TEST_PSQL="$pgbin/psql" TEST_PG_URL="postgres://postgres@127.0.0.1:$pg_port/postgres" TEST_PG_PORT="$pg_port" TEST_WS_BINARY="$(pwd)/$binary" node tests/startup_listener_retry.cjs
 echo 'WS startup retry, deadline, termination and database recovery passed.'
