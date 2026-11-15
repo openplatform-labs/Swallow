@@ -157,6 +157,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let resend_enabled = env_bool("SWALLOW_ALERT_RESEND_ENABLED", true)?;
     let attempts_enabled = env_bool("SWALLOW_ALERT_ATTEMPTS_ENABLED", false)?;
     let slack_jobs_enabled = env_bool("SWALLOW_ALERT_SLACK_JOBS_ENABLED", false)?;
+    let discord_enabled = env_bool("SWALLOW_ALERT_DISCORD_ENABLED", false)?;
+    if discord_enabled && on_new_condition && !conditions_v2 { return Err("Discord health with new-condition policy requires v2 conditions".into()); }
     let failed_jobs_enabled = env_bool("SWALLOW_ALERT_FAILED_JOBS_ENABLED", false)?;
     let slack_missing_enabled = env_bool("SWALLOW_ALERT_SLACK_MISSING_ENDPOINTS_ENABLED", false)?;
     let email_policy_enabled = env_bool("SWALLOW_ALERT_EMAIL_POLICY_CANCELLED_ENABLED", false)?;
@@ -221,6 +223,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     };
     if !resend_enabled
         && !attempts_enabled
+        && !discord_enabled
         && !slack_jobs_enabled
         && !slack_policy_enabled
         && !email_policy_enabled
@@ -426,6 +429,15 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     } else {
         None
     };
+    let discord_health = if discord_enabled {
+        let result = tokio::time::timeout(operation_timeout, db.query_one("SELECT * FROM public.novu_rust_discord_health($1)", &[&args[0]])).await;
+        Some(match result {
+            Ok(Ok(row)) => match (u64::try_from(row.get::<_,i64>(0)),u64::try_from(row.get::<_,i64>(1)),u64::try_from(row.get::<_,i64>(2)),u64::try_from(row.get::<_,i64>(3))) {
+                (Ok(a),Ok(b),Ok(c),Ok(d)) => Ok((a,b,c,d)), _ => Err(())
+            },
+            _ => { eprintln!("Discord health check failed"); Err(()) }
+        })
+    } else { None };
     let slack_attempts = if slack_jobs_enabled {
         let scoped_slack = env_bool("SWALLOW_ALERT_SLACK_SCOPED_ACCESS", false)?;
         let result = tokio::time::timeout(operation_timeout, async {
@@ -584,7 +596,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         });
         Some(match values {Some(value)=>Ok(value),None=>{eprintln!("FCM cooldown check failed");Err(())}})
     } else {None};
-    let unhealthy = fcm_credentials.is_some_and(|value| match value {
+    let unhealthy = discord_health.is_some_and(|v| !matches!(v,Ok((0,0,0,0)))) || fcm_credentials.is_some_and(|value| match value {
         Ok((healthy, failed, _, minimum)) => healthy < minimum || failed > 0,
         Err(()) => true,
     }) || sendgrid_webhook_keys.is_some_and(|v| !matches!(v, Ok(1..=10)))
@@ -632,6 +644,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         fcm_credentials,
         slack_attempts,
         slack_policy_cancelled,
+        discord_health,
         email_policy_cancelled,
         sms_policy_cancelled,
         push_policy_cancelled,
@@ -691,7 +704,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         println!("{{\"status\":\"healthy\"}}");
         return Ok(());
     }
-    let mut error = configuration_error
+    let mut error = discord_health.is_some_and(|v| v.is_err()) || configuration_error
         || observation_error
         || sendgrid_webhook_keys.is_some_and(|v| v.is_err())
         || fcm_credentials.is_some_and(|v| v.is_err())

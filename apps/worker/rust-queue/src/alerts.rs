@@ -314,6 +314,7 @@ pub struct Alert {
     pub fcm_credentials: Option<Result<(u64, u64, u64, u64), ()>>,
     pub slack_attempts: Option<(u64, u64, u64, u64, Option<u64>)>,
     pub slack_policy_cancelled: Option<u64>,
+    pub discord_health: Option<Result<(u64,u64,u64,u64), ()>>,
     pub email_policy_cancelled: Option<u64>,
     pub sms_policy_cancelled: Option<u64>,
     pub push_policy_cancelled: Option<u64>,
@@ -373,11 +374,12 @@ impl Alert {
             || self.fcm_partial.is_some_and(|value| matches!(value,Ok(n) if n>0))
             || self.fcm_unreviewed.is_some_and(|value| matches!(value,Ok(n) if n>0))
             || self.fcm_unrecorded_claims.is_some_and(|value| matches!(value,Ok(n) if n>0))
+            || self.discord_health.is_some_and(|v| matches!(v,Ok((a,b,c,d)) if a>0||b>0||c>0||d>0))
             || self.fcm_cooldown.is_some_and(|value| matches!(value,Ok((active,deferred,overdue)) if active||deferred>0||overdue>0))
         {
             mask |= 1 << 18;
         }
-        if self.fcm_unrecorded_claims.is_some_and(|value| value.is_err()) || self.failed_jobs_check_failed || self.resend_auto.is_some_and(|value| value.is_err()) || self.slack_cooldown.is_some_and(|value| value.is_err()) || self.resend_cooldown.is_some_and(|value| value.is_err()) || self.twilio_delayed.is_some_and(|value| value.is_err()) || self.fcm_partial.is_some_and(|value| value.is_err()) || self.fcm_unreviewed.is_some_and(|value| value.is_err()) || self.fcm_cooldown.is_some_and(|value| value.is_err()) {
+        if self.discord_health.is_some_and(|value| value.is_err()) || self.fcm_unrecorded_claims.is_some_and(|value| value.is_err()) || self.failed_jobs_check_failed || self.resend_auto.is_some_and(|value| value.is_err()) || self.slack_cooldown.is_some_and(|value| value.is_err()) || self.resend_cooldown.is_some_and(|value| value.is_err()) || self.twilio_delayed.is_some_and(|value| value.is_err()) || self.fcm_partial.is_some_and(|value| value.is_err()) || self.fcm_unreviewed.is_some_and(|value| value.is_err()) || self.fcm_cooldown.is_some_and(|value| value.is_err()) {
             mask |= 1 << 19;
         }
         if self
@@ -455,6 +457,10 @@ impl Alert {
         if self.fcm_cooldown_distinct_source && self.fcm_cooldown.is_some_and(|v| matches!(v,Ok((true,_,_)))) {
             match self.fcm_cooldown_source { Some(Some(429)) => mask |= 1_i64 << 44, Some(Some(503)) => mask |= 1_i64 << 45, Some(None) => mask |= 1_i64 << 46, _ => {} }
         }
+        if let Some(Ok((unknown,rejected,stranded,pre_dispatch))) = self.discord_health {
+            for (bit,count) in [(51,unknown),(52,rejected),(53,stranded),(54,pre_dispatch)] { if count>0 { mask |= 1_i64 << bit; } }
+        }
+        if self.discord_health.is_some_and(|v| v.is_err()) { mask |= 1_i64 << 55; }
         mask
     }
     pub fn observed_condition_mask_v2(&self) -> i64 {
@@ -478,6 +484,8 @@ impl Alert {
         if self.resend_cooldown.is_some_and(|v| v.is_ok()) { known |= 1_i64 << 47; }
         if self.resend_cooldown.is_some() { known |= 1_i64 << 48; }
         if self.fcm_cooldown_distinct_source && self.fcm_cooldown_source.is_some() && self.fcm_cooldown.is_some_and(|v| v.is_ok()) { known |= (1_i64 << 44) | (1_i64 << 45) | (1_i64 << 46); }
+        if self.discord_health.is_some_and(|v| v.is_ok()) { known |= (1_i64 << 51) | (1_i64 << 52) | (1_i64 << 53) | (1_i64 << 54); }
+        if self.discord_health.is_some() { known |= 1_i64 << 55; }
         known
     }
     /// Bits whose current state was actually observed, excluding unavailable or disabled checks.
@@ -518,7 +526,8 @@ impl Alert {
         }
         // Both checks share the existing failed-job cooldown category. Do
         // not mark it observed healthy if either enabled check failed.
-        if (self.fcm_unrecorded_claims.is_some() || self.failed_jobs.is_some() || self.resend_auto.is_some() || self.slack_cooldown.is_some() || self.resend_cooldown.is_some() || self.twilio_delayed.is_some() || self.fcm_partial.is_some() || self.fcm_unreviewed.is_some() || self.fcm_cooldown.is_some())
+        if (self.discord_health.is_some() || self.fcm_unrecorded_claims.is_some() || self.failed_jobs.is_some() || self.resend_auto.is_some() || self.slack_cooldown.is_some() || self.resend_cooldown.is_some() || self.twilio_delayed.is_some() || self.fcm_partial.is_some() || self.fcm_unreviewed.is_some() || self.fcm_cooldown.is_some())
+            && !self.discord_health.is_some_and(|value| value.is_err())
             && !self.fcm_unrecorded_claims.is_some_and(|value| value.is_err())
             && !self.failed_jobs_check_failed
             && !self.resend_auto.is_some_and(|value| value.is_err())
@@ -531,7 +540,7 @@ impl Alert {
         {
             known |= 1 << 18;
         }
-        if self.fcm_unrecorded_claims.is_some() || self.failed_jobs.is_some() || self.failed_jobs_check_failed || self.resend_auto.is_some() || self.slack_cooldown.is_some() || self.resend_cooldown.is_some() || self.twilio_delayed.is_some() || self.fcm_partial.is_some() || self.fcm_unreviewed.is_some() || self.fcm_cooldown.is_some()
+        if self.discord_health.is_some() || self.fcm_unrecorded_claims.is_some() || self.failed_jobs.is_some() || self.failed_jobs_check_failed || self.resend_auto.is_some() || self.slack_cooldown.is_some() || self.resend_cooldown.is_some() || self.twilio_delayed.is_some() || self.fcm_partial.is_some() || self.fcm_unreviewed.is_some() || self.fcm_cooldown.is_some()
         {
             known |= 1 << 19;
         }
@@ -631,6 +640,12 @@ impl Alert {
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "disabled".into());
             details.push(format!("Slack chat unknown attempts: {unknown}; rejected attempts: {rejected}; stranded dispatches: {stranded}; pre-dispatch failures: {pre_dispatch}; missing endpoint alerts: {missing}"));
+        }
+        if let Some(result) = self.discord_health {
+            match result {
+                Ok((unknown,rejected,stranded,pre_dispatch)) => details.push(format!("Discord unknown attempts: {unknown}; rejected attempts: {rejected}; stranded dispatches: {stranded}; pre-dispatch failures: {pre_dispatch}")),
+                Err(()) => details.push("Discord health check failed".into()),
+            }
         }
         if let Some(count) = self.slack_policy_cancelled {
             details.push(format!("Slack workflow policy cancellations: {count}"));
@@ -1479,6 +1494,7 @@ mod tests {
             fcm_credentials: None,
             slack_attempts: None,
             slack_policy_cancelled: None,
+            discord_health: None,
             email_policy_cancelled: None,
             sms_policy_cancelled: None,
             push_policy_cancelled: None,
@@ -1623,6 +1639,21 @@ mod tests {
         assert_eq!(result.0,Some(Ok(())));assert_eq!(result.1,Some(Ok(())));
         for payload in [server.await.unwrap(),email_server.await.unwrap()] {assert!(payload.contains("Twilio delayed retries overdue: 2; expired leases: 1; callback blocked: 3"));}
         a.twilio_delayed=Some(Err(()));assert_eq!(a.observed_condition_mask_v2()&(1_i64<<36),0);assert_ne!(a.condition_mask_v2()&(1_i64<<37),0);
+    }
+    #[tokio::test]
+    async fn discord_health_uses_independent_bits_and_both_destinations() {
+        let mut a=alert(); a.resend_enabled=false; a.discord_health=Some(Ok((1,2,3,4)));
+        assert_eq!(a.condition_mask_v2(),(1_i64<<51)|(1_i64<<52)|(1_i64<<53)|(1_i64<<54));
+        let (url,server)=mock_server("200 OK","ok").await; let slack=SlackWebhook::with_endpoint(url).unwrap();
+        let (email_url,email_server)=mock_server("200 OK",r#"{"id":"mock-email"}"#).await;
+        let email=AlertEmailProvider::Resend(crate::resend::Resend::test_endpoint(crate::resend::Config{api_key:"re_test".into(),from:"sender@example.test".into(),sender_name:String::new()},email_url.as_str()).unwrap());
+        let sent=send_uncoordinated_selected(&a,Some(&slack),Some((&email,"ops@example.test")),Duration::from_secs(2),false).await;
+        assert_eq!(sent.0,Some(Ok(()))); assert_eq!(sent.1,Some(Ok(())));
+        for payload in [server.await.unwrap(),email_server.await.unwrap()] {assert!(payload.contains("Discord unknown attempts: 1; rejected attempts: 2; stranded dispatches: 3; pre-dispatch failures: 4"));}
+        a.discord_health=Some(Err(()));
+        assert_eq!(a.condition_mask_v2(),1_i64<<55);
+        assert_eq!(a.observed_condition_mask_v2()&(1_i64<<51),0);
+        assert_ne!(a.observed_condition_mask_v2()&(1_i64<<55),0);
     }
     #[tokio::test]
     async fn fcm_partial_alert_uses_independent_bits_and_both_destinations() {
@@ -2584,6 +2615,7 @@ mod tests {
             fcm_credentials: None,
             slack_attempts: None,
             slack_policy_cancelled: None,
+            discord_health: None,
             email_policy_cancelled: None,
             sms_policy_cancelled: None,
             push_policy_cancelled: None,
