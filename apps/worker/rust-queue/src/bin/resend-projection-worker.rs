@@ -200,22 +200,21 @@ async fn run(
                 if stop.requested() {
                     return Ok(false);
                 }
-                if scoped_policy
-                    && !tokio::time::timeout(
-                        timeout,
-                        novu_postgres_queue::projection_policy::check_scoped(
-                            &db,
-                            &environment,
-                            "resend",
-                            require_full_scan,
-                        ),
-                    )
-                    .await??
-                {
-                    return Err("projection heartbeat policy changed".into());
-                }
                 if !require_full_scan || !skipped {
-                    tokio::time::timeout(timeout, db.execute("INSERT INTO novu_rust_resend_projection_heartbeat(environment_id,last_completed_at) VALUES ($1,clock_timestamp()) ON CONFLICT(environment_id) DO UPDATE SET last_completed_at=EXCLUDED.last_completed_at", &[&environment])).await??;
+                    if scoped_policy {
+                        tokio::time::timeout(
+                            timeout,
+                            novu_postgres_queue::projection_policy::scoped_heartbeat(
+                                &db,
+                                &environment,
+                                "resend",
+                                require_full_scan,
+                            ),
+                        )
+                        .await??;
+                    } else {
+                        tokio::time::timeout(timeout, db.execute("INSERT INTO novu_rust_resend_projection_heartbeat(environment_id,last_completed_at) VALUES ($1,clock_timestamp()) ON CONFLICT(environment_id) DO UPDATE SET last_completed_at=EXCLUDED.last_completed_at", &[&environment])).await??;
+                    }
                 } else {
                     eprintln!("projection scan skipped jobs; heartbeat not advanced");
                 }

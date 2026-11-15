@@ -26,7 +26,7 @@ async fn scoped_registration_isolated_and_used_by_real_workers() {
     .await
     .unwrap();
     let role = format!("proj_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'fixture-password'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_register_projection_policy(text,text,boolean),public.novu_rust_check_projection_policy(text,text,boolean) TO {role}; GRANT SELECT ON public.novu_rust_environments, public.novu_queue_jobs, public.novu_rust_sendgrid_attempts, public.novu_rust_resend_attempts, public.novu_rust_twilio_attempts TO {role}; GRANT SELECT,INSERT,UPDATE ON public.novu_rust_sendgrid_projection_heartbeat, public.novu_rust_resend_projection_heartbeat, public.novu_rust_twilio_projection_heartbeat TO {role}" )).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'fixture-password'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_register_projection_policy(text,text,boolean),public.novu_rust_check_projection_policy(text,text,boolean),public.novu_rust_scoped_projection_heartbeat(text,text,boolean) TO {role}; GRANT SELECT ON public.novu_rust_environments, public.novu_queue_jobs, public.novu_rust_sendgrid_attempts, public.novu_rust_resend_attempts, public.novu_rust_twilio_attempts TO {role}; GRANT SELECT ON public.novu_rust_sendgrid_projection_heartbeat, public.novu_rust_resend_projection_heartbeat, public.novu_rust_twilio_projection_heartbeat TO {role}" )).await.unwrap();
     for provider in ["sendgrid", "resend", "twilio"] {
         db.execute("INSERT INTO public.novu_rust_projection_policy_logins SELECT 'policy-a',$1,rolname,oid FROM pg_catalog.pg_roles WHERE rolname=$2", &[&provider,&role]).await.unwrap();
     }
@@ -46,6 +46,7 @@ async fn scoped_registration_isolated_and_used_by_real_workers() {
             .await
             .is_err()
     );
+    assert!(actor.execute("UPDATE public.novu_rust_sendgrid_projection_heartbeat SET last_completed_at=clock_timestamp() WHERE environment_id='policy-a'", &[]).await.is_err());
     assert!(
         projection_policy::register_scoped(&actor, "policy-b", "sendgrid", true)
             .await
@@ -166,11 +167,45 @@ async fn scoped_registration_isolated_and_used_by_real_workers() {
             .is_err()
     );
     db.execute("UPDATE public.novu_rust_projection_policy_logins SET principal_oid=(SELECT oid FROM pg_catalog.pg_roles WHERE rolname=$1) WHERE environment_id='policy-a' AND provider='sendgrid' AND database_principal=$1", &[&role]).await.unwrap();
-    // Revocation commits before the waiting registration is allowed to proceed.
+    // An authorized heartbeat holds the grant lock until its transaction commits.
+    let (mut heartbeat_actor, driver) = tokio_postgres::connect(role_url.as_str(), NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move { driver.await.unwrap() });
+    let heartbeat_tx = heartbeat_actor.transaction().await.unwrap();
+    heartbeat_tx
+        .execute(
+            "SELECT public.novu_rust_scoped_projection_heartbeat('policy-a','sendgrid',true)",
+            &[],
+        )
+        .await
+        .unwrap();
+    let (revoker, driver) = tokio_postgres::connect(
+        &format!("{url}?application_name=projection_policy_revoker"),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move { driver.await.unwrap() });
+    let revoke_role = role.clone();
+    let revoke = tokio::spawn(async move {
+        revoker.execute("DELETE FROM public.novu_rust_projection_policy_logins WHERE environment_id='policy-a' AND provider='sendgrid' AND database_principal=$1", &[&revoke_role]).await
+    });
+    let mut blocked = false;
+    for _ in 0..100 {
+        if db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='projection_policy_revoker' AND wait_event_type='Lock')", &[]).await.unwrap().get::<_,bool>(0) { blocked=true; break; }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(blocked);
+    heartbeat_tx.commit().await.unwrap();
+    assert_eq!(revoke.await.unwrap().unwrap(), 1);
+    db.execute("INSERT INTO public.novu_rust_projection_policy_logins SELECT 'policy-a','sendgrid',rolname,oid FROM pg_catalog.pg_roles WHERE rolname=$1", &[&role]).await.unwrap();
+    db.execute("UPDATE public.novu_rust_sendgrid_projection_heartbeat SET last_completed_at=clock_timestamp()-interval '1 hour' WHERE environment_id='policy-a'", &[]).await.unwrap();
+    // Revocation commits before the waiting heartbeat is allowed to proceed.
     let tx = db.transaction().await.unwrap();
     tx.execute("DELETE FROM public.novu_rust_projection_policy_logins WHERE environment_id='policy-a' AND provider='sendgrid' AND database_principal=$1", &[&role]).await.unwrap();
     let waiting = tokio::spawn(async move {
-        projection_policy::register_scoped(&actor, "policy-a", "sendgrid", true).await
+        projection_policy::scoped_heartbeat(&actor, "policy-a", "sendgrid", true).await
     });
     let (observer, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move { driver.await.unwrap() });
@@ -182,4 +217,5 @@ async fn scoped_registration_isolated_and_used_by_real_workers() {
     assert!(blocked);
     tx.commit().await.unwrap();
     assert!(waiting.await.unwrap().is_err());
+    assert!(observer.query_one("SELECT last_completed_at<clock_timestamp()-interval '30 minutes' FROM public.novu_rust_sendgrid_projection_heartbeat WHERE environment_id='policy-a'",&[]).await.unwrap().get::<_,bool>(0));
 }

@@ -52,3 +52,18 @@ pub async fn check_scoped(
         .await?
         .get(0))
 }
+
+/// Write the scoped heartbeat while holding authorization locks through commit.
+pub async fn scoped_heartbeat(
+    db: &Client,
+    environment: &str,
+    provider: &str,
+    require_full_scan: bool,
+) -> Result<(), Error> {
+    db.execute(
+        "SELECT public.novu_rust_scoped_projection_heartbeat($1,$2,$3)",
+        &[&environment, &provider, &require_full_scan],
+    )
+    .await?;
+    Ok(())
+}
