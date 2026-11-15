@@ -13,7 +13,7 @@ import uuid
 
 root=pathlib.Path(os.environ['TEST_ROOT']); fixture=pathlib.Path(os.environ['TEST_FIXTURE_DIR'])
 primary=os.environ['TEST_PRIMARY_URL']; standby=os.environ['TEST_STANDBY_URL']; psql=os.environ['TEST_PSQL']; pgctl=os.environ['TEST_LOCAL_PG_CTL']
-job=str(uuid.uuid4()); attempt=str(uuid.uuid4()); api=None
+job=str(uuid.uuid4()); attempt=str(uuid.uuid4()); inflight_job=str(uuid.uuid4()); inflight_attempt=str(uuid.uuid4()); api=None; inflight=None
 
 def sql(url, statement):
     p=subprocess.run([psql,url,'-q','-At','-v','ON_ERROR_STOP=1','-c',statement],capture_output=True,text=True,timeout=15)
@@ -57,6 +57,18 @@ INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES
 INSERT INTO public.novu_rust_resend_attempts(job_id,environment_id,state,attempt_id,same_request_replays) VALUES ('%s','resend-reconcile-ha','unknown','%s',1);
 SELECT public.novu_rust_resolve_email_sms('resend-reconcile-ha','%s','retry','fixture','reviewed');""" % (job,job,attempt,job))
     until(lambda:sql(standby,"SELECT count(*) FROM public.novu_rust_delivery_reconciliations WHERE job_id='%s' AND resend_attempt_id='%s' AND resend_replay_reserved"%(job,attempt))=='1','reconciliation did not replicate')
+    # Block after the audit insert and attempt delete, before the job update.
+    # The single function call is one uncommitted PostgreSQL transaction.
+    sql(primary,"""INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES ('%s','resend-reconcile-ha','experimental_resend_email','{}','failed');
+INSERT INTO public.novu_rust_resend_attempts(job_id,environment_id,state,attempt_id,same_request_replays) VALUES ('%s','resend-reconcile-ha','unknown','%s',1);
+CREATE FUNCTION public.fixture_pause_reconciliation() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(120); RETURN NEW; END $$;
+CREATE TRIGGER fixture_pause_reconciliation BEFORE UPDATE ON public.novu_queue_jobs FOR EACH ROW WHEN (OLD.id='%s'::uuid) EXECUTE FUNCTION public.fixture_pause_reconciliation();"""%(inflight_job,inflight_job,inflight_attempt,inflight_job))
+    inflight=subprocess.Popen([psql,primary,'-q','-v','ON_ERROR_STOP=1','-c',"SELECT public.novu_rust_resolve_email_sms('resend-reconcile-ha','%s','retry','fixture','inflight')"%inflight_job],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    until(lambda:sql(primary,"SELECT count(*) FROM pg_stat_activity WHERE wait_event='PgSleep' AND query LIKE '%%"+inflight_job+"%%'")=='1','reconciliation did not reach the blocked update')
+    assert inflight.poll() is None
+    assert sql(standby,"SELECT count(*) FROM public.novu_queue_jobs j JOIN public.novu_rust_resend_attempts a ON a.job_id=j.id WHERE j.id='%s' AND j.status='failed' AND a.state='unknown' AND a.attempt_id='%s'"%(inflight_job,inflight_attempt))=='1'
+    assert sql(standby,"SELECT count(*) FROM public.novu_rust_delivery_reconciliations WHERE job_id='%s'"%inflight_job)=='0'
+
     pub=(root/'apps/api/rust-api/tests/fixtures/operator_jwt/test-only-public.pem').read_text()
     keys=fixture/'operator-keys.json';keys.write_text(json.dumps({'issuer':'https://issuer.test','audience':'swallow','keys':[{'kid':'fixture','pem':pub}]}))
     sock=socket.socket();sock.bind(('127.0.0.1',0));port=sock.getsockname()[1];sock.close()
@@ -72,10 +84,22 @@ SELECT public.novu_rust_resolve_email_sms('resend-reconcile-ha','%s','retry','fi
     assert get(base+path.replace('resend-reconcile-ha','resend-other-ha'),jwt)[0]==401
     control(os.environ['TEST_LOCAL_PRIMARY_DATA'],'-m','immediate','stop');control(os.environ['TEST_LOCAL_STANDBY_DATA'],'promote')
     until(good,'API did not reconnect with preserved reconciliation')
+    inflight.wait(timeout=10)
+    assert inflight.returncode != 0
+    assert sql(standby,"SELECT count(*) FROM public.novu_queue_jobs j JOIN public.novu_rust_resend_attempts a ON a.job_id=j.id WHERE j.id='%s' AND j.status='failed' AND a.state='unknown' AND a.attempt_id='%s'"%(inflight_job,inflight_attempt))=='1'
+    assert sql(standby,"SELECT count(*) FROM public.novu_rust_delivery_reconciliations WHERE job_id='%s'"%inflight_job)=='0'
+    sql(standby,"DROP TRIGGER fixture_pause_reconciliation ON public.novu_queue_jobs; DROP FUNCTION public.fixture_pause_reconciliation(); SELECT public.novu_rust_resolve_email_sms('resend-reconcile-ha','%s','retry','fixture','after promotion')"%inflight_job)
+    other_path=path.replace(job,inflight_job)
+    status,value=get(base+other_path,jwt)
+    assert status==200 and value['lastResolvedAttemptId']==inflight_attempt and value['lastResolvedReplayReserved'] is True and value['attemptId'] is None
     assert get(base+path.replace('resend-reconcile-ha','resend-other-ha'),jwt)[0]==401
     assert sql(standby,"SELECT count(*) FROM public.novu_queue_jobs WHERE id='%s' AND status='pending'"%job)=='1'
-    print('JWT-scoped Resend reconciliation evidence survived synchronous promotion and API reconnection.')
+    print('Committed evidence survived promotion; in-flight reconciliation rolled back and could be retried after API reconnection.')
 finally:
+    if inflight is not None and inflight.poll() is None:
+        inflight.terminate()
+        try:inflight.wait(timeout=10)
+        except subprocess.TimeoutExpired:inflight.kill();inflight.wait()
     if api is not None:
         api.terminate()
         try:api.wait(timeout=10)
