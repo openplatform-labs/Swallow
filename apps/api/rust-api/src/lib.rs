@@ -4055,7 +4055,12 @@ async fn trigger_inner(db:Arc<Client>,environment_id:String,auth:TriggerAuth,rej
                 "sendgrid" => valid_layer(layer, true, true),
                 "resend" => layer.as_object().is_some_and(|fields| fields.iter().all(|(key,value)| {
                     if key == "_passthrough" {
-                        value.as_object().is_some_and(|object| object.len()==1 && object.get("body").and_then(Value::as_object).is_some_and(|body| body.iter().all(|(key,value)| ["subject","html","text"].contains(&key.as_str()) && value.is_string())))
+                        value.as_object().is_some_and(|object| object.len()==1 && object.get("body").and_then(Value::as_object).is_some_and(|body| body.iter().all(|(key,value)| match key.as_str() {
+                            "subject" | "html" | "text" => value.is_string(),
+                            "from" => value.as_str().is_some_and(|v| !v.is_empty() && !v.contains(['\r','\n'])),
+                            "replyTo" => value.as_str().is_some_and(|v| !v.contains(['\r','\n'])),
+                            _ => false,
+                        })))
                     } else {
                         valid_layer(&Value::Object(serde_json::Map::from_iter([(key.clone(),value.clone())])), false, false)
                     }

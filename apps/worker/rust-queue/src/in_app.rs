@@ -719,7 +719,12 @@ async fn process_claimed(
             if let Some(value)=layer.get("_passthrough") {
                 let object=value.as_object().ok_or(InvalidJob("invalid Resend passthrough"))?;
                 let body=object.get("body").and_then(serde_json::Value::as_object).ok_or(InvalidJob("invalid Resend passthrough"))?;
-                if object.len()!=1 || body.iter().any(|(k,v)| !["subject","html","text"].contains(&k.as_str()) || !v.is_string()) {return Err(InvalidJob("invalid Resend passthrough").into());}
+                if object.len()!=1 || body.iter().any(|(k,v)| match k.as_str() {
+                    "subject"|"html"|"text" => !v.is_string(),
+                    "from" => v.as_str().is_none_or(|s|s.is_empty()||s.contains(['\r','\n'])),
+                    "replyTo" => v.as_str().is_none_or(|s|s.contains(['\r','\n'])),
+                    _=>true,
+                }) {return Err(InvalidJob("invalid Resend passthrough").into());}
                 passthrough.extend(body.clone());
             }
         }

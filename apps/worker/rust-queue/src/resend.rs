@@ -42,7 +42,7 @@ pub fn request_body(config: &Config, email: &Email) -> Result<Value, SendError> 
         || email.attachments.len() > 100
         || !email.alternatives.is_empty()
         || !email.custom_data.is_empty()
-        || email.provider_from_without_name
+        || (email.provider_from_without_name && email.from.as_deref().is_none_or(str::is_empty))
     {
         return Err(SendError::InvalidMessage);
     }
@@ -59,10 +59,10 @@ pub fn request_body(config: &Config, email: &Email) -> Result<Value, SendError> 
         .as_deref()
         .filter(|v| !v.is_empty())
         .unwrap_or(&config.sender_name);
-    if from.contains(['\r', '\n']) || name.contains(['\r', '\n', '<', '>']) {
+    if from.contains(['\r', '\n']) || (!email.provider_from_without_name && name.contains(['\r', '\n', '<', '>'])) {
         return Err(SendError::InvalidMessage);
     }
-    let from = if name.is_empty() {
+    let from = if name.is_empty() || email.provider_from_without_name {
         from.to_owned()
     } else {
         format!("{name} <{from}>")
@@ -262,6 +262,17 @@ mod tests {
             html: "<b>Hi</b>".into(),
             ..Default::default()
         }
+    }
+    #[test]
+    fn raw_provider_from_preserves_display_name_and_rejects_invalid_values() {
+        let mut email=message();email.provider_from_without_name=true;
+        assert_eq!(request_body(&config(),&email),Err(SendError::InvalidMessage));
+        email.from=Some("Other <other@example.test>".into());
+        assert_eq!(request_body(&config(),&email).unwrap()["from"],"Other <other@example.test>");
+        let mut settings=config();settings.sender_name="ignored <name>".into();
+        assert_eq!(request_body(&settings,&email).unwrap()["from"],"Other <other@example.test>");
+        email.from=Some("bad\naddress".into());
+        assert_eq!(request_body(&config(),&email),Err(SendError::InvalidMessage));
     }
     #[test]
     fn bounded_message_mapping() {
