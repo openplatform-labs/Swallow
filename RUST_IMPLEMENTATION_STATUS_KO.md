@@ -1,4 +1,6 @@
-FCM 반복 선점 권한 위임: API 0116과 설정 화면에서 기존 FCM 위임 관리자가 집계·목록 JWT 권한을 각각 부여·회수한다. 한 권한 회수 후 다른 권한이 유지되며 요청 재제출과 자기 변경 거절을 확인했다. 기존 FCM 위임 관리자의 권한 범위가 확장되므로 배포 전 관리자를 검토해야 한다. 제한 DB 로그인·임시 PostgreSQL API 시험과 Angular 테스트 233건이 통과했다. 첫 통합 시험은 고정 환경 ID가 다른 시험과 충돌해 별도 DB로 분리한 뒤 통과했다. 최초 관리자·API DB 로그인 권한은 별도 부여하며 실제 브라우저–API, 외부 IdP 및 운영 HA는 미검증이다. [API README](apps/api/rust-api/README.md)를 참고한다.
+FCM 반복 선점 화면 종단 간 시험: 격리 PostgreSQL·제한 API 로그인·시험 JWT·실제 브라우저에서 관리자의 두 권한 부여와 감사 조회, 대상의 건수·작업 조회, 개별 회수와 다른 권한 유지를 확인했다. 외부 IdP·운영 HA는 미검증이다. [대시보드 README](apps/dashboard/swallow/README.md)에 재현 절차가 있다.
+
+FCM 반복 선점 권한 위임: API 0116과 설정 화면에서 기존 FCM 위임 관리자가 집계·목록 JWT 권한을 각각 부여·회수한다. 한 권한 회수 후 다른 권한이 유지되며 요청 재제출과 자기 변경 거절을 확인했다. 기존 FCM 위임 관리자의 권한 범위가 확장되므로 배포 전 관리자를 검토해야 한다. 제한 DB 로그인·임시 PostgreSQL API 시험과 Angular 테스트 233건이 통과했다. 첫 통합 시험은 고정 환경 ID가 다른 시험과 충돌해 별도 DB로 분리한 뒤 통과했다. 최초 관리자·API DB 로그인 권한은 별도 부여하며 실제 브라우저–API는 위 최신 시험을 참고하며 외부 IdP 및 운영 HA는 미검증이다. [API README](apps/api/rust-api/README.md)를 참고한다.
 
 FCM 반복 선점 JWT API·관리 화면: API 0115는 집계와 목록을 독립 JWT 권한 및 API DB 로그인 `alert_view`로 보호하며 운영 경보 화면에서 임계값과 100건 단위 목록을 선택한다. 제한 DB 로그인·임시 PostgreSQL에서 권한 회수, 검증 및 101건 페이지, Angular 테스트 233건과 빌드를 확인했다. 첫 API 실행은 테스트 DB 환경 변수 누락으로 실패해 수정 후 통과했다. 최초 위임 관리자와 DB 로그인은 별도 부여하며 위임 화면은 위 최신 항목을 참고한다. 실제 브라우저–API, 외부 IdP와 운영 HA는 미검증이다. 빌드는 기존 크기 예산 경고가 있다. [API README](apps/api/rust-api/README.md)와 [대시보드 README](apps/dashboard/swallow/README.md)를 참고한다.
 
