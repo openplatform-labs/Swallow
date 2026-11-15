@@ -848,4 +848,30 @@ mod tests {
             "unknown"
         );
     }
+    #[tokio::test]
+    #[ignore = "requires fully migrated disposable PostgreSQL"]
+    async fn scheduled_twilio_429_waits_then_dispatches() {
+        use super::*;
+        use crate::twilio::{Config,Region,Twilio};
+        use tokio::io::{AsyncReadExt,AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let url=std::env::var("TEST_DATABASE_URL").unwrap();
+        let (mut db,driver)=tokio_postgres::connect(&url,tokio_postgres::NoTls).await.unwrap();tokio::spawn(async move {let _=driver.await;});
+        let env=format!("twilio-retry-worker-{}",Uuid::new_v4());let job=Uuid::new_v4();let dispatch=Uuid::new_v4();
+        db.execute("INSERT INTO public.novu_rust_environments VALUES($1,'org')",&[&env]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,rolname,'retry',oid FROM pg_roles WHERE rolname=current_user",&[&env]).await.unwrap();
+        crate::enqueue(&db,job,&env,JOB_KIND,&serde_json::json!({"to":"+15550000002","content":"hello"})).await.unwrap();
+        db.execute("UPDATE public.novu_queue_jobs SET status='failed' WHERE id=$1",&[&job]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_twilio_dispatch_ids(id,job_id,environment_id) VALUES($1,$2,$3)",&[&dispatch,&job,&env]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_twilio_attempts(job_id,environment_id,state,http_status,dispatch_id,retry_after_seconds,retry_not_before) VALUES($1,$2,'rejected',429,$3,120,clock_timestamp()+interval '2 minutes')",&[&job,&env,&dispatch]).await.unwrap();
+        db.query_one("SELECT public.novu_rust_resolve_twilio_after($1,$2,$3,'operator','ticket')",&[&env,&job,&dispatch]).await.unwrap();
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();let origin=format!("http://{}",listener.local_addr().unwrap());
+        let provider=Twilio::test_origin(Config{account_sid:"ACfixture".into(),auth_token:"fixture".into(),api_key_sid:None,api_key_secret:None,from:"+15550000001".into(),region:Region::Us},&origin).unwrap();
+        assert!(!process_one(&mut db,&env,&provider).await.unwrap());
+        db.execute("UPDATE public.novu_queue_jobs SET available_at=clock_timestamp()-interval '1 second' WHERE id=$1",&[&job]).await.unwrap();
+        let server=tokio::spawn(async move {let (mut socket,_)=listener.accept().await.unwrap();let mut data=[0;8192];assert!(socket.read(&mut data).await.unwrap()>0);let body=r#"{"sid":"SM123","date_created":"Wed, 28 Oct 2026 10:00:00 +0000"}"#;socket.write_all(format!("HTTP/1.1 201 Created\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();});
+        assert!(process_one(&mut db,&env,&provider).await.unwrap());server.await.unwrap();
+        let row=db.query_one("SELECT j.status,a.state FROM public.novu_queue_jobs j JOIN public.novu_rust_twilio_attempts a ON a.job_id=j.id WHERE j.id=$1",&[&job]).await.unwrap();assert_eq!(row.get::<_,String>(0),"completed");assert_eq!(row.get::<_,String>(1),"accepted");
+    }
+
 }

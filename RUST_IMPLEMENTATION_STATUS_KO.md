@@ -1,6 +1,8 @@
 ## Slack 공유 대기 상태 조회와 경보
 
-- Twilio 429 대기 안내: 워커 0178이 숫자형 `Retry-After`와 안내 시각을 기록하고 API 0099와 Angular 화면이 기존 권한으로 표시한다. 모의 Twilio·격리 PostgreSQL 워커, 제한 JWT API, Angular 196개 테스트 및 실제 로컬 브라우저에서 120초 안내를 확인했다. 자동·지연 재시도는 구현하지 않았고 기존 수동 재시도는 안내를 강제하지 않는다. 실제 Twilio 429·운영 HA는 미검증이다. 배포 순서와 제약은 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+- Twilio 429 운영자 지연 재시도: 워커 0179와 CLI가 현재 시도 ID·안내 시각을 조회하고, 운영자 판정 시 해당 시도와 콜백 증거를 잠금·검사해 안내 시각 이후로 원자적으로 예약·감사한다. 제한 DB 역할·실제 CLI·임시 PostgreSQL에서 권한, 잘못된 시도, 증거 차단, 감사 롤백과 동시 판정을 확인했으며 큐 함수·모의 Twilio에서 예약 전 미발송과 시험상 시각 변경 후 발송을 확인했다. 자동 재시도, 요청 ID 재제출, 관리 UI, 실제 Twilio 및 운영 HA는 미검증 또는 미구현이다. 늦은 콜백과 다른 경로의 중복 위험은 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
+- Twilio 429 대기 안내: 워커 0178이 숫자형 `Retry-After`와 안내 시각을 기록하고 API 0099와 Angular 화면이 기존 권한으로 표시한다. 모의 Twilio·격리 PostgreSQL 워커, 제한 JWT API, Angular 196개 테스트 및 실제 로컬 브라우저에서 120초 안내를 확인했다. 자동 재시도는 구현하지 않았으며 선택형 지연 예약은 위 최신 항목을 참고한다. 다른 수동 경로는 안내를 강제하지 않는다. 실제 Twilio 429·운영 HA는 미검증이다. 배포 순서와 제약은 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
 - Twilio 엄격 콜백 장애 전환 시험: 로컬 PostgreSQL 17 동기 복제 환경에서 모의 SMS 요청을 보류하는 동안 발송 계정·시도 ID가 복제된 것을 확인하고 주 서버를 중지해 복제본을 승격했다. 두 실제 워커가 결과 불명으로 복구한 뒤 엄격 모드의 실제 API가 서명된 합성 콜백을 수락·중복 제거했고 메시지 결과는 `unknown`으로 유지됐다. 최초 발송은 큐 함수·모의 공급자이며 단일 호스트·관리자 계정 시험이다. 실제 Twilio, 비동기 복제·네트워크 분할 및 운영 HA는 미검증이다. 재현은 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
