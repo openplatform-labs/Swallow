@@ -40,13 +40,11 @@ fn worker(url: &str, name: &str) -> Worker {
     )
 }
 #[tokio::test]
-#[ignore = "requires disposable synchronously replicated PostgreSQL containers; destroys the primary"]
+#[ignore = "requires disposable synchronously replicated PostgreSQL instances; destroys the primary"]
 async fn synchronous_standby_promotion_recovers_pending_and_leased_work() {
     let primary_url = std::env::var("TEST_PRIMARY_URL").unwrap();
     let standby_url = std::env::var("TEST_STANDBY_URL").unwrap();
     let cluster_url = std::env::var("TEST_FAILOVER_URL").unwrap();
-    let primary = std::env::var("TEST_PRIMARY_CONTAINER").unwrap();
-    let standby = std::env::var("TEST_STANDBY_CONTAINER").unwrap();
     let db = connect(&primary_url).await;
     db.batch_execute("INSERT INTO public.novu_rust_environments VALUES('ha-env','org'); INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,in_app_content,inbox_metadata) VALUES('ha-env','ha-workflow',true,true,'Hello {{subscriber.firstName}}','{\"id\":\"64a000000000000000000051\",\"name\":\"Fixture\",\"critical\":false,\"tags\":[]}'); INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES('ha-env','alice','64a000000000000000000054','{\"firstName\":\"Alice\"}')").await.unwrap();
     let pending = Uuid::new_v4();
@@ -89,32 +87,55 @@ async fn synchronous_standby_promotion_recovers_pending_and_leased_work() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(started, "workers did not connect to writable primary");
-    assert!(
-        Command::new("docker")
-            .args(["kill", &primary])
-            .stdout(Stdio::null())
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(
-        Command::new("docker")
-            .args([
-                "exec",
-                "-u",
-                "postgres",
-                &standby,
-                "pg_ctl",
-                "promote",
-                "-D",
-                "/var/lib/postgresql/data",
-                "-w"
-            ])
-            .stdout(Stdio::null())
-            .status()
-            .unwrap()
-            .success()
-    );
+    if let Ok(pgctl) = std::env::var("TEST_LOCAL_PG_CTL") {
+        let primary = std::env::var("TEST_LOCAL_PRIMARY_DATA").unwrap();
+        let standby = std::env::var("TEST_LOCAL_STANDBY_DATA").unwrap();
+        assert!(
+            Command::new(&pgctl)
+                .args(["-D", &primary, "-m", "immediate", "stop", "-w"])
+                .stdout(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new(&pgctl)
+                .args(["-D", &standby, "promote", "-w"])
+                .stdout(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+    } else {
+        let primary = std::env::var("TEST_PRIMARY_CONTAINER").unwrap();
+        let standby = std::env::var("TEST_STANDBY_CONTAINER").unwrap();
+        assert!(
+            Command::new("docker")
+                .args(["kill", &primary])
+                .stdout(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("docker")
+                .args([
+                    "exec",
+                    "-u",
+                    "postgres",
+                    &standby,
+                    "pg_ctl",
+                    "promote",
+                    "-D",
+                    "/var/lib/postgresql/data",
+                    "-w"
+                ])
+                .stdout(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
     let promoted = connect(&standby_url).await;
     assert!(
         !promoted
@@ -146,6 +167,19 @@ async fn synchronous_standby_promotion_recovers_pending_and_leased_work() {
         .await
         .unwrap();
     promoted.execute("UPDATE public.novu_queue_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1",&[&leased]).await.unwrap();
+    // The pre-failover token must no longer mutate the job after its lease expires,
+    // even if a replacement worker races to reclaim or complete it.
+    assert!(
+        !queue::renew(&promoted, leased, lease, Duration::from_secs(30))
+            .await
+            .unwrap()
+    );
+    assert!(!queue::complete(&promoted, leased, lease).await.unwrap());
+    assert!(
+        !queue::fail(&promoted, leased, lease, "stale worker")
+            .await
+            .unwrap()
+    );
     let mut recovered = false;
     for _ in 0..250 {
         let row=promoted.query_one("SELECT (SELECT count(*)=2 FROM public.novu_queue_jobs WHERE id=ANY($1::uuid[]) AND status='completed'),(SELECT count(*)=2 FROM public.novu_rust_in_app_messages WHERE environment_id='ha-env' AND subscriber_id='alice'),(SELECT count(*)=2 FROM public.novu_rust_notifications WHERE job_id=ANY($1::uuid[])),(SELECT count(*)=2 FROM pg_stat_activity WHERE application_name IN ('failover_worker_1','failover_worker_2'))",&[&vec![pending,leased]]).await.unwrap();

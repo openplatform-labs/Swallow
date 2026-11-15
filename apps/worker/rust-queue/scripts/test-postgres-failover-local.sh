@@ -4,13 +4,18 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$(cd ../../.. && pwd)
 scenario=${SWALLOW_LOCAL_FAILOVER_SCENARIO:-alert-binding}
-case "$scenario" in alert-binding|alert-scheduler|alert-v2|resend|resend-cooldown|twilio|fcm|fcm-delay|fcm-exp|fcm-exp-repeat|fcm-review) ;; *) echo 'invalid local failover scenario' >&2; exit 2;; esac
+case "$scenario" in alert-binding|alert-scheduler|alert-v2|in-app|resend|resend-cooldown|twilio|fcm|fcm-delay|fcm-exp|fcm-exp-repeat|fcm-review) ;; *) echo 'invalid local failover scenario' >&2; exit 2;; esac
 pgbin=${SWALLOW_TEST_POSTGRES_BIN:-/opt/homebrew/opt/postgresql@17/bin}
 [[ -x "$pgbin/pg_ctl" && -x "$pgbin/pg_basebackup" ]] || { echo 'PostgreSQL 17 server binaries are required' >&2; exit 1; }
 testdir=$(mktemp -d /private/tmp/swallow-alert-ha.XXXXXX)
 cleanup() {
-  "$pgbin/pg_ctl" -D "$testdir/standby" -m immediate stop >/dev/null 2>&1 || true
-  "$pgbin/pg_ctl" -D "$testdir/primary" -m immediate stop >/dev/null 2>&1 || true
+  local running=0
+  for data in "$testdir/standby" "$testdir/primary"; do
+    if [[ -f "$data/postmaster.pid" ]]; then
+      "$pgbin/pg_ctl" -D "$data" -m immediate -w stop >/dev/null 2>&1 || running=1
+    fi
+  done
+  if ((running)); then echo "Could not stop a test database; retained $testdir" >&2; return; fi
   python3 -c 'import shutil,sys; shutil.rmtree(sys.argv[1])' "$testdir"
 }
 trap cleanup EXIT
@@ -41,7 +46,9 @@ done
 export TEST_PRIMARY_URL="$DATABASE_URL" TEST_STANDBY_URL="postgres://postgres@127.0.0.1:$standby_port/postgres"
 export TEST_FAILOVER_URL="postgres://postgres@127.0.0.1:$standby_port,127.0.0.1:$primary_port/postgres?target_session_attrs=read-write&connect_timeout=2"
 export TEST_LOCAL_PRIMARY_DATA="$testdir/primary" TEST_LOCAL_STANDBY_DATA="$testdir/standby" TEST_LOCAL_PG_CTL="$pgbin/pg_ctl"
-if [[ "$scenario" == resend || "$scenario" == resend-cooldown ]]; then
+if [[ "$scenario" == in-app ]]; then
+  cargo test --locked --test postgres_failover -- --ignored
+elif [[ "$scenario" == resend || "$scenario" == resend-cooldown ]]; then
   cargo build --quiet --locked --bin resend-worker
   target_dir=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
   export TEST_RESEND_WORKER_BINARY="$target_dir/debug/resend-worker"
