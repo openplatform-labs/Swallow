@@ -42,7 +42,7 @@ pub async fn reserve_with_conditions(
     cooldown: i32,
     condition_mask: Option<i32>,
 ) -> DbResult<Reservation> {
-    if condition_mask.is_some_and(|mask| mask <= 0) {
+    if condition_mask == Some(0) {
         return Err("invalid alert condition mask".into());
     }
     if !["slack", "email"].contains(&channel)
@@ -311,6 +311,7 @@ pub struct Alert {
     pub sendgrid: Option<(u64, bool)>,
     pub sendgrid_check_failed: bool,
     pub sendgrid_webhook_keys: Option<Result<u64, ()>>,
+    pub fcm_credentials: Option<Result<(u64, u64, u64, u64), ()>>,
     pub slack_attempts: Option<(u64, u64, u64, u64, Option<u64>)>,
     pub slack_policy_cancelled: Option<u64>,
     pub email_policy_cancelled: Option<u64>,
@@ -395,6 +396,12 @@ impl Alert {
         {
             mask |= 1 << 30;
         }
+        if self.fcm_credentials.is_some_and(|value| match value {
+            Ok((healthy, unhealthy, _, minimum)) => healthy < minimum || unhealthy > 0,
+            Err(()) => true,
+        }) {
+            mask |= i32::MIN;
+        }
         mask
     }
     /// Bits whose current state was actually observed, excluding unavailable or disabled checks.
@@ -466,6 +473,9 @@ impl Alert {
         if self.sendgrid_webhook_keys.is_some() {
             known |= 1 << 30;
         }
+        if self.fcm_credentials.is_some() {
+            known |= i32::MIN;
+        }
         if self.email_policy_cancelled.is_some()
             || self.sms_policy_cancelled.is_some()
             || self.push_policy_cancelled.is_some()
@@ -514,6 +524,12 @@ impl Alert {
             match result {
                 Ok(count) => details.push(format!("SendGrid active webhook keys: {count}")),
                 Err(()) => details.push("SendGrid webhook key check failed".into()),
+            }
+        }
+        if let Some(result) = self.fcm_credentials {
+            match result {
+                Ok((healthy,unhealthy,stale,minimum))=>details.push(format!("FCM credential workers: {healthy} healthy, {unhealthy} unhealthy, {stale} stale; minimum healthy: {minimum}")),
+                Err(())=>details.push("FCM credential worker check failed".into()),
             }
         }
         if let Some((overdue, stale)) = self.twilio {
@@ -1248,6 +1264,7 @@ mod tests {
             sendgrid: None,
             sendgrid_check_failed: false,
             sendgrid_webhook_keys: None,
+            fcm_credentials: None,
             slack_attempts: None,
             slack_policy_cancelled: None,
             email_policy_cancelled: None,
@@ -1281,6 +1298,27 @@ mod tests {
             a.text()
                 .unwrap()
                 .contains("SendGrid webhook key check failed")
+        );
+    }
+
+    #[test]
+    fn fcm_credential_health_uses_distinct_signed_condition() {
+        let mut a = alert();
+        assert_eq!(a.observed_condition_mask() & i32::MIN, 0);
+        for (state, unhealthy) in [
+            (Ok((2, 0, 1, 1)), false),
+            (Ok((0, 0, 0, 1)), true),
+            (Ok((2, 1, 0, 1)), true),
+            (Err(()), true),
+        ] {
+            a.fcm_credentials = Some(state);
+            assert_ne!(a.observed_condition_mask() & i32::MIN, 0);
+            assert_eq!(a.condition_mask() & i32::MIN != 0, unhealthy);
+        }
+        assert!(
+            a.text()
+                .unwrap()
+                .contains("FCM credential worker check failed")
         );
     }
 
@@ -1854,6 +1892,7 @@ mod tests {
             sendgrid: Some((1, true)),
             sendgrid_check_failed: false,
             sendgrid_webhook_keys: None,
+            fcm_credentials: None,
             slack_attempts: None,
             slack_policy_cancelled: None,
             email_policy_cancelled: None,

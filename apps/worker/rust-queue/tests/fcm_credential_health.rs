@@ -61,19 +61,26 @@ async fn credential_health_tracks_individual_workers_and_permissions() {
         novu_postgres_queue::reconciliation::MIGRATION,
         novu_postgres_queue::reconciliation::OPERATOR_GRANTS_MIGRATION,
         novu_postgres_queue::reconciliation::OPERATOR_GRANT_LOCK_MIGRATION,
+        novu_postgres_queue::alerts::MIGRATION,
         include_str!("../migrations/0072_operator_grant_management.sql"),
         include_str!("../migrations/0073_operator_role_identity.sql"),
         include_str!("../migrations/0087_alert_view_permission.sql"),
+        include_str!("../migrations/0085_alert_condition_cooldown.sql"),
+        include_str!("../migrations/0088_scoped_alert_dispatch.sql"),
         include_str!("../migrations/0089_scoped_delivery_health.sql"),
+        include_str!("../migrations/0093_alert_condition_recovery.sql"),
         include_str!("../migrations/0095_fcm_routing_guard.sql"),
         include_str!("../migrations/0124_push_workflow_worker_policy.sql"),
         include_str!("../migrations/0142_fcm_credential_health.sql"),
+        include_str!("../migrations/0143_alert_signed_condition_masks.sql"),
     ] {
         db.batch_execute(sql).await.unwrap();
     }
     db.batch_execute("ALTER TABLE public.novu_rust_push_workflow_worker_config ADD COLUMN preference_policy text DEFAULT 'snapshot', ADD COLUMN target_policy text DEFAULT 'reference'; CREATE ROLE fcm_health_reader LOGIN; CREATE ROLE fcm_health_writer LOGIN; GRANT USAGE ON SCHEMA public TO fcm_health_reader,fcm_health_writer; GRANT EXECUTE ON FUNCTION public.novu_rust_fcm_credential_health_check(text,integer) TO fcm_health_reader; GRANT EXECUTE ON FUNCTION public.novu_rust_fcm_credential_heartbeat(text,uuid,text) TO fcm_health_writer").await.unwrap();
     db.execute("INSERT INTO public.novu_rust_fcm_routing_workers SELECT 'env-a',rolname,oid FROM pg_roles WHERE rolname=session_user",&[]).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_delivery_operator_grants VALUES ('env-a',session_user,'alert_view',(SELECT oid FROM pg_roles WHERE rolname=session_user)),('env-a','fcm_health_reader','alert_view',(SELECT oid FROM pg_roles WHERE rolname='fcm_health_reader'))",&[]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_delivery_operator_grants VALUES ('env-a',session_user,'alert_send',(SELECT oid FROM pg_roles WHERE rolname=session_user))",&[]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES ('env-a','slack','fcm-test','rejected'),('env-a','email','fcm-test','rejected')",&[]).await.unwrap();
     let reader_url = url.replace("postgres@", "fcm_health_reader@");
     let writer_url = url.replace("postgres@", "fcm_health_writer@");
     let (reader, driver) = tokio_postgres::connect(&reader_url, NoTls).await.unwrap();
@@ -190,6 +197,48 @@ async fn credential_health_tracks_individual_workers_and_permissions() {
             .unwrap()
     };
     assert_eq!(cli().status.code(), Some(2));
+    let alert = |scoped: bool| {
+        Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"))
+            .env_clear()
+            .args(["env-a", "300", "120", "60"])
+            .env("DATABASE_URL", &url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
+            .env(
+                "SWALLOW_ALERT_SLACK_WEBHOOK",
+                "https://hooks.slack.com/services/A/B/C",
+            )
+            .env("SWALLOW_ALERT_SLACK_TARGET_ID", "fcm-test")
+            .env("SWALLOW_ALERT_EMAIL_TO", "ops@example.test")
+            .env("SWALLOW_ALERT_EMAIL_TARGET_ID", "fcm-test")
+            .env("NOVU_RESEND_FROM", "sender@example.test")
+            .env("NOVU_RESEND_API_KEY", "fixture-token")
+            .env("SWALLOW_ALERT_COOLDOWN_POLICY", "new-condition")
+            .env(
+                "SWALLOW_ALERT_SCOPED_DELIVERY",
+                if scoped { "true" } else { "false" },
+            )
+            .env("SWALLOW_ALERT_FCM_CREDENTIAL_MAX_AGE_SECONDS", "60")
+            .env("SWALLOW_ALERT_FCM_CREDENTIAL_MIN_HEALTHY", "1")
+            .output()
+            .unwrap()
+    };
+    let blocked = alert(false);
+    assert_eq!(
+        blocked.status.code(),
+        Some(2),
+        "unhealthy worker must reach the blocked alert reservation"
+    );
+    let stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert!(
+        stderr.contains("Slack alert requires operator review")
+            && stderr.contains("email alert requires operator review")
+    );
+    assert_eq!(
+        alert(true).status.code(),
+        Some(2),
+        "scoped delivery must also reach the blocked reservation"
+    );
     fs::write(fixture.0.join("next"), "fixture-new").unwrap();
     fs::rename(fixture.0.join("next"), &first).unwrap();
     let mut recovered = false;
@@ -203,6 +252,11 @@ async fn credential_health_tracks_individual_workers_and_permissions() {
     }
     assert!(recovered);
     assert_eq!(cli().status.code(), Some(0));
+    assert_eq!(
+        alert(false).status.code(),
+        Some(0),
+        "healthy worker check must not dispatch an alert"
+    );
     let third = fixture.0.join("three");
     fs::write(&third, "fixture-three").unwrap();
     let mut exit_worker = worker(&url, &third, "fcm_health_exit", true);
@@ -250,6 +304,13 @@ async fn credential_health_tracks_individual_workers_and_permissions() {
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
     drop(second_worker);
+    db.execute("DELETE FROM public.novu_rust_delivery_operator_grants WHERE environment_id='env-a' AND database_principal=session_user AND decision='alert_view'",&[]).await.unwrap();
+    assert_eq!(
+        alert(false).status.code(),
+        Some(1),
+        "a check failure must remain an error even with a blocked alert destination"
+    );
+    assert_eq!(alert(true).status.code(), Some(1));
     db.execute("DELETE FROM public.novu_rust_delivery_operator_grants WHERE environment_id='env-a' AND database_principal='fcm_health_reader' AND decision='alert_view'",&[]).await.unwrap();
     assert!(
         reader

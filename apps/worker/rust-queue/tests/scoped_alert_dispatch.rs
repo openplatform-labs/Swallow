@@ -34,6 +34,12 @@ async fn isolated_senders_fence_outcomes_and_preserve_inflight_revocation() {
         .batch_execute(include_str!("../migrations/0088_scoped_alert_dispatch.sql"))
         .await
         .unwrap();
+    admin
+        .batch_execute(include_str!(
+            "../migrations/0143_alert_signed_condition_masks.sql"
+        ))
+        .await
+        .unwrap();
     let first = format!("alert_sender_a_{}", Uuid::new_v4().simple());
     let second = format!("alert_sender_b_{}", Uuid::new_v4().simple());
     for role in [&first, &second] {
@@ -62,6 +68,125 @@ async fn isolated_senders_fence_outcomes_and_preserve_inflight_revocation() {
     for role in [&first, &second] {
         admin.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'a',$1,'alert_send',oid FROM pg_roles WHERE rolname::text=$1",&[role]).await.unwrap();
     }
+    let first_id = match alerts::reserve_scoped(&a, "a", "slack", "signed", 60, Some(1))
+        .await
+        .unwrap()
+    {
+        Reservation::Claimed(id) => id,
+        _ => panic!("first reservation expected"),
+    };
+    assert!(
+        alerts::finish_scoped(&a, "a", "slack", "signed", first_id, &Ok(()))
+            .await
+            .unwrap()
+    );
+    let high = i32::MIN;
+    let second_id = match alerts::reserve_scoped(&a, "a", "slack", "signed", 60, Some(high | 1))
+        .await
+        .unwrap()
+    {
+        Reservation::Claimed(id) => id,
+        _ => panic!("high bit must be a distinct new condition"),
+    };
+    assert!(
+        alerts::finish_scoped(&a, "a", "slack", "signed", second_id, &Ok(()))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        alerts::reserve_scoped(&a, "a", "slack", "signed", 60, Some(high | 1))
+            .await
+            .unwrap(),
+        Reservation::CoolingDown
+    );
+    alerts::observe_conditions(&a, "a", "slack", "signed", 1, high | 1)
+        .await
+        .unwrap();
+    let third_id = match alerts::reserve_scoped(&a, "a", "slack", "signed", 60, Some(high | 1))
+        .await
+        .unwrap()
+    {
+        Reservation::Claimed(id) => id,
+        _ => panic!("recovered condition should alert again"),
+    };
+    assert!(
+        alerts::finish_scoped(&a, "a", "slack", "signed", third_id, &Ok(()))
+            .await
+            .unwrap()
+    );
+    admin.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'a',session_user,'alert_send',oid FROM pg_roles WHERE rolname=session_user",&[]).await.unwrap();
+    let (mut direct, direct_driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = direct_driver.await;
+    });
+    let direct_first = match alerts::reserve_with_conditions(
+        &mut direct,
+        "a",
+        "email",
+        "direct-signed",
+        60,
+        Some(1),
+    )
+    .await
+    .unwrap()
+    {
+        Reservation::Claimed(id) => id,
+        _ => panic!("direct first reservation expected"),
+    };
+    assert!(
+        alerts::finish(
+            &mut direct,
+            "a",
+            "email",
+            "direct-signed",
+            direct_first,
+            &Ok(())
+        )
+        .await
+        .unwrap()
+    );
+    let direct_second = match alerts::reserve_with_conditions(
+        &mut direct,
+        "a",
+        "email",
+        "direct-signed",
+        60,
+        Some(high | 1),
+    )
+    .await
+    .unwrap()
+    {
+        Reservation::Claimed(id) => id,
+        _ => panic!("direct high bit must bypass cooldown"),
+    };
+    assert!(
+        alerts::finish(
+            &mut direct,
+            "a",
+            "email",
+            "direct-signed",
+            direct_second,
+            &Ok(())
+        )
+        .await
+        .unwrap()
+    );
+    alerts::observe_conditions(&direct, "a", "email", "direct-signed", 1, high | 1)
+        .await
+        .unwrap();
+    assert!(matches!(
+        alerts::reserve_with_conditions(
+            &mut direct,
+            "a",
+            "email",
+            "direct-signed",
+            60,
+            Some(high | 1)
+        )
+        .await
+        .unwrap(),
+        Reservation::Claimed(_)
+    ));
     assert!(
         alerts::reserve_scoped(&a, "b", "slack", "ops", 60, None)
             .await

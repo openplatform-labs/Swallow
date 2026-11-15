@@ -136,6 +136,18 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let push_policy_enabled = env_bool("SWALLOW_ALERT_PUSH_POLICY_CANCELLED_ENABLED", false)?;
     let slack_policy_enabled = env_bool("SWALLOW_ALERT_SLACK_POLICY_CANCELLED_ENABLED", false)?;
     let sendgrid_keys_enabled = env_bool("SWALLOW_ALERT_SENDGRID_WEBHOOK_KEYS_ENABLED", false)?;
+    let fcm_credentials_thresholds = match (
+        env_optional_i32("SWALLOW_ALERT_FCM_CREDENTIAL_MAX_AGE_SECONDS")?,
+        env_optional_i32("SWALLOW_ALERT_FCM_CREDENTIAL_MIN_HEALTHY")?,
+    ) {
+        (None, None) => None,
+        (Some(age), Some(minimum))
+            if (1..=86_400).contains(&age) && (1..=1000).contains(&minimum) =>
+        {
+            Some((age, minimum))
+        }
+        _ => return Err("invalid FCM credential alert thresholds".into()),
+    };
     let twilio_grace = env_optional_i32("SWALLOW_ALERT_TWILIO_GRACE_SECONDS")?;
     let twilio_heartbeat = env_optional_i32("SWALLOW_ALERT_TWILIO_HEARTBEAT_MAX_SECONDS")?;
     let twilio_thresholds = match (twilio_grace, twilio_heartbeat) {
@@ -168,6 +180,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         && twilio_thresholds.is_none()
         && sendgrid_thresholds.is_none()
         && !sendgrid_keys_enabled
+        && fcm_credentials_thresholds.is_none()
     {
         return Err("no alert checks configured".into());
     }
@@ -318,6 +331,27 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     } else {
         None
     };
+    let fcm_credentials = if let Some((age, minimum)) = fcm_credentials_thresholds {
+        let result=tokio::time::timeout(operation_timeout,db.query_one("SELECT healthy,unhealthy,stale FROM public.novu_rust_fcm_credential_health_check($1,$2)",&[&args[0],&age])).await;
+        Some(match result {
+            Ok(Ok(row)) => match (
+                u64::try_from(row.get::<_, i64>(0)),
+                u64::try_from(row.get::<_, i64>(1)),
+                u64::try_from(row.get::<_, i64>(2)),
+            ) {
+                (Ok(healthy), Ok(unhealthy), Ok(stale)) => {
+                    Ok((healthy, unhealthy, stale, minimum as u64))
+                }
+                _ => Err(()),
+            },
+            _ => {
+                eprintln!("FCM credential worker check failed");
+                Err(())
+            }
+        })
+    } else {
+        None
+    };
     let slack_attempts = if slack_jobs_enabled {
         let scoped_slack = env_bool("SWALLOW_ALERT_SLACK_SCOPED_ACCESS", false)?;
         let result = tokio::time::timeout(operation_timeout, async {
@@ -409,7 +443,10 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     } else {
         None
     };
-    let unhealthy = sendgrid_webhook_keys.is_some_and(|v| !matches!(v, Ok(1..=10)))
+    let unhealthy = fcm_credentials.is_some_and(|value| match value {
+        Ok((healthy, failed, _, minimum)) => healthy < minimum || failed > 0,
+        Err(()) => true,
+    }) || sendgrid_webhook_keys.is_some_and(|v| !matches!(v, Ok(1..=10)))
         || channel_policy_check_failed
         || email_policy_cancelled.is_some_and(|n| n > 0)
         || sms_policy_cancelled.is_some_and(|n| n > 0)
@@ -443,6 +480,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         sendgrid,
         sendgrid_check_failed,
         sendgrid_webhook_keys,
+        fcm_credentials,
         slack_attempts,
         slack_policy_cancelled,
         email_policy_cancelled,
@@ -494,6 +532,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut error = configuration_error
         || observation_error
         || sendgrid_webhook_keys.is_some_and(|v| v.is_err())
+        || fcm_credentials.is_some_and(|v| v.is_err())
         || sendgrid_check_failed
         || failed_jobs_check_failed
         || channel_policy_check_failed
