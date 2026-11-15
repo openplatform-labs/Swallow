@@ -21,6 +21,9 @@ async fn selected_429_retry_is_bounded_fenced_and_preserves_unknown() {
     db.batch_execute(discord_queue::RETRY_POLICY_MIGRATION)
         .await
         .unwrap();
+    db.batch_execute(discord_queue::SHARED_COOLDOWN_MIGRATION)
+        .await
+        .unwrap();
     db.batch_execute("INSERT INTO public.novu_rust_discord_retry_policy VALUES('env','known','known',2,20),('env','fallback','fallback',1,7),('env','off','off',3,10)").await.unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/webhook", listener.local_addr().unwrap());
@@ -257,7 +260,7 @@ async fn selected_429_retry_is_bounded_fenced_and_preserves_unknown() {
     );
 
     let role = format!("discord_retry_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT SELECT,UPDATE ON public.novu_queue_jobs TO {role}; GRANT SELECT,INSERT,UPDATE,DELETE ON public.novu_rust_discord_attempts TO {role}; GRANT SELECT,UPDATE ON public.novu_rust_discord_retry_policy TO {role}; GRANT SELECT,INSERT ON public.novu_rust_discord_retry_history TO {role}; GRANT USAGE ON SEQUENCE public.novu_rust_discord_retry_history_id_seq TO {role}; INSERT INTO public.novu_rust_discord_retry_policy VALUES('env','restricted','known',1,10)")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT SELECT,UPDATE ON public.novu_queue_jobs TO {role}; GRANT SELECT,INSERT,UPDATE,DELETE ON public.novu_rust_discord_attempts TO {role}; GRANT SELECT,UPDATE ON public.novu_rust_discord_retry_policy TO {role}; GRANT SELECT,UPDATE ON public.novu_rust_discord_shared_cooldown TO {role}; GRANT SELECT,INSERT ON public.novu_rust_discord_retry_history TO {role}; GRANT USAGE ON SEQUENCE public.novu_rust_discord_retry_history_id_seq TO {role}; INSERT INTO public.novu_rust_discord_retry_policy VALUES('env','restricted','known',1,10); INSERT INTO public.novu_rust_discord_shared_cooldown(environment_id,destination_id) VALUES('env','restricted')")).await.unwrap();
     let restricted = Uuid::new_v4();
     queue::enqueue(
         &db,
@@ -292,6 +295,8 @@ async fn selected_429_retry_is_bounded_fenced_and_preserves_unknown() {
         .get::<_, i64>(0),
         1
     );
+
+    assert!(db.query_one("SELECT not_before>clock_timestamp() FROM public.novu_rust_discord_shared_cooldown WHERE environment_id='env' AND destination_id='restricted'", &[]).await.unwrap().get::<_, bool>(0));
 
     // Two actual workers for one destination must agree on retry settings.
     let worker = || {

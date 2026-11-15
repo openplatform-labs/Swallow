@@ -14,6 +14,8 @@ pub const WORKFLOW_KIND: &str = "experimental_discord_workflow";
 pub const MIGRATION: &str = include_str!("../migrations/0202_discord_webhook_queue.sql");
 pub const RETRY_POLICY_MIGRATION: &str =
     include_str!("../migrations/0208_discord_retry_policy.sql");
+pub const SHARED_COOLDOWN_MIGRATION: &str =
+    include_str!("../migrations/0230_discord_shared_cooldown.sql");
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -200,12 +202,19 @@ pub async fn process_one(
     };
     // Serialize policy changes with reservation and fence old worker versions.
     tx.query_opt("SELECT mode FROM public.novu_rust_discord_retry_policy WHERE environment_id=$1 AND destination_id=$2 FOR SHARE", &[&environment,&destination]).await?;
+    let cooldown = tx.query_opt("SELECT not_before>clock_timestamp() FROM public.novu_rust_discord_shared_cooldown WHERE environment_id=$1 AND destination_id=$2 FOR UPDATE", &[&environment,&destination]).await?;
+    if cooldown.is_some_and(|row| row.get::<_, bool>(0)) {
+        tx.execute("UPDATE public.novu_queue_jobs SET status='pending',attempts=attempts-1,available_at=GREATEST(available_at,(SELECT not_before FROM public.novu_rust_discord_shared_cooldown WHERE environment_id=$2 AND destination_id=$3)),lease_token=NULL,lease_until=NULL WHERE id=$1", &[&job.id,&environment,&destination]).await?;
+        tx.commit().await?;
+        return Ok(true);
+    }
     let marker = format!("{}:{}", job.id, job.lease_token);
     tx.query_one(
         "SELECT set_config('swallow.discord_retry_fence',$1,true)",
         &[&marker],
     )
     .await?;
+    tx.query_one("SELECT set_config('swallow.discord_cooldown_fence',$1,true)", &[&marker]).await?;
     let inserted = tx.execute("INSERT INTO novu_rust_discord_attempts(job_id,environment_id,state) VALUES ($1,$2,'dispatching') ON CONFLICT DO NOTHING", &[&job.id,&environment]).await?;
     if inserted != 1 {
         tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='Discord attempt requires review',lease_token=NULL,lease_until=NULL WHERE id=$1", &[&job.id]).await?;
@@ -263,6 +272,10 @@ pub async fn process_one(
     let updated = tx.execute("UPDATE novu_rust_discord_attempts SET state=$3,http_status=$4,provider_message_id=$5,provider_timestamp=$6,retry_after_seconds=$7,updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$2 AND state='dispatching'", &[&job.id,&environment,&state,&code,&id,&timestamp,&retry_after]).await?;
     if updated == 1 {
         let retry_policy = tx.query_opt("SELECT mode,max_retries,fallback_seconds FROM public.novu_rust_discord_retry_policy WHERE environment_id=$1 AND destination_id=$2 FOR SHARE", &[&environment,&destination]).await?;
+        if let (Some(429), Some(seconds)) = (code, retry_after) {
+            let delay = seconds.max(1) as f64;
+            tx.execute("UPDATE public.novu_rust_discord_shared_cooldown SET not_before=GREATEST(not_before,clock_timestamp()+make_interval(secs=>$3::double precision)) WHERE environment_id=$1 AND destination_id=$2", &[&environment,&destination,&delay]).await?;
+        }
         let mut retry = None;
         if code == Some(429) {
             if let Some(policy) = retry_policy {

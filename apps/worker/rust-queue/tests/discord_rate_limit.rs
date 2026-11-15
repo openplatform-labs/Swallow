@@ -21,6 +21,9 @@ async fn fractional_rate_limit_guidance_is_persisted_without_retry() {
     db.batch_execute(discord_queue::RETRY_POLICY_MIGRATION)
         .await
         .unwrap();
+    db.batch_execute(discord_queue::SHARED_COOLDOWN_MIGRATION)
+        .await
+        .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/webhook", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
