@@ -246,6 +246,18 @@ async fn run(
     {
         return Err("FCM reload failure policy requires a reload mode".into());
     }
+    let credential_health = match std::env::var("NOVU_FCM_CREDENTIAL_HEALTH_ENABLED").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid FCM credential health setting".into()),
+    };
+    if credential_health
+        && reload_access_token.is_none()
+        && reload_integrations.is_none()
+        && reload_service_account.is_none()
+    {
+        return Err("FCM credential health requires a reload mode".into());
+    }
     let integrations_raw = if let Some(path) = &reload_integrations {
         Some(novu_rust_contracts::secret::read_regular_multiline_file(
             path, 1_048_576,
@@ -421,6 +433,9 @@ async fn run(
                 }
             }
             let mut recovery = tokio::time::Instant::now();
+            let health_instance = uuid::Uuid::new_v4();
+            let mut health_previous: Option<bool> = None;
+            let mut health_next = tokio::time::Instant::now();
             if configured {
                 match tokio::time::timeout(
                     timeout,
@@ -473,6 +488,7 @@ async fn run(
                     if stop.requested() {
                         break;
                     }
+                    let mut reload_error: Option<&str> = None;
                     if let Some(path) = &reload_access_token
                         && provider
                             .as_mut()
@@ -480,14 +496,7 @@ async fn run(
                             .reload_access_token_file(path)
                             .is_err()
                     {
-                        if exit_on_reload_failure {
-                            task.abort();
-                            let _ = task.await;
-                            return Err("FCM access token reload failed".into());
-                        }
-                        eprintln!("FCM access token reload failed; dispatch paused");
-                        stop.wait(Duration::from_secs(2)).await;
-                        continue;
+                        reload_error = Some("FCM access token reload failed");
                     }
                     if let Some(path) = &reload_integrations {
                         let next = reload_integration_file(
@@ -504,16 +513,7 @@ async fn run(
                             }
                             Ok(None) => {}
                             Err(()) => {
-                                if exit_on_reload_failure {
-                                    task.abort();
-                                    let _ = task.await;
-                                    return Err("FCM integration credential reload failed".into());
-                                }
-                                eprintln!(
-                                    "FCM integration credential reload failed; dispatch paused"
-                                );
-                                stop.wait(Duration::from_secs(2)).await;
-                                continue;
+                                reload_error = Some("FCM integration credential reload failed");
                             }
                         }
                     }
@@ -533,16 +533,40 @@ async fn run(
                             }
                             Ok(None) => {}
                             Err(()) => {
-                                if exit_on_reload_failure {
-                                    task.abort();
-                                    let _ = task.await;
-                                    return Err("FCM service account key reload failed".into());
-                                }
-                                eprintln!("FCM service account key reload failed; dispatch paused");
-                                stop.wait(Duration::from_secs(2)).await;
-                                continue;
+                                reload_error = Some("FCM service account key reload failed");
                             }
                         }
+                    }
+                    let healthy = reload_error.is_none();
+                    if credential_health
+                        && (health_previous != Some(healthy)
+                            || tokio::time::Instant::now() >= health_next)
+                    {
+                        let state = if healthy { "healthy" } else { "unhealthy" };
+                        let result = tokio::time::timeout(
+                            timeout,
+                            db.query_one(
+                                "SELECT public.novu_rust_fcm_credential_heartbeat($1,$2,$3)",
+                                &[&environment, &health_instance, &state],
+                            ),
+                        )
+                        .await;
+                        if !matches!(result,Ok(Ok(row)) if row.get::<_,bool>(0)) {
+                            eprintln!("FCM credential health observation failed; reconnecting");
+                            break;
+                        }
+                        health_previous = Some(healthy);
+                        health_next = tokio::time::Instant::now() + Duration::from_secs(10);
+                    }
+                    if let Some(error) = reload_error {
+                        if exit_on_reload_failure {
+                            task.abort();
+                            let _ = task.await;
+                            return Err(error.into());
+                        }
+                        eprintln!("{error}; dispatch paused");
+                        stop.wait(Duration::from_secs(2)).await;
+                        continue;
                     }
                     let dispatch = async {
                         fcm_queue::process_one_with_target_policy(

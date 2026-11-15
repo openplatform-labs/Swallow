@@ -78,6 +78,7 @@ async fn worker_supports_token_pem_and_integration_files() {
         .env_remove("NOVU_FCM_RELOAD_INTEGRATIONS")
         .env_remove("NOVU_FCM_RELOAD_SERVICE_ACCOUNT")
         .env_remove("NOVU_FCM_RELOAD_FAILURE_POLICY")
+        .env_remove("NOVU_FCM_CREDENTIAL_HEALTH_ENABLED")
         .env_remove("NOVU_FCM_CLIENT_EMAIL")
         .env_remove("NOVU_FCM_PRIVATE_KEY")
         .env_remove("NOVU_FCM_PRIVATE_KEY_FILE")
