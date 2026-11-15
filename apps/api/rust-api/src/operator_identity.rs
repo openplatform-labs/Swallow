@@ -24,6 +24,7 @@ enum Lookup {
     PermissionAudit,
     PermissionChangeRequest,
     ResendAutoHealthJobs,
+    ResendCancelList,
     ResendAutoHealth,
     SlackCooldownHealth,
     ResendCooldownHealth,
@@ -463,6 +464,9 @@ pub(super) async fn smtp_auto_worker_health(State(db):State<Arc<Client>>,headers
 }
 pub(super) async fn discord_cooldown_health(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
     query(db,headers,uri,verifier,Lookup::DiscordCooldownHealth).await
+}
+pub(super) async fn resend_cancel_list(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
+    query(db,headers,uri,verifier,Lookup::ResendCancelList).await
 }
 pub(super) async fn smtp_auto_health(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
     query(db,headers,uri,verifier,Lookup::SmtpAutoHealth).await
@@ -2869,6 +2873,7 @@ async fn query(
         Lookup::DiscordCooldownHealth | Lookup::SmtpAutoHealth => &["environmentId", "graceSeconds"],
         Lookup::DiscordRetryHealth => &["environmentId", "graceSeconds"],
         Lookup::DiscordRetryList => &["environmentId", "graceSeconds", "filter", "after"],
+        Lookup::ResendCancelList => &["environmentId", "graceSeconds", "after"],
         Lookup::FcmUnrecordedClaimHealth => &["environmentId", "minGap", "graceSeconds"],
         Lookup::FcmUnrecordedClaimList => &["environmentId", "minGap", "graceSeconds", "after"],
         Lookup::FcmPartialHealth => &["environmentId", "windowSeconds"],
@@ -3087,6 +3092,11 @@ async fn query(
         Lookup::DiscordCooldownHealth => {
             let Some(grace)=params.get("graceSeconds").and_then(|v|v.parse::<i32>().ok().filter(|n|(1..=86400).contains(n)&&n.to_string()==*v)) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};
             guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_discord_cooldown_health($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&grace]).await
+        }
+        Lookup::ResendCancelList => {
+            let Some(grace)=params.get("graceSeconds").and_then(|v|v.parse::<i32>().ok().filter(|n|(1..=86400).contains(n)&&n.to_string()==*v)) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};
+            let after=match params.get("after") {Some(v)=>match Uuid::parse_str(v){Ok(v)=>Some(v),Err(_)=>return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request")},None=>None};
+            guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_resend_cancel_list($1,$2,$3,$4,$5,$6,$7)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&grace,&after]).await
         }
         Lookup::SmtpAutoHealth => {
             let Some(grace)=params.get("graceSeconds").and_then(|v|v.parse::<i32>().ok().filter(|n|(1..=86400).contains(n)&&n.to_string()==*v)) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};

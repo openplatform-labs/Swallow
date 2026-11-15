@@ -1,3 +1,5 @@
+운영 경보 화면에서 JWT를 선택하면 Resend 취소 결과 불명 목록을 조회할 수 있다. 50건씩 요청·작업 ID, 시각 및 유예 시간 초과 여부를 표시하며 페이지는 별도 시점이다. API 0171과 워커 0261, 독립 JWT 목록 권한과 API DB 로그인 조회 권한이 필요하다. 상세 조사·취소·판정은 현재 CLI에서 수행한다. Angular 모의 시험과 제한 DB 계정·시험 JWT·실제 로컬 API에 연결한 jsdom 시험을 통과했다. 실제 브라우저·IdP·Resend·운영 HA는 미검증이며 빌드 크기 경고가 남아 있다. [API README](../../api/rust-api/README.md)를 참고한다.
+
 예약 UI 발송 경로 검증: 위 로컬 스크립트는 추가로 시험 전용 loopback 엔드포인트를 사용한 실제 Resend 워커와 모의 HTTP 서버를 실행한다. 폼에서 선택한 시각과 수신자가 공급자 요청 본문에 담기고 접수 시도가 PostgreSQL에 기록되는지 확인한다. 이는 공급자 접수 모의 시험이며 실제 Resend 처리·예약·수신을 증명하지 않는다. 시험용 워커를 임시 위치에 복사한 뒤 일반 빌드를 복원한다. 실제 브라우저·제한 DB 로그인·JWT 및 운영 HA는 검증하지 않았다.
 
 예약 UI 통합 검증: `TEST_PG_BIN=/opt/homebrew/opt/postgresql@17/bin scripts/test-resend-schedule-component-local.sh`는 격리 PostgreSQL과 실제 Rust HTTP API, Angular jsdom 폼 및 실제 워크플로 워커를 연결하고 Resend 작업에 예약 시각이 보존되는지 확인한다. 초기 시도는 폼 초기화 대기와 테스트의 큐 필드 경로 오류를 수정한 뒤 통과했다. API는 테스트용 DB 관리자 로그인을 사용하며 실제 브라우저·Resend 발송·JWT 실행·운영 HA는 이 시험의 범위가 아니다. Docker는 사용하지 않는다.

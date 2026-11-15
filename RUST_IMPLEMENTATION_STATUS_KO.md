@@ -1,3 +1,5 @@
+Resend 취소 미해결 목록 API·화면: API 0171은 별도 JWT 권한과 API DB 로그인 조회 권한으로 요청을 제공하고 Angular 운영 경보 화면에 페이지를 표시한다. 제한 계정·시험 JWT·실제 로컬 API와 jsdom에서 55건 조회 및 권한 회수를 시험했다. 운영자 권한 관리 UI, 취소 상세·판정 UI와 실제 브라우저·IdP·Resend·운영 HA는 미구현 또는 미검증이다. [API README](apps/api/rust-api/README.md)를 참고한다.
+
 Resend 취소 미해결 목록: 워커 0261과 CLI에서 별도 조회 권한으로 환경별 결과 불명 요청을 UUID순 50건씩 찾고 상세 요청 ID를 확인한다. 수신자·제공자 ID·사유는 목록에서 제외한다. 제한 계정·격리 PostgreSQL에서 56건 페이지와 권한 격리를 시험했으며 페이지는 동일 시점 스냅샷이 아니다. HTTP API·UI, 실제 Resend 및 운영 HA는 미구현 또는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
 Resend 취소 결과 불명 감시: 워커 0260은 환경별 권한이 있는 집계와 유예 시간 초과 시 선택형 Slack·이메일 경보를 제공한다. 조회 실패는 별도 조건이며 V3 경보 이력을 사용한다. 제한 계정·격리 DB·실제 경보 명령의 차단된 Slack 목적지와 모의 Slack·메일로 집계·본문·조건을 시험했다. 실제 외부 경보, Resend 취소·운영 HA는 미검증이며 요청 목록 UI와 큐 상태 동기화는 아직 없다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.

@@ -20,6 +20,7 @@ import { AlertTiming } from './alert-timing';
 import { AlertTimingGrants } from './alert-timing-grants';
 import { DiscordRetryPolicyGrants } from './discord-retry-policy-grants';
 import { ResendAutoHealth } from './resend-auto-health';
+import { ResendCancelList } from './resend-cancel-list';
 import { SendgridResults } from './sendgrid-results';
 import { WorkflowTrigger } from './workflow-trigger';
 import { ExecutionGrants } from './execution-grants';
@@ -68,7 +69,7 @@ type SendgridKey = {identifier:string;active:boolean};
 type SendgridKeyAudit = {id:string;identifier:string;action:string;userId:string;recordedAt:string};
 
 @Component({
-  imports: [FormsModule, ClrAlertModule, FcmIntegrations, SlackIntegrations, TwilioResults, FcmResults, DiscordReviews, SmtpReviews, SmtpScope, DiscordEndpoints, SlackResults, SendgridResults, WorkflowTrigger, ExecutionGrants, ResendAutoPolicy, ResendCooldownPolicy, SmtpTransportPolicy, SmtpAutoPolicy, DiscordPolicy, DiscordRetryPolicy, DiscordCooldown, AlertTiming, AlertTimingGrants, DiscordRetryPolicyGrants, ResendAutoHealth],
+  imports: [FormsModule, ClrAlertModule, FcmIntegrations, SlackIntegrations, TwilioResults, FcmResults, DiscordReviews, SmtpReviews, SmtpScope, DiscordEndpoints, SlackResults, SendgridResults, WorkflowTrigger, ExecutionGrants, ResendAutoPolicy, ResendCooldownPolicy, SmtpTransportPolicy, SmtpAutoPolicy, DiscordPolicy, DiscordRetryPolicy, DiscordCooldown, AlertTiming, AlertTimingGrants, DiscordRetryPolicyGrants, ResendAutoHealth, ResendCancelList],
   selector: 'app-root',
   styleUrl: './app.css',
   templateUrl: './app.html',
