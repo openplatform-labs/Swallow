@@ -46,3 +46,24 @@ async fn timing_settings_are_scoped_audited_and_applied_by_fanout() {
     let output=run("postgres",&reader_url);assert_eq!(output.status.code(),Some(1));assert!(output.stdout.is_empty());
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires fully migrated disposable PostgreSQL and loopback proxy"]
+async fn database_alert_can_opt_into_file_timing_on_initial_connection_failure() {
+    use std::{io::Read, net::TcpListener, sync::{Arc,atomic::{AtomicUsize,Ordering}}, time::{Duration,Instant}};
+    let url=std::env::var("TEST_DATABASE_URL").unwrap();let (db,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(async move{let _=driver.await;});
+    db.batch_execute("CREATE ROLE timing_noaccess LOGIN; INSERT INTO novu_rust_environments VALUES('timing-fallback','org'); INSERT INTO novu_rust_delivery_operator_grants SELECT 'timing-fallback',rolname,'alert_send',oid FROM pg_roles WHERE rolname=session_user").await.unwrap();
+    let dir=std::env::temp_dir().join(format!("swallow-timing-fallback-{}",Uuid::new_v4()));std::fs::create_dir(&dir).unwrap();let secret=dir.join("slack");std::fs::write(&secret,"https://hooks.slack.com/services/A/B/C").unwrap();let config=dir.join("targets.json");std::fs::write(&config,serde_json::to_vec(&serde_json::json!({"targets":[{"channel":"slack","id":"ops","webhook_file":secret,"alert_timing":{"cooldown_seconds":120}}]})).unwrap()).unwrap();
+    let listener=TcpListener::bind("127.0.0.1:0").unwrap();listener.set_nonblocking(true).unwrap();let proxy=format!("http://{}",listener.local_addr().unwrap());let count=Arc::new(AtomicUsize::new(0));let observed=count.clone();
+    let server=std::thread::spawn(move||{let until=Instant::now()+Duration::from_secs(20);while observed.load(Ordering::SeqCst)==0&&Instant::now()<until {match listener.accept(){Ok((mut socket,_))=>{let _=socket.set_read_timeout(Some(Duration::from_secs(2)));let mut buf=[0;2048];let _=socket.read(&mut buf);observed.fetch_add(1,Ordering::SeqCst);},Err(e) if e.kind()==std::io::ErrorKind::WouldBlock=>std::thread::sleep(Duration::from_millis(20)),Err(e)=>panic!("{e}")}}});
+    let make=|mode:&str,db_url:&str,fallback:&str|{let mut cmd=Command::new(env!("CARGO_BIN_EXE_alert-fanout"));if mode=="database" {cmd.args(["database","timing-fallback","primary","60"]);} else {cmd.args(["delivery","timing-fallback","300","120","60"]);} cmd.arg(&config).env("DATABASE_URL",db_url).env("NOVU_POSTGRES_ALLOW_INSECURE","true").env("SWALLOW_ALERT_TIMING_SOURCE","postgres").env("SWALLOW_ALERT_TIMING_CONNECTION_FAILURE",fallback).env("SWALLOW_DB_ALERT_STATE_FAILURE_MODE","secondary-store").env("SWALLOW_DB_ALERT_BACKUP_DATABASE_URL",&url).env("SWALLOW_DB_PROBE_URL","postgres://postgres@127.0.0.1:1/postgres").env("SWALLOW_DB_PROBE_TIMEOUT_SECONDS","1").env("SWALLOW_DB_ALERT_OPERATION_TIMEOUT_SECONDS","3").env("HTTPS_PROXY",&proxy).env("NO_PROXY","").env_remove("SWALLOW_ALERT_BINDING_KEY").env_remove("SWALLOW_ALERT_BINDING_KEY_FILE");cmd.output().unwrap()};
+    let down="postgres://postgres@127.0.0.1:1/postgres";
+    for (mode,policy,db_url) in [("database","fail",down),("delivery","file",down),("database","file",url.replace("postgres://postgres@","postgres://timing_noaccess@").as_str())] {
+        let out=make(mode,db_url,policy);assert_eq!(out.status.code(),Some(1));assert!(out.stdout.is_empty());
+    }
+    assert_eq!(count.load(Ordering::SeqCst),0);
+    let out=make("database",down,"file");assert_eq!(out.status.code(),Some(1));assert!(String::from_utf8_lossy(&out.stderr).contains("using file timing"));
+    server.join().unwrap();assert_eq!(count.load(Ordering::SeqCst),1);
+    let row=db.query_one("SELECT state FROM novu_rust_alert_delivery_slots WHERE environment_id='timing-fallback' AND channel='slack' AND target_id='ops'",&[]).await.unwrap();assert_eq!(row.get::<_,String>(0),"unknown");
+    std::fs::remove_dir_all(dir).unwrap();
+}

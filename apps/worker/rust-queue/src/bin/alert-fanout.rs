@@ -500,15 +500,17 @@ fn child_path(name: &str) -> Result<PathBuf> {
     path.set_file_name(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     Ok(path)
 }
-async fn load_timing_settings(config: &mut Config, environment: &str) -> Result<()> {
-    let (pg, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
+enum TimingError { Configuration, Connection, Query }
+async fn load_timing_settings(config: &mut Config, environment: &str) -> std::result::Result<(), TimingError> {
+    let url = std::env::var("DATABASE_URL").map_err(|_| TimingError::Configuration)?;
+    let (pg, tls) = novu_rust_contracts::postgres::configure(&url).map_err(|_| TimingError::Configuration)?;
     let (db, connection) = tokio::time::timeout(Duration::from_secs(10), pg.connect(tls)).await
-        .map_err(|_| "alert timing database connection timed out")??;
+        .map_err(|_| TimingError::Connection)?.map_err(|_| TimingError::Connection)?;
     tokio::spawn(async move { let _ = connection.await; });
     let rows = tokio::time::timeout(Duration::from_secs(10), db.query(
         "SELECT channel,target_id,grace,heartbeat,cooldown FROM public.novu_rust_alert_timing_list($1)", &[&environment]
-    )).await.map_err(|_| "alert timing query timed out")??;
-    if rows.len() > 1024 { return Err("too many alert timing settings".into()); }
+    )).await.map_err(|_| TimingError::Query)?.map_err(|_| TimingError::Query)?;
+    if rows.len() > 1024 { return Err(TimingError::Query); }
     for row in rows {
         let channel: String = row.get(0);
         let id: String = row.get(1);
@@ -518,7 +520,7 @@ async fn load_timing_settings(config: &mut Config, environment: &str) -> Result<
                 resend_heartbeat_max_seconds: row.get::<_, Option<i32>>(3).map(|v| v as u32),
                 cooldown_seconds: row.get::<_, Option<i32>>(4).map(|v| v as u32),
             };
-            if !timing.valid() { return Err("invalid stored alert timing".into()); }
+            if !timing.valid() { return Err(TimingError::Query); }
             match target {
                 Target::Slack { alert_timing, .. } | Target::Email { alert_timing, .. } => *alert_timing = Some(timing),
             }
@@ -562,8 +564,23 @@ async fn run(stop: novu_postgres_queue::shutdown::Stop) -> Result<()> {
         Err(_) => return Err("invalid fanout target timeout".into()),
     };
     let mut config = read_config(file)?;
+    let timing_failure = match std::env::var("SWALLOW_ALERT_TIMING_CONNECTION_FAILURE").as_deref() {
+        Ok("file") => true,
+        Ok("fail") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid alert timing connection failure policy".into()),
+    };
+    let mut timing_degraded = false;
     match std::env::var("SWALLOW_ALERT_TIMING_SOURCE").as_deref() {
-        Ok("postgres") => load_timing_settings(&mut config, command_args[0]).await?,
+        Ok("postgres") => match load_timing_settings(&mut config, command_args[0]).await {
+            Ok(()) => {},
+            Err(TimingError::Connection) if timing_failure && name == "send-database-alert" => {
+                timing_degraded = true;
+                eprintln!("alert timing database connection failed; using file timing for database alert");
+            }
+            Err(TimingError::Configuration) => return Err("invalid alert timing database configuration".into()),
+            Err(TimingError::Connection) => return Err("alert timing database connection failed".into()),
+            Err(TimingError::Query) => return Err("alert timing database query failed".into()),
+        },
         Ok("file") | Err(std::env::VarError::NotPresent) => {},
         _ => return Err("invalid alert timing source".into()),
     }
@@ -579,7 +596,7 @@ async fn run(stop: novu_postgres_queue::shutdown::Stop) -> Result<()> {
     let command_args: Vec<String> = command_args.into_iter().cloned().collect();
     let mut remaining = VecDeque::from(config.targets);
     let mut active = tokio::task::JoinSet::new();
-    let mut failed = false;
+    let mut failed = timing_degraded;
     let mut review = false;
     loop {
         while active.len() < concurrency && !stop.requested() {
