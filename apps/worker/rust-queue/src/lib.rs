@@ -3,12 +3,16 @@ pub mod alerts;
 pub mod db_probe;
 pub mod email_step_policy;
 pub mod fcm;
+#[cfg(test)]
+mod fcm_failover_test;
 pub mod fcm_queue;
 pub mod google_oauth;
 pub mod in_app;
 pub mod push_step_policy;
 pub mod reconciliation;
 pub mod resend;
+#[cfg(test)]
+mod resend_failover_test;
 pub mod resend_projection;
 pub mod resend_queue;
 pub mod sendgrid;
@@ -24,8 +28,6 @@ pub mod sms_step_policy;
 pub mod twilio;
 pub mod twilio_projection;
 pub mod twilio_queue;
-#[cfg(test)]
-mod resend_failover_test;
 
 use serde_json::Value;
 use std::time::Duration;
