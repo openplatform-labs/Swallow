@@ -13,6 +13,7 @@ pub mod operator_access_token;
 mod operator_identity;
 pub mod resend_webhook;
 mod sendgrid_webhook;
+mod sendgrid_key_management;
 mod slack_endpoints;
 mod slack_integrations;
 mod slack_workflow_management;
@@ -371,6 +372,8 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/console/alerts/decisions", get(console_alerts::history))
         .route("/v1/events/trigger", post(trigger))
         .route("/v1/experimental/fcm-integrations", get(fcm_integrations::list).post(fcm_integrations::create))
+        .route("/v1/experimental/sendgrid-webhook-keys", get(sendgrid_key_management::list).post(sendgrid_key_management::create))
+        .route("/v1/experimental/sendgrid-webhook-keys/{identifier}", axum::routing::delete(sendgrid_key_management::delete))
         .route("/v1/experimental/fcm-integrations/{identifier}", get(fcm_integrations::get).patch(fcm_integrations::update))
         .route("/v1/experimental/workflows/{workflow}/channel-steps/{channel}", get(channel_workflow_management::get).put(channel_workflow_management::put))
         .route("/v1/experimental/slack-integrations", get(slack_integrations::list_integrations).post(slack_integrations::create_integration))
