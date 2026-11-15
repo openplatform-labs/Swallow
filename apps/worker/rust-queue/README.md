@@ -1211,3 +1211,19 @@ To revoke, set `enabled=false` on the registered row; the RLS condition then den
 `SWALLOW_LOCAL_FAILOVER_SCENARIO=smtp-rls scripts/test-postgres-failover-local.sh` repeats the synchronous promotion test with a non-superuser SMTP worker, scoped policies and a second environment. It verifies the worker cannot read the other environment before or after promotion, its scoped guard succeeds after promotion, the old uncertain attempt stays unknown and the pre-existing worker reconnects to process a different job. Schema setup and assertions use an administrator; SMTP jobs in this scenario are standalone, and the local mock relay, forced lease expiry, one host and short observation window do not prove real delivery, asynchronous replication, split-brain fencing or production HA.
 
 Worker migration 0218 strengthens the scoped startup guard to reject membership in a superuser or BYPASSRLS role, including indirect membership. Without 0218, a login that is itself non-superuser/non-BYPASSRLS may still be able to `SET ROLE` to a bypass role. Upgrade the migration before relying on this check. Role memberships are checked at connection time, not continuously: do not grant privileged roles to a running scoped login; stop and drain affected workers and review sessions before changing membership. The local HTTP fixture tests a real worker being refused before connecting to the mock SMTP relay with a BYPASSRLS membership, then successfully starting after revocation. The scoped synchronous promotion regression also passed; external relay and production HA remain unverified.
+
+### SMTP scope registration audit
+
+Worker migration 0219 adds an audit record in the same transaction for each new scoped-login registration or actual change of its environment or enabled state. If the audit insert fails, the registration change rolls back. An unchanged update does not create a record. Existing registrations from before this migration are not backfilled; their historical changes cannot be reconstructed. Audit records contain the database session login and role OIDs, not an individual identity behind a shared login, and do not capture a change reason. The audit table and its owner must be protected; DB owners, superusers, trigger disabling and privileged direct SQL can bypass or alter records. No tamper-evidence or external export is provided.
+
+A DBA can separately authorize a LOGIN to read each environment's audit records:
+
+```sql
+INSERT INTO public.novu_rust_smtp_scope_audit_viewers(environment_id,database_principal,principal_oid)
+SELECT 'ENVIRONMENT_ID',rolname,oid FROM pg_catalog.pg_roles WHERE rolname='AUDIT_VIEWER_LOGIN';
+GRANT EXECUTE ON FUNCTION public.novu_rust_smtp_scope_audit_read(text,bigint) TO AUDIT_VIEWER_LOGIN;
+```
+
+With that login, run `delivery-reconcile smtp-scope-audit ENV [AFTER_ID]`; the cursor is a nonnegative decimal audit ID and the query returns up to 100 records in ID order. A change between environments is visible to authorized viewers of either side, but the other environment identifier is redacted. ID order is not a guaranteed commit order; concurrent transactions can commit out of order, so poll with overlap or use an independent audit export when complete collection matters. Registration audit does not cover role grants, RLS installation, policy changes or attempts by unauthorized users. Viewer grants themselves require trusted DBA administration.
+
+The local SMTP HTTP fixture verifies registration and disable audit, no-op updates, audit-write rollback, environment redaction, viewer separation and revocation, plus the CLI cursor. The synchronous promotion regression also passed with a scoped worker. Actual external auditing, role-administration audit, HTTP/UI access to these records, production concurrency and multi-host HA are not implemented or verified.

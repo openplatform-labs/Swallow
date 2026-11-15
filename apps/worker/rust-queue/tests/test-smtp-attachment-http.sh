@@ -41,6 +41,7 @@ CREATE ROLE smtp_fixture_switch NOLOGIN;
 CREATE ROLE smtp_fixture_plain LOGIN;
 GRANT smtp_fixture_switch TO smtp_fixture_worker;
 GRANT SELECT ON public.novu_queue_jobs TO smtp_fixture_switch,smtp_fixture_plain;
+GRANT EXECUTE ON FUNCTION public.novu_rust_smtp_scope_audit_read(text,bigint) TO smtp_fixture_plain;
 GRANT USAGE ON SCHEMA public TO smtp_fixture_worker;
 GRANT SELECT,UPDATE ON public.novu_queue_jobs TO smtp_fixture_worker;
 GRANT SELECT,INSERT,UPDATE ON public.novu_rust_smtp_attempts,public.novu_rust_email_workflow_worker_config TO smtp_fixture_worker;
@@ -59,6 +60,7 @@ SQL
 if [[ "${TEST_SMTP_RLS:-false}" == true ]]; then
   db_sql -q -v ON_ERROR_STOP=1 <<'SQL'
 INSERT INTO public.novu_rust_smtp_scoped_logins(principal_oid,database_principal,environment_id) SELECT oid,rolname,'attachment-env' FROM pg_roles WHERE rolname='smtp_fixture_worker';
+INSERT INTO public.novu_rust_smtp_scope_audit_viewers(environment_id,database_principal,principal_oid) SELECT 'attachment-env',rolname,oid FROM pg_roles WHERE rolname='smtp_fixture_plain';
 SQL
   if db_sql -q -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_worker; SELECT public.novu_rust_assert_smtp_scoped_login('attachment-env')" >/dev/null 2>&1; then echo 'uninstalled RLS was accepted' >&2; exit 1; fi
   db_sql -q -v ON_ERROR_STOP=1 -c "SELECT public.novu_rust_install_smtp_scoped_rls()"
@@ -72,7 +74,7 @@ fi
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost -addext subjectAltName=DNS:localhost -addext basicConstraints=critical,CA:FALSE -keyout "$TEST_DIR/key" -out "$TEST_DIR/cert" >"$TEST_DIR/openssl.log" 2>&1
 printf '%s' fixture-password > "$TEST_DIR/password"
 cargo build --quiet --locked --manifest-path "$API/Cargo.toml" --bin novu-rust-api
-cargo build --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin in-app-worker --bin smtp-worker
+cargo build --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin in-app-worker --bin smtp-worker --bin delivery-reconcile
 python3 "$WORKER/tests/fixtures/smtp_starttls_fixture.py" "$TEST_DIR/cert" "$TEST_DIR/key" "$TEST_DIR/message" "$TEST_DIR/connected" > "$TEST_DIR/smtp-port" 2>"$TEST_DIR/smtp-fixture.log" & FIXTURE_PID=$!
 for _ in $(seq 1 100); do [[ -s "$TEST_DIR/smtp-port" ]] && break; kill -0 "$FIXTURE_PID"; sleep 0.1; done
 SMTP_PORT=$(cat "$TEST_DIR/smtp-port")
@@ -154,7 +156,35 @@ if [[ "${TEST_SMTP_RLS:-false}" == true ]]; then
   if db_sql -q -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_worker; INSERT INTO public.novu_rust_smtp_attempts(job_id,environment_id,state) VALUES('11111111-1111-4111-8111-000000000099','other-env','unknown')" >/dev/null 2>&1; then echo 'cross-environment insert was allowed' >&2; exit 1; fi
   if db_sql -q -v ON_ERROR_STOP=1 -c "DELETE FROM public.novu_rust_smtp_scoped_logins WHERE database_principal='smtp_fixture_worker'" >/dev/null 2>&1; then echo 'scope registration was deleted' >&2; exit 1; fi
   if db_sql -q -v ON_ERROR_STOP=1 -c "UPDATE public.novu_rust_smtp_scoped_logins SET database_principal='smtp_fixture_plain' WHERE database_principal='smtp_fixture_worker'" >/dev/null 2>&1; then echo 'scope identity was changed' >&2; exit 1; fi
+  [[ $(db_sql -qAt -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_plain; SELECT count(*) FROM public.novu_rust_smtp_scope_audit_read('attachment-env',0)") == 1 ]]
+  if db_sql -q -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_plain; SELECT * FROM public.novu_rust_smtp_scope_audit_read('other-env',0)" >/dev/null 2>&1; then echo 'cross-environment scope audit allowed' >&2; exit 1; fi
+  if db_sql -q -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_plain; SELECT * FROM public.novu_rust_smtp_scope_audit" >/dev/null 2>&1; then echo 'direct scope audit access allowed' >&2; exit 1; fi
+  db_sql -q -v ON_ERROR_STOP=1 -c "UPDATE public.novu_rust_smtp_scoped_logins SET enabled=true WHERE database_principal='smtp_fixture_worker'"
+  [[ $(db_sql -qAt -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_plain; SELECT count(*) FROM public.novu_rust_smtp_scope_audit_read('attachment-env',0)") == 1 ]]
+  db_sql -q -v ON_ERROR_STOP=1 -c "CREATE FUNCTION public.fixture_audit_fail() RETURNS trigger LANGUAGE plpgsql AS \$\$ BEGIN RAISE EXCEPTION 'fixture'; END \$\$; CREATE TRIGGER fixture_audit_fail BEFORE INSERT ON public.novu_rust_smtp_scope_audit FOR EACH ROW EXECUTE FUNCTION public.fixture_audit_fail()"
+  if db_sql -q -v ON_ERROR_STOP=1 -c "UPDATE public.novu_rust_smtp_scoped_logins SET enabled=false WHERE database_principal='smtp_fixture_worker'" >/dev/null 2>&1; then echo 'scope change succeeded without audit' >&2; exit 1; fi
+  [[ $(db_sql -qAt -v ON_ERROR_STOP=1 -c "SELECT enabled FROM public.novu_rust_smtp_scoped_logins WHERE database_principal='smtp_fixture_worker'") == t ]]
+  db_sql -q -v ON_ERROR_STOP=1 -c "DROP TRIGGER fixture_audit_fail ON public.novu_rust_smtp_scope_audit; DROP FUNCTION public.fixture_audit_fail()"
   db_sql -q -v ON_ERROR_STOP=1 -c "UPDATE public.novu_rust_smtp_scoped_logins SET enabled=false WHERE database_principal='smtp_fixture_worker'"
+  [[ $(db_sql -qAt -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_plain; SELECT count(*) FROM public.novu_rust_smtp_scope_audit_read('attachment-env',0)") == 2 ]]
+  env -i PATH="$PATH" DATABASE_URL="postgres://smtp_fixture_plain@127.0.0.1:$DB_PORT/postgres" NOVU_POSTGRES_ALLOW_INSECURE=true "$WORKER/target/debug/delivery-reconcile" smtp-scope-audit attachment-env > "$TEST_DIR/audit.json"
+  python3 - "$TEST_DIR/audit.json" <<'PY2'
+import json,sys
+rows=json.load(open(sys.argv[1]))['data']
+assert len(rows)==2 and rows[0]['previousEnabled'] is None and rows[1]['enabled'] is False
+assert rows[1]['databasePrincipal']=='smtp_fixture_worker'
+PY2
+FIRST_AUDIT_ID=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["data"][0]["id"])' "$TEST_DIR/audit.json")
+  env -i PATH="$PATH" DATABASE_URL="postgres://smtp_fixture_plain@127.0.0.1:$DB_PORT/postgres" NOVU_POSTGRES_ALLOW_INSECURE=true "$WORKER/target/debug/delivery-reconcile" smtp-scope-audit attachment-env "$FIRST_AUDIT_ID" > "$TEST_DIR/audit-next.json"
+  python3 - "$TEST_DIR/audit-next.json" <<'PY2'
+import json,sys
+rows=json.load(open(sys.argv[1]))['data']
+assert len(rows)==1 and rows[0]['enabled'] is False
+PY2
+  db_sql -q -v ON_ERROR_STOP=1 -c "CREATE ROLE smtp_fixture_move LOGIN; INSERT INTO public.novu_rust_smtp_scoped_logins(principal_oid,database_principal,environment_id) SELECT oid,rolname,'attachment-env' FROM pg_roles WHERE rolname='smtp_fixture_move'; UPDATE public.novu_rust_smtp_scoped_logins SET environment_id='other-env' WHERE database_principal='smtp_fixture_move'"
+  [[ $(db_sql -qAt -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_plain; SELECT count(*) FROM public.novu_rust_smtp_scope_audit_read('attachment-env',0) WHERE database_principal='smtp_fixture_move' AND previous_environment='attachment-env' AND environment_id IS NULL") == 1 ]]
+  db_sql -q -v ON_ERROR_STOP=1 -c "DELETE FROM public.novu_rust_smtp_scope_audit_viewers WHERE environment_id='attachment-env' AND database_principal='smtp_fixture_plain'"
+  if db_sql -q -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_plain; SELECT * FROM public.novu_rust_smtp_scope_audit_read('attachment-env',0)" >/dev/null 2>&1; then echo 'revoked audit access allowed' >&2; exit 1; fi
   if db_sql -q -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_worker; SELECT public.novu_rust_assert_smtp_scoped_login('attachment-env')" >/dev/null 2>&1; then echo 'revoked SMTP scope was accepted' >&2; exit 1; fi
   [[ $(db_sql -qAt -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_worker; SELECT count(*) FROM public.novu_queue_jobs WHERE environment_id='attachment-env'") == 0 ]]
 else
