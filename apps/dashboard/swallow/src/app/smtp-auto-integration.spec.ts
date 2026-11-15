@@ -1,6 +1,7 @@
 import { TestBed } from '@angular/core/testing';
 import { describe, expect, it } from 'vitest';
 import { SmtpAutoPolicy } from './smtp-auto-policy';
+import { SmtpAutoHealth } from './smtp-auto-health';
 
 const env = (globalThis as unknown as { process?: { env: Record<string, string | undefined> } }).process?.env;
 const origin = env?.['SWALLOW_UI_TEST_API'], token = env?.['SWALLOW_UI_TEST_JWT'];
@@ -18,6 +19,10 @@ describe.skipIf(!origin || !token)('SMTP auto retry policy with real local API',
     c.lookupId = draft.requestId; await c.lookup(); expect(c.lookupStatus()).toBe('found');
     await c.audit(); expect(c.auditStatus()).toBe('loaded'); expect(c.auditRows().some(row => row.requestId === draft.requestId && row.actorSubject === 'admin')).toBe(true);
     await c.history(); expect(c.historyStatus()).toBe('loaded'); expect(c.historyRows()).toHaveLength(1);
+    const healthFixture = TestBed.createComponent(SmtpAutoHealth), health = healthFixture.componentInstance;
+    health.apiOrigin=origin!; health.environment='fixture-env'; health.token=token!; await health.load();
+    expect(health.status()).toBe('loaded'); expect(health.health()).toEqual({enabled:true,eligible:0,overdue:0,exhausted:0});
+    health.environment='other'; health.ngOnChanges(); await health.load(); expect(health.status()).toBe('error'); healthFixture.destroy();
     expect(c.historyRows()[0].jobId).toBe('11111111-1111-4111-8111-111111111111'); expect(JSON.stringify(c.historyRows())).not.toContain('fixture-secret');
     fixture.detectChanges(); expect(fixture.nativeElement.textContent).toContain('SMTP 자동 재시도 이력');
     response = await fetch(`${origin}/v1/experimental/operator/smtp-auto-policy?environmentId=fixture-env`, { headers: { Authorization: `Bearer ${token}` } });

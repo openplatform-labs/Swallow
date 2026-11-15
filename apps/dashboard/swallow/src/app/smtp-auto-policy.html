@@ -52,3 +52,5 @@
 @else if(historyStatus()==='loaded'){@if(historyRows().length===0){<p>조회된 이력이 없습니다.</p>}@else{<div class="table-wrap"><table class="table"><thead><tr><th>시각과 작업</th><th>시도와 실패 revision</th><th>실행자와 제한</th></tr></thead><tbody>@for(row of historyRows();track row.id){<tr><td>{{ row.recordedAt }}<br>{{ row.jobId }}</td><td>{{ row.attemptRevision }}<br>{{ row.failureRevision }}</td><td>{{ row.databasePrincipal }}<br>최대 {{ row.maxRetries }}회 · {{ row.delaySeconds }}초</td></tr>}</tbody></table></div>}
 <p>{{ historyPage() }} 페이지</p><button type="button" class="btn btn-sm btn-outline" [disabled]="historyPage()<=1" (click)="history('previous')">이전</button><button type="button" class="btn btn-sm btn-outline" [disabled]="!historyNext()" (click)="history('next')">다음</button>}
 </div></section>
+
+<app-smtp-auto-health [apiOrigin]="apiOrigin" [environment]="environment" [token]="token"></app-smtp-auto-health>

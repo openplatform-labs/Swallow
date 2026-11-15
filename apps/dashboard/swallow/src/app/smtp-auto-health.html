@@ -1,0 +1,7 @@
+<section class="card subscriber-card"><div class="card-block">
+<h2>SMTP 자동 재시도 현황</h2><p>대상 실패 중 대기 시간이 지난 건수와 지연·한도 소진 건수입니다. 비활성 정책은 0으로 표시되며 발송 완료나 워커 정상 동작을 뜻하지 않습니다.</p>
+<form class="subscriber-form" (ngSubmit)="load()"><label for="smtp-auto-health-grace">지연 유예 시간(초)</label><input id="smtp-auto-health-grace" name="smtpAutoHealthGrace" type="number" min="1" max="86400" step="1" [(ngModel)]="graceSeconds" (ngModelChange)="clear()" required><button type="submit" class="btn btn-outline" [disabled]="status()==='loading'">현황 조회</button></form>
+@if(status()==='error'){<p role="alert">현황을 조회하지 못했습니다. 인증과 집계 권한을 확인하세요.</p>}
+@else if(status()==='loading'){<p role="status">조회 중입니다.</p>}
+@else if(health();as count){<p role="status">정책 {{count.enabled ? '활성' : '비활성'}} · 대상 {{count.eligible}}건 · 지연 {{count.overdue}}건 · 한도 소진 {{count.exhausted}}건</p>}
+</div></section>

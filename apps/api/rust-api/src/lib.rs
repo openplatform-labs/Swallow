@@ -509,6 +509,7 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/operator/smtp-credential-health", get(operator_identity::smtp_credential_health))
         .route("/v1/experimental/operator/smtp-ca-health", get(operator_identity::smtp_ca_health))
         .route("/v1/experimental/operator/discord-cooldown-health", get(operator_identity::discord_cooldown_health))
+        .route("/v1/experimental/operator/smtp-auto-health", get(operator_identity::smtp_auto_health))
         .route("/v1/experimental/operator/discord-retry-health", get(operator_identity::discord_retry_health))
         .route("/v1/experimental/operator/discord-retries", get(operator_identity::discord_retry_list))
         .route("/v1/experimental/operator/fcm-unrecorded-claims-health", get(operator_identity::fcm_unrecorded_claim_health))
