@@ -35,4 +35,12 @@ rg -q 'immediate replay migration or privilege unavailable' "$DIR/worker-reconci
 stop_worker
 if NOVU_RESEND_ENVIRONMENT_ID=replay-worker-fixture NOVU_RESEND_API_KEY=fixture NOVU_RESEND_FROM=sender@example.test NOVU_RESEND_REPLAY_UNCERTAIN_ONCE=invalid "$WORKER/target/debug/resend-worker" >"$DIR/invalid.log" 2>&1; then echo 'invalid replay setting accepted' >&2; exit 1; fi
 rg -q 'invalid Resend immediate replay setting' "$DIR/invalid.log"
+# Test-only build accepts a strictly loopback fixture endpoint; rebuild production afterward.
+cargo build --quiet --locked --offline --features test-mocks --manifest-path "$WORKER/Cargo.toml" --bin resend-worker
+cp "$WORKER/target/debug/resend-worker" "$DIR/resend-worker-mock"
+cargo build --quiet --locked --offline --manifest-path "$WORKER/Cargo.toml" --bin resend-worker
+cargo build --quiet --locked --offline --manifest-path "$WORKER/Cargo.toml" --bin in-app-worker
+if SWALLOW_TEST_RESEND_ENDPOINT='https://example.com/emails' NOVU_RESEND_ENVIRONMENT_ID=replay-worker-fixture NOVU_RESEND_API_KEY=fixture NOVU_RESEND_FROM=sender@example.test "$DIR/resend-worker-mock" >"$DIR/fixture-endpoint.log" 2>&1; then echo 'non-loopback test endpoint accepted' >&2; exit 1; fi
+rg -q 'invalid fixture endpoint' "$DIR/fixture-endpoint.log"
+TEST_RESEND_WORKER="$DIR/resend-worker-mock" TEST_IN_APP_WORKER="$WORKER/target/debug/in-app-worker" TEST_PSQL="$TEST_PG_BIN/psql" python3 "$WORKER/tests/resend_replay_worker_process.py"
 echo 'Resend replay fixture and worker configuration checks passed.'

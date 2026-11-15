@@ -5,6 +5,25 @@ use novu_postgres_queue::{
 };
 use std::{error::Error, time::Duration};
 
+// Only test-mocks builds can target a local fixture; production always uses Resend.
+fn provider(config: Config) -> Result<Resend, Box<dyn Error + Send + Sync>> {
+    #[cfg(feature = "test-mocks")]
+    match std::env::var("SWALLOW_TEST_RESEND_ENDPOINT") {
+        Ok(endpoint) => {
+            let url = reqwest::Url::parse(&endpoint).map_err(|_| "invalid fixture endpoint")?;
+            if url.scheme() != "http" || url.host_str() != Some("127.0.0.1") || url.port().is_none()
+                || !url.username().is_empty() || url.password().is_some() || url.path() != "/emails"
+                || url.query().is_some() || url.fragment().is_some() {
+                return Err("invalid fixture endpoint".into());
+            }
+            return Ok(Resend::test_endpoint(config, &endpoint)?);
+        }
+        Err(std::env::VarError::NotPresent) => {},
+        Err(_) => return Err("invalid fixture endpoint".into()),
+    }
+    Ok(Resend::new(config)?)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     novu_postgres_queue::shutdown::run_until_signal(run).await
@@ -36,7 +55,7 @@ async fn run(
         novu_rust_contracts::secret::from_env("NOVU_RESEND_API_KEY", "NOVU_RESEND_API_KEY_FILE")?
             .ok_or("Resend API key is required")?
     };
-    let mut provider = Resend::new(Config {
+    let mut provider = provider(Config {
         api_key,
         from: std::env::var("NOVU_RESEND_FROM")?,
         sender_name: std::env::var("NOVU_RESEND_SENDER_NAME").unwrap_or_default(),
