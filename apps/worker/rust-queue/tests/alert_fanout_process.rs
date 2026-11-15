@@ -3,6 +3,34 @@
 use std::{os::unix::fs::PermissionsExt, process::Command};
 use uuid::Uuid;
 #[test]
+fn optional_preflight_checks_effective_threshold_pairs_before_any_child() {
+    let dir=std::env::temp_dir().join(format!("swallow-alert-pairs-{}",Uuid::new_v4()));std::fs::create_dir(&dir).unwrap();
+    let fanout=dir.join("alert-fanout");std::fs::copy(env!("CARGO_BIN_EXE_alert-fanout"),&fanout).unwrap();
+    for name in ["send-delivery-alert","send-database-alert"] {
+        let child=dir.join(name);std::fs::write(&child,"#!/bin/sh\nprintf '%s\\n' \"$SWALLOW_ALERT_SLACK_TARGET_ID\" >> \"$FANOUT_TEST_LOG\"\n").unwrap();std::fs::set_permissions(child,std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let pairs=[("smtp_credential_max_age_seconds","smtp_credential_min_healthy"),("smtp_ca_max_age_seconds","smtp_ca_min_healthy"),("fcm_credential_max_age_seconds","fcm_credential_min_healthy"),("fcm_unrecorded_claim_min_gap","fcm_unrecorded_claim_grace_seconds"),("twilio_grace_seconds","twilio_heartbeat_max_seconds"),("sendgrid_grace_seconds","sendgrid_heartbeat_max_seconds")];
+    let config=dir.join("config.json");let log=dir.join("log");
+    for (left,right) in pairs {
+        for (left_value,right_value,expected) in [(serde_json::json!(30),serde_json::Value::Null,false),(serde_json::json!(30),serde_json::json!(30),true),(serde_json::json!("disabled"),serde_json::json!("disabled"),true)] {
+            let mut thresholds=serde_json::Map::new();thresholds.insert(left.into(),left_value);thresholds.insert(right.into(),right_value);
+            std::fs::write(&config,serde_json::to_vec(&serde_json::json!({"targets":[{"channel":"slack","id":"first","webhook_file":dir.join("key")},{"channel":"slack","id":"second","webhook_file":dir.join("key"),"delivery_thresholds":thresholds}]})).unwrap()).unwrap();
+            std::fs::write(&log,"").unwrap();
+            let output=Command::new(&fanout).args(["delivery","env","300","120","60"]).arg(&config).env("FANOUT_TEST_LOG",&log).env("SWALLOW_ALERT_FANOUT_PREFLIGHT_PAIRS","true").env_remove(format!("SWALLOW_ALERT_{}",left.to_ascii_uppercase())).env_remove(format!("SWALLOW_ALERT_{}",right.to_ascii_uppercase())).output().unwrap();
+            assert_eq!(output.status.success(),expected);assert_eq!(std::fs::read_to_string(&log).unwrap(),if expected {"first\nsecond\n"} else {""});
+        }
+    }
+    std::fs::write(&config,serde_json::to_vec(&serde_json::json!({"targets":[{"channel":"slack","id":"only","webhook_file":dir.join("key"),"delivery_thresholds":{"twilio_grace_seconds":"disabled"}}]})).unwrap()).unwrap();
+    for (mode,flag,heartbeat,success) in [("delivery","true",true,false),("delivery","true",false,true),("delivery","false",true,true),("database","true",true,true)] {
+        std::fs::write(&log,"").unwrap();let mut cmd=Command::new(&fanout);
+        if mode=="delivery" {cmd.args(["delivery","env","300","120","60"]);} else {cmd.args(["database","env","probe","60"]);}
+        cmd.arg(&config).env("FANOUT_TEST_LOG",&log).env("SWALLOW_ALERT_FANOUT_PREFLIGHT_PAIRS",flag).env("SWALLOW_ALERT_TWILIO_GRACE_SECONDS","120");
+        if heartbeat {cmd.env("SWALLOW_ALERT_TWILIO_HEARTBEAT_MAX_SECONDS","120");} else {cmd.env_remove("SWALLOW_ALERT_TWILIO_HEARTBEAT_MAX_SECONDS");}
+        assert_eq!(cmd.output().unwrap().status.success(),success);assert_eq!(std::fs::read_to_string(&log).unwrap(),if success {"only\n"} else {""});
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[test]
 fn alert_timing_overrides_are_isolated_for_delivery_and_database() {
     let dir=std::env::temp_dir().join(format!("swallow-alert-timing-{}",Uuid::new_v4()));std::fs::create_dir(&dir).unwrap();
     let fanout=dir.join("alert-fanout");std::fs::copy(env!("CARGO_BIN_EXE_alert-fanout"),&fanout).unwrap();

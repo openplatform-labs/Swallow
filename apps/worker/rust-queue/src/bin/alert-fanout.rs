@@ -292,6 +292,28 @@ impl Target {
                 }
             }
     }
+    fn paired_thresholds_valid(&self) -> bool {
+        let thresholds = match self {
+            Self::Slack { delivery_thresholds, .. } | Self::Email { delivery_thresholds, .. } => delivery_thresholds.as_ref(),
+        };
+        let supplied = |key: &str, value: Option<&Threshold>| match value {
+            Some(Threshold::Value(_)) => true,
+            Some(Threshold::Disabled(_)) => false,
+            None => std::env::var_os(key).is_some(),
+        };
+        let value = |f: fn(&DeliveryThresholds) -> &Option<Threshold>| thresholds.and_then(|t| f(t).as_ref());
+        for (left_key, left, right_key, right) in [
+            ("SWALLOW_ALERT_SMTP_CREDENTIAL_MAX_AGE_SECONDS", value(|t| &t.smtp_credential_max_age_seconds), "SWALLOW_ALERT_SMTP_CREDENTIAL_MIN_HEALTHY", value(|t| &t.smtp_credential_min_healthy)),
+            ("SWALLOW_ALERT_SMTP_CA_MAX_AGE_SECONDS", value(|t| &t.smtp_ca_max_age_seconds), "SWALLOW_ALERT_SMTP_CA_MIN_HEALTHY", value(|t| &t.smtp_ca_min_healthy)),
+            ("SWALLOW_ALERT_FCM_CREDENTIAL_MAX_AGE_SECONDS", value(|t| &t.fcm_credential_max_age_seconds), "SWALLOW_ALERT_FCM_CREDENTIAL_MIN_HEALTHY", value(|t| &t.fcm_credential_min_healthy)),
+            ("SWALLOW_ALERT_FCM_UNRECORDED_CLAIM_MIN_GAP", value(|t| &t.fcm_unrecorded_claim_min_gap), "SWALLOW_ALERT_FCM_UNRECORDED_CLAIM_GRACE_SECONDS", value(|t| &t.fcm_unrecorded_claim_grace_seconds)),
+            ("SWALLOW_ALERT_TWILIO_GRACE_SECONDS", value(|t| &t.twilio_grace_seconds), "SWALLOW_ALERT_TWILIO_HEARTBEAT_MAX_SECONDS", value(|t| &t.twilio_heartbeat_max_seconds)),
+            ("SWALLOW_ALERT_SENDGRID_GRACE_SECONDS", value(|t| &t.sendgrid_grace_seconds), "SWALLOW_ALERT_SENDGRID_HEARTBEAT_MAX_SECONDS", value(|t| &t.sendgrid_heartbeat_max_seconds)),
+        ] {
+            if supplied(left_key, left) != supplied(right_key, right) { return false; }
+        }
+        true
+    }
     fn command_args(&self, default: &[String], delivery: bool) -> Vec<String> {
         let mut args = default.to_vec();
         let timing = match self {
@@ -514,6 +536,14 @@ async fn run(stop: novu_postgres_queue::shutdown::Stop) -> Result<()> {
         Err(_) => return Err("invalid fanout target timeout".into()),
     };
     let config = read_config(file)?;
+    let preflight = match std::env::var("SWALLOW_ALERT_FANOUT_PREFLIGHT_PAIRS").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid alert preflight policy".into()),
+    };
+    if name == "send-delivery-alert" && preflight && config.targets.iter().any(|target| !target.paired_thresholds_valid()) {
+        return Err("incomplete alert threshold pair".into());
+    }
     let binary = child_path(name)?;
     let command_args: Vec<String> = command_args.into_iter().cloned().collect();
     let mut remaining = VecDeque::from(config.targets);
