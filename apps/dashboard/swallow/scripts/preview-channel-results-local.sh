@@ -46,6 +46,13 @@ INSERT INTO public.novu_rust_operator_jwt_sendgrid_result_grants VALUES ('https:
 INSERT INTO public.novu_rust_operator_jwt_sendgrid_jobs_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
 INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) SELECT gen_random_uuid(),'ui-fixture-env','experimental_sendgrid_email','{}' FROM generate_series(1,21);
 SQL
+if [[ "${SWALLOW_UI_RESEND_AUTO_POLICY_FIXTURE:-false}" == true ]]; then
+ "$pgbin/psql" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_auto_policy_read(text,text,text,text,bigint),public.novu_rust_operator_jwt_resend_auto_policy_change(text,text,text,text,bigint,uuid,bigint,boolean,integer,text,text),public.novu_rust_operator_jwt_resend_auto_policy_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_resend_auto_policy_audit_read(text,text,text,text,bigint,uuid) TO ui_channel_results_fixture;
+INSERT INTO public.novu_rust_resend_auto_policy_admins(environment_id,database_principal,principal_oid,can_read,can_write) SELECT 'ui-fixture-env',rolname,oid,true,true FROM pg_roles WHERE rolname='ui_channel_results_fixture';
+INSERT INTO public.novu_rust_operator_jwt_resend_auto_policy_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env',true,true,true);
+SQL
+fi
 if [[ "${SWALLOW_UI_SLACK_DECISION_FIXTURE:-false}" == true ]]; then
  "$pgbin/psql" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_slack_resolve(text,text,text,text,bigint,uuid,uuid,uuid,text,text),public.novu_rust_operator_jwt_slack_decision_request(text,text,text,text,bigint,uuid) TO ui_channel_results_fixture;
