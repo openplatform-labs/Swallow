@@ -55,6 +55,10 @@ elif [[ "$scenario" == resend || "$scenario" == resend-cooldown ]]; then
   if [[ "$scenario" == resend-cooldown ]]; then
     cargo test --locked --lib resend_failover_test::synchronous_failover_preserves_resend_shared_cooldown -- --ignored
   else
+    cargo build --quiet --locked --bin resend-projection-worker
+    cargo build --quiet --locked --manifest-path "$root/apps/api/rust-api/Cargo.toml" --bin novu-rust-api
+    api_target=$(cargo metadata --format-version 1 --no-deps --manifest-path "$root/apps/api/rust-api/Cargo.toml" | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+    export TEST_RESEND_FAILOVER_API_BINARY="$api_target/debug/novu-rust-api" TEST_RESEND_FAILOVER_PROJECTION_BINARY="$target_dir/debug/resend-projection-worker"
     cargo test --locked --lib resend_failover_test::synchronous_failover_during_resend_dispatch_preserves_unknown -- --ignored
   fi
 elif [[ "$scenario" == fcm || "$scenario" == fcm-delay || "$scenario" == fcm-exp || "$scenario" == fcm-exp-repeat ]]; then

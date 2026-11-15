@@ -213,6 +213,90 @@ async fn synchronous_failover_during_resend_dispatch_preserves_unknown() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(replicated, "dispatch marker not replayed");
+    // Optionally run the real webhook API and scoped projector throughout the failover.
+    let mut live_pipeline = None;
+    if let (Ok(api_binary), Ok(projection_binary)) = (
+        std::env::var("TEST_RESEND_FAILOVER_API_BINARY"),
+        std::env::var("TEST_RESEND_FAILOVER_PROJECTION_BINARY"),
+    ) {
+        let api_role = format!("ha_web_{}", Uuid::new_v4().simple());
+        let projection_role = format!("ha_projection_{}", Uuid::new_v4().simple());
+        db.batch_execute(&format!("CREATE ROLE {api_role} LOGIN; CREATE ROLE {projection_role} LOGIN; GRANT USAGE ON SCHEMA public TO {api_role},{projection_role}; GRANT SELECT ON public.novu_rust_environments TO {api_role}; GRANT SELECT,INSERT,UPDATE ON public.novu_rust_resend_delivery_events TO {api_role}; GRANT EXECUTE ON FUNCTION public.novu_rust_lock_resend_webhook_jobs_with_correlation(text,text,uuid) TO {api_role}; GRANT SELECT ON public.novu_rust_environments,public.novu_queue_jobs,public.novu_rust_resend_attempts,public.novu_rust_resend_recipients,public.novu_rust_resend_delivery_events,public.novu_rust_delivery_reconciliations,public.novu_rust_resend_auto_correlations,public.novu_rust_email_messages TO {projection_role}; GRANT UPDATE ON public.novu_queue_jobs,public.novu_rust_resend_attempts,public.novu_rust_email_messages TO {projection_role}; GRANT INSERT ON public.novu_rust_resend_auto_correlations TO {projection_role}; GRANT EXECUTE ON FUNCTION public.novu_rust_register_projection_policy(text,text,boolean),public.novu_rust_check_projection_policy(text,text,boolean),public.novu_rust_scoped_projection_heartbeat(text,text,boolean) TO {projection_role}")).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_resend_webhook_lock_grants SELECT 'resend-ha',$1,oid FROM pg_roles WHERE rolname::text=$1",&[&api_role]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_projection_policy_logins SELECT 'resend-ha','resend',rolname,oid FROM pg_roles WHERE rolname::text=$1",&[&projection_role]).await.unwrap();
+        let role_url = |role: &str| {
+            cluster_url
+                .replacen("postgres://postgres@", &format!("postgres://{role}@"), 1)
+                .replacen(
+                    "postgresql://postgres@",
+                    &format!("postgresql://{role}@"),
+                    1,
+                )
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let secret = b"fixture-secret-012345678901234567";
+        let key = format!(
+            "whsec_{}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, secret)
+        );
+        let api = Worker(
+            Command::new(api_binary)
+                .env_clear()
+                .env("DATABASE_URL", role_url(&api_role))
+                .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+                .env("LISTEN_ADDR", format!("127.0.0.1:{port}"))
+                .env("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED", "true")
+                .env("NOVU_RESEND_WEBHOOK_ENVIRONMENT_ID", "resend-ha")
+                .env("NOVU_RESEND_WEBHOOK_SECRET", key)
+                .env("NOVU_RESEND_WEBHOOK_LOCK_RETRY_JOBS", "true")
+                .env("NOVU_RESEND_WEBHOOK_CAPTURE_CORRELATION", "true")
+                .env("NOVU_RESEND_WEBHOOK_LOCK_CORRELATION_JOBS", "true")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let projection = Worker(
+            Command::new(projection_binary)
+                .env_clear()
+                .env("DATABASE_URL", role_url(&projection_role))
+                .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+                .env("NOVU_RESEND_ENVIRONMENT_ID", "resend-ha")
+                .env("SWALLOW_PROJECTION_SCOPED_POLICY", "true")
+                .env("NOVU_RESEND_PROJECTION_AUTO_CORRELATE", "true")
+                .env("NOVU_RESEND_PROJECTION_SCAN_INTERVAL_SECONDS", "1")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let origin = format!("http://127.0.0.1:{port}");
+        let client = reqwest::Client::new();
+        let mut ready = false;
+        for _ in 0..150 {
+            if client
+                .get(format!("{origin}/health/ready"))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(ready, "webhook API failed to start");
+        let mut projection_ready = false;
+        for _ in 0..150 {
+            if db.query_one("SELECT EXISTS(SELECT 1 FROM public.novu_rust_resend_projection_heartbeat WHERE environment_id='resend-ha')",&[]).await.unwrap().get::<_,bool>(0){projection_ready=true;break;}
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(projection_ready, "scoped projection worker failed to start");
+        live_pipeline = Some((api, projection, origin));
+    }
+
     if let Ok(pgctl) = std::env::var("TEST_LOCAL_PG_CTL") {
         let primary = std::env::var("TEST_LOCAL_PRIMARY_DATA").unwrap();
         let standby = std::env::var("TEST_LOCAL_STANDBY_DATA").unwrap();
@@ -331,17 +415,84 @@ async fn synchronous_failover_during_resend_dispatch_preserves_unknown() {
         .get(0);
     assert_eq!(stored_tag, sent_tag);
     let recipient:String=promoted.query_one("SELECT recipient_hash FROM public.novu_rust_resend_recipients WHERE job_id=$1 AND recipient_kind='to' AND recipient_index=0",&[&job]).await.unwrap().get(0);
-    promoted.execute("INSERT INTO public.novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type,recipient_hash,correlation_id) VALUES ('resend-ha','dispatch-after-failover','fixture-accepted','email.delivered',$1,$2)",&[&recipient,&sent_tag]).await.unwrap();
-    assert!(
-        crate::resend_projection::project_with_auto_correlation(
-            &mut promoted,
-            "resend-ha",
-            job,
-            true
-        )
-        .await
-        .unwrap()
-    );
+    if let Some((ref mut api, ref mut projection, ref origin)) = live_pipeline {
+        use base64::Engine;
+        let secret = b"fixture-secret-012345678901234567";
+        let id = "msg_post_failover";
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string();
+        let payload=json!({"type":"email.delivered","data":{"email_id":"fixture-accepted","to":["receiver@example.test"],"tags":{"swallow_dispatch":sent_tag.to_string()}}}).to_string();
+        let signed = format!("{id}.{timestamp}.{payload}");
+        let signature = format!(
+            "v1,{}",
+            base64::engine::general_purpose::STANDARD.encode(
+                ring::hmac::sign(
+                    &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret),
+                    signed.as_bytes()
+                )
+                .as_ref()
+            )
+        );
+        let client = reqwest::Client::new();
+        let mut ready = false;
+        for _ in 0..150 {
+            if client
+                .get(format!("{origin}/health/ready"))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                ready = true;
+                break;
+            }
+            assert!(api.0.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(ready, "API did not reconnect");
+        let response = client
+            .post(format!(
+                "{origin}/webhooks/organizations/org/environments/resend-ha/email/resend"
+            ))
+            .header("svix-id", id)
+            .header("svix-timestamp", timestamp)
+            .header("svix-signature", signature)
+            .body(payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+        let mut projected = false;
+        for _ in 0..200 {
+            let row=promoted.query_one("SELECT j.resend_delivery_result,m.resend_delivery_result FROM public.novu_queue_jobs j JOIN public.novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1",&[&job]).await.unwrap();
+            if row.get::<_, Option<String>>(0).as_deref() == Some("delivered")
+                && row.get::<_, Option<String>>(1).as_deref() == Some("delivered")
+            {
+                projected = true;
+                break;
+            }
+            assert!(projection.0.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            projected,
+            "scoped projector failed to recover after promotion"
+        );
+    } else {
+        promoted.execute("INSERT INTO public.novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type,recipient_hash,correlation_id) VALUES ('resend-ha','dispatch-after-failover','fixture-accepted','email.delivered',$1,$2)",&[&recipient,&sent_tag]).await.unwrap();
+        assert!(
+            crate::resend_projection::project_with_auto_correlation(
+                &mut promoted,
+                "resend-ha",
+                job,
+                true
+            )
+            .await
+            .unwrap()
+        );
+    }
     let row=promoted.query_one("SELECT j.status,j.resend_delivery_result,a.state,a.provider_message_id,m.delivery_state,m.resend_delivery_result,(SELECT count(*) FROM public.novu_rust_resend_auto_correlations c WHERE c.job_id=j.id) FROM public.novu_queue_jobs j JOIN public.novu_rust_resend_attempts a ON a.job_id=j.id JOIN public.novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1",&[&job]).await.unwrap();
     assert_eq!(row.get::<_, String>(0), "completed");
     assert_eq!(
@@ -370,27 +521,71 @@ async fn synchronous_failover_during_resend_dispatch_preserves_unknown() {
 #[tokio::test]
 #[ignore = "requires disposable local synchronous PostgreSQL primary and standby; stops the primary"]
 async fn synchronous_failover_preserves_resend_shared_cooldown() {
-    let primary=std::env::var("TEST_PRIMARY_URL").unwrap();
-    let standby=std::env::var("TEST_STANDBY_URL").unwrap();
-    let cluster=std::env::var("TEST_FAILOVER_URL").unwrap();
-    let mut db=connect(&primary).await;
-    let env="resend-cooldown-ha";
-    db.execute("INSERT INTO public.novu_rust_environments VALUES($1,'org')", &[&env]).await.unwrap();
+    let primary = std::env::var("TEST_PRIMARY_URL").unwrap();
+    let standby = std::env::var("TEST_STANDBY_URL").unwrap();
+    let cluster = std::env::var("TEST_FAILOVER_URL").unwrap();
+    let mut db = connect(&primary).await;
+    let env = "resend-cooldown-ha";
+    db.execute(
+        "INSERT INTO public.novu_rust_environments VALUES($1,'org')",
+        &[&env],
+    )
+    .await
+    .unwrap();
     db.execute("INSERT INTO public.novu_rust_resend_cooldown_policies(environment_id,fallback_seconds) VALUES($1,600)", &[&env]).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_resend_cooldown_workers SELECT $1,rolname,oid FROM pg_roles WHERE rolname=session_user", &[&env]).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,rolname,'alert_view',oid FROM pg_roles WHERE rolname=session_user", &[&env]).await.unwrap();
-    assert!(resend_queue::register_worker_policy(&db,env,false,true).await.unwrap());
-    let first=Uuid::new_v4();
-    enqueue(&db,first,env,resend_queue::JOB_KIND,&json!({"to":["fixture@example.test"],"subject":"fixture","html":"test"})).await.unwrap();
-    let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let provider=Resend::test_endpoint(Config {api_key:"fixture".into(),from:"sender@example.test".into(),sender_name:String::new()}, &format!("http://{}/emails",listener.local_addr().unwrap())).unwrap();
-    let mocked=tokio::spawn(async move {let (mut socket,_)=listener.accept().await.unwrap();let mut buf=[0u8;4096];assert!(socket.read(&mut buf).await.unwrap()>0);socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nDate: Wed, 21 Oct 2015 07:28:00 GMT\r\nRetry-After: Wed, 21 Oct 2015 07:33:00 GMT\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();});
-    assert!(resend_queue::process_one_with_registered_policy_and_cooldown(&mut db,env,&provider,false,crate::email_step_policy::Policy::Snapshot,false,false,false,true).await.unwrap());
+    assert!(
+        resend_queue::register_worker_policy(&db, env, false, true)
+            .await
+            .unwrap()
+    );
+    let first = Uuid::new_v4();
+    enqueue(
+        &db,
+        first,
+        env,
+        resend_queue::JOB_KIND,
+        &json!({"to":["fixture@example.test"],"subject":"fixture","html":"test"}),
+    )
+    .await
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider = Resend::test_endpoint(
+        Config {
+            api_key: "fixture".into(),
+            from: "sender@example.test".into(),
+            sender_name: String::new(),
+        },
+        &format!("http://{}/emails", listener.local_addr().unwrap()),
+    )
+    .unwrap();
+    let mocked = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        assert!(socket.read(&mut buf).await.unwrap() > 0);
+        socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nDate: Wed, 21 Oct 2015 07:28:00 GMT\r\nRetry-After: Wed, 21 Oct 2015 07:33:00 GMT\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+    });
+    assert!(
+        resend_queue::process_one_with_registered_policy_and_cooldown(
+            &mut db,
+            env,
+            &provider,
+            false,
+            crate::email_step_policy::Policy::Snapshot,
+            false,
+            false,
+            false,
+            true
+        )
+        .await
+        .unwrap()
+    );
     mocked.await.unwrap();
     let seconds: i32 = db.query_one("SELECT retry_after_seconds FROM public.novu_rust_resend_attempts WHERE job_id=$1 AND environment_id=$2", &[&first,&env]).await.unwrap().get(0);
-    assert_eq!(seconds,300);
+    assert_eq!(seconds, 300);
     let deadline:String=db.query_one("SELECT not_before::text FROM public.novu_rust_resend_cooldown_policies WHERE environment_id=$1", &[&env]).await.unwrap().get(0);
-    let replica=connect(&standby).await;
+    let replica = connect(&standby).await;
     tokio::time::timeout(Duration::from_secs(10),async {
         loop {
             let row=replica.query_opt("SELECT p.not_before::text,a.state,a.http_status,a.retry_after_seconds FROM public.novu_rust_resend_cooldown_policies p JOIN public.novu_rust_resend_attempts a ON a.environment_id=p.environment_id WHERE p.environment_id=$1 AND a.job_id=$2", &[&env,&first]).await.unwrap();
@@ -398,24 +593,57 @@ async fn synchronous_failover_preserves_resend_shared_cooldown() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }).await.expect("committed cooldown and attempt were not replayed");
-    let pgctl=std::env::var("TEST_LOCAL_PG_CTL").unwrap();
-    let primary_data=std::env::var("TEST_LOCAL_PRIMARY_DATA").unwrap();
-    let standby_data=std::env::var("TEST_LOCAL_STANDBY_DATA").unwrap();
-    assert!(Command::new(&pgctl).args(["-D",&primary_data,"-m","immediate","stop"]).stdout(Stdio::null()).status().unwrap().success());
-    assert!(Command::new(&pgctl).args(["-D",&standby_data,"promote","-w"]).stdout(Stdio::null()).status().unwrap().success());
-    let promoted=connect(&standby).await;
+    let pgctl = std::env::var("TEST_LOCAL_PG_CTL").unwrap();
+    let primary_data = std::env::var("TEST_LOCAL_PRIMARY_DATA").unwrap();
+    let standby_data = std::env::var("TEST_LOCAL_STANDBY_DATA").unwrap();
+    assert!(
+        Command::new(&pgctl)
+            .args(["-D", &primary_data, "-m", "immediate", "stop"])
+            .stdout(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new(&pgctl)
+            .args(["-D", &standby_data, "promote", "-w"])
+            .stdout(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let promoted = connect(&standby).await;
     let persisted:String=promoted.query_one("SELECT not_before::text FROM public.novu_rust_resend_cooldown_policies WHERE environment_id=$1", &[&env]).await.unwrap().get(0);
-    assert_eq!(persisted,deadline);
-    let second=Uuid::new_v4();
-    enqueue(&promoted,second,env,resend_queue::JOB_KIND,&json!({"to":["fixture@example.test"],"subject":"deferred","html":"test"})).await.unwrap();
-    let proxy=TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_url=format!("http://{}",proxy.local_addr().unwrap());
-    let _worker=Worker(Command::new(std::env::var("TEST_RESEND_WORKER_BINARY").unwrap()).env_clear()
-        .env("DATABASE_URL",&cluster).env("NOVU_POSTGRES_ALLOW_INSECURE","true")
-        .env("NOVU_RESEND_ENVIRONMENT_ID",env).env("NOVU_RESEND_API_KEY","fixture")
-        .env("NOVU_RESEND_FROM","sender@example.test").env("NOVU_RESEND_SHARED_COOLDOWN","true")
-        .env("NOVU_RESEND_DB_TIMEOUT_SECONDS","10").env("HTTPS_PROXY",&proxy_url).env("NO_PROXY","")
-        .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    assert_eq!(persisted, deadline);
+    let second = Uuid::new_v4();
+    enqueue(
+        &promoted,
+        second,
+        env,
+        resend_queue::JOB_KIND,
+        &json!({"to":["fixture@example.test"],"subject":"deferred","html":"test"}),
+    )
+    .await
+    .unwrap();
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+    let _worker = Worker(
+        Command::new(std::env::var("TEST_RESEND_WORKER_BINARY").unwrap())
+            .env_clear()
+            .env("DATABASE_URL", &cluster)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("NOVU_RESEND_ENVIRONMENT_ID", env)
+            .env("NOVU_RESEND_API_KEY", "fixture")
+            .env("NOVU_RESEND_FROM", "sender@example.test")
+            .env("NOVU_RESEND_SHARED_COOLDOWN", "true")
+            .env("NOVU_RESEND_DB_TIMEOUT_SECONDS", "10")
+            .env("HTTPS_PROXY", &proxy_url)
+            .env("NO_PROXY", "")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     tokio::time::timeout(Duration::from_secs(20),async {
         loop {
             let row=promoted.query_one("SELECT status,last_error,available_at::text,(SELECT count(*) FROM public.novu_rust_resend_attempts a WHERE a.job_id=j.id) FROM public.novu_queue_jobs j WHERE id=$1", &[&second]).await.unwrap();
@@ -425,7 +653,15 @@ async fn synchronous_failover_preserves_resend_shared_cooldown() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }).await.expect("worker did not defer after promotion");
-    let health=crate::resend_cooldown::health(&promoted,env,60).await.unwrap();
-    assert_eq!(health["active"],true);assert_eq!(health["deferred"],1);
-    assert!(tokio::time::timeout(Duration::from_secs(1),proxy.accept()).await.is_err(),"deferred worker opened provider connection");
+    let health = crate::resend_cooldown::health(&promoted, env, 60)
+        .await
+        .unwrap();
+    assert_eq!(health["active"], true);
+    assert_eq!(health["deferred"], 1);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), proxy.accept())
+            .await
+            .is_err(),
+        "deferred worker opened provider connection"
+    );
 }
