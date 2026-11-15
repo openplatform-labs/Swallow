@@ -36,6 +36,16 @@ pub async fn process_one(
     provider: &SmtpAlert,
     policy: email_step_policy::Policy,
 ) -> Result<bool, Error> {
+    process_one_with_transport_guard(client, environment, provider, policy, false).await
+}
+
+pub async fn process_one_with_transport_guard(
+    client: &mut Client,
+    environment: &str,
+    provider: &SmtpAlert,
+    policy: email_step_policy::Policy,
+    transport_guard: bool,
+) -> Result<bool, Error> {
     let Some(job) = claim(client, environment).await? else {
         return Ok(false);
     };
@@ -81,6 +91,9 @@ pub async fn process_one(
     if !lock_live(&tx, &job).await? {
         tx.rollback().await?;
         return Ok(true);
+    }
+    if transport_guard {
+        tx.query_one("SELECT public.novu_rust_smtp_transport_guard($1,$2,$3,$4)", &[&environment,&job.id,&job.lease_token,&provider.transport_mode()]).await?;
     }
     let inserted=tx.execute("INSERT INTO public.novu_rust_smtp_attempts(job_id,environment_id,state) VALUES ($1,$2,'dispatching') ON CONFLICT(job_id) DO NOTHING",&[&job.id,&environment]).await?;
     if inserted == 0 {

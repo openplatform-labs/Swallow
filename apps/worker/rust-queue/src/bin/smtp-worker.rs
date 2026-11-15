@@ -17,6 +17,11 @@ async fn run(
         Ok("false") | Err(std::env::VarError::NotPresent) => false,
         _ => return Err("invalid SMTP scoped RLS setting".into()),
     };
+    let transport_guard = match std::env::var("SWALLOW_SMTP_TRANSPORT_GUARD").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid SMTP transport guard setting".into()),
+    };
     let reload_path = match std::env::var("NOVU_SMTP_RELOAD_PASSWORD").as_deref() {
         Ok("true") => Some(std::path::PathBuf::from(
             std::env::var_os("SWALLOW_SMTP_PASSWORD_FILE")
@@ -106,6 +111,13 @@ async fn run(
                     eprintln!("SMTP scoped isolation unavailable; reconnecting");
                     stop.wait(Duration::from_secs(2)).await;
                     continue;
+                }
+                if transport_guard {
+                    match tokio::time::timeout(timeout, db.query_one("SELECT public.novu_rust_smtp_transport_check($1,$2)", &[&environment,&provider.transport_mode()])).await {
+                        Ok(Ok(row)) if row.get::<_,bool>(0) => {},
+                        Ok(Ok(_)) => {task.abort();return Err("SMTP transport policy mismatch".into());},
+                        _ => {task.abort();eprintln!("SMTP transport policy unavailable; reconnecting");stop.wait(Duration::from_secs(2)).await;continue;}
+                    }
                 }
                 match tokio::time::timeout(
                     timeout,
@@ -201,7 +213,7 @@ async fn run(
                     }
                     match tokio::time::timeout(
                         timeout,
-                        smtp_queue::process_one(&mut db, &environment, &provider, policy),
+                        smtp_queue::process_one_with_transport_guard(&mut db, &environment, &provider, policy, transport_guard),
                     )
                     .await
                     {

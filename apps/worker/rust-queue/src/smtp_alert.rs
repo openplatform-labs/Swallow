@@ -189,6 +189,7 @@ impl SmtpAlert {
         *self = replacement;
         Ok(())
     }
+    pub fn transport_mode(&self) -> &str { &self.tls }
     pub fn binding_parts(&self) -> Vec<&str> {
         let mut values = vec![
             self.host.as_str(),

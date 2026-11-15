@@ -193,12 +193,21 @@ async fn worker_sends_workflow_through_explicit_plain_smtp() {
     let (mut db,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(async move {driver.await.unwrap()});
     let env=format!("smtp-plain-worker-{}",Uuid::new_v4().simple());
     db.execute("INSERT INTO public.novu_rust_environments VALUES($1,'org')",&[&env]).await.unwrap();
+    let guarded=std::env::var("TEST_SMTP_TRANSPORT_GUARD").as_deref()==Ok("true");
+    if guarded {db.execute("UPDATE public.novu_rust_smtp_transport_policy SET allowed_mode='none' WHERE environment_id=$1",&[&env]).await.unwrap();}
     db.execute("INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,in_app_content,email_subject,email_html,email_provider,inbox_metadata) VALUES($1,'fixture',true,true,'Hello','Plain SMTP fixture','<p>hello</p>','smtp','{\"id\":\"64a000000000000000000051\"}')",&[&env]).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES($1,'alice','64a000000000000000000054','{\"email\":\"alice@example.test\"}')",&[&env]).await.unwrap();
     queue::enqueue(&db,Uuid::new_v4(),&env,queue::in_app::JOB_KIND,&json!({"workflow":"fixture","transactionId":"plain-smtp","content":"","payload":{},"recipients":[{"subscriberId":"alice"}],"recipientIdentitySnapshot":{"alice":"64a000000000000000000054"},"severityOverride":null})).await.unwrap();
     assert!(queue::in_app::process_one(&mut db).await.unwrap());
     let job:Uuid=db.query_one("SELECT email_job_id FROM public.novu_rust_email_step_outcomes WHERE environment_id=$1 AND transaction_id='plain-smtp'",&[&env]).await.unwrap().get(0);
     let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();let port=listener.local_addr().unwrap().port();listener.set_nonblocking(true).unwrap();
+    if guarded {
+        let mut wrong=Process(Command::new(env!("CARGO_BIN_EXE_smtp-worker")).env("DATABASE_URL",&url).env("NOVU_POSTGRES_ALLOW_INSECURE","true").env("NOVU_SMTP_ENVIRONMENT_ID",&env).env("SWALLOW_SMTP_HOST","127.0.0.1").env("SWALLOW_SMTP_PORT",port.to_string()).env("SWALLOW_SMTP_TLS","starttls").env("SWALLOW_SMTP_TRANSPORT_GUARD","true").env("SWALLOW_SMTP_FROM","sender@example.test").env_remove("SWALLOW_SMTP_USERNAME").env_remove("SWALLOW_SMTP_PASSWORD").env_remove("SWALLOW_SMTP_PASSWORD_FILE").env_remove("SWALLOW_SMTP_CA_FILE").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+        let deadline=std::time::Instant::now()+Duration::from_secs(10);
+        loop {if let Some(status)=wrong.0.try_wait().unwrap(){assert!(!status.success());break;}assert!(std::time::Instant::now()<deadline);tokio::time::sleep(Duration::from_millis(50)).await;}
+        assert!(matches!(listener.accept(),Err(e) if e.kind()==std::io::ErrorKind::WouldBlock));
+        assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_smtp_attempts WHERE job_id=$1",&[&job]).await.unwrap().get::<_,i64>(0),0);
+    }
     let server=std::thread::spawn(move || {
         let deadline=std::time::Instant::now()+Duration::from_secs(20);
         let (mut stream,_)=loop {match listener.accept(){Ok(value)=>break value,Err(e) if e.kind()==std::io::ErrorKind::WouldBlock => {assert!(std::time::Instant::now()<deadline);std::thread::sleep(Duration::from_millis(20));},Err(e)=>panic!("{e}")}};
@@ -206,7 +215,7 @@ async fn worker_sends_workflow_through_explicit_plain_smtp() {
         loop {line.clear();reader.read_line(&mut line).unwrap();if line.starts_with("MAIL FROM")||line.starts_with("RCPT TO") {stream.write_all(b"250 OK\r\n").unwrap();}else if line.starts_with("DATA"){stream.write_all(b"354 Continue\r\n").unwrap();break;}else {panic!("unexpected SMTP command");}}
         let mut body=String::new();loop {line.clear();reader.read_line(&mut line).unwrap();if line==".\r\n" {break;}body.push_str(&line);}stream.write_all(b"250 queued\r\n").unwrap();assert!(body.contains("Plain SMTP fixture"));
     });
-    let mut worker=Process(Command::new(env!("CARGO_BIN_EXE_smtp-worker")).env("DATABASE_URL",&url).env("NOVU_POSTGRES_ALLOW_INSECURE","true").env("NOVU_SMTP_ENVIRONMENT_ID",&env).env("SWALLOW_SMTP_HOST","127.0.0.1").env("SWALLOW_SMTP_PORT",port.to_string()).env("SWALLOW_SMTP_TLS","none").env("SWALLOW_SMTP_FROM","sender@example.test").env_remove("SWALLOW_SMTP_USERNAME").env_remove("SWALLOW_SMTP_PASSWORD").env_remove("SWALLOW_SMTP_PASSWORD_FILE").env_remove("SWALLOW_SMTP_CA_FILE").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    let mut worker=Process(Command::new(env!("CARGO_BIN_EXE_smtp-worker")).env("DATABASE_URL",&url).env("NOVU_POSTGRES_ALLOW_INSECURE","true").env("NOVU_SMTP_ENVIRONMENT_ID",&env).env("SWALLOW_SMTP_HOST","127.0.0.1").env("SWALLOW_SMTP_PORT",port.to_string()).env("SWALLOW_SMTP_TLS","none").env("SWALLOW_SMTP_TRANSPORT_GUARD",if guarded {"true"} else {"false"}).env("SWALLOW_SMTP_FROM","sender@example.test").env_remove("SWALLOW_SMTP_USERNAME").env_remove("SWALLOW_SMTP_PASSWORD").env_remove("SWALLOW_SMTP_PASSWORD_FILE").env_remove("SWALLOW_SMTP_CA_FILE").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
     let deadline=std::time::Instant::now()+Duration::from_secs(20);
     loop {let row=db.query_opt("SELECT state FROM public.novu_rust_smtp_attempts WHERE job_id=$1",&[&job]).await.unwrap();if row.is_some_and(|r|r.get::<_,String>(0)=="accepted") {break;}assert!(std::time::Instant::now()<deadline && worker.0.try_wait().unwrap().is_none());tokio::time::sleep(Duration::from_millis(100)).await;}
     server.join().unwrap();let row=db.query_one("SELECT status FROM public.novu_queue_jobs WHERE id=$1",&[&job]).await.unwrap();assert_eq!(row.get::<_,String>(0),"completed");

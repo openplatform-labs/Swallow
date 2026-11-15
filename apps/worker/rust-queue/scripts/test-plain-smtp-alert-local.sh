@@ -12,4 +12,5 @@ export TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/postgres" DATABASE
 cargo run --quiet --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --bin migrate-worker -- apply api "$ROOT/apps/api/rust-api/migrations" --through 17
 cargo run --quiet --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --bin migrate-worker -- apply worker "$ROOT/apps/worker/rust-queue/migrations"
 cargo test --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --test alert_fanout explicit_plain_smtp_fanout_records_relay_acceptance -- --ignored
-cargo test --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --test smtp_queue worker_sends_workflow_through_explicit_plain_smtp -- --ignored
+TEST_SMTP_TRANSPORT_GUARD=true cargo test --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --test smtp_queue worker_sends_workflow_through_explicit_plain_smtp -- --ignored
+cargo test --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --test smtp_transport_fence -- --ignored

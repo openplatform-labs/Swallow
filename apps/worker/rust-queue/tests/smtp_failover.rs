@@ -35,6 +35,8 @@ async fn smtp_uncertain_dispatch_survives_synchronous_promotion() {
     .unwrap();
     let scoped = std::env::var("TEST_SMTP_FAILOVER_RLS").as_deref() == Ok("true");
     let plain = std::env::var("TEST_SMTP_FAILOVER_PLAIN").as_deref() == Ok("true");
+    let fenced = std::env::var("TEST_SMTP_FAILOVER_FENCE").as_deref() == Ok("true");
+    if fenced {db.execute("UPDATE public.novu_rust_smtp_transport_policy SET allowed_mode=$2 WHERE environment_id=$1",&[&env,&if plain {"none"} else {"starttls"}]).await.unwrap();}
     let foreign = Uuid::new_v4();
     let other = format!("smtp-other-{}", Uuid::new_v4().simple());
     db.execute(
@@ -54,6 +56,7 @@ async fn smtp_uncertain_dispatch_survives_synchronous_promotion() {
     .unwrap();
     if scoped {
         db.batch_execute("CREATE ROLE smtp_failover_worker LOGIN; GRANT USAGE ON SCHEMA public TO smtp_failover_worker; GRANT SELECT,UPDATE ON public.novu_queue_jobs,public.novu_rust_email_messages TO smtp_failover_worker; GRANT SELECT,INSERT,UPDATE ON public.novu_rust_smtp_attempts,public.novu_rust_email_workflow_worker_config TO smtp_failover_worker;").await.unwrap();
+        if fenced {db.batch_execute("GRANT EXECUTE ON FUNCTION public.novu_rust_smtp_transport_check(text,text),public.novu_rust_smtp_transport_guard(text,uuid,uuid,text) TO smtp_failover_worker").await.unwrap();}
         db.execute("INSERT INTO public.novu_rust_smtp_scoped_logins(principal_oid,database_principal,environment_id) SELECT oid,rolname,$1 FROM pg_roles WHERE rolname='smtp_failover_worker'", &[&env]).await.unwrap();
         db.query_one("SELECT public.novu_rust_install_smtp_scoped_rls()", &[])
             .await
@@ -160,6 +163,7 @@ async fn smtp_uncertain_dispatch_survives_synchronous_promotion() {
                 .env("SWALLOW_SMTP_FROM", "sender@example.test")
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
+        if fenced { command.env("SWALLOW_SMTP_TRANSPORT_GUARD", "true"); }
         if plain { command.env("SWALLOW_SMTP_TLS", "none"); }
         else { command.env("SWALLOW_SMTP_CA_FILE", &cert); }
         Process(command.spawn().unwrap())
