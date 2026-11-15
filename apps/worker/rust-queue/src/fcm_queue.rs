@@ -86,6 +86,15 @@ pub async fn unrecorded_claim_health(db:&Client, environment:&str, min_gap:i32, 
     Ok(db.query_one("SELECT public.novu_rust_fcm_unrecorded_claim_health($1,$2,$3)", &[&environment,&min_gap,&grace]).await?.get(0))
 }
 
+/// Environment-scoped diagnostic rows; UUID order is not chronological.
+pub async fn unrecorded_claim_list(db:&Client, environment:&str, min_gap:i32, grace:i32, after:Option<Uuid>)->Result<serde_json::Value,Error> {
+    let rows=db.query("SELECT * FROM public.novu_rust_fcm_unrecorded_claim_list($1,$2,$3,$4)", &[&environment,&min_gap,&grace,&after]).await?;
+    let has_more=rows.len()>100;
+    let data:Vec<_>=rows.iter().take(100).map(|r|serde_json::json!({"jobId":r.get::<_,Uuid>(0),"status":r.get::<_,String>(1),"availableAt":r.get::<_,String>(2),"claims":r.get::<_,i32>(3),"recordedAttempts":r.get::<_,i64>(4),"unrecordedClaims":r.get::<_,i64>(5)})).collect();
+    let next=if has_more {data.last().and_then(|v|v["jobId"].as_str()).map(str::to_owned)} else {None};
+    Ok(serde_json::json!({"data":data,"hasMore":has_more,"next":next}))
+}
+
 /// Environment-scoped aggregate shared-cooldown status.
 pub async fn cooldown_health(db:&Client,environment:&str,grace:i32)->Result<serde_json::Value,Error> {
     let row=db.query_one("SELECT active,not_before,fallback_seconds,deferred,overdue FROM public.novu_rust_fcm_cooldown_health($1,$2)",&[&environment,&grace]).await?;
