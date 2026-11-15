@@ -23,3 +23,4 @@ cargo test --locked --manifest-path "$WORKER/Cargo.toml" --lib shared_resend_coo
 cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test resend_idempotency_policy workers_reject_conflicting_shared_cooldown_settings -- --ignored
 cargo test --locked --manifest-path "$WORKER/Cargo.toml" --lib resend_cooldown_has_distinct_v2_conditions_and_transports
 cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test resend_cooldown_health -- --ignored
+cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test resend_cooldown_policy_admin -- --ignored
