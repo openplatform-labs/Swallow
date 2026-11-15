@@ -476,13 +476,13 @@ mod tests {
         let provider=Resend::test_endpoint(Config {api_key:"fixture".into(),from:"from@example.test".into(),sender_name:String::new()}, &format!("http://{}/emails",listener.local_addr().unwrap())).unwrap();
         let server=tokio::spawn(async move {
             let (mut socket,_)=listener.accept().await.unwrap();let mut data=[0u8;4096]; assert!(socket.read(&mut data).await.unwrap()>0);
-            socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nDate: Wed, 21 Oct 2015 07:28:00 GMT\r\nRetry-After: Wed, 21 Oct 2015 07:28:30 GMT\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
         });
         assert!(process_one_with_registered_policy_and_cooldown(&mut db,&env,&provider,false,crate::email_step_policy::Policy::Snapshot,false,false,false,true).await.unwrap());
         server.await.unwrap();
         let row=db.query_one("SELECT state,http_status FROM public.novu_rust_resend_attempts WHERE job_id=$1", &[&first]).await.unwrap();
         assert_eq!(row.get::<_,String>(0),"rejected"); assert_eq!(row.get::<_,Option<i32>>(1),Some(429));
-        assert!(db.query_one("SELECT not_before>clock_timestamp()+interval '20 seconds' FROM public.novu_rust_resend_cooldown_policies WHERE environment_id=$1", &[&env]).await.unwrap().get::<_,bool>(0));
+        assert!(db.query_one("SELECT not_before>clock_timestamp()+interval '20 seconds' AND not_before<clock_timestamp()+interval '40 seconds' FROM public.novu_rust_resend_cooldown_policies WHERE environment_id=$1", &[&env]).await.unwrap().get::<_,bool>(0));
         let second=Uuid::new_v4();
         enqueue(&db,second,&env,JOB_KIND,&json!({"to":["to@example.test"],"subject":"second","html":"test"})).await.unwrap();
         let (mut second_db,second_driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();
@@ -549,7 +549,7 @@ mod tests {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut buf = [0; 4096];
             assert!(socket.read(&mut buf).await.unwrap() > 0);
-            socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nDate: Wed, 21 Oct 2015 07:28:00 GMT\r\nRetry-After: Wed, 21 Oct 2015 07:28:30 GMT\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
         });
         assert!(process_one(&mut db, &env, &provider).await.unwrap());
         server.await.unwrap();

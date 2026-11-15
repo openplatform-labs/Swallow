@@ -24,3 +24,4 @@ cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test resend_idempoten
 cargo test --locked --manifest-path "$WORKER/Cargo.toml" --lib resend_cooldown_has_distinct_v2_conditions_and_transports
 cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test resend_cooldown_health -- --ignored
 cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test resend_cooldown_policy_admin -- --ignored
+cargo test --locked --manifest-path "$WORKER/Cargo.toml" --lib rate_limit_header_is_recorded_on_the_attempt -- --ignored

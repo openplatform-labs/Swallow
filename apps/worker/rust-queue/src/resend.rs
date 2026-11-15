@@ -3,7 +3,30 @@ use crate::sendgrid::Email;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{Client, header};
 use serde_json::{Value, json};
-use std::{fmt, path::Path, time::Duration};
+use std::{fmt, path::Path, time::{Duration, SystemTime}};
+
+// Return a conservative whole-second delay. When available, the server's
+// Date header avoids relying on agreement between the server and worker clocks.
+fn retry_after_seconds(headers: &header::HeaderMap, now: SystemTime) -> Option<u32> {
+    let mut values = headers.get_all(header::RETRY_AFTER).iter();
+    let value = match (values.next(), values.next()) {
+        (Some(value), None) => value.to_str().ok()?,
+        _ => return None,
+    };
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        return value.parse::<u32>().ok().filter(|seconds| *seconds <= 86_400);
+    }
+    let until = httpdate::parse_http_date(value).ok()?;
+    let mut dates = headers.get_all(header::DATE).iter();
+    let base = match (dates.next(), dates.next()) {
+        (None, None) => now,
+        (Some(date), None) => httpdate::parse_http_date(date.to_str().ok()?).ok()?,
+        _ => return None,
+    };
+    let delay = until.duration_since(base).unwrap_or(Duration::ZERO);
+    let seconds = delay.as_secs().checked_add(u64::from(delay.subsec_nanos() != 0))?;
+    u32::try_from(seconds).ok().filter(|seconds| *seconds <= 86_400)
+}
 
 pub struct Config {
     pub api_key: String,
@@ -205,18 +228,7 @@ impl Resend {
         }
         let mut response = request.send().await.map_err(|_| SendError::Transport)?;
         if response.status().as_u16() == 429 {
-            // Resend documents a delay in seconds. Never shorten an invalid,
-            // repeated, or excessive header into a misleading delay.
-            let mut headers = response.headers().get_all(header::RETRY_AFTER).iter();
-            let retry_after = match (headers.next(), headers.next()) {
-                (Some(value), None) => value.to_str().ok().and_then(|s| {
-                    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-                        return None;
-                    }
-                    s.parse::<u32>().ok().filter(|seconds| *seconds <= 86_400)
-                }),
-                _ => None,
-            };
+            let retry_after = retry_after_seconds(response.headers(), SystemTime::now());
             return Err(SendError::RateLimited(retry_after));
         }
         if !response.status().is_success() {
@@ -353,6 +365,14 @@ mod tests {
         server.await.unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn date_retry_after_without_server_date_rounds_up() {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, "Wed, 21 Oct 2015 07:30:00 GMT".parse().unwrap());
+        let now = httpdate::parse_http_date("Wed, 21 Oct 2015 07:28:00 GMT").unwrap() + Duration::from_millis(500);
+        assert_eq!(retry_after_seconds(&headers, now), Some(120));
+        assert_eq!(retry_after_seconds(&headers, now + Duration::from_secs(121)), Some(0));
+    }
     #[tokio::test]
     async fn rate_limit_retry_after_is_bounded_and_rejects_ambiguous_headers() {
         for (headers, expected) in [
@@ -363,7 +383,11 @@ mod tests {
             ("Retry-After: 1.5\r\n", None),
             ("Retry-After: -1\r\n", None),
             ("Retry-After: 1\r\nRetry-After: 2\r\n", None),
-            ("Retry-After: Wed, 21 Oct 2015 07:28:00 GMT\r\n", None),
+            ("Date: Wed, 21 Oct 2015 07:28:00 GMT\r\nRetry-After: Wed, 21 Oct 2015 07:30:00 GMT\r\n", Some(120)),
+            ("Date: Wed, 21 Oct 2015 07:28:00 GMT\r\nRetry-After: Wed, 21 Oct 2015 07:27:00 GMT\r\n", Some(0)),
+            ("Date: Wed, 21 Oct 2015 07:28:00 GMT\r\nRetry-After: Thu, 22 Oct 2015 07:28:01 GMT\r\n", None),
+            ("Date: invalid\r\nRetry-After: Wed, 21 Oct 2015 07:30:00 GMT\r\n", None),
+            ("Date: Wed, 21 Oct 2015 07:28:00 GMT\r\nDate: Wed, 21 Oct 2015 07:28:00 GMT\r\nRetry-After: Wed, 21 Oct 2015 07:30:00 GMT\r\n", None),
             ("", None),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
