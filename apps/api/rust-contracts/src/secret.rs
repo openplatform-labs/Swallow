@@ -53,7 +53,7 @@ fn validate(mut bytes: Vec<u8>) -> Result<String, io::Error> {
 /// Read a regular file through its opened handle; on Unix, nonblocking open
 /// prevents a FIFO without a writer from hanging the worker. Symlinks to
 /// regular files are allowed for secret mounts and atomic replacement.
-pub fn read_regular_file(path: &Path) -> Result<String, io::Error> {
+fn read_regular_bytes(path: &Path, limit: u64) -> Result<Vec<u8>, io::Error> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -72,10 +72,23 @@ pub fn read_regular_file(path: &Path) -> Result<String, io::Error> {
         return Err(io::Error::other("invalid secret file type"));
     }
     let mut bytes = Vec::new();
-    file.take(MAX_SECRET_BYTES + 1)
+    file.take(limit.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|_| io::Error::other("secret file unavailable"))?;
-    validate(bytes)
+    if bytes.is_empty() || bytes.len() as u64 > limit || bytes.contains(&0) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid secret"));
+    }
+    Ok(bytes)
+}
+
+pub fn read_regular_file(path: &Path) -> Result<String, io::Error> {
+    validate(read_regular_bytes(path, MAX_SECRET_BYTES)?)
+}
+
+/// Read bounded UTF-8 multiline credentials from a regular file without logging them.
+pub fn read_regular_multiline_file(path: &Path, limit: u64) -> Result<String, io::Error> {
+    String::from_utf8(read_regular_bytes(path, limit)?)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid secret"))
 }
 
 pub fn from_env(name: &str, file_name: &str) -> Result<Option<String>, io::Error> {

@@ -79,6 +79,45 @@ fn build_integrations(raw: &str) -> Result<HashMap<String, Fcm>, Box<dyn Error +
     Ok(providers)
 }
 
+fn integration_projects(items: &HashMap<String, Fcm>) -> BTreeMap<String, String> {
+    items
+        .iter()
+        .map(|(id, provider)| (id.clone(), provider.project_id().to_owned()))
+        .collect()
+}
+
+fn reload_integration_file(
+    path: &std::path::Path,
+    previous_hash: &[u8],
+    projects: &BTreeMap<String, String>,
+    invalid_token_policy: InvalidTokenPolicy,
+    cleanup_guard: TokenCleanupGuard,
+) -> Result<Option<(Vec<u8>, HashMap<String, Fcm>)>, ()> {
+    let raw = novu_rust_contracts::secret::read_regular_multiline_file(path, 1_048_576)
+        .map_err(|_| ())?;
+    let hash = ring::digest::digest(&ring::digest::SHA256, raw.as_bytes())
+        .as_ref()
+        .to_vec();
+    if hash == previous_hash {
+        return Ok(None);
+    }
+    let providers = build_integrations(&raw).map_err(|_| ())?;
+    if &integration_projects(&providers) != projects {
+        return Err(());
+    }
+    let providers = providers
+        .into_iter()
+        .map(|(id, p)| {
+            (
+                id,
+                p.with_invalid_token_policy(invalid_token_policy)
+                    .with_token_cleanup_guard(cleanup_guard),
+            )
+        })
+        .collect();
+    Ok(Some((hash, providers)))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     novu_postgres_queue::shutdown::run_until_signal(run).await
@@ -124,11 +163,47 @@ async fn run(
         Ok("false") | Err(std::env::VarError::NotPresent) => None,
         _ => return Err("invalid FCM token reload setting".into()),
     };
-    let (provider, integrations) = if let Some(raw) = multiline_secret(
-        "NOVU_FCM_INTEGRATIONS",
-        "NOVU_FCM_INTEGRATIONS_FILE",
-        1_048_576,
-    )? {
+    let reload_integrations = match std::env::var("NOVU_FCM_RELOAD_INTEGRATIONS").as_deref() {
+        Ok("true") => {
+            if [
+                "NOVU_FCM_INTEGRATIONS",
+                "NOVU_FCM_ACCESS_TOKEN",
+                "NOVU_FCM_ACCESS_TOKEN_FILE",
+                "NOVU_FCM_CLIENT_EMAIL",
+                "NOVU_FCM_PRIVATE_KEY",
+                "NOVU_FCM_PRIVATE_KEY_FILE",
+            ]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some())
+                || reload_access_token.is_some()
+            {
+                return Err("FCM integration reload sources conflict".into());
+            }
+            Some(std::path::PathBuf::from(
+                std::env::var_os("NOVU_FCM_INTEGRATIONS_FILE")
+                    .ok_or("FCM integration reload requires a file")?,
+            ))
+        }
+        Ok("false") | Err(std::env::VarError::NotPresent) => None,
+        _ => return Err("invalid FCM integration reload setting".into()),
+    };
+    let integrations_raw = if let Some(path) = &reload_integrations {
+        Some(novu_rust_contracts::secret::read_regular_multiline_file(
+            path, 1_048_576,
+        )?)
+    } else {
+        multiline_secret(
+            "NOVU_FCM_INTEGRATIONS",
+            "NOVU_FCM_INTEGRATIONS_FILE",
+            1_048_576,
+        )?
+    };
+    let mut integrations_hash = integrations_raw.as_ref().map(|raw| {
+        ring::digest::digest(&ring::digest::SHA256, raw.as_bytes())
+            .as_ref()
+            .to_vec()
+    });
+    let (provider, integrations) = if let Some(raw) = integrations_raw {
         (None, Some(build_integrations(&raw)?))
     } else {
         let project = std::env::var("NOVU_FCM_PROJECT_ID")?;
@@ -156,7 +231,7 @@ async fn run(
         p.with_invalid_token_policy(invalid_token_policy)
             .with_token_cleanup_guard(cleanup_guard)
     });
-    let integrations = integrations.map(|items| {
+    let mut integrations = integrations.map(|items| {
         items
             .into_iter()
             .map(|(id, p)| {
@@ -171,6 +246,7 @@ async fn run(
     if shared_provider && integrations.is_some() {
         return Err("shared FCM provider cannot be combined with an integration map".into());
     }
+    let original_projects = integrations.as_ref().map(integration_projects);
     let enforce_routing = match std::env::var("SWALLOW_FCM_ENFORCE_ROUTING_CONFIG").as_deref() {
         Ok("true") => true,
         Ok("false") | Err(std::env::VarError::NotPresent) => false,
@@ -336,6 +412,29 @@ async fn run(
                         stop.wait(Duration::from_secs(2)).await;
                         continue;
                     }
+                    if let Some(path) = &reload_integrations {
+                        let next = reload_integration_file(
+                            path,
+                            integrations_hash.as_deref().expect("integration hash"),
+                            original_projects.as_ref().expect("integration projects"),
+                            invalid_token_policy,
+                            cleanup_guard,
+                        );
+                        match next {
+                            Ok(Some((hash, providers))) => {
+                                integrations_hash = Some(hash);
+                                integrations = Some(providers);
+                            }
+                            Ok(None) => {}
+                            Err(()) => {
+                                eprintln!(
+                                    "FCM integration credential reload failed; dispatch paused"
+                                );
+                                stop.wait(Duration::from_secs(2)).await;
+                                continue;
+                            }
+                        }
+                    }
                     let dispatch = async {
                         fcm_queue::process_one_with_target_policy(
                             &mut db,
@@ -371,7 +470,8 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::build_integrations;
+    use super::{build_integrations, integration_projects, reload_integration_file};
+    use novu_postgres_queue::fcm::{InvalidTokenPolicy, TokenCleanupGuard};
 
     #[tokio::test]
     async fn validates_integration_config_without_echoing_secrets() {
@@ -390,5 +490,41 @@ mod tests {
                 .to_string();
             assert!(!error.contains("test-secret"));
         }
+    }
+
+    #[test]
+    fn reload_keeps_routes_and_rejects_bad_or_changed_maps() {
+        let path = std::env::temp_dir().join(format!("swallow-fcm-map-{}", uuid::Uuid::new_v4()));
+        let old = r#"{"a":{"project_id":"project-a","access_token":"old-secret"}}"#;
+        let baseline = integration_projects(&build_integrations(old).unwrap());
+        let hash = ring::digest::digest(&ring::digest::SHA256, old.as_bytes())
+            .as_ref()
+            .to_vec();
+        std::fs::write(&path, old).unwrap();
+        let check = || {
+            reload_integration_file(
+                &path,
+                &hash,
+                &baseline,
+                InvalidTokenPolicy::Reference,
+                TokenCleanupGuard::Reference,
+            )
+        };
+        assert!(matches!(check(), Ok(None)));
+        std::fs::write(
+            &path,
+            r#"{"a":{"project_id":"project-a","access_token":"new-secret"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(check(), Ok(Some(_))));
+        for invalid in [
+            "bad",
+            r#"{"a":{"project_id":"other","access_token":"new-secret"}}"#,
+            r#"{"b":{"project_id":"project-a","access_token":"new-secret"}}"#,
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(check().is_err());
+        }
+        std::fs::remove_file(path).unwrap();
     }
 }

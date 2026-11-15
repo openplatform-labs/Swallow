@@ -75,6 +75,7 @@ async fn worker_supports_token_pem_and_integration_files() {
         .env_remove("NOVU_FCM_ACCESS_TOKEN")
         .env_remove("NOVU_FCM_ACCESS_TOKEN_FILE")
         .env_remove("NOVU_FCM_RELOAD_ACCESS_TOKEN")
+        .env_remove("NOVU_FCM_RELOAD_INTEGRATIONS")
         .env_remove("NOVU_FCM_CLIENT_EMAIL")
         .env_remove("NOVU_FCM_PRIVATE_KEY")
         .env_remove("NOVU_FCM_PRIVATE_KEY_FILE")
@@ -214,6 +215,167 @@ async fn worker_supports_token_pem_and_integration_files() {
         "worker should resume and reject the invalid job without sending"
     );
     drop(worker);
+    for mode in 0..3 {
+        let mut c = command();
+        c.env("NOVU_FCM_RELOAD_INTEGRATIONS", "true");
+        match mode {
+            0 => {}
+            1 => {
+                c.env("NOVU_FCM_INTEGRATIONS_FILE", &integrations)
+                    .env("NOVU_FCM_INTEGRATIONS", "fixture-secret");
+            }
+            _ => {
+                c.env("NOVU_FCM_INTEGRATIONS_FILE", &integrations)
+                    .env("NOVU_FCM_ACCESS_TOKEN", "fixture-secret");
+            }
+        }
+        let out = c.output().unwrap();
+        assert!(!out.status.success());
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("fixture-secret"));
+    }
+    let mut map_worker = Worker(
+        command()
+            .env("NOVU_FCM_INTEGRATIONS_FILE", &integrations)
+            .env("NOVU_FCM_RELOAD_INTEGRATIONS", "true")
+            .spawn()
+            .unwrap(),
+    );
+    let mut connected = false;
+    for _ in 0..100 {
+        connected=db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='fcm_secret_fixture')",&[]).await.unwrap().get(0);
+        if connected {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(connected);
+    assert!(map_worker.0.try_wait().unwrap().is_none());
+    let mut changed = data.clone();
+    changed["a"]["project_id"] = serde_json::json!("different-project");
+    fs::write(
+        fixture.0.join("next"),
+        serde_json::to_string(&changed).unwrap(),
+    )
+    .unwrap();
+    fs::rename(fixture.0.join("next"), &integrations).unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let map_job = uuid::Uuid::new_v4();
+    novu_postgres_queue::enqueue(
+        &db,
+        map_job,
+        "env",
+        novu_postgres_queue::fcm_queue::JOB_KIND,
+        &serde_json::json!({"unrecognized":true}),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        db.query_one(
+            "SELECT status FROM novu_queue_jobs WHERE id=$1",
+            &[&map_job]
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0),
+        "pending"
+    );
+    let mut rotated = data.clone();
+    rotated["a"]["access_token"] = serde_json::json!("rotated-map-token");
+    fs::write(
+        fixture.0.join("next"),
+        serde_json::to_string(&rotated).unwrap(),
+    )
+    .unwrap();
+    fs::rename(fixture.0.join("next"), &integrations).unwrap();
+    let mut failed = false;
+    for _ in 0..100 {
+        failed = db
+            .query_one(
+                "SELECT status='failed' FROM novu_queue_jobs WHERE id=$1",
+                &[&map_job],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if failed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        failed,
+        "worker should resume after credential-only map update"
+    );
+    let mut broken = rotated.clone();
+    broken["b"]["private_key"] = serde_json::json!("invalid fixture key");
+    fs::write(
+        fixture.0.join("next"),
+        serde_json::to_string(&broken).unwrap(),
+    )
+    .unwrap();
+    fs::rename(fixture.0.join("next"), &integrations).unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let service_job = uuid::Uuid::new_v4();
+    novu_postgres_queue::enqueue(
+        &db,
+        service_job,
+        "env",
+        novu_postgres_queue::fcm_queue::JOB_KIND,
+        &serde_json::json!({"unrecognized":true}),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        db.query_one(
+            "SELECT status FROM novu_queue_jobs WHERE id=$1",
+            &[&service_job]
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0),
+        "pending"
+    );
+    let next_private = Command::new("openssl")
+        .args([
+            "genpkey",
+            "-algorithm",
+            "RSA",
+            "-pkeyopt",
+            "rsa_keygen_bits:2048",
+        ])
+        .output()
+        .unwrap();
+    assert!(next_private.status.success());
+    rotated["b"]["private_key"] =
+        serde_json::json!(String::from_utf8(next_private.stdout).unwrap());
+    fs::write(
+        fixture.0.join("next"),
+        serde_json::to_string(&rotated).unwrap(),
+    )
+    .unwrap();
+    fs::rename(fixture.0.join("next"), &integrations).unwrap();
+    let mut service_resumed = false;
+    for _ in 0..100 {
+        service_resumed = db
+            .query_one(
+                "SELECT status='failed' FROM novu_queue_jobs WHERE id=$1",
+                &[&service_job],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if service_resumed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        service_resumed,
+        "worker should resume after service account key replacement"
+    );
+    drop(map_worker);
     let result = command()
         .env("NOVU_FCM_ACCESS_TOKEN_FILE", &token)
         .env("SWALLOW_FCM_ENFORCE_ROUTING_CONFIG", "invalid")

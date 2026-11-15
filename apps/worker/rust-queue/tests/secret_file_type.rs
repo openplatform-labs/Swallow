@@ -18,7 +18,7 @@ fn reloadable_workers_reject_fifo_at_startup() {
             .unwrap()
             .success()
     );
-    for provider in ["resend", "sendgrid", "twilio", "slack", "fcm"] {
+    for provider in ["resend", "sendgrid", "twilio", "slack", "fcm", "fcm-map"] {
         let (bin, environment, file, flag) = match provider {
             "resend" => (
                 env!("CARGO_BIN_EXE_resend-worker"),
@@ -44,11 +44,17 @@ fn reloadable_workers_reject_fifo_at_startup() {
                 "NOVU_SLACK_BOT_TOKEN_FILE",
                 Some("NOVU_SLACK_RELOAD_BOT_TOKEN"),
             ),
-            _ => (
+            "fcm" => (
                 env!("CARGO_BIN_EXE_fcm-worker"),
                 "NOVU_FCM_ENVIRONMENT_ID",
                 "NOVU_FCM_ACCESS_TOKEN_FILE",
                 Some("NOVU_FCM_RELOAD_ACCESS_TOKEN"),
+            ),
+            _ => (
+                env!("CARGO_BIN_EXE_fcm-worker"),
+                "NOVU_FCM_ENVIRONMENT_ID",
+                "NOVU_FCM_INTEGRATIONS_FILE",
+                Some("NOVU_FCM_RELOAD_INTEGRATIONS"),
             ),
         };
         let mut cmd = Command::new(bin);
