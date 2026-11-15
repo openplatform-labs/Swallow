@@ -132,6 +132,39 @@ async fn scoped_credential_health_prevents_spoofing_and_detects_failure() {
         value,
         json!({"healthy":0,"unhealthy":1,"stale":0,"minimumHealthy":1})
     );
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_reserve_alert(text,text,text,integer,integer) TO {monitor}")).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_delivery_operator_grants SELECT $1,rolname,'alert_send',oid FROM pg_roles WHERE rolname::text=$2",&[&env,&monitor]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES($1,'slack','blocked','rejected')",&[&env]).await.unwrap();
+    let alert = |policy: &str| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"))
+            .env_clear()
+            .env("DATABASE_URL", login(&monitor))
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
+            .env("SWALLOW_ALERT_SMTP_CREDENTIAL_MAX_AGE_SECONDS", "60")
+            .env("SWALLOW_ALERT_SMTP_CREDENTIAL_MIN_HEALTHY", "1")
+            .env("SWALLOW_ALERT_SCOPED_DELIVERY", "true")
+            .env("SWALLOW_ALERT_COOLDOWN_POLICY", policy)
+            .env(
+                "SWALLOW_ALERT_SLACK_WEBHOOK",
+                "https://hooks.slack.com/services/A/B/C",
+            )
+            .env("SWALLOW_ALERT_SLACK_TARGET_ID", "blocked")
+            .args([&env, "300", "120", "60"])
+            .output()
+            .unwrap()
+    };
+    let blocked = alert("destination");
+    assert_eq!(
+        blocked.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("requires operator review"));
+    let invalid = alert("new-condition");
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("requires destination cooldown"));
     writer
         .query_one(
             "SELECT public.novu_rust_smtp_credential_heartbeat($1,$2,'healthy')",
@@ -140,6 +173,7 @@ async fn scoped_credential_health_prevents_spoofing_and_detects_failure() {
         .await
         .unwrap();
     assert!(run().status.success());
+    assert!(alert("destination").status.success());
     drop(writer);
     let mut disconnected = false;
     for _ in 0..100 {

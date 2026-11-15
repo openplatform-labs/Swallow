@@ -401,6 +401,7 @@ impl SmtpAlert {
             username: String::new(),
             password: String::new(),
             ca_fingerprint: None,
+            ca_pem: None,
         }
     }
 }
