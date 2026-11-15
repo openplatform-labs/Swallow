@@ -81,6 +81,11 @@ fn continuation_delay(
     }
 }
 
+/// Count old FCM jobs with repeated claims lacking per-target attempt records.
+pub async fn unrecorded_claim_health(db:&Client, environment:&str, min_gap:i32, grace:i32)->Result<i64,Error> {
+    Ok(db.query_one("SELECT public.novu_rust_fcm_unrecorded_claim_health($1,$2,$3)", &[&environment,&min_gap,&grace]).await?.get(0))
+}
+
 /// Environment-scoped aggregate shared-cooldown status.
 pub async fn cooldown_health(db:&Client,environment:&str,grace:i32)->Result<serde_json::Value,Error> {
     let row=db.query_one("SELECT active,not_before,fallback_seconds,deferred,overdue FROM public.novu_rust_fcm_cooldown_health($1,$2)",&[&environment,&grace]).await?;

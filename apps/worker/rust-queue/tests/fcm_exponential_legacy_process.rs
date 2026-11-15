@@ -56,6 +56,8 @@ async fn old_exponential_worker_is_fenced_and_new_worker_recovers() {
     .unwrap();
     db.execute("INSERT INTO public.novu_rust_push_workflow_worker_config(environment_id,multicast_503_policy) VALUES($1,'exponential')", &[&env]).await.unwrap();
     db.execute("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES($1,$2,'experimental_fcm_push','{\"title\":\"Hi\",\"content\":\"Body\",\"targets\":[\"fixture-device\"]}','pending')", &[&job,&env]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,rolname,'alert_view',oid FROM pg_roles WHERE rolname=session_user", &[&env]).await.unwrap();
+    db.execute("UPDATE public.novu_queue_jobs SET available_at=clock_timestamp()-interval '2 minutes' WHERE id=$1", &[&job]).await.unwrap();
     let log_path = std::env::var("TEST_DISPOSABLE_POSTGRES_LOG").unwrap();
     let offset = std::fs::metadata(&log_path).unwrap().len() as usize;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -96,6 +98,27 @@ async fn old_exponential_worker_is_fenced_and_new_worker_recovers() {
         .get::<_, i64>(0),
         0
     );
+    // Force lease expiry to reproduce repeated legacy claims without waiting for production leases.
+    db.execute("UPDATE public.novu_queue_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1", &[&job]).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let count: i64 = db
+            .query_one(
+                "SELECT public.novu_rust_fcm_unrecorded_claim_health($1,2,60)",
+                &[&env],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if count == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "repeated legacy claims were not detected"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     previous.0.kill().unwrap();
     previous.0.wait().unwrap();
     db.execute("UPDATE public.novu_queue_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1", &[&job]).await.unwrap();

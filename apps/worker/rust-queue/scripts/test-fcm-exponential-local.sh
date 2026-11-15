@@ -26,3 +26,4 @@ cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-wo
 cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply api "$API/migrations"
 cargo test --locked --manifest-path "$WORKER/Cargo.toml" --lib exponential_policy_fences_legacy_attempts_before_dispatch -- --ignored
 TEST_DISPOSABLE_POSTGRES_LOG="$TEST_DIR/postgres.log" "$WORKER/scripts/test-fcm-exponential-legacy.sh"
+cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test fcm_unrecorded_claim_health -- --ignored

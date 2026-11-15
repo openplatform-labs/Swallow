@@ -176,6 +176,9 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
         _ => return Err("invalid FCM credential alert thresholds".into()),
     };
+    let fcm_claim_gap=env_optional_i32("SWALLOW_ALERT_FCM_UNRECORDED_CLAIM_MIN_GAP")?;
+    let fcm_claim_grace=env_optional_i32("SWALLOW_ALERT_FCM_UNRECORDED_CLAIM_GRACE_SECONDS")?;
+    if fcm_claim_gap.is_some()!=fcm_claim_grace.is_some() || fcm_claim_gap.is_some_and(|v|!(2..=100000).contains(&v)) || fcm_claim_grace.is_some_and(|v|!(1..=86400).contains(&v)) || (fcm_claim_gap.is_some() && on_new_condition && !conditions_v2) {return Err("FCM unrecorded claims requires valid thresholds and v2 conditions for new-condition policy".into());}
     let fcm_cooldown_grace=env_optional_i32("SWALLOW_ALERT_FCM_COOLDOWN_GRACE_SECONDS")?;
     let fcm_cooldown_source_enabled=env_bool("SWALLOW_ALERT_FCM_COOLDOWN_SOURCE_ENABLED",false)?;
     if fcm_cooldown_source_enabled && fcm_cooldown_grace.is_none() { return Err("FCM cooldown source requires the cooldown check".into()); }
@@ -231,6 +234,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         && fcm_partial_window.is_none()
         && !fcm_unreviewed_enabled
         && fcm_cooldown_grace.is_none()
+        && fcm_claim_gap.is_none()
         && queue_wait.is_none()
         && twilio_thresholds.is_none()
         && sendgrid_thresholds.is_none()
@@ -560,6 +564,10 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         let result=tokio::time::timeout(operation_timeout,reconciliation::fcm_unreviewed_health(&db,&args[0])).await;
         Some(match result {Ok(Ok(n)) if n>=0=>Ok(n as u64),_=>{eprintln!("FCM unreviewed check failed");Err(())}})
     } else {None};
+    let fcm_unrecorded_claims=if let (Some(gap),Some(grace))=(fcm_claim_gap,fcm_claim_grace) {
+        let result=tokio::time::timeout(operation_timeout,novu_postgres_queue::fcm_queue::unrecorded_claim_health(&db,&args[0],gap,grace)).await;
+        Some(match result {Ok(Ok(n)) if n>=0=>Ok(n as u64),_=>{eprintln!("FCM unrecorded claims check failed");Err(())}})
+    } else {None};
     let mut fcm_cooldown_source=None;
     let fcm_cooldown=if let Some(grace)=fcm_cooldown_grace {
         let result = if fcm_cooldown_source_enabled {
@@ -593,6 +601,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         || twilio_delayed.is_some_and(|v| !matches!(v, Ok((0,0,0))))
         || fcm_partial.is_some_and(|v| !matches!(v, Ok(0)))
         || fcm_unreviewed.is_some_and(|v| !matches!(v, Ok(0)))
+        || fcm_unrecorded_claims.is_some_and(|v| !matches!(v, Ok(0)))
         || fcm_cooldown.is_some_and(|v| !matches!(v, Ok((false,0,0))))
         || failed_jobs.is_some_and(|n| n > 0)
         || failed_checks.iter().any(|failed| *failed)
@@ -634,6 +643,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         twilio_delayed,
         fcm_partial,
         fcm_unreviewed,
+        fcm_unrecorded_claims,
         fcm_cooldown,
         fcm_cooldown_source,
         fcm_cooldown_distinct_source,
@@ -691,6 +701,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         || twilio_delayed.is_some_and(|value| value.is_err())
         || fcm_partial.is_some_and(|value| value.is_err())
         || fcm_unreviewed.is_some_and(|value| value.is_err())
+        || fcm_unrecorded_claims.is_some_and(|value| value.is_err())
         || fcm_cooldown.is_some_and(|value| value.is_err())
         || channel_policy_check_failed
         || failed_checks.iter().any(|failed| *failed);

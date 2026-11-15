@@ -141,6 +141,7 @@ async fn run() -> Result<()> {
         twilio_delayed: None,
         fcm_partial: None,
         fcm_unreviewed: None,
+        fcm_unrecorded_claims: None,
         fcm_cooldown: None,
         fcm_cooldown_source: None,
         fcm_cooldown_distinct_source: false,
