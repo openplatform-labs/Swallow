@@ -440,6 +440,7 @@ async fn synchronous_failover_preserves_fcm_delayed_continuation() {
 #[tokio::test]
 #[ignore = "requires disposable synchronously replicated PostgreSQL; destroys the primary"]
 async fn synchronous_failover_preserves_fcm_exponential_503_continuation() {
+    let repeated=std::env::var("TEST_FCM_EXP_REPEATED").as_deref()==Ok("true");
     let primary_url = std::env::var("TEST_PRIMARY_URL").unwrap();
     let standby_url = std::env::var("TEST_STANDBY_URL").unwrap();
     let cluster_url = std::env::var("TEST_FAILOVER_URL").unwrap();
@@ -450,19 +451,22 @@ async fn synchronous_failover_preserves_fcm_exponential_503_continuation() {
     )
     .await
     .unwrap();
+    db.execute("INSERT INTO public.novu_rust_push_workflow_worker_config(environment_id,multicast_503_policy) VALUES('fcm-ha','exponential')", &[]).await.unwrap();
     let job = Uuid::new_v4();
+    let targets=if repeated {vec!["first","second","third"]} else {vec!["first","second"]};
     enqueue(
         &db,
         job,
         "fcm-ha",
         fcm_queue::JOB_KIND,
-        &json!({"title":"Hi","content":"Body","targets":["first","second"]}),
+        &json!({"title":"Hi","content":"Body","targets":targets}),
     )
     .await
     .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
+        for expected in if repeated {vec!["first","second"]} else {vec!["first"]} {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut bytes = Vec::new();
         let mut chunk = [0u8; 4096];
@@ -483,12 +487,14 @@ async fn synchronous_failover_preserves_fcm_exponential_503_continuation() {
                 if bytes.len() >= pos + 4 + len {
                     let body: Value =
                         serde_json::from_slice(&bytes[pos + 4..pos + 4 + len]).unwrap();
-                    assert_eq!(body["message"]["token"], "first");
+                    assert_eq!(body["message"]["token"], expected);
                     break;
                 }
             }
         }
-        socket.write_all(b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 120\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+        let response=if repeated {b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".as_slice()} else {b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 120\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".as_slice()};
+        socket.write_all(response).await.unwrap();
+        }
     });
     let provider = Fcm::with_origin("fixture-project", "fixture-token".into(), &origin).unwrap();
     let mut sender = connect(&primary_url).await;
@@ -509,11 +515,23 @@ async fn synchronous_failover_preserves_fcm_exponential_503_continuation() {
         .await
         .unwrap()
     );
+    if repeated {
+        let first=db.query_one("SELECT available_at>clock_timestamp()+interval '8 seconds',available_at<clock_timestamp()+interval '14 seconds' FROM public.novu_queue_jobs WHERE id=$1", &[&job]).await.unwrap();
+        assert!(first.get::<_,bool>(0) && first.get::<_,bool>(1));
+        db.execute("UPDATE public.novu_queue_jobs SET available_at=clock_timestamp()-interval '1 second' WHERE id=$1", &[&job]).await.unwrap();
+        assert!(fcm_queue::process_one_with_unavailable_policy(&mut sender,"fcm-ha",Some(&provider),None,false,crate::push_step_policy::Policy::Snapshot,crate::push_step_policy::PreferencePolicy::Snapshot,crate::push_step_policy::TargetPolicy::Reference,fcm_queue::RateLimitPolicy::DelayKnown,fcm_queue::UnavailablePolicy::Exponential,false).await.unwrap());
+        let second=db.query_one("SELECT available_at>clock_timestamp()+interval '18 seconds',available_at<clock_timestamp()+interval '26 seconds' FROM public.novu_queue_jobs WHERE id=$1", &[&job]).await.unwrap();
+        assert!(second.get::<_,bool>(0) && second.get::<_,bool>(1));
+    }
     server.await.unwrap();
     let replica = connect(&standby_url).await;
     let mut replayed = false;
     for _ in 0..100 {
-        replayed=replica.query_opt("SELECT 1 FROM public.novu_queue_jobs j JOIN public.novu_rust_fcm_attempts a ON a.job_id=j.id WHERE j.id=$1 AND j.status='pending' AND j.available_at>clock_timestamp()+interval '90 seconds' AND a.target_index=0 AND a.state='unknown' AND a.http_status=503 AND a.retry_after_seconds=120",&[&job]).await.unwrap().is_some();
+        replayed=if repeated {
+            replica.query_opt("SELECT 1 FROM public.novu_queue_jobs j WHERE j.id=$1 AND j.status='pending' AND j.available_at>clock_timestamp()+interval '10 seconds' AND (SELECT count(*) FROM public.novu_rust_fcm_attempts a WHERE a.job_id=j.id AND a.state='unknown' AND a.http_status=503 AND a.retry_after_seconds IS NULL)=2", &[&job]).await.unwrap().is_some()
+        } else {
+            replica.query_opt("SELECT 1 FROM public.novu_queue_jobs j JOIN public.novu_rust_fcm_attempts a ON a.job_id=j.id WHERE j.id=$1 AND j.status='pending' AND j.available_at>clock_timestamp()+interval '90 seconds' AND a.target_index=0 AND a.state='unknown' AND a.http_status=503 AND a.retry_after_seconds=120",&[&job]).await.unwrap().is_some()
+        };
         if replayed {
             break;
         }
@@ -581,13 +599,13 @@ async fn synchronous_failover_preserves_fcm_exponential_503_continuation() {
             .await
             .unwrap()
             .get::<_, i64>(0),
-        1
+        if repeated {2} else {1}
     );
     // Advance the schedule for a short test; this is an administrative intervention.
     promoted.execute("UPDATE public.novu_queue_jobs SET available_at=clock_timestamp()-interval '1 second' WHERE id=$1",&[&job]).await.unwrap();
     let mut finished = false;
     for _ in 0..100 {
-        finished=promoted.query_one("SELECT EXISTS(SELECT 1 FROM public.novu_rust_fcm_attempts WHERE job_id=$1 AND target_index=1 AND state='unknown')",&[&job]).await.unwrap().get(0);
+        finished=promoted.query_one("SELECT EXISTS(SELECT 1 FROM public.novu_rust_fcm_attempts WHERE job_id=$1 AND target_index=$2 AND state='unknown')",&[&job,&(if repeated {2_i32} else {1_i32})]).await.unwrap().get(0);
         if finished {
             break;
         }
@@ -605,7 +623,7 @@ async fn synchronous_failover_preserves_fcm_exponential_503_continuation() {
         rows.iter()
             .map(|r| r.get::<_, String>(0))
             .collect::<Vec<_>>(),
-        ["unknown", "unknown"]
+        if repeated {vec!["unknown", "unknown", "unknown"]} else {vec!["unknown", "unknown"]}
     );
     assert_eq!(
         count.load(Ordering::SeqCst),
