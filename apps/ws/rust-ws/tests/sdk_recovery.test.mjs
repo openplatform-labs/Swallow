@@ -147,6 +147,8 @@ test('rejects invalid recovery delay settings', () => {
   ]) assert.throws(() => startSocketRecovery(sdk, {refresh: () => {}, ...options}), RangeError);
   assert.throws(() => startSocketRecovery(sdk, {refresh: () => {}, onError: null}), TypeError);
   assert.throws(() => startSocketRecovery(sdk, {refresh: () => {}, recoverInitialConnection: 'true'}), TypeError);
+  assert.throws(() => startSocketRecovery(sdk, {refresh: () => {}, initialConnectTimeoutMs: 10}), TypeError);
+  assert.throws(() => startSocketRecovery(sdk, {refresh: () => {}, recoverInitialConnection: true, initialConnectTimeoutMs: 0}), RangeError);
 });
 
 test('initial socket errors are retried only when explicitly enabled', async () => {
@@ -187,4 +189,53 @@ test('initial error callback can stop before retry starts', async () => {
   emit('socket.connect.resolved',{error:new Error('authorization failed')});
   await delay(20);
   assert.equal(attempts,0);
+});
+
+test('initial connection watchdog reports timeout and recovers', async () => {
+  const {sdk,emit}=client();
+  let attempts=0, refreshes=0, errors=[];
+  const connect=sdk.socket.connect;
+  sdk.socket.connect=async()=>{attempts++;return connect();};
+  const stop=startSocketRecovery(sdk,{
+    recoverInitialConnection:true,initialConnectTimeoutMs:10,retryDelayMs:5,
+    refresh:()=>refreshes++,onError:error=>errors.push(error.code),
+  });
+  emit('socket.connect.pending');
+  await until(()=>refreshes===1);
+  assert.equal(attempts,1);
+  assert.deepEqual(errors,['SWALLOW_SOCKET_INITIAL_TIMEOUT']);
+  stop();
+});
+
+test('successful initial connect and stop cancel the watchdog', async () => {
+  for (const mode of ['connect','stop']) {
+    const {sdk,emit}=client();
+    let errors=0;
+    const stop=startSocketRecovery(sdk,{
+      recoverInitialConnection:true,initialConnectTimeoutMs:10,
+      refresh:()=>{},onError:()=>errors++,
+    });
+    emit('socket.connect.pending');
+    if(mode==='connect')emit('socket.connect.resolved');
+    else stop();
+    await delay(25);
+    assert.equal(errors,0);
+    stop();
+  }
+});
+
+test('initial SDK error cancels its watchdog and starts only one recovery', async () => {
+  const {sdk,emit}=client();
+  let reports=0, refreshes=0;
+  const stop=startSocketRecovery(sdk,{
+    recoverInitialConnection:true,initialConnectTimeoutMs:20,retryDelayMs:5,
+    refresh:()=>refreshes++,onError:()=>reports++,
+  });
+  emit('socket.connect.pending');
+  emit('socket.connect.resolved',{error:new Error('connection refused')});
+  await until(()=>refreshes===1);
+  await delay(30);
+  assert.equal(reports,1);
+  assert.equal(refreshes,1);
+  stop();
 });

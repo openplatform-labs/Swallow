@@ -13,6 +13,8 @@ export interface SocketRecoveryOptions {
   jitterRatio?: number;
   /** Also retry SDK socket errors before the first successful connection; default false. */
   recoverInitialConnection?: boolean;
+  /** Optional timeout after the SDK emits socket.connect.pending. Requires recoverInitialConnection. */
+  initialConnectTimeoutMs?: number;
 }
 
 /** Start optional recovery; return an idempotent stop function. */

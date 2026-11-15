@@ -12,16 +12,19 @@ export function startSocketRecovery(novu, {
   maxRetryDelayMs = Math.max(retryDelayMs, 30000),
   jitterRatio = 0,
   recoverInitialConnection = false,
+  initialConnectTimeoutMs,
 } = {}) {
   if (typeof refresh !== 'function') throw new TypeError('refresh is required');
   if (typeof onError !== 'function') throw new TypeError('onError must be a function');
   if (typeof recoverInitialConnection !== 'boolean') throw new TypeError('recoverInitialConnection must be a boolean');
+  if (initialConnectTimeoutMs !== undefined && !recoverInitialConnection) throw new TypeError('initialConnectTimeoutMs requires recoverInitialConnection');
   const maxTimerMs = 2147483647;
   if (!Number.isFinite(retryDelayMs) || retryDelayMs < 1 || retryDelayMs > maxTimerMs
     || !Number.isFinite(connectTimeoutMs) || connectTimeoutMs < 1 || connectTimeoutMs > maxTimerMs
     || !Number.isFinite(backoffFactor) || backoffFactor < 1
     || !Number.isFinite(maxRetryDelayMs) || maxRetryDelayMs < retryDelayMs || maxRetryDelayMs > maxTimerMs
-    || !Number.isFinite(jitterRatio) || jitterRatio < 0 || jitterRatio > 1) {
+    || !Number.isFinite(jitterRatio) || jitterRatio < 0 || jitterRatio > 1
+    || (initialConnectTimeoutMs !== undefined && (!Number.isFinite(initialConnectTimeoutMs) || initialConnectTimeoutMs < 1 || initialConnectTimeoutMs > maxTimerMs))) {
     throw new RangeError('invalid retry, timeout, backoff or jitter configuration');
   }
   let stopped = false;
@@ -33,6 +36,7 @@ export function startSocketRecovery(novu, {
   let activeRefresh;
   let timer;
   let wake;
+  let initialTimer;
 
   function cancelWait() {
     clearTimeout(timer);
@@ -50,16 +54,33 @@ export function startSocketRecovery(novu, {
   function report(error) {
     try { onError(error); } catch { /* reporting must not disable recovery */ }
   }
+  function clearInitialTimer() {
+    clearTimeout(initialTimer);
+    initialTimer = undefined;
+  }
+  function beginInitialRecovery(error) {
+    if (!recoverInitialConnection || everConnected || recovering || stopped) return;
+    // Mark first so a synchronous error callback cannot start a second loop.
+    recovering = true;
+    report(error);
+    if (!stopped) void recover();
+    else recovering = false;
+  }
+  const unsubscribePending = novu.on('socket.connect.pending', () => {
+    if (initialConnectTimeoutMs === undefined || everConnected || recovering || stopped) return;
+    clearInitialTimer();
+    initialTimer = setTimeout(() => {
+      initialTimer = undefined;
+      const error = new Error('Initial Socket.IO connection timed out');
+      error.code = 'SWALLOW_SOCKET_INITIAL_TIMEOUT';
+      beginInitialRecovery(error);
+    }, initialConnectTimeoutMs);
+  });
   const unsubscribeConnect = novu.on('socket.connect.resolved', ({ error } = {}) => {
+    clearInitialTimer();
     if (error) {
       if (recovering && !stopped) report(error);
-      else if (recoverInitialConnection && !everConnected && !stopped) {
-        // Mark first so a synchronous error callback cannot start a second loop.
-        recovering = true;
-        report(error);
-        if (!stopped) void recover();
-        else recovering = false;
-      }
+      else beginInitialRecovery(error);
       return;
     }
     connected = true;
@@ -67,6 +88,7 @@ export function startSocketRecovery(novu, {
     cancelWait();
   });
   const unsubscribeDisconnect = novu.on('socket.disconnect.resolved', () => {
+    clearInitialTimer();
     connected = false;
     if (resetting || stopped) return;
     epoch++;
@@ -129,8 +151,10 @@ export function startSocketRecovery(novu, {
   return () => {
     if (stopped) return;
     stopped = true;
+    unsubscribePending();
     unsubscribeConnect();
     unsubscribeDisconnect();
+    clearInitialTimer();
     activeRefresh?.abort();
     cancelWait();
   };

@@ -13,7 +13,7 @@ function sql(query) {
   assert.equal(result.status,0,result.stderr);
   return result.stdout.trim();
 }
-async function networkFailureScenario(startSocketRecovery, initialFailure=false) {
+async function networkFailureScenario(startSocketRecovery, initialFailure=false, stall=false) {
   let blocked=initialFailure, connections=0, refreshes=0, errors=[];
   const sockets=new Set();
   const upstream=new URL(process.env.RUST_WS_URL);
@@ -21,7 +21,7 @@ async function networkFailureScenario(startSocketRecovery, initialFailure=false)
     sockets.add(client);
     client.on('close',()=>sockets.delete(client));
     client.on('error',()=>{});
-    if(blocked) { client.destroy(); return; }
+    if(blocked) { if(!stall)client.destroy(); return; }
     const target=net.connect(Number(upstream.port),upstream.hostname);
     sockets.add(target);
     target.on('close',()=>sockets.delete(target));
@@ -31,10 +31,10 @@ async function networkFailureScenario(startSocketRecovery, initialFailure=false)
     client.pipe(target).pipe(client);
   });
   await new Promise(resolve=>proxy.listen(0,'127.0.0.1',resolve));
-  const sdk=new Novu({applicationIdentifier:'recovery-app',subscriberId:'proxy-user',apiUrl:process.env.NOVU_RUST_URL,socketUrl:`http://127.0.0.1:${proxy.address().port}`,socketOptions:{reconnection:false,timeout:300}});
+  const sdk=new Novu({applicationIdentifier:'recovery-app',subscriberId:'proxy-user',apiUrl:process.env.NOVU_RUST_URL,socketUrl:`http://127.0.0.1:${proxy.address().port}`,socketOptions:{reconnection:false,timeout:stall ? 10000 : 300}});
   sdk.on('socket.connect.resolved',({error})=>{if(!error)connections++});
   const stop=startSocketRecovery(sdk,{
-    retryDelayMs:100,connectTimeoutMs:300,backoffFactor:2,maxRetryDelayMs:500,jitterRatio:0.2,recoverInitialConnection:initialFailure,
+    retryDelayMs:100,connectTimeoutMs:300,backoffFactor:2,maxRetryDelayMs:500,jitterRatio:0.2,recoverInitialConnection:initialFailure,initialConnectTimeoutMs:stall ? 200 : undefined,
     onError:error=>errors.push(error),
     refresh:async({signal})=>{
       const result=await sdk.notifications.list({useCache:false});
@@ -50,10 +50,11 @@ async function networkFailureScenario(startSocketRecovery, initialFailure=false)
       for(const socket of sockets)socket.destroy();
     }
     await until(()=>errors.length>0,'real SDK connection error was not reported');
+    if(stall)assert.equal(errors[0].code,'SWALLOW_SOCKET_INITIAL_TIMEOUT');
     assert.equal(refreshes,0,'refresh ran while the proxy was blocked');
     blocked=false;
     await until(()=>connections>=(initialFailure ? 1 : 2) && refreshes>=1,'proxied SDK did not recover');
-    console.log(`real SDK ${initialFailure ? 'initial' : 'established'} network failure: error callback and Inbox refresh verified`);
+    console.log(`real SDK ${stall ? 'stalled initial' : initialFailure ? 'initial' : 'established'} network failure: error callback and Inbox refresh verified`);
   } finally {
     stop();
     await sdk.socket.disconnect();
@@ -166,6 +167,7 @@ async function networkFailureScenario(startSocketRecovery, initialFailure=false)
     assert.equal(sql("SELECT count(*) FROM novu_rust_in_app_messages WHERE transaction_id='recovery-gap-1'"),'0');
     await networkFailureScenario(startSocketRecovery);
     await networkFailureScenario(startSocketRecovery,true);
+    await networkFailureScenario(startSocketRecovery,true,true);
     console.log('real SDK recovered Inbox state from Rust API after a lost WS event');
   } finally {
     stop();
