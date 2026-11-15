@@ -342,6 +342,8 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/operator/subscribers", get(operator_identity::subscribers))
         .route("/v1/experimental/operator/alerts", get(operator_identity::alerts))
         .route("/v1/experimental/operator/resend-result", get(operator_identity::resend_result))
+        .route("/v1/experimental/operator/twilio-result", get(operator_identity::twilio_result))
+        .route("/v1/experimental/operator/twilio-jobs", get(operator_identity::twilio_jobs))
         .route("/v1/experimental/operator/resend-jobs", get(operator_identity::resend_jobs))
         .route("/v1/experimental/operator/workflow", get(operator_identity::workflow_read).put(operator_identity::workflow_write))
         .route("/v1/experimental/operator/workflow-audit", get(operator_identity::workflow_audit))

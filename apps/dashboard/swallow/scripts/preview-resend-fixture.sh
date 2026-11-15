@@ -83,6 +83,15 @@ INSERT INTO public.novu_rust_resend_delivery_events(environment_id,event_id,emai
 INSERT INTO public.novu_rust_resend_auto_correlations(job_id,environment_id,correlation_id,provider_message_id,evidence_count) VALUES ('1889f88e-c0a3-4ab5-b861-2fdc1f26f254','ui-fixture-env','96df49d1-0f4d-4bce-9290-666dd8fc908c','fixture-provider',1);
 UPDATE public.novu_queue_jobs SET resend_delivery_result='delivered' WHERE id='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
 SQL
+if [[ "${SWALLOW_UI_TWILIO_FIXTURE:-false}" == true ]]; then
+  docker exec -i "$name" psql -q -v ON_ERROR_STOP=1 -U postgres -d ui_test <<'SQL'
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_twilio_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_twilio_jobs(text,text,text,text,bigint,uuid) TO ui_resend_fixture;
+INSERT INTO public.novu_rust_operator_jwt_twilio_result_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
+INSERT INTO public.novu_rust_operator_jwt_twilio_jobs_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
+INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status,twilio_delivery_result) VALUES ('2889f88e-c0a3-4ab5-b861-2fdc1f26f254','ui-fixture-env','experimental_twilio_sms','{}','completed','delivered');
+INSERT INTO public.novu_rust_twilio_attempts(job_id,environment_id,state,provider_message_id) VALUES ('2889f88e-c0a3-4ab5-b861-2fdc1f26f254','ui-fixture-env','accepted','fixture-provider');
+SQL
+fi
 if [[ "${SWALLOW_UI_SELF_REVOKE:-false}" == true ]]; then
   docker exec -i "$name" psql -q -v ON_ERROR_STOP=1 -U postgres -d ui_test <<'SQL'
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_self(text,text,text,text,bigint),public.novu_rust_operator_token_revoked(bytea,bytea,bytea,bytea),public.novu_rust_operator_token_guard(bytea,bytea,bytea,bytea),public.novu_rust_operator_jwt_self_revoke(text,text,text,text,bigint,bytea) TO ui_resend_fixture;

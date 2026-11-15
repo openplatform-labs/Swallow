@@ -44,7 +44,7 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     let db = connect(&url).await;
     db.batch_execute("INSERT INTO public.novu_rust_environments VALUES('jwt-alert-a','org'),('jwt-alert-b','org')").await.unwrap();
     let role = format!("jwt_alert_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_alerts(text,text,text,text,bigint,text,text),public.novu_rust_console_alerts_page(text,text,text),public.novu_rust_operator_jwt_resend_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_resend_jobs(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_alerts(text,text,text,text,bigint,text,text),public.novu_rust_console_alerts_page(text,text,text),public.novu_rust_operator_jwt_resend_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_resend_jobs(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_twilio_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_twilio_jobs(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_read(text,text,text,text,bigint,text,text) TO {role}")).await.unwrap();
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_write(text,text,text,text,bigint,text,text,jsonb,jsonb,text) TO {role}")).await.unwrap();
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_audit_read(text,text,text,text,bigint,text,text,uuid) TO {role}")).await.unwrap();
@@ -112,6 +112,11 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
         )
         .await
         .is_err()
+    );
+    assert!(
+        api.query("SELECT * FROM public.novu_rust_twilio_attempts", &[])
+            .await
+            .is_err()
     );
     let app = novu_rust_api::router(Arc::new(api)).layer(Extension(Arc::new(
         AccessTokenVerifier::new("https://issuer.test", "swallow", &[("key", PUBLIC)]).unwrap(),
@@ -1813,6 +1818,132 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     let mut waiting = false;
     for _ in 0..100 {
         if db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%novu_rust_operator_jwt_workflow_audit_read%')",&[]).await.unwrap().get::<_,bool>(0){waiting=true;break;}
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(waiting && !pending.is_finished());
+    tx.commit().await.unwrap();
+    assert_eq!(pending.await.unwrap(), StatusCode::UNAUTHORIZED);
+    let sms_job = Uuid::new_v4();
+    novu_postgres_queue::enqueue(
+        &db,
+        sms_job,
+        "jwt-alert-a",
+        novu_postgres_queue::twilio_queue::JOB_KIND,
+        &json!({"phone":"private-phone"}),
+    )
+    .await
+    .unwrap();
+    db.execute("UPDATE public.novu_queue_jobs SET status='completed',twilio_delivery_result='delivered' WHERE id=$1",&[&sms_job]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_twilio_attempts(job_id,environment_id,state,provider_message_id) VALUES ($1,'jwt-alert-a','accepted','private-sid')",&[&sms_job]).await.unwrap();
+    let sms_request = |jwt: &str, path: &str| {
+        Request::builder()
+            .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let sms_path = format!(
+        "/v1/experimental/operator/twilio-result?environmentId=jwt-alert-a&jobId={sms_job}"
+    );
+    let sms_list = "/v1/experimental/operator/twilio-jobs?environmentId=jwt-alert-a";
+    assert_eq!(
+        app.clone()
+            .oneshot(sms_request(&token, &sms_path))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_twilio_result_grants VALUES('https://issuer.test','person','console','jwt-alert-a')").await.unwrap();
+    let response = app
+        .clone()
+        .oneshot(sms_request(&token, &sms_path))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let sms: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(sms["result"], "delivered");
+    assert!(!sms.to_string().contains("private-phone") && !sms.to_string().contains("private-sid"));
+    assert_eq!(
+        app.clone()
+            .oneshot(sms_request(&token, sms_list))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_twilio_jobs_grants VALUES('https://issuer.test','person','console','jwt-alert-a'); INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) SELECT gen_random_uuid(),'jwt-alert-a','experimental_twilio_sms','{}' FROM generate_series(1,21); INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) VALUES(gen_random_uuid(),'jwt-alert-b','experimental_twilio_sms','{}')").await.unwrap();
+    let response = app
+        .clone()
+        .oneshot(sms_request(&token, sms_list))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(page["data"].as_array().unwrap().len(), 20);
+    assert_eq!(page["hasMore"], true);
+    let next = page["next"].as_str().unwrap();
+    let response = app
+        .clone()
+        .oneshot(sms_request(&token, &format!("{sms_list}&after={next}")))
+        .await
+        .unwrap();
+    let page: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(page["data"].as_array().unwrap().len(), 2);
+    let duplicate = Uuid::new_v4();
+    novu_postgres_queue::enqueue(
+        &db,
+        duplicate,
+        "jwt-alert-a",
+        novu_postgres_queue::twilio_queue::JOB_KIND,
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO public.novu_rust_twilio_attempts(job_id,environment_id,state,provider_message_id) VALUES ($1,'jwt-alert-a','accepted','private-sid')",&[&duplicate]).await.unwrap();
+    let response = app
+        .clone()
+        .oneshot(sms_request(&token, &sms_path))
+        .await
+        .unwrap();
+    let sms: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(sms["result"], "unknown");
+    assert_eq!(sms["providerIdAmbiguous"], true);
+    assert_eq!(app.clone().oneshot(sms_request(&token,&format!("/v1/experimental/operator/twilio-result?environmentId=jwt-alert-b&jobId={sms_job}"))).await.unwrap().status(),StatusCode::UNAUTHORIZED);
+    db.execute("DELETE FROM public.novu_rust_operator_jwt_twilio_result_grants WHERE subject='person' AND environment_id='jwt-alert-a'",&[]).await.unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(sms_request(&token, &sms_path))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(sms_request(&token, sms_list))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_twilio_result_grants VALUES('https://issuer.test','person','console','jwt-alert-a')").await.unwrap();
+    let mut sms_revoker = connect(&url).await;
+    let tx = sms_revoker.transaction().await.unwrap();
+    tx.execute("DELETE FROM public.novu_rust_operator_jwt_twilio_result_grants WHERE subject='person' AND environment_id='jwt-alert-a'",&[]).await.unwrap();
+    let req = sms_request(&token, &sms_path);
+    let pending = tokio::spawn({
+        let app = app.clone();
+        async move { app.oneshot(req).await.unwrap().status() }
+    });
+    let mut waiting = false;
+    for _ in 0..100 {
+        if db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%novu_rust_operator_jwt_twilio_result%')",&[]).await.unwrap().get::<_,bool>(0){waiting=true;break;}
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert!(waiting && !pending.is_finished());

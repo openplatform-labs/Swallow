@@ -2,6 +2,7 @@ import { Component, OnDestroy, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { FcmIntegrations } from './fcm-integrations';
 import { SlackIntegrations } from './slack-integrations';
+import { TwilioResults } from './twilio-results';
 import { ClrAlertModule } from '@clr/angular/emphasis/alert';
 import { OperatorOidc, type PreparedOidc, type VerifiedSession } from './operator-oidc';
 
@@ -44,7 +45,7 @@ type SendgridKey = {identifier:string;active:boolean};
 type SendgridKeyAudit = {id:string;identifier:string;action:string;userId:string;recordedAt:string};
 
 @Component({
-  imports: [FormsModule, ClrAlertModule, FcmIntegrations, SlackIntegrations],
+  imports: [FormsModule, ClrAlertModule, FcmIntegrations, SlackIntegrations, TwilioResults],
   selector: 'app-root',
   styleUrl: './app.css',
   templateUrl: './app.html',
