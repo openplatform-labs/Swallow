@@ -39,7 +39,8 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
     }
     let (db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move { driver.await.unwrap() });
-    db.batch_execute("INSERT INTO novu_rust_environments VALUES ('guard-env','org'),('map-env','org'),('pref-env','org'); INSERT INTO novu_rust_fcm_routing_workers SELECT e.id,r.rolname,r.oid FROM novu_rust_environments e CROSS JOIN pg_roles r WHERE r.rolname=session_user; INSERT INTO novu_rust_operator_grant_admins(environment_id,database_principal,principal_oid) SELECT 'guard-env',rolname,oid FROM pg_roles WHERE rolname=session_user").await.unwrap();
+    db.batch_execute("INSERT INTO novu_rust_environments VALUES ('guard-env','org'),('map-env','org'),('pref-env','org'),('cool-env','org'); INSERT INTO novu_rust_fcm_routing_workers SELECT e.id,r.rolname,r.oid FROM novu_rust_environments e CROSS JOIN pg_roles r WHERE r.rolname=session_user; INSERT INTO novu_rust_operator_grant_admins(environment_id,database_principal,principal_oid) SELECT 'guard-env',rolname,oid FROM pg_roles WHERE rolname=session_user").await.unwrap();
+    db.batch_execute("INSERT INTO public.novu_rust_fcm_cooldown_policies(environment_id,fallback_seconds) VALUES ('guard-env',60),('cool-env',60); INSERT INTO public.novu_rust_fcm_cooldown_workers SELECT e.id,r.rolname,r.oid FROM public.novu_rust_environments e CROSS JOIN pg_roles r WHERE e.id IN ('guard-env','cool-env') AND r.rolname=session_user").await.unwrap();
     let command = |env: &str, project: &str, token: &str| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_fcm-worker"));
         c.env("DATABASE_URL", &url)
@@ -51,6 +52,7 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
             .env_remove("NOVU_FCM_ACCESS_TOKEN_FILE")
             .env_remove("NOVU_FCM_INTEGRATIONS")
             .env_remove("NOVU_FCM_INTEGRATIONS_FILE")
+            .env_remove("SWALLOW_FCM_SHARED_COOLDOWN")
             .env_remove("SWALLOW_FCM_ALLOW_SHARED_PROVIDER")
             .env_remove("SWALLOW_FCM_INVALID_TOKEN_POLICY")
             .env_remove("SWALLOW_FCM_TOKEN_CLEANUP_GUARD")
@@ -81,6 +83,38 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
     );
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert!(same.0.try_wait().unwrap().is_none());
+    // A registered false setting rejects an enabled worker, and vice versa.
+    for _ in 0..100 {
+        if db.query_one("SELECT shared_cooldown=false FROM public.novu_rust_push_workflow_worker_config WHERE environment_id='guard-env'",&[]).await.ok().is_some_and(|r|r.get::<_,bool>(0)){break;}
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mismatch = command("guard-env", "project-a", "fixture-token")
+        .env("SWALLOW_FCM_SHARED_COOLDOWN", "true")
+        .output()
+        .unwrap();
+    assert!(!mismatch.status.success());
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("shared cooldown setting"));
+    let mut cool = Worker(
+        command("cool-env", "project-a", "fixture-token")
+            .env("SWALLOW_FCM_SHARED_COOLDOWN", "true")
+            .spawn()
+            .unwrap(),
+    );
+    let mut registered = false;
+    for _ in 0..100 {
+        registered=db.query_opt("SELECT shared_cooldown FROM public.novu_rust_push_workflow_worker_config WHERE environment_id='cool-env'",&[]).await.unwrap().is_some_and(|r|r.get::<_,Option<bool>>(0)==Some(true));
+        if registered {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(registered);
+    assert!(cool.0.try_wait().unwrap().is_none());
+    let mismatch = command("cool-env", "project-a", "fixture-token")
+        .output()
+        .unwrap();
+    assert!(!mismatch.status.success());
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("shared cooldown setting"));
     let mismatch_step = command("guard-env", "project-a", "fixture-token")
         .env("SWALLOW_PUSH_WORKFLOW_STEP_POLICY", "active")
         .output()

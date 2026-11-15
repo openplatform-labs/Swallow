@@ -89,6 +89,11 @@ async fn workers_reconnect_and_preserve_uncertain_attempts() {
     .await
     .unwrap();
     db.batch_execute("ALTER TABLE public.novu_rust_push_workflow_worker_config ADD COLUMN preference_policy text DEFAULT 'snapshot', ADD COLUMN target_policy text DEFAULT 'reference'").await.unwrap();
+    db.batch_execute(include_str!(
+        "../migrations/0190_fcm_cooldown_registration.sql"
+    ))
+    .await
+    .unwrap();
     db.batch_execute("CREATE TABLE novu_rust_operator_grant_admins(environment_id text,database_principal text,principal_oid oid)").await.unwrap();
     db.batch_execute(include_str!("../migrations/0095_fcm_routing_guard.sql"))
         .await
