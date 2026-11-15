@@ -25,13 +25,14 @@ cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-wo
 "$TEST_PG_BIN/psql" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
 CREATE ROLE ui_fixture_api LOGIN;
 GRANT USAGE ON SCHEMA public TO ui_fixture_api;
-GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_429_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_resend_429_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_resend_429_grant_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_resend_429_grant_audit_read(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_resend_cooldown_health(text,text,text,text,bigint,integer) TO ui_fixture_api;
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_429_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_resend_429_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_resend_429_grant_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_resend_429_grant_audit_read(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_resend_cooldown_health(text,text,text,text,bigint,integer),public.novu_rust_operator_jwt_resend_cooldown_policy_read(text,text,text,text,bigint),public.novu_rust_operator_jwt_resend_cooldown_policy_change(text,text,text,text,bigint,uuid,bigint,integer,text),public.novu_rust_operator_jwt_resend_cooldown_policy_audit_read(text,text,text,text,bigint,uuid) TO ui_fixture_api;
 INSERT INTO public.novu_rust_environments VALUES('fixture-env','fixture-org');
 INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES('https://issuer.test','admin','console','fixture-env'),('https://issuer.test','target','console','fixture-env');
 INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname='ui_fixture_api';
 INSERT INTO public.novu_rust_operator_jwt_resend_429_grant_admins VALUES('https://issuer.test','admin','console','fixture-env',true,true);
 INSERT INTO public.novu_rust_operator_jwt_resend_429_grant_audit_viewers VALUES('https://issuer.test','admin','console','fixture-env');
 INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'fixture-env',rolname,'alert_view',oid FROM pg_roles WHERE rolname='ui_fixture_api';
+INSERT INTO public.novu_rust_resend_cooldown_policy_admins(environment_id,database_principal,principal_oid,can_read,can_write) SELECT 'fixture-env',rolname,oid,true,true FROM pg_roles WHERE rolname='ui_fixture_api';
 INSERT INTO public.novu_rust_resend_cooldown_policies(environment_id,fallback_seconds,not_before) VALUES('fixture-env',30,clock_timestamp()+interval '5 minutes');
 SQL
 python3 - "$API/tests/fixtures/operator_jwt/test-only-public.pem" "$API/tests/fixtures/operator_jwt/test-only-private.pem" "$TEST_DIR" <<'PY'
@@ -67,19 +68,26 @@ await fs.writeFile(ROOT+'/space-id',String(task.spaceId));
 const page=task.page('p1'), api='http://127.0.0.1:'+API;
 const admin=await fs.readFile(ROOT+'/admin.jwt','utf8'), target=await fs.readFile(ROOT+'/target.jwt','utf8');
 await page.goto('http://127.0.0.1:'+UI+'/');
+await page.evaluate(selector=>document.querySelector(selector)?.scrollIntoView({block:'center'}),'input[name="apiOrigin"]');
 await page.fill('input[name="apiOrigin"]',api);
 async function settings() {
   await page.click('nav.sidenav button >> nth=6');
+  await page.evaluate(selector=>document.querySelector(selector)?.scrollIntoView({block:'center'}),'input[name="permissionEnvironment"]');
   await page.fill('input[name="permissionEnvironment"]','fixture-env');
+  await page.evaluate(selector=>document.querySelector(selector)?.scrollIntoView({block:'center'}),'input[name="permissionKey"]');
   await page.fill('input[name="permissionKey"]',admin);
+  await page.evaluate(selector=>document.querySelector(selector)?.scrollIntoView({block:'center'}),'input[name="permissionIssuer"]');
   await page.fill('input[name="permissionIssuer"]','https://issuer.test');
+  await page.evaluate(selector=>document.querySelector(selector)?.scrollIntoView({block:'center'}),'input[name="permissionSubject"]');
   await page.fill('input[name="permissionSubject"]','target');
+  await page.evaluate(selector=>document.querySelector(selector)?.scrollIntoView({block:'center'}),'input[name="permissionClient"]');
   await page.fill('input[name="permissionClient"]','console');
   await page.selectOption('select[name="grantKind"]','resend-429:cooldown-health');
   await page.click('loc=role:button[name="선택 권한 조회"]');
 }
 async function submit(reason) {
   await page.click('input[name="grantDesired"]');
+  await page.evaluate(selector=>document.querySelector(selector)?.scrollIntoView({block:'center'}),'textarea[name="grantReason"]');
   await page.fill('textarea[name="grantReason"]',reason);
   await page.click('input[name="grantConfirmed"]');
   await page.click('loc=role:button[name="변경 요청 준비"]');
@@ -91,7 +99,9 @@ async function submit(reason) {
 async function alerts() {
   await page.click('nav.sidenav button >> nth=5');
   await page.selectOption('select[name="alertAuthMode"]','jwt');
+  await page.evaluate(selector=>document.querySelector(selector)?.scrollIntoView({block:'center'}),'input[name="alertEnvironment"]');
   await page.fill('input[name="alertEnvironment"]','fixture-env');
+  await page.evaluate(selector=>document.querySelector(selector)?.scrollIntoView({block:'center'}),'input[name="alertKey"]');
   await page.fill('input[name="alertKey"]',target);
   await page.click('section[aria-labelledby="resend-cooldown-heading"] button');
 }
@@ -108,7 +118,34 @@ await page.waitForFunction(()=>document.body.innerText.includes('resend-429:cool
 await submit('browser fixture revoke');
 await alerts();
 await page.waitForFunction(()=>document.querySelector('#resend-cooldown-heading')?.closest('section')?.innerText.includes('조회하지 못했습니다. 권한, 정책 및 연결 상태를 확인하세요.'));
-console.log('Real API browser test: grant, audit, health and revoke passed');
+await settings();
+for (const permission of ['policy-read','policy-write','policy-audit']) {
+  await page.selectOption('select[name="grantKind"]','resend-429:'+permission);
+  await page.click('loc=role:button[name="선택 권한 조회"]');
+  await page.waitForFunction(p=>document.body.innerText.includes('resend-429:'+p+' 현재 상태: 없음'),permission);
+  await submit('browser '+permission);
+  await page.click('loc=role:button[name="요청 정보 지우기"]');
+}
+await page.evaluate(selector=>document.querySelector(selector)?.scrollIntoView({block:'center'}),'input[name="permissionKey"]');
+await page.fill('input[name="permissionKey"]',target);
+await page.click('app-resend-cooldown-policy section:first-child button');
+await page.waitForFunction(()=>document.body.innerText.includes('기본 대기: 30초'));
+await page.evaluate(selector=>document.querySelector(selector)?.scrollIntoView({block:'center'}),'input[name="resendCooldownFallback"]');
+await page.fill('input[name="resendCooldownFallback"]','45');
+await page.evaluate(selector=>document.querySelector(selector)?.scrollIntoView({block:'center'}),'textarea[name="resendCooldownReason"]');
+await page.fill('textarea[name="resendCooldownReason"]','browser policy change');
+await page.click('input[name="resendCooldownConfirm"]');
+await page.click('loc=role:button[name="정책 변경 요청 준비"]');
+await page.waitForSelector('input[name="resendCooldownSubmitConfirm"]');
+await page.click('input[name="resendCooldownSubmitConfirm"]');
+await page.click('loc=role:button[name="정책 변경 제출"]');
+await page.waitForFunction(()=>document.body.innerText.includes('요청이 기록됐습니다. 현재 정책은 다시 조회하세요.'));
+await page.click('app-resend-cooldown-policy section:last-child button >> nth=0');
+await page.waitForFunction(()=>[...document.querySelectorAll('table')].some(t=>t.innerText.includes('browser policy change') && t.innerText.includes('45초')));
+await page.click('loc=role:button[name="정책 요청 정보 지우기"]');
+await page.click('app-resend-cooldown-policy section:first-child button');
+await page.waitForFunction(()=>document.body.innerText.includes('기본 대기: 45초'));
+console.log('Real API browser test: grant, audit, health, revoke and delegated policy change passed');
 '''
 with open(root+'/browser.mjs','w') as f:f.write('const API='+json.dumps(api)+'; const UI='+json.dumps(ui)+'; const ROOT='+json.dumps(root)+'; const SPACE='+json.dumps(int(space) if space else None)+';\n'+script)
 PY
@@ -116,3 +153,5 @@ ego-browser nodejs < "$TEST_DIR/browser.mjs"
 SPACE_ID=$(cat "$TEST_DIR/space-id")
 printf 'const task=await taskSpace(%s); await task.finish({keep:[]});\n' "$SPACE_ID" | ego-browser nodejs
 [[ $("$TEST_PG_BIN/psql" "$DATABASE_URL" -At -v ON_ERROR_STOP=1 -c "SELECT count(*)=2 AND bool_or(current) AND bool_or(NOT current) FROM public.novu_rust_operator_jwt_resend_429_grant_audit WHERE environment_id='fixture-env' AND permission='cooldown-health'") == t ]]
+
+[[ $("$TEST_PG_BIN/psql" "$DATABASE_URL" -At -v ON_ERROR_STOP=1 -c "SELECT fallback_seconds=45 FROM public.novu_rust_resend_cooldown_policies WHERE environment_id='fixture-env'") == t ]]
