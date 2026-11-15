@@ -44,7 +44,7 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     let db = connect(&url).await;
     db.batch_execute("INSERT INTO public.novu_rust_environments VALUES('jwt-alert-a','org'),('jwt-alert-b','org')").await.unwrap();
     let role = format!("jwt_alert_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_alerts(text,text,text,text,bigint,text,text),public.novu_rust_console_alerts_page(text,text,text),public.novu_rust_operator_jwt_resend_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_resend_jobs(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_twilio_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_twilio_jobs(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_jobs(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_alerts(text,text,text,text,bigint,text,text),public.novu_rust_console_alerts_page(text,text,text),public.novu_rust_operator_jwt_resend_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_resend_jobs(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_twilio_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_twilio_jobs(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_jobs(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_slack_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_slack_jobs(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_read(text,text,text,text,bigint,text,text) TO {role}")).await.unwrap();
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_write(text,text,text,text,bigint,text,text,jsonb,jsonb,text) TO {role}")).await.unwrap();
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_audit_read(text,text,text,text,bigint,text,text,uuid) TO {role}")).await.unwrap();
@@ -120,6 +120,16 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     );
     assert!(
         api.query("SELECT * FROM public.novu_rust_fcm_attempts", &[])
+            .await
+            .is_err()
+    );
+    assert!(
+        api.query("SELECT * FROM public.novu_rust_slack_attempts", &[])
+            .await
+            .is_err()
+    );
+    assert!(
+        api.query("SELECT * FROM public.novu_rust_slack_resolutions", &[])
             .await
             .is_err()
     );
@@ -1823,6 +1833,166 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     let mut waiting = false;
     for _ in 0..100 {
         if db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%novu_rust_operator_jwt_workflow_audit_read%')",&[]).await.unwrap().get::<_,bool>(0){waiting=true;break;}
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(waiting && !pending.is_finished());
+    tx.commit().await.unwrap();
+    assert_eq!(pending.await.unwrap(), StatusCode::UNAUTHORIZED);
+    let slack_job = Uuid::new_v4();
+    novu_postgres_queue::enqueue(
+        &db,
+        slack_job,
+        "jwt-alert-a",
+        novu_postgres_queue::slack_workflow::DELIVERY_KIND,
+        &json!({"channel":"private-channel","token":"private-token"}),
+    )
+    .await
+    .unwrap();
+    db.execute("UPDATE public.novu_queue_jobs SET status='failed',last_error='Slack endpoint revision missing' WHERE id=$1",&[&slack_job]).await.unwrap();
+    let slack_request = |jwt: &str, path: &str| {
+        Request::builder()
+            .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let slack_path = format!(
+        "/v1/experimental/operator/slack-result?environmentId=jwt-alert-a&jobId={slack_job}"
+    );
+    let slack_list = "/v1/experimental/operator/slack-jobs?environmentId=jwt-alert-a";
+    assert_eq!(
+        app.clone()
+            .oneshot(slack_request(&token, &slack_path))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_slack_result_grants VALUES('https://issuer.test','person','console','jwt-alert-a')").await.unwrap();
+    let response = app
+        .clone()
+        .oneshot(slack_request(&token, &slack_path))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let slack: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(slack["kind"], "workflow-delivery");
+    assert_eq!(slack["failureCategory"], "endpoint-review");
+    assert!(slack["attemptState"].is_null());
+    assert!(
+        !slack.to_string().contains("private-token")
+            && !slack.to_string().contains("private-channel")
+    );
+    db.execute(
+        "UPDATE public.novu_queue_jobs SET last_error='private-diagnostic' WHERE id=$1",
+        &[&slack_job],
+    )
+    .await
+    .unwrap();
+    let response = app
+        .clone()
+        .oneshot(slack_request(&token, &slack_path))
+        .await
+        .unwrap();
+    let slack: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(slack["failureCategory"], "other");
+    assert!(!slack.to_string().contains("private-diagnostic"));
+    assert_eq!(
+        app.clone()
+            .oneshot(slack_request(&token, slack_list))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_slack_jobs_grants VALUES('https://issuer.test','person','console','jwt-alert-a'); INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) SELECT gen_random_uuid(),'jwt-alert-a','experimental_slack_chat','{}' FROM generate_series(1,21); INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) VALUES(gen_random_uuid(),'jwt-alert-b','experimental_slack_webhook','{}')").await.unwrap();
+    let response = app
+        .clone()
+        .oneshot(slack_request(&token, slack_list))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(page["data"].as_array().unwrap().len(), 20);
+    let next = page["next"].as_str().unwrap();
+    let response = app
+        .clone()
+        .oneshot(slack_request(&token, &format!("{slack_list}&after={next}")))
+        .await
+        .unwrap();
+    let page: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(page["data"].as_array().unwrap().len(), 2);
+    db.execute("INSERT INTO public.novu_rust_slack_resolutions(id,environment_id,job_id,previous_state,decision,operator_name,reason) VALUES(gen_random_uuid(),'jwt-alert-a',$1,'unknown','accepted','operator','private-reason')",&[&slack_job]).await.unwrap();
+    let response = app
+        .clone()
+        .oneshot(slack_request(&token, &slack_path))
+        .await
+        .unwrap();
+    let slack: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(slack["hasResolutionHistory"], true);
+    assert!(!slack.to_string().contains("private-reason"));
+    for (kind, expected) in [
+        ("experimental_slack_chat", "app"),
+        ("experimental_slack_webhook", "webhook"),
+        ("experimental_slack_workflow_fanout", "workflow-fanout"),
+    ] {
+        let id = Uuid::new_v4();
+        novu_postgres_queue::enqueue(&db, id, "jwt-alert-a", kind, &json!({}))
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(slack_request(
+                &token,
+                &format!(
+                    "/v1/experimental/operator/slack-result?environmentId=jwt-alert-a&jobId={id}"
+                ),
+            ))
+            .await
+            .unwrap();
+        let data: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(data["kind"], expected);
+    }
+    db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES('https://issuer.test','person','console','jwt-alert-b'); INSERT INTO public.novu_rust_operator_jwt_slack_result_grants VALUES('https://issuer.test','person','console','jwt-alert-b')").await.unwrap();
+    assert_eq!(app.clone().oneshot(slack_request(&token,&format!("/v1/experimental/operator/slack-result?environmentId=jwt-alert-b&jobId={slack_job}"))).await.unwrap().status(),StatusCode::BAD_REQUEST);
+    db.execute("DELETE FROM public.novu_rust_operator_jwt_identities WHERE subject='person' AND environment_id='jwt-alert-b'",&[]).await.unwrap();
+    db.execute("DELETE FROM public.novu_rust_operator_jwt_slack_result_grants WHERE subject='person' AND environment_id='jwt-alert-a'",&[]).await.unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(slack_request(&token, &slack_path))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(slack_request(&token, slack_list))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_slack_result_grants VALUES('https://issuer.test','person','console','jwt-alert-a')").await.unwrap();
+    let mut slack_revoker = connect(&url).await;
+    let tx = slack_revoker.transaction().await.unwrap();
+    tx.execute("DELETE FROM public.novu_rust_operator_jwt_slack_result_grants WHERE subject='person' AND environment_id='jwt-alert-a'",&[]).await.unwrap();
+    let req = slack_request(&token, &slack_path);
+    let pending = tokio::spawn({
+        let app = app.clone();
+        async move { app.oneshot(req).await.unwrap().status() }
+    });
+    let mut waiting = false;
+    for _ in 0..100 {
+        if db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%novu_rust_operator_jwt_slack_result%')",&[]).await.unwrap().get::<_,bool>(0){waiting=true;break;}
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert!(waiting && !pending.is_finished());

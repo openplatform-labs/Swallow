@@ -29,6 +29,8 @@ enum Lookup {
     TwilioJobs,
     FcmResult,
     FcmJobs,
+    SlackResult,
+    SlackJobs,
     WorkflowRead,
     WorkflowAudit,
     WorkflowRequest,
@@ -317,6 +319,22 @@ pub(super) async fn fcm_jobs(
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
 ) -> Response {
     query(db, headers, uri, verifier, Lookup::FcmJobs).await
+}
+pub(super) async fn slack_result(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::SlackResult).await
+}
+pub(super) async fn slack_jobs(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::SlackJobs).await
 }
 pub(super) async fn workflow_read(
     State(db): State<Arc<Client>>,
@@ -1042,10 +1060,12 @@ async fn query(
         Lookup::PermissionIdentity => &["environmentId", "issuer", "subject", "clientId"],
         Lookup::PermissionAudit => &["environmentId", "before"],
         Lookup::PermissionChangeRequest => &["environmentId", "requestId"],
-        Lookup::ResendResult | Lookup::TwilioResult | Lookup::FcmResult => {
+        Lookup::ResendResult | Lookup::TwilioResult | Lookup::FcmResult | Lookup::SlackResult => {
             &["environmentId", "jobId"]
         }
-        Lookup::ResendJobs | Lookup::TwilioJobs | Lookup::FcmJobs => &["environmentId", "after"],
+        Lookup::ResendJobs | Lookup::TwilioJobs | Lookup::FcmJobs | Lookup::SlackJobs => {
+            &["environmentId", "after"]
+        }
         Lookup::WorkflowRead => &["environmentId", "workflow", "resource"],
         Lookup::WorkflowAudit => &["environmentId", "workflow", "resource", "after"],
         Lookup::WorkflowRequest => &["environmentId", "resource", "requestId"],
@@ -1363,7 +1383,7 @@ async fn query(
             )
             .await
         }
-        Lookup::ResendJobs | Lookup::TwilioJobs | Lookup::FcmJobs => {
+        Lookup::ResendJobs | Lookup::TwilioJobs | Lookup::FcmJobs | Lookup::SlackJobs => {
             let after = match params.get("after") {
                 None => None,
                 Some(value) => match Uuid::parse_str(value) {
@@ -1376,7 +1396,9 @@ async fn query(
             guarded_query(
                 &db,
                 &identity,
-                if matches!(lookup, Lookup::FcmJobs) {
+                if matches!(lookup, Lookup::SlackJobs) {
+                    "SELECT public.novu_rust_operator_jwt_slack_jobs($1,$2,$3,$4,$5,$6)"
+                } else if matches!(lookup, Lookup::FcmJobs) {
                     "SELECT public.novu_rust_operator_jwt_fcm_jobs($1,$2,$3,$4,$5,$6)"
                 } else if matches!(lookup, Lookup::TwilioJobs) {
                     "SELECT public.novu_rust_operator_jwt_twilio_jobs($1,$2,$3,$4,$5,$6)"
@@ -1394,14 +1416,16 @@ async fn query(
             )
             .await
         }
-        Lookup::ResendResult | Lookup::TwilioResult | Lookup::FcmResult => {
+        Lookup::ResendResult | Lookup::TwilioResult | Lookup::FcmResult | Lookup::SlackResult => {
             let Some(job) = params.get("jobId").and_then(|id| Uuid::parse_str(id).ok()) else {
                 return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
             };
             guarded_query(
                 &db,
                 &identity,
-                if matches!(lookup, Lookup::FcmResult) {
+                if matches!(lookup, Lookup::SlackResult) {
+                    "SELECT public.novu_rust_operator_jwt_slack_result($1,$2,$3,$4,$5,$6)"
+                } else if matches!(lookup, Lookup::FcmResult) {
                     "SELECT public.novu_rust_operator_jwt_fcm_result($1,$2,$3,$4,$5,$6)"
                 } else if matches!(lookup, Lookup::TwilioResult) {
                     "SELECT public.novu_rust_operator_jwt_twilio_result($1,$2,$3,$4,$5,$6)"
