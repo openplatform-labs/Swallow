@@ -480,6 +480,19 @@ impl Alert {
         if self.discord_cooldown_health.is_some_and(|v| v.is_err()) { mask |= i64::MIN; }
         mask
     }
+    /// V3 retains the V2 low word and adds an independent high word.
+    pub fn condition_mask_v3(&self) -> (i64,i64) {
+        let mut high=0_i64;
+        if self.smtp_credentials.is_some_and(|v| matches!(v,Ok((healthy,unhealthy,_,minimum)) if healthy<minimum||unhealthy>0)) { high|=1; }
+        if self.smtp_credentials.is_some_and(|v|v.is_err()) {high|=2;}
+        (self.condition_mask_v2(),high)
+    }
+    pub fn observed_condition_mask_v3(&self) -> (i64,i64) {
+        let mut high=0_i64;
+        if self.smtp_credentials.is_some_and(|v|v.is_ok()) {high|=1;}
+        if self.smtp_credentials.is_some() {high|=2;}
+        (self.observed_condition_mask_v2(),high)
+    }
     pub fn observed_condition_mask_v2(&self) -> i64 {
         let mut known = i64::from(self.observed_condition_mask() as u32) & !((1_i64 << 18) | (1_i64 << 19));
         if self.failed_jobs.is_some() && !self.failed_jobs_check_failed { known |= 1_i64 << 18; }
@@ -1328,6 +1341,34 @@ pub async fn dispatch_pair_v2(db: &mut PgClient, other: Option<&mut PgClient>, c
     if let Some(other)=other { tokio::join!(slack(db,&cfg),email(other,&cfg)) } else { (slack(db,&cfg).await,email(db,&cfg).await) }
 }
 
+/// Versioned scoped dispatch with a second condition word.
+pub async fn dispatch_pair_v3(db: &mut PgClient, other: Option<&mut PgClient>, cfg: DispatchPair<'_>) -> (DispatchOutcome, DispatchOutcome) {
+    async fn dispatch_v3<F, Fut>(db: &mut PgClient, cfg: &DispatchPair<'_>, channel: &str, target: &str, send: F) -> DbResult<Dispatch>
+    where F: FnOnce(Uuid) -> Fut, Fut: std::future::Future<Output=Result<(), AlertError>> {
+        let (low,high) = cfg.alert.condition_mask_v3();
+        let row = db.query_one("SELECT result,attempt_id FROM public.novu_rust_reserve_alert_v3($1,$2,$3,$4,$5,$6)", &[&cfg.alert.environment,&channel,&target,&cfg.cooldown,&low,&high]).await?;
+        let result: String = row.get(0); let id: Option<Uuid> = row.get(1);
+        match (result.as_str(), id) {
+            ("cooldown",None) => Ok(Dispatch::CoolingDown), ("inflight",None) => Ok(Dispatch::InFlight),
+            ("blocked",None) => Ok(Dispatch::NeedsReview), ("claimed",Some(id)) => {
+                let result = send(id).await;
+                let recorded = finish_scoped(db,&cfg.alert.environment,channel,target,id,&result).await?;
+                if result.is_ok() && recorded { Ok(Dispatch::Accepted) } else { Ok(Dispatch::NeedsReview) }
+            }, _ => Err("invalid v3 reservation result".into())
+        }
+    }
+    async fn slack(db: &mut PgClient,cfg: &DispatchPair<'_>) -> DispatchOutcome {
+        let (provider,target)=cfg.slack?;
+        Some(tokio::time::timeout(cfg.timeout,dispatch_v3(db,cfg,"slack",target,|_|provider.send(cfg.alert))).await.unwrap_or_else(|_|Err("Slack dispatch timed out".into())))
+    }
+    async fn email(db: &mut PgClient,cfg: &DispatchPair<'_>) -> DispatchOutcome {
+        let (provider,target,recipient)=cfg.email?;
+        if recipient.is_empty() || recipient.len() > 320 || recipient.contains(['\r', '\n', '<', '>']) || !recipient.contains('@') { return Some(Err("invalid alert recipient".into())); }
+        Some(tokio::time::timeout(cfg.timeout,dispatch_v3(db,cfg,"email",target,|id|async move { send_selected_email(provider,recipient,cfg.alert,&format!("swallow-alert/{id}")).await })).await.unwrap_or_else(|_|Err("email dispatch timed out".into())))
+    }
+    if let Some(other)=other { tokio::join!(slack(db,&cfg),email(other,&cfg)) } else { (slack(db,&cfg).await,email(db,&cfg).await) }
+}
+
 pub fn parallel_delivery_from_env() -> DbResult<bool> {
     match std::env::var("SWALLOW_ALERT_DELIVERY_POLICY").as_deref() {
         Ok("parallel") => Ok(true),
@@ -1734,13 +1775,32 @@ mod tests {
     #[tokio::test]
     async fn smtp_credential_health_reaches_slack_and_email() {
         let mut a=alert();a.resend_enabled=false;a.smtp_credentials=Some(Ok((0,1,2,1)));
+        assert_eq!(a.condition_mask_v3(),(0,1));assert_eq!(a.observed_condition_mask_v3().1,3);
         let (url,server)=mock_server("200 OK","ok").await;let slack=SlackWebhook::with_endpoint(url).unwrap();
         let (email_url,email_server)=mock_server("200 OK",r#"{"id":"mock-email"}"#).await;
         let email=AlertEmailProvider::Resend(crate::resend::Resend::test_endpoint(crate::resend::Config{api_key:"re_test".into(),from:"sender@example.test".into(),sender_name:String::new()},email_url.as_str()).unwrap());
         let sent=send_uncoordinated_selected(&a,Some(&slack),Some((&email,"ops@example.test")),Duration::from_secs(2),false).await;
         assert_eq!(sent.0,Some(Ok(())));assert_eq!(sent.1,Some(Ok(())));
         for payload in [server.await.unwrap(),email_server.await.unwrap()] {assert!(payload.contains("SMTP credential workers: healthy 0; unhealthy 1; stale 2; minimum healthy 1"));}
-        a.smtp_credentials=Some(Err(()));assert!(a.text().unwrap().contains("SMTP credential worker check failed"));
+        a.smtp_credentials=Some(Err(()));assert!(a.text().unwrap().contains("SMTP credential worker check failed"));assert_eq!(a.condition_mask_v3(),(0,2));assert_eq!(a.observed_condition_mask_v3().1,2);
+    }
+    #[tokio::test]
+    #[ignore = "requires fully migrated disposable PostgreSQL"]
+    async fn v3_smtp_credentials_send_and_recur_after_observed_recovery() {
+        let url=std::env::var("TEST_DATABASE_URL").unwrap();let (mut db,driver)=tokio_postgres::connect(&url,tokio_postgres::NoTls).await.unwrap();tokio::spawn(driver);
+        let env=format!("v3-smtp-{}",Uuid::new_v4());db.execute("INSERT INTO public.novu_rust_environments VALUES($1,'org')",&[&env]).await.unwrap();db.execute("INSERT INTO public.novu_rust_delivery_operator_grants SELECT $1,rolname,'alert_send',oid FROM pg_roles WHERE rolname=current_user",&[&env]).await.unwrap();
+        let mut a=alert();a.environment=env.clone();a.resend_enabled=false;a.smtp_credentials=Some(Ok((0,1,0,1)));
+        let (url,server)=mock_server("200 OK","ok").await;let slack=SlackWebhook::with_endpoint(url).unwrap();
+        let (email_url,email_server)=mock_server("200 OK",r#"{"id":"mock-email"}"#).await;
+        let email=AlertEmailProvider::Resend(crate::resend::Resend::test_endpoint(crate::resend::Config{api_key:"re_test".into(),from:"sender@example.test".into(),sender_name:String::new()},email_url.as_str()).unwrap());
+        let cfg=DispatchPair{alert:&a,slack:Some((&slack,"ops")),email:Some((&email,"mail","ops@example.test")),cooldown:3600,on_new:true,scoped:true,timeout:Duration::from_secs(3)};
+        let sent=dispatch_pair_v3(&mut db,None,cfg).await;assert_eq!(sent.0.unwrap().unwrap(),Dispatch::Accepted);assert_eq!(sent.1.unwrap().unwrap(),Dispatch::Accepted);
+        for payload in [server.await.unwrap(),email_server.await.unwrap()] {assert!(payload.contains("SMTP credential workers: healthy 0; unhealthy 1"));}
+        let cfg=DispatchPair{alert:&a,slack:Some((&slack,"ops")),email:None,cooldown:3600,on_new:true,scoped:true,timeout:Duration::from_secs(3)};assert_eq!(dispatch_pair_v3(&mut db,None,cfg).await.0.unwrap().unwrap(),Dispatch::CoolingDown);
+        a.smtp_credentials=Some(Ok((1,0,0,1)));let (low,high)=a.condition_mask_v3();let (known_low,known_high)=a.observed_condition_mask_v3();
+        db.query_one("SELECT public.novu_rust_observe_alert_conditions_v3($1,'slack','ops',$2,$3,$4,$5)",&[&env,&low,&known_low,&high,&known_high]).await.unwrap();
+        a.smtp_credentials=Some(Ok((0,1,0,1)));let (url,server)=mock_server("200 OK","ok").await;let slack=SlackWebhook::with_endpoint(url).unwrap();
+        let cfg=DispatchPair{alert:&a,slack:Some((&slack,"ops")),email:None,cooldown:3600,on_new:true,scoped:true,timeout:Duration::from_secs(3)};assert_eq!(dispatch_pair_v3(&mut db,None,cfg).await.0.unwrap().unwrap(),Dispatch::Accepted);server.await.unwrap();
     }
     #[tokio::test]
     async fn smtp_health_uses_independent_bits_and_both_destinations() {

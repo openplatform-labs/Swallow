@@ -41,6 +41,9 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     };
     // These checks share condition bits in the legacy mask.
     let conditions_v2 = env_bool("SWALLOW_ALERT_CONDITIONS_V2", false)?;
+    let conditions_v3 = env_bool("SWALLOW_ALERT_CONDITIONS_V3", false)?;
+    if conditions_v2 && conditions_v3 {return Err("choose one alert condition version".into());}
+    let extended_conditions=conditions_v2||conditions_v3;
     let require_distinct = env_bool("SWALLOW_ALERT_REQUIRE_DISTINCT_SHARED_CHECKS", false)?;
     let bind_shared = env_bool("SWALLOW_ALERT_BIND_SHARED_CHECKS", false)?;
     if bind_shared && (!require_distinct || !on_new_condition) {
@@ -153,12 +156,12 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     let scoped_delivery = env_bool("SWALLOW_ALERT_SCOPED_DELIVERY", false)?;
     let scoped_checks = env_bool("SWALLOW_ALERT_CHECK_SCOPED_ACCESS", false)?;
-    if conditions_v2 && (!on_new_condition || !scoped_delivery || require_distinct || bind_shared) { return Err("v2 alert conditions require scoped delivery and new-condition, without legacy shared-check guards".into()); }
+    if extended_conditions && (!on_new_condition || !scoped_delivery || require_distinct || bind_shared) { return Err("v2 alert conditions require scoped delivery and new-condition, without legacy shared-check guards".into()); }
     let resend_enabled = env_bool("SWALLOW_ALERT_RESEND_ENABLED", true)?;
     let attempts_enabled = env_bool("SWALLOW_ALERT_ATTEMPTS_ENABLED", false)?;
     let slack_jobs_enabled = env_bool("SWALLOW_ALERT_SLACK_JOBS_ENABLED", false)?;
     let smtp_enabled = env_bool("SWALLOW_ALERT_SMTP_ENABLED", false)?;
-    if smtp_enabled && on_new_condition && !conditions_v2 { return Err("SMTP health with new-condition policy requires v2 conditions".into()); }
+    if smtp_enabled && on_new_condition && !extended_conditions { return Err("SMTP health with new-condition policy requires v2 conditions".into()); }
     let discord_enabled = env_bool("SWALLOW_ALERT_DISCORD_ENABLED", false)?;
     let discord_cooldown_overdue_only = match std::env::var("SWALLOW_ALERT_DISCORD_COOLDOWN_MODE").as_deref() {
         Ok("all") | Err(std::env::VarError::NotPresent) => false,
@@ -167,11 +170,11 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     };
     let discord_cooldown_grace = env_optional_i32("SWALLOW_ALERT_DISCORD_COOLDOWN_GRACE_SECONDS")?;
     if discord_cooldown_grace.is_some_and(|v| !(1..=86400).contains(&v)) { return Err("invalid Discord cooldown grace".into()); }
-    if discord_cooldown_grace.is_some() && on_new_condition && !conditions_v2 { return Err("Discord cooldown health with new-condition policy requires v2 conditions".into()); }
+    if discord_cooldown_grace.is_some() && on_new_condition && !extended_conditions { return Err("Discord cooldown health with new-condition policy requires v2 conditions".into()); }
     let discord_retry_grace = env_optional_i32("SWALLOW_ALERT_DISCORD_RETRY_GRACE_SECONDS")?;
     if discord_retry_grace.is_some_and(|v| !(1..=86400).contains(&v)) { return Err("invalid Discord retry grace".into()); }
-    if discord_retry_grace.is_some() && on_new_condition && !conditions_v2 { return Err("Discord retry health with new-condition policy requires v2 conditions".into()); }
-    if discord_enabled && on_new_condition && !conditions_v2 { return Err("Discord health with new-condition policy requires v2 conditions".into()); }
+    if discord_retry_grace.is_some() && on_new_condition && !extended_conditions { return Err("Discord retry health with new-condition policy requires v2 conditions".into()); }
+    if discord_enabled && on_new_condition && !extended_conditions { return Err("Discord health with new-condition policy requires v2 conditions".into()); }
     let failed_jobs_enabled = env_bool("SWALLOW_ALERT_FAILED_JOBS_ENABLED", false)?;
     let slack_missing_enabled = env_bool("SWALLOW_ALERT_SLACK_MISSING_ENDPOINTS_ENABLED", false)?;
     let email_policy_enabled = env_bool("SWALLOW_ALERT_EMAIL_POLICY_CANCELLED_ENABLED", false)?;
@@ -187,7 +190,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         (Some(age),Some(minimum)) if (1..=86400).contains(&age) && (1..=1000).contains(&minimum)=>Some((age,minimum)),
         _=>return Err("invalid SMTP credential alert thresholds".into()),
     };
-    if smtp_credentials_thresholds.is_some() && on_new_condition {return Err("SMTP credential health requires destination cooldown policy".into());}
+    if smtp_credentials_thresholds.is_some() && on_new_condition && !conditions_v3 {return Err("SMTP credential health new-condition requires v3 conditions".into());}
     let fcm_credentials_thresholds = match (
         env_optional_i32("SWALLOW_ALERT_FCM_CREDENTIAL_MAX_AGE_SECONDS")?,
         env_optional_i32("SWALLOW_ALERT_FCM_CREDENTIAL_MIN_HEALTHY")?,
@@ -202,21 +205,21 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     };
     let fcm_claim_gap=env_optional_i32("SWALLOW_ALERT_FCM_UNRECORDED_CLAIM_MIN_GAP")?;
     let fcm_claim_grace=env_optional_i32("SWALLOW_ALERT_FCM_UNRECORDED_CLAIM_GRACE_SECONDS")?;
-    if fcm_claim_gap.is_some()!=fcm_claim_grace.is_some() || fcm_claim_gap.is_some_and(|v|!(2..=100000).contains(&v)) || fcm_claim_grace.is_some_and(|v|!(1..=86400).contains(&v)) || (fcm_claim_gap.is_some() && on_new_condition && !conditions_v2) {return Err("FCM unrecorded claims requires valid thresholds and v2 conditions for new-condition policy".into());}
+    if fcm_claim_gap.is_some()!=fcm_claim_grace.is_some() || fcm_claim_gap.is_some_and(|v|!(2..=100000).contains(&v)) || fcm_claim_grace.is_some_and(|v|!(1..=86400).contains(&v)) || (fcm_claim_gap.is_some() && on_new_condition && !extended_conditions) {return Err("FCM unrecorded claims requires valid thresholds and v2 conditions for new-condition policy".into());}
     let fcm_cooldown_grace=env_optional_i32("SWALLOW_ALERT_FCM_COOLDOWN_GRACE_SECONDS")?;
     let fcm_cooldown_source_enabled=env_bool("SWALLOW_ALERT_FCM_COOLDOWN_SOURCE_ENABLED",false)?;
     if fcm_cooldown_source_enabled && fcm_cooldown_grace.is_none() { return Err("FCM cooldown source requires the cooldown check".into()); }
     let fcm_cooldown_distinct_source=env_bool("SWALLOW_ALERT_FCM_COOLDOWN_DISTINCT_SOURCE",false)?;
-    if fcm_cooldown_distinct_source && (!fcm_cooldown_source_enabled || !conditions_v2) { return Err("distinct FCM cooldown sources require source monitoring and v2 new-condition alerts".into()); }
-    if fcm_cooldown_grace.is_some_and(|v|!(1..=86400).contains(&v)) || (fcm_cooldown_grace.is_some() && on_new_condition && !conditions_v2) {return Err("FCM cooldown check requires a valid threshold and v2 conditions for new-condition policy".into());}
+    if fcm_cooldown_distinct_source && (!fcm_cooldown_source_enabled || !extended_conditions) { return Err("distinct FCM cooldown sources require source monitoring and v2 new-condition alerts".into()); }
+    if fcm_cooldown_grace.is_some_and(|v|!(1..=86400).contains(&v)) || (fcm_cooldown_grace.is_some() && on_new_condition && !extended_conditions) {return Err("FCM cooldown check requires a valid threshold and v2 conditions for new-condition policy".into());}
     let fcm_unreviewed_enabled=env_bool("SWALLOW_ALERT_FCM_UNREVIEWED_ENABLED",false)?;
-    if fcm_unreviewed_enabled && on_new_condition && !conditions_v2 {return Err("FCM unreviewed check requires v2 conditions for new-condition policy".into());}
+    if fcm_unreviewed_enabled && on_new_condition && !extended_conditions {return Err("FCM unreviewed check requires v2 conditions for new-condition policy".into());}
     let fcm_partial_window = env_optional_i32("SWALLOW_ALERT_FCM_PARTIAL_WINDOW_SECONDS")?;
-    if fcm_partial_window.is_some_and(|v| !(1..=604_800).contains(&v)) || (fcm_partial_window.is_some() && on_new_condition && !conditions_v2) { return Err("FCM partial check requires a valid window and v2 conditions for new-condition policy".into()); }
+    if fcm_partial_window.is_some_and(|v| !(1..=604_800).contains(&v)) || (fcm_partial_window.is_some() && on_new_condition && !extended_conditions) { return Err("FCM partial check requires a valid window and v2 conditions for new-condition policy".into()); }
     let twilio_delayed_grace=env_optional_i32("SWALLOW_ALERT_TWILIO_DELAYED_GRACE_SECONDS")?;
-    if twilio_delayed_grace.is_some_and(|v| !(1..=86_400).contains(&v)) || (twilio_delayed_grace.is_some() && on_new_condition && !conditions_v2) { return Err("Twilio delayed retry check requires a valid threshold and v2 conditions for new-condition policy".into()); }
+    if twilio_delayed_grace.is_some_and(|v| !(1..=86_400).contains(&v)) || (twilio_delayed_grace.is_some() && on_new_condition && !extended_conditions) { return Err("Twilio delayed retry check requires a valid threshold and v2 conditions for new-condition policy".into()); }
     let resend_cooldown_grace = env_optional_i32("SWALLOW_ALERT_RESEND_COOLDOWN_GRACE_SECONDS")?;
-    if resend_cooldown_grace.is_some_and(|v| !(1..=86_400).contains(&v)) || (resend_cooldown_grace.is_some() && on_new_condition && !conditions_v2) { return Err("Resend cooldown check requires valid grace and v2 conditions for new-condition policy".into()); }
+    if resend_cooldown_grace.is_some_and(|v| !(1..=86_400).contains(&v)) || (resend_cooldown_grace.is_some() && on_new_condition && !extended_conditions) { return Err("Resend cooldown check requires valid grace and v2 conditions for new-condition policy".into()); }
     let slack_cooldown_grace = env_optional_i32("SWALLOW_ALERT_SLACK_COOLDOWN_GRACE_SECONDS")?;
     if slack_cooldown_grace.is_some_and(|v| !(1..=86_400).contains(&v)) { return Err("invalid Slack cooldown grace".into()); }
     let resend_auto_grace = env_optional_i32("SWALLOW_ALERT_RESEND_AUTO_GRACE_SECONDS")?;
@@ -747,7 +750,10 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                     tokio::time::timeout(
                         operation_timeout,
                         async {
-                            if conditions_v2 {
+                            if conditions_v3 {
+                                let (active_low,active_high)=alert.condition_mask_v3();let (known_low,known_high)=alert.observed_condition_mask_v3();
+                                db.query_one("SELECT public.novu_rust_observe_alert_conditions_v3($1,$2,$3,$4,$5,$6,$7)",&[&args[0],&channel,&target,&active_low,&known_low,&active_high,&known_high]).await?;Ok(())
+                            } else if conditions_v2 {
                                 db.query_one("SELECT public.novu_rust_observe_alert_conditions_v2($1,$2,$3,$4,$5)", &[&args[0], &channel, &target, &alert.condition_mask_v2(), &alert.observed_condition_mask_v2()]).await?;
                                 Ok(())
                             } else {
@@ -828,7 +834,9 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
             scoped: scoped_delivery,
             timeout: operation_timeout,
         };
-    let (slack_result, email_result) = if conditions_v2 {
+    let (slack_result, email_result) = if conditions_v3 {
+        alerts::dispatch_pair_v3(&mut db, other.as_mut(), dispatch_config).await
+    } else if conditions_v2 {
         alerts::dispatch_pair_v2(&mut db, other.as_mut(), dispatch_config).await
     } else {
         alerts::dispatch_pair(&mut db, other.as_mut(), dispatch_config).await
