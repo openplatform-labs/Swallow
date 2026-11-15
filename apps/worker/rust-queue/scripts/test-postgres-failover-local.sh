@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$(cd ../../.. && pwd)
 scenario=${SWALLOW_LOCAL_FAILOVER_SCENARIO:-alert-binding}
-case "$scenario" in alert-binding|alert-scheduler|alert-v2|alert-v3|alert-timing|sendgrid-inflight|smtp|smtp-rls|smtp-resolution|discord-manual-retry|discord-cooldown|discord-inflight|in-app|resend|resend-cooldown|resend-invalid|twilio|fcm|fcm-delay|fcm-exp|fcm-exp-repeat|fcm-review) ;; *) echo 'invalid local failover scenario' >&2; exit 2;; esac
+case "$scenario" in alert-binding|alert-scheduler|alert-v2|alert-v3|alert-timing|sendgrid-inflight|sendgrid-sandbox-inflight|smtp|smtp-rls|smtp-resolution|discord-manual-retry|discord-cooldown|discord-inflight|in-app|resend|resend-cooldown|resend-invalid|twilio|fcm|fcm-delay|fcm-exp|fcm-exp-repeat|fcm-review) ;; *) echo 'invalid local failover scenario' >&2; exit 2;; esac
 pgbin=${SWALLOW_TEST_POSTGRES_BIN:-/opt/homebrew/opt/postgresql@17/bin}
 [[ -x "$pgbin/pg_ctl" && -x "$pgbin/pg_basebackup" ]] || { echo 'PostgreSQL 17 server binaries are required' >&2; exit 1; }
 testdir=$(mktemp -d /private/tmp/swallow-alert-ha.XXXXXX)
@@ -48,7 +48,8 @@ export TEST_FAILOVER_URL="postgres://postgres@127.0.0.1:$standby_port,127.0.0.1:
 export TEST_LOCAL_PRIMARY_DATA="$testdir/primary" TEST_LOCAL_STANDBY_DATA="$testdir/standby" TEST_LOCAL_PG_CTL="$pgbin/pg_ctl"
 if [[ "$scenario" == alert-timing ]]; then
   "$root/apps/worker/rust-queue/scripts/test-alert-timing-failover.sh" "$root" "$testdir" "$pgbin"
-elif [[ "$scenario" == sendgrid-inflight ]]; then
+elif [[ "$scenario" == sendgrid-inflight || "$scenario" == sendgrid-sandbox-inflight ]]; then
+  export TEST_SENDGRID_SANDBOX=$([[ "$scenario" == sendgrid-sandbox-inflight ]] && printf true || printf false)
   cargo test --locked --features test-mocks --test sendgrid_inflight_failover -- --ignored --nocapture
 elif [[ "$scenario" == discord-inflight ]]; then
   cargo test --locked --features test-mocks --test discord_inflight_failover -- --ignored --nocapture
