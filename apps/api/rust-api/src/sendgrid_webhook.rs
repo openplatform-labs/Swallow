@@ -86,7 +86,14 @@ pub async fn receive(
     {
         return fail();
     }
-    let keys=match db.query("SELECT k.public_key_base64 FROM novu_rust_sendgrid_webhook_keys k JOIN novu_rust_environments e ON e.id=k.environment_id WHERE k.environment_id=$1 AND e.organization_id=$2 AND k.active LIMIT 10", &[&environment,&organization]).await { Ok(keys)=>keys,Err(_)=>return (StatusCode::INTERNAL_SERVER_ERROR,Json(json!({"message":"webhook unavailable"}))) };
+    let keys=match db.query("SELECT k.public_key_base64 FROM novu_rust_sendgrid_webhook_keys k JOIN novu_rust_environments e ON e.id=k.environment_id WHERE k.environment_id=$1 AND e.organization_id=$2 AND k.active LIMIT 11", &[&environment,&organization]).await { Ok(keys)=>keys,Err(_)=>return (StatusCode::INTERNAL_SERVER_ERROR,Json(json!({"message":"webhook unavailable"}))) };
+    if keys.len() > 10 {
+        eprintln!("SendGrid webhook verification key limit exceeded");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"message":"webhook unavailable"})),
+        );
+    }
     if !keys
         .iter()
         .any(|row| verify(&row.get::<_, String>(0), &signature, timestamp, &raw))

@@ -129,6 +129,98 @@ async fn signed_events_are_scoped_idempotent_and_private() {
     let (status, body) = call(router.clone(), path, &timestamp, &signature, raw.clone()).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["recorded"], 1);
+
+    // Both signing keys are accepted during a manual rotation, and revoking
+    // the old key stops accepting its signatures without affecting the new key.
+    let new_pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+    let new_key =
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, new_pkcs8.as_ref(), &rng)
+            .unwrap();
+    let mut new_spki = STANDARD.decode(&public).unwrap()[..26].to_vec();
+    new_spki.extend_from_slice(new_key.public_key().as_ref());
+    let new_public = STANDARD.encode(new_spki);
+    db.execute("INSERT INTO novu_rust_sendgrid_webhook_keys(environment_id,key_id,public_key_base64) VALUES ('env-a','rotation',$1)", &[&new_public]).await.unwrap();
+    let new_signature = STANDARD.encode(new_key.sign(&rng, &signed).unwrap().as_ref());
+    assert_eq!(
+        call(
+            router.clone(),
+            path,
+            &timestamp,
+            &new_signature,
+            raw.clone()
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(router.clone(), path, &timestamp, &signature, raw.clone())
+            .await
+            .0,
+        StatusCode::OK
+    );
+    db.execute("UPDATE novu_rust_sendgrid_webhook_keys SET active=false WHERE environment_id='env-a' AND key_id='key'", &[]).await.unwrap();
+    assert_eq!(
+        call(router.clone(), path, &timestamp, &signature, raw.clone())
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(
+            router.clone(),
+            path,
+            &timestamp,
+            &new_signature,
+            raw.clone()
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    db.execute("DELETE FROM novu_rust_sendgrid_webhook_keys WHERE environment_id='env-a' AND key_id='rotation'", &[]).await.unwrap();
+    db.execute("UPDATE novu_rust_sendgrid_webhook_keys SET active=true WHERE environment_id='env-a' AND key_id='key'", &[]).await.unwrap();
+
+    // Ten keys remain usable; at eleven, no partial key set is trusted and no
+    // new delivery evidence is stored until the configuration is corrected.
+    for i in 0..9 {
+        let id = format!("extra-{i}");
+        let value = STANDARD.encode(format!("unused-public-key-{i}"));
+        db.execute("INSERT INTO novu_rust_sendgrid_webhook_keys(environment_id,key_id,public_key_base64) VALUES ('env-a',$1,$2)", &[&id, &value]).await.unwrap();
+    }
+    assert_eq!(
+        call(router.clone(), path, &timestamp, &signature, raw.clone())
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let extra = STANDARD.encode("unused-public-key-9");
+    db.execute("INSERT INTO novu_rust_sendgrid_webhook_keys(environment_id,key_id,public_key_base64) VALUES ('env-a','extra-9',$1)", &[&extra]).await.unwrap();
+    let overflow_raw = serde_json::to_vec(&json!([{"id":"64a000000000000000000099","event":"delivered","sg_event_id":"overflow-event","timestamp":1730000000,"email":"private@example.test"}])).unwrap();
+    let mut overflow_signed = timestamp.as_bytes().to_vec();
+    overflow_signed.extend_from_slice(&overflow_raw);
+    let overflow_signature = STANDARD.encode(key.sign(&rng, &overflow_signed).unwrap().as_ref());
+    assert_eq!(
+        call(
+            router.clone(),
+            path,
+            &timestamp,
+            &overflow_signature,
+            overflow_raw
+        )
+        .await
+        .0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let count: i64 = db.query_one("SELECT count(*) FROM novu_rust_sendgrid_delivery_events WHERE environment_id='env-a' AND event_id='overflow-event'", &[]).await.unwrap().get(0);
+    assert_eq!(count, 0);
+    db.execute("DELETE FROM novu_rust_sendgrid_webhook_keys WHERE environment_id='env-a' AND key_id LIKE 'extra-%'", &[]).await.unwrap();
+    assert_eq!(
+        call(router.clone(), path, &timestamp, &signature, raw.clone())
+            .await
+            .0,
+        StatusCode::OK
+    );
     let (mut operator_db, operator_driver) =
         tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(), NoTls)
             .await
@@ -297,8 +389,13 @@ async fn signed_events_are_scoped_idempotent_and_private() {
     assert_eq!(response.0, StatusCode::OK);
     assert_eq!(response.1["recorded"], 3);
     let rows = db.query("SELECT event_id,bounce_type,dispatch_proof_verified FROM novu_rust_sendgrid_delivery_events WHERE event_id IN ('hard-bounce','soft-bounce','unknown-bounce') ORDER BY event_id", &[]).await.unwrap();
-    assert_eq!(rows.iter().map(|r| r.get::<_,Option<String>>(1)).collect::<Vec<_>>(), vec![Some("bounce".into()),Some("blocked".into()),None]);
-    assert!(rows.iter().all(|r|r.get::<_,bool>(2)));
+    assert_eq!(
+        rows.iter()
+            .map(|r| r.get::<_, Option<String>>(1))
+            .collect::<Vec<_>>(),
+        vec![Some("bounce".into()), Some("blocked".into()), None]
+    );
+    assert!(rows.iter().all(|r| r.get::<_, bool>(2)));
     let err = novu_postgres_queue::reconciliation::resolve(
         &mut operator_db,
         "env-a",

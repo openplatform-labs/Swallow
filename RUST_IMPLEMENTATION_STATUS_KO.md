@@ -1130,6 +1130,8 @@ SendGrid의 수동 재시도 결정은 기존 발송 시도를 삭제하고 작�
 
 API 마이그레이션 `0004_sendgrid_webhooks.sql`은 환경별 SendGrid 공개키와 최소 이벤트 이력을 만든다. `POST /webhooks/organizations/{organizationId}/environments/{environmentId}/email/sendgrid`는 원본 바이트와 timestamp에 대한 ECDSA P-256 서명을 필수 검증하고 환경·조직을 확인한다. 활성 공개키는 `novu_rust_sendgrid_webhook_keys`에 SendGrid가 제공한 Base64 DER 공개키로 수동 등록한다. 하나의 활성 공개키를 두 환경이 공유하지 못한다. 같은 `sg_event_id`는 환경별로 한 번만 기록하고 다른 환경의 메시지 ID는 무시한다. 이메일 주소 원문과 이벤트 본문은 저장하지 않지만 주소의 SHA-256 해시는 추측될 수 있는 개인정보이므로 DB 접근을 제한해야 한다.
 
+공개키 교체 시 환경별로 최대 10개의 키를 동시에 활성화해 기존·신규 서명을 검증할 수 있다. 활성 키가 11개 이상이면 임의의 일부만 검사하지 않고 HTTP 503을 반환하며 이벤트를 기록하지 않는다. 일반적인 설정 오류 로그를 감시하고 불필요한 키를 비활성화해야 한다. 공급자의 재전송 여부는 별도 확인이 필요하다. Docker PostgreSQL과 합성 서명으로 두 키의 동시 사용·기존 키 비활성화·10개 경계·초과 시 기록 차단을 검증한다. 실제 SendGrid 키 교체 및 웹훅 전달, 키 관리 API와 자동 회전은 아직 검증 또는 구현하지 않았다.
+
 `delivered`, `bounce`, `dropped`, `blocked`, `deferred`, `processed` 이벤트의 근거만 저장하며, `delivered`는 수신 메일 서버의 수락이지 수신함 표시나 사용자의 읽음을 보장하지 않는다. 이벤트를 자동으로 `delivery_state`·작업 상태에 반영하거나 불명 작업을 재시도하지 않는다. 검증 후 7일이 넘는 서명 timestamp는 거절하며 배치 1,000개·본문 1 MiB와 활성 키 10개로 제한한다. 서명이 없는 원본 Novu 요청과 통합 ID 경로, 원본 webhook 응답 및 전체 이벤트 계약은 호환되지 않는다. 키 관리 API·회전 자동화, 이벤트 보존·삭제, 받는 사람별 집계, 원본 webhook 서버와 실제 SendGrid의 종단 간 검증, 운영 접근 제어는 미구현 또는 미검증이다. 외부 HTTPS 종단과 방화벽·DB 권한을 별도로 구성해야 한다. [격리 테스트](apps/api/rust-api/tests/sendgrid_webhook.rs)는 임시 서명 키와 PostgreSQL로 변조·재생·환경 격리·유효하지 않은 배치를 확인한다.
 
 
