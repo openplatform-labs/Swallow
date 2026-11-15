@@ -7,9 +7,17 @@ export class FcmResults implements OnChanges,OnDestroy {
   @Input() apiOrigin='';@Input() environment='';@Input() token='';
   jobId=''; readonly rows=signal<Result[]>([]); readonly result=signal<Result|null>(null); readonly next=signal<string|null>(null);
   readonly listStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');readonly resultStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');
+  windowSeconds=3600; readonly partialCount=signal<number|null>(null); readonly partialStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle'); private partialSequence=0; private partialAbort:AbortController|null=null;
   private listSequence=0;private resultSequence=0;private listAbort:AbortController|null=null;private resultAbort:AbortController|null=null;
   ngOnChanges():void {this.clear();} ngOnDestroy():void {this.clear();this.token='';}
-  clear():void {this.listSequence++;this.resultSequence++;this.listAbort?.abort();this.resultAbort?.abort();this.listAbort=null;this.resultAbort=null;this.rows.set([]);this.result.set(null);this.next.set(null);this.listStatus.set('idle');this.resultStatus.set('idle');this.jobId='';}
+  clear():void {this.clearPartial();this.listSequence++;this.resultSequence++;this.listAbort?.abort();this.resultAbort?.abort();this.listAbort=null;this.resultAbort=null;this.rows.set([]);this.result.set(null);this.next.set(null);this.listStatus.set('idle');this.resultStatus.set('idle');this.jobId='';}
+  clearPartial():void {this.partialSequence++;this.partialAbort?.abort();this.partialAbort=null;this.partialCount.set(null);this.partialStatus.set('idle');}
+  async loadPartial():Promise<void> {this.clearPartial();const seq=this.partialSequence,controller=new AbortController();this.partialAbort=controller;this.partialStatus.set('loading');
+    try {const params=this.params(),window=this.windowSeconds;if(!Number.isInteger(window)||window<1||window>604800)throw new Error('input');params.set('windowSeconds',String(window));
+      const response=await fetch(`${this.origin()}/v1/experimental/operator/fcm-partial-health?${params}`,{headers:{Authorization:`Bearer ${this.token.trim()}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});if(!response.ok)throw new Error('request');
+      const value:unknown=await response.json();if(!value||typeof value!=='object')throw new Error('response');const count=(value as Record<string,unknown>)['partialJobs'];if(!Number.isSafeInteger(count)||(count as number)<0)throw new Error('response');if(seq!==this.partialSequence)return;this.partialCount.set(count as number);this.partialStatus.set('loaded');
+    }catch {if(seq===this.partialSequence){this.partialCount.set(null);this.partialStatus.set('error');}}finally {if(seq===this.partialSequence)this.partialAbort=null;}
+  }
   clearResult():void {this.resultSequence++;this.resultAbort?.abort();this.resultAbort=null;this.result.set(null);this.resultStatus.set('idle');}
   private validUuid(value:unknown):value is string {return typeof value==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);}
   private origin():string {const url=new URL(this.apiOrigin.trim());if(!['http:','https:'].includes(url.protocol)||url.username||url.password||url.pathname!=='/'||url.search||url.hash||(url.protocol==='http:'&&!['localhost','127.0.0.1','[::1]'].includes(url.hostname)))throw new Error('origin');return url.origin;}

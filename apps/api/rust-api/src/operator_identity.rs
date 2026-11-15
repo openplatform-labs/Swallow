@@ -27,6 +27,7 @@ enum Lookup {
     ResendAutoHealth,
     SlackCooldownHealth,
     TwilioDelayedHealth,
+    FcmPartialHealth,
     ResendResult,
     ResendJobs,
     TwilioResult,
@@ -369,6 +370,13 @@ pub(super) async fn twilio_delayed_health(
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
 ) -> Response {
     query(db, headers, uri, verifier, Lookup::TwilioDelayedHealth).await
+}
+
+pub(super) async fn fcm_partial_health(
+    State(db): State<Arc<Client>>, headers: HeaderMap, OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::FcmPartialHealth).await
 }
 
 pub(super) async fn resend_result(
@@ -1542,6 +1550,7 @@ async fn query(
         | Lookup::SlackResult
         | Lookup::SendgridResult => &["environmentId", "jobId"],
         Lookup::ResendAutoHealth | Lookup::SlackCooldownHealth | Lookup::TwilioDelayedHealth => &["environmentId", "graceSeconds"],
+        Lookup::FcmPartialHealth => &["environmentId", "windowSeconds"],
         Lookup::ResendAutoHealthJobs => &["environmentId", "graceSeconds", "filter", "after"],
         Lookup::ResendJobs => &["environmentId", "after", "status"],
         Lookup::TwilioJobs | Lookup::FcmJobs | Lookup::SlackJobs | Lookup::SendgridJobs => {
@@ -1698,6 +1707,12 @@ async fn query(
                 ],
             )
             .await
+        }
+        Lookup::FcmPartialHealth => {
+            let Some(window) = params.get("windowSeconds").and_then(|v| v.parse::<i32>().ok().filter(|n| (1..=604800).contains(n) && n.to_string() == *v)) else {
+                return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+            };
+            guarded_query(&db, &identity, "SELECT public.novu_rust_operator_jwt_fcm_partial_health($1,$2,$3,$4,$5,$6)", &[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&window]).await
         }
         Lookup::ResendAutoPolicyRead => {
             guarded_query(

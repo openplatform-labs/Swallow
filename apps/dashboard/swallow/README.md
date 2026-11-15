@@ -1,5 +1,8 @@
 ## Slack 429 지연 재시도 화면
 
+The FCM results panel can query recent partial failure health with an independently granted operator JWT and an environment `alert_view` DB permission. The window is 1–604800 seconds; the count excludes aged-out unreviewed work and is not an acknowledgement. Apply worker migration `0185` followed by API migration `0104`. A local browser test against a disposable PostgreSQL/API fixture checked the count and result clearing after JWT permission revocation; real identity providers and production deployment remain unverified.
+
+
 The FCM operator result view shows 429 target count, count with recorded numeric advice, and the latest recorded not-before timestamp when API migration `0103` is present. A partial count does not supply guidance for every target. This view does not retry or throttle sends. Older API responses remain readable.
 
 
