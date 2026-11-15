@@ -16,8 +16,8 @@ esac
 case "${SWALLOW_ALERT_EMAIL_TARGET_ID:-}" in
   mail-a) test -z "${NOVU_SENDGRID_IP_POOL_NAME:-}" || exit 8; test -z "${SWALLOW_ALERT_SLACK_WEBHOOK:-}" || exit 8; test -z "${NOVU_RESEND_API_KEY:-}" || exit 8; test "$SWALLOW_ALERT_EMAIL_PROVIDER" = resend || exit 8; printf '%s\n' 'email mail-a' >> "$FANOUT_TEST_LOG"; exit 1;;
   mail-b) test -z "${SWALLOW_ALERT_SLACK_WEBHOOK:-}" || exit 8; test -z "${NOVU_SENDGRID_API_KEY:-}" || exit 8; test "$SWALLOW_ALERT_EMAIL_PROVIDER" = sendgrid || exit 8; test "$NOVU_SENDGRID_REGION" = eu || exit 8; test "$NOVU_SENDGRID_IP_POOL_NAME" = pool-b || exit 8; printf '%s\n' 'email mail-b' >> "$FANOUT_TEST_LOG"; exit 0;;
-  mail-smtp) test "$SWALLOW_ALERT_EMAIL_PROVIDER" = smtp || exit 8; test "$SWALLOW_SMTP_HOST" = smtp.example.test || exit 8; test "$SWALLOW_SMTP_PORT" = 587 || exit 8; test "$SWALLOW_SMTP_TLS" = starttls || exit 8; test "$SWALLOW_SMTP_USERNAME" = fixture-user || exit 8; test -n "$SWALLOW_SMTP_PASSWORD_FILE" || exit 8; test -z "${SWALLOW_SMTP_PASSWORD:-}" || exit 8; test -z "${NOVU_RESEND_API_KEY:-}" || exit 8; printf '%s\n' 'email mail-smtp' >> "$FANOUT_TEST_LOG"; exit 0;;
-  mail-c) test -z "${SWALLOW_SMTP_PASSWORD:-}" || exit 8; test -z "${SWALLOW_SMTP_HOST:-}" || exit 8; test -z "${NOVU_SENDGRID_IP_POOL_NAME:-}" || exit 8; printf '%s\n' 'email mail-c' >> "$FANOUT_TEST_LOG"; exit 0;;
+  mail-smtp) test "$SWALLOW_ALERT_EMAIL_PROVIDER" = smtp || exit 8; test "$SWALLOW_SMTP_HOST" = smtp.example.test || exit 8; test "$SWALLOW_SMTP_PORT" = 587 || exit 8; test "$SWALLOW_SMTP_TLS" = starttls || exit 8; test "$SWALLOW_SMTP_USERNAME" = fixture-user || exit 8; test -n "$SWALLOW_SMTP_PASSWORD_FILE" || exit 8; test -n "$SWALLOW_SMTP_CA_FILE" || exit 8; test -z "${SWALLOW_SMTP_PASSWORD:-}" || exit 8; test -z "${NOVU_RESEND_API_KEY:-}" || exit 8; printf '%s\n' 'email mail-smtp' >> "$FANOUT_TEST_LOG"; exit 0;;
+  mail-c) test -z "${SWALLOW_SMTP_CA_FILE:-}" || exit 8; test -z "${SWALLOW_SMTP_PASSWORD:-}" || exit 8; test -z "${SWALLOW_SMTP_HOST:-}" || exit 8; test -z "${NOVU_SENDGRID_IP_POOL_NAME:-}" || exit 8; printf '%s\n' 'email mail-c' >> "$FANOUT_TEST_LOG"; exit 0;;
 esac
 exit 9
 "#;
@@ -34,7 +34,7 @@ exit 9
       {"channel":"slack","id":"ops-b","webhook_file":dir.join("slack")},
       {"channel":"email","id":"mail-b","provider":"sendgrid","to":"two@example.test","from":"sender@example.test","api_key_file":dir.join("key-b"),"region":"eu","ip_pool_name":"pool-b"},
       {"channel":"email","id":"mail-c","provider":"sendgrid","to":"three@example.test","from":"sender@example.test","api_key_file":dir.join("key-c")},
-      {"channel":"email","id":"mail-smtp","provider":"smtp","to":"four@example.test","from":"sender@example.test","smtp_host":"smtp.example.test","smtp_port":587,"smtp_tls":"starttls","smtp_username":"fixture-user","smtp_password_file":dir.join("smtp-key")}
+      {"channel":"email","id":"mail-smtp","provider":"smtp","to":"four@example.test","from":"sender@example.test","smtp_host":"smtp.example.test","smtp_port":587,"smtp_tls":"starttls","smtp_username":"fixture-user","smtp_password_file":dir.join("smtp-key"),"smtp_ca_file":dir.join("smtp-ca")}
     ]});
     std::fs::write(&config, serde_json::to_vec(&targets).unwrap()).unwrap();
     for mode in ["delivery", "database"] {
@@ -54,6 +54,7 @@ exit 9
             .env("NOVU_SENDGRID_IP_POOL_NAME", "inherited-pool")
             .env("SWALLOW_SMTP_PASSWORD", "inherited-smtp-secret")
             .env("SWALLOW_SMTP_HOST", "inherited-host")
+            .env("SWALLOW_SMTP_CA_FILE", "inherited-ca")
             .output()
             .unwrap();
         assert_eq!(out.status.code(), Some(1));

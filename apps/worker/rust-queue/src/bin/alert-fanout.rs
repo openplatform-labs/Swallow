@@ -35,6 +35,7 @@ enum Target {
         smtp_tls: Option<String>,
         smtp_username: Option<String>,
         smtp_password_file: Option<String>,
+        smtp_ca_file: Option<String>,
         sender_name: Option<String>,
         region: Option<String>,
         ip_pool_name: Option<String>,
@@ -89,13 +90,15 @@ impl Target {
                     smtp_tls,
                     smtp_username,
                     smtp_password_file,
+                    smtp_ca_file,
                     ..
                 } => {
                     let no_smtp = smtp_host.is_none()
                         && smtp_port.is_none()
                         && smtp_tls.is_none()
                         && smtp_username.is_none()
-                        && smtp_password_file.is_none();
+                        && smtp_password_file.is_none()
+                        && smtp_ca_file.is_none();
                     email(to)
                         && email(from)
                         && sender_name
@@ -139,6 +142,7 @@ impl Target {
                                     })
                                     && smtp_username.is_some() == smtp_password_file.is_some()
                                     && smtp_password_file.as_ref().is_none_or(|v| path(v))
+                                    && smtp_ca_file.as_ref().is_none_or(|v| path(v))
                             }
                         }
                 }
@@ -171,6 +175,7 @@ impl Target {
             "SWALLOW_SMTP_USERNAME",
             "SWALLOW_SMTP_PASSWORD",
             "SWALLOW_SMTP_PASSWORD_FILE",
+            "SWALLOW_SMTP_CA_FILE",
         ] {
             cmd.env_remove(key);
         }
@@ -191,6 +196,7 @@ impl Target {
                 smtp_tls,
                 smtp_username,
                 smtp_password_file,
+                smtp_ca_file,
                 sender_name,
                 region,
                 ip_pool_name,
@@ -240,6 +246,9 @@ impl Target {
                         }
                         if let Some(password) = smtp_password_file {
                             cmd.env("SWALLOW_SMTP_PASSWORD_FILE", password);
+                        }
+                        if let Some(ca) = smtp_ca_file {
+                            cmd.env("SWALLOW_SMTP_CA_FILE", ca);
                         }
                     }
                 }

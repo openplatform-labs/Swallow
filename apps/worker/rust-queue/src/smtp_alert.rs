@@ -13,6 +13,7 @@ pub struct SmtpAlert {
     tls: String,
     username: String,
     password: String,
+    ca_fingerprint: Option<String>,
 }
 impl SmtpAlert {
     pub fn from_env() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -43,7 +44,14 @@ impl SmtpAlert {
             "SWALLOW_SMTP_PASSWORD",
             "SWALLOW_SMTP_PASSWORD_FILE",
         )?;
-        Self::new(host, port, tls, from, username, password)
+        let ca_pem = match std::env::var_os("SWALLOW_SMTP_CA_FILE") {
+            Some(path) => Some(novu_rust_contracts::secret::read_regular_multiline_file(
+                std::path::Path::new(&path),
+                65_536,
+            )?),
+            None => None,
+        };
+        Self::new(host, port, tls, from, username, password, ca_pem)
     }
     fn new(
         host: String,
@@ -52,6 +60,7 @@ impl SmtpAlert {
         from: String,
         username: Option<String>,
         password: Option<String>,
+        ca_pem: Option<String>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         if host.is_empty()
             || host.len() > 253
@@ -81,6 +90,34 @@ impl SmtpAlert {
         }
         .port(port)
         .timeout(Some(Duration::from_secs(30)));
+        let ca_fingerprint = if let Some(pem) = ca_pem.as_deref() {
+            use lettre::transport::smtp::client::{Certificate, Tls, TlsParameters};
+            if !pem.contains("-----BEGIN CERTIFICATE-----")
+                || !pem.contains("-----END CERTIFICATE-----")
+            {
+                return Err("invalid SMTP CA".into());
+            }
+            let cert = Certificate::from_pem(pem.as_bytes()).map_err(|_| "invalid SMTP CA")?;
+            let params = TlsParameters::builder(host.clone())
+                .add_root_certificate(cert)
+                .build()
+                .map_err(|_| "invalid SMTP CA")?;
+            builder = builder.tls(if tls == "tls" {
+                Tls::Wrapper(params)
+            } else {
+                Tls::Required(params)
+            });
+            Some(format!(
+                "ca-sha256:{}",
+                ring::digest::digest(&ring::digest::SHA256, pem.as_bytes())
+                    .as_ref()
+                    .iter()
+                    .map(|v| format!("{v:02x}"))
+                    .collect::<String>()
+            ))
+        } else {
+            None
+        };
         if let (Some(user), Some(pass)) = (&username, &password) {
             builder = builder.credentials(Credentials::new(user.clone(), pass.clone()));
         }
@@ -92,17 +129,22 @@ impl SmtpAlert {
             tls,
             username: username.unwrap_or_default(),
             password: password.unwrap_or_default(),
+            ca_fingerprint,
         })
     }
-    pub fn binding_parts(&self) -> [&str; 6] {
-        [
-            &self.host,
-            &self.port,
-            &self.tls,
-            &self.from,
-            &self.username,
-            &self.password,
-        ]
+    pub fn binding_parts(&self) -> Vec<&str> {
+        let mut values = vec![
+            self.host.as_str(),
+            self.port.as_str(),
+            self.tls.as_str(),
+            self.from.as_str(),
+            self.username.as_str(),
+            self.password.as_str(),
+        ];
+        if let Some(ca) = &self.ca_fingerprint {
+            values.push(ca);
+        }
+        values
     }
     pub async fn send(&self, recipient: &str, text: String) -> Result<(), ()> {
         if recipient.len() > 320 || recipient.contains(['\r', '\n', '\0', '<', '>']) {
@@ -132,6 +174,7 @@ impl SmtpAlert {
             tls: "test-plaintext".into(),
             username: String::new(),
             password: String::new(),
+            ca_fingerprint: None,
         }
     }
 }
@@ -225,6 +268,7 @@ mod tests {
             "sender@example.test".into(),
             Some("user".into()),
             Some("secret".into()),
+            None,
         )
         .unwrap();
         assert!(smtp.send("ops@example.test", "alert".into()).await.is_err());
@@ -232,7 +276,6 @@ mod tests {
     }
     #[tokio::test]
     async fn authenticated_starttls_accepts_a_message_after_tls_validation() {
-        use lettre::transport::smtp::client::{Certificate, Tls, TlsParameters};
         use std::{
             io::{BufRead, BufReader},
             process::{Command, Stdio},
@@ -283,30 +326,29 @@ mod tests {
             .read_line(&mut line)
             .unwrap();
         let port: u16 = line.trim().parse().unwrap();
-        let certificate = Certificate::from_pem(&std::fs::read(&cert).unwrap()).unwrap();
-        let tls = TlsParameters::builder("localhost".into())
-            .add_root_certificate(certificate)
-            .build()
-            .unwrap();
-        let transport = AsyncSmtpTransport::<Tokio1Executor>::starttls_relay("localhost")
-            .unwrap()
-            .tls(Tls::Required(tls))
-            .port(port)
-            .credentials(Credentials::new(
-                "fixture-user".into(),
-                "fixture-password".into(),
-            ))
-            .timeout(Some(Duration::from_secs(5)))
-            .build();
-        let smtp = SmtpAlert {
-            transport,
-            from: "sender@example.test".into(),
-            host: "localhost".into(),
-            port: port.to_string(),
-            tls: "starttls".into(),
-            username: "fixture-user".into(),
-            password: "fixture-password".into(),
-        };
+        let smtp = SmtpAlert::new(
+            "localhost".into(),
+            port,
+            "starttls".into(),
+            "sender@example.test".into(),
+            Some("fixture-user".into()),
+            Some("fixture-password".into()),
+            Some(std::fs::read_to_string(&cert).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(smtp.binding_parts().len(), 7);
+        let no_ca = SmtpAlert::new(
+            "localhost".into(),
+            port,
+            "starttls".into(),
+            "sender@example.test".into(),
+            Some("fixture-user".into()),
+            Some("fixture-password".into()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(no_ca.binding_parts().len(), 6);
+        assert_eq!(&smtp.binding_parts()[..6], &no_ca.binding_parts()[..]);
         assert!(
             smtp.send("ops@example.test", "TLS fixture alert".into())
                 .await
@@ -316,10 +358,67 @@ mod tests {
         let message = std::fs::read_to_string(&output).unwrap();
         assert!(message.contains("TLS fixture alert"));
         assert!(!message.contains("fixture-password"));
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/smtp_starttls_fixture.py");
+        let mut wrong_host_server = Command::new("python3")
+            .arg(fixture)
+            .arg(&cert)
+            .arg(&key)
+            .arg(&output)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(wrong_host_server.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let port: u16 = line.trim().parse().unwrap();
+        let wrong_host = SmtpAlert::new(
+            "127.0.0.1".into(),
+            port,
+            "starttls".into(),
+            "sender@example.test".into(),
+            Some("fixture-user".into()),
+            Some("fixture-password".into()),
+            Some(std::fs::read_to_string(&cert).unwrap()),
+        )
+        .unwrap();
+        assert!(
+            wrong_host
+                .send("ops@example.test", "should not send".into())
+                .await
+                .is_err()
+        );
+        assert!(!wrong_host_server.wait().unwrap().success());
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn validates_tls_credentials_and_sender() {
+        assert!(
+            SmtpAlert::new(
+                "example.test".into(),
+                587,
+                "starttls".into(),
+                "sender@example.test".into(),
+                None,
+                None,
+                Some("-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n".into())
+            )
+            .is_err()
+        );
+        assert!(
+            SmtpAlert::new(
+                "example.test".into(),
+                587,
+                "starttls".into(),
+                "sender@example.test".into(),
+                None,
+                None,
+                Some("not a certificate".into())
+            )
+            .is_err()
+        );
         for mode in ["plain", "opportunistic", ""] {
             assert!(
                 SmtpAlert::new(
@@ -327,6 +426,7 @@ mod tests {
                     587,
                     mode.into(),
                     "sender@example.test".into(),
+                    None,
                     None,
                     None
                 )
@@ -340,6 +440,7 @@ mod tests {
                 "starttls".into(),
                 "sender@example.test".into(),
                 Some("user".into()),
+                None,
                 None
             )
             .is_err()
@@ -350,6 +451,7 @@ mod tests {
                 587,
                 "starttls".into(),
                 "sender@example.test\r\nBcc:x@example.test".into(),
+                None,
                 None,
                 None
             )
