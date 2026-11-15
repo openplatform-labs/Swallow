@@ -174,7 +174,7 @@ async fn scoped_health_and_alert_selection() {
         );
         assert!(String::from_utf8_lossy(&result.stderr).contains("requires operator review"));
     }
-    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_discord_attention(text,uuid),public.novu_rust_ack_discord(text,uuid,uuid,bigint,text,text) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_discord_attention(text,uuid),public.novu_rust_ack_discord(text,uuid,uuid,bigint,text,text),public.novu_rust_discord_failure_lookup(text,uuid) TO {role}")).await.unwrap();
     let attention = reader
         .query(
             "SELECT * FROM public.novu_rust_discord_attention($1,NULL)",
@@ -285,6 +285,9 @@ async fn scoped_health_and_alert_selection() {
             .unwrap()
             .get::<_, bool>(0)
     );
+    let lookup=Command::new(env!("CARGO_BIN_EXE_delivery-reconcile")).env_clear().env("DATABASE_URL",role_url.as_str()).env("NOVU_POSTGRES_ALLOW_INSECURE","true").args(["get-discord",&env,&ids[0].to_string()]).output().unwrap();
+    assert!(lookup.status.success(),"{}",String::from_utf8_lossy(&lookup.stderr));let lookup:serde_json::Value=serde_json::from_slice(&lookup.stdout).unwrap();assert_eq!(lookup["reviewed"],true);assert_eq!(lookup["attemptRevision"],revision.to_string());assert!(!lookup.to_string().contains("fixture"));
+    assert!(reader.query("SELECT * FROM public.novu_rust_discord_failure_lookup($1,$2)",&[&other,&ids[4]]).await.is_err());
     let row = reader
         .query_one("SELECT * FROM public.novu_rust_discord_health($1)", &[&env])
         .await

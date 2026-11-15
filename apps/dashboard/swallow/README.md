@@ -406,3 +406,5 @@ Discord attention now allows authorized operators to prepare an acceptance or re
 `TEST_POSTGRES_MODE=local scripts/test-discord-resolution-grants-browser.sh` exercises JWT decision grant, target operator decision, delegation audit and revocation through the real dashboard and API using fixture JWTs and disposable PostgreSQL. It does not contact Discord or an external IdP.
 
 `TEST_POSTGRES_MODE=local scripts/test-discord-history-browser.sh` verifies a Discord decision, 429 schedule and JWT-attributed history through the real dashboard/API, fixture JWT and disposable PostgreSQL. Earlier or CLI decisions can lack JWT attribution. History viewer grants are initially DBA-managed. The test does not contact Discord or a real IdP.
+
+Discord failed jobs can be looked up by UUID even after acknowledgment, using the existing list permissions. The lookup shows the current snapshot and 429 guidance without changing the job or alert. `TEST_POSTGRES_MODE=local scripts/test-discord-failure-lookup-browser.sh` verifies acknowledgment, lookup and guided retry with fixture JWT and disposable PostgreSQL; it does not contact Discord.

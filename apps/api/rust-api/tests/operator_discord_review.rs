@@ -102,7 +102,7 @@ async fn discord_review_is_scoped_revision_fenced_and_idempotent() {
     .await
     .unwrap();
     db.execute("INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES('https://issuer.test','alice','console',$1),('https://issuer.test','alice','console',$2)",&[&env,&other]).await.unwrap();
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_discord_attention(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_discord_review(text,text,text,text,bigint,uuid,uuid,uuid,bigint,text),public.novu_rust_operator_jwt_discord_review_request(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_discord_attention(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_discord_review(text,text,text,text,bigint,uuid,uuid,uuid,bigint,text),public.novu_rust_operator_jwt_discord_review_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_discord_failure_lookup(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname::text=$1",&[&role]).await.unwrap();
     db.execute("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES($1,$2,'experimental_discord_workflow',jsonb_build_object('secret','fixture-private'),'failed')",&[&job,&env]).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_discord_attempts(job_id,environment_id,state) VALUES($1,$2,'unknown')",&[&job,&env]).await.unwrap();
@@ -166,7 +166,7 @@ async fn discord_review_is_scoped_revision_fenced_and_idempotent() {
     );
     let (_, updated) = response(app.clone(), &token, "GET", &list, None).await;
     let row = &updated["data"][0];
-    assert_eq!(row["retryAfterSeconds"],90);
+    assert_eq!(row["retryAfterSeconds"], 90);
     assert!(row["retryNotBefore"].as_str().unwrap().ends_with('Z'));
     let input = json!({"requestId":request_id,"jobId":job,"attemptRevision":row["attemptRevision"],"failureRevision":row["failureRevision"],"reason":"reviewed"});
     assert_eq!(
@@ -195,6 +195,42 @@ async fn discord_review_is_scoped_revision_fenced_and_idempotent() {
     assert_eq!(
         response(app.clone(), &token, "GET", &list, None).await.1["data"],
         json!([])
+    );
+    let failure_lookup =
+        format!("/v1/experimental/operator/discord-failure?environmentId={env}&jobId={job}");
+    let (status, found) = response(app.clone(), &token, "GET", &failure_lookup, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(found["reviewed"], true);
+    assert_eq!(found["attemptRevision"], row["attemptRevision"]);
+    assert_eq!(found["retryAfterSeconds"], 90);
+    assert!(found["retryNotBefore"].as_str().unwrap().ends_with('Z'));
+    assert!(!found.to_string().contains("fixture-private"));
+    assert_eq!(
+        response(
+            app.clone(),
+            &token,
+            "GET",
+            &format!(
+                "/v1/experimental/operator/discord-failure?environmentId={env}&jobId={}",
+                Uuid::new_v4()
+            ),
+            None
+        )
+        .await
+        .1,
+        json!({"found":false})
+    );
+    assert_eq!(
+        response(
+            app.clone(),
+            &token,
+            "GET",
+            &format!("/v1/experimental/operator/discord-failure?environmentId={other}&jobId={job}"),
+            None
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
     );
     let pre_job = Uuid::new_v4();
     db.execute("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES($1,$2,'experimental_discord_workflow','{}','failed')",&[&pre_job,&env]).await.unwrap();
@@ -225,7 +261,11 @@ async fn discord_review_is_scoped_revision_fenced_and_idempotent() {
     );
     db.execute("UPDATE public.novu_rust_operator_jwt_discord_review_grants SET can_list=false WHERE environment_id=$1",&[&env]).await.unwrap();
     assert_eq!(
-        response(app, &token, "GET", &list, None).await.0,
+        response(app.clone(), &token, "GET", &list, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        response(app, &token, "GET", &failure_lookup, None).await.0,
         StatusCode::UNAUTHORIZED
     );
 }
