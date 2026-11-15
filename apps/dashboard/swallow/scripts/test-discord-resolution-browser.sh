@@ -93,7 +93,7 @@ await page.click('app-discord-reviews button:has-text("요청 결과 조회")');
 await page.click('app-discord-reviews button:has-text("새 검토 준비")');await page.click('app-discord-reviews button:has-text("미확인 작업 조회")');
 await page.waitForFunction(()=>document.querySelector('app-discord-reviews table')?.innerText.includes('11111111-1111-4111-8111-000000000002'));
 await page.waitForFunction(()=>document.querySelector('app-discord-reviews table')?.innerText.includes('60초'));
-await fill('input[name="discordReviewReason"]','relay did not accept');await page.click('app-discord-reviews tbody tr:nth-child(1) button:has-text("재발송 준비")');
+await fill('input[name="discordReviewReason"]','relay did not accept');await page.click('app-discord-reviews tbody tr:nth-child(1) button:has-text("즉시 재발송 준비")');
 await page.click('input[name="discordReviewConfirm"]');await page.click('app-discord-reviews button:has-text("판정 요청")');
 await page.waitForFunction(()=>document.querySelector('app-discord-reviews')?.innerText.includes('판정이 기록되었습니다.'));
 console.log('Discord browser resolution and rate guidance passed');

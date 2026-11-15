@@ -292,4 +292,37 @@ async fn discord_resolution_requires_both_permissions_and_isolates_jwt_requests(
         .get::<_, i64>(0),
         0
     );
+    let delayed = Uuid::new_v4();
+    db.execute("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES($1,$2,'experimental_discord_webhook',jsonb_build_object('destination','fixture','content','hello'),'failed')",&[&delayed,&env]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_discord_attempts(job_id,environment_id,state,http_status,retry_after_seconds) VALUES($1,$2,'rejected',429,90)",&[&delayed,&env]).await.unwrap();
+    let row=db.query_one("SELECT a.revision,j.failure_revision FROM public.novu_rust_discord_attempts a JOIN public.novu_queue_jobs j ON j.id=a.job_id WHERE j.id=$1",&[&delayed]).await.unwrap();
+    let rev: Uuid = row.get(0);
+    let fail: i64 = row.get(1);
+    let id = Uuid::new_v4();
+    let input = json!({"requestId":id,"jobId":delayed,"attemptRevision":rev,"failureRevision":fail.to_string(),"decision":"retry_after","reason":"rate limit guidance"});
+    let (status, result) = response(app.clone(), &alice, "POST", &path, Some(input.clone())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(result["replayed"], false);
+    assert_eq!(
+        response(app.clone(), &alice, "POST", &path, Some(input))
+            .await
+            .1["replayed"],
+        true
+    );
+    let lookup = format!(
+        "/v1/experimental/operator/discord-resolution-request?environmentId={env}&requestId={id}&decision=retry_after"
+    );
+    assert_eq!(
+        response(app.clone(), &alice, "GET", &lookup, None).await.1["found"],
+        true
+    );
+    assert!(
+        db.query_one(
+            "SELECT available_at>clock_timestamp() FROM public.novu_queue_jobs WHERE id=$1",
+            &[&delayed]
+        )
+        .await
+        .unwrap()
+        .get::<_, bool>(0)
+    );
 }

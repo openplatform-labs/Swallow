@@ -298,6 +298,88 @@ async fn discord_resolution_is_scoped_fenced_and_delivers_retry() {
         (row.get::<_, String>(0), row.get::<_, String>(1)),
         ("completed".into(), "accepted".into())
     );
+
+    let delayed = Uuid::new_v4();
+    db.execute("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES($1,$2,'experimental_discord_webhook',jsonb_build_object('destination','one','content','delay test'),'failed')",&[&delayed,&env]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_discord_attempts(job_id,environment_id,state,http_status,retry_after_seconds) VALUES($1,$2,'rejected',429,60)",&[&delayed,&env]).await.unwrap();
+    let row=db.query_one("SELECT a.revision,j.failure_revision,a.updated_at::text FROM public.novu_rust_discord_attempts a JOIN public.novu_queue_jobs j ON j.id=a.job_id WHERE j.id=$1",&[&delayed]).await.unwrap();
+    let delayed_rev: Uuid = row.get(0);
+    let delayed_failure: i64 = row.get(1);
+    assert!(
+        op.query_one(
+            sql,
+            &[
+                &env,
+                &Uuid::new_v4(),
+                &delayed,
+                &Some(Uuid::new_v4()),
+                &delayed_failure,
+                &"retry_after",
+                &"stale"
+            ]
+        )
+        .await
+        .is_err()
+    );
+    let delayed_id = Uuid::new_v4();
+    let delayed_out = Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .env_clear()
+        .env("DATABASE_URL", role_url.as_str())
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .args([
+            "resolve-discord",
+            &env,
+            &delayed_id.to_string(),
+            &delayed.to_string(),
+            &delayed_rev.to_string(),
+            &delayed_failure.to_string(),
+            "retry_after",
+            "rate guidance",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        delayed_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&delayed_out.stderr)
+    );
+    let row=db.query_one("SELECT j.status,j.available_at>clock_timestamp(),r.retry_not_before=j.available_at,r.retry_after_seconds FROM public.novu_queue_jobs j JOIN public.novu_rust_discord_resolutions r ON r.job_id=j.id WHERE j.id=$1 AND r.request_id=$2",&[&delayed,&delayed_id]).await.unwrap();
+    assert_eq!(
+        (
+            row.get::<_, String>(0),
+            row.get::<_, bool>(1),
+            row.get::<_, bool>(2),
+            row.get::<_, i32>(3)
+        ),
+        ("pending".into(), true, true, 60)
+    );
+    assert!(
+        !discord_queue::process_one(&mut db, &env, "one", &provider)
+            .await
+            .unwrap()
+    );
+    let no_guidance = Uuid::new_v4();
+    db.execute("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES($1,$2,'experimental_discord_webhook',jsonb_build_object('destination','one','content','missing'),'failed')",&[&no_guidance,&env]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_discord_attempts(job_id,environment_id,state,http_status) VALUES($1,$2,'rejected',429)",&[&no_guidance,&env]).await.unwrap();
+    let row=db.query_one("SELECT a.revision,j.failure_revision FROM public.novu_rust_discord_attempts a JOIN public.novu_queue_jobs j ON j.id=a.job_id WHERE j.id=$1",&[&no_guidance]).await.unwrap();
+    let rev: Uuid = row.get(0);
+    let failure: i64 = row.get(1);
+    assert!(
+        op.query_one(
+            sql,
+            &[
+                &env,
+                &Uuid::new_v4(),
+                &no_guidance,
+                &Some(rev),
+                &failure,
+                &"retry_after",
+                &"missing guidance"
+            ]
+        )
+        .await
+        .is_err()
+    );
     let pre_failure: i64 = db
         .query_one(
             "SELECT failure_revision FROM public.novu_queue_jobs WHERE id=$1",
