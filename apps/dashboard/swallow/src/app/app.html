@@ -46,7 +46,7 @@
         <div class="feature-grid">
           <button class="feature-card" (click)="setSection('workflows')"><span class="feature-icon">WF</span><strong>워크플로</strong><small>채널별 단일 단계 설정</small><span class="feature-status">설정하기 →</span></button>
           <button class="feature-card" (click)="setSection('subscribers')"><span class="feature-icon teal">SU</span><strong>구독자</strong><small>수신자와 알림 설정 관리</small><span class="feature-status">준비 중 →</span></button>
-          <button class="feature-card" (click)="setSection('channels')"><span class="feature-icon amber">CH</span><strong>발송 채널</strong><small>이메일, SMS, 푸시 연결</small><span class="feature-status">준비 중 →</span></button>
+          <button class="feature-card" (click)="setSection('channels')"><span class="feature-icon amber">CH</span><strong>발송 채널</strong><small>SendGrid 웹훅 서명 키 관리</small><span class="feature-status">키 관리 →</span></button>
         </div>
       } @else if (section() === 'workflows') {
         <div class="page-heading"><div><div class="eyebrow">WORKFLOWS</div><h1>워크플로</h1><p>기존 워크플로의 채널별 단일 단계를 조회하고 설정합니다.</p></div></div>
