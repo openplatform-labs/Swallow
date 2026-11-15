@@ -55,6 +55,7 @@ struct ApiState {
     ready_require_capacity: bool,
     ready_require_writable: bool,
     ready_require_all: bool,
+    ready_operator_keys: Option<novu_rust_api::RuntimeConfig>,
     route_require_writable: bool,
     timeout: Duration,
     request_timeout: Option<Duration>,
@@ -267,6 +268,9 @@ async fn ready(State(shared): State<ApiState>) -> Response {
     }
     probes.abort_all();
     ready &= !shared.draining.load(Ordering::Acquire);
+    if let Some(runtime) = &shared.ready_operator_keys {
+        ready &= runtime.operator_key_reload_healthy() == Some(true);
+    }
     let status = if ready {
         StatusCode::OK
     } else {
@@ -477,6 +481,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if key_health && (!health_endpoints || runtime.operator_key_reload_healthy().is_none()) {
         return Err("operator key health requires health endpoints and key reload".into());
     }
+    let ready_require_operator_keys = match std::env::var("SWALLOW_API_READY_REQUIRE_OPERATOR_KEYS").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid operator key readiness setting".into()),
+    };
+    if ready_require_operator_keys && (!health_endpoints || runtime.operator_key_reload_healthy().is_none()) {
+        return Err("operator key readiness requires health endpoints and key reload".into());
+    }
     runtime.start_operator_key_reload();
     let cors = cors_from_env()?;
     let shared = ApiState {
@@ -493,6 +505,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         ready_require_capacity,
         ready_require_writable,
         ready_require_all,
+        ready_operator_keys: ready_require_operator_keys.then(|| runtime.clone()),
         route_require_writable,
         timeout,
         request_timeout,

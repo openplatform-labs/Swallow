@@ -106,6 +106,7 @@ async fn process_reloads_keys_and_applies_each_failure_policy() {
             .env("SWALLOW_OPERATOR_JWT_CONFIG_FILE", &path)
             .env("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED", "true")
             .env("SWALLOW_API_OPERATOR_KEY_HEALTH_ENABLED", "true")
+            .env("SWALLOW_API_READY_REQUIRE_OPERATOR_KEYS", if policy == "retain" { "true" } else { "false" })
             .env("SWALLOW_OPERATOR_JWT_RELOAD_SECONDS", "1")
             .env("SWALLOW_OPERATOR_JWT_RELOAD_FAILURE", policy)
             .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
@@ -115,6 +116,8 @@ async fn process_reloads_keys_and_applies_each_failure_policy() {
     let old = token("old");
     let new = token("new");
     let health = |url: &str| format!("{}/health/operator-keys", url.split("/v1/").next().unwrap());
+    let ready = |url: &str| format!("{}/health/ready", url.split("/v1/").next().unwrap());
+    for (_, _, url) in &processes { wait_status(&client, &ready(url), "", 200).await; }
     for (_, _, url) in &processes { wait_status(&client, &health(url), "", 200).await; }
     for (_, _, url) in &processes { wait_status(&client, url, &old, 200).await; wait_status(&client, url, &new, 401).await; }
     for (_, path, _) in &processes { replace(path, &config(&["old", "new"]).to_string()); }
@@ -124,6 +127,8 @@ async fn process_reloads_keys_and_applies_each_failure_policy() {
     for (_, path, _) in &processes { replace(path, "{"); }
     wait_status(&client, &processes[1].2, &new, 503).await;
     for (_, _, url) in &processes { wait_status(&client, &health(url), "", 503).await; }
+    wait_status(&client, &ready(&processes[0].2), "", 503).await;
+    wait_status(&client, &ready(&processes[1].2), "", 200).await;
     tokio::time::sleep(Duration::from_millis(1200)).await;
     wait_status(&client, &processes[0].2, &new, 200).await;
     let mut changed = config(&["old"]); changed["check_token_revocation"] = json!(true);
@@ -135,6 +140,7 @@ async fn process_reloads_keys_and_applies_each_failure_policy() {
     wait_status(&client, &processes[1].2, &new, 200).await;
     for (_, _, url) in &processes {
         wait_status(&client, &health(url), "", 200).await;
+        wait_status(&client, &ready(url), "", 200).await;
         let response = client.get(health(url)).send().await.unwrap();
         assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
     }
@@ -154,6 +160,20 @@ fn key_health_requires_explicit_health_and_reload_configuration() {
             .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
             .env("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED", health)
             .env("SWALLOW_API_OPERATOR_KEY_HEALTH_ENABLED", key_health)
+            .stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap();
+        assert!(!status.success());
+    }
+}
+
+#[test]
+fn key_readiness_rejects_invalid_or_incomplete_configuration() {
+    use std::process::{Command, Stdio};
+    for (health, ready) in [("false", "true"), ("true", "true"), ("true", "invalid")] {
+        let status = Command::new(env!("CARGO_BIN_EXE_novu-rust-api"))
+            .env_clear().env("DATABASE_URL", "postgres://postgres@127.0.0.1:1/postgres")
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED", health)
+            .env("SWALLOW_API_READY_REQUIRE_OPERATOR_KEYS", ready)
             .stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap();
         assert!(!status.success());
     }
