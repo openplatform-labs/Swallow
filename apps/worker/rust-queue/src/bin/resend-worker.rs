@@ -65,6 +65,11 @@ async fn run(
         Ok("false") | Err(std::env::VarError::NotPresent) => false,
         _ => return Err("invalid Resend retry correlation guard setting".into()),
     };
+    let retry_key = match std::env::var("NOVU_RESEND_IDEMPOTENCY_SCOPE").as_deref() {
+        Ok("job") | Err(std::env::VarError::NotPresent) => false,
+        Ok("retry") => true,
+        _ => return Err("invalid Resend idempotency scope".into()),
+    };
     let timeout = Duration::from_secs(timeout);
     loop {
         if stop.requested() {
@@ -139,7 +144,7 @@ async fn run(
                     }
                     match tokio::time::timeout(
                         timeout,
-                        resend_queue::process_one_with_correlation_guard(
+                        resend_queue::process_one_with_retry_key(
                             &mut db,
                             &environment,
                             &provider,
@@ -147,6 +152,7 @@ async fn run(
                             step_policy,
                             correlation,
                             correlation_guard,
+                            retry_key,
                         ),
                     )
                     .await

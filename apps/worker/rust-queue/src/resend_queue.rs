@@ -100,6 +100,30 @@ pub async fn process_one_with_correlation_guard(
     correlation_enabled: bool,
     correlation_guard: bool,
 ) -> Result<bool, Error> {
+    process_one_with_retry_key(
+        client,
+        environment,
+        provider,
+        retry_guard,
+        policy,
+        correlation_enabled,
+        correlation_guard,
+        false,
+    )
+    .await
+}
+
+/// A retry-specific key is an explicit opt-in: a mistaken retry can resend a previously accepted email.
+pub async fn process_one_with_retry_key(
+    client: &mut Client,
+    environment: &str,
+    provider: &Resend,
+    retry_guard: bool,
+    policy: crate::email_step_policy::Policy,
+    correlation_enabled: bool,
+    correlation_guard: bool,
+    retry_key: bool,
+) -> Result<bool, Error> {
     let Some(job) = claim(client, environment).await? else {
         return Ok(false);
     };
@@ -202,8 +226,16 @@ pub async fn process_one_with_correlation_guard(
     if email.message_id.is_some() {
         tx.execute("UPDATE novu_rust_email_messages SET delivery_state='dispatching' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
     }
+    let retry_id: Option<Uuid> = if retry_key {
+        tx.query_opt("SELECT id FROM novu_rust_delivery_reconciliations WHERE environment_id=$1 AND job_id=$2 AND target_index IS NULL AND decision='retry' ORDER BY decision_order DESC LIMIT 1", &[&environment, &job.id]).await?.map(|row| row.get(0))
+    } else {
+        None
+    };
     tx.commit().await?;
-    let key = format!("swallow/{}", job.id);
+    let key = match retry_id {
+        Some(id) => format!("swallow/{}/retry/{id}", job.id),
+        None => format!("swallow/{}", job.id),
+    };
     let (state, code, id, diagnostic) = match provider
         .send_with_correlation(&email, Some(&key), correlation)
         .await
@@ -519,6 +551,7 @@ mod tests {
             include_str!("../../../api/rust-api/migrations/0008_sendgrid_dispatch_identity.sql"),
             include_str!("../../../api/rust-api/migrations/0009_sendgrid_dispatch_proof.sql"),
             include_str!("../../../api/rust-api/migrations/0010_resend_webhooks.sql"),
+            include_str!("../../../api/rust-api/migrations/0013_resend_event_recipient.sql"),
             include_str!("../../../api/rust-api/migrations/0047_resend_event_correlation.sql"),
             include_str!("../../../api/rust-api/migrations/0005_twilio_webhooks.sql"),
             include_str!("../../../api/rust-api/migrations/0006_twilio_webhook_job_link.sql"),
@@ -823,9 +856,9 @@ mod tests {
         assert!(row.get::<_, Option<String>>(4).is_none());
 
         // A disabled guard permits the prior behavior; an unrelated event never blocks.
-        for (enabled, prior_id) in [
-            (false, "prior-provider-id"),
-            (true, "unrelated-provider-id"),
+        for (enabled, prior_id, retry_key) in [
+            (false, "prior-provider-id", false),
+            (true, "unrelated-provider-id", true),
         ] {
             let unguarded = Uuid::new_v4();
             enqueue(
@@ -837,7 +870,29 @@ mod tests {
             )
             .await
             .unwrap();
-            db.execute("INSERT INTO novu_rust_delivery_reconciliations(id,environment_id,job_id,decision,operator_name,reason,retry_provider_message_id) VALUES ($1,'env-a',$2,'retry','operator','test',$3)", &[&Uuid::new_v4(),&unguarded,&prior_id]).await.unwrap();
+            if retry_key {
+                db.execute(
+                    "UPDATE novu_queue_jobs SET status='failed' WHERE id=$1",
+                    &[&unguarded],
+                )
+                .await
+                .unwrap();
+                db.execute("INSERT INTO novu_rust_resend_attempts(job_id,environment_id,state,provider_message_id) VALUES ($1,'env-a','unknown',$2)", &[&unguarded,&prior_id]).await.unwrap();
+                crate::reconciliation::resolve(
+                    &mut db,
+                    "env-a",
+                    unguarded,
+                    None,
+                    "retry",
+                    "operator",
+                    "verified not accepted",
+                )
+                .await
+                .unwrap();
+            } else {
+                db.execute("INSERT INTO novu_rust_delivery_reconciliations(id,environment_id,job_id,decision,operator_name,reason,retry_provider_message_id) VALUES ($1,'env-a',$2,'retry','operator','test',$3)", &[&Uuid::new_v4(),&unguarded,&prior_id]).await.unwrap();
+            }
+            let decision: Uuid = db.query_one("SELECT id FROM novu_rust_delivery_reconciliations WHERE environment_id='env-a' AND job_id=$1 AND decision='retry'", &[&unguarded]).await.unwrap().get(0);
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let provider = Resend::test_endpoint(
                 Config {
@@ -871,6 +926,13 @@ mod tests {
                         }
                     }
                 }
+                let headers = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+                let expected = if retry_key {
+                    format!("swallow/{unguarded}/retry/{decision}")
+                } else {
+                    format!("swallow/{unguarded}")
+                };
+                assert!(headers.contains(&format!("idempotency-key: {expected}\r\n")));
                 let body = "{\"id\":\"mock-accepted\"}";
                 socket
                 .write_all(
@@ -884,9 +946,18 @@ mod tests {
                 .unwrap();
             });
             assert!(
-                process_one_with_retry_guard(&mut db, "env-a", &provider, enabled)
-                    .await
-                    .unwrap()
+                process_one_with_retry_key(
+                    &mut db,
+                    "env-a",
+                    &provider,
+                    enabled,
+                    crate::email_step_policy::Policy::Snapshot,
+                    false,
+                    false,
+                    retry_key
+                )
+                .await
+                .unwrap()
             );
             tokio::time::timeout(std::time::Duration::from_secs(2), mock)
                 .await
