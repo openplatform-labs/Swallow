@@ -83,7 +83,12 @@ INSERT INTO public.novu_rust_resend_delivery_events(environment_id,event_id,emai
 INSERT INTO public.novu_rust_resend_auto_correlations(job_id,environment_id,correlation_id,provider_message_id,evidence_count) VALUES ('1889f88e-c0a3-4ab5-b861-2fdc1f26f254','ui-fixture-env','96df49d1-0f4d-4bce-9290-666dd8fc908c','fixture-provider',1);
 UPDATE public.novu_queue_jobs SET resend_delivery_result='delivered' WHERE id='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
 SQL
-node --input-type=module - "$root" "$fixture_dir" <<'JS'
+if [[ "${SWALLOW_UI_SELF_REVOKE:-false}" == true ]]; then
+  docker exec -i "$name" psql -q -v ON_ERROR_STOP=1 -U postgres -d ui_test <<'SQL'
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_self(text,text,text,text,bigint),public.novu_rust_operator_token_revoked(bytea,bytea,bytea,bytea),public.novu_rust_operator_token_guard(bytea,bytea,bytea,bytea),public.novu_rust_operator_jwt_self_revoke(text,text,text,text,bigint,bytea) TO ui_resend_fixture;
+SQL
+fi
+node --input-type=module - "$root" "$fixture_dir" "${SWALLOW_UI_SELF_REVOKE:-false}" <<'JS'
 import {readFile,writeFile} from 'node:fs/promises';
 import {SignJWT,importPKCS8} from './node_modules/jose/dist/webapi/index.js';
 const root=process.argv[2], dir=process.argv[3];
@@ -92,7 +97,7 @@ const [privatePem,publicPem]=await Promise.all([readFile(`${keyDir}/test-only-pr
 const now=Math.floor(Date.now()/1000);
 const token=await new SignJWT({client_id:'console',jti:'ui-fixture'}).setProtectedHeader({alg:'RS256',typ:'at+jwt',kid:'key'}).setIssuer('https://issuer.test').setSubject('ui-fixture').setAudience('swallow').setIssuedAt(now).setExpirationTime(now+600).sign(await importPKCS8(privatePem,'RS256'));
 await writeFile(`${dir}/token`,token,{mode:0o600});
-await writeFile(`${dir}/jwt-config`,JSON.stringify({issuer:'https://issuer.test',audience:'swallow',keys:[{kid:'key',pem:publicPem}]}),{mode:0o600});
+await writeFile(`${dir}/jwt-config`,JSON.stringify({issuer:'https://issuer.test',audience:'swallow',keys:[{kid:'key',pem:publicPem}],check_token_revocation:process.argv[4]==='true'}),{mode:0o600});
 JS
 api_port=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
 cargo build --quiet --locked --manifest-path "$api/Cargo.toml" --bin novu-rust-api

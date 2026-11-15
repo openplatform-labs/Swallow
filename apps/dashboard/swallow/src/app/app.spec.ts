@@ -6,6 +6,34 @@ import { OperatorOidc } from './operator-oidc';
 describe('Swallow console', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
+  it('revokes the signed-in token only after confirmation and clears local credentials', async () => {
+    vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));
+    vi.spyOn(OperatorOidc.prototype,'signIn').mockResolvedValue({token:'aaa.bbb.ccc',subject:'alice',environmentId:'env-a',expiresAt:Math.floor(Date.now()/1000)+600});
+    const mock=vi.spyOn(globalThis,'fetch').mockResolvedValue(new Response(JSON.stringify({created:true}),{status:200}));
+    const fixture=TestBed.createComponent(App);const app=fixture.componentInstance;
+    app.oidcIssuer='https://issuer.test';app.oidcClientId='console';app.oidcEnvironment='env-a';await app.prepareOidc();await app.signInOidc();
+    await app.revokeOidcToken();expect(mock).not.toHaveBeenCalled();
+    app.oidcRevokeConfirmed=true;await app.revokeOidcToken();
+    expect(mock).toHaveBeenCalledOnce();expect(mock.mock.calls[0][0]).toContain('/v1/experimental/operator/token/revoke-self?environmentId=env-a');
+    expect(mock.mock.calls[0][1]).toMatchObject({method:'POST',headers:{Authorization:'Bearer aaa.bbb.ccc'},credentials:'omit',cache:'no-store',redirect:'error'});
+    expect(app.oidcRevokeStatus()).toBe('revoked');expect(app.oidcStatus()).toBe('idle');expect(app.oidcSubject()).toBe('');expect(app.oidcRevokeConfirmed).toBe(false);
+    fixture.destroy();
+  });
+
+  it('clears the local session but reports unknown when revocation response is lost', async () => {
+    vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));
+    vi.spyOn(OperatorOidc.prototype,'signIn').mockResolvedValue({token:'aaa.bbb.ccc',subject:'alice',environmentId:'env-a',expiresAt:Math.floor(Date.now()/1000)+600});
+    let finish!:(response:Response)=>void;
+    const mock=vi.spyOn(globalThis,'fetch').mockImplementation(()=>new Promise<Response>(done=>finish=done));
+    const fixture=TestBed.createComponent(App);const app=fixture.componentInstance;
+    app.oidcIssuer='https://issuer.test';app.oidcClientId='console';app.oidcEnvironment='env-a';await app.prepareOidc();await app.signInOidc();
+    app.oidcRevokeConfirmed=true;const pending=app.revokeOidcToken();expect(app.oidcRevokeStatus()).toBe('sending');
+    app.setSection('alerts');app.resetOidc();expect(app.section()).toBe('overview');expect(app.oidcStatus()).toBe('signed-in');
+    finish(new Response('',{status:503}));await pending;
+    expect(app.oidcRevokeStatus()).toBe('unknown');expect(app.oidcStatus()).toBe('idle');expect(app.oidcSubject()).toBe('');
+    await app.revokeOidcToken();expect(mock).toHaveBeenCalledOnce();fixture.destroy();
+  });
+
   it('manages SendGrid keys with scoped API authentication and blocks uncertain retries', async () => {
     const mock=vi.spyOn(globalThis,'fetch')
       .mockResolvedValueOnce(new Response(JSON.stringify({data:[{identifier:'old',active:true}],nextCursor:'old'})))
