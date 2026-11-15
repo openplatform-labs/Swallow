@@ -144,6 +144,7 @@ async fn verifies_token_mapping_scope_revocation_and_expiry() {
     );
     db.batch_execute("CREATE ROLE jwt_revoke_admin LOGIN; CREATE ROLE jwt_revoke_reader LOGIN; GRANT USAGE ON SCHEMA public TO jwt_revoke_admin,jwt_revoke_reader; GRANT EXECUTE ON FUNCTION public.novu_rust_admin_revoke_operator_token(bytea,bytea,bytea,bytea,text) TO jwt_revoke_admin,jwt_revoke_reader; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_token_revocation_audit_page(bigint,integer) TO jwt_revoke_admin,jwt_revoke_reader; INSERT INTO public.novu_rust_operator_token_revocation_admins SELECT rolname,oid,rolname='jwt_revoke_admin',rolname='jwt_revoke_reader' FROM pg_roles WHERE rolname IN ('jwt_revoke_admin','jwt_revoke_reader')").await.unwrap();
     db.batch_execute("CREATE ROLE jwt_revoke_owner NOLOGIN; CREATE ROLE jwt_revoke_audit_owner NOLOGIN; GRANT USAGE ON SCHEMA public TO jwt_revoke_owner,jwt_revoke_audit_owner; GRANT SELECT,UPDATE ON public.novu_rust_operator_token_revocation_admins TO jwt_revoke_owner,jwt_revoke_audit_owner; GRANT INSERT ON public.novu_rust_operator_token_revocations,public.novu_rust_operator_token_revocation_audit TO jwt_revoke_owner; GRANT USAGE ON SEQUENCE public.novu_rust_operator_token_revocation_audit_id_seq TO jwt_revoke_owner; GRANT SELECT ON public.novu_rust_operator_token_revocation_audit TO jwt_revoke_audit_owner; ALTER FUNCTION public.novu_rust_admin_revoke_operator_token(bytea,bytea,bytea,bytea,text) OWNER TO jwt_revoke_owner; ALTER FUNCTION public.novu_rust_operator_token_revocation_audit_page(bigint,integer) OWNER TO jwt_revoke_audit_owner").await.unwrap();
+    db.batch_execute("GRANT SELECT ON public.novu_rust_operator_token_revocations TO jwt_revoke_audit_owner; ALTER FUNCTION public.novu_rust_operator_token_revocation_inspect(bytea,bytea,bytea,bytea) OWNER TO jwt_revoke_audit_owner; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_token_revocation_inspect(bytea,bytea,bytea,bytea) TO jwt_revoke_admin,jwt_revoke_reader").await.unwrap();
     let admin =
         connect(&url.replacen("postgres://postgres@", "postgres://jwt_revoke_admin@", 1)).await;
     let reader =
@@ -243,6 +244,18 @@ async fn verifies_token_mapping_scope_revocation_and_expiry() {
         write!(file,"{}",json!({"issuer":"https://issuer.test","subject":"user-1","client_id":"console","jti":"cli-fixture","reason":"fixture CLI"})).unwrap();
         drop(file);
         let admin_url = url.replacen("postgres://postgres@", "postgres://jwt_revoke_admin@", 1);
+        let reader_url = url.replacen("postgres://postgres@", "postgres://jwt_revoke_reader@", 1);
+        let inspect = || async {
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_operator-token-admin"))
+                .env_clear()
+                .env("DATABASE_URL", &reader_url)
+                .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+                .arg("inspect")
+                .arg(&path)
+                .output()
+                .await
+                .unwrap()
+        };
         let run = || async {
             tokio::process::Command::new(env!("CARGO_BIN_EXE_operator-token-admin"))
                 .env_clear()
@@ -257,6 +270,22 @@ async fn verifies_token_mapping_scope_revocation_and_expiry() {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(!run().await.status.success());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let before = inspect().await;
+        assert!(before.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&before.stdout).unwrap()["revoked"],
+            false
+        );
+        let denied = tokio::process::Command::new(env!("CARGO_BIN_EXE_operator-token-admin"))
+            .env_clear()
+            .env("DATABASE_URL", &admin_url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .arg("inspect")
+            .arg(&path)
+            .output()
+            .await
+            .unwrap();
+        assert!(!denied.status.success());
         let link = path.with_extension("link");
         std::os::unix::fs::symlink(&path, &link).unwrap();
         let link_result = tokio::process::Command::new(env!("CARGO_BIN_EXE_operator-token-admin"))
@@ -281,6 +310,13 @@ async fn verifies_token_mapping_scope_revocation_and_expiry() {
             true
         );
         assert!(!String::from_utf8_lossy(&output.stdout).contains("cli-fixture"));
+        let after = inspect().await;
+        assert!(after.status.success());
+        let record: Value = serde_json::from_slice(&after.stdout).unwrap();
+        assert_eq!(record["revoked"], true);
+        assert_eq!(record["reason"], "fixture CLI");
+        assert!(record["revokedAt"].is_string());
+        assert!(!String::from_utf8_lossy(&after.stdout).contains("cli-fixture"));
         let cli_token = token_with_id("user-1", "console", now + 120, "cli-fixture");
         assert_eq!(
             guarded
@@ -291,7 +327,6 @@ async fn verifies_token_mapping_scope_revocation_and_expiry() {
                 .status(),
             StatusCode::UNAUTHORIZED
         );
-        let reader_url = url.replacen("postgres://postgres@", "postgres://jwt_revoke_reader@", 1);
         let audit = tokio::process::Command::new(env!("CARGO_BIN_EXE_operator-token-admin"))
             .env_clear()
             .env("DATABASE_URL", reader_url)
@@ -358,6 +393,7 @@ async fn verifies_token_mapping_scope_revocation_and_expiry() {
             .await
             .is_err()
     );
+    assert!(reader.query_one("SELECT * FROM public.novu_rust_operator_token_revocation_inspect(sha256('a'::bytea),sha256('b'::bytea),sha256('c'::bytea),sha256('d'::bytea))",&[]).await.is_err());
     assert_eq!(
         guarded
             .clone()

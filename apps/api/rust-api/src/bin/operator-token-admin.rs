@@ -79,11 +79,14 @@ fn hex(bytes: &[u8]) -> String {
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let request = match args.as_slice() {
-        [action, path] if action == "revoke" => Some(read_request(Path::new(path))?),
+        [action, path] if action == "revoke" || action == "inspect" => {
+            Some(read_request(Path::new(path))?)
+        }
         [action] | [action, _] if action == "audit" => None,
         _ => {
             return Err(
-                "usage: operator-token-admin revoke PRIVATE_JSON_FILE | audit [BEFORE_ID]".into(),
+                "usage: operator-token-admin revoke|inspect PRIVATE_JSON_FILE | audit [BEFORE_ID]"
+                    .into(),
             );
         }
     };
@@ -113,6 +116,17 @@ async fn main() -> Result<()> {
         let subject = Sha256::digest(request.subject.as_bytes());
         let client = Sha256::digest(request.client_id.as_bytes());
         let jti = Sha256::digest(request.jti.as_bytes());
+        if args[0] == "inspect" {
+            let result = tokio::time::timeout(Duration::from_secs(30), db.query_one("SELECT revoked,reason,revoked_at::text FROM public.novu_rust_operator_token_revocation_inspect($1,$2,$3,$4)", &[&issuer.as_slice(),&subject.as_slice(),&client.as_slice(),&jti.as_slice()])).await;
+            let row = result
+                .map_err(|_| "revocation inspection unavailable")?
+                .map_err(|_| "revocation inspection unavailable")?;
+            println!(
+                "{}",
+                json!({"revoked":row.get::<_,bool>(0),"reason":row.get::<_,Option<String>>(1),"revokedAt":row.get::<_,Option<String>>(2)})
+            );
+            return Ok(());
+        }
         let result = tokio::time::timeout(
             Duration::from_secs(30),
             db.query_one(
