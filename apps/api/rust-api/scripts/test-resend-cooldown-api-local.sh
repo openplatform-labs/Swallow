@@ -20,3 +20,5 @@ cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-wo
 cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply api "$API/migrations"
 TEST_DATABASE_URL="$DATABASE_URL" cargo test --locked --manifest-path "$API/Cargo.toml" --test operator_resend_cooldown_health -- --ignored
 TEST_DATABASE_URL="$DATABASE_URL" cargo test --locked --manifest-path "$API/Cargo.toml" --test operator_resend_429_grants -- --ignored
+
+TEST_DATABASE_URL="$DATABASE_URL" cargo test --locked --manifest-path "$API/Cargo.toml" --test operator_resend_cooldown_policy -- --ignored

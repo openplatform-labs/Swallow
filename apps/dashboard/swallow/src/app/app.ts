@@ -6,6 +6,7 @@ import { TwilioResults } from './twilio-results';
 import { FcmResults } from './fcm-results';
 import { SlackResults } from './slack-results';
 import { ResendAutoPolicy } from './resend-auto-policy';
+import { ResendCooldownPolicy } from './resend-cooldown-policy';
 import { ResendAutoHealth } from './resend-auto-health';
 import { SendgridResults } from './sendgrid-results';
 import { ClrAlertModule } from '@clr/angular/emphasis/alert';
@@ -53,7 +54,7 @@ type SendgridKey = {identifier:string;active:boolean};
 type SendgridKeyAudit = {id:string;identifier:string;action:string;userId:string;recordedAt:string};
 
 @Component({
-  imports: [FormsModule, ClrAlertModule, FcmIntegrations, SlackIntegrations, TwilioResults, FcmResults, SlackResults, SendgridResults, ResendAutoPolicy, ResendAutoHealth],
+  imports: [FormsModule, ClrAlertModule, FcmIntegrations, SlackIntegrations, TwilioResults, FcmResults, SlackResults, SendgridResults, ResendAutoPolicy, ResendCooldownPolicy, ResendAutoHealth],
   selector: 'app-root',
   styleUrl: './app.css',
   templateUrl: './app.html',
@@ -75,6 +76,8 @@ export class App implements OnDestroy {
   readonly operatorKeyHealth = signal<'idle'|'checking'|'healthy'|'unhealthy'|'unavailable'>('idle');
   private operatorKeyHealthSequence = 0;
   resendPolicyBusy=false;
+  resendCooldownPolicyBusy=false;
+  get policyBusy():boolean { return this.resendPolicyBusy || this.resendCooldownPolicyBusy; }
   fcmBusy=false;
   slackBusy=false;
   sendgridApiKey='';
@@ -460,7 +463,7 @@ export class App implements OnDestroy {
 
   resetOidc(): void {
     if (this.oidcRevokeStatus()==='sending' || this.oidcIdpRevokeStatus()==='sending') return;
-    if ((this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying' || this.subscriberDeleteRetryStatus()==='retrying') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || (this.grantChangeStatus()==='sending'||this.resendPolicyBusy) || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
+    if ((this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying' || this.subscriberDeleteRetryStatus()==='retrying') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || (this.grantChangeStatus()==='sending'||this.policyBusy) || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     if (this.oidcExpiryTimer !== null) clearTimeout(this.oidcExpiryTimer);
     if (this.oidcRenewTimer !== null) clearTimeout(this.oidcRenewTimer);
     this.oidcExpiryTimer=null;this.oidcRenewTimer=null;this.oidcRenewError.set(false);this.oidcRenewing.set(false);this.oidc.dispose();
@@ -497,7 +500,7 @@ export class App implements OnDestroy {
   async revokeIdpAccess():Promise<void> {
     this.expireOidcIfNeeded();
     const session=this.oidcSession,prepared=this.oidcPrepared;
-    if(!session || !prepared || !this.oidcIdpAccessConfirmed || !this.canRevokeIdpAccess() || (this.oidcIdpAccessAlsoRefresh && !this.canRevokeIdpRefresh()) || this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying' || this.subscriberDeleteRetryStatus()==='retrying' || this.decisionStatus()==='sending' || this.permissionChangeStatus()==='sending' || (this.grantChangeStatus()==='sending'||this.resendPolicyBusy) || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying')return;
+    if(!session || !prepared || !this.oidcIdpAccessConfirmed || !this.canRevokeIdpAccess() || (this.oidcIdpAccessAlsoRefresh && !this.canRevokeIdpRefresh()) || this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying' || this.subscriberDeleteRetryStatus()==='retrying' || this.decisionStatus()==='sending' || this.permissionChangeStatus()==='sending' || (this.grantChangeStatus()==='sending'||this.policyBusy) || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying')return;
     const sequence=this.oidcSequence;
     if(this.oidcRenewTimer!==null)clearTimeout(this.oidcRenewTimer);this.oidcRenewTimer=null;
     this.oidcIdpRevokeStatus.set('sending');this.oidcIdpSwallowResult.set('idle');this.oidcIdpRefreshResult.set('idle');
@@ -519,7 +522,7 @@ export class App implements OnDestroy {
 
   async revokeIdpRefresh():Promise<void> {
     this.expireOidcIfNeeded();
-    if(!this.oidcIdpRevokeConfirmed || !this.canRevokeIdpRefresh() || this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying' || this.subscriberDeleteRetryStatus()==='retrying' || this.decisionStatus()==='sending' || this.permissionChangeStatus()==='sending' || (this.grantChangeStatus()==='sending'||this.resendPolicyBusy) || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying')return;
+    if(!this.oidcIdpRevokeConfirmed || !this.canRevokeIdpRefresh() || this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying' || this.subscriberDeleteRetryStatus()==='retrying' || this.decisionStatus()==='sending' || this.permissionChangeStatus()==='sending' || (this.grantChangeStatus()==='sending'||this.policyBusy) || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying')return;
     const sequence=this.oidcSequence;
     if(this.oidcRenewTimer!==null)clearTimeout(this.oidcRenewTimer);this.oidcRenewTimer=null;
     this.oidcIdpRevokeStatus.set('sending');
@@ -541,7 +544,7 @@ export class App implements OnDestroy {
   async revokeOidcToken(): Promise<void> {
     this.expireOidcIfNeeded();
     const session=this.oidcSession;
-    if (!session || !this.oidcRevokeConfirmed || this.oidcIdpRevokeStatus()==='sending' || this.oidcRevokeStatus()==='sending' || this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying' || this.subscriberDeleteRetryStatus()==='retrying' || this.decisionStatus()==='sending' || this.permissionChangeStatus()==='sending' || (this.grantChangeStatus()==='sending'||this.resendPolicyBusy) || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
+    if (!session || !this.oidcRevokeConfirmed || this.oidcIdpRevokeStatus()==='sending' || this.oidcRevokeStatus()==='sending' || this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying' || this.subscriberDeleteRetryStatus()==='retrying' || this.decisionStatus()==='sending' || this.permissionChangeStatus()==='sending' || (this.grantChangeStatus()==='sending'||this.policyBusy) || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     let origin:string;
     try {origin=this.validatedOrigin();} catch {this.oidcRevokeStatus.set('error');return;}
     const sequence=this.oidcSequence;
@@ -563,7 +566,7 @@ export class App implements OnDestroy {
   useOidc(section: 'subscribers' | 'alerts' | 'workflows'): void {
     this.expireOidcIfNeeded();
     if (this.oidcRevokeStatus()==='sending' || this.oidcIdpRevokeStatus()==='sending') return;
-    if (!this.oidcSession || (this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying' || this.subscriberDeleteRetryStatus()==='retrying') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || (this.grantChangeStatus()==='sending'||this.resendPolicyBusy) || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
+    if (!this.oidcSession || (this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying' || this.subscriberDeleteRetryStatus()==='retrying') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || (this.grantChangeStatus()==='sending'||this.policyBusy) || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     const session=this.oidcSession;
     this.setSection(section);
     if (section === 'subscribers') { this.forgetKey(); this.credentialMode='jwt'; this.subscriberEnvironment=session.environmentId; this.apiKey=session.token; }
@@ -585,7 +588,7 @@ export class App implements OnDestroy {
 
   useOidcForPermissions(): void {
     this.expireOidcIfNeeded();
-    if (!this.oidcSession || this.decisionStatus()==='sending' || this.permissionChangeStatus()==='sending' || (this.grantChangeStatus()==='sending'||this.resendPolicyBusy)) return;
+    if (!this.oidcSession || this.decisionStatus()==='sending' || this.permissionChangeStatus()==='sending' || (this.grantChangeStatus()==='sending'||this.policyBusy)) return;
     const session=this.oidcSession;
     this.clearPermissions(true);this.permissionEnvironment=session.environmentId;this.permissionKey=session.token;
   }
@@ -605,7 +608,7 @@ export class App implements OnDestroy {
   }
 
   async lookupPermissionRequest():Promise<void> {
-    if(this.permissionChangeStatus()==='sending'||(this.grantChangeStatus()==='sending'||this.resendPolicyBusy))return;
+    if(this.permissionChangeStatus()==='sending'||(this.grantChangeStatus()==='sending'||this.policyBusy))return;
     this.expireOidcIfNeeded();this.clearPermissionRequest();const sequence=this.permissionRequestSequence;
     const key=this.permissionKey.trim(),env=this.permissionEnvironment.trim(),requestId=this.permissionRequestId.trim();
     if(!this.validJwt(key)||!this.validEnvironment(env)||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId)){this.permissionRequestStatus.set('error');return;}
@@ -629,7 +632,7 @@ export class App implements OnDestroy {
     this.activityAuditSequence++;this.activityAuditAbort?.abort();this.activityAuditAbort=null;this.activityAuditRows.set([]);this.activityAuditNext.set(null);this.activityAuditPage.set(1);this.activityAuditHistory=[null];this.activityAuditStatus.set('idle');
   }
   async loadActivityAudit(direction?:'next'|'previous'):Promise<void> {
-    this.expireOidcIfNeeded();if((this.grantChangeStatus()==='sending'||this.resendPolicyBusy)||this.permissionChangeStatus()==='sending')return;
+    this.expireOidcIfNeeded();if((this.grantChangeStatus()==='sending'||this.policyBusy)||this.permissionChangeStatus()==='sending')return;
     if(direction==='previous'&&this.activityAuditPage()<=1)return;
     const cursor=direction==='next'?this.activityAuditNext():direction==='previous'?this.activityAuditHistory[this.activityAuditPage()-2]:null;
     if((direction==='next'&&!cursor)||cursor===undefined)return;
@@ -659,7 +662,7 @@ export class App implements OnDestroy {
     this.grantAuditSequence++;this.grantAuditAbort?.abort();this.grantAuditAbort=null;this.grantAuditRows.set([]);this.grantAuditNext.set(null);this.grantAuditPage.set(1);this.grantAuditHistory=[null];this.grantAuditStatus.set('idle');
   }
   async loadGrantAudit(direction?:'next'|'previous'):Promise<void> {
-    this.expireOidcIfNeeded();if((this.grantChangeStatus()==='sending'||this.resendPolicyBusy)||this.permissionChangeStatus()==='sending')return;
+    this.expireOidcIfNeeded();if((this.grantChangeStatus()==='sending'||this.policyBusy)||this.permissionChangeStatus()==='sending')return;
     if(direction==='previous'&&this.grantAuditPage()<=1)return;
     const cursor=direction==='next'?this.grantAuditNext():direction==='previous'?this.grantAuditHistory[this.grantAuditPage()-2]:null;
     if((direction==='next'&&!cursor)||cursor===undefined)return;
@@ -695,7 +698,7 @@ export class App implements OnDestroy {
     if(clearInput)this.grantRequestId='';
   }
   clearGrantChange():void {
-    if((this.grantChangeStatus()==='sending'||this.resendPolicyBusy))return;
+    if((this.grantChangeStatus()==='sending'||this.policyBusy))return;
     this.grantChange.set(null);this.grantChangeStatus.set('idle');this.grantChanged.set(null);this.grantMessage.set('');
     this.grantReason='';this.grantConfirmed=false;this.grantSubmitConfirmed=false;this.grantRetryConfirmed=false;
   }
@@ -712,7 +715,7 @@ export class App implements OnDestroy {
     return {origin,key,environment,targetIssuer,targetSubject,targetClientId,resource,permission};
   }
   async loadGrant():Promise<void> {
-    if((this.grantChangeStatus()==='sending'||this.resendPolicyBusy)||this.permissionChangeStatus()==='sending')return;
+    if((this.grantChangeStatus()==='sending'||this.policyBusy)||this.permissionChangeStatus()==='sending')return;
     this.expireOidcIfNeeded();this.clearGrantRead();const sequence=this.grantSequence;
     const controller=new AbortController();this.grantAbort=controller;this.grantStatus.set('loading');
     try {
@@ -729,7 +732,7 @@ export class App implements OnDestroy {
   }
   canChangeGrant():boolean {
     const reason=this.grantReason.trim();
-    return !this.resendPolicyBusy&&this.grantChangeStatus()==='idle'&&this.permissionChangeStatus()!=='sending'&&this.grantStatus()==='loaded'&&this.grantValue()!==null&&this.grantConfirmed&&!!reason&&new TextEncoder().encode(reason).length<=1000;
+    return !this.policyBusy&&this.grantChangeStatus()==='idle'&&this.permissionChangeStatus()!=='sending'&&this.grantStatus()==='loaded'&&this.grantValue()!==null&&this.grantConfirmed&&!!reason&&new TextEncoder().encode(reason).length<=1000;
   }
   async changeGrant():Promise<void> {
     this.expireOidcIfNeeded();if(!this.canChangeGrant())return;
@@ -747,7 +750,7 @@ export class App implements OnDestroy {
     finally{this.grantReason='';this.grantConfirmed=false;this.clearGrantRead();}
   }
   async submitGrant():Promise<void> {
-    if(this.resendPolicyBusy)return;this.expireOidcIfNeeded();const snapshot=this.grantChange(),key=this.permissionKey.trim();
+    if(this.policyBusy)return;this.expireOidcIfNeeded();const snapshot=this.grantChange(),key=this.permissionKey.trim();
     if(!snapshot||this.grantChangeStatus()!=='prepared'||!this.grantSubmitConfirmed||!this.validJwt(key))return;
     this.grantChangeStatus.set('sending');this.grantMessage.set('');
     let sent=false;
@@ -767,7 +770,7 @@ export class App implements OnDestroy {
     this.grantChanged.set(value.changed);this.grantChangeStatus.set('recorded');
   }
   async retryGrant():Promise<void> {
-    if(this.resendPolicyBusy)return;this.expireOidcIfNeeded();const snapshot=this.grantChange(),key=this.permissionKey.trim();
+    if(this.policyBusy)return;this.expireOidcIfNeeded();const snapshot=this.grantChange(),key=this.permissionKey.trim();
     if(!snapshot||this.grantChangeStatus()!=='unknown'||!this.grantRetryConfirmed||!this.validJwt(key))return;
     this.grantChangeStatus.set('sending');this.grantMessage.set('');
     try {
@@ -778,7 +781,7 @@ export class App implements OnDestroy {
     finally{this.grantRetryConfirmed=false;if(this.grantChangeStatus()==='sending')this.grantChangeStatus.set('unknown');}
   }
   async lookupGrantRequest():Promise<void> {
-    if((this.grantChangeStatus()==='sending'||this.resendPolicyBusy)||this.permissionChangeStatus()==='sending')return;
+    if((this.grantChangeStatus()==='sending'||this.policyBusy)||this.permissionChangeStatus()==='sending')return;
     this.expireOidcIfNeeded();this.clearGrantRequest();const sequence=this.grantRequestSequence;
     const key=this.permissionKey.trim(),environment=this.permissionEnvironment.trim(),requestId=this.grantRequestId.trim(),scope=this.grantRequestScope;
     if(!this.validJwt(key)||!this.validEnvironment(environment)||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId)){this.grantRequestStatus.set('error');return;}
@@ -804,7 +807,7 @@ export class App implements OnDestroy {
   }
 
   async loadPermissions(mode:'identity'|'audit', next=false): Promise<void> {
-    if(this.permissionChangeStatus()==='sending'||(this.grantChangeStatus()==='sending'||this.resendPolicyBusy))return;
+    if(this.permissionChangeStatus()==='sending'||(this.grantChangeStatus()==='sending'||this.policyBusy))return;
     this.expireOidcIfNeeded();
     const cursor=next ? this.permissionNext() : null;
     if (next && (!cursor || mode!=='audit')) return;
@@ -856,7 +859,7 @@ export class App implements OnDestroy {
 
   canChangePermissions(): boolean {
     const reason=this.permissionReason.trim();
-    return !this.resendPolicyBusy && this.permissionChangeStatus()==='idle' && this.grantChangeStatus()!=='sending' && (this.permissionStatus()==='identity'||this.permissionStatus()==='missing') && this.permissionConfirmed && this.validJwt(this.permissionKey.trim()) && this.validEnvironment(this.permissionEnvironment.trim()) && !!reason && new TextEncoder().encode(reason).length<=1000;
+    return !this.policyBusy && this.permissionChangeStatus()==='idle' && this.grantChangeStatus()!=='sending' && (this.permissionStatus()==='identity'||this.permissionStatus()==='missing') && this.permissionConfirmed && this.validJwt(this.permissionKey.trim()) && this.validEnvironment(this.permissionEnvironment.trim()) && !!reason && new TextEncoder().encode(reason).length<=1000;
   }
 
   async changePermissions(): Promise<void> {
@@ -1145,7 +1148,7 @@ export class App implements OnDestroy {
     if(this.fcmBusy||this.slackBusy)return;
     if(this.oidcRevokeStatus()==='sending')return;
     if(this.sendgridWriteStatus()==='sending')return;
-    if (this.resendDecisionStatus()==='sending' || this.resendDecisionStatus()==='preparing' || this.slackDecisionBusy || this.twilioDecisionBusy || this.fcmReviewBusy || this.resendPolicyBusy || (this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying' || this.subscriberDeleteRetryStatus()==='retrying') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || (this.grantChangeStatus()==='sending'||this.resendPolicyBusy) || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
+    if (this.resendDecisionStatus()==='sending' || this.resendDecisionStatus()==='preparing' || this.slackDecisionBusy || this.twilioDecisionBusy || this.fcmReviewBusy || this.policyBusy || (this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying' || this.subscriberDeleteRetryStatus()==='retrying') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || (this.grantChangeStatus()==='sending'||this.policyBusy) || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     if (this.section()==='workflows' && next!=='workflows') {this.clearWorkflow(true);this.forgetWorkflowRequest();}
     if (this.section()==='channels' && next!=='channels') this.clearSendgrid(true);
     if (this.section() === 'subscribers' && next !== 'subscribers') this.forgetKey();
