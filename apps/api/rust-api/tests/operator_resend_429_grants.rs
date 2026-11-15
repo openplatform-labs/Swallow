@@ -66,7 +66,7 @@ async fn resend_429_grants_are_independent_conditional_and_audited() {
     let db = connect(&url).await;
     db.batch_execute("INSERT INTO public.novu_rust_environments VALUES ('grant-a','org'),('grant-b','org'); INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES ('https://issuer.test','admin','console','grant-a'),('https://issuer.test','target','console','grant-a'),('https://issuer.test','target','console','grant-b'); INSERT INTO public.novu_rust_operator_jwt_channel_access_grant_admins VALUES ('https://issuer.test','admin','console','grant-a',true,true)").await.unwrap();
     let role = format!("resend_grant_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_429_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_resend_429_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_resend_429_grant_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_resend_429_grant_audit_read(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_resend_429_resolve(text,text,text,text,bigint,uuid,uuid,uuid,text,text) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_429_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_resend_429_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_resend_429_grant_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_resend_429_grant_audit_read(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_resend_429_resolve(text,text,text,text,bigint,uuid,uuid,uuid,text,text),public.novu_rust_operator_jwt_resend_cooldown_health(text,text,text,text,bigint,integer) TO {role}")).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname::text=$1", &[&role]).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'grant-a',$1,'retry',oid FROM pg_roles WHERE rolname::text=$1", &[&role]).await.unwrap();
     let api = connect(&url).await;
@@ -134,6 +134,23 @@ async fn resend_429_grants_are_independent_conditional_and_audited() {
             .0,
         StatusCode::OK
     );
+    // The new cooldown permission is separately granted but uses the same audited administrator.
+    db.execute("INSERT INTO public.novu_rust_resend_cooldown_policies(environment_id,fallback_seconds) VALUES('grant-a',30)",&[]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'grant-a',$1,'alert_view',oid FROM pg_roles WHERE rolname::text=$1", &[&role]).await.unwrap();
+    let health="/v1/experimental/operator/resend-cooldown-health?environmentId=grant-a&graceSeconds=60";
+    assert_eq!(response(app.clone(),&jwt("target"),"GET",health,None).await.0,StatusCode::UNAUTHORIZED);
+    let health_read=format!("{path}&targetIssuer=https%3A%2F%2Fissuer.test&targetSubject=target&targetClientId=console&resource=resend-429&permission=cooldown-health");
+    assert_eq!(response(app.clone(),&token,"GET",&health_read,None).await.1,json!({"targetExists":true,"granted":false}));
+    let health_id=Uuid::new_v4();
+    let grant_health=json!({"requestId":health_id,"targetIssuer":"https://issuer.test","targetSubject":"target","targetClientId":"console","resource":"resend-429","permission":"cooldown-health","expected":false,"desired":true,"reason":"health monitoring"});
+    assert_eq!(response(app.clone(),&token,"PUT",path,Some(grant_health.clone())).await.1["changed"],true);
+    assert_eq!(response(app.clone(),&token,"PUT",path,Some(grant_health.clone())).await.1["replayed"],true);
+    assert_eq!(response(app.clone(),&jwt("target"),"GET",health,None).await.0,StatusCode::OK);
+    let mut stale=grant_health.clone();stale["requestId"]=json!(Uuid::new_v4());
+    assert_eq!(response(app.clone(),&token,"PUT",path,Some(stale)).await.0,StatusCode::CONFLICT);
+    let mut revoke_health=grant_health.clone();revoke_health["requestId"]=json!(Uuid::new_v4());revoke_health["expected"]=json!(true);revoke_health["desired"]=json!(false);
+    assert_eq!(response(app.clone(),&token,"PUT",path,Some(revoke_health)).await.0,StatusCode::OK);
+    assert_eq!(response(app.clone(),&jwt("target"),"GET",health,None).await.0,StatusCode::UNAUTHORIZED);
     let mut invalid = change.clone();
     invalid["requestId"] = json!(Uuid::new_v4());
     invalid["resource"] = json!("sendgrid");
@@ -170,7 +187,7 @@ async fn resend_429_grants_are_independent_conditional_and_audited() {
             .as_array()
             .unwrap()
             .len(),
-        2
+        4
     );
     let job = Uuid::new_v4();
     db.execute("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES ($1,'grant-a','experimental_resend_email','{}','failed')", &[&job]).await.unwrap();
