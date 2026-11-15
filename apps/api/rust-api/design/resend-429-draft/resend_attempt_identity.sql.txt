@@ -1,0 +1,3 @@
+-- Each new attempt gets a fresh identity. Existing attempts are backfilled.
+ALTER TABLE public.novu_rust_resend_attempts ADD COLUMN IF NOT EXISTS attempt_id uuid NOT NULL DEFAULT gen_random_uuid();
+ALTER TABLE public.novu_rust_delivery_reconciliations ADD COLUMN IF NOT EXISTS resend_attempt_id uuid;
