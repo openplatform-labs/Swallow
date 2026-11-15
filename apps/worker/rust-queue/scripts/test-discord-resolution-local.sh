@@ -19,3 +19,7 @@ cargo test --locked --features test-mocks --manifest-path "$WORKER/Cargo.toml" -
 "$TEST_PG_BIN/createdb" -h 127.0.0.1 -p "$PORT" -U postgres discord_health_test
 export TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/discord_health_test"
 cargo test --locked --features test-mocks --manifest-path "$WORKER/Cargo.toml" --test discord_health -- --ignored
+
+"$TEST_PG_BIN/createdb" -h 127.0.0.1 -p "$PORT" -U postgres discord_retry_health_test
+export TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/discord_retry_health_test"
+cargo test --locked --features test-mocks --manifest-path "$WORKER/Cargo.toml" --test discord_retry_health -- --ignored

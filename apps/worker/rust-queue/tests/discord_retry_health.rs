@@ -251,6 +251,88 @@ async fn retry_health_is_scoped_and_alerts_only_overdue_jobs() {
     let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
     assert_eq!(second["data"].as_array().unwrap().len(), 5);
     assert!(second["next"].is_null());
+    // Manual 429 decisions join diagnostics, without consuming automatic retry budget.
+    let manual_env = format!("manual-{}", Uuid::new_v4());
+    let manual_job = Uuid::new_v4();
+    let manual_id = Uuid::new_v4();
+    db.execute(
+        "INSERT INTO public.novu_rust_environments VALUES($1,'org')",
+        &[&manual_env],
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,$2,p,oid FROM pg_roles CROSS JOIN unnest(ARRAY['alert_view','alert_send']) p WHERE rolname::text=$2",&[&manual_env,&role]).await.unwrap();
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_resolve_discord(text,uuid,uuid,uuid,bigint,text,text) TO {role}")).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_discord_resolvers SELECT $1,rolname,oid,false,true FROM pg_roles WHERE rolname::text=$2",&[&manual_env,&role]).await.unwrap();
+    db.execute("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status,attempts) VALUES($1,$2,'experimental_discord_webhook',jsonb_build_object('destination','manual-dest','content','secret-payload'),'failed',1)",&[&manual_job,&manual_env]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_discord_attempts(job_id,environment_id,state,http_status,retry_after_seconds) VALUES($1,$2,'rejected',429,60)",&[&manual_job,&manual_env]).await.unwrap();
+    let row=db.query_one("SELECT a.revision,j.failure_revision FROM public.novu_rust_discord_attempts a JOIN public.novu_queue_jobs j ON j.id=a.job_id WHERE j.id=$1",&[&manual_job]).await.unwrap();
+    let rev: Uuid = row.get(0);
+    let failure: i64 = row.get(1);
+    assert!(
+        reader
+            .query_one(
+                "SELECT public.novu_rust_resolve_discord($1,$2,$3,$4,$5,'retry_after','reviewed')",
+                &[&manual_env, &manual_id, &manual_job, &rev, &failure]
+            )
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
+    let row = reader
+        .query_one(
+            "SELECT * FROM public.novu_rust_discord_retry_health($1,60)",
+            &[&manual_env],
+        )
+        .await
+        .unwrap();
+    assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1)), (1, 0));
+    let row = reader
+        .query_one(
+            "SELECT * FROM public.novu_rust_discord_retry_list($1,60,false,NULL)",
+            &[&manual_env],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(2), "manual-dest");
+    assert_eq!(row.get::<_, i64>(5), 1);
+    assert_eq!(row.get::<_, Option<i32>>(7), Some(60));
+    assert_eq!(
+        db.query_one(
+            "SELECT count(*) FROM public.novu_rust_discord_retry_history WHERE job_id=$1",
+            &[&manual_job]
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0),
+        0
+    );
+    db.execute("UPDATE public.novu_queue_jobs SET available_at=clock_timestamp()-interval '2 minutes' WHERE id=$1",&[&manual_job]).await.unwrap();
+    let row = reader
+        .query_one(
+            "SELECT * FROM public.novu_rust_discord_retry_health($1,60)",
+            &[&manual_env],
+        )
+        .await
+        .unwrap();
+    assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1)), (1, 1));
+    db.execute("INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES($1,'slack','blocked','rejected')",&[&manual_env]).await.unwrap();
+    let alert = Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"))
+        .env_clear()
+        .env("DATABASE_URL", role_url.as_str())
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
+        .env("SWALLOW_ALERT_DISCORD_RETRY_GRACE_SECONDS", "60")
+        .env("SWALLOW_ALERT_SCOPED_DELIVERY", "true")
+        .env(
+            "SWALLOW_ALERT_SLACK_WEBHOOK",
+            "https://hooks.slack.com/services/A/B/C",
+        )
+        .env("SWALLOW_ALERT_SLACK_TARGET_ID", "blocked")
+        .args([&manual_env, "300", "120", "60"])
+        .output()
+        .unwrap();
+    assert_eq!(alert.status.code(), Some(2));
     db.execute("DELETE FROM public.novu_rust_delivery_operator_grants WHERE environment_id=$1 AND database_principal::text=$2 AND decision='alert_view'",&[&env,&role]).await.unwrap();
     assert!(
         reader
