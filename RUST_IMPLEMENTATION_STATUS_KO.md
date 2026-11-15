@@ -1,4 +1,6 @@
-SMTP 불명 결과 판정 API: API 0132는 환경별 JWT 접수·재시도 권한과 API DB 로그인 권한을 모두 검사하고 판정 및 요청 재조회를 제공한다. JWT별 요청 ID를 분리하며 시도 revision 충돌과 감사 저장 실패 시 판정을 롤백한다. 제한 API DB 로그인·서명 테스트 JWT·격리 로컬 PostgreSQL에서 권한 회수, 환경 격리, 서로 다른 JWT의 동일 요청 ID, 재시도 및 롤백을 검증했다. DB와 JWT 권한은 DBA가 별도로 설정한다. 관리 UI·권한 위임과 실제 IdP·외부 발송·운영 HA는 미구현 또는 미검증이다. [API README](apps/api/rust-api/README.md)를 참고한다.
+SMTP 판정 관리 화면: Angular 경보 화면에서 결과 불명 시도에 릴레이 접수 또는 재발송을 선택하고 사유·확인 후 요청하며, 요청 ID와 판정 유형으로 결과를 조회한다. 응답 불명 시 원래 인증 정보로 동일 요청을 재제출할 수 있다. 로컬 PostgreSQL·제한 API DB 로그인·서명 테스트 JWT·실제 Rust API와 브라우저에서 두 선택, 요청 조회 및 DB 상태를 확인했다. 첫 브라우저 시험의 선택자 문법을 수정한 뒤 통과했고 Angular 테스트 276건 및 빌드가 통과했다. 빌드 크기 경고가 있다. 판정 권한의 UI 위임과 이력 화면, 실제 릴레이·IdP·운영 HA는 미구현 또는 미검증이다. [대시보드 README](apps/dashboard/swallow/README.md)를 참고한다.
+
+SMTP 불명 결과 판정 API: API 0132는 환경별 JWT 접수·재시도 권한과 API DB 로그인 권한을 모두 검사하고 판정 및 요청 재조회를 제공한다. JWT별 요청 ID를 분리하며 시도 revision 충돌과 감사 저장 실패 시 판정을 롤백한다. 제한 API DB 로그인·서명 테스트 JWT·격리 로컬 PostgreSQL에서 권한 회수, 환경 격리, 서로 다른 JWT의 동일 요청 ID, 재시도 및 롤백을 검증했다. DB와 JWT 권한은 DBA가 별도로 설정한다. 관리 UI는 위 최신 항목을 참고하며 권한 위임과 실제 IdP·외부 발송·운영 HA는 미구현 또는 미검증이다. [API README](apps/api/rust-api/README.md)를 참고한다.
 
 SMTP 판정 이력 조회: 워커 0222와 `smtp-resolution-history` CLI는 판정 권한과 독립된 환경별 DB 조회 권한을 사용해 작업별 판정과 사유를 페이지로 제공한다. 제한 로그인·격리 로컬 PostgreSQL에서 환경 격리, 직접 테이블 접근 거절, 같은 시각의 103건 페이지, CLI 커서와 권한 회수를 검증했다. SMTP 판정 및 실제 워커·모의 릴레이 재시도 회귀도 통과했다. 동시 커밋의 완전한 수집과 위변조 방지는 보장하지 않으며 초기 권한은 DBA가 설정한다. HTTP·UI와 운영 HA는 미구현 또는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
