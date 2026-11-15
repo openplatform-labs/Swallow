@@ -229,6 +229,85 @@ async fn discord_grants_are_independent_conditional_and_audited() {
         response(app.clone(), &target, "GET", &jobs, None).await.0,
         StatusCode::OK
     );
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_discord_cooldown_health(text,text,text,text,bigint,integer) TO {role}")).await.unwrap();
+    let cooldown = format!(
+        "/v1/experimental/operator/discord-cooldown-health?environmentId={env}&graceSeconds=60"
+    );
+    let read_cooldown = read.replace("permission=health", "permission=cooldown-health");
+    assert_eq!(
+        response(app.clone(), &target, "GET", &cooldown, None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        response(app.clone(), &token, "GET", &read_cooldown, None)
+            .await
+            .1,
+        json!({"targetExists":true,"granted":false})
+    );
+    let new_id = Uuid::new_v4();
+    let grant = json!({"requestId":new_id,"targetIssuer":"https://issuer.test","targetSubject":"target","targetClientId":"console","resource":"discord-retry","permission":"cooldown-health","expected":false,"desired":true,"reason":"cooldown access"});
+    let (first, second) = tokio::join!(
+        response(app.clone(), &token, "PUT", &path, Some(grant.clone())),
+        response(app2.clone(), &token, "PUT", &path, Some(grant.clone()))
+    );
+    assert_eq!((first.0, second.0), (StatusCode::OK, StatusCode::OK));
+    assert_ne!(first.1["replayed"], second.1["replayed"]);
+    assert_eq!(
+        response(app.clone(), &target, "GET", &cooldown, None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let mut conflict = grant.clone();
+    conflict["desired"] = false.into();
+    assert_eq!(
+        response(app.clone(), &token, "PUT", &path, Some(conflict))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    let mut revoke_cooldown = grant.clone();
+    revoke_cooldown["requestId"] = Uuid::new_v4().to_string().into();
+    revoke_cooldown["expected"] = true.into();
+    revoke_cooldown["desired"] = false.into();
+    db.batch_execute("CREATE FUNCTION public.test_cooldown_grant_reject() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'audit unavailable'; END $$; CREATE TRIGGER test_cooldown_grant_reject BEFORE INSERT ON public.novu_rust_operator_jwt_discord_retry_grant_audit FOR EACH ROW EXECUTE FUNCTION public.test_cooldown_grant_reject()").await.unwrap();
+    assert_eq!(
+        response(
+            app.clone(),
+            &token,
+            "PUT",
+            &path,
+            Some(revoke_cooldown.clone())
+        )
+        .await
+        .0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        response(app.clone(), &target, "GET", &cooldown, None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    db.batch_execute("DROP TRIGGER test_cooldown_grant_reject ON public.novu_rust_operator_jwt_discord_retry_grant_audit; DROP FUNCTION public.test_cooldown_grant_reject()").await.unwrap();
+    assert_eq!(
+        response(app.clone(), &token, "PUT", &path, Some(revoke_cooldown))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        response(app.clone(), &target, "GET", &cooldown, None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        response(app.clone(), &target, "GET", &jobs, None).await.0,
+        StatusCode::OK
+    );
     let revoke = json!({"requestId":Uuid::new_v4(),"targetIssuer":"https://issuer.test","targetSubject":"target","targetClientId":"console","resource":"discord-retry","permission":"health","expected":true,"desired":false,"reason":"done"});
     db.batch_execute("CREATE FUNCTION public.test_retry_grant_reject() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test audit failure'; END $$; CREATE TRIGGER test_retry_grant_reject BEFORE INSERT ON public.novu_rust_operator_jwt_discord_retry_grant_audit FOR EACH ROW EXECUTE FUNCTION public.test_retry_grant_reject()").await.unwrap();
     assert_eq!(
