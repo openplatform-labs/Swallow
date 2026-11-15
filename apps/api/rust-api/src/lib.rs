@@ -380,6 +380,7 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/fcm-integrations/{identifier}", get(fcm_integrations::get).patch(fcm_integrations::update))
         .route("/v1/experimental/workflows/{workflow}/channel-steps/{channel}", get(channel_workflow_management::get).put(channel_workflow_management::put))
         .route("/v1/experimental/slack-integrations", get(slack_integrations::list_integrations).post(slack_integrations::create_integration))
+        .route("/v1/experimental/slack-integration-audit", get(slack_integrations::audit))
         .route("/v1/experimental/slack-integrations/{integration}", get(slack_integrations::get_integration).delete(slack_integrations::delete_integration))
         .route("/v1/experimental/slack-integrations/{integration}/connections", get(slack_integrations::list_connections).post(slack_integrations::create_connection))
         .route("/v1/experimental/slack-integrations/{integration}/connections/{connection}", get(slack_integrations::get_connection).delete(slack_integrations::delete_connection))

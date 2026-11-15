@@ -68,6 +68,11 @@ async fn slack_metadata_is_scoped_audited_and_safe_to_delete() {
             }
         }
     }
+    db.batch_execute(include_str!(
+        "../migrations/0074_slack_integration_audit_access.sql"
+    ))
+    .await
+    .unwrap();
     db.batch_execute("INSERT INTO public.novu_rust_users VALUES ('u'); INSERT INTO public.novu_rust_environments VALUES ('a','org'),('b','org'); INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id) VALUES ('a','alice','alice-id')").await.unwrap();
     let hash = |s: &[u8]| format!("{:x}", Sha256::digest(s));
     let (a, b, read) = (hash(b"a-key"), hash(b"b-key"), hash(b"read-key"));
@@ -230,9 +235,59 @@ async fn slack_metadata_is_scoped_audited_and_safe_to_delete() {
         StatusCode::CONFLICT
     );
     assert_eq!(setup.query_one("SELECT count(*) FROM public.novu_rust_slack_integration_audit WHERE environment_id='a'",&[]).await.unwrap().get::<_,i64>(0),2);
+    let audit_path = "/v1/experimental/slack-integration-audit";
+    assert_eq!(
+        call(app.clone(), "GET", audit_path, "a-key", Value::Null)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    setup.execute("INSERT INTO public.novu_rust_slack_integration_permissions VALUES ($1,'audit'),($2,'audit')",&[&a,&b]).await.unwrap();
+    let (status, audit) = call(app.clone(), "GET", audit_path, "a-key", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(audit["data"].as_array().unwrap().len(), 2);
+    assert!(
+        audit["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|v| v["integrationIdentifier"] == "main" && v.get("keyHash").is_none())
+    );
+    assert_eq!(
+        call(app.clone(), "GET", audit_path, "b-key", Value::Null)
+            .await
+            .1["data"],
+        json!([])
+    );
+    assert_eq!(
+        call(
+            app.clone(),
+            "GET",
+            &format!("{audit_path}?after=bad"),
+            "a-key",
+            Value::Null
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    setup.execute("INSERT INTO public.novu_rust_slack_integration_audit(id,environment_id,integration_identifier,action,key_hash,user_id) SELECT gen_random_uuid(),'a','main','create',$1,'u' FROM generate_series(1,101)",&[&a]).await.unwrap();
+    let (_, page) = call(app.clone(), "GET", audit_path, "a-key", Value::Null).await;
+    assert_eq!(page["data"].as_array().unwrap().len(), 100);
+    let cursor = page["nextCursor"].as_str().unwrap();
+    let (_, page) = call(
+        app.clone(),
+        "GET",
+        &format!("{audit_path}?after={cursor}"),
+        "a-key",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(page["data"].as_array().unwrap().len(), 3);
+    assert!(page["nextCursor"].is_null());
     // The restricted API DB login cannot read permissions or audit entries.
     let role = format!("slack_meta_{}", uuid::Uuid::new_v4().simple());
-    setup.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT SELECT ON public.novu_rust_users,public.novu_rust_api_keys,public.novu_rust_slack_endpoint_integrations,public.novu_rust_slack_endpoint_connections TO {role}; GRANT INSERT,DELETE ON public.novu_rust_slack_endpoint_integrations,public.novu_rust_slack_endpoint_connections TO {role}; GRANT INSERT ON public.novu_rust_slack_integration_audit TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_lock_slack_integration_grant(text,text,text) TO {role}")).await.unwrap();
+    setup.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT SELECT ON public.novu_rust_users,public.novu_rust_api_keys,public.novu_rust_slack_endpoint_integrations,public.novu_rust_slack_endpoint_connections TO {role}; GRANT INSERT,DELETE ON public.novu_rust_slack_endpoint_integrations,public.novu_rust_slack_endpoint_connections TO {role}; GRANT INSERT ON public.novu_rust_slack_integration_audit TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_lock_slack_integration_grant(text,text,text),public.novu_rust_slack_integration_audit_list(text,text,uuid) TO {role}")).await.unwrap();
     let (limited, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move {
         let _ = driver.await;
@@ -260,6 +315,19 @@ async fn slack_metadata_is_scoped_audited_and_safe_to_delete() {
             .is_err()
     );
     let limited_app = novu_rust_api::router_with_subscriber_secret(Arc::new(limited), None);
+    assert_eq!(
+        call(limited_app.clone(), "GET", audit_path, "a-key", Value::Null)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    setup.execute("DELETE FROM public.novu_rust_slack_integration_permissions WHERE key_hash=$1 AND permission='audit'",&[&a]).await.unwrap();
+    assert_eq!(
+        call(limited_app.clone(), "GET", audit_path, "a-key", Value::Null)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
     assert_eq!(
         call(
             limited_app.clone(),
