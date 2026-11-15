@@ -96,6 +96,29 @@ async fn run(
                 continue;
             }
         }
+        match tokio::time::timeout(
+            timeout,
+            novu_postgres_queue::projection_policy::register(
+                &db,
+                &environment,
+                "resend",
+                require_full_scan,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => {
+                driver.abort();
+                return Err("projection workers have different heartbeat policies".into());
+            }
+            _ => {
+                driver.abort();
+                eprintln!("projection policy registration failed; retrying");
+                stop.wait(Duration::from_secs(2)).await;
+                continue;
+            }
+        }
         loop {
             if stop.requested() {
                 break;

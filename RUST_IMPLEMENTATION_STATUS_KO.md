@@ -1,3 +1,9 @@
+## 집계 워커의 heartbeat 정책 일치
+
+워커 `0151`은 SendGrid·Resend·Twilio 각각에 대해 같은 환경의 신규 집계 워커가 동일한 전체 순회 정책을 등록하도록 한다. 사용자는 기존처럼 엄격 또는 일반 정책을 선택할 수 있으며, 다른 정책을 가진 신규 워커는 집계를 시작하기 전에 종료한다. 채널과 환경은 독립적이다. 정책 변경은 모든 해당 워커를 중지한 뒤 신뢰된 관리자가 등록 행과 기존 heartbeat를 정리하고 선택한 동일 설정으로 재시작해야 한다. 예전 워커와 직접 DB 변경은 보호를 우회한다. DB 권한과 배포 절차는 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
+임시 PostgreSQL 17과 실제 세 집계 워커에서 잠긴 작업의 엄격 heartbeat 억제, 서로 다른 정책의 기동 거절, 잠금 해제 후 복구를 확인했다. 세 워커의 실행 중 종료와 재시작 회귀 테스트 및 SendGrid 서명 테스트 웹훅도 통과했다. 테스트 DB 계정은 관리자이며 실제 공급자·운영 다중 호스트 장애 전환과 부하는 검증하지 않았다. Docker 저장소가 읽기 전용이어서 로컬 DB를 사용했다.
+
 ## SendGrid IP 풀 선택
 
 SendGrid 워커의 `NOVU_SENDGRID_IP_POOL_NAME`으로 기본 IP 풀을 선택할 수 있다. 트리거의 `overrides.email.ipPoolName`, `overrides.sendgrid.ipPoolName`, `overrides.providers.sendgrid.ipPoolName`, 해당 단계의 `overrides.steps.<stepId>.providers.sendgrid.ipPoolName`은 차례로 앞 설정을 덮는다. 이메일 채널 값이 빈 문자열이면 워커 기본값을 사용한다. 공급자 또는 단계 override가 빈 문자열을 명시하면 원본처럼 빈 값을 공급자에 전달한다. 설정이 없으면 공급자 요청과 작업 payload에서 풀 필드를 생략한다. override 사용 전 모든 SendGrid 워커를 업데이트해야 한다. 풀의 유효성·권한과 실제 전송 가능 여부는 SendGrid가 판단한다. 이 구현은 다른 공급자에 IP 풀을 적용하지 않는다.

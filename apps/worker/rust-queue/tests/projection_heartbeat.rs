@@ -25,6 +25,7 @@ async fn strict_heartbeat_waits_for_skipped_jobs_in_each_channel() {
     db.batch_execute("CREATE TABLE novu_rust_environments(id text PRIMARY KEY,organization_id text NOT NULL); INSERT INTO novu_rust_environments VALUES ('resend','org'),('twilio','org')").await.unwrap();
     for sql in [
         queue::MIGRATION,
+        queue::projection_policy::MIGRATION,
         queue::resend_queue::MIGRATION,
         queue::resend_queue::RECIPIENT_MIGRATION,
         queue::in_app::EMAIL_MESSAGES_MIGRATION,
@@ -132,6 +133,45 @@ async fn strict_heartbeat_waits_for_skipped_jobs_in_each_channel() {
         assert!(
             skipped && worker.0.try_wait().unwrap().is_none(),
             "{name} did not skip locked job"
+        );
+        assert!(
+            queue::projection_policy::register(&observer, name, name, true)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !queue::projection_policy::register(&observer, name, name, false)
+                .await
+                .unwrap()
+        );
+        let mut conflicting = Command::new(bin)
+            .env("DATABASE_URL", &url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env(env_key, name)
+            .env(full_key, "false")
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut finished = false;
+        for _ in 0..100 {
+            if conflicting.try_wait().unwrap().is_some() {
+                finished = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if !finished {
+            let _ = conflicting.kill();
+            let _ = conflicting.wait();
+            panic!("conflicting projection worker did not stop");
+        }
+        let conflicting = conflicting.wait_with_output().unwrap();
+        assert!(
+            !conflicting.status.success(),
+            "{name} accepted conflicting policy"
+        );
+        assert!(
+            String::from_utf8_lossy(&conflicting.stderr).contains("different heartbeat policies")
         );
         let exists: bool = observer
             .query_one(

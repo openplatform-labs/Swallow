@@ -57,6 +57,7 @@ async fn signed_events_update_current_recipient_and_job_results() {
     for sql in [
         novu_rust_api::MIGRATION,
         novu_postgres_queue::MIGRATION,
+        novu_postgres_queue::projection_policy::MIGRATION,
         novu_postgres_queue::in_app::EMAIL_MESSAGES_MIGRATION,
         novu_postgres_queue::sendgrid_queue::MIGRATION,
         novu_postgres_queue::sendgrid_queue::DISPATCH_ID_MIGRATION,
@@ -387,6 +388,7 @@ async fn signed_events_update_current_recipient_and_job_results() {
     }
     assert!(reconnected && worker.0.try_wait().unwrap().is_none());
     drop(worker);
+    db.execute("DELETE FROM novu_rust_projection_worker_policy WHERE environment_id='env-a' AND provider='sendgrid'", &[]).await.unwrap();
     // A strict heartbeat must not advance when a locked row is skipped.
     db.execute(
         "DELETE FROM novu_rust_sendgrid_projection_heartbeat WHERE environment_id='env-a'",
@@ -444,6 +446,30 @@ async fn signed_events_update_current_recipient_and_job_results() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(observed_skip && strict.0.try_wait().unwrap().is_none());
+    let mut conflicting = Command::new(std::env::var("TEST_SENDGRID_PROJECTION_BIN").unwrap())
+        .env("DATABASE_URL", &url)
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .env("NOVU_SENDGRID_ENVIRONMENT_ID", "env-a")
+        .env("NOVU_SENDGRID_PROJECTION_REQUIRE_FULL_SCAN", "false")
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut finished = false;
+    for _ in 0..100 {
+        if conflicting.try_wait().unwrap().is_some() {
+            finished = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if !finished {
+        let _ = conflicting.kill();
+        let _ = conflicting.wait();
+        panic!("conflicting projection worker did not stop");
+    }
+    let conflicting = conflicting.wait_with_output().unwrap();
+    assert!(!conflicting.status.success());
+    assert!(String::from_utf8_lossy(&conflicting.stderr).contains("different heartbeat policies"));
     assert!(!observer.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_sendgrid_projection_heartbeat WHERE environment_id='env-a')", &[]).await.unwrap().get::<_,bool>(0));
     lock.rollback().await.unwrap();
     let mut complete = false;
