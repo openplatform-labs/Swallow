@@ -21,7 +21,12 @@ struct IntegrationConfig {
 }
 
 // PEM and JSON may contain newlines. Never include a path or value in errors.
-fn multiline_secret(name: &str, file_name: &str, limit: u64) -> Result<Option<String>, io::Error> {
+fn multiline_secret(
+    name: &str,
+    file_name: &str,
+    limit: u64,
+    regular_only: bool,
+) -> Result<Option<String>, io::Error> {
     let inline = match std::env::var(name) {
         Ok(value) => Some(value),
         Err(std::env::VarError::NotPresent) => None,
@@ -37,6 +42,13 @@ fn multiline_secret(name: &str, file_name: &str, limit: u64) -> Result<Option<St
     let bytes = match (inline, path) {
         (Some(value), None) => value.into_bytes(),
         (None, Some(path)) => {
+            if regular_only {
+                return novu_rust_contracts::secret::read_regular_multiline_file(
+                    std::path::Path::new(&path),
+                    limit,
+                )
+                .map(Some);
+            }
             let mut bytes = Vec::new();
             File::open(path)
                 .map_err(|_| io::Error::other("secret file unavailable"))?
@@ -149,6 +161,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 async fn run(
     stop: novu_postgres_queue::shutdown::Stop,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let regular_only = match std::env::var("SWALLOW_SECRET_REGULAR_FILES_ONLY").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid secret file policy".into()),
+    };
     let step_policy = novu_postgres_queue::push_step_policy::Policy::from_env()?;
     let preference_policy = novu_postgres_queue::push_step_policy::PreferencePolicy::from_env()?;
     let target_policy = novu_postgres_queue::push_step_policy::TargetPolicy::from_env()?;
@@ -267,6 +284,7 @@ async fn run(
             "NOVU_FCM_INTEGRATIONS",
             "NOVU_FCM_INTEGRATIONS_FILE",
             1_048_576,
+            regular_only,
         )?
     };
     let mut integrations_hash = integrations_raw.as_ref().map(|raw| {
@@ -305,8 +323,13 @@ async fn run(
             Fcm::with_service_account(
                 &project,
                 std::env::var("NOVU_FCM_CLIENT_EMAIL")?,
-                &multiline_secret("NOVU_FCM_PRIVATE_KEY", "NOVU_FCM_PRIVATE_KEY_FILE", 65_536)?
-                    .ok_or("FCM private key required")?,
+                &multiline_secret(
+                    "NOVU_FCM_PRIVATE_KEY",
+                    "NOVU_FCM_PRIVATE_KEY_FILE",
+                    65_536,
+                    regular_only,
+                )?
+                .ok_or("FCM private key required")?,
             )?
         };
         (Some(provider), None)

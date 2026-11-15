@@ -253,3 +253,56 @@ fn fanout_timeout_isolates_actual_alert_command_blocked_on_fifo() {
     assert!(stderr.contains("slack missing: failed"));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn fcm_regular_file_policy_rejects_nonreloadable_multiline_fifo_secrets() {
+    let dir = std::env::temp_dir().join(format!("swallow-fcm-multiline-fifo-{}", Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let fifo = dir.join("private");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    for variable in ["NOVU_FCM_PRIVATE_KEY_FILE", "NOVU_FCM_INTEGRATIONS_FILE"] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_fcm-worker"))
+            .env_clear()
+            .env("SWALLOW_SECRET_REGULAR_FILES_ONLY", "true")
+            .env("NOVU_FCM_ENVIRONMENT_ID", "fixture")
+            .env("NOVU_FCM_PROJECT_ID", "fixture")
+            .env("NOVU_FCM_CLIENT_EMAIL", "fixture@example.test")
+            .env(variable, &fifo)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(!status.success());
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("FCM blocked on FIFO {variable}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let output = child.wait_with_output().unwrap();
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("invalid secret file type"), "{error}");
+        assert!(!error.contains(dir.to_str().unwrap()));
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_fcm-worker"))
+        .env_clear()
+        .env("SWALLOW_SECRET_REGULAR_FILES_ONLY", "invalid")
+        .env("NOVU_FCM_ENVIRONMENT_ID", "fixture")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid secret file policy"));
+    std::fs::remove_dir_all(dir).unwrap();
+}

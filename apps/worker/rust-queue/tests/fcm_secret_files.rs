@@ -70,6 +70,7 @@ async fn worker_supports_token_pem_and_integration_files() {
         .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
         .env("NOVU_FCM_ENVIRONMENT_ID", "env")
         .env("NOVU_FCM_PROJECT_ID", "project-a")
+        .env_remove("SWALLOW_SECRET_REGULAR_FILES_ONLY")
         .env_remove("NOVU_FCM_INTEGRATIONS")
         .env_remove("NOVU_FCM_INTEGRATIONS_FILE")
         .env_remove("NOVU_FCM_ACCESS_TOKEN")
@@ -91,7 +92,12 @@ async fn worker_supports_token_pem_and_integration_files() {
         .stderr(Stdio::piped());
         c
     };
-    for mode in 0..4 {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&key, fixture.0.join("key-link")).unwrap();
+        std::os::unix::fs::symlink(&integrations, fixture.0.join("integrations-link")).unwrap();
+    }
+    for mode in 0..if cfg!(unix) { 6 } else { 4 } {
         let mut c = command();
         match mode {
             0 => {
@@ -104,9 +110,20 @@ async fn worker_supports_token_pem_and_integration_files() {
             2 => {
                 c.env("NOVU_FCM_INTEGRATIONS_FILE", &integrations);
             }
-            _ => {
+            3 => {
                 c.env("NOVU_FCM_ACCESS_TOKEN_FILE", &token)
                     .env("SWALLOW_FCM_ALLOW_SHARED_PROVIDER", "true");
+            }
+            4 => {
+                c.env("SWALLOW_SECRET_REGULAR_FILES_ONLY", "true")
+                    .env("NOVU_FCM_CLIENT_EMAIL", "example@example.test")
+                    .env("NOVU_FCM_PRIVATE_KEY_FILE", fixture.0.join("key-link"));
+            }
+            _ => {
+                c.env("SWALLOW_SECRET_REGULAR_FILES_ONLY", "true").env(
+                    "NOVU_FCM_INTEGRATIONS_FILE",
+                    fixture.0.join("integrations-link"),
+                );
             }
         }
         let mut child = c.spawn().unwrap();
