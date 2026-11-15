@@ -215,6 +215,7 @@ exit 9
     assert_eq!(out.status.code(), Some(1));
     for invalid in [
         serde_json::json!({"channel":"email","id":"x","provider":"smtp","to":"one@example.test","from":"sender@example.test","smtp_host":"smtp.example.test","smtp_tls":"plain"}),
+        serde_json::json!({"channel":"email","id":"x","provider":"smtp","to":"one@example.test","from":"sender@example.test","smtp_host":"smtp.example.test","smtp_tls":"none","smtp_ca_file":"/tmp/ca"}),
         serde_json::json!({"channel":"email","id":"x","provider":"smtp","to":"one@example.test","from":"sender@example.test","smtp_host":"smtp.example.test","smtp_username":"user"}),
     ] {
         std::fs::write(

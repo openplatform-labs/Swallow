@@ -33,10 +33,10 @@ impl SmtpAlert {
                 .filter(|v| *v > 0)
                 .ok_or("invalid SMTP port")?,
             Err(std::env::VarError::NotPresent) => {
-                if tls == "tls" {
-                    465
-                } else {
-                    587
+                match tls.as_str() {
+                    "tls" => 465,
+                    "none" => 25,
+                    _ => 587,
                 }
             }
             Err(_) => return Err("invalid SMTP port".into()),
@@ -96,7 +96,11 @@ impl SmtpAlert {
         {
             return Err("invalid SMTP credentials".into());
         }
+        if tls == "none" && ca_pem.is_some() {
+            return Err("SMTP CA requires TLS".into());
+        }
         let mut builder = match tls.as_str() {
+            "none" => AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&host),
             "tls" => AsyncSmtpTransport::<Tokio1Executor>::relay(&host)?,
             "starttls" => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&host)?,
             _ => return Err("invalid SMTP TLS mode".into()),
@@ -505,7 +509,7 @@ mod tests {
                 }
                 content
             });
-            let transport = SmtpAlert::test_transport("127.0.0.1".into(), port);
+            let transport = SmtpAlert::new("127.0.0.1".into(), port, "none".into(), "sender@example.test".into(), None, None, None).unwrap();
             let result = transport
                 .send("ops@example.test", "fixture alert".into())
                 .await;
@@ -514,6 +518,37 @@ mod tests {
             assert!(content.contains("fixture alert"));
             assert!(content.contains("Swallow delivery alert"));
         }
+    }
+    #[tokio::test]
+    async fn explicit_plain_smtp_auth_and_message_reach_local_relay() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            let mut reader = BufReader::new(reader); let mut line = String::new();
+            writer.write_all(b"220 localhost ESMTP\r\n").await.unwrap();
+            reader.read_line(&mut line).await.unwrap(); assert!(line.starts_with("EHLO"));
+            writer.write_all(b"250-localhost\r\n250 AUTH PLAIN\r\n").await.unwrap();
+            line.clear(); reader.read_line(&mut line).await.unwrap();
+            let encoded = line.trim().strip_prefix("AUTH PLAIN ").unwrap();
+            assert_eq!(STANDARD.decode(encoded).unwrap(), b"\0fixture-user\0fixture-secret");
+            writer.write_all(b"235 authenticated\r\n").await.unwrap();
+            loop {
+                line.clear(); if reader.read_line(&mut line).await.unwrap() == 0 { break; }
+                if line.starts_with("MAIL FROM") || line.starts_with("RCPT TO") {writer.write_all(b"250 OK\r\n").await.unwrap();}
+                else if line.starts_with("DATA") {
+                    writer.write_all(b"354 Continue\r\n").await.unwrap();
+                    loop {line.clear();reader.read_line(&mut line).await.unwrap();if line==".\r\n" {break;}}
+                    writer.write_all(b"250 queued\r\n").await.unwrap();break;
+                } else {panic!("unexpected SMTP command");}
+            }
+        });
+        let smtp = SmtpAlert::new("127.0.0.1".into(),port,"none".into(),"sender@example.test".into(),Some("fixture-user".into()),Some("fixture-secret".into()),None).unwrap();
+        smtp.send("ops@example.test", "fixture alert".into()).await.unwrap();
+        server.await.unwrap();
+        assert!(SmtpAlert::new("127.0.0.1".into(),port,"none".into(),"sender@example.test".into(),None,None,Some("irrelevant".into())).is_err());
     }
     #[tokio::test]
     async fn starttls_downgrade_rejects_without_auth_or_message() {

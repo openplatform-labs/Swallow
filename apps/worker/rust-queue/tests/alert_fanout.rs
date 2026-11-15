@@ -644,3 +644,34 @@ async fn smtp_private_ca_delivers_an_alert_and_preserves_cooldown() {
     assert_eq!(count, 1);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires fully migrated disposable PostgreSQL"]
+async fn explicit_plain_smtp_fanout_records_relay_acceptance() {
+    use std::io::{BufRead, BufReader, Write};
+    let url=std::env::var("TEST_DATABASE_URL").unwrap();
+    let (db,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(async move {driver.await.unwrap()});
+    let env=format!("smtp-plain-{}",Uuid::new_v4().simple());
+    db.execute("INSERT INTO novu_rust_environments VALUES ($1,'org')",&[&env]).await.unwrap();
+    db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,rolname,'alert_send',oid FROM pg_roles WHERE rolname=session_user",&[&env]).await.unwrap();
+    let job=Uuid::new_v4();novu_postgres_queue::enqueue(&db,job,&env,"fixture",&serde_json::json!({})).await.unwrap();
+    db.execute("UPDATE novu_queue_jobs SET available_at=clock_timestamp()-interval '5 minutes' WHERE id=$1",&[&job]).await.unwrap();
+    let dir=std::env::temp_dir().join(format!("swallow-smtp-plain-{}",Uuid::new_v4()));std::fs::create_dir(&dir).unwrap();
+    let config=dir.join("targets.json");let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();let port=listener.local_addr().unwrap().port();
+    std::fs::write(&config,serde_json::to_vec(&serde_json::json!({"targets":[{"channel":"email","id":"smtp-plain","provider":"smtp","to":"ops@example.test","from":"sender@example.test","smtp_host":"127.0.0.1","smtp_port":port,"smtp_tls":"none"}]})).unwrap()).unwrap();
+    let server=std::thread::spawn(move || {
+        let (mut stream,_)=listener.accept().unwrap();stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut reader=BufReader::new(stream.try_clone().unwrap());let mut line=String::new();stream.write_all(b"220 local ESMTP\r\n").unwrap();
+        reader.read_line(&mut line).unwrap();assert!(line.starts_with("EHLO"));stream.write_all(b"250 localhost\r\n").unwrap();
+        loop {line.clear();reader.read_line(&mut line).unwrap();
+            if line.starts_with("MAIL FROM")||line.starts_with("RCPT TO") {stream.write_all(b"250 OK\r\n").unwrap();}
+            else if line.starts_with("DATA") {stream.write_all(b"354 Continue\r\n").unwrap();break;}
+            else {panic!("unexpected SMTP command");}}
+        let mut body=String::new();loop {line.clear();reader.read_line(&mut line).unwrap();if line==".\r\n" {break;}body.push_str(&line);}
+        stream.write_all(b"250 queued\r\n").unwrap();assert!(body.contains("Swallow delivery alert"));
+    });
+    let output=Command::new(env!("CARGO_BIN_EXE_alert-fanout")).args(["delivery",&env,"300","120","60"]).arg(&config).env("DATABASE_URL",&url).env("NOVU_POSTGRES_ALLOW_INSECURE","true").env("SWALLOW_ALERT_RESEND_ENABLED","false").env("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS","60").env("SWALLOW_ALERT_OPERATION_TIMEOUT_SECONDS","5").env_remove("SWALLOW_ALERT_SCOPED_DELIVERY").env_remove("SWALLOW_ALERT_CHECK_SCOPED_ACCESS").env_remove("SWALLOW_ALERT_BINDING_KEY").env_remove("SWALLOW_ALERT_BINDING_KEY_FILE").output().unwrap();
+    assert_eq!(output.status.code(),Some(0),"{}",String::from_utf8_lossy(&output.stderr));server.join().unwrap();
+    let state:String=db.query_one("SELECT state FROM novu_rust_alert_delivery_slots WHERE environment_id=$1 AND channel='email' AND target_id='smtp-plain'",&[&env]).await.unwrap().get(0);assert_eq!(state,"accepted");
+    std::fs::remove_dir_all(dir).unwrap();
+}

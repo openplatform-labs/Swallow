@@ -285,7 +285,8 @@ impl Target {
                                     && smtp_port.is_none_or(|v| v > 0)
                                     && smtp_tls
                                         .as_ref()
-                                        .is_none_or(|v| v == "tls" || v == "starttls")
+                                        .is_none_or(|v| v == "tls" || v == "starttls" || v == "none")
+                                    && !(smtp_tls.as_deref() == Some("none") && smtp_ca_file.is_some())
                                     && smtp_username.as_ref().is_none_or(|v| {
                                         !v.is_empty()
                                             && v.len() <= 1024
