@@ -36,6 +36,15 @@ async function boundedText(response: Response, limit: number): Promise<string> {
   } finally { reader.releaseLock(); }
 }
 
+function revocationEndpoint(prepared:PreparedOidc):string|null {
+  if(typeof prepared.metadata.revocation_endpoint!=='string')return null;
+  try {
+    const endpoint=secureUrl(prepared.metadata.revocation_endpoint,true);
+    if(endpoint.protocol==='http:' && new URL(prepared.settings.issuer).protocol!=='http:')return null;
+    return endpoint.href;
+  } catch {return null;}
+}
+
 export class OperatorOidc {
   private active: {manager:UserManager; settings:OidcSettings; subject:string; revocationEndpoint:string | null} | null=null;
   private renewing=false;
@@ -86,11 +95,7 @@ export class OperatorOidc {
       if(generation!==this.generation)throw new Error('login cancelled');
       if(settings.allowRefresh){
         if(!user.refresh_token || user.refresh_token.length>16384)throw new Error('refresh token unavailable');
-        let revocationEndpoint:string|null=null;
-        if(typeof metadata.revocation_endpoint==='string') {
-          try { const endpoint=secureUrl(metadata.revocation_endpoint,true);if(endpoint.protocol==='http:' && new URL(settings.issuer).protocol!=='http:')throw new Error('insecure revocation endpoint');revocationEndpoint=endpoint.href; } catch { /* Optional unsupported endpoint. */ }
-        }
-        this.active={manager,settings,subject:session.subject,revocationEndpoint};
+        this.active={manager,settings,subject:session.subject,revocationEndpoint:revocationEndpoint(prepared)};
       }
       return session;
     } finally { if(this.active?.manager!==manager) await manager.removeUser(); }
@@ -126,6 +131,18 @@ export class OperatorOidc {
       else await active.manager.removeUser();
       throw error;
     } finally {this.renewing=false;}
+  }
+
+  canRevokeAccess(prepared:PreparedOidc):boolean {return !!revocationEndpoint(prepared) && !this.renewing && !this.revoking;}
+  async revokeAccess(prepared:PreparedOidc,token:string):Promise<void> {
+    const endpoint=revocationEndpoint(prepared);
+    if(!endpoint || !token || token.length>16384 || this.renewing || this.revoking)throw new Error('access revocation unavailable');
+    this.revoking=true;
+    try {
+      const body=new URLSearchParams({token,token_type_hint:'access_token',client_id:prepared.settings.clientId});
+      const response=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body,credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
+      if(response.status!==200)throw new Error('access revocation failed');
+    } finally {this.revoking=false;}
   }
 
   canRevokeRefresh():boolean {return !!this.active?.revocationEndpoint && !this.renewing && !this.revoking;}

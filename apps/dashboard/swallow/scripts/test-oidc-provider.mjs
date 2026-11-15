@@ -12,10 +12,11 @@ const publicPem=await readFile(new URL('../../../api/rust-api/tests/fixtures/ope
 const privateKey=await importPKCS8(privatePem,'RS256');
 const jwk=await exportJWK(await importSPKI(publicPem,'RS256'));
 Object.assign(jwk,{kid:'key',use:'sig',alg:'RS256'});
-const codes=new Map(),refreshTokens=new Map();
-let revokedCount=0,lastRevoked=null;
+const codes=new Map(),refreshTokens=new Map(),accessTokens=new Set();
+let revokedCount=0,lastRevoked=null,revokedAccessCount=0;
 const refreshEnabled=process.env.SWALLOW_TEST_OIDC_REFRESH==='true';
-const lifetime=refreshEnabled?9:600;
+const lifetime=refreshEnabled ? Number(process.env.SWALLOW_TEST_OIDC_LIFETIME||9) : 600;
+if(!Number.isInteger(lifetime)||lifetime<3||lifetime>600)throw new Error('invalid test lifetime');
 const server=createServer(async(req,res)=>{
   res.setHeader('Access-Control-Allow-Origin',origin);
   res.setHeader('Access-Control-Allow-Methods','GET, POST, OPTIONS');
@@ -28,7 +29,7 @@ const server=createServer(async(req,res)=>{
     json({issuer,authorization_endpoint:`${issuer}/authorize`,token_endpoint:`${issuer}/token`,jwks_uri:`${issuer}/jwks`,...(refreshEnabled?{revocation_endpoint:`${issuer}/revoke`}:{}),response_types_supported:['code'],subject_types_supported:['public'],id_token_signing_alg_values_supported:['RS256'],code_challenge_methods_supported:['S256'],token_endpoint_auth_methods_supported:['none']});return;
   }
   if(req.method==='GET' && url.pathname==='/jwks'){json({keys:[jwk]});return;}
-  if(req.method==='GET' && url.pathname==='/fixture/revocation-count'){json({count:revokedCount});return;}
+  if(req.method==='GET' && url.pathname==='/fixture/revocation-count'){json({count:revokedCount,accessCount:revokedAccessCount});return;}
   if(req.method==='GET' && url.pathname==='/fixture/replay-revoked'){
     if(!lastRevoked){json({error:'no_revoked_token'},404);return;}
     const body=new URLSearchParams({grant_type:'refresh_token',client_id:'console',refresh_token:lastRevoked});
@@ -36,8 +37,10 @@ const server=createServer(async(req,res)=>{
   }
   if(req.method==='POST' && url.pathname==='/revoke' && refreshEnabled){
     let raw='';for await(const chunk of req){raw+=chunk;if(raw.length>32768){json({error:'invalid_request'},400);return;}}
-    const p=new URLSearchParams(raw);if(p.get('client_id')!=='console'||p.get('token_type_hint')!=='refresh_token'){json({error:'invalid_request'},400);return;}
-    if(refreshTokens.delete(p.get('token'))){revokedCount++;lastRevoked=p.get('token');}res.writeHead(200).end();return;
+    const p=new URLSearchParams(raw),type=p.get('token_type_hint');if(p.get('client_id')!=='console'||!['refresh_token','access_token'].includes(type)){json({error:'invalid_request'},400);return;}
+    if(type==='refresh_token' && refreshTokens.delete(p.get('token'))){revokedCount++;lastRevoked=p.get('token');}
+    if(type==='access_token' && accessTokens.delete(p.get('token')))revokedAccessCount++;
+    res.writeHead(200).end();return;
   }
   if(req.method==='GET' && url.pathname==='/authorize'){
     const p=url.searchParams;
@@ -55,7 +58,7 @@ const server=createServer(async(req,res)=>{
       if(!refreshEnabled||!saved||p.get('client_id')!=='console'){json({error:'invalid_grant'},400);return;}
       const now=Math.floor(Date.now()/1000);const next=randomBytes(24).toString('base64url');refreshTokens.set(next,saved);
       const access=await new SignJWT({client_id:'console',jti:randomUUID()}).setProtectedHeader({alg:'RS256',typ:'at+jwt',kid:'key'}).setIssuer(issuer).setSubject('ui-fixture').setAudience('swallow').setIssuedAt(now).setExpirationTime(now+lifetime).sign(privateKey);
-      json({access_token:access,refresh_token:next,token_type:'Bearer',expires_in:lifetime,scope:saved.scope});return;
+      accessTokens.add(access);json({access_token:access,refresh_token:next,token_type:'Bearer',expires_in:lifetime,scope:saved.scope});return;
     }
     const saved=codes.get(p.get('code'));codes.delete(p.get('code'));
     const challenge=createHash('sha256').update(p.get('code_verifier')||'').digest('base64url');
@@ -64,7 +67,7 @@ const server=createServer(async(req,res)=>{
     const access=await new SignJWT({client_id:'console',jti:randomUUID()}).setProtectedHeader({alg:'RS256',typ:'at+jwt',kid:'key'}).setIssuer(issuer).setSubject('ui-fixture').setAudience('swallow').setIssuedAt(now).setExpirationTime(now+lifetime).sign(privateKey);
     const id=await new SignJWT({nonce:saved.nonce}).setProtectedHeader({alg:'RS256',kid:'key'}).setIssuer(issuer).setSubject('ui-fixture').setAudience('console').setIssuedAt(now).setExpirationTime(now+600).sign(privateKey);
     const refresh=refreshEnabled&&saved.scope.split(/\s+/).includes('offline_access')?randomBytes(24).toString('base64url'):undefined;if(refresh)refreshTokens.set(refresh,{scope:saved.scope});
-    json({access_token:access,id_token:id,refresh_token:refresh,token_type:'Bearer',expires_in:lifetime,scope:saved.scope});return;
+    accessTokens.add(access);json({access_token:access,id_token:id,refresh_token:refresh,token_type:'Bearer',expires_in:lifetime,scope:saved.scope});return;
   }
   json({error:'not_found'},404);
 });

@@ -49,6 +49,12 @@ describe('operator OIDC configuration',()=>{
     const service=new OperatorOidc();const prepared=await service.prepare({...settings,allowRefresh:true,resource:'https://api.test/'});expect(prepared.settings.scope).toBe('openid offline_access');await service.signIn(prepared);
     await expect(service.renew()).rejects.toThrow('identity mismatch');await expect(service.renew()).rejects.toThrow('refresh unavailable');expect(silent).toHaveBeenCalledOnce();expect(silent).toHaveBeenCalledWith(expect.objectContaining({resource:'https://api.test/'}));expect(fetchMock).toHaveBeenCalledTimes(4);
   });
+  it('revokes an access token at the discovered endpoint without requiring a refresh token',async()=>{
+    const service=new OperatorOidc(),prepared={settings,metadata:{...metadata,revocation_endpoint:'https://issuer.test/revoke'}};
+    const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response('',{status:200}));expect(service.canRevokeAccess(prepared)).toBe(true);await service.revokeAccess(prepared,accessToken);
+    const [url,options]=mock.mock.calls[0];expect(url).toBe('https://issuer.test/revoke');expect(options).toEqual(expect.objectContaining({method:'POST',credentials:'omit',redirect:'error',cache:'no-store'}));expect(Object.fromEntries(options!.body as URLSearchParams)).toEqual({token:accessToken,token_type_hint:'access_token',client_id:'console'});
+    const unsafe={settings,metadata:{...metadata,revocation_endpoint:'http://127.0.0.1:9000/revoke'}};expect(service.canRevokeAccess(unsafe)).toBe(false);await expect(service.revokeAccess(unsafe,accessToken)).rejects.toThrow();expect(mock).toHaveBeenCalledOnce();
+  });
   it('revokes the refresh token only at the validated provider endpoint',async()=>{
     const {privateKey,publicKey}=await generateKeyPair('RS256');const jwk={...(await exportJWK(publicKey)),kid:'test',alg:'RS256',use:'sig'};
     vi.spyOn(UserManager.prototype,'signinPopup').mockImplementation(async args=>({expired:false,token_type:'Bearer',access_token:accessToken,refresh_token:'private-refresh',id_token:await new SignJWT({nonce:args?.nonce}).setProtectedHeader({alg:'RS256',kid:'test'}).setIssuer(settings.issuer).setAudience(settings.clientId).setSubject('alice').setIssuedAt().setExpirationTime('1m').sign(privateKey)} as User));

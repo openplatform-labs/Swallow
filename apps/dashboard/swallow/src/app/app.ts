@@ -256,6 +256,9 @@ export class App implements OnDestroy {
   readonly oidcRenewError = signal(false);
   readonly oidcRenewing = signal(false);
   oidcIdpRevokeConfirmed=false;
+  oidcIdpAccessConfirmed=false;
+  oidcIdpAccessAlsoSwallow=true;
+  readonly oidcIdpSwallowResult=signal<'idle'|'revoked'|'unknown'>('idle');
   readonly oidcIdpRevokeStatus=signal<'idle'|'sending'|'accepted'|'unknown'>('idle');
   readonly oidcStatus = signal<'idle' | 'preparing' | 'ready' | 'signing' | 'signed-in' | 'expired' | 'error'>('idle');
   readonly oidcSubject = signal('');
@@ -418,6 +421,7 @@ export class App implements OnDestroy {
       if(workflow)this.workflowKey=next.token;
       if(lookup)this.lookupKey=next.token;
       this.oidcSession=next;this.oidcSubject.set(next.subject);this.oidcRenewError.set(false);
+      this.oidcIdpAccessConfirmed=false;this.oidcIdpRevokeConfirmed=false;this.oidcRevokeConfirmed=false;
       if(this.oidcExpiryTimer!==null)clearTimeout(this.oidcExpiryTimer);
       this.oidcExpiryTimer=null;this.scheduleOidcExpiry();this.scheduleOidcRenew();
     } catch {
@@ -438,7 +442,7 @@ export class App implements OnDestroy {
 
   async prepareOidc(): Promise<void> {
     if (this.oidcStatus() === 'preparing' || this.oidcStatus() === 'signing' || this.oidcRevokeStatus()==='sending' || this.oidcIdpRevokeStatus()==='sending') return;
-    this.oidcRevokeStatus.set('idle'); this.oidcRevokeConfirmed=false;this.oidcIdpRevokeStatus.set('idle');this.oidcIdpRevokeConfirmed=false;
+    this.oidcRevokeStatus.set('idle'); this.oidcRevokeConfirmed=false;this.oidcIdpRevokeStatus.set('idle');this.oidcIdpRevokeConfirmed=false;this.oidcIdpAccessConfirmed=false;this.oidcIdpSwallowResult.set('idle');
     this.resetOidc(); const sequence=this.oidcSequence; this.oidcStatus.set('preparing');
     try {
       const prepared=await this.oidc.prepare({issuer:this.oidcIssuer,clientId:this.oidcClientId,scope:this.oidcScope,resource:this.oidcResource,audience:this.oidcAudience,apiOrigin:this.apiOrigin,environmentId:this.oidcEnvironment,allowRefresh:this.oidcAutoRenew});
@@ -457,6 +461,25 @@ export class App implements OnDestroy {
     } catch { if (sequence === this.oidcSequence) this.oidcStatus.set('error'); }
   }
 
+  canRevokeIdpAccess():boolean {
+    return !!this.oidcSession && !!this.oidcPrepared && !this.oidcRenewing() && this.oidcRevokeStatus()!=='sending' && this.oidcIdpRevokeStatus()!=='sending' && this.oidc.canRevokeAccess(this.oidcPrepared);
+  }
+
+  async revokeIdpAccess():Promise<void> {
+    this.expireOidcIfNeeded();
+    const session=this.oidcSession,prepared=this.oidcPrepared;
+    if(!session || !prepared || !this.oidcIdpAccessConfirmed || !this.canRevokeIdpAccess() || this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying' || this.subscriberDeleteRetryStatus()==='retrying' || this.decisionStatus()==='sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying')return;
+    const sequence=this.oidcSequence;
+    if(this.oidcRenewTimer!==null)clearTimeout(this.oidcRenewTimer);this.oidcRenewTimer=null;
+    this.oidcIdpRevokeStatus.set('sending');this.oidcIdpSwallowResult.set('idle');
+    if(this.oidcIdpAccessAlsoSwallow)this.oidcIdpSwallowResult.set(await this.requestSelfRevocation(session));
+    if(sequence!==this.oidcSequence)return;
+    let outcome:'accepted'|'unknown'='unknown';
+    try {await this.oidc.revokeAccess(prepared,session.token);outcome='accepted';} catch { /* A lost response does not prove revocation. */ }
+    if(sequence!==this.oidcSequence)return;
+    this.oidcIdpRevokeStatus.set(outcome);this.oidcIdpAccessConfirmed=false;this.resetOidc();
+  }
+
   canRevokeIdpRefresh():boolean {
     return !!this.oidcSession && !this.oidcRenewing() && this.oidcRevokeStatus()!=='sending' && this.oidcIdpRevokeStatus()!=='sending' && this.oidc.canRevokeRefresh();
   }
@@ -471,6 +494,15 @@ export class App implements OnDestroy {
     try {await this.oidc.revokeRefresh();outcome='accepted';} catch { /* A lost response does not prove revocation. */ }
     if(sequence!==this.oidcSequence)return;
     this.oidcIdpRevokeStatus.set(outcome);this.oidcIdpRevokeConfirmed=false;this.resetOidc();
+  }
+
+  private async requestSelfRevocation(session:VerifiedSession):Promise<'revoked'|'unknown'> {
+    try {
+      const origin=this.validatedOrigin();const params=new URLSearchParams({environmentId:session.environmentId});
+      const response=await fetch(`${origin}/v1/experimental/operator/token/revoke-self?${params}`,{method:'POST',headers:{Authorization:`Bearer ${session.token}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
+      if(response.ok){const value:unknown=await response.json();if(typeof value==='object' && value!==null && 'created' in value && typeof value.created==='boolean')return 'revoked';}
+    } catch { /* The outcome can be committed even if the response is lost. */ }
+    return 'unknown';
   }
 
   async revokeOidcToken(): Promise<void> {
