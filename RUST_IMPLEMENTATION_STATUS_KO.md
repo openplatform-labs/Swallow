@@ -1,4 +1,6 @@
-SMTP 발송 중 워커 종료 시험: 임시 로컬 PostgreSQL·실제 SMTP 워커 두 개·모의 STARTTLS 서버에서 첫 메시지 DATA 수신 직후 응답 전에 워커를 종료했다. 임대를 강제로 만료시킨 뒤 다른 워커가 첫 시도를 `unknown`으로 유지하고 재발송하지 않으면서 별도 대기 작업을 처리하는 것을 확인했다. 관리자 계정·강제 만료·단일 DB 시험이며 실제 릴레이 수락, DB 장애 전환·분할 뇌 및 다중 호스트 운영 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+SMTP 동기 DB 장애 전환 시험: 단일 호스트 PostgreSQL 17 동기 복제에서 실제 SMTP 워커와 모의 STARTTLS 서버를 실행했다. 본문 수신 후 응답 전 시도 기록이 대기 DB에 복제된 것을 확인하고 워커와 주 DB를 종료·대기 DB를 승격했다. 장애 전부터 실행 중이던 다른 워커가 재연결해 강제로 만료한 시도를 `unknown`으로 보존하고 별도 작업을 발송했으며 짧은 관찰 기간에 추가 연결은 없었다. 관리자 DB 계정·모의 릴레이 시험으로 실제 공급자, 비동기 복제·분할 뇌·다중 호스트 HA는 미검증이다. Docker를 사용할 수 없어 격리 로컬 DB를 사용했다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
+SMTP 발송 중 워커 종료 시험: 임시 로컬 PostgreSQL·실제 SMTP 워커 두 개·모의 STARTTLS 서버에서 첫 메시지 DATA 수신 직후 응답 전에 워커를 종료했다. 임대를 강제로 만료시킨 뒤 다른 워커가 첫 시도를 `unknown`으로 유지하고 재발송하지 않으면서 별도 대기 작업을 처리하는 것을 확인했다. 관리자 계정·강제 만료·단일 DB 시험이며 DB 장애 전환은 위 후속 항목을 참고한다. 실제 릴레이 수락, 분할 뇌 및 다중 호스트 운영 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
 SMTP 첨부 HTTP 종단 간 시험: 실제 HTTP API, 인앱 워커와 SMTP 워커 및 모의 인증 STARTTLS 서버를 임시 로컬 PostgreSQL에서 실행했다. Base64와 Buffer 첨부 트리거 후 수신 MIME의 원본 바이트·CID와 부모·SMTP 자식 보관 시각을 확인했다. 관리자 DB 계정과 모의 서버를 사용했으며 실제 SMTP 공급자·제한 운영 DB 권한·Novu 서버 비교·다중 호스트 HA는 미검증이다. 재현 명령은 [워커 README](apps/worker/rust-queue/README.md)에 있다.
 
