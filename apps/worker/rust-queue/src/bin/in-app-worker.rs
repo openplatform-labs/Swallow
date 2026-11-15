@@ -15,6 +15,11 @@ async fn run(
         Ok("false") | Err(std::env::VarError::NotPresent) => false,
         _ => return Err("NOVU_SLACK_SNAPSHOT_ENDPOINTS must be true or false".into()),
     };
+    let discord_workflow = match std::env::var("NOVU_DISCORD_WORKFLOW_ENABLED").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("NOVU_DISCORD_WORKFLOW_ENABLED must be true or false".into()),
+    };
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let timeout = match std::env::var("NOVU_IN_APP_DB_TIMEOUT_SECONDS") {
         Ok(value) => value
@@ -85,10 +90,11 @@ async fn run(
                     }
                     match tokio::time::timeout(
                         timeout,
-                        in_app::process_one_with_slack_snapshot(
+                        in_app::process_one_with_chat_options(
                             &mut db,
                             Duration::from_secs(60),
                             slack_snapshot,
+                            discord_workflow,
                         ),
                     )
                     .await

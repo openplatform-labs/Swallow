@@ -283,6 +283,15 @@ pub async fn process_one_with_slack_snapshot(
     lease: Duration,
     snapshot_slack_endpoints: bool,
 ) -> WorkerResult<bool> {
+    process_one_with_chat_options(client, lease, snapshot_slack_endpoints, false).await
+}
+
+pub async fn process_one_with_chat_options(
+    client: &mut Client,
+    lease: Duration,
+    snapshot_slack_endpoints: bool,
+    discord_workflow: bool,
+) -> WorkerResult<bool> {
     let token = Uuid::new_v4();
     let seconds = lease.as_secs_f64();
     let kinds = [JOB_KIND, ATTACHMENT_JOB_KIND];
@@ -297,7 +306,7 @@ pub async fn process_one_with_slack_snapshot(
     }) else {
         return Ok(false);
     };
-    match Box::pin(process_claimed(client, &job, snapshot_slack_endpoints)).await {
+    match Box::pin(process_claimed(client, &job, snapshot_slack_endpoints, discord_workflow)).await {
         Ok(()) => Ok(true),
         Err(error) if error.downcast_ref::<LeaseLost>().is_some() => Ok(true),
         Err(error) if error.downcast_ref::<InvalidJob>().is_some() => {
@@ -315,6 +324,7 @@ async fn process_claimed(
     client: &mut Client,
     job: &crate::ClaimedJob,
     snapshot_slack_endpoints: bool,
+    discord_workflow: bool,
 ) -> WorkerResult<()> {
     let data = &job.payload;
     if !crate::allow_recreated_subscriber()
@@ -907,6 +917,22 @@ async fn process_claimed(
                 ],
             )
             .await?;
+        }
+        if discord_workflow {
+            if let Some(chat_content) = chat_step.as_ref() {
+                // The subscriber lock is held by the upsert. Snapshot the endpoint
+                // generation so edits/deletes cannot redirect pending deliveries.
+                let endpoints = tx.query("SELECT internal_id,revision,destination_id FROM public.novu_rust_discord_workflow_endpoints WHERE environment_id=$1 AND subscriber_internal_id=$2 AND context_keys @> $3 AND context_keys <@ $3 AND cardinality(context_keys)=cardinality($3) ORDER BY internal_id FOR SHARE LIMIT 1001", &[&job.environment_id,&subscriber_internal_id,&context_keys]).await?;
+                if endpoints.len() > 1000 { return Err(InvalidJob("too many Discord endpoints").into()); }
+                for endpoint in endpoints {
+                    let endpoint_id: Uuid = endpoint.get(0);
+                    let revision: Uuid = endpoint.get(1);
+                    let destination: String = endpoint.get(2);
+                    let discord_id = Uuid::new_v4();
+                    let discord_payload = serde_json::json!({"destination":destination,"content":"","workflowContext":{"subscriber_id":subscriber,"subscriber_internal_id":subscriber_internal_id,"workflow_identifier":workflow,"workflow_internal_id":workflow_internal_id,"content_template":chat_content,"payload":payload,"context_keys":context_keys,"actor":actor_profile,"actor_internal_id":actor_internal_id,"endpoint_id":endpoint_id,"endpoint_revision":revision}});
+                    tx.execute("INSERT INTO novu_queue_jobs(id,environment_id,kind,payload) VALUES ($1,$2,$3,$4)", &[&discord_id,&job.environment_id,&crate::discord_queue::WORKFLOW_KIND,&discord_payload]).await?;
+                }
+            }
         }
         if let Some((push_title, push_content)) = push_step.as_ref() {
             let push_job_id = Uuid::new_v4();
