@@ -66,7 +66,7 @@ async fn fcm_review_grants_are_independent_conditional_and_audited() {
     let db = connect(&url).await;
     db.batch_execute("INSERT INTO public.novu_rust_environments VALUES ('grant-a','org'),('grant-b','org'); INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES ('https://issuer.test','admin','console','grant-a'),('https://issuer.test','target','console','grant-a'),('https://issuer.test','target','console','grant-b'); INSERT INTO public.novu_rust_operator_jwt_channel_access_grant_admins VALUES ('https://issuer.test','admin','console','grant-a',true,true)").await.unwrap();
     let role = format!("fcm_grant_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_fcm_review_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_fcm_review_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_fcm_review_grant_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_review_grant_audit_read(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_unreviewed(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_fcm_review_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_fcm_review_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_fcm_review_grant_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_review_grant_audit_read(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_unreviewed(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_cooldown_health(text,text,text,text,bigint,integer) TO {role}")).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname::text=$1", &[&role]).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'grant-a',$1,'alert_view',oid FROM pg_roles WHERE rolname::text=$1", &[&role]).await.unwrap();
     let api = connect(&url).await;
@@ -180,7 +180,7 @@ async fn fcm_review_grants_are_independent_conditional_and_audited() {
             .len(),
         2
     );
-    for permission in ["health", "recent-list"] {
+    for permission in ["health", "recent-list", "cooldown-health"] {
         let request = json!({"requestId":Uuid::new_v4(),"targetIssuer":"https://issuer.test","targetSubject":"target","targetClientId":"console","resource":"fcm-partial","permission":permission,"expected":false,"desired":true,"reason":"ticket"});
         assert_eq!(
             response(app.clone(), &token, "PUT", path, Some(request))
@@ -189,6 +189,28 @@ async fn fcm_review_grants_are_independent_conditional_and_audited() {
             StatusCode::OK
         );
     }
+    db.execute("INSERT INTO public.novu_rust_fcm_cooldown_policies(environment_id,fallback_seconds) VALUES('grant-a',60)",&[]).await.unwrap();
+    let cooldown =
+        "/v1/experimental/operator/fcm-cooldown-health?environmentId=grant-a&graceSeconds=60";
+    assert_eq!(
+        response(app.clone(), &jwt("target"), "GET", cooldown, None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let revoke_cooldown = json!({"requestId":Uuid::new_v4(),"targetIssuer":"https://issuer.test","targetSubject":"target","targetClientId":"console","resource":"fcm-partial","permission":"cooldown-health","expected":true,"desired":false,"reason":"done"});
+    assert_eq!(
+        response(app.clone(), &token, "PUT", path, Some(revoke_cooldown))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        response(app.clone(), &jwt("target"), "GET", cooldown, None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
     let revoke = json!({"requestId":Uuid::new_v4(),"targetIssuer":"https://issuer.test","targetSubject":"target","targetClientId":"console","resource":"fcm-partial","permission":"unreviewed","expected":true,"desired":false,"reason":"done"});
     db.batch_execute("CREATE FUNCTION public.test_fcm_grant_reject_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test audit failure'; END $$; CREATE TRIGGER test_fcm_grant_reject_audit BEFORE INSERT ON public.novu_rust_operator_jwt_fcm_review_grant_audit FOR EACH ROW EXECUTE FUNCTION public.test_fcm_grant_reject_audit()").await.unwrap();
     assert_eq!(
