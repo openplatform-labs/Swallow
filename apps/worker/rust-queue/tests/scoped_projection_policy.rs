@@ -26,7 +26,7 @@ async fn scoped_registration_isolated_and_used_by_real_workers() {
     .await
     .unwrap();
     let role = format!("proj_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'fixture-password'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_register_projection_policy(text,text,boolean) TO {role}; GRANT SELECT ON public.novu_rust_environments, public.novu_queue_jobs, public.novu_rust_sendgrid_attempts, public.novu_rust_resend_attempts, public.novu_rust_twilio_attempts TO {role}; GRANT SELECT,INSERT,UPDATE ON public.novu_rust_sendgrid_projection_heartbeat, public.novu_rust_resend_projection_heartbeat, public.novu_rust_twilio_projection_heartbeat TO {role}" )).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'fixture-password'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_register_projection_policy(text,text,boolean),public.novu_rust_check_projection_policy(text,text,boolean) TO {role}; GRANT SELECT ON public.novu_rust_environments, public.novu_queue_jobs, public.novu_rust_sendgrid_attempts, public.novu_rust_resend_attempts, public.novu_rust_twilio_attempts TO {role}; GRANT SELECT,INSERT,UPDATE ON public.novu_rust_sendgrid_projection_heartbeat, public.novu_rust_resend_projection_heartbeat, public.novu_rust_twilio_projection_heartbeat TO {role}" )).await.unwrap();
     for provider in ["sendgrid", "resend", "twilio"] {
         db.execute("INSERT INTO public.novu_rust_projection_policy_logins SELECT 'policy-a',$1,rolname,oid FROM pg_catalog.pg_roles WHERE rolname=$2", &[&provider,&role]).await.unwrap();
     }
@@ -71,6 +71,8 @@ async fn scoped_registration_isolated_and_used_by_real_workers() {
             "NOVU_TWILIO_PROJECTION_REQUIRE_FULL_SCAN",
         ),
     ] {
+        let log_path = std::env::temp_dir().join(format!("swallow-scope-{}.log", Uuid::new_v4()));
+        let log = std::fs::File::create(&log_path).unwrap();
         let mut worker = Worker(
             Command::new(bin)
                 .env("DATABASE_URL", role_url.as_str())
@@ -78,8 +80,15 @@ async fn scoped_registration_isolated_and_used_by_real_workers() {
                 .env("SWALLOW_PROJECTION_SCOPED_POLICY", "true")
                 .env(env_key, "policy-a")
                 .env(full_key, "true")
+                .env(
+                    format!(
+                        "NOVU_{}_PROJECTION_SCAN_INTERVAL_SECONDS",
+                        provider.to_uppercase()
+                    ),
+                    "1",
+                )
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::from(log))
                 .spawn()
                 .unwrap(),
         );
@@ -108,7 +117,47 @@ async fn scoped_registration_isolated_and_used_by_real_workers() {
                 .await
                 .unwrap()
         );
+        db.execute("DELETE FROM public.novu_rust_projection_policy_logins WHERE environment_id='policy-a' AND provider=$1 AND database_principal=$2", &[&provider, &role]).await.unwrap();
+        let mut denied = false;
+        for _ in 0..150 {
+            if std::fs::read_to_string(&log_path)
+                .unwrap()
+                .contains("projection policy registration failed")
+            {
+                denied = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            denied,
+            "{provider} did not stop and reconnect after revocation"
+        );
+        db.execute(&format!("UPDATE public.novu_rust_{provider}_projection_heartbeat SET last_completed_at=clock_timestamp()-interval '1 hour' WHERE environment_id='policy-a'"), &[]).await.unwrap();
+        let mut repeated = false;
+        for _ in 0..100 {
+            if std::fs::read_to_string(&log_path)
+                .unwrap()
+                .matches("projection policy registration failed")
+                .count()
+                >= 2
+            {
+                repeated = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(repeated);
+        assert!(db.query_one(&format!("SELECT last_completed_at<clock_timestamp()-interval '30 minutes' FROM public.novu_rust_{provider}_projection_heartbeat WHERE environment_id='policy-a'"),&[]).await.unwrap().get::<_,bool>(0));
+        db.execute("INSERT INTO public.novu_rust_projection_policy_logins SELECT 'policy-a',$1,rolname,oid FROM pg_catalog.pg_roles WHERE rolname=$2", &[&provider,&role]).await.unwrap();
+        let mut recovered = false;
+        for _ in 0..150 {
+            if db.query_one(&format!("SELECT last_completed_at>clock_timestamp()-interval '30 minutes' FROM public.novu_rust_{provider}_projection_heartbeat WHERE environment_id='policy-a'"),&[]).await.unwrap().get::<_,bool>(0) { recovered=true;break; }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(recovered, "{provider} did not resume after restoration");
         drop(worker);
+        std::fs::remove_file(log_path).unwrap();
     }
     db.execute("UPDATE public.novu_rust_projection_policy_logins SET principal_oid=0 WHERE environment_id='policy-a' AND provider='sendgrid' AND database_principal=$1", &[&role]).await.unwrap();
     assert!(

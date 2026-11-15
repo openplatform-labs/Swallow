@@ -36,3 +36,19 @@ pub async fn register_scoped(
         .await?
         .get(0))
 }
+
+/// Recheck a scoped registration while a connection is running.
+pub async fn check_scoped(
+    db: &Client,
+    environment: &str,
+    provider: &str,
+    require_full_scan: bool,
+) -> Result<bool, Error> {
+    Ok(db
+        .query_one(
+            "SELECT public.novu_rust_check_projection_policy($1,$2,$3)",
+            &[&environment, &provider, &require_full_scan],
+        )
+        .await?
+        .get(0))
+}

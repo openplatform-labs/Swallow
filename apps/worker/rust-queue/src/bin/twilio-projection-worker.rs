@@ -135,6 +135,20 @@ async fn run(
                     if stop.requested() {
                         return Ok(false);
                     }
+                    if scoped_policy
+                        && !tokio::time::timeout(
+                            timeout,
+                            novu_postgres_queue::projection_policy::check_scoped(
+                                &db,
+                                &environment,
+                                "twilio",
+                                require_full_scan,
+                            ),
+                        )
+                        .await??
+                    {
+                        return Err("projection heartbeat policy changed".into());
+                    }
                     let jobs = tokio::time::timeout(
                         timeout,
                         twilio_projection::page(&db, &environment, after),
@@ -151,6 +165,20 @@ async fn run(
                         if stop.requested() {
                             return Ok(false);
                         }
+                        if scoped_policy
+                            && !tokio::time::timeout(
+                                timeout,
+                                novu_postgres_queue::projection_policy::check_scoped(
+                                    &db,
+                                    &environment,
+                                    "twilio",
+                                    require_full_scan,
+                                ),
+                            )
+                            .await??
+                        {
+                            return Err("projection heartbeat policy changed".into());
+                        }
                         let processed = tokio::time::timeout(
                             timeout,
                             twilio_projection::project(&mut db, &environment, job),
@@ -161,6 +189,20 @@ async fn run(
                 }
                 if stop.requested() {
                     return Ok(false);
+                }
+                if scoped_policy
+                    && !tokio::time::timeout(
+                        timeout,
+                        novu_postgres_queue::projection_policy::check_scoped(
+                            &db,
+                            &environment,
+                            "twilio",
+                            require_full_scan,
+                        ),
+                    )
+                    .await??
+                {
+                    return Err("projection heartbeat policy changed".into());
                 }
                 if !require_full_scan || !skipped {
                     tokio::time::timeout(timeout, db.execute("INSERT INTO novu_rust_twilio_projection_heartbeat(environment_id,last_completed_at) VALUES ($1,clock_timestamp()) ON CONFLICT(environment_id) DO UPDATE SET last_completed_at=EXCLUDED.last_completed_at", &[&environment])).await??;
