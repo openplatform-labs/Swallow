@@ -128,6 +128,7 @@ async fn run() -> Result<()> {
         fcm_unreviewed: None,
         fcm_cooldown: None,
         fcm_cooldown_source: None,
+        fcm_cooldown_distinct_source: false,
         failed_jobs: None,
         failed_jobs_check_failed: false,
         database_probe: Some((args[1].clone(), false)),

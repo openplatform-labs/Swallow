@@ -1,6 +1,8 @@
 ## Slack 공유 대기 상태 조회와 경보
 
-- FCM 공유 대기 원인 경보: 워커 0194와 `SWALLOW_ALERT_FCM_COOLDOWN_SOURCE_ENABLED=true`를 사용하면 Slack·메일 경보에 현재 대기 종료 시각을 연장한 HTTP 429 또는 503을 표시한다. 제한 DB 계정·실제 경보 CLI에서 별도 권한, 환경 격리와 실패 처리를 확인하고 모의 Slack·Resend에서 경보 내용을 검증했다. 원인만 바뀌어도 기존 경보 쿨다운이 즉시 해제되는 것은 아니며 실제 외부 수신·운영 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+- FCM 대기 원인 변경 경보: `SWALLOW_ALERT_FCM_COOLDOWN_DISTINCT_SOURCE=true`를 선택하면 활성 대기의 429·503·원인 불명을 별도 64비트 경보 조건으로 다룬다. 제한 계정·임시 PostgreSQL과 모의 Slack에서 429→503→429 재경보와 같은 원인의 반복 억제를 확인했다. 이전 경보 실행기는 새 조건을 이해하지 못하므로 같은 대상의 모든 실행기를 함께 업데이트해야 한다. 실제 외부 수신과 운영 HA는 미검증이며 자세한 설정은 [워커 README](apps/worker/rust-queue/README.md)에 기록했다.
+
+- FCM 공유 대기 원인 경보: 워커 0194와 `SWALLOW_ALERT_FCM_COOLDOWN_SOURCE_ENABLED=true`를 사용하면 Slack·메일 경보에 현재 대기 종료 시각을 연장한 HTTP 429 또는 503을 표시한다. 제한 DB 계정·실제 경보 CLI에서 별도 권한, 환경 격리와 실패 처리를 확인하고 모의 Slack·Resend에서 경보 내용을 검증했다. 선택형 원인별 조건은 위 최신 항목을 참고하며 실제 외부 수신·운영 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
 - FCM 공유 대기 원인 표시: 워커 0193과 API 0110은 현재 대기 종료 시각을 마지막으로 연장한 429·503 응답과 기록 시각을 제공하며 Angular 화면에 표시한다. 더 짧은 지시는 원인을 덮어쓰지 않고 기존 워커의 구분 불가능한 기록은 원인 불명으로 둔다. 제한 DB 계정·시험 JWT·모의 FCM과 PostgreSQL에서 권한, 구버전 기록, 연장 순서와 API를 확인했고 Angular 테스트 211개와 빌드가 통과했다. 최초 API 시험에서 정책 누락 시 오류 대신 빈 결과가 발생해 수정 후 재검증했다. 실제 FCM·운영 HA는 미검증이며 새 DB 함수 권한과 배포 순서는 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 

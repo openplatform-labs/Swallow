@@ -179,6 +179,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let fcm_cooldown_grace=env_optional_i32("SWALLOW_ALERT_FCM_COOLDOWN_GRACE_SECONDS")?;
     let fcm_cooldown_source_enabled=env_bool("SWALLOW_ALERT_FCM_COOLDOWN_SOURCE_ENABLED",false)?;
     if fcm_cooldown_source_enabled && fcm_cooldown_grace.is_none() { return Err("FCM cooldown source requires the cooldown check".into()); }
+    let fcm_cooldown_distinct_source=env_bool("SWALLOW_ALERT_FCM_COOLDOWN_DISTINCT_SOURCE",false)?;
+    if fcm_cooldown_distinct_source && (!fcm_cooldown_source_enabled || !conditions_v2) { return Err("distinct FCM cooldown sources require source monitoring and v2 new-condition alerts".into()); }
     if fcm_cooldown_grace.is_some_and(|v|!(1..=86400).contains(&v)) || (fcm_cooldown_grace.is_some() && on_new_condition && !conditions_v2) {return Err("FCM cooldown check requires a valid threshold and v2 conditions for new-condition policy".into());}
     let fcm_unreviewed_enabled=env_bool("SWALLOW_ALERT_FCM_UNREVIEWED_ENABLED",false)?;
     if fcm_unreviewed_enabled && on_new_condition && !conditions_v2 {return Err("FCM unreviewed check requires v2 conditions for new-condition policy".into());}
@@ -624,6 +626,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         fcm_unreviewed,
         fcm_cooldown,
         fcm_cooldown_source,
+        fcm_cooldown_distinct_source,
         failed_jobs,
         failed_jobs_check_failed,
         database_probe: None,

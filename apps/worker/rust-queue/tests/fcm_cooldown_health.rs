@@ -130,6 +130,20 @@ async fn scoped_fcm_cooldown_health_reaches_alerts() {
     let details = queue::fcm_queue::cooldown_health_detail(&reader,&env,60).await.unwrap();
     assert_eq!(details["deadlineSource"],503);
     assert_eq!(alert_with_source(role_url.as_str(), &env, true).status.code(), Some(2));
+    let distinct = |v2: bool| {
+        Command::new(env!("CARGO_BIN_EXE_send-delivery-alert")).env_clear()
+            .env("DATABASE_URL",role_url.as_str()).env("NOVU_POSTGRES_ALLOW_INSECURE","true")
+            .env("SWALLOW_ALERT_RESEND_ENABLED","false").env("SWALLOW_ALERT_FCM_COOLDOWN_GRACE_SECONDS","60")
+            .env("SWALLOW_ALERT_FCM_COOLDOWN_SOURCE_ENABLED","true").env("SWALLOW_ALERT_FCM_COOLDOWN_DISTINCT_SOURCE","true")
+            .env("SWALLOW_ALERT_COOLDOWN_POLICY",if v2 {"new-condition"} else {"destination"})
+            .env("SWALLOW_ALERT_CONDITIONS_V2",if v2 {"true"} else {"false"}).env("SWALLOW_ALERT_SCOPED_DELIVERY","true")
+            .env("SWALLOW_ALERT_SLACK_WEBHOOK","https://hooks.slack.com/services/A/B/C").env("SWALLOW_ALERT_SLACK_TARGET_ID","blocked")
+            .args([&env,"300","120","60"]).output().unwrap()
+    };
+    let invalid=distinct(false);assert_eq!(invalid.status.code(),Some(1));
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("distinct FCM cooldown sources require"));
+    assert_eq!(distinct(true).status.code(),Some(2));
+
     assert!(queue::fcm_queue::cooldown_health_detail(&reader,&other,60).await.is_err());
 
     db.execute("DELETE FROM public.novu_rust_delivery_operator_grants WHERE environment_id=$1 AND database_principal=$2 AND decision='alert_view'",&[&env,&role]).await.unwrap();

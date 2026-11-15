@@ -326,6 +326,7 @@ pub struct Alert {
     pub fcm_unreviewed: Option<Result<u64, ()>>,
     pub fcm_cooldown: Option<Result<(bool,u64,u64), ()>>,
     pub fcm_cooldown_source: Option<Option<u16>>,
+    pub fcm_cooldown_distinct_source: bool,
     pub failed_jobs: Option<u64>,
     pub failed_jobs_check_failed: bool,
     pub database_probe: Option<(String, bool)>,
@@ -437,6 +438,9 @@ impl Alert {
         if self.fcm_unreviewed.is_some_and(|v| v.is_err()) { mask |= 1_i64 << 41; }
         if self.fcm_cooldown.is_some_and(|v| matches!(v, Ok((active,deferred,overdue)) if active||deferred>0||overdue>0)) { mask |= 1_i64 << 42; }
         if self.fcm_cooldown.is_some_and(|v| v.is_err()) { mask |= 1_i64 << 43; }
+        if self.fcm_cooldown_distinct_source && self.fcm_cooldown.is_some_and(|v| matches!(v,Ok((true,_,_)))) {
+            match self.fcm_cooldown_source { Some(Some(429)) => mask |= 1_i64 << 44, Some(Some(503)) => mask |= 1_i64 << 45, Some(None) => mask |= 1_i64 << 46, _ => {} }
+        }
         mask
     }
     pub fn observed_condition_mask_v2(&self) -> i64 {
@@ -455,6 +459,7 @@ impl Alert {
         if self.fcm_unreviewed.is_some() { known |= 1_i64 << 41; }
         if self.fcm_cooldown.is_some_and(|v| v.is_ok()) { known |= 1_i64 << 42; }
         if self.fcm_cooldown.is_some() { known |= 1_i64 << 43; }
+        if self.fcm_cooldown_distinct_source && self.fcm_cooldown_source.is_some() && self.fcm_cooldown.is_some_and(|v| v.is_ok()) { known |= (1_i64 << 44) | (1_i64 << 45) | (1_i64 << 46); }
         known
     }
     /// Bits whose current state was actually observed, excluding unavailable or disabled checks.
@@ -1446,6 +1451,7 @@ mod tests {
             fcm_unreviewed: None,
             fcm_cooldown: None,
             fcm_cooldown_source: None,
+            fcm_cooldown_distinct_source: false,
             failed_jobs: None,
             failed_jobs_check_failed: false,
             database_probe: None,
@@ -1533,6 +1539,35 @@ mod tests {
         assert_eq!(dispatch_pair_v2(&mut db,None,cfg).await.0.unwrap().unwrap(),Dispatch::CoolingDown);
     }
     #[tokio::test]
+    #[ignore = "requires fully migrated disposable PostgreSQL and role creation"]
+    async fn fcm_source_change_sends_once_and_recovery_allows_recurrence() {
+        let url=std::env::var("TEST_DATABASE_URL").unwrap();
+        let (admin,driver)=tokio_postgres::connect(&url,tokio_postgres::NoTls).await.unwrap();tokio::spawn(async move {let _=driver.await;});
+        let env=format!("source-alert-{}",uuid::Uuid::new_v4());let role=format!("source_alert_{}",uuid::Uuid::new_v4().simple());
+        admin.execute("INSERT INTO public.novu_rust_environments VALUES($1,'org')", &[&env]).await.unwrap();
+        admin.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_reserve_alert_v2(text,text,text,integer,bigint),public.novu_rust_observe_alert_conditions_v2(text,text,text,bigint,bigint),public.novu_rust_finish_alert(text,text,text,uuid,text,integer) TO {role}")).await.unwrap();
+        admin.execute("INSERT INTO public.novu_rust_delivery_operator_grants SELECT $1,$2,'alert_send',oid FROM pg_roles WHERE rolname::text=$2", &[&env,&role]).await.unwrap();
+        let (mut db,driver)=tokio_postgres::connect(&url,tokio_postgres::NoTls).await.unwrap();tokio::spawn(async move {let _=driver.await;});
+        db.batch_execute(&format!("SET SESSION AUTHORIZATION {role}")).await.unwrap();
+        let mut a=alert();a.environment=env.clone();a.resend_enabled=false;a.fcm_cooldown=Some(Ok((true,0,0)));a.fcm_cooldown_distinct_source=true;a.fcm_cooldown_source=Some(Some(429));
+        let (endpoint,server)=mock_server("200 OK","ok").await;let slack=SlackWebhook::with_endpoint(endpoint).unwrap();
+        let cfg=DispatchPair{alert:&a,slack:Some((&slack,"ops")),email:None,cooldown:3600,on_new:true,scoped:true,timeout:Duration::from_secs(3)};
+        assert_eq!(dispatch_pair_v2(&mut db,None,cfg).await.0.unwrap().unwrap(),Dispatch::Accepted);assert!(server.await.unwrap().contains("HTTP 429"));
+        a.fcm_cooldown_source=Some(Some(503));
+        db.query_one("SELECT public.novu_rust_observe_alert_conditions_v2($1,'slack','ops',$2,$3)", &[&env,&a.condition_mask_v2(),&a.observed_condition_mask_v2()]).await.unwrap();
+        let (endpoint,server)=mock_server("200 OK","ok").await;let slack=SlackWebhook::with_endpoint(endpoint).unwrap();
+        let cfg=DispatchPair{alert:&a,slack:Some((&slack,"ops")),email:None,cooldown:3600,on_new:true,scoped:true,timeout:Duration::from_secs(3)};
+        assert_eq!(dispatch_pair_v2(&mut db,None,cfg).await.0.unwrap().unwrap(),Dispatch::Accepted);assert!(server.await.unwrap().contains("HTTP 503"));
+        let cfg=DispatchPair{alert:&a,slack:Some((&slack,"ops")),email:None,cooldown:3600,on_new:true,scoped:true,timeout:Duration::from_secs(3)};
+        assert_eq!(dispatch_pair_v2(&mut db,None,cfg).await.0.unwrap().unwrap(),Dispatch::CoolingDown);
+        a.fcm_cooldown_source=Some(Some(429));
+        db.query_one("SELECT public.novu_rust_observe_alert_conditions_v2($1,'slack','ops',$2,$3)", &[&env,&a.condition_mask_v2(),&a.observed_condition_mask_v2()]).await.unwrap();
+        let (endpoint,server)=mock_server("200 OK","ok").await;let slack=SlackWebhook::with_endpoint(endpoint).unwrap();
+        let cfg=DispatchPair{alert:&a,slack:Some((&slack,"ops")),email:None,cooldown:3600,on_new:true,scoped:true,timeout:Duration::from_secs(3)};
+        assert_eq!(dispatch_pair_v2(&mut db,None,cfg).await.0.unwrap().unwrap(),Dispatch::Accepted);assert!(server.await.unwrap().contains("HTTP 429"));
+        assert_eq!(admin.query_one("SELECT count(*) FROM public.novu_rust_alert_delivery_attempts WHERE environment_id=$1", &[&env]).await.unwrap().get::<_,i64>(0),3);
+    }
+    #[tokio::test]
     async fn twilio_delayed_health_has_independent_v2_bits_and_reaches_both_channels() {
         let mut a=alert();a.resend_enabled=false;a.twilio_delayed=Some(Ok((2,1,3)));
         assert_eq!(a.condition_mask_v2(),1_i64<<36);assert_ne!(a.observed_condition_mask_v2()&(1_i64<<36),0);
@@ -1583,6 +1618,19 @@ mod tests {
         assert_eq!(sent.0,Some(Ok(())));assert_eq!(sent.1,Some(Ok(())));
         for payload in [server.await.unwrap(),email_server.await.unwrap()] {assert!(payload.contains("FCM shared cooldown active: true; deferred jobs: 2; overdue deferred jobs: 1; deadline extended by HTTP 503"));}
         a.fcm_cooldown=Some(Err(()));assert_eq!(a.observed_condition_mask_v2()&(1_i64<<42),0);assert_ne!(a.condition_mask_v2()&(1_i64<<43),0);
+    }
+    #[test]
+    fn fcm_source_conditions_track_changes_and_preserve_failed_observations() {
+        let mut a=alert(); a.resend_enabled=false; a.fcm_cooldown=Some(Ok((true,0,0)));
+        a.fcm_cooldown_distinct_source=true; a.fcm_cooldown_source=Some(Some(429));
+        let all=(1_i64<<44)|(1_i64<<45)|(1_i64<<46);
+        assert_eq!(a.condition_mask_v2() & all,1_i64<<44);
+        assert_eq!(a.observed_condition_mask_v2() & all,all);
+        a.fcm_cooldown_source=Some(Some(503));assert_eq!(a.condition_mask_v2() & all,1_i64<<45);
+        a.fcm_cooldown_source=Some(None);assert_eq!(a.condition_mask_v2() & all,1_i64<<46);
+        a.fcm_cooldown=Some(Err(()));assert_eq!(a.condition_mask_v2() & all,0);assert_eq!(a.observed_condition_mask_v2() & all,0);
+        a.fcm_cooldown=Some(Ok((false,0,0)));assert_eq!(a.condition_mask_v2() & all,0);assert_eq!(a.observed_condition_mask_v2() & all,all);
+        a.fcm_cooldown_distinct_source=false;assert_eq!(a.observed_condition_mask_v2() & all,0);
     }
     #[test]
     fn v2_independent_shared_checks_preserve_unknown_and_sign_bit() {
@@ -2416,6 +2464,7 @@ mod tests {
             fcm_unreviewed: None,
             fcm_cooldown: None,
             fcm_cooldown_source: None,
+            fcm_cooldown_distinct_source: false,
             failed_jobs: None,
             failed_jobs_check_failed: false,
             database_probe: None,
