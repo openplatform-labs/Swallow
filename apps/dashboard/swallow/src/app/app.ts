@@ -38,6 +38,7 @@ type GrantRecord = GrantBody & {changed:boolean;createdAt:string};
 type PermissionRequestRecord = {requestId:string; targetIssuer:string; targetSubject:string; targetClientId:string; expected:PermissionFlags|null; desired:PermissionFlags; reason:string; changed:boolean; createdAt:string};
 type PermissionAudit = { id:string; recordedAt:string; issuer:string; subject:string; clientId:string; actor:string; jwtIssuer:string|null; jwtSubject:string|null; jwtClientId:string|null; requestId:string|null; reason:string; previous:string; current:string };
 type Section = 'overview' | 'workflows' | 'subscribers' | 'channels' | 'activity' | 'alerts' | 'settings';
+type SendgridKey = {identifier:string;active:boolean};
 
 @Component({
   imports: [FormsModule, ClrAlertModule],
@@ -59,6 +60,18 @@ export class App implements OnDestroy {
   readonly status = signal<ConnectionState>('unchecked');
   readonly checkedAt = signal<string | null>(null);
   readonly detail = signal('');
+  sendgridApiKey='';
+  sendgridIdentifier='';
+  sendgridPublicKey='';
+  sendgridAction:'create'|'activate'|'deactivate'|'delete'='create';
+  sendgridConfirmed=false;
+  readonly sendgridRows=signal<SendgridKey[]>([]);
+  readonly sendgridListStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');
+  readonly sendgridWriteStatus=signal<'idle'|'sending'|'saved'|'rejected'|'unknown'>('idle');
+  readonly sendgridMessage=signal('');
+  readonly sendgridNext=signal<string|null>(null);
+  private sendgridSequence=0;
+  private sendgridAbort:AbortController|null=null;
   workflowKey='';
   workflowAuthMode:'api-key'|'jwt'='api-key';
   workflowEnvironment='';
@@ -292,6 +305,7 @@ export class App implements OnDestroy {
   private grantRequestAbort:AbortController|null=null;
 
   ngOnDestroy(): void {
+    this.clearSendgrid(true);
     this.stopAlertRefresh();
     this.alertRequestId++; this.alertAbort?.abort(); this.alertAbort=null;
     this.clearWorkflow(true);
@@ -941,8 +955,10 @@ export class App implements OnDestroy {
   }
 
   setSection(next: Section): void {
+    if(this.sendgridWriteStatus()==='sending')return;
     if ((this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying' || this.subscriberDeleteRetryStatus()==='retrying') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     if (this.section()==='workflows' && next!=='workflows') {this.clearWorkflow(true);this.forgetWorkflowRequest();}
+    if (this.section()==='channels' && next!=='channels') this.clearSendgrid(true);
     if (this.section() === 'subscribers' && next !== 'subscribers') this.forgetKey();
     if (this.section() === 'alerts' && next !== 'alerts') this.forgetAlertKey();
     if (this.section() === 'settings' && next !== 'settings') {this.clearPermissions(true);this.clearPermissionChange();this.clearGrantChange();}
@@ -950,6 +966,7 @@ export class App implements OnDestroy {
   }
 
   connectionChanged(): void {
+    this.clearSendgrid(true);
     this.clearWorkflow(true);
     this.resetOidc();
     this.apiKey = '';
@@ -959,6 +976,50 @@ export class App implements OnDestroy {
     this.status.set('unchecked');
     this.checkedAt.set(null);
     this.detail.set('');
+  }
+
+  clearSendgrid(forgetKey=false):void {
+    if(this.sendgridWriteStatus()==='sending')return;
+    this.sendgridSequence++;this.sendgridAbort?.abort();this.sendgridAbort=null;
+    this.sendgridRows.set([]);this.sendgridNext.set(null);this.sendgridListStatus.set('idle');
+    this.sendgridWriteStatus.set('idle');this.sendgridMessage.set('');this.sendgridConfirmed=false;
+    this.sendgridPublicKey='';this.sendgridIdentifier='';
+    if(forgetKey)this.sendgridApiKey='';
+  }
+  async loadSendgridKeys(next=false):Promise<void> {
+    if(this.sendgridWriteStatus()==='sending')return;
+    const cursor=next?this.sendgridNext():null;if(next&&!cursor)return;
+    const sequence=++this.sendgridSequence;this.sendgridAbort?.abort();const controller=new AbortController();this.sendgridAbort=controller;
+    this.sendgridRows.set([]);this.sendgridNext.set(null);this.sendgridListStatus.set('loading');this.sendgridMessage.set('');
+    try {
+      const key=this.sendgridApiKey.trim();if(!key||/[^\x21-\x7e]/.test(key))throw new Error('invalid credentials');
+      const params=new URLSearchParams();if(cursor)params.set('after',cursor);
+      const response=await fetch(`${this.validatedOrigin()}/v1/experimental/sendgrid-webhook-keys${cursor?'?'+params:''}`,{headers:{Authorization:`ApiKey ${key}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      if(!response.ok)throw new Error('request failed');
+      const result:unknown=await response.json();if(sequence!==this.sendgridSequence)return;
+      if(typeof result!=='object'||result===null||!('data' in result)||!Array.isArray(result.data)||result.data.length>100||!('nextCursor' in result)||!(result.nextCursor===null||typeof result.nextCursor==='string'))throw new Error('invalid response');
+      const rows:SendgridKey[]=result.data.map((value:unknown)=>{if(typeof value!=='object'||value===null||!('identifier' in value)||typeof value.identifier!=='string'||!('active' in value)||typeof value.active!=='boolean')throw new Error('invalid row');return {identifier:value.identifier,active:value.active};});
+      this.sendgridRows.set(rows);this.sendgridNext.set(result.nextCursor);this.sendgridListStatus.set('loaded');this.sendgridWriteStatus.set('idle');
+    } catch {if(sequence===this.sendgridSequence){this.sendgridListStatus.set('error');this.sendgridMessage.set('키 목록을 조회하지 못했습니다. 인증과 읽기 권한을 확인하세요.');}}
+    finally {if(sequence===this.sendgridSequence)this.sendgridAbort=null;}
+  }
+  async changeSendgridKey():Promise<void> {
+    if(!this.sendgridConfirmed||this.sendgridListStatus()==='loading'||this.sendgridWriteStatus()==='sending'||this.sendgridWriteStatus()==='unknown')return;
+    const key=this.sendgridApiKey.trim(),id=this.sendgridIdentifier.trim(),publicKey=this.sendgridPublicKey.trim(),action=this.sendgridAction;
+    if(!key||/[^\x21-\x7e]/.test(key)||!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id)||(['create','activate'].includes(action)&&(!publicKey||publicKey.length>1024))){this.sendgridMessage.set('API 키, 식별자와 필요한 공개키를 확인하세요.');return;}
+    let origin:string;try{origin=this.validatedOrigin();}catch{this.sendgridMessage.set('API 주소를 확인하세요.');return;}
+    const base=`${origin}/v1/experimental/sendgrid-webhook-keys`;
+    const method=action==='create'?'POST':action==='delete'?'DELETE':'PATCH';
+    const body=action==='create'?{identifier:id,publicKey}:action==='activate'?{active:true,publicKey}:action==='deactivate'?{active:false}:undefined;
+    this.sendgridSequence++;this.sendgridAbort?.abort();this.sendgridAbort=null;this.sendgridRows.set([]);this.sendgridNext.set(null);this.sendgridListStatus.set('idle');
+    this.sendgridWriteStatus.set('sending');this.sendgridMessage.set('');
+    try {
+      const response=await fetch(action==='create'?base:`${base}/${encodeURIComponent(id)}`,{method,headers:{Authorization:`ApiKey ${key}`,...(body?{'Content-Type':'application/json'}:{})},...(body?{body:JSON.stringify(body)}:{}),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
+      if(!response.ok){const rejected=[400,401,403,404,409].includes(response.status);this.sendgridWriteStatus.set(rejected?'rejected':'unknown');this.sendgridMessage.set(rejected?'변경이 거절되었습니다. 키와 권한, 활성 키 한도를 확인하세요.':'변경 결과가 불명입니다. 목록과 감사 이력을 확인한 뒤 다시 판단하세요.');return;}
+      const value:unknown=await response.json();if(typeof value!=='object'||value===null||!('data' in value)||typeof value.data!=='object'||value.data===null||!('identifier' in value.data)||value.data.identifier!==id)throw new Error('invalid response');
+      this.sendgridWriteStatus.set('saved');this.sendgridRows.set([]);this.sendgridNext.set(null);this.sendgridListStatus.set('idle');this.sendgridMessage.set('변경 응답을 받았습니다. 목록을 다시 조회해 확인하세요.');
+    }catch{this.sendgridWriteStatus.set('unknown');this.sendgridRows.set([]);this.sendgridNext.set(null);this.sendgridListStatus.set('idle');this.sendgridMessage.set('변경 결과가 불명입니다. 목록과 감사 이력을 확인한 뒤 다시 판단하세요.');}
+    finally{this.sendgridConfirmed=false;this.sendgridPublicKey='';}
   }
 
   clearSubscribers(): void {

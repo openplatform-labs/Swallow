@@ -6,6 +6,42 @@ import { OperatorOidc } from './operator-oidc';
 describe('Swallow console', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
+  it('manages SendGrid keys with scoped API authentication and blocks uncertain retries', async () => {
+    const mock=vi.spyOn(globalThis,'fetch')
+      .mockResolvedValueOnce(new Response(JSON.stringify({data:[{identifier:'old',active:true}],nextCursor:'old'})))
+      .mockResolvedValueOnce(new Response(JSON.stringify({data:[{identifier:'new',active:false}],nextCursor:null})))
+      .mockResolvedValueOnce(new Response(JSON.stringify({data:{identifier:'new',active:true,changed:true}})))
+      .mockRejectedValueOnce(new TypeError('connection lost'))
+      .mockResolvedValueOnce(new Response(JSON.stringify({data:[],nextCursor:null})));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('channels');app.sendgridApiKey='key';
+    await app.loadSendgridKeys();expect(app.sendgridRows()[0].identifier).toBe('old');
+    expect(mock.mock.calls[0][1]?.headers).toEqual({Authorization:'ApiKey key'});
+    await app.loadSendgridKeys(true);expect(mock.mock.calls[1][0]).toContain('after=old');expect(app.sendgridRows()[0].active).toBe(false);
+    app.sendgridIdentifier='new';app.sendgridAction='activate';app.sendgridPublicKey='public';app.sendgridConfirmed=true;
+    await app.changeSendgridKey();expect(mock.mock.calls[2][1]?.method).toBe('PATCH');expect(JSON.parse(mock.mock.calls[2][1]?.body as string)).toEqual({active:true,publicKey:'public'});expect(app.sendgridWriteStatus()).toBe('saved');expect(app.sendgridPublicKey).toBe('');
+    app.sendgridAction='delete';app.sendgridConfirmed=true;await app.changeSendgridKey();expect(app.sendgridWriteStatus()).toBe('unknown');app.sendgridConfirmed=true;await app.changeSendgridKey();expect(mock).toHaveBeenCalledTimes(4);
+    await app.loadSendgridKeys();expect(app.sendgridWriteStatus()).toBe('idle');
+    app.setSection('overview');expect(app.sendgridApiKey).toBe('');expect(app.sendgridRows()).toEqual([]);
+  });
+
+  it('discards stale SendGrid responses after credentials are changed', async () => {
+    let resolve!:(response:Response)=>void;
+    vi.spyOn(globalThis,'fetch').mockImplementation(()=>new Promise<Response>(done=>resolve=done));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('channels');app.sendgridApiKey='old';
+    const loading=app.loadSendgridKeys();app.sendgridApiKey='new';app.clearSendgrid();
+    resolve(new Response(JSON.stringify({data:[{identifier:'old',active:true}],nextCursor:null})));await loading;
+    expect(app.sendgridRows()).toEqual([]);expect(app.sendgridListStatus()).toBe('idle');
+  });
+
+  it('sends the selected SendGrid key operation without including unrelated fields', async () => {
+    const mock=vi.spyOn(globalThis,'fetch').mockImplementation(async()=>new Response(JSON.stringify({data:{identifier:'key-1'}})));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('channels');app.sendgridApiKey='token';app.sendgridIdentifier='key-1';
+    app.sendgridAction='create';app.sendgridPublicKey='pub';app.sendgridConfirmed=true;await app.changeSendgridKey();
+    expect(mock.mock.calls[0][1]?.method).toBe('POST');expect(JSON.parse(mock.mock.calls[0][1]?.body as string)).toEqual({identifier:'key-1',publicKey:'pub'});
+    app.sendgridAction='deactivate';app.sendgridConfirmed=true;await app.changeSendgridKey();expect(mock.mock.calls[1][1]?.method).toBe('PATCH');expect(JSON.parse(mock.mock.calls[1][1]?.body as string)).toEqual({active:false});
+    app.sendgridAction='delete';app.sendgridConfirmed=true;await app.changeSendgridKey();expect(mock.mock.calls[2][1]?.method).toBe('DELETE');expect(mock.mock.calls[2][1]?.body).toBeUndefined();
+  });
+
   it('polls alert first page only when no decision is being reviewed', async () => {
     vi.useFakeTimers();
     const row={channel:'slack',targetId:'ops',state:'unknown',lastStartedAt:null,attemptId:'1889f88e-c0a3-4ab5-b861-2fdc1f26f254'};
