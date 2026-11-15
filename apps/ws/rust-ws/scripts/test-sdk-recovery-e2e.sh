@@ -74,3 +74,5 @@ for ((i=0;i<60;i++)); do
   sleep 0.2
 done
 NOVU_RUST_URL="http://127.0.0.1:$api_port" RUST_WS_URL="http://127.0.0.1:$ws_port" PG_CONTAINER="$name" TEST_POSTGRES_MODE="$pg_mode" TEST_PSQL="$pgbin/psql" WS_PID="$ws_pid" node tests/sdk_recovery_e2e.cjs
+
+NOVU_RUST_URL="http://127.0.0.1:$api_port" PG_CONTAINER="$name" TEST_POSTGRES_MODE="$pg_mode" TEST_PSQL="$pgbin/psql" TEST_PG_PORT="$pg_port" TEST_WS_BINARY="$(pwd)/target/debug/novu-rust-ws" node tests/sdk_listener_probe_e2e.cjs
