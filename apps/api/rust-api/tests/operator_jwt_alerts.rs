@@ -2567,9 +2567,16 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     let empty: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert!(empty["attemptId"].is_null());
     assert!(empty["sameRequestReplayReserved"].is_null());
-    db.execute("INSERT INTO public.novu_rust_resend_attempts(job_id,environment_id,state) VALUES ($1,'jwt-alert-a','rejected')", &[&fresh_job]).await.unwrap();
+    db.execute("UPDATE public.novu_queue_jobs SET status='failed' WHERE id=$1", &[&fresh_job]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_resend_attempts(job_id,environment_id,state,same_request_replays) VALUES ($1,'jwt-alert-a','unknown',1)", &[&fresh_job]).await.unwrap();
     let first: Uuid = db.query_one("SELECT attempt_id FROM public.novu_rust_resend_attempts WHERE job_id=$1", &[&fresh_job]).await.unwrap().get(0);
-    db.execute("DELETE FROM public.novu_rust_resend_attempts WHERE job_id=$1", &[&fresh_job]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'jwt-alert-a',rolname,'retry',oid FROM pg_roles WHERE rolname=current_user ON CONFLICT DO NOTHING", &[]).await.unwrap();
+    db.execute("SELECT public.novu_rust_resolve_email_sms('jwt-alert-a',$1,'retry','test','reviewed')", &[&fresh_job]).await.unwrap();
+    let response = app.clone().oneshot(result_request(&token, &fresh_query)).await.unwrap();
+    let resolved: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert!(resolved["attemptId"].is_null());
+    assert_eq!(resolved["lastResolvedAttemptId"], first.to_string());
+    assert_eq!(resolved["lastResolvedReplayReserved"], true);
     db.execute("INSERT INTO public.novu_rust_resend_attempts(job_id,environment_id,state) VALUES ($1,'jwt-alert-a','rejected')", &[&fresh_job]).await.unwrap();
     let second: Uuid = db.query_one("SELECT attempt_id FROM public.novu_rust_resend_attempts WHERE job_id=$1", &[&fresh_job]).await.unwrap().get(0);
     assert_ne!(first, second);
@@ -2577,6 +2584,17 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     let recreated: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(recreated["attemptId"], second.to_string());
     assert_eq!(recreated["sameRequestReplayReserved"], false);
+    assert_eq!(recreated["lastResolvedAttemptId"], first.to_string());
+    assert_eq!(recreated["lastResolvedReplayReserved"], true);
+    db.execute("UPDATE public.novu_queue_jobs SET status='failed' WHERE id=$1", &[&fresh_job]).await.unwrap();
+    db.execute("UPDATE public.novu_rust_resend_attempts SET state='unknown' WHERE job_id=$1", &[&fresh_job]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'jwt-alert-a',rolname,'accepted',oid FROM pg_roles WHERE rolname=current_user ON CONFLICT DO NOTHING", &[]).await.unwrap();
+    db.execute("SELECT public.novu_rust_resolve_email_sms('jwt-alert-a',$1,'accepted','test','reviewed')", &[&fresh_job]).await.unwrap();
+    let response = app.clone().oneshot(result_request(&token, &fresh_query)).await.unwrap();
+    let accepted: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(accepted["lastResolvedAttemptId"], second.to_string());
+    assert_eq!(accepted["lastResolvedReplayReserved"], false);
+    db.execute("DELETE FROM public.novu_rust_delivery_reconciliations WHERE job_id=$1", &[&fresh_job]).await.unwrap();
     db.execute("DELETE FROM public.novu_queue_jobs WHERE id=$1", &[&fresh_job]).await.unwrap();
     db.execute(
         "UPDATE public.novu_rust_resend_attempts SET http_status=NULL WHERE job_id=$1",

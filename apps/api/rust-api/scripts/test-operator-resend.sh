@@ -16,4 +16,4 @@ export DATABASE_URL="postgres://postgres@127.0.0.1:${port}/operator_test" NOVU_P
 cargo run --locked --manifest-path "$worker/Cargo.toml" --bin migrate-worker -- apply api migrations --through 17
 cargo run --locked --manifest-path "$worker/Cargo.toml" --bin migrate-worker -- apply worker "$worker/migrations"
 cargo run --locked --manifest-path "$worker/Cargo.toml" --bin migrate-worker -- apply api migrations
-TEST_DATABASE_URL="$DATABASE_URL" cargo test --locked --test operator_jwt_alerts -- --ignored
+RUST_MIN_STACK=8388608 TEST_DATABASE_URL="$DATABASE_URL" cargo test --locked --test operator_jwt_alerts -- --ignored
