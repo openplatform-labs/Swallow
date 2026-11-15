@@ -88,3 +88,12 @@ fn original_resend_options_match_selected_cases() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+#[ignore = "requires Node.js and local esbuild"]
+fn original_resend_passthrough_content_precedence() {
+    let output=Command::new("node").arg("tests/reference_resend_passthrough.cjs").output().unwrap();
+    assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+    let original:Value=serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(original,serde_json::json!({"subject":"pass global","html":"","text":"literal {{name}}"}));
+}

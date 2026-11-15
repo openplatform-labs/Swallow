@@ -12,6 +12,29 @@ use tower::ServiceExt;
 static QUEUE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
+#[ignore = "requires fully migrated disposable PostgreSQL and loopback"]
+async fn resend_passthrough_content_reaches_provider_with_layer_precedence() {
+    use tokio::io::{AsyncReadExt,AsyncWriteExt};
+    let _guard=QUEUE_TEST_LOCK.lock().await;let url=std::env::var("TEST_DATABASE_URL").unwrap();
+    let (mut db,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(async move{driver.await.unwrap()});
+    db.batch_execute("INSERT INTO public.novu_rust_users VALUES ('resend-pass-user'); INSERT INTO public.novu_rust_environments VALUES ('resend-pass-env','org'); INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,in_app_content,email_subject,email_html,email_provider,email_step_id,inbox_metadata) VALUES ('resend-pass-env','resend-pass-workflow',true,true,'Hi','template','<p>template</p>','resend','mail-step','{\"id\":\"resend-pass-id\"}')").await.unwrap();
+    let hash=format!("{:x}",Sha256::digest(b"resend-pass-key"));db.execute("INSERT INTO public.novu_rust_api_keys(key_hash,environment_id,user_id) VALUES($1,'resend-pass-env','resend-pass-user')",&[&hash]).await.unwrap();
+    let (api,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(async move{driver.await.unwrap()});let router=novu_rust_api::router(Arc::new(api));
+    let request=|txn:&str,overrides:Value| Request::builder().method("POST").uri("/v1/events/trigger").header("authorization","ApiKey resend-pass-key").header("content-type","application/json").body(Body::from(json!({"name":"resend-pass-workflow","to":{"subscriberId":txn,"email":"recipient@example.test"},"payload":{},"transactionId":txn,"overrides":overrides}).to_string())).unwrap();
+    for (i,bad) in [json!({"body":{"to":["other@example.test"]}}),json!({"body":{"subject":5}}),json!({"headers":{},"body":{"subject":"x"}})].into_iter().enumerate() {
+        assert_eq!(router.clone().oneshot(request(&format!("invalid-pass-{i}"),json!({"providers":{"resend":{"_passthrough":bad}}}))).await.unwrap().status(),StatusCode::NOT_IMPLEMENTED);
+    }
+    let overrides=json!({"providers":{"resend":{"subject":"known global","_passthrough":{"body":{"subject":"pass global","text":"literal {{name}}"}}}},"steps":{"mail-step":{"providers":{"resend":{"subject":"known step","_passthrough":{"body":{"html":""}}}}}}});
+    assert_eq!(router.oneshot(request("resend-pass-valid",overrides)).await.unwrap().status(),StatusCode::CREATED);
+    assert!(novu_postgres_queue::in_app::process_one(&mut db).await.unwrap());
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let addr=listener.local_addr().unwrap();
+    let server=tokio::spawn(async move{let (mut socket,_)=listener.accept().await.unwrap();let mut raw=Vec::new();let mut chunk=[0;4096];loop{let n=socket.read(&mut chunk).await.unwrap();assert!(n>0);raw.extend_from_slice(&chunk[..n]);if let Some(pos)=raw.windows(4).position(|v|v==b"\r\n\r\n"){let header=String::from_utf8_lossy(&raw[..pos]);let len=header.lines().find_map(|l|l.to_ascii_lowercase().strip_prefix("content-length: ").and_then(|v|v.parse::<usize>().ok())).unwrap();if raw.len()>=pos+4+len{let body:Value=serde_json::from_slice(&raw[pos+4..pos+4+len]).unwrap();let response=b"{\"id\":\"fixture-id\"}";socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",response.len()).as_bytes()).await.unwrap();socket.write_all(response).await.unwrap();return body;}}}});
+    let provider=novu_postgres_queue::resend::Resend::test_endpoint(novu_postgres_queue::resend::Config{api_key:"fixture".into(),from:"sender@example.test".into(),sender_name:"Sender".into()},&format!("http://{addr}/emails")).unwrap();
+    assert!(novu_postgres_queue::resend_queue::process_one(&mut db,"resend-pass-env",&provider).await.unwrap());
+    let body=server.await.unwrap();assert_eq!(body["subject"],"pass global");assert_eq!(body["html"],"");assert_eq!(body["text"],"literal {{name}}");assert_eq!(body["to"],json!(["recipient@example.test"]));
+}
+
+#[tokio::test]
 #[ignore = "requires fully migrated disposable PostgreSQL"]
 async fn trigger_lookup_is_environment_scoped_and_distinguishes_missing_jobs() {
     let _guard=QUEUE_TEST_LOCK.lock().await;let url=std::env::var("TEST_DATABASE_URL").unwrap();

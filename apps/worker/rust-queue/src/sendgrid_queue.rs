@@ -257,6 +257,19 @@ pub(crate) async fn prepare_workflow_email(
             .or_else(|| option("text"))
             .unwrap_or(&html)
             .to_owned();
+        if let Some(value)=context.overrides.get("__resend_passthrough") {
+            let fields=value.as_object();
+            if fields.is_none_or(|fields| fields.iter().any(|(key,value)| !["subject","html","text"].contains(&key.as_str()) || !value.is_string())) {
+                tx.execute("UPDATE novu_rust_email_messages SET status='error',error_id='mail_unexpected_error',error_text='invalid Resend passthrough' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
+                tx.execute("UPDATE novu_rust_email_step_outcomes SET status='failed',email_job_id=NULL WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
+                tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='invalid Resend passthrough',lease_token=NULL,lease_until=NULL WHERE id=$1", &[&job.id]).await?;
+                return Ok(false);
+            }
+            let fields=fields.expect("validated object");
+            if let Some(value)=fields.get("subject").and_then(serde_json::Value::as_str) {email.subject=value.to_owned();}
+            if let Some(value)=fields.get("html").and_then(serde_json::Value::as_str) {email.html=value.to_owned();}
+            if let Some(value)=fields.get("text").and_then(serde_json::Value::as_str) {email.text=Some(value.to_owned());}
+        }
         tx.execute("UPDATE novu_rust_email_messages SET email=$3 WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id,&address]).await?;
     }
     Ok(true)

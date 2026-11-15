@@ -4053,7 +4053,13 @@ async fn trigger_inner(db:Arc<Client>,environment_id:String,auth:TriggerAuth,rej
         value.as_object().is_some_and(|entries| {
             entries.iter().all(|(key, layer)| match key.as_str() {
                 "sendgrid" => valid_layer(layer, true, true),
-                "resend" => valid_layer(layer, false, false),
+                "resend" => layer.as_object().is_some_and(|fields| fields.iter().all(|(key,value)| {
+                    if key == "_passthrough" {
+                        value.as_object().is_some_and(|object| object.len()==1 && object.get("body").and_then(Value::as_object).is_some_and(|body| body.iter().all(|(key,value)| ["subject","html","text"].contains(&key.as_str()) && value.is_string())))
+                    } else {
+                        valid_layer(&Value::Object(serde_json::Map::from_iter([(key.clone(),value.clone())])), false, false)
+                    }
+                })),
                 "smtp" => layer.as_object().is_some_and(|fields| fields.iter().all(|(key,value)| key == "alternatives" && valid_email_alternatives(value))),
                 "twilio" => valid_sms_layer(layer),
                 "fcm" => valid_fcm_layer(layer),

@@ -713,6 +713,18 @@ async fn process_claimed(
             merged_email_override.extend(fields.clone());
         }
     }
+    if email_provider == "resend" {
+        let mut passthrough = serde_json::Map::new();
+        for layer in [provider_layer,step_layer].into_iter().flatten() {
+            if let Some(value)=layer.get("_passthrough") {
+                let object=value.as_object().ok_or(InvalidJob("invalid Resend passthrough"))?;
+                let body=object.get("body").and_then(serde_json::Value::as_object).ok_or(InvalidJob("invalid Resend passthrough"))?;
+                if object.len()!=1 || body.iter().any(|(k,v)| !["subject","html","text"].contains(&k.as_str()) || !v.is_string()) {return Err(InvalidJob("invalid Resend passthrough").into());}
+                passthrough.extend(body.clone());
+            }
+        }
+        if !passthrough.is_empty() {merged_email_override.insert("__resend_passthrough".into(),serde_json::Value::Object(passthrough));}
+    }
     let email_override = Some(&merged_email_override);
     let severity = severity_override
         .map(str::to_owned)
