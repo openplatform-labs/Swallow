@@ -17,6 +17,7 @@ CREATE ROLE cancel_fixture LOGIN; CREATE ROLE cancel_unprivileged LOGIN; CREATE 
 GRANT USAGE ON SCHEMA public TO cancel_fixture,cancel_unprivileged,cancel_resolver;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_reserve(text,uuid,uuid,text),public.novu_rust_resend_cancel_finish(text,uuid,text,integer),public.novu_rust_resend_cancel_get(text,uuid) TO cancel_fixture,cancel_unprivileged;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_resolve(text,uuid,uuid,text,text),public.novu_rust_resend_cancel_resolution_get(text,uuid),public.novu_rust_resend_cancel_get(text,uuid) TO cancel_resolver,cancel_fixture;
+GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_list(text,integer,uuid) TO cancel_resolver,cancel_fixture,cancel_unprivileged;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_health(text,integer),public.novu_rust_reserve_alert_v3(text,text,text,integer,bigint,bigint,bigint,bigint),public.novu_rust_observe_alert_conditions_v3(text,text,text,bigint,bigint,bigint,bigint) TO cancel_fixture;
 INSERT INTO public.novu_rust_environments VALUES ('cancel-env','org'),('cancel-other','org');
 INSERT INTO public.novu_rust_resend_cancel_operators(environment_id,database_principal,principal_oid,can_cancel,can_read,can_resolve) SELECT 'cancel-env',rolname,oid,rolname='cancel_fixture',true,rolname='cancel_resolver' FROM pg_roles WHERE rolname IN ('cancel_fixture','cancel_resolver');

@@ -81,5 +81,19 @@ try:
     assert json.loads(run('get','cancel-env',request3).stdout)['request']['state']=='confirmed'
     assert run('cancel','cancel-env','99999999-9999-4999-8999-999999999999','33333333-3333-4333-8333-333333333333','new').returncode!=0
     assert len(server.calls)==3
+    # Page unknown requests without exposing provider IDs or investigation reasons.
+    insert="""WITH jobs AS (INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) SELECT gen_random_uuid(),'cancel-env','experimental_resend_email','{}','completed' FROM generate_series(1,55) RETURNING id)
+    INSERT INTO public.novu_rust_resend_cancel_requests(environment_id,request_id,job_id,provider_id,database_principal,principal_oid,reason,state,created_at)
+    SELECT 'cancel-env',gen_random_uuid(),jobs.id,'private-provider-id',r.rolname,r.oid,'private reason','unknown',clock_timestamp()-interval '5 minutes' FROM jobs CROSS JOIN pg_roles r WHERE r.rolname='cancel_fixture'"""
+    subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',insert],check=True,capture_output=True)
+    first=run('list','cancel-env','60',override=resolver);assert first.returncode==0,(first.stdout,first.stderr)
+    page=json.loads(first.stdout);assert len(page['data'])==50 and page['next'];assert 'private' not in first.stdout
+    second=run('list','cancel-env','60',page['next'],override=resolver);more=json.loads(second.stdout)
+    assert second.returncode==0 and len(more['data'])==6 and more['next'] is None
+    ids=[x['requestId'] for x in page['data']+more['data']];assert len(set(ids))==56 and ids==sorted(ids)
+    assert all(set(x)=={'requestId','jobId','createdAt','overdue'} for x in page['data']+more['data'])
+    assert run('list','cancel-env','0',override=resolver).returncode!=0
+    assert run('list','cancel-other','60',override=resolver).returncode!=0
+    assert run('list','cancel-env','60',override=denied).returncode!=0
 finally:
     server.shutdown();server.server_close();thread.join()
