@@ -10,3 +10,7 @@ PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print
 "$TEST_PG_BIN/pg_ctl" -D "$TEST_DIR/data" -o "-h 127.0.0.1 -p $PORT -k $TEST_DIR" -l "$TEST_DIR/postgres.log" start >/dev/null
 export TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/postgres" CARGO_INCREMENTAL=0
 cargo test --locked --manifest-path "$ROOT/apps/api/rust-api/Cargo.toml" --test operator_smtp_resolution -- --ignored
+
+"$TEST_PG_BIN/createdb" -h 127.0.0.1 -p "$PORT" -U postgres smtp_grants_test
+export TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/smtp_grants_test"
+cargo test --locked --manifest-path "$ROOT/apps/api/rust-api/Cargo.toml" --test operator_smtp_resolution_grants -- --ignored
