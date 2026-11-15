@@ -4,6 +4,9 @@ import http.server
 import json
 import os
 import socket
+import signal
+import pathlib
+import tempfile
 import subprocess
 import threading
 import time
@@ -64,6 +67,43 @@ try:
         assert requests[0][1]==requests[1][1]
         assert json.loads(requests[0][1])['tags'][0]['name']=='swallow_dispatch'
     print('Two Resend worker processes handled one workflow job; one identical replay recovered the dropped response.')
+    for p in children: p.terminate()
+    for p in children: p.wait(timeout=10)
+    children.clear()
+    for scenario in ('lease-lost','address-changed'):
+        with lock: requests.clear()
+        env='resend-replay-'+scenario; parent=str(uuid.uuid4())
+        sql("INSERT INTO public.novu_rust_environments VALUES('"+env+"','org'); INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,email_subject,email_html,email_provider,inbox_metadata) VALUES('"+env+"','fixture',true,true,'Hello','<p>Hello</p>','resend','{\"id\":\"64a000000000000000000051\"}'); INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES('"+env+"','alice','64a000000000000000000054','{\"email\":\"alice@example.test\"}');")
+        payload=json.dumps({'workflow':'fixture','transactionId':'process-'+scenario,'content':'','payload':{},'recipients':[{'subscriberId':'alice'}],'recipientIdentitySnapshot':{'alice':'64a000000000000000000054'},'severityOverride':None},separators=(',',':'))
+        sql("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) VALUES ('"+parent+"','"+env+"','experimental_static_in_app','"+payload+"'::jsonb)")
+        in_app_process=subprocess.Popen([in_app],env=base,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);children.append(in_app_process)
+        until(lambda:sql("SELECT count(*) FROM public.novu_rust_email_step_outcomes WHERE environment_id='"+env+"' AND transaction_id='process-"+scenario+"' AND email_job_id IS NOT NULL")=='1','in-app worker did not create gated job')
+        in_app_process.terminate();in_app_process.wait(timeout=10);children.remove(in_app_process)
+        job=sql("SELECT email_job_id FROM public.novu_rust_email_step_outcomes WHERE environment_id='"+env+"' AND transaction_id='process-"+scenario+"'")
+        with tempfile.TemporaryDirectory(prefix='swallow-resend-replay-gate-') as directory:
+            gate=pathlib.Path(directory)
+            config={**base,'NOVU_RESEND_ENVIRONMENT_ID':env,'NOVU_RESEND_API_KEY':'fixture-key','NOVU_RESEND_FROM':'sender@example.test','NOVU_RESEND_REPLAY_UNCERTAIN_ONCE':'true','NOVU_RESEND_CORRELATION_TAG':'true','SWALLOW_TEST_RESEND_ENDPOINT':f'http://127.0.0.1:{server.server_port}/emails','SWALLOW_TEST_RESEND_REPLAY_GATE':directory}
+            for _ in range(2): children.append(subprocess.Popen([worker],env=config,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL))
+            until(lambda:(gate/'ready').exists(),'replay was not reserved')
+            owner=int((gate/'ready').read_text());assert owner in [p.pid for p in children]
+            os.kill(owner,signal.SIGSTOP)
+            try:
+                assert sql("SELECT same_request_replays FROM public.novu_rust_resend_attempts WHERE job_id='"+job+"'")=='1'
+                if scenario=='lease-lost':
+                    sql("UPDATE public.novu_queue_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id='"+job+"'")
+                    until(lambda:sql("SELECT count(*) FROM public.novu_queue_jobs j JOIN public.novu_rust_resend_attempts a ON a.job_id=j.id WHERE j.id='"+job+"' AND j.status='failed' AND a.state='unknown'")=='1','surviving worker did not recover expired lease')
+                else:
+                    sql("UPDATE public.novu_rust_subscribers SET profile='{\"email\":\"changed@example.test\"}' WHERE environment_id='"+env+"' AND subscriber_id='alice'")
+                (gate/'release').write_text('resume')
+            finally:
+                os.kill(owner,signal.SIGCONT)
+            until(lambda:sql("SELECT count(*) FROM public.novu_queue_jobs j JOIN public.novu_rust_resend_attempts a ON a.job_id=j.id WHERE j.id='"+job+"' AND j.status='failed' AND a.state='unknown'")=='1','uncertain result was not preserved')
+            time.sleep(2)
+            with lock: assert len(requests)==1, f'unexpected replay after {scenario}'
+            for p in children: p.terminate()
+            for p in children: p.wait(timeout=10)
+            children.clear()
+    print('Paused workers did not replay after lease loss or subscriber address change.')
 finally:
     for p in children:
         if p.poll() is None: p.terminate()

@@ -395,10 +395,16 @@ async fn process_one_inner(
         let mut result = provider.send_prepared_with_correlation(prepared.clone(), Some(&key), correlation).await;
         if matches!(&result, Err(SendError::Transport | SendError::InvalidResponse) | Err(SendError::Provider(408 | 500..=599))) {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            if recheck_immediate_replay(client, environment, &job, provider, policy, &prepared).await? {
-                // A rejection or ambiguous replay cannot disprove acceptance of the first request.
-                let replay = provider.send_prepared_with_correlation(prepared, Some(&key), correlation).await;
-                if replay.is_ok() { result = replay; }
+            if recheck_immediate_replay(client, environment, &job, provider, policy, &prepared, true).await? {
+                #[cfg(feature = "test-mocks")]
+                let proceed = test_replay_gate().await;
+                #[cfg(not(feature = "test-mocks"))]
+                let proceed = true;
+                if proceed && recheck_immediate_replay(client, environment, &job, provider, policy, &prepared, false).await? {
+                    // A rejection or ambiguous replay cannot disprove acceptance of the first request.
+                    let replay = provider.send_prepared_with_correlation(prepared, Some(&key), correlation).await;
+                    if replay.is_ok() { result = replay; }
+                }
             }
         }
         result
@@ -471,7 +477,7 @@ async fn process_one_inner(
 // attempt unknown; it must not mark a possibly delivered message cancelled.
 async fn recheck_immediate_replay(
     client: &mut Client, environment: &str, job: &ClaimedJob, provider: &Resend,
-    policy: crate::email_step_policy::Policy, original: &serde_json::Value,
+    policy: crate::email_step_policy::Policy, original: &serde_json::Value, reserve: bool,
 ) -> Result<bool, Error> {
     let Ok(mut email) = serde_json::from_value::<Email>(job.payload.clone()) else { return Ok(false); };
     let tx=client.transaction().await?;
@@ -486,10 +492,24 @@ async fn recheck_immediate_replay(
     let same=valid && provider.prepare(&email).is_ok_and(|body| body==*original);
     tx.batch_execute("ROLLBACK TO SAVEPOINT resend_replay_render").await?;
     if !same {tx.rollback().await?;return Ok(false);}
-    let updated=tx.execute("UPDATE public.novu_rust_resend_attempts a SET same_request_replays=1 WHERE a.job_id=$1 AND a.environment_id=$2 AND a.state='dispatching' AND a.same_request_replays=0 AND EXISTS(SELECT 1 FROM public.novu_queue_jobs j WHERE j.id=a.job_id AND j.environment_id=$2 AND j.status='running' AND j.lease_token=$3 AND j.lease_until>clock_timestamp()+interval '20 seconds')",&[&job.id,&environment,&job.lease_token]).await?;
-    if updated!=1 {tx.rollback().await?;return Ok(false);}
+    let eligible=if reserve {
+        tx.execute("UPDATE public.novu_rust_resend_attempts a SET same_request_replays=1 WHERE a.job_id=$1 AND a.environment_id=$2 AND a.state='dispatching' AND a.same_request_replays=0 AND EXISTS(SELECT 1 FROM public.novu_queue_jobs j WHERE j.id=a.job_id AND j.environment_id=$2 AND j.status='running' AND j.lease_token=$3 AND j.lease_until>clock_timestamp()+interval '20 seconds')",&[&job.id,&environment,&job.lease_token]).await? == 1
+    } else {
+        tx.query_one("SELECT EXISTS(SELECT 1 FROM public.novu_rust_resend_attempts a JOIN public.novu_queue_jobs j ON j.id=a.job_id AND j.environment_id=a.environment_id WHERE a.job_id=$1 AND a.environment_id=$2 AND a.state='dispatching' AND a.same_request_replays=1 AND j.status='running' AND j.lease_token=$3 AND j.lease_until>clock_timestamp()+interval '20 seconds')",&[&job.id,&environment,&job.lease_token]).await?.get(0)
+    };
+    if !eligible {tx.rollback().await?;return Ok(false);}
     tx.commit().await?;
     Ok(true)
+}
+
+// Test-feature-only barrier for exercising the post-reservation crash window.
+#[cfg(feature = "test-mocks")]
+async fn test_replay_gate() -> bool {
+    let Some(path) = std::env::var_os("SWALLOW_TEST_RESEND_REPLAY_GATE") else { return true; };
+    let path=std::path::PathBuf::from(path);
+    if std::fs::write(path.join("ready"),std::process::id().to_string()).is_err() {return false;}
+    while !path.join("release").exists() {tokio::time::sleep(Duration::from_millis(50)).await;}
+    true
 }
 
 pub async fn recover_expired(client: &mut Client, environment: &str) -> Result<usize, Error> {
