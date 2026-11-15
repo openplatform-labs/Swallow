@@ -2,7 +2,7 @@
 
 API 0084는 기존 운영자 Resend 결과·작업 목록 응답에 현재 발송 시도의 HTTP 상태를 추가한다. Angular 상세 화면은 429 거절과 수동 재시도 안내를 표시하며 이전 API의 필드 누락도 구별한다. 기존 조회 권한을 사용하고 UI에서 재시도하지 않는다. 이전 시도의 상태는 현재 시도 조회에서 사라질 수 있으므로 감사 이력을 확인해야 한다.
 
-임시 PostgreSQL과 Rust API 통합 시험에서 상태와 기존 권한을, Angular 테스트 159개와 빌드에서 표시·구버전·잘못된 응답을 확인했다. 실제 브라우저와 API를 연결한 이 필드의 검증, 실제 Resend 429 및 운영 HA는 미검증이다. 빌드에 기존 CSS 크기 경고가 있다. 상세 내용은 [API README](apps/api/rust-api/README.md)와 [화면 README](apps/dashboard/swallow/README.md)를 참고한다.
+임시 PostgreSQL과 Rust API 통합 시험에서 상태와 기존 권한을, Angular 테스트 159개와 빌드에서 표시·구버전·잘못된 응답을 확인했다. 실제 브라우저·제한 API 로그인·테스트 JWT·임시 로컬 PostgreSQL에서 429 표시와 권한 회수 후 결과 제거를 확인했다. 실제 Resend 429 및 운영 HA는 미검증이다. 빌드에 기존 CSS 크기 경고가 있다. 상세 내용은 [API README](apps/api/rust-api/README.md)와 [화면 README](apps/dashboard/swallow/README.md)를 참고한다.
 
 ## Resend 429 수동 재시도
 
