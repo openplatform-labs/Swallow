@@ -1291,6 +1291,47 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires migrated disposable PostgreSQL and loopback"]
+    async fn oversized_success_response_keeps_fcm_attempt_unknown_without_retry() {
+        let (mut db, driver) =
+            tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(), NoTls)
+                .await
+                .unwrap();
+        tokio::spawn(async move { driver.await.unwrap() });
+        let environment = format!("fcm-response-{}", Uuid::new_v4());
+        let job = Uuid::new_v4();
+        let payload = json!({"prepared_messages":[{"message":{"token":"target","notification":{"title":"title","body":"content"}}}]});
+        crate::enqueue(&db, job, &environment, JOB_KIND, &payload)
+            .await
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            assert!(socket.read(&mut buffer).await.unwrap() > 0);
+            let body = format!(
+                "{{\"name\":\"projects/demo/messages/123\",\"padding\":\"{}\"}}",
+                "x".repeat(16 * 1024)
+            );
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(header.as_bytes()).await.unwrap();
+            let _ = socket.write_all(body.as_bytes()).await;
+        });
+        let provider = Fcm::with_origin("demo", "fixture".into(), &origin).unwrap();
+        assert!(process_one(&mut db, &environment, &provider).await.unwrap());
+        server.await.unwrap();
+        let row = db.query_one("SELECT j.status,a.state,a.provider_message_id FROM novu_queue_jobs j JOIN novu_rust_fcm_attempts a ON a.job_id=j.id WHERE j.id=$1 AND j.environment_id=$2", &[&job,&environment]).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), "failed");
+        assert_eq!(row.get::<_, String>(1), "unknown");
+        assert_eq!(row.get::<_, Option<String>>(2), None);
+        assert!(!process_one(&mut db, &environment, &provider).await.unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires migrated disposable PostgreSQL and loopback"]
     async fn registration_guard_skips_removed_target_and_sends_remaining() {
         let url = std::env::var("TEST_DATABASE_URL").unwrap();
         let (mut db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();

@@ -1013,13 +1013,26 @@ impl Fcm {
             }
             return Err(SendError::Provider(status));
         }
-        let result = response.json::<Value>().await.ok().and_then(|v| {
-            v.get("name")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-        });
-        result.ok_or(SendError::InvalidResponse)
+        // A 2xx response may follow a completed send. A malformed, truncated,
+        // or oversized body is therefore ambiguous, never a safe rejection.
+        const MAX_SUCCESS_BODY: usize = 16 * 1024;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| SendError::Transport)? {
+            if chunk.len() > MAX_SUCCESS_BODY - bytes.len() {
+                return Err(SendError::InvalidResponse);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let value: Value =
+            serde_json::from_slice(&bytes).map_err(|_| SendError::InvalidResponse)?;
+        value
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| {
+                !name.is_empty() && name.len() <= 1024 && !name.chars().any(char::is_control)
+            })
+            .map(str::to_owned)
+            .ok_or(SendError::InvalidResponse)
     }
 }
 
@@ -1077,6 +1090,59 @@ mod tests {
         );
         server.await.unwrap();
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn success_response_is_streamed_with_a_limit_and_invalid_responses_are_ambiguous() {
+        let cases = vec![
+            (
+                r#"{"name":"projects/demo/messages/123"}"#.to_string(),
+                Ok("projects/demo/messages/123".to_string()),
+            ),
+            (
+                format!("{{\"name\":\"{}\"}}", "x".repeat(1025)),
+                Err(SendError::InvalidResponse),
+            ),
+            (
+                r#"{"name":"bad\nname"}"#.to_string(),
+                Err(SendError::InvalidResponse),
+            ),
+            (
+                r#"{"name":""}"#.to_string(),
+                Err(SendError::InvalidResponse),
+            ),
+            ("{".to_string(), Err(SendError::InvalidResponse)),
+            (
+                format!(
+                    "{{\"name\":\"ok\",\"padding\":\"{}\"}}",
+                    "x".repeat(16 * 1024)
+                ),
+                Err(SendError::InvalidResponse),
+            ),
+        ];
+        for (body, expected) in cases {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = [0; 4096];
+                assert!(socket.read(&mut buffer).await.unwrap() > 0);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(header.as_bytes()).await.unwrap();
+                // The client may close early once the limit is exceeded.
+                let _ = socket.write_all(body.as_bytes()).await;
+            });
+            let provider = Fcm::with_origin("demo", "fixture".into(), &origin).unwrap();
+            assert_eq!(
+                provider
+                    .send_wire(&json!({"message":{"token":"target"}}))
+                    .await,
+                expected
+            );
+            server.await.unwrap();
+        }
     }
     #[test]
     fn structured_unregistered_is_narrowly_classified() {

@@ -1,3 +1,7 @@
+FCM HTTP 성공 응답은 스트리밍으로 최대 16 KiB까지 읽는다. `name`이 없거나 비어 있거나 1,024바이트 초과 또는 제어 문자를 포함하면 잘못된 응답으로 처리한다. 본문 초과·잘못된 JSON·읽기 오류도 발송 여부를 확인할 수 없으므로 큐는 해당 시도를 `unknown`으로 기록하고 자동 재전송하지 않는다. 이 제한을 초과하는 공급자의 유효한 성공 응답도 수동 조사가 필요하다. API를 호출하기 전 요청 검증은 바뀌지 않으며 기존 워커를 모두 교체해야 같은 제한이 적용된다. 이 보호는 전송 요청당 메모리를 제한하며 네트워크나 공급자 자체의 과부하를 해결하지 않는다.
+
+로컬 모의 FCM에서 정상·빈 ID·긴 ID·제어 문자·잘못된 JSON·크기 초과 응답을 테스트했다. 임시 PostgreSQL 17과 실제 큐 처리 함수에서는 크기 초과 응답을 받은 작업이 `failed`/`unknown`으로 남고 다음 큐 조회에서 다시 보내지 않는 것을 확인했다. 실제 FCM과 운영 부하·HA는 검증하지 않았다.
+
 ## Attempt-fenced Slack resolution
 
 Worker migration `0158` assigns a random UUID to each current Slack delivery attempt, including attempts already present during migration. New app, webhook and workflow-delivery attempts get new IDs automatically. `delivery-reconcile list-slack-v2 ENV [AFTER_JOB]` returns the existing authorized attention list plus `attemptId` (null for entries without an attempt). After independently investigating the current outcome, `delivery-reconcile slack-resolve-v2 ENV JOB ATTEMPT_ID retry|accepted OPERATOR REASON` locks the operator grant, job and attempt, checks the exact ID and eligible state, and atomically records the attempt ID and decision in the audit. An old ID is rejected if the job has since been retried and acquired a new attempt. Two concurrent decisions on one attempt cannot both succeed. `accepted` remains an operator assertion and `retry` can duplicate a message; neither proves delivery.
