@@ -1,4 +1,6 @@
-SMTP CA 상태 관측: 워커 0237과 선택형 `NOVU_SMTP_CA_HEALTH_ENABLED`는 암호와 독립적으로 CA 파일 검증 성공·실패를 DB에 기록한다. 별도 등록 워커와 환경별 조회 권한으로 `delivery-reconcile check-smtp-ca`를 제공하며 실제 워커의 오류·복구와 제한 로그인·CLI를 로컬 PostgreSQL에서 시험한다. 릴레이 연결이나 인증서 신뢰를 증명하지 않으며 Slack·이메일 경보, HTTP·UI, 상태 기록 보존 관리는 아직 미구현이다. 실제 CA·운영 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+SMTP CA 상태 경보: 선택형 최소 정상 워커 수·최대 관측 나이로 CA 파일 오류와 조회 실패를 Slack·이메일 경보에 포함한다. 목적지별 대기 또는 v3 신규 조건 경보를 선택할 수 있으며 암호 상태와 별도 비트를 사용한다. 제한 DB 로그인·실제 경보 명령과 모의 Slack·Resend로 정책·본문을 시험한다. 실제 경보 수신·릴레이 신뢰·다중 호스트 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
+SMTP CA 상태 관측: 워커 0237과 선택형 `NOVU_SMTP_CA_HEALTH_ENABLED`는 암호와 독립적으로 CA 파일 검증 성공·실패를 DB에 기록한다. 별도 등록 워커와 환경별 조회 권한으로 `delivery-reconcile check-smtp-ca`를 제공하며 실제 워커의 오류·복구와 제한 로그인·CLI를 로컬 PostgreSQL에서 시험한다. 릴레이 연결이나 인증서 신뢰를 증명하지 않으며 Slack·이메일 경보는 위 최신 항목을 참고하며 HTTP·UI와 상태 기록 보존 관리는 아직 미구현이다. 실제 CA·운영 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
 SMTP CA 교체: `NOVU_SMTP_RELOAD_CA=true`는 새 작업 선점 전에 CA 파일을 다시 읽고 검증한다. 잘못된 파일이면 기존 `pause` 또는 `exit` 정책을 따르며, 암호와 함께 사용할 때 둘 다 정상이어야 새 작업을 시작한다. 실제 SMTP 워커·로컬 PostgreSQL·모의 STARTTLS 릴레이에서 CA 오류 중 선점 방지, 원자적 교체 후 발송, 암호 상태의 독립성과 CA 전용 종료 정책을 검증한다. 기존 비밀번호 상태 경보는 CA 오류를 감지하지 않으며 별도 로그·프로세스·큐 감시가 필요하다. 실제 CA 교체·릴레이·다중 호스트 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
