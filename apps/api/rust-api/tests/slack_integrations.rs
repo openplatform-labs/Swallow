@@ -352,6 +352,84 @@ async fn slack_metadata_is_scoped_audited_and_safe_to_delete() {
         .0,
         StatusCode::OK
     );
+    // A stale generation cannot delete a recreated integration or connection.
+    for (parent, identifier) in [
+        (base, "generation-fixture"),
+        (nested.as_str(), "generation-child"),
+    ] {
+        let path = format!("{parent}/{identifier}");
+        assert_eq!(
+            call(
+                app.clone(),
+                "POST",
+                parent,
+                "a-key",
+                json!({"identifier":identifier})
+            )
+            .await
+            .0,
+            StatusCode::CREATED
+        );
+        let (_, old) = call(app.clone(), "GET", &path, "a-key", Value::Null).await;
+        let old = old["data"]["generation"].as_str().unwrap().to_owned();
+        assert_eq!(
+            call(app.clone(), "DELETE", &path, "a-key", Value::Null)
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(
+                app.clone(),
+                "POST",
+                parent,
+                "a-key",
+                json!({"identifier":identifier})
+            )
+            .await
+            .0,
+            StatusCode::CREATED
+        );
+        let (_, fresh) = call(app.clone(), "GET", &path, "a-key", Value::Null).await;
+        let fresh = fresh["data"]["generation"].as_str().unwrap();
+        assert_ne!(old, fresh);
+        assert_eq!(
+            call(
+                app.clone(),
+                "DELETE",
+                &format!("{path}?expectedGeneration={old}"),
+                "a-key",
+                Value::Null
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            call(
+                app.clone(),
+                "DELETE",
+                &format!("{path}?expectedGeneration=bad"),
+                "a-key",
+                Value::Null
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            call(
+                app.clone(),
+                "DELETE",
+                &format!("{path}?expectedGeneration={fresh}"),
+                "a-key",
+                Value::Null
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
     setup.batch_execute("INSERT INTO public.novu_rust_slack_endpoint_integrations VALUES ('a','rollback-delete'); ALTER TABLE public.novu_rust_slack_integration_audit ADD CONSTRAINT fixture_reject CHECK (false) NOT VALID").await.unwrap();
     assert_eq!(
         call(

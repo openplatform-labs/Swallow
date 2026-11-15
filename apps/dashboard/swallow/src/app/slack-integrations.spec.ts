@@ -10,10 +10,15 @@ describe('Slack integration management',()=>{
     expect(mock.mock.calls[2][0]).toBe('https://api.example.test/v1/experimental/slack-integrations/team/connections?after=first');expect(mock.mock.calls[0][1]).toMatchObject({headers:{Authorization:'ApiKey fixture'},credentials:'omit',redirect:'error',cache:'no-store'});fixture.destroy();
   });
   it('requires confirmation and sends connection creation and deletion contracts',async()=>{
-    const mock=vi.spyOn(globalThis,'fetch').mockImplementation(async()=>new Response(JSON.stringify({data:{integrationIdentifier:'team',connectionIdentifier:'main'}}),{status:200}));
+    const mock=vi.spyOn(globalThis,'fetch').mockImplementation(async()=>new Response(JSON.stringify({data:{integrationIdentifier:'team',connectionIdentifier:'main',generation:'11111111-1111-4111-8111-111111111111'}}),{status:200}));
     const fixture=TestBed.createComponent(SlackIntegrations);const component=fixture.componentInstance;component.apiOrigin='https://api.example.test';component.key='fixture';component.integration='team';component.connection='main';component.operation='create-connection';
     await component.save();expect(mock).not.toHaveBeenCalled();component.confirmed=true;await component.save();expect(component.writeStatus()).toBe('saved');expect(mock.mock.calls[0][1]).toMatchObject({method:'POST',body:'{"identifier":"main"}'});
-    component.operation='delete-connection';component.confirmed=true;await component.save();expect(mock.mock.calls[1][0]).toBe('https://api.example.test/v1/experimental/slack-integrations/team/connections/main');expect(mock.mock.calls[1][1]).toMatchObject({method:'DELETE'});expect(component.writeStatus()).toBe('saved');fixture.destroy();
+    component.operation='delete-connection';component.confirmed=true;await component.save();expect(mock).toHaveBeenCalledTimes(1);await component.review();component.confirmed=true;await component.save();expect(mock.mock.calls[2][0]).toBe('https://api.example.test/v1/experimental/slack-integrations/team/connections/main?expectedGeneration=11111111-1111-4111-8111-111111111111');expect(mock.mock.calls[2][1]).toMatchObject({method:'DELETE'});expect(component.writeStatus()).toBe('saved');fixture.destroy();
+  });
+  it('requires a new target review after conditional deletion conflicts',async()=>{
+    const generation='11111111-1111-4111-8111-111111111111';
+    const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:{integrationIdentifier:'team',connectionIdentifier:null,generation}}))).mockResolvedValueOnce(new Response('',{status:409}));
+    const fixture=TestBed.createComponent(SlackIntegrations);const component=fixture.componentInstance;component.apiOrigin='https://api.example.test';component.key='fixture';component.integration='team';component.operation='delete-integration';await component.review();expect(component.target()?.generation).toBe(generation);component.confirmed=true;await component.save();expect(component.writeStatus()).toBe('rejected');expect(component.target()).toBeNull();component.confirmed=true;await component.save();expect(mock).toHaveBeenCalledTimes(2);fixture.destroy();
   });
   it('paginates audit and clears records on denied access',async()=>{
     const row={id:'10000000-0000-4000-8000-000000000001',integrationIdentifier:'team',connectionIdentifier:'main',action:'create',userId:'user',recordedAt:'2026-01-01'};

@@ -124,6 +124,7 @@ async fn remove(
     hash: &str,
     integration: &str,
     connection: Option<&str>,
+    expected: Option<Uuid>,
     path: &str,
 ) -> ApiError {
     if !valid(integration) || connection.is_some_and(|id| !valid(id)) {
@@ -131,19 +132,25 @@ async fn remove(
     }
     let audit = Uuid::new_v4();
     let remove = if connection.is_some() {
-        "DELETE FROM public.novu_rust_slack_endpoint_connections t USING auth a WHERE a.ok AND t.environment_id=$2 AND t.integration_identifier=$3 AND t.identifier=$4 RETURNING 1"
+        "DELETE FROM public.novu_rust_slack_endpoint_connections t USING auth a WHERE a.ok AND t.environment_id=$2 AND t.integration_identifier=$3 AND t.identifier=$4 AND ($6::uuid IS NULL OR t.generation=$6) RETURNING 1"
     } else {
-        "DELETE FROM public.novu_rust_slack_endpoint_integrations t USING auth a WHERE a.ok AND t.environment_id=$2 AND t.identifier=$3 RETURNING 1"
+        "DELETE FROM public.novu_rust_slack_endpoint_integrations t USING auth a WHERE a.ok AND t.environment_id=$2 AND t.identifier=$3 AND ($6::uuid IS NULL OR t.generation=$6) RETURNING 1"
     };
     let sql = format!(
         "WITH auth AS MATERIALIZED (SELECT public.novu_rust_lock_slack_integration_grant($1,$2,'write') AS ok), removed AS ({remove}), audited AS (INSERT INTO public.novu_rust_slack_integration_audit(id,environment_id,integration_identifier,connection_identifier,action,key_hash,user_id) SELECT $5,$2,$3,$4,'delete',$1,k.user_id FROM removed r JOIN public.novu_rust_api_keys k ON k.key_hash=$1 RETURNING 1) SELECT a.ok,(SELECT count(*) FROM removed),(SELECT count(*) FROM audited) FROM auth a"
     );
     match db
-        .query_one(&sql, &[&hash, &env, &integration, &connection, &audit])
+        .query_one(
+            &sql,
+            &[&hash, &env, &integration, &connection, &audit, &expected],
+        )
         .await
     {
         Ok(row) if !row.get::<_, bool>(0) => {
             fail(StatusCode::FORBIDDEN, "Permission revoked", path)
+        }
+        Ok(row) if row.get::<_, i64>(1) == 0 && expected.is_some() => {
+            fail(StatusCode::CONFLICT, "Metadata changed or missing", path)
         }
         Ok(row) if row.get::<_, i64>(1) == 0 => fail(StatusCode::NOT_FOUND, "Not found", path),
         Ok(_) => (
@@ -232,13 +239,13 @@ async fn get_one(
     if !valid(integration) || connection.is_some_and(|v| !valid(v)) {
         return fail(StatusCode::BAD_REQUEST, "Invalid identifier", path);
     }
-    let exists = if connection.is_some() {
-        "EXISTS(SELECT 1 FROM public.novu_rust_slack_endpoint_connections WHERE environment_id=$2 AND integration_identifier=$3 AND identifier=$4)"
+    let target = if connection.is_some() {
+        "SELECT generation FROM public.novu_rust_slack_endpoint_connections WHERE environment_id=$2 AND integration_identifier=$3 AND identifier=$4"
     } else {
-        "EXISTS(SELECT 1 FROM public.novu_rust_slack_endpoint_integrations WHERE environment_id=$2 AND identifier=$3 AND $4::text IS NULL)"
+        "SELECT generation FROM public.novu_rust_slack_endpoint_integrations WHERE environment_id=$2 AND identifier=$3 AND $4::text IS NULL"
     };
     let sql = format!(
-        "WITH auth AS MATERIALIZED (SELECT public.novu_rust_lock_slack_integration_grant($1,$2,'read') AS ok) SELECT a.ok, CASE WHEN a.ok THEN {exists} ELSE false END FROM auth a"
+        "WITH auth AS MATERIALIZED (SELECT public.novu_rust_lock_slack_integration_grant($1,$2,'read') AS ok) SELECT a.ok,CASE WHEN a.ok THEN ({target}) ELSE NULL END FROM auth a"
     );
     match db
         .query_one(&sql, &[&hash, &env, &integration, &connection])
@@ -247,13 +254,15 @@ async fn get_one(
         Ok(row) if !row.get::<_, bool>(0) => {
             fail(StatusCode::FORBIDDEN, "Permission revoked", path)
         }
-        Ok(row) if !row.get::<_, bool>(1) => fail(StatusCode::NOT_FOUND, "Not found", path),
-        Ok(_) => (
-            StatusCode::OK,
-            Json(
-                json!({"data":{"integrationIdentifier":integration,"connectionIdentifier":connection}}),
+        Ok(row) => match row.get::<_, Option<Uuid>>(1) {
+            Some(generation) => (
+                StatusCode::OK,
+                Json(
+                    json!({"data":{"integrationIdentifier":integration,"connectionIdentifier":connection,"generation":generation.to_string()}}),
+                ),
             ),
-        ),
+            None => fail(StatusCode::NOT_FOUND, "Not found", path),
+        },
         Err(_) => fail(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Internal server error",
@@ -304,6 +313,16 @@ pub(super) async fn create_integration(
     };
     create(&db, &env, &hash, &id, None, &path).await
 }
+fn expected_generation(uri: &axum::http::Uri) -> Result<Option<Uuid>, ()> {
+    let mut expected = None;
+    for (name, value) in form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()) {
+        if name != "expectedGeneration" || expected.is_some() {
+            return Err(());
+        }
+        expected = Some(Uuid::parse_str(&value).map_err(|_| ())?);
+    }
+    Ok(expected)
+}
 pub(super) async fn delete_integration(
     State(db): State<Arc<Client>>,
     headers: HeaderMap,
@@ -315,7 +334,11 @@ pub(super) async fn delete_integration(
         Ok(v) => v,
         Err(e) => return e,
     };
-    remove(&db, &env, &hash, &id, None, &path).await
+    let expected = match expected_generation(&uri) {
+        Ok(v) => v,
+        Err(_) => return fail(StatusCode::BAD_REQUEST, "Invalid generation", &path),
+    };
+    remove(&db, &env, &hash, &id, None, expected, &path).await
 }
 pub(super) async fn list_integrations(
     State(db): State<Arc<Client>>,
@@ -357,7 +380,11 @@ pub(super) async fn delete_connection(
         Ok(v) => v,
         Err(e) => return e,
     };
-    remove(&db, &env, &hash, &integration, Some(&id), &path).await
+    let expected = match expected_generation(&uri) {
+        Ok(v) => v,
+        Err(_) => return fail(StatusCode::BAD_REQUEST, "Invalid generation", &path),
+    };
+    remove(&db, &env, &hash, &integration, Some(&id), expected, &path).await
 }
 pub(super) async fn list_connections(
     State(db): State<Arc<Client>>,
