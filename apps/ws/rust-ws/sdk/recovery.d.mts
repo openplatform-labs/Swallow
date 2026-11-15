@@ -6,6 +6,11 @@ export interface SocketRecoveryOptions {
   onError?: (error: unknown) => void;
   retryDelayMs?: number;
   connectTimeoutMs?: number;
+  /** Retry multiplier; defaults to 1 (fixed delay). */
+  backoffFactor?: number;
+  maxRetryDelayMs?: number;
+  /** Symmetric randomization from 0 to 1, capped at maxRetryDelayMs. */
+  jitterRatio?: number;
 }
 
 /** Start optional recovery; return an idempotent stop function. */

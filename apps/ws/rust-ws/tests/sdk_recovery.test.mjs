@@ -108,3 +108,42 @@ test('stopping from a connection error does not schedule another attempt', async
   await delay(30);
   assert.equal(attempts, 1);
 });
+
+test('configurable backoff and jitter are capped and reset after recovery', async () => {
+  const { sdk, emit } = client();
+  const originalTimer = globalThis.setTimeout;
+  const originalRandom = Math.random;
+  const scheduled = [];
+  let attempts = 0, refreshes = 0, stop;
+  globalThis.setTimeout = (fn, ms, ...args) => { scheduled.push(ms); return originalTimer(fn, ms, ...args); };
+  Math.random = () => 1;
+  sdk.socket.connect = async () => {
+    if (++attempts === 4 || attempts === 5) emit('socket.connect.resolved');
+    return {};
+  };
+  try {
+    stop = startSocketRecovery(sdk, {
+      retryDelayMs: 10, connectTimeoutMs: 3, backoffFactor: 2, maxRetryDelayMs: 40, jitterRatio: 0.5,
+      refresh: () => { refreshes++; },
+    });
+    emit('socket.disconnect.resolved');
+    await until(() => refreshes === 1);
+    assert.deepEqual(scheduled.filter(ms => ms !== 5 && ms !== 3), [15,30,40,40]);
+    emit('socket.disconnect.resolved');
+    await until(() => refreshes === 2);
+    assert.equal(scheduled.filter(ms => ms !== 5 && ms !== 3).at(-1),15);
+  } finally {
+    stop?.();
+    globalThis.setTimeout = originalTimer;
+    Math.random = originalRandom;
+  }
+});
+
+test('rejects invalid recovery delay settings', () => {
+  const { sdk } = client();
+  for (const options of [
+    { backoffFactor: 0.5 }, { maxRetryDelayMs: 5, retryDelayMs: 10 },
+    { jitterRatio: 1.1 }, { retryDelayMs: Infinity }, { connectTimeoutMs: 2147483648 },
+  ]) assert.throws(() => startSocketRecovery(sdk, {refresh: () => {}, ...options}), RangeError);
+  assert.throws(() => startSocketRecovery(sdk, {refresh: () => {}, onError: null}), TypeError);
+});

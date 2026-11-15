@@ -8,10 +8,19 @@ export function startSocketRecovery(novu, {
   onError = () => {},
   retryDelayMs = 1000,
   connectTimeoutMs = 10000,
+  backoffFactor = 1,
+  maxRetryDelayMs = Math.max(retryDelayMs, 30000),
+  jitterRatio = 0,
 } = {}) {
   if (typeof refresh !== 'function') throw new TypeError('refresh is required');
-  if (!Number.isFinite(retryDelayMs) || retryDelayMs < 1 || !Number.isFinite(connectTimeoutMs) || connectTimeoutMs < 1) {
-    throw new RangeError('retry and connection timeouts must be positive');
+  if (typeof onError !== 'function') throw new TypeError('onError must be a function');
+  const maxTimerMs = 2147483647;
+  if (!Number.isFinite(retryDelayMs) || retryDelayMs < 1 || retryDelayMs > maxTimerMs
+    || !Number.isFinite(connectTimeoutMs) || connectTimeoutMs < 1 || connectTimeoutMs > maxTimerMs
+    || !Number.isFinite(backoffFactor) || backoffFactor < 1
+    || !Number.isFinite(maxRetryDelayMs) || maxRetryDelayMs < retryDelayMs || maxRetryDelayMs > maxTimerMs
+    || !Number.isFinite(jitterRatio) || jitterRatio < 0 || jitterRatio > 1) {
+    throw new RangeError('invalid retry, timeout, backoff or jitter configuration');
   }
   let stopped = false;
   let connected = false;
@@ -57,9 +66,12 @@ export function startSocketRecovery(novu, {
 
   async function recover() {
     recovering = true;
+    let retryDelay = retryDelayMs;
+    const advanceDelay = () => { retryDelay = Math.min(maxRetryDelayMs, retryDelay * backoffFactor); };
+    const nextDelay = () => Math.max(1, Math.min(maxRetryDelayMs, retryDelay * (1 - jitterRatio + 2 * jitterRatio * Math.random())));
     while (!stopped) {
       if (!connected) {
-        await wait(retryDelayMs);
+        await wait(nextDelay());
         if (stopped) break;
         // Automatic transport reconnection may have already succeeded.
         if (!connected) {
@@ -79,7 +91,7 @@ export function startSocketRecovery(novu, {
         }
       }
       if (stopped) break;
-      if (!connected) continue;
+      if (!connected) { advanceDelay(); continue; }
       const generation = epoch;
       const controller = new AbortController();
       activeRefresh = controller;
@@ -91,7 +103,10 @@ export function startSocketRecovery(novu, {
       } catch (error) {
         if (!stopped && generation === epoch) {
           report(error);
-          if (!stopped) await wait(retryDelayMs);
+          if (!stopped) {
+            await wait(nextDelay());
+            advanceDelay();
+          }
         }
       } finally {
         if (activeRefresh === controller) activeRefresh = undefined;

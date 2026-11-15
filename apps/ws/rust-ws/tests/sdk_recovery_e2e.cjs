@@ -1,6 +1,7 @@
 const { Novu } = require(process.env.NOVU_SDK_MODULE);
 const { spawnSync } = require('child_process');
 const assert = require('assert/strict');
+const net = require('net');
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function until(fn, message, timeout=15000) {
   const end=Date.now()+timeout;
@@ -11,6 +12,52 @@ function sql(query) {
   const result=spawnSync('docker',['exec',process.env.PG_CONTAINER,'psql','-q','-v','ON_ERROR_STOP=1','-U','postgres','-d','novu_recovery','-At','-c',query],{encoding:'utf8'});
   assert.equal(result.status,0,result.stderr);
   return result.stdout.trim();
+}
+async function networkFailureScenario(startSocketRecovery) {
+  let blocked=false, connections=0, refreshes=0, errors=[];
+  const sockets=new Set();
+  const upstream=new URL(process.env.RUST_WS_URL);
+  const proxy=net.createServer(client=>{
+    sockets.add(client);
+    client.on('close',()=>sockets.delete(client));
+    client.on('error',()=>{});
+    if(blocked) { client.destroy(); return; }
+    const target=net.connect(Number(upstream.port),upstream.hostname);
+    sockets.add(target);
+    target.on('close',()=>sockets.delete(target));
+    target.on('error',()=>client.destroy());
+    client.on('close',()=>target.destroy());
+    target.on('close',()=>client.destroy());
+    client.pipe(target).pipe(client);
+  });
+  await new Promise(resolve=>proxy.listen(0,'127.0.0.1',resolve));
+  const sdk=new Novu({applicationIdentifier:'recovery-app',subscriberId:'proxy-user',apiUrl:process.env.NOVU_RUST_URL,socketUrl:`http://127.0.0.1:${proxy.address().port}`,socketOptions:{reconnection:false,timeout:300}});
+  sdk.on('socket.connect.resolved',({error})=>{if(!error)connections++});
+  const stop=startSocketRecovery(sdk,{
+    retryDelayMs:100,connectTimeoutMs:300,backoffFactor:2,maxRetryDelayMs:500,jitterRatio:0.2,
+    onError:error=>errors.push(error),
+    refresh:async({signal})=>{
+      const result=await sdk.notifications.list({useCache:false});
+      if(result.error)throw result.error;
+      if(!signal.aborted)refreshes++;
+    },
+  });
+  sdk.on('notifications.unseen_count_changed',()=>{});
+  try {
+    await until(()=>connections===1,'proxied SDK did not connect');
+    blocked=true;
+    for(const socket of sockets)socket.destroy();
+    await until(()=>errors.length>0,'real SDK connection error was not reported');
+    assert.equal(refreshes,0,'refresh ran while the proxy was blocked');
+    blocked=false;
+    await until(()=>connections>=2 && refreshes>=1,'proxied SDK did not recover');
+    console.log('real SDK network failure: error callback and Inbox refresh verified');
+  } finally {
+    stop();
+    await sdk.socket.disconnect();
+    for(const socket of sockets)socket.destroy();
+    await new Promise(resolve=>proxy.close(resolve));
+  }
 }
 (async()=>{
   const { startSocketRecovery }=await import('../sdk/recovery.mjs');
@@ -115,6 +162,7 @@ function sql(query) {
     const deleted=await item.delete();
     assert(!deleted.error, String(deleted.error?.originalError ?? deleted.error));
     assert.equal(sql("SELECT count(*) FROM novu_rust_in_app_messages WHERE transaction_id='recovery-gap-1'"),'0');
+    await networkFailureScenario(startSocketRecovery);
     console.log('real SDK recovered Inbox state from Rust API after a lost WS event');
   } finally {
     stop();
