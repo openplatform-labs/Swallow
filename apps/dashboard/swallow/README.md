@@ -1,3 +1,5 @@
+예약 UI 발송 경로 검증: 위 로컬 스크립트는 추가로 시험 전용 loopback 엔드포인트를 사용한 실제 Resend 워커와 모의 HTTP 서버를 실행한다. 폼에서 선택한 시각과 수신자가 공급자 요청 본문에 담기고 접수 시도가 PostgreSQL에 기록되는지 확인한다. 이는 공급자 접수 모의 시험이며 실제 Resend 처리·예약·수신을 증명하지 않는다. 시험용 워커를 임시 위치에 복사한 뒤 일반 빌드를 복원한다. 실제 브라우저·제한 DB 로그인·JWT 및 운영 HA는 검증하지 않았다.
+
 예약 UI 통합 검증: `TEST_PG_BIN=/opt/homebrew/opt/postgresql@17/bin scripts/test-resend-schedule-component-local.sh`는 격리 PostgreSQL과 실제 Rust HTTP API, Angular jsdom 폼 및 실제 워크플로 워커를 연결하고 Resend 작업에 예약 시각이 보존되는지 확인한다. 초기 시도는 폼 초기화 대기와 테스트의 큐 필드 경로 오류를 수정한 뒤 통과했다. API는 테스트용 DB 관리자 로그인을 사용하며 실제 브라우저·Resend 발송·JWT 실행·운영 HA는 이 시험의 범위가 아니다. Docker는 사용하지 않는다.
 
 워크플로 실행 화면에서 선택적으로 Resend 이메일의 예약 시각을 시간대가 포함된 RFC 3339 형식으로 입력할 수 있다. 이 선택은 Resend에만 적용되며 다른 채널은 즉시 실행될 수 있다. 공급자가 접수한 예약은 화면에서 취소·변경할 수 없으며 미래 시각과 허용 범위는 Resend가 판정한다. 워커 0256–0257 및 최신 API와 워커·모니터를 먼저 적용한다. 입력 시각은 클라이언트 메모리와 서버 큐에 남고, 서버는 최종 검증한다. API 키와 JWT 요청을 Angular 모의 응답으로 시험했으며 실제 브라우저·실제 예약 발송과 원본 Novu 전체 비교는 미검증이다. 세부 제한은 [워커 README](../../worker/rust-queue/README.md)를 참고한다.

@@ -40,4 +40,43 @@ for _ in $(seq 1 100); do
 done
 [[ "$count" == 1 ]]
 "$TEST_PG_BIN/psql" "$DATABASE_URL" -qAtc "SELECT payload FROM public.novu_queue_jobs WHERE environment_id='schedule-env' AND kind='experimental_resend_email'" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["workflow_context"]["overrides"]["__resend_passthrough"]["scheduledAt"]=="2030-01-01T09:00:00+09:00",p'
-echo 'Angular form, local API and workflow worker schedule test passed.'
+# Compile the loopback-only fixture binary separately and restore the normal build.
+cargo build --quiet --locked --manifest-path "$WORKER/Cargo.toml" --features test-mocks --bin resend-worker
+cp "$WORKER/target/debug/resend-worker" "$DIR/resend-worker-mock"
+cargo build --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin resend-worker
+TEST_WORKER="$DIR/resend-worker-mock" TEST_PSQL="$TEST_PG_BIN/psql" python3 - <<'PYTEST'
+import json,os,subprocess,threading,time
+from http.server import BaseHTTPRequestHandler,HTTPServer
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.server.body=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        self.server.path_received=self.path
+        response=b'{"id":"fixture-scheduled-id"}'
+        self.send_response(200);self.send_header('Content-Length',str(len(response)));self.end_headers();self.wfile.write(response)
+    def log_message(self,*args): pass
+server=HTTPServer(('127.0.0.1',0),Handler);server.timeout=0.1;server.body=None
+thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+env=os.environ.copy();env.update(NOVU_RESEND_ENVIRONMENT_ID='schedule-env',NOVU_RESEND_API_KEY='fixture',NOVU_RESEND_FROM='sender@example.test',SWALLOW_TEST_RESEND_ENDPOINT='http://127.0.0.1:%d/emails'%server.server_port)
+worker=subprocess.Popen([env['TEST_WORKER']],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+try:
+    deadline=time.monotonic()+20
+    while server.body is None and time.monotonic()<deadline:
+        if worker.poll() is not None: raise AssertionError('worker exited: '+worker.stderr.read().decode())
+        time.sleep(0.05)
+    assert server.body is not None, 'mock provider did not receive request'
+    assert server.path_received=='/emails'
+    assert server.body.get('scheduled_at')=='2030-01-01T09:00:00+09:00',server.body
+    assert server.body.get('to')==['recipient@example.test'],server.body
+    query="SELECT count(*) FROM public.novu_rust_resend_attempts WHERE environment_id='schedule-env' AND state='accepted' AND provider_message_id='fixture-scheduled-id'"
+    while time.monotonic()<deadline:
+        result=subprocess.check_output([env['TEST_PSQL'],env['DATABASE_URL'],'-qAtc',query],text=True).strip()
+        if result=='1': break
+        time.sleep(0.05)
+    else: raise AssertionError('accepted attempt not recorded')
+finally:
+    worker.terminate()
+    try: worker.wait(timeout=5)
+    except subprocess.TimeoutExpired: worker.kill();worker.wait()
+    server.shutdown();server.server_close();thread.join()
+PYTEST
+echo 'Angular form, API, workflow and Resend worker schedule test passed.'
