@@ -123,6 +123,7 @@ async fn run() -> Result<()> {
         failed_checks: [false; 5],
         resend_auto: None,
         slack_cooldown: None,
+        twilio_delayed: None,
         failed_jobs: None,
         failed_jobs_check_failed: false,
         database_probe: Some((args[1].clone(), false)),

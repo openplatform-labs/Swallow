@@ -321,6 +321,7 @@ pub struct Alert {
     pub failed_checks: [bool; 5], // resend, queue, attempts, twilio, Slack chat
     pub resend_auto: Option<Result<(u64, u64, u64, u64), ()>>,
     pub slack_cooldown: Option<Result<(bool, u64, u64), ()>>,
+    pub twilio_delayed: Option<Result<(u64, u64, u64), ()>>,
     pub failed_jobs: Option<u64>,
     pub failed_jobs_check_failed: bool,
     pub database_probe: Option<(String, bool)>,
@@ -357,10 +358,11 @@ impl Alert {
                 .resend_auto
                 .is_some_and(|value| matches!(value,Ok((a,b,c,d)) if a>0||b>0||c>0||d>0))
             || self.slack_cooldown.is_some_and(|value| matches!(value,Ok((active,deferred,overdue)) if active||deferred>0||overdue>0))
+            || self.twilio_delayed.is_some_and(|value| matches!(value,Ok((a,b,c)) if a>0||b>0||c>0))
         {
             mask |= 1 << 18;
         }
-        if self.failed_jobs_check_failed || self.resend_auto.is_some_and(|value| value.is_err()) || self.slack_cooldown.is_some_and(|value| value.is_err()) {
+        if self.failed_jobs_check_failed || self.resend_auto.is_some_and(|value| value.is_err()) || self.slack_cooldown.is_some_and(|value| value.is_err()) || self.twilio_delayed.is_some_and(|value| value.is_err()) {
             mask |= 1 << 19;
         }
         if self
@@ -420,6 +422,8 @@ impl Alert {
         if self.resend_auto.is_some_and(|v| v.is_err()) { mask |= 1_i64 << 33; }
         if self.slack_cooldown.is_some_and(|v| matches!(v, Ok((active,deferred,overdue)) if active || deferred>0 || overdue>0)) { mask |= 1_i64 << 34; }
         if self.slack_cooldown.is_some_and(|v| v.is_err()) { mask |= 1_i64 << 35; }
+        if self.twilio_delayed.is_some_and(|v| matches!(v, Ok((a,b,c)) if a>0||b>0||c>0)) { mask |= 1_i64 << 36; }
+        if self.twilio_delayed.is_some_and(|v| v.is_err()) { mask |= 1_i64 << 37; }
         mask
     }
     pub fn observed_condition_mask_v2(&self) -> i64 {
@@ -430,6 +434,8 @@ impl Alert {
         if self.resend_auto.is_some() { known |= 1_i64 << 33; }
         if self.slack_cooldown.is_some_and(|v| v.is_ok()) { known |= 1_i64 << 34; }
         if self.slack_cooldown.is_some() { known |= 1_i64 << 35; }
+        if self.twilio_delayed.is_some_and(|v| v.is_ok()) { known |= 1_i64 << 36; }
+        if self.twilio_delayed.is_some() { known |= 1_i64 << 37; }
         known
     }
     /// Bits whose current state was actually observed, excluding unavailable or disabled checks.
@@ -470,14 +476,15 @@ impl Alert {
         }
         // Both checks share the existing failed-job cooldown category. Do
         // not mark it observed healthy if either enabled check failed.
-        if (self.failed_jobs.is_some() || self.resend_auto.is_some() || self.slack_cooldown.is_some())
+        if (self.failed_jobs.is_some() || self.resend_auto.is_some() || self.slack_cooldown.is_some() || self.twilio_delayed.is_some())
             && !self.failed_jobs_check_failed
             && !self.resend_auto.is_some_and(|value| value.is_err())
             && !self.slack_cooldown.is_some_and(|value| value.is_err())
+            && !self.twilio_delayed.is_some_and(|value| value.is_err())
         {
             known |= 1 << 18;
         }
-        if self.failed_jobs.is_some() || self.failed_jobs_check_failed || self.resend_auto.is_some() || self.slack_cooldown.is_some()
+        if self.failed_jobs.is_some() || self.failed_jobs_check_failed || self.resend_auto.is_some() || self.slack_cooldown.is_some() || self.twilio_delayed.is_some()
         {
             known |= 1 << 19;
         }
@@ -609,6 +616,9 @@ impl Alert {
         }
         if let Some(result) = self.slack_cooldown {
             match result { Ok((active,deferred,overdue))=>details.push(format!("Slack shared cooldown active: {active}; deferred jobs: {deferred}; overdue deferred jobs: {overdue}")),Err(())=>details.push("Slack shared cooldown check failed".into()) }
+        }
+        if let Some(result)=self.twilio_delayed {
+            match result { Ok((pending,expired,blocked))=>details.push(format!("Twilio delayed retries overdue: {pending}; expired leases: {expired}; callback blocked: {blocked}")),Err(())=>details.push("Twilio delayed retry check failed".into()) }
         }
         if let Some(count) = self.failed_jobs {
             details.push(format!("unacknowledged failed jobs: {count}"));
@@ -1389,6 +1399,7 @@ mod tests {
             failed_checks: [false; 5],
             resend_auto: None,
             slack_cooldown: None,
+            twilio_delayed: None,
             failed_jobs: None,
             failed_jobs_check_failed: false,
             database_probe: None,
@@ -1474,6 +1485,18 @@ mod tests {
         assert_eq!(dispatch_pair_v2(&mut db,None,cfg).await.0.unwrap().unwrap(),Dispatch::Accepted);server.await.unwrap();
         let cfg=DispatchPair {alert:&a,slack:Some((&slack,"ops")),email:None,cooldown:60,on_new:true,scoped:true,timeout:Duration::from_secs(3)};
         assert_eq!(dispatch_pair_v2(&mut db,None,cfg).await.0.unwrap().unwrap(),Dispatch::CoolingDown);
+    }
+    #[tokio::test]
+    async fn twilio_delayed_health_has_independent_v2_bits_and_reaches_both_channels() {
+        let mut a=alert();a.resend_enabled=false;a.twilio_delayed=Some(Ok((2,1,3)));
+        assert_eq!(a.condition_mask_v2(),1_i64<<36);assert_ne!(a.observed_condition_mask_v2()&(1_i64<<36),0);
+        let (url,server)=mock_server("200 OK","ok").await;let slack=SlackWebhook::with_endpoint(url).unwrap();
+        let (email_url,email_server)=mock_server("200 OK",r#"{"id":"mock-email"}"#).await;
+        let email=AlertEmailProvider::Resend(crate::resend::Resend::test_endpoint(crate::resend::Config{api_key:"re_test".into(),from:"sender@example.test".into(),sender_name:String::new()},email_url.as_str()).unwrap());
+        let result=send_uncoordinated_selected(&a,Some(&slack),Some((&email,"ops@example.test")),Duration::from_secs(2),false).await;
+        assert_eq!(result.0,Some(Ok(())));assert_eq!(result.1,Some(Ok(())));
+        for payload in [server.await.unwrap(),email_server.await.unwrap()] {assert!(payload.contains("Twilio delayed retries overdue: 2; expired leases: 1; callback blocked: 3"));}
+        a.twilio_delayed=Some(Err(()));assert_eq!(a.observed_condition_mask_v2()&(1_i64<<36),0);assert_ne!(a.condition_mask_v2()&(1_i64<<37),0);
     }
     #[test]
     fn v2_independent_shared_checks_preserve_unknown_and_sign_bit() {
@@ -2302,6 +2325,7 @@ mod tests {
             failed_checks: [false; 5],
             resend_auto: None,
             slack_cooldown: None,
+            twilio_delayed: None,
             failed_jobs: None,
             failed_jobs_check_failed: false,
             database_probe: None,

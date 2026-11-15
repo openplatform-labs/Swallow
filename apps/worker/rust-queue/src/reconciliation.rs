@@ -662,6 +662,12 @@ pub async fn sms_evidence(client: &Client, environment: &str, job: Uuid) -> Resu
 
 /// Classify authenticated callbacks for the current identified SMS attempt.
 /// Conflicting or unfamiliar evidence is intentionally never resolved.
+/// Aggregate monitoring of delayed Twilio retry jobs; no recipient or payload data.
+pub async fn twilio_delayed_retry_health(client:&Client,environment:&str,grace:i32)->Result<Value> {
+    let row=client.query_one("SELECT pending_overdue,expired_lease,callback_blocked FROM public.novu_rust_twilio_delayed_retry_health($1,$2)",&[&environment,&grace]).await?;
+    Ok(json!({"pendingOverdue":row.get::<_,i64>(0),"expiredLease":row.get::<_,i64>(1),"callbackBlocked":row.get::<_,i64>(2)}))
+}
+
 pub async fn sms_delivery<C: tokio_postgres::GenericClient + Sync>(
     client: &C,
     environment: &str,
