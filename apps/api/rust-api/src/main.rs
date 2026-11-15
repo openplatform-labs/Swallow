@@ -469,6 +469,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         _ => return Err("invalid health endpoint setting".into()),
     };
     let runtime = novu_rust_api::RuntimeConfig::try_from_env()?;
+    let key_health = match std::env::var("SWALLOW_API_OPERATOR_KEY_HEALTH_ENABLED").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid operator key health setting".into()),
+    };
+    if key_health && (!health_endpoints || runtime.operator_key_reload_healthy().is_none()) {
+        return Err("operator key health requires health endpoints and key reload".into());
+    }
     runtime.start_operator_key_reload();
     let cors = cors_from_env()?;
     let shared = ApiState {
@@ -555,6 +563,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         app = app
             .route("/health/live", axum::routing::get(live))
             .route("/health/ready", axum::routing::get(ready));
+    }
+    if key_health {
+        let runtime = runtime.clone();
+        app = app.route("/health/operator-keys", axum::routing::get(move || {
+            let runtime = runtime.clone();
+            async move {
+                let healthy = runtime.operator_key_reload_healthy() == Some(true);
+                (if healthy { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE },
+                 [(header::CACHE_CONTROL, "no-store")],
+                 Json(serde_json::json!({"status": if healthy { "healthy" } else { "unhealthy" }})))
+            }
+        }));
     }
     if let Some(cors) = cors {
         app = app.layer(cors);

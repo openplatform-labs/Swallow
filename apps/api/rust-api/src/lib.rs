@@ -83,6 +83,22 @@ fn generate_transaction_id() -> Option<String> {
     Some(format!("txn_{seconds:08x}{suffix}"))
 }
 
+fn key_reload_state_healthy(last: std::time::Instant, valid: bool, interval: std::time::Duration) -> bool {
+    valid && last.elapsed() <= interval * 2 + std::time::Duration::from_secs(5)
+}
+
+#[cfg(test)]
+mod operator_key_health_tests {
+    #[test]
+    fn rejects_failed_or_stale_observations() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        assert!(super::key_reload_state_healthy(now, true, Duration::from_secs(1)));
+        assert!(!super::key_reload_state_healthy(now, false, Duration::from_secs(1)));
+        assert!(!super::key_reload_state_healthy(now - Duration::from_secs(8), true, Duration::from_secs(1)));
+    }
+}
+
 #[derive(Clone)]
 pub struct RuntimeConfig {
     secret: Option<Vec<u8>>,
@@ -93,6 +109,7 @@ pub struct RuntimeConfig {
     reassert_fcm_registration: bool,
     operator_verifier: Option<Arc<operator_access_token::AccessTokenVerifier>>,
     operator_reload: Option<(std::path::PathBuf, std::time::Duration, bool)>,
+    operator_reload_health: Option<Arc<std::sync::Mutex<(std::time::Instant, bool)>>>,
 }
 impl RuntimeConfig {
     pub fn from_env() -> Self {
@@ -268,6 +285,7 @@ impl RuntimeConfig {
             require_jwt_exp,
             reassert_fcm_registration,
             operator_verifier,
+            operator_reload_health: operator_reload.as_ref().map(|_| Arc::new(std::sync::Mutex::new((std::time::Instant::now(), true)))),
             operator_reload,
         })
     }
@@ -275,18 +293,27 @@ impl RuntimeConfig {
     pub fn start_operator_key_reload(&self) {
         let (Some(verifier), Some((path, interval, reject))) = (&self.operator_verifier, &self.operator_reload) else { return; };
         let verifier=verifier.clone(); let path=path.clone(); let interval=*interval; let reject=*reject;
+        let health = self.operator_reload_health.clone().expect("reload health initialized");
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
                 let source=path.clone();
                 let read=tokio::task::spawn_blocking(move || novu_rust_contracts::secret::read_regular_file(&source)).await;
                 let valid=match read { Ok(Ok(value)) => verifier.reload_keys(&value).is_ok(), _ => false };
+                if let Ok(mut state) = health.lock() { *state = (std::time::Instant::now(), valid); }
                 if !valid {
                     if reject { verifier.reject_until_reloaded(); }
                     eprintln!("operator signing key reload failed");
                 }
             }
         });
+    }
+
+    /// Local polling health, including stale or blocked reads. None means reload is disabled.
+    pub fn operator_key_reload_healthy(&self) -> Option<bool> {
+        let (_, interval, _) = self.operator_reload.as_ref()?;
+        let state = self.operator_reload_health.as_ref()?;
+        Some(state.lock().map(|value| key_reload_state_healthy(value.0, value.1, *interval)).unwrap_or(false))
     }
 
     pub fn router(&self, db: Arc<Client>) -> Router {
