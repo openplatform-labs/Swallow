@@ -16,3 +16,10 @@
   @if(slackStatus()==='error'){<p role="alert">조회하지 못했습니다. 권한, 정책 및 연결 상태를 확인하세요.</p>}
   @if(slackHealth(); as health){<p>공유 대기: {{health.active ? '진행 중' : '없음'}} · 대기 종료 시각: {{health.notBefore || '없음'}} · 기본 대기: {{health.fallbackSeconds}}초</p><p>연기된 작업: {{health.deferred}} · 기준 시간 초과: {{health.overdue}}</p><p>이 상태만으로 모든 작업자가 공유 대기를 사용 중인지 확인할 수 없습니다.</p>}
 </section>
+
+<section class="card decision-card" aria-labelledby="twilio-delayed-heading">
+ <h3 id="twilio-delayed-heading">Twilio 지연 재시도 상태</h3><p>선택한 환경의 조회 시점 집계입니다. 별도의 조회 권한이 필요합니다.</p>
+ <form class="decision-form" (ngSubmit)="loadTwilio()"><label for="twilio-delayed-grace">기준 시간(초)</label><input id="twilio-delayed-grace" name="twilioDelayedGrace" type="number" min="1" max="86400" step="1" [(ngModel)]="twilioGraceSeconds" (ngModelChange)="clearTwilio()" required><button type="submit" class="btn btn-outline" [disabled]="twilioStatus()==='loading'">Twilio 재시도 상태 조회</button></form>
+ @if(twilioStatus()==='error'){<p role="alert">조회하지 못했습니다. 권한과 연결 상태를 확인하세요.</p>}
+ @if(twilioHealth();as health){<p role="status">기한 초과 대기: {{health.pendingOverdue}} · 임대 만료: {{health.expiredLease}} · 콜백 차단: {{health.callbackBlocked}}</p><p>이 값은 지연 원인이나 실제 수신을 증명하지 않습니다.</p>}
+</section>

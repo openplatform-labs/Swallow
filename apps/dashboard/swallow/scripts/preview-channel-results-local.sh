@@ -121,6 +121,14 @@ INSERT INTO public.novu_rust_twilio_dispatch_ids(id,job_id,environment_id,accoun
 INSERT INTO public.novu_rust_twilio_attempts(job_id,environment_id,state,http_status,dispatch_id,retry_after_seconds,retry_not_before) VALUES ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','ui-fixture-env','rejected',429,'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',120,clock_timestamp()+interval '2 minutes');
 SQL
 fi
+if [[ "${SWALLOW_UI_TWILIO_DELAYED_HEALTH_FIXTURE:-false}" == true ]]; then
+ "$pgbin/psql" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_twilio_delayed_health(text,text,text,text,bigint,integer) TO ui_channel_results_fixture;
+INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'ui-fixture-env',rolname,'alert_view',oid FROM pg_roles WHERE rolname='ui_channel_results_fixture' ON CONFLICT DO NOTHING;
+INSERT INTO public.novu_rust_operator_jwt_twilio_delayed_health_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
+INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status,twilio_delayed_retry,available_at,last_error) VALUES (gen_random_uuid(),'ui-fixture-env','experimental_twilio_sms','{}','pending',true,clock_timestamp()-interval '10 minutes',NULL),(gen_random_uuid(),'ui-fixture-env','experimental_twilio_sms','{}','failed',true,clock_timestamp(),'sms retry blocked by provider callback');
+SQL
+fi
 node --input-type=module - "$root" "$testdir" <<'JS'
 import {readFile,writeFile} from 'node:fs/promises';
 import {SignJWT,importPKCS8} from './node_modules/jose/dist/webapi/index.js';

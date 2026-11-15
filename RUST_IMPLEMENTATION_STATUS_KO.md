@@ -1,5 +1,7 @@
 ## Slack 공유 대기 상태 조회와 경보
 
+- Twilio 지연 재시도 상태 화면: API 0102와 Angular 운영 경보 화면에서 기한 초과·임대 만료·콜백 차단 집계를 조회한다. 별도 JWT 조회 권한과 DB `alert_view`가 필요하다. 시험 JWT·제한 DB 계정·임시 PostgreSQL에서 권한 회수와 환경 격리를, Angular 테스트 200건과 실제 로컬 브라우저에서 집계 표시·권한 회수 후 값 제거를 확인했다. 실제 IdP·운영 HA는 미검증이며 상태는 수신을 증명하지 않는다. [API README](apps/api/rust-api/README.md)와 [관리 화면 README](apps/dashboard/swallow/README.md)를 참고한다.
+
 - Twilio 지연 재시도 감시·경보: 워커 0183과 CLI가 기한 초과 대기, 임대 만료, 콜백 차단 건수를 환경별로 조회하며 선택적으로 Slack·메일 경보에 포함한다. `new-condition`은 64비트 전용 독립 조건을 사용한다. 제한 계정·임시 PostgreSQL에서 집계·권한 회수·차단된 경보 대상 및 기본/64비트 정책을 확인했고 모의 Slack·Resend 전송과 경보 단위 테스트 23건이 통과했다. 첫 통합 시험은 시험 데이터의 임대 토큰 누락으로 실패했고 수정 후 통과했다. 오래된 실행기, 실제 외부 수신·운영 HA와 대규모 인덱스 부하는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
 - Twilio 구형 워커 프로세스 시험: 이전 커밋 `d6a4bef4`의 실제 워커를 임시 소스에서 빌드해 지연 작업을 가져가게 하고, DB 트리거 거절 로그·시도 없음·외부 연결 없음을 확인했다. 이후 현재 워커가 만료 임대를 복구해 로컬 프록시에 연결했고 연결 중단으로 결과를 `unknown`으로 남겼다. 임시 단일 PostgreSQL·관리자 계정·로컬 프록시 시험으로 실제 Twilio 수신, 제한 운영 권한과 다중 호스트 HA는 미검증이다. 재현은 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
