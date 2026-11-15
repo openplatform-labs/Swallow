@@ -27,3 +27,5 @@
   <form class="decision-form" (ngSubmit)="lookup()"><label for="discord-review-request">검토 요청 ID 조회</label><input id="discord-review-request" name="discordReviewRequestId" [(ngModel)]="lookupId" (ngModelChange)="clearLookup()" autocomplete="off" [disabled]="reviewStatus()==='sending'" required><button type="submit" class="btn btn-outline" [disabled]="reviewStatus()==='sending' || lookupStatus()==='loading'">요청 결과 조회</button></form>
   @if(lookupStatus()==='found'){@if(lookupRecord();as found){<p role="status">확인된 요청: 작업 {{found.jobId}} · 사유 {{found.reason}} · {{found.recorded ? '기록됨' : '이미 확인됨'}}</p>}} @else if(lookupStatus()==='not-found'){<p role="status">조회 시점에 기록이 없습니다. 요청이 아직 진행 중일 수 있습니다.</p>} @else if(lookupStatus()==='error'){<p role="alert">요청 결과를 조회하지 못했습니다. 인증과 권한을 확인하세요.</p>}
 </div></section>
+
+<app-discord-retry-diagnostics [apiOrigin]="apiOrigin" [environment]="environment" [token]="token"></app-discord-retry-diagnostics>

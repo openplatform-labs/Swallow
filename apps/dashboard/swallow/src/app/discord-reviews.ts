@@ -1,9 +1,10 @@
 import { Component, EventEmitter, Input, OnChanges, OnDestroy, Output, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
+import { DiscordRetryDiagnostics } from './discord-retry-diagnostics';
 
 type DiscordRow = {jobId:string;kind:string;status:string;attemptState:string|null;attemptRevision:string|null;failureRevision:string;attempts:number;httpStatus:number|null};
 type Review = {requestId:string;jobId:string;attemptRevision:string|null;failureRevision:string;reason:string};
-@Component({selector:'app-discord-reviews',imports:[FormsModule],templateUrl:'./discord-reviews.html'})
+@Component({selector:'app-discord-reviews',imports:[FormsModule,DiscordRetryDiagnostics],templateUrl:'./discord-reviews.html'})
 export class DiscordReviews implements OnChanges,OnDestroy {
   @Input() apiOrigin=''; @Input() environment=''; @Input() token=''; @Output() busyChange=new EventEmitter<boolean>();
   readonly rows=signal<DiscordRow[]>([]); readonly next=signal<string|null>(null); readonly listStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');
