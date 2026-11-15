@@ -176,6 +176,14 @@ async fn run(
         Ok("false") | Err(std::env::VarError::NotPresent) => false,
         _ => return Err("invalid FCM shared cooldown setting".into()),
     };
+    let shared_unavailable = match std::env::var("SWALLOW_FCM_SHARED_COOLDOWN_503").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid FCM shared 503 cooldown setting".into()),
+    };
+    if shared_unavailable && !shared_cooldown {
+        return Err("FCM shared 503 cooldown requires shared cooldown".into());
+    }
     let invalid_token_policy = InvalidTokenPolicy::from_env()?;
     let cleanup_guard = TokenCleanupGuard::from_env()?;
     let environment = std::env::var("NOVU_FCM_ENVIRONMENT_ID")?;
@@ -494,7 +502,7 @@ async fn run(
             if configured {
                 match tokio::time::timeout(
                     timeout,
-                    novu_postgres_queue::push_step_policy::register_with_multicast(
+                    novu_postgres_queue::push_step_policy::register_with_shared_unavailable(
                         &db,
                         &environment,
                         step_policy,
@@ -503,6 +511,7 @@ async fn run(
                         shared_cooldown,
                         rate_limit_policy,
                         unavailable_policy,
+                        shared_unavailable,
                     ),
                 )
                 .await
@@ -512,7 +521,7 @@ async fn run(
                         task.abort();
                         let _ = task.await;
                         return Err(
-                            "push workers have different workflow, preference or target policies, or shared cooldown setting, or multicast 429/503 policies"
+                            "push workers have different workflow, preference or target policies, or shared cooldown setting, or multicast 429/503 policies or shared 503 cooldown setting"
                                 .into(),
                         );
                     }
@@ -627,7 +636,7 @@ async fn run(
                         continue;
                     }
                     let dispatch = async {
-                        fcm_queue::process_one_with_unavailable_policy(
+                        fcm_queue::process_one_with_shared_unavailable(
                             &mut db,
                             &environment,
                             provider.as_ref(),
@@ -639,6 +648,7 @@ async fn run(
                             rate_limit_policy,
                             unavailable_policy,
                             shared_cooldown,
+                            shared_unavailable,
                         )
                         .await
                     };

@@ -39,8 +39,8 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
     }
     let (db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move { driver.await.unwrap() });
-    db.batch_execute("INSERT INTO novu_rust_environments VALUES ('guard-env','org'),('map-env','org'),('pref-env','org'),('cool-env','org'),('rate-env','org'),('race-env','org'); INSERT INTO novu_rust_fcm_routing_workers SELECT e.id,r.rolname,r.oid FROM novu_rust_environments e CROSS JOIN pg_roles r WHERE r.rolname=session_user; INSERT INTO novu_rust_operator_grant_admins(environment_id,database_principal,principal_oid) SELECT 'guard-env',rolname,oid FROM pg_roles WHERE rolname=session_user").await.unwrap();
-    db.batch_execute("INSERT INTO public.novu_rust_fcm_cooldown_policies(environment_id,fallback_seconds) VALUES ('guard-env',60),('cool-env',60); INSERT INTO public.novu_rust_fcm_cooldown_workers SELECT e.id,r.rolname,r.oid FROM public.novu_rust_environments e CROSS JOIN pg_roles r WHERE e.id IN ('guard-env','cool-env') AND r.rolname=session_user").await.unwrap();
+    db.batch_execute("INSERT INTO novu_rust_environments VALUES ('guard-env','org'),('map-env','org'),('pref-env','org'),('cool-env','org'),('rate-env','org'),('race-env','org'),('shared503-env','org'); INSERT INTO novu_rust_fcm_routing_workers SELECT e.id,r.rolname,r.oid FROM novu_rust_environments e CROSS JOIN pg_roles r WHERE r.rolname=session_user; INSERT INTO novu_rust_operator_grant_admins(environment_id,database_principal,principal_oid) SELECT 'guard-env',rolname,oid FROM pg_roles WHERE rolname=session_user").await.unwrap();
+    db.batch_execute("INSERT INTO public.novu_rust_fcm_cooldown_policies(environment_id,fallback_seconds) VALUES ('guard-env',60),('cool-env',60),('shared503-env',60); INSERT INTO public.novu_rust_fcm_cooldown_workers SELECT e.id,r.rolname,r.oid FROM public.novu_rust_environments e CROSS JOIN pg_roles r WHERE e.id IN ('guard-env','cool-env','shared503-env') AND r.rolname=session_user").await.unwrap();
     let command = |env: &str, project: &str, token: &str| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_fcm-worker"));
         c.env("DATABASE_URL", &url)
@@ -53,6 +53,7 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
             .env_remove("NOVU_FCM_INTEGRATIONS")
             .env_remove("NOVU_FCM_INTEGRATIONS_FILE")
             .env_remove("SWALLOW_FCM_SHARED_COOLDOWN")
+            .env_remove("SWALLOW_FCM_SHARED_COOLDOWN_503")
             .env_remove("SWALLOW_FCM_MULTICAST_429_POLICY")
             .env_remove("SWALLOW_FCM_MULTICAST_503_POLICY")
             .env_remove("SWALLOW_FCM_ALLOW_SHARED_PROVIDER")
@@ -160,6 +161,26 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
     assert!(resolved, "competing policies both remained active");
     let registered: String = db.query_one("SELECT multicast_503_policy FROM public.novu_rust_push_workflow_worker_config WHERE environment_id='race-env'", &[]).await.unwrap().get(0);
     assert!(["delay-known", "delay-minimum"].contains(&registered.as_str()));
+    let mismatch_shared_503 = command("cool-env", "project-a", "fixture-token")
+        .env("SWALLOW_FCM_SHARED_COOLDOWN", "true").env("SWALLOW_FCM_SHARED_COOLDOWN_503", "true").output().unwrap();
+    assert!(!mismatch_shared_503.status.success());
+    assert!(String::from_utf8_lossy(&mismatch_shared_503.stderr).contains("shared 503 cooldown setting"));
+    let mut shared_503 = Worker(command("shared503-env", "project-a", "fixture-token")
+        .env("SWALLOW_FCM_SHARED_COOLDOWN", "true").env("SWALLOW_FCM_SHARED_COOLDOWN_503", "true").spawn().unwrap());
+    let mut bound = false;
+    for _ in 0..100 {
+        bound = db.query_opt("SELECT shared_unavailable FROM public.novu_rust_push_workflow_worker_config WHERE environment_id='shared503-env'", &[]).await.unwrap().is_some_and(|r| r.get::<_,Option<bool>>(0)==Some(true));
+        if bound { break; } tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(bound); assert!(shared_503.0.try_wait().unwrap().is_none());
+    let reverse = command("shared503-env", "project-a", "fixture-token")
+        .env("SWALLOW_FCM_SHARED_COOLDOWN", "true").output().unwrap();
+    assert!(!reverse.status.success());
+    assert!(String::from_utf8_lossy(&reverse.stderr).contains("shared 503 cooldown setting"));
+    let requires_base = command("guard-env", "project-a", "fixture-token")
+        .env("SWALLOW_FCM_SHARED_COOLDOWN_503", "true").output().unwrap();
+    assert!(!requires_base.status.success());
+    assert!(String::from_utf8_lossy(&requires_base.stderr).contains("requires shared cooldown"));
     let mismatch_step = command("guard-env", "project-a", "fixture-token")
         .env("SWALLOW_PUSH_WORKFLOW_STEP_POLICY", "active")
         .output()

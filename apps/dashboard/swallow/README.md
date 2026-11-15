@@ -1,6 +1,6 @@
 ## Slack 429 지연 재시도 화면
 
-The FCM results panel displays the shared cooldown's active state, end time, fallback and deferred/overdue job counts using the independent operator JWT and DB `alert_view` grants. Apply API `0108` after worker `0188`–`0190`. This aggregate does not prove that every worker uses the policy or that devices received pushes. A local browser with restricted API and disposable PostgreSQL verified display and clearing after permission revocation; real IdP and production HA remain unverified.
+The FCM results panel displays the shared cooldown's active state, end time, fallback and deferred/overdue job counts using the independent operator JWT and DB `alert_view` grants. Apply API `0108` after worker `0188`–`0190`. The aggregate can include both 429 and optional 503 cooldowns and does not identify their cause. It does not prove that every worker uses the policy or that devices received pushes. A local browser with restricted API and disposable PostgreSQL verified display and clearing after permission revocation; real IdP and production HA remain unverified.
 
 
 

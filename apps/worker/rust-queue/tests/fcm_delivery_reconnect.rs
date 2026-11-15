@@ -95,6 +95,7 @@ async fn workers_reconnect_and_preserve_uncertain_attempts() {
     .await
     .unwrap();
     db.batch_execute(include_str!("../migrations/0191_fcm_multicast_policy_registration.sql")).await.unwrap();
+    db.batch_execute(include_str!("../migrations/0192_fcm_shared_unavailable_registration.sql")).await.unwrap();
     db.batch_execute("CREATE TABLE novu_rust_operator_grant_admins(environment_id text,database_principal text,principal_oid oid)").await.unwrap();
     db.batch_execute(include_str!("../migrations/0095_fcm_routing_guard.sql"))
         .await

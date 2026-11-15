@@ -192,6 +192,7 @@ pub async fn process_one(
         RateLimitPolicy::Continue,
         UnavailablePolicy::Continue,
         false,
+        false,
     )
     .await
 }
@@ -213,6 +214,7 @@ pub async fn process_one_with_shared_provider(
         crate::push_step_policy::TargetPolicy::Reference,
         RateLimitPolicy::Continue,
         UnavailablePolicy::Continue,
+        false,
         false,
     )
     .await
@@ -236,6 +238,7 @@ pub async fn process_one_with_integrations(
         crate::push_step_policy::TargetPolicy::Reference,
         RateLimitPolicy::Continue,
         UnavailablePolicy::Continue,
+        false,
         false,
     )
     .await
@@ -261,6 +264,7 @@ pub async fn process_one_with_policy(
         RateLimitPolicy::Continue,
         UnavailablePolicy::Continue,
         false,
+        false,
     )
     .await
 }
@@ -285,6 +289,7 @@ pub async fn process_one_with_policies(
         crate::push_step_policy::TargetPolicy::Reference,
         RateLimitPolicy::Continue,
         UnavailablePolicy::Continue,
+        false,
         false,
     )
     .await
@@ -313,6 +318,7 @@ pub async fn process_one_with_target_policy(
         RateLimitPolicy::Continue,
         UnavailablePolicy::Continue,
         false,
+        false,
     )
     .await
 }
@@ -340,6 +346,7 @@ pub async fn process_one_with_rate_limit_policy(
         target,
         rate_limit,
         UnavailablePolicy::Continue,
+        false,
         false,
     )
     .await
@@ -380,8 +387,27 @@ pub async fn process_one_with_unavailable_policy(
 ) -> Result<bool, Error> {
     process_one_inner(
         client, environment, provider, providers, shared, policy, preference, target,
-        rate_limit, unavailable, cooldown,
+        rate_limit, unavailable, cooldown, false,
     ).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn process_one_with_shared_unavailable(
+    client: &mut Client,
+    environment: &str,
+    provider: Option<&Fcm>,
+    providers: Option<&HashMap<String, Fcm>>,
+    shared: bool,
+    policy: crate::push_step_policy::Policy,
+    preference: crate::push_step_policy::PreferencePolicy,
+    target: crate::push_step_policy::TargetPolicy,
+    rate_limit: RateLimitPolicy,
+    unavailable: UnavailablePolicy,
+    cooldown: bool,
+    shared_unavailable: bool,
+) -> Result<bool, Error> {
+    process_one_inner(client, environment, provider, providers, shared, policy, preference, target,
+        rate_limit, unavailable, cooldown, shared_unavailable).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -397,6 +423,7 @@ async fn process_one_inner(
     rate_limit_policy: RateLimitPolicy,
     unavailable_policy: UnavailablePolicy,
     shared_cooldown: bool,
+    shared_unavailable: bool,
 ) -> Result<bool, Error> {
     let Some(job) = claim(client, environment).await? else {
         return Ok(false);
@@ -1053,7 +1080,7 @@ async fn process_one_inner(
     }
     let updated=tx.execute("UPDATE novu_rust_fcm_attempts SET state=$4,http_status=$5,provider_message_id=$6,updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$2 AND target_index=$3 AND state='dispatching'",&[&job.id,&environment,&index_i32,&state,&status,&id]).await?;
     if updated == 1 {
-        if shared_cooldown && status == Some(429) {
+        if shared_cooldown && (status == Some(429) || (shared_unavailable && status == Some(503))) {
             tx.query_one(
                 "SELECT public.novu_rust_fcm_cooldown_record($1,$2)",
                 &[&environment, &retry_after],
@@ -2360,6 +2387,28 @@ mod tests {
             .unwrap()
         );
         assert_eq!(shared_server.await.unwrap(), ["a", "a"]);
+        // 503 may opt into the same environment-wide guard for other jobs.
+        for (env, enabled, headers, minimum) in [("shared-503-on", true, "Retry-After: 120\r\n", 100f64), ("shared-503-missing", true, "", 45f64), ("shared-503-off", false, "Retry-After: 120\r\n", 100f64)] {
+            db.execute("INSERT INTO public.novu_rust_environments(id) VALUES ($1)", &[&env]).await.unwrap();
+            db.execute("INSERT INTO public.novu_rust_fcm_cooldown_policies(environment_id,fallback_seconds) VALUES($1,60)", &[&env]).await.unwrap();
+            db.execute("INSERT INTO public.novu_rust_fcm_cooldown_workers SELECT $1,rolname,oid FROM pg_roles WHERE rolname=session_user", &[&env]).await.unwrap();
+            let first = Uuid::new_v4(); let second = Uuid::new_v4();
+            crate::enqueue(&db, first, env, JOB_KIND, &shared_payload).await.unwrap();
+            let (provider, server) = mock_with_headers(vec![503,200], headers).await;
+            assert!(process_one_with_shared_unavailable(&mut db, env, Some(&provider), None, false, crate::push_step_policy::Policy::Snapshot, crate::push_step_policy::PreferencePolicy::Snapshot, crate::push_step_policy::TargetPolicy::Reference, RateLimitPolicy::Continue, UnavailablePolicy::Continue, true, enabled).await.unwrap());
+            let first_state=db.query_one("SELECT state,http_status FROM public.novu_rust_fcm_attempts WHERE job_id=$1", &[&first]).await.unwrap();
+            assert_eq!(first_state.get::<_,String>(0), "unknown"); assert_eq!(first_state.get::<_,Option<i32>>(1), Some(503));
+            crate::enqueue(&db, second, env, JOB_KIND, &shared_payload).await.unwrap();
+            assert!(process_one_with_shared_unavailable(&mut other_db, env, Some(&provider), None, false, crate::push_step_policy::Policy::Snapshot, crate::push_step_policy::PreferencePolicy::Snapshot, crate::push_step_policy::TargetPolicy::Reference, RateLimitPolicy::Continue, UnavailablePolicy::Continue, true, enabled).await.unwrap());
+            let row=db.query_one("SELECT status,available_at>clock_timestamp()+make_interval(secs=>$2::double precision),(SELECT count(*) FROM public.novu_rust_fcm_attempts WHERE job_id=$1) FROM public.novu_queue_jobs WHERE id=$1", &[&second,&minimum]).await.unwrap();
+            if enabled {
+                assert_eq!(row.get::<_,String>(0), "pending"); assert!(row.get::<_,bool>(1)); assert_eq!(row.get::<_,i64>(2),0);
+                db.execute("UPDATE public.novu_rust_fcm_cooldown_policies SET not_before=clock_timestamp()-interval '1 second' WHERE environment_id=$1", &[&env]).await.unwrap();
+                db.execute("UPDATE public.novu_queue_jobs SET available_at=clock_timestamp()-interval '1 second' WHERE id=$1", &[&second]).await.unwrap();
+                assert!(process_one_with_shared_unavailable(&mut other_db, env, Some(&provider), None, false, crate::push_step_policy::Policy::Snapshot, crate::push_step_policy::PreferencePolicy::Snapshot, crate::push_step_policy::TargetPolicy::Reference, RateLimitPolicy::Continue, UnavailablePolicy::Continue, true, enabled).await.unwrap());
+            } else { assert_eq!(row.get::<_,String>(0), "completed"); assert_eq!(row.get::<_,i64>(2),1); }
+            assert_eq!(server.await.unwrap(), ["a", "a"]);
+        }
         let payload = json!({"title":"Hi","content":"Hello","targets":["a","b","c"]});
         let other = Uuid::new_v4();
         let id = Uuid::new_v4();
