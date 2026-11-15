@@ -332,3 +332,9 @@ Angular tests cover selection, review, ambiguous responses, identity changes, ma
 ### Discord review grant administration
 
 The settings permission panel supports the Discord review list and review grants, request lookup and grant audit. Administrator read/write and audit-view privileges must be provisioned independently, along with the worker-side permissions described in the API README. A local browser integration can be reproduced with `scripts/test-discord-grants-browser.sh`; it builds the API and UI, starts a disposable Docker PostgreSQL, uses restricted API database credentials and test-signed JWTs, grants both permissions, records a review and revokes list access. It removes its test container and processes afterwards. It does not contact Discord or an external identity provider, and does not validate production HA.
+
+# Discord 워크플로 정책
+
+설정 화면에서 환경별 Discord 발송 정책을 조회하고 활성·비활성을 선택할 수 있다. 변경은 조회한 revision과 새 요청 ID를 고정해 준비한 뒤 별도 확인을 받아 제출한다. 결과가 불명이면 요청 ID로 조회하거나 같은 토큰·환경·API 주소로 동일 요청을 재제출할 수 있다. 요청과 감사 조회는 각기 권한이 필요하며, JWT와 API DB 로그인에 모두 해당 권한이 있어야 한다. 정책별 권한 위임 UI는 아직 없어 DBA가 사전에 설정해야 한다. API와 워커 배포 순서는 [API README](../../api/rust-api/README.md)와 [워커 README](../../worker/rust-queue/README.md)를 따른다.
+
+요청 정보와 토큰은 화면 메모리에만 보관하므로 새로고침 전에 요청 ID와 내용을 기록한다. 감사 목록은 JWT 경로만 보여 주고 단일 스냅샷이나 전체 변경 이력을 보장하지 않는다. Angular 테스트 242개와 빌드가 통과했고 실제 브라우저에서 카드 표시를 확인했다. API 응답은 화면 단위 테스트에서 모의했으며, 브라우저에서 실제 API까지의 종단 간 경로, 외부 IdP, 실제 Discord 및 운영 HA는 검증하지 않았다. 빌드에 기존 번들·CSS 예산 경고가 남아 있다.

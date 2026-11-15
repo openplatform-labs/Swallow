@@ -1,0 +1,27 @@
+import { TestBed } from '@angular/core/testing';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { DiscordPolicy } from './discord-policy';
+import { App } from './app';
+const current={enabled:false,revision:'0'};
+function setup(){const fixture=TestBed.createComponent(DiscordPolicy);const c=fixture.componentInstance;c.apiOrigin='https://api.example.test';c.environment='env';c.token='aaa.bbb.ccc';return {fixture,c};}
+describe('Discord workflow policy',()=>{
+ afterEach(()=>vi.restoreAllMocks());
+ it('prepares and confirms a change, looks up its result, and displays audit',async()=>{
+  const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify(current))).mockImplementationOnce(async (_url,opts)=>{const b=JSON.parse(opts!.body as string);return new Response(JSON.stringify({requestId:b.requestId,replayed:false,policy:{enabled:true,revision:'1'}}));});
+  const {fixture,c}=setup();await c.load();expect(c.policy()).toEqual(current);c.enabled=true;c.reason='ticket';c.confirm=true;await c.prepare();const draft=c.snapshot()!.body;expect(draft.expectedRevision).toBe('0');expect(draft.enabled).toBe(true);await c.submit();expect(mock).toHaveBeenCalledTimes(1);c.submitConfirm=true;await c.submit();expect(c.changeStatus()).toBe('recorded');expect(new URL(mock.mock.calls[1][0] as string).pathname).toBe('/v1/experimental/operator/discord-policy');
+  c.lookupId=draft.requestId;mock.mockResolvedValueOnce(new Response(JSON.stringify({found:true,...draft,policy:{enabled:true,revision:'1'},createdAt:'today'})));await c.lookup();expect(c.lookupRecord()?.enabled).toBe(true);
+  mock.mockResolvedValueOnce(new Response(JSON.stringify({data:[{id:'11111111-1111-4111-8111-000000000001',actorIssuer:'issuer',actorSubject:'alice',actorClientId:'console',databasePrincipal:'api',requestId:draft.requestId,previous:current,current:{enabled:true,revision:'1'},reason:'ticket',recordedAt:'today'}],hasMore:false,next:null})));await c.audit();expect(c.auditRows()[0].current.enabled).toBe(true);fixture.detectChanges();expect(fixture.nativeElement.textContent).toContain('Discord 워크플로 정책');fixture.destroy();
+ });
+ it('preserves an uncertain request and retries only with matching credentials',async()=>{
+  const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify(current))).mockRejectedValueOnce(new Error('lost')).mockImplementationOnce(async (_url,opts)=>{const b=JSON.parse(opts!.body as string);return new Response(JSON.stringify({requestId:b.requestId,replayed:true,policy:{enabled:true,revision:'1'}}));});
+  const {fixture,c}=setup();await c.load();c.enabled=true;c.reason='ticket';c.confirm=true;await c.prepare();c.submitConfirm=true;await c.submit();expect(c.changeStatus()).toBe('unknown');c.reset();expect(c.snapshot()).not.toBeNull();c.token='other.token.value';c.retryConfirm=true;await c.submit(true);expect(mock).toHaveBeenCalledTimes(2);c.token='aaa.bbb.ccc';c.retryConfirm=true;await c.submit(true);expect(c.changeStatus()).toBe('recorded');expect(mock.mock.calls[1][1]!.body).toEqual(mock.mock.calls[2][1]!.body);fixture.destroy();
+ });
+ it('rejects malformed policy and invalid write response',async()=>{
+  vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({enabled:'yes',revision:'0'}))).mockResolvedValueOnce(new Response(JSON.stringify(current))).mockImplementationOnce(async (_url,opts)=>{const b=JSON.parse(opts!.body as string);return new Response(JSON.stringify({requestId:b.requestId,replayed:false,policy:{enabled:false,revision:'1'}}));});
+  const {fixture,c}=setup();await c.load();expect(c.readStatus()).toBe('error');await c.load();c.enabled=true;c.reason='ticket';c.confirm=true;await c.prepare();c.submitConfirm=true;await c.submit();expect(c.changeStatus()).toBe('unknown');fixture.destroy();
+ });
+ it('clears stale reads when credentials change and blocks navigation during a write',async()=>{
+  let finish!:(r:Response)=>void;vi.spyOn(globalThis,'fetch').mockReturnValueOnce(new Promise(done=>finish=done));const {fixture,c}=setup();const pending=c.load();c.token='other.token.value';c.ngOnChanges();finish(new Response(JSON.stringify(current)));await pending;expect(c.policy()).toBeNull();fixture.destroy();
+  const appFixture=TestBed.createComponent(App),app=appFixture.componentInstance;app.setSection('settings');app.discordPolicyBusy=true;app.setSection('overview');expect(app.section()).toBe('settings');app.discordPolicyBusy=false;app.setSection('overview');expect(app.section()).toBe('overview');appFixture.destroy();
+ });
+});

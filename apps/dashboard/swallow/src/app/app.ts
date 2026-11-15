@@ -8,6 +8,7 @@ import { DiscordReviews } from './discord-reviews';
 import { SlackResults } from './slack-results';
 import { ResendAutoPolicy } from './resend-auto-policy';
 import { ResendCooldownPolicy } from './resend-cooldown-policy';
+import { DiscordPolicy } from './discord-policy';
 import { ResendAutoHealth } from './resend-auto-health';
 import { SendgridResults } from './sendgrid-results';
 import { ClrAlertModule } from '@clr/angular/emphasis/alert';
@@ -55,7 +56,7 @@ type SendgridKey = {identifier:string;active:boolean};
 type SendgridKeyAudit = {id:string;identifier:string;action:string;userId:string;recordedAt:string};
 
 @Component({
-  imports: [FormsModule, ClrAlertModule, FcmIntegrations, SlackIntegrations, TwilioResults, FcmResults, DiscordReviews, SlackResults, SendgridResults, ResendAutoPolicy, ResendCooldownPolicy, ResendAutoHealth],
+  imports: [FormsModule, ClrAlertModule, FcmIntegrations, SlackIntegrations, TwilioResults, FcmResults, DiscordReviews, SlackResults, SendgridResults, ResendAutoPolicy, ResendCooldownPolicy, DiscordPolicy, ResendAutoHealth],
   selector: 'app-root',
   styleUrl: './app.css',
   templateUrl: './app.html',
@@ -78,7 +79,8 @@ export class App implements OnDestroy {
   private operatorKeyHealthSequence = 0;
   resendPolicyBusy=false;
   resendCooldownPolicyBusy=false;
-  get policyBusy():boolean { return this.resendPolicyBusy || this.resendCooldownPolicyBusy; }
+  discordPolicyBusy=false;
+  get policyBusy():boolean { return this.resendPolicyBusy || this.resendCooldownPolicyBusy || this.discordPolicyBusy; }
   fcmBusy=false;
   slackBusy=false;
   sendgridApiKey='';
