@@ -15,18 +15,23 @@ pub fn request_body(
 ) -> Result<Value, SendError> {
     fn merge(target: &mut Map<String, Value>, source: &Map<String, Value>) {
         for (key, value) in source {
-            if let (Some(Value::Object(existing)), Value::Object(incoming)) =
-                (target.get_mut(key), value)
-            {
-                merge(existing, incoming);
-            } else {
-                target.insert(key.clone(), value.clone());
+            match (target.get_mut(key), value) {
+                (Some(Value::Object(existing)), Value::Object(incoming)) => {
+                    merge(existing, incoming)
+                }
+                (Some(Value::Array(existing)), Value::Array(incoming)) => {
+                    existing.extend(incoming.clone())
+                }
+                _ => {
+                    target.insert(key.clone(), value.clone());
+                }
             }
         }
     }
     let mut body = Map::new();
     body.insert("content".into(), json!(content));
-    merge(&mut body, custom);
+    // Novu spreads customData into the trigger body before the deep merge.
+    body.extend(custom.clone());
     merge(&mut body, provider);
     merge(&mut body, passthrough);
     let body = Value::Object(body);
@@ -190,6 +195,17 @@ mod tests {
         assert_eq!(
             body,
             json!({"content":"passthrough", "allowed_mentions":{"parse":[],"users":["1"]}})
+        );
+        let merged = request_body(
+            "text",
+            &map(json!({"embeds":[{"title":"a"}]})),
+            &map(json!({"embeds":[{"title":"b"}]})),
+            &map(json!({"embeds":[{"title":"c"}]})),
+        )
+        .unwrap();
+        assert_eq!(
+            merged["embeds"],
+            json!([{"title":"a"},{"title":"b"},{"title":"c"}])
         );
         assert!(request_body(&"x".repeat(131073), &Map::new(), &Map::new(), &Map::new()).is_err());
     }
