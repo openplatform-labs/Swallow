@@ -330,6 +330,7 @@ pub struct Alert {
     pub failed_jobs: Option<u64>,
     pub failed_jobs_check_failed: bool,
     pub database_probe: Option<(String, bool)>,
+    pub operator_key_probe: Option<(String, bool)>,
     pub alert_store_unavailable: bool,
 }
 impl Alert {
@@ -377,6 +378,7 @@ impl Alert {
             .database_probe
             .as_ref()
             .is_some_and(|(_, unhealthy)| *unhealthy)
+            || self.operator_key_probe.as_ref().is_some_and(|(_, unhealthy)| *unhealthy)
         {
             mask |= 1 << 20;
         }
@@ -515,7 +517,7 @@ impl Alert {
         {
             known |= 1 << 19;
         }
-        if self.database_probe.is_some() {
+        if self.database_probe.is_some() || self.operator_key_probe.is_some() {
             known |= 1 << 20;
         }
         if self.alert_store_unavailable {
@@ -683,6 +685,12 @@ impl Alert {
                 return Err(AlertError::InvalidConfiguration);
             }
             details.push(format!("database {name} probe failed: {unhealthy}"));
+        }
+        if let Some((name, unhealthy)) = &self.operator_key_probe {
+            if name.is_empty() || name.len() > 48 || !name.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c)) {
+                return Err(AlertError::InvalidConfiguration);
+            }
+            details.push(format!("operator key reload {name} probe failed: {unhealthy}"));
         }
         if self.alert_store_unavailable {
             details.push("alert state database unavailable".into());
@@ -1455,6 +1463,7 @@ mod tests {
             failed_jobs: None,
             failed_jobs_check_failed: false,
             database_probe: None,
+            operator_key_probe: None,
             alert_store_unavailable: false,
         }
     }
@@ -2016,6 +2025,18 @@ mod tests {
     }
 
     #[test]
+    fn operator_key_probe_reports_only_the_safe_label_and_condition() {
+        let mut a = alert();
+        a.resend_enabled = false;
+        a.operator_key_probe = Some(("api-1".into(), true));
+        assert_eq!(a.condition_mask() & (1 << 20), 1 << 20);
+        assert_eq!(a.observed_condition_mask() & (1 << 20), 1 << 20);
+        assert!(a.text().unwrap().contains("operator key reload api-1 probe failed: true"));
+        a.operator_key_probe = Some(("invalid\nlabel".into(), true));
+        assert!(a.text().is_err());
+    }
+
+    #[test]
     fn rejects_untrusted_webhook_destinations_and_injection() {
         for url in [
             "http://hooks.slack.com/services/A/B/C",
@@ -2106,6 +2127,21 @@ mod tests {
             Err(AlertError::Unknown)
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn operator_key_probe_alert_uses_both_mock_transports() {
+        let mut a = alert();
+        a.resend_enabled = false;
+        a.operator_key_probe = Some(("instance-1".into(), true));
+        let expected = "operator key reload instance-1 probe failed: true";
+        let (url, slack_server) = mock_server("200 OK", "ok").await;
+        assert_eq!(SlackWebhook::with_endpoint(url).unwrap().send(&a).await, Ok(()));
+        assert!(slack_server.await.unwrap().contains(expected));
+        let (url, mail_server) = mock_server("200 OK", r#"{"id":"fixture"}"#).await;
+        let provider = Resend::test_endpoint(crate::resend::Config { api_key:"fixture-key".into(), from:"from@example.test".into(), sender_name:String::new() }, url.as_str()).unwrap();
+        assert_eq!(send_email(&provider, "ops@example.test", &a, "key-alert-fixture").await, Ok(()));
+        assert!(mail_server.await.unwrap().contains(expected));
     }
 
     #[tokio::test]
@@ -2468,6 +2504,7 @@ mod tests {
             failed_jobs: None,
             failed_jobs_check_failed: false,
             database_probe: None,
+            operator_key_probe: None,
             alert_store_unavailable: false,
         };
         assert!(alert.projector_stale);

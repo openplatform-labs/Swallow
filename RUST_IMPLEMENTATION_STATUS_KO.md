@@ -1,3 +1,5 @@
+운영자 키 갱신 자동 경보: 기존 `send-database-alert`·`alert-fanout database`에 API 키 상태 URL 선택을 추가해 장애 시 기존 Slack·Resend·SendGrid 발송과 대상별 예약·검토 절차를 사용할 수 있다. API 인스턴스별로 독립 대상 ID가 필요하고 기존 DB 점검과 조건 비트를 공유하므로 ID를 재사용하면 안 된다. 로컬 상태 서버·제한 DB 계정·임시 PostgreSQL에서 정상, 장애, 잘못된 응답과 발송 결과 불명에 따른 중복 억제를 검증했고, 모의 Slack·Resend에서 경보 메시지를 확인했다. 첫 통합 시험에서 결과 불명 상태의 복구 동작을 잘못 가정해 실패한 뒤 검토가 유지되는 동작으로 수정했다. 실제 공급자 발송과 실제 API·HA 연동은 미검증이다. 상세 설정은 `apps/worker/rust-queue/README.md`를 참고한다.
+
 관리 화면의 운영자 키 갱신 상태: 개요에서 `/health/operator-keys`를 수동 조회해 정상·장애·확인 불가를 구분한다. Angular 테스트와 실제 브라우저의 로컬 모의 API에서 정상·장애 응답을 확인했다. 실제 Rust API와 로컬 임시 PostgreSQL을 연결한 브라우저에서도 키 파일 오류와 복구 표시를 확인했다. 각 응답은 한 인스턴스의 순간 상태이며 운영자 로그인과 다중 호스트 운영 환경은 이 시험으로 검증하지 않았다.
 
 운영자 JWT 키 갱신 readiness 선택: `SWALLOW_API_READY_REQUIRE_OPERATOR_KEYS=true`일 때 키 갱신 실패·장시간 미갱신을 기존 `/health/ready`의 503 조건에 추가한다. 기본값은 꺼짐이며 `retain`·`reject` 모두에 적용된다. 로컬 임시 PostgreSQL과 API 프로세스 두 개에서 옵션 활성·비활성, 갱신 오류·복구를 검증했다. 로드밸런서가 이 상태를 사용하면 운영자 외 전체 API 트래픽도 제외될 수 있고, 공통 장애 시 모든 인스턴스가 제외될 수 있다. 실제 로드밸런서와 다중 호스트 HA는 검증하지 않았다.

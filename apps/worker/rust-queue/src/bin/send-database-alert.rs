@@ -54,7 +54,21 @@ async fn run() -> Result<()> {
     if !(1..=60).contains(&seconds) {
         return Err("invalid database probe timeout".into());
     }
-    let probe_role = novu_postgres_queue::db_probe::Role::from_env()?;
+    let key_probe = match std::env::var("SWALLOW_OPERATOR_KEY_PROBE_URL") {
+        Ok(raw) => {
+            if std::env::var_os("SWALLOW_DB_PROBE_URL").is_some() { return Err("select exactly one probe".into()); }
+            let url = reqwest::Url::parse(&raw).map_err(|_| "invalid operator key probe URL")?;
+            if !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some()
+                || url.path() != "/health/operator-keys"
+                || !(url.scheme() == "https" || (url.scheme() == "http" && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")))) {
+                return Err("invalid operator key probe URL".into());
+            }
+            Some(url)
+        }
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => return Err("invalid operator key probe URL".into()),
+    };
+    let probe_role = if key_probe.is_none() { Some(novu_postgres_queue::db_probe::Role::from_env()?) } else { None };
     let operation_seconds: u64 = std::env::var("SWALLOW_DB_ALERT_OPERATION_TIMEOUT_SECONDS")
         .unwrap_or_else(|_| "30".into())
         .parse()?;
@@ -131,40 +145,48 @@ async fn run() -> Result<()> {
         fcm_cooldown_distinct_source: false,
         failed_jobs: None,
         failed_jobs_check_failed: false,
-        database_probe: Some((args[1].clone(), false)),
+        database_probe: key_probe.is_none().then(|| (args[1].clone(), false)),
+        operator_key_probe: key_probe.as_ref().map(|_| (args[1].clone(), false)),
         alert_store_unavailable: false,
     };
     alert.text().map_err(|_| "invalid alert label")?;
-    let default_target = format!("db-{}", args[1]);
+    let default_target = format!("{}-{}", if key_probe.is_some() { "key" } else { "db" }, args[1]);
     let slack_id = std::env::var("SWALLOW_DB_ALERT_SLACK_TARGET_ID")
         .unwrap_or_else(|_| default_target.clone());
     let email_id = std::env::var("SWALLOW_DB_ALERT_EMAIL_TARGET_ID").unwrap_or(default_target);
     let (monitor_config, monitor_tls) =
         novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)
             .map_err(|_| "invalid monitor database configuration")?;
-    let (probe_config, probe_tls) =
-        novu_rust_contracts::postgres::configure(&std::env::var("SWALLOW_DB_PROBE_URL")?)
-            .map_err(|_| "invalid target database configuration")?;
     let secondary_config = if fallback == StateFailureMode::Secondary {
-        Some(
-            novu_rust_contracts::postgres::configure(&std::env::var(
-                "SWALLOW_DB_ALERT_BACKUP_DATABASE_URL",
-            )?)
-            .map_err(|_| "invalid secondary database configuration")?,
-        )
+        Some(novu_rust_contracts::postgres::configure(&std::env::var("SWALLOW_DB_ALERT_BACKUP_DATABASE_URL")?)
+            .map_err(|_| "invalid secondary database configuration")?)
+    } else { None };
+    let probe_unhealthy = if let Some(url) = key_probe {
+        let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(seconds)).build().map_err(|_| "invalid probe client")?;
+        !matches!(tokio::time::timeout(Duration::from_secs(seconds), async {
+            let mut response = client.get(url).send().await.map_err(|_| ())?;
+            if response.status() != reqwest::StatusCode::OK || response.content_length().is_some_and(|size| size > 4096) { return Err(()); }
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|_| ())? {
+                if body.len() + chunk.len() > 4096 { return Err(()); }
+                body.extend_from_slice(&chunk);
+            }
+            let body: serde_json::Value = serde_json::from_slice(&body).map_err(|_| ())?;
+            if body.get("status").and_then(|status| status.as_str()) == Some("healthy") { Ok(()) } else { Err(()) }
+        }).await, Ok(Ok(())))
     } else {
-        None
+        let (probe_config, probe_tls) = novu_rust_contracts::postgres::configure(&std::env::var("SWALLOW_DB_PROBE_URL")?)
+            .map_err(|_| "invalid target database configuration")?;
+        let probe = tokio::time::timeout(Duration::from_secs(seconds), async move {
+            let (client, connection) = probe_config.connect(probe_tls).await?;
+            let _driver = AbortOnDrop(tokio::spawn(async move { let _ = connection.await; }));
+            novu_postgres_queue::db_probe::healthy(&client, probe_role.expect("DB probe role configured")).await
+        }).await;
+        !matches!(probe, Ok(Ok(true)))
     };
-    let probe = tokio::time::timeout(Duration::from_secs(seconds), async move {
-        let (client, connection) = probe_config.connect(probe_tls).await?;
-        let _driver = AbortOnDrop(tokio::spawn(async move {
-            let _ = connection.await;
-        }));
-        novu_postgres_queue::db_probe::healthy(&client, probe_role).await
-    })
-    .await;
-    let probe_unhealthy = !matches!(probe, Ok(Ok(true)));
-    alert.database_probe = Some((args[1].clone(), probe_unhealthy));
+    if let Some((_, unhealthy)) = alert.database_probe.as_mut() { *unhealthy = probe_unhealthy; }
+    if let Some((_, unhealthy)) = alert.operator_key_probe.as_mut() { *unhealthy = probe_unhealthy; }
     let mut delivery_config = (monitor_config.clone(), monitor_tls.clone());
     let monitor = tokio::time::timeout(
         Duration::from_secs(seconds),
