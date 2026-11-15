@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$(cd ../../.. && pwd)
 scenario=${SWALLOW_LOCAL_FAILOVER_SCENARIO:-alert-binding}
-case "$scenario" in alert-binding|alert-scheduler|alert-v2|smtp|smtp-rls|smtp-resolution|discord-manual-retry|discord-cooldown|discord-inflight|in-app|resend|resend-cooldown|twilio|fcm|fcm-delay|fcm-exp|fcm-exp-repeat|fcm-review) ;; *) echo 'invalid local failover scenario' >&2; exit 2;; esac
+case "$scenario" in alert-binding|alert-scheduler|alert-v2|alert-v3|smtp|smtp-rls|smtp-resolution|discord-manual-retry|discord-cooldown|discord-inflight|in-app|resend|resend-cooldown|twilio|fcm|fcm-delay|fcm-exp|fcm-exp-repeat|fcm-review) ;; *) echo 'invalid local failover scenario' >&2; exit 2;; esac
 pgbin=${SWALLOW_TEST_POSTGRES_BIN:-/opt/homebrew/opt/postgresql@17/bin}
 [[ -x "$pgbin/pg_ctl" && -x "$pgbin/pg_basebackup" ]] || { echo 'PostgreSQL 17 server binaries are required' >&2; exit 1; }
 testdir=$(mktemp -d /private/tmp/swallow-alert-ha.XXXXXX)
@@ -93,6 +93,8 @@ elif [[ "$scenario" == twilio ]]; then
   cargo test --locked --lib twilio_failover_test::synchronous_failover_during_twilio_dispatch_preserves_unknown -- --ignored
 elif [[ "$scenario" == fcm-review ]]; then
   cargo test --locked --test fcm_review_failover -- --ignored
+elif [[ "$scenario" == alert-v3 ]]; then
+  cargo test --locked --test alert_v3_failover -- --ignored
 elif [[ "$scenario" == alert-v2 ]]; then
   cargo test --locked --test alert_v2_failover -- --ignored
 elif [[ "$scenario" == alert-scheduler ]]; then
