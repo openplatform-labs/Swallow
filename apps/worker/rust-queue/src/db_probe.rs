@@ -8,6 +8,7 @@ pub enum Role {
     SynchronousPrimary {
         min_standbys: i64,
         max_replay_lag_bytes: Option<i64>,
+        reject_logical_sync: bool,
     },
     Standby,
 }
@@ -43,9 +44,16 @@ impl Role {
                         }
                         Err(_) => return Err("invalid maximum replay lag"),
                     };
+                let reject_logical_sync =
+                    match std::env::var("SWALLOW_DB_PROBE_REJECT_LOGICAL_SYNC").as_deref() {
+                        Err(std::env::VarError::NotPresent) | Ok("false") => false,
+                        Ok("true") => true,
+                        _ => return Err("invalid logical synchronous sender policy"),
+                    };
                 Ok(Self::SynchronousPrimary {
                     min_standbys,
                     max_replay_lag_bytes,
+                    reject_logical_sync,
                 })
             }
             Ok("standby") => Ok(Self::Standby),
@@ -59,9 +67,10 @@ pub async fn healthy(client: &Client, role: Role) -> Result<bool, Error> {
     if let Role::SynchronousPrimary {
         min_standbys,
         max_replay_lag_bytes,
+        reject_logical_sync,
     } = role
     {
-        let row=client.query_one("SELECT CASE WHEN pg_catalog.pg_is_in_recovery() THEN false ELSE NOT current_setting('transaction_read_only')::boolean AND current_setting('synchronous_commit') IN ('on','remote_apply') AND current_setting('synchronous_standby_names')<>'' AND (pg_catalog.pg_has_role(current_user,'pg_read_all_stats','MEMBER') OR (SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname=current_user)) AND (SELECT count(*) FROM pg_catalog.pg_stat_replication r WHERE r.state='streaming' AND r.sync_state IN ('sync','quorum') AND r.flush_lsn IS NOT NULL AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_replication_slots s WHERE s.active_pid=r.pid AND s.slot_type='logical') AND ($2::bigint IS NULL OR (r.replay_lsn IS NOT NULL AND pg_catalog.pg_wal_lsn_diff(pg_catalog.pg_current_wal_lsn(),r.replay_lsn) BETWEEN 0 AND $2::bigint)))>=$1 END",&[&min_standbys,&max_replay_lag_bytes]).await?;
+        let row=client.query_one("SELECT CASE WHEN pg_catalog.pg_is_in_recovery() THEN false ELSE NOT current_setting('transaction_read_only')::boolean AND current_setting('synchronous_commit') IN ('on','remote_apply') AND current_setting('synchronous_standby_names')<>'' AND (pg_catalog.pg_has_role(current_user,'pg_read_all_stats','MEMBER') OR (SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname=current_user)) AND (NOT $3::boolean OR NOT EXISTS(SELECT 1 FROM pg_catalog.pg_stat_replication r JOIN pg_catalog.pg_replication_slots s ON s.active_pid=r.pid AND s.slot_type='logical' WHERE r.sync_state IN ('sync','quorum'))) AND (SELECT count(*) FROM pg_catalog.pg_stat_replication r WHERE r.state='streaming' AND r.sync_state IN ('sync','quorum') AND r.flush_lsn IS NOT NULL AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_replication_slots s WHERE s.active_pid=r.pid AND s.slot_type='logical') AND ($2::bigint IS NULL OR (r.replay_lsn IS NOT NULL AND pg_catalog.pg_wal_lsn_diff(pg_catalog.pg_current_wal_lsn(),r.replay_lsn) BETWEEN 0 AND $2::bigint)))>=$1 END",&[&min_standbys,&max_replay_lag_bytes,&reject_logical_sync]).await?;
         return Ok(row.get(0));
     }
     let row = client.query_one("SELECT pg_catalog.pg_is_in_recovery(), current_setting('transaction_read_only')::boolean", &[]).await?;

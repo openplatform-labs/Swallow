@@ -39,7 +39,8 @@ async fn detects_actual_primary_standby_and_session_read_only() {
             &primary,
             Role::SynchronousPrimary {
                 min_standbys: 1,
-                max_replay_lag_bytes: None
+                max_replay_lag_bytes: None,
+                reject_logical_sync: false,
             }
         )
         .await
@@ -50,7 +51,8 @@ async fn detects_actual_primary_standby_and_session_read_only() {
             &primary,
             Role::SynchronousPrimary {
                 min_standbys: 2,
-                max_replay_lag_bytes: None
+                max_replay_lag_bytes: None,
+                reject_logical_sync: false,
             }
         )
         .await
@@ -61,7 +63,8 @@ async fn detects_actual_primary_standby_and_session_read_only() {
             &standby,
             Role::SynchronousPrimary {
                 min_standbys: 1,
-                max_replay_lag_bytes: None
+                max_replay_lag_bytes: None,
+                reject_logical_sync: false,
             }
         )
         .await
@@ -76,7 +79,8 @@ async fn detects_actual_primary_standby_and_session_read_only() {
             &primary,
             Role::SynchronousPrimary {
                 min_standbys: 1,
-                max_replay_lag_bytes: None
+                max_replay_lag_bytes: None,
+                reject_logical_sync: false,
             }
         )
         .await
@@ -96,7 +100,8 @@ async fn detects_actual_primary_standby_and_session_read_only() {
             &limited,
             Role::SynchronousPrimary {
                 min_standbys: 1,
-                max_replay_lag_bytes: None
+                max_replay_lag_bytes: None,
+                reject_logical_sync: false,
             }
         )
         .await
@@ -111,7 +116,20 @@ async fn detects_actual_primary_standby_and_session_read_only() {
             &limited,
             Role::SynchronousPrimary {
                 min_standbys: 1,
-                max_replay_lag_bytes: None
+                max_replay_lag_bytes: None,
+                reject_logical_sync: true
+            }
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        healthy(
+            &limited,
+            Role::SynchronousPrimary {
+                min_standbys: 1,
+                max_replay_lag_bytes: None,
+                reject_logical_sync: false,
             }
         )
         .await
@@ -122,7 +140,8 @@ async fn detects_actual_primary_standby_and_session_read_only() {
             &standby,
             Role::SynchronousPrimary {
                 min_standbys: 1,
-                max_replay_lag_bytes: Some(0)
+                max_replay_lag_bytes: Some(0),
+                reject_logical_sync: false,
             }
         )
         .await
@@ -172,7 +191,8 @@ async fn detects_actual_primary_standby_and_session_read_only() {
             &limited,
             Role::SynchronousPrimary {
                 min_standbys: 1,
-                max_replay_lag_bytes: None
+                max_replay_lag_bytes: None,
+                reject_logical_sync: false,
             }
         )
         .await
@@ -183,7 +203,8 @@ async fn detects_actual_primary_standby_and_session_read_only() {
             &limited,
             Role::SynchronousPrimary {
                 min_standbys: 1,
-                max_replay_lag_bytes: Some(1000)
+                max_replay_lag_bytes: Some(1000),
+                reject_logical_sync: false,
             }
         )
         .await
@@ -194,7 +215,8 @@ async fn detects_actual_primary_standby_and_session_read_only() {
             &limited,
             Role::SynchronousPrimary {
                 min_standbys: 1,
-                max_replay_lag_bytes: Some(10_000_000)
+                max_replay_lag_bytes: Some(10_000_000),
+                reject_logical_sync: false,
             }
         )
         .await
@@ -278,11 +300,25 @@ async fn detects_actual_primary_standby_and_session_read_only() {
         );
     }
     assert!(
+        !healthy(
+            &limited,
+            Role::SynchronousPrimary {
+                min_standbys: 1,
+                max_replay_lag_bytes: None,
+                reject_logical_sync: true
+            }
+        )
+        .await
+        .unwrap(),
+        "a synchronous logical receiver must trigger the opt-in policy"
+    );
+    assert!(
         healthy(
             &limited,
             Role::SynchronousPrimary {
                 min_standbys: 1,
-                max_replay_lag_bytes: None
+                max_replay_lag_bytes: None,
+                reject_logical_sync: false,
             }
         )
         .await
@@ -293,7 +329,8 @@ async fn detects_actual_primary_standby_and_session_read_only() {
             &limited,
             Role::SynchronousPrimary {
                 min_standbys: 2,
-                max_replay_lag_bytes: None
+                max_replay_lag_bytes: None,
+                reject_logical_sync: false,
             }
         )
         .await
@@ -315,6 +352,7 @@ async fn detects_actual_primary_standby_and_session_read_only() {
             Role::SynchronousPrimary {
                 min_standbys: 1,
                 max_replay_lag_bytes: None,
+                reject_logical_sync: false,
             },
         )
         .await
@@ -347,7 +385,8 @@ async fn detects_actual_primary_standby_and_session_read_only() {
             &limited,
             Role::SynchronousPrimary {
                 min_standbys: 1,
-                max_replay_lag_bytes: None
+                max_replay_lag_bytes: None,
+                reject_logical_sync: false,
             }
         )
         .await
@@ -363,7 +402,8 @@ async fn detects_actual_primary_standby_and_session_read_only() {
             &primary,
             Role::SynchronousPrimary {
                 min_standbys: 1,
-                max_replay_lag_bytes: None
+                max_replay_lag_bytes: None,
+                reject_logical_sync: false,
             }
         )
         .await
