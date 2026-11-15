@@ -40,4 +40,12 @@ describe('Discord operator reviews',()=>{
     const {fixture,c}=component();await c.list();c.reason='wait';c.prepare({...c.rows()[0],retryAfterSeconds:null},'retry_after');expect(c.review()).toBeNull();c.prepare(c.rows()[0],'retry_after');c.confirmed=true;await c.submit();expect(JSON.parse(mock.mock.calls[1][1]?.body as string).decision).toBe('retry_after');await c.lookup();expect(c.lookupStatus()).toBe('found');expect(mock.mock.calls[2][0]).toContain('decision=retry_after');fixture.destroy();
   });
 
+  it('shows Discord decisions with JWT attribution and 429 guidance',async()=>{
+    const record={actor:'api',actorOid:'42',requestId,jobId:job,attemptRevision:revision,failureRevision:'9223372036854775807',decision:'retry_after',attemptState:'rejected',httpStatus:429,retryAfterSeconds:60,retryNotBefore:'2026-11-15T00:01:00Z',reason:'wait',createdAt:'2026-11-15T00:00:00Z',operator:{issuer:'issuer',subject:'alice',clientId:'console',requestId}};
+    vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[record],next:null})));const {fixture,c}=component();c.historyJob=job;await c.loadHistory();expect(c.historyStatus()).toBe('loaded');expect(c.history()[0].operator?.subject).toBe('alice');fixture.detectChanges();expect(fixture.nativeElement.textContent).toContain('issuer / alice / console');expect(fixture.nativeElement.textContent).toContain('60초');fixture.destroy();
+  });
+  it('does not show a delayed history response from a previous environment',async()=>{
+    let resolve!:(r:Response)=>void;vi.spyOn(globalThis,'fetch').mockImplementationOnce(()=>new Promise(r=>resolve=r));const {fixture,c}=component();c.historyJob=job;const pending=c.loadHistory();c.environment='other';c.ngOnChanges();resolve(new Response(JSON.stringify({data:[],next:null})));await pending;expect(c.historyStatus()).toBe('idle');expect(c.history()).toEqual([]);fixture.destroy();
+  });
+
 });

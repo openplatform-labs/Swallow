@@ -507,6 +507,7 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/operator/discord-review", post(operator_identity::discord_review))
         .route("/v1/experimental/operator/discord-resolution", post(operator_identity::discord_resolve))
         .route("/v1/experimental/operator/discord-resolution-request", get(operator_identity::discord_resolution_request))
+        .route("/v1/experimental/operator/discord-resolution-history", get(operator_identity::discord_resolution_history))
         .route("/v1/experimental/operator/discord-review-request", get(operator_identity::discord_review_request))
         .route("/v1/experimental/operator/fcm-unreviewed", get(operator_identity::fcm_unreviewed))
         .route("/v1/experimental/operator/fcm-review", post(operator_identity::fcm_review))
