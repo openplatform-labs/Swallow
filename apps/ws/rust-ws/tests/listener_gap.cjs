@@ -41,8 +41,9 @@ async function until(fn,message,timeout=4000){for(let i=0;i<timeout/25;i++){if(f
   // Optional real upstream SDK exercise. The session and Inbox HTTP responses
   // are fixtures; Socket.IO and the PostgreSQL listener are real processes.
   let sdk, api, connects=0, disconnects=0, inboxReads=0, fixtureNotifications=[];
-  if(process.env.NOVU_REFERENCE_SOURCE) {
-    const {Novu}=require(path.join(process.env.NOVU_REFERENCE_SOURCE,'packages/js/dist/cjs/index.js'));
+  if(process.env.NOVU_REFERENCE_SOURCE || process.env.NOVU_SDK_MODULE) {
+    const sdkModule=process.env.NOVU_SDK_MODULE || path.join(process.env.NOVU_REFERENCE_SOURCE,'packages/js/dist/cjs/index.js');
+    const {Novu}=require(sdkModule);
     api=http.createServer((req,res)=>{
       res.setHeader('content-type','application/json');
       if(req.method==='POST' && req.url==='/v1/inbox/session') return res.end(JSON.stringify({data:{token,applicationIdentifier:'fixture'}}));
@@ -86,7 +87,28 @@ async function until(fn,message,timeout=4000){for(let i=0;i<timeout/25;i++){if(f
     const refreshed=await sdk.notifications.list({useCache:false});
     assert.equal(refreshed.data.notifications[0].id,'missed');
     assert.equal(inboxReads,2,'cache-bypassing list did not fetch Inbox');
+    const {startSocketRecovery}=await import('../sdk/recovery.mjs');
+    let refreshes=0, recoveredId, errors=[];
+    const stopRecovery=startSocketRecovery(sdk,{
+      retryDelayMs:100,connectTimeoutMs:500,
+      onError:error=>errors.push(error),
+      refresh:async({signal})=>{
+        const result=await sdk.notifications.list({useCache:false});
+        if(result.error)throw result.error;
+        if(!signal.aborted) { refreshes++; recoveredId=result.data.notifications[0]?.id; }
+      },
+    });
+    fixtureNotifications=[{id:'recovered-by-helper',body:'during second gap'}];
+    sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name='novu-rust-ws-listener'");
+    await until(()=>refreshes===1,'SDK recovery helper did not refresh after listener failure',10000);
+    assert.equal(recoveredId,'recovered-by-helper');
+    assert(connects>=3,'SDK recovery helper did not reconnect');
+    assert.equal(errors.length,0,`unexpected refresh errors: ${errors}`);
+    stopRecovery();
+    const stoppedConnects=connects;
     await sdk.socket.disconnect();
+    await wait(400);
+    assert.equal(connects,stoppedConnects,'disposed recovery helper reconnected');
     await new Promise(resolve=>api.close(resolve));
     console.log('upstream SDK: namespace disconnect requires disconnect/connect and cache-bypassing Inbox refresh');
   }
