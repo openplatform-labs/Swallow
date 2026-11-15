@@ -1,5 +1,8 @@
 ## Slack 429 지연 재시도 화면
 
+The FCM operator result view shows 429 target count, count with recorded numeric advice, and the latest recorded not-before timestamp when API migration `0103` is present. A partial count does not supply guidance for every target. This view does not retry or throttle sends. Older API responses remain readable.
+
+
 운영 경보에서 Slack 작업 결과를 조회한 후 실패한 429 시도에 유효한 대기 안내가 있으면 `권장 시각 이후 재시도`를 선택할 수 있다. 즉시 재시도와 접수 판정도 별도로 선택한다. 요청 ID·작업·시도·사유를 확인한 뒤 제출하고, 결과 불명 시 같은 토큰·환경·API 주소에서 동일 요청을 재제출하거나 같은 운영자와 환경에서 요청 ID를 조회한다. 기록이 없더라도 요청이 진행 중일 수 있다. 요청 정보는 메모리에만 보관하므로 ID를 따로 기록한다. 인증 변경 시 과거 요청을 자동으로 확정하거나 다른 인증으로 재제출하지 않으며 조회 결과는 운영자가 대조해야 한다.
 
 워커 0170–0171과 API 0096–0097, 기존 Slack 결과 및 `retry` JWT 권한, API DB `slack_retry` 및 해당 함수 EXECUTE가 필요하다. 즉시·지연은 동일 `retry` 권한을 사용한다. 권장 시각과 시도 ID는 조회 시점의 정보이고 Slack 수신이나 중복 방지를 증명하지 않는다. 선택형 환경 공유 대기는 별도 워커 설정으로 제공하며, 정확한 작업공간·채널 단위 요청률이나 참여하지 않은 발송자는 제어하지 않는다. [API README](../../api/rust-api/README.md)와 [워커 README](../../worker/rust-queue/README.md)를 참고한다.

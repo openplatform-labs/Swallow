@@ -2250,6 +2250,7 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     .await
     .unwrap();
     db.execute("INSERT INTO public.novu_rust_fcm_attempts(job_id,environment_id,target_index,state,provider_message_id,operator_resolution) VALUES ($1,'jwt-alert-a',0,'accepted','private-id','accepted'),($1,'jwt-alert-a',1,'unknown',NULL,NULL),($1,'jwt-alert-a',2,'rejected',NULL,'not_accepted')",&[&push_job]).await.unwrap();
+    db.execute("UPDATE public.novu_rust_fcm_attempts SET http_status=429,retry_after_seconds=120,retry_not_before=clock_timestamp()+interval '120 seconds' WHERE job_id=$1 AND target_index=2",&[&push_job]).await.unwrap();
     let push_request = |jwt: &str, path: &str| {
         Request::builder()
             .uri(path)
@@ -2284,6 +2285,9 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     assert_eq!(push["rejectedCount"], 1);
     assert_eq!(push["operatorAcceptedCount"], 1);
     assert_eq!(push["operatorNotAcceptedCount"], 1);
+    assert_eq!(push["rateLimitedCount"], 1);
+    assert_eq!(push["rateLimitAdviceCount"], 1);
+    assert!(push["rateLimitNotBefore"].is_string());
     assert!(
         !push.to_string().contains("private-token") && !push.to_string().contains("private-id")
     );

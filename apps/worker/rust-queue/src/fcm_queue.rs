@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 pub const JOB_KIND: &str = "experimental_fcm_push";
 pub const MIGRATION: &str = include_str!("../migrations/0045_experimental_fcm_attempts.sql");
+pub const RETRY_AFTER_MIGRATION: &str = include_str!("../migrations/0184_fcm_retry_after.sql");
 
 async fn claim(client: &Client, environment: &str) -> Result<Option<ClaimedJob>, Error> {
     let token = Uuid::new_v4();
@@ -849,6 +850,10 @@ async fn process_one_inner(
     tx.commit().await?;
     let result = selected_provider.send_wire(&messages[index]).await;
     let invalid_token = matches!(result, Err(SendError::InvalidDeviceToken(code)) if (400..500).contains(&code) && ![408, 409].contains(&code));
+    let retry_after = match &result {
+        Err(SendError::RateLimited(seconds)) => seconds.map(|v| v as i32),
+        _ => None,
+    };
     let (state, status, id) = match result {
         Ok(id) => (
             "accepted",
@@ -863,6 +868,7 @@ async fn process_one_inner(
         Err(SendError::Provider(code) | SendError::InvalidDeviceToken(code)) => {
             ("rejected", Some(i32::from(code)), None)
         }
+        Err(SendError::RateLimited(_)) => ("rejected", Some(429), None),
         Err(SendError::Transport | SendError::InvalidResponse) => ("unknown", None, None),
         Err(_) => ("rejected", None, None),
     };
@@ -873,6 +879,9 @@ async fn process_one_inner(
     }
     let updated=tx.execute("UPDATE novu_rust_fcm_attempts SET state=$4,http_status=$5,provider_message_id=$6,updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$2 AND target_index=$3 AND state='dispatching'",&[&job.id,&environment,&index_i32,&state,&status,&id]).await?;
     if updated == 1 {
+        if let Some(seconds) = retry_after {
+            tx.execute("UPDATE public.novu_rust_fcm_attempts SET retry_after_seconds=$4, retry_not_before=clock_timestamp()+make_interval(secs=>$4::integer::double precision) WHERE job_id=$1 AND environment_id=$2 AND target_index=$3", &[&job.id,&environment,&index_i32,&seconds]).await?;
+        }
         if invalid_token
             && std::env::var("IS_EXPIRED_TOKENS_REMOVAL_ENABLED").as_deref() == Ok("true")
             && !target_metadata
@@ -1279,7 +1288,7 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(150)).await;
                 }
                 let response = r#"{"name":"projects/demo/messages/123"}"#;
-                socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).as_bytes()).await.unwrap();
+                socket.write_all(format!("HTTP/1.1 {status} Test\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{response}",if status == 429 {"Retry-After: 120\r\n"} else {""},response.len()).as_bytes()).await.unwrap();
             }
             targets
         });
@@ -1905,6 +1914,7 @@ mod tests {
             .unwrap();
         db.batch_execute(crate::MIGRATION).await.unwrap();
         db.batch_execute(MIGRATION).await.unwrap();
+        db.batch_execute(RETRY_AFTER_MIGRATION).await.unwrap();
         db.batch_execute(crate::in_app::PUSH_MESSAGES_MIGRATION)
             .await
             .unwrap();
@@ -1940,6 +1950,9 @@ mod tests {
         assert!(process_one(&mut db, "test", &provider).await.unwrap());
         assert!(process_one(&mut db, "test", &provider).await.unwrap());
         assert_eq!(server.await.unwrap(), ["a", "b", "c"]);
+        let advice = db.query_one("SELECT retry_after_seconds, retry_not_before > clock_timestamp() + interval '100 seconds' FROM public.novu_rust_fcm_attempts WHERE job_id=$1 AND target_index=1", &[&id]).await.unwrap();
+        assert_eq!(advice.get::<_, Option<i32>>(0), Some(120));
+        assert!(advice.get::<_, bool>(1));
         let rows=db.query("SELECT state,http_status FROM novu_rust_fcm_attempts WHERE job_id=$1 ORDER BY target_index",&[&id]).await.unwrap();
         assert_eq!(
             rows.iter()

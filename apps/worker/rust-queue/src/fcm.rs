@@ -214,6 +214,7 @@ pub enum SendError {
     UnsupportedMessage,
     Transport,
     Provider(u16),
+    RateLimited(Option<u32>),
     InvalidDeviceToken(u16),
     InvalidResponse,
     OAuth(crate::google_oauth::AuthError),
@@ -225,6 +226,7 @@ impl std::fmt::Display for SendError {
             Self::UnsupportedMessage => f.write_str("unsupported FCM message"),
             Self::Transport => f.write_str("FCM transport failed"),
             Self::Provider(code) => write!(f, "FCM returned HTTP {code}"),
+            Self::RateLimited(_) => f.write_str("FCM returned HTTP 429"),
             Self::InvalidDeviceToken(code) => {
                 write!(f, "FCM returned HTTP {code}: invalid device token")
             }
@@ -987,6 +989,9 @@ impl Fcm {
             .map_err(|_| SendError::Transport)?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
+            let retry_after = (status == 429)
+                .then(|| crate::slack::retry_after_seconds(response.headers()))
+                .flatten();
             // The source Firebase SDK exposes error.message to the provider.
             // Bound the body and keep only the classification, never the raw
             // provider response, which can contain sensitive data.
@@ -995,10 +1000,20 @@ impl Fcm {
                 let chunk = match response.chunk().await {
                     Ok(Some(chunk)) => chunk,
                     Ok(None) => break,
-                    Err(_) => return Err(SendError::Provider(status)),
+                    Err(_) => {
+                        return Err(if status == 429 {
+                            SendError::RateLimited(retry_after)
+                        } else {
+                            SendError::Provider(status)
+                        });
+                    }
                 };
                 if bytes.len() + chunk.len() > 16 * 1024 {
-                    return Err(SendError::Provider(status));
+                    return Err(if status == 429 {
+                        SendError::RateLimited(retry_after)
+                    } else {
+                        SendError::Provider(status)
+                    });
                 }
                 bytes.extend_from_slice(&chunk);
             }
@@ -1011,7 +1026,11 @@ impl Fcm {
             if invalid {
                 return Err(SendError::InvalidDeviceToken(status));
             }
-            return Err(SendError::Provider(status));
+            return Err(if status == 429 {
+                SendError::RateLimited(retry_after)
+            } else {
+                SendError::Provider(status)
+            });
         }
         // A 2xx response may follow a completed send. A malformed, truncated,
         // or oversized body is therefore ambiguous, never a safe rejection.
@@ -1228,7 +1247,7 @@ mod tests {
                     json!({"message":{"token":format!("token{index}"),"notification":{"title":"Hi","body":"Hello"},"data":{},"android":{"notification":{"event_time":"2026-11-14T12:34:56.999Z"}}}})
                 );
                 let response = r#"{"name":"projects/demo-project/messages/123"}"#;
-                socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).as_bytes()).await.unwrap();
+                socket.write_all(format!("HTTP/1.1 {status} Test\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{response}",if status == 429 {"Retry-After: 120\r\n"} else {""},response.len()).as_bytes()).await.unwrap();
             }
         });
         let fcm = Fcm::with_origin("demo-project", "fixture-token".into(), &origin).unwrap();
@@ -1246,7 +1265,7 @@ mod tests {
             result,
             vec![
                 Ok("projects/demo-project/messages/123".into()),
-                Err(SendError::Provider(429))
+                Err(SendError::RateLimited(Some(120)))
             ]
         );
         server.await.unwrap();
