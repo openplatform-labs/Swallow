@@ -24,6 +24,12 @@ if env -u SWALLOW_WS_STARTUP_RETRY_SECONDS "$binary" >"$dir/default.log" 2>&1; t
 if SWALLOW_WS_STARTUP_RETRY_SECONDS=301 "$binary" >"$dir/invalid.log" 2>&1; then echo 'invalid retry duration accepted' >&2; exit 1; fi
 if NOVU_WS_LISTENER_RECONNECT_TIMEOUT_SECONDS=0 "$binary" >"$dir/invalid-listener.log" 2>&1; then echo 'invalid listener timeout accepted' >&2; exit 1; fi
 rg -q 'invalid WS listener reconnect timeout' "$dir/invalid-listener.log"
+if NOVU_WS_LISTENER_PROBE_INTERVAL_SECONDS=1 "$binary" >"$dir/invalid-probe.log" 2>&1; then echo 'incomplete listener probe configuration accepted' >&2; exit 1; fi
+rg -q 'listener probe requires' "$dir/invalid-probe.log"
+if NOVU_WS_LISTENER_PROBE_INTERVAL_SECONDS=1 NOVU_WS_LISTENER_PROBE_TIMEOUT_SECONDS=1 "$binary" >"$dir/unguarded-probe.log" 2>&1; then echo 'listener probe without disconnect-on-gap accepted' >&2; exit 1; fi
+rg -q 'listener probe requires' "$dir/unguarded-probe.log"
+if NOVU_WS_DISCONNECT_ON_EVENT_GAP=true NOVU_WS_LISTENER_PROBE_INTERVAL_SECONDS=0 NOVU_WS_LISTENER_PROBE_TIMEOUT_SECONDS=1 "$binary" >"$dir/probe-range.log" 2>&1; then echo 'invalid listener probe timing accepted' >&2; exit 1; fi
+rg -q 'invalid WS listener probe timing' "$dir/probe-range.log"
 if SWALLOW_WS_STARTUP_RETRY_SECONDS=2 "$binary" >"$dir/deadline.log" 2>&1; then echo 'retry deadline should fail' >&2; exit 1; fi
 rg -q 'retry deadline exceeded' "$dir/deadline.log"
 SWALLOW_WS_STARTUP_RETRY_SECONDS=30 "$binary" >"$dir/terminate.log" 2>&1 & ws_pid=$!

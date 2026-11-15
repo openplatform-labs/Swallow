@@ -572,6 +572,34 @@ async fn start_event_listener(
     Ok((client, guard.0.take().expect("listener driver present")))
 }
 
+// Probe the dedicated LISTEN connection itself; failures force a gap recovery.
+async fn monitor_listener(
+    client: Client,
+    mut driver: tokio::task::JoinHandle<()>,
+    probe: Option<(std::time::Duration, std::time::Duration)>,
+) {
+    let Some((interval, timeout)) = probe else {
+        let _ = driver.await;
+        return;
+    };
+    loop {
+        tokio::select! {
+            _ = &mut driver => return,
+            _ = tokio::time::sleep(interval) => {},
+        }
+        let result = tokio::select! {
+            _ = &mut driver => return,
+            result = tokio::time::timeout(timeout, client.simple_query("SELECT 1")) => result,
+        };
+        if !matches!(result, Ok(Ok(_))) {
+            eprintln!("socket event listener probe failed");
+            driver.abort();
+            let _ = driver.await;
+            return;
+        }
+    }
+}
+
 // Startup retries are opt-in and share a single deadline across both DB connections.
 async fn retry_startup<T, F, Fut>(
     deadline: Option<tokio::time::Instant>,
@@ -697,6 +725,32 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             }
             Err(_) => return Err("invalid WS listener reconnect timeout".into()),
         };
+    let listener_probe = match (
+        std::env::var("NOVU_WS_LISTENER_PROBE_INTERVAL_SECONDS"),
+        std::env::var("NOVU_WS_LISTENER_PROBE_TIMEOUT_SECONDS"),
+    ) {
+        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => None,
+        (Ok(interval), Ok(timeout)) if disconnect_on_gap => {
+            let interval: u64 = interval
+                .parse()
+                .map_err(|_| "invalid WS listener probe timing")?;
+            let timeout: u64 = timeout
+                .parse()
+                .map_err(|_| "invalid WS listener probe timing")?;
+            if !(1..=300).contains(&interval) || !(1..=300).contains(&timeout) {
+                return Err("invalid WS listener probe timing".into());
+            }
+            Some((
+                std::time::Duration::from_secs(interval),
+                std::time::Duration::from_secs(timeout),
+            ))
+        }
+        _ => {
+            return Err(
+                "WS listener probe requires both timing values and disconnect-on-gap".into(),
+            );
+        }
+    };
     let startup_retry_seconds: u64 = match std::env::var("SWALLOW_WS_STARTUP_RETRY_SECONDS") {
         Ok(value) => value
             .parse()
@@ -747,8 +801,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     tokio::spawn(async move {
         let mut listener = initial_listener;
         loop {
-            let (_client, driver) = listener;
-            let _ = driver.await;
+            let (client, driver) = listener;
+            monitor_listener(client, driver, listener_probe).await;
             listener_ready_task.store(false, Ordering::SeqCst);
             if disconnect_on_gap {
                 listener_generation_task.fetch_add(1, Ordering::SeqCst);
