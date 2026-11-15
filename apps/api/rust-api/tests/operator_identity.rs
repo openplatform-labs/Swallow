@@ -51,6 +51,164 @@ fn request(token: &str, query: &str) -> Request<Body> {
         .body(Body::empty())
         .unwrap()
 }
+
+fn self_revoke_request(token: &str, environment: &str, body: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/v1/experimental/operator/token/revoke-self?environmentId={environment}"
+        ))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::from(body.to_owned()))
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires fully migrated disposable PostgreSQL and role creation"]
+async fn self_revoke_uses_provisioned_identity_and_audits_atomically() {
+    let url = std::env::var("TEST_DATABASE_URL").unwrap();
+    let db = connect(&url).await;
+    db.batch_execute("INSERT INTO public.novu_rust_environments VALUES ('self-a','org'),('self-b','org'); CREATE ROLE self_api LOGIN; CREATE ROLE self_owner NOLOGIN; GRANT USAGE ON SCHEMA public TO self_api,self_owner; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_self(text,text,text,text,bigint),public.novu_rust_operator_token_revoked(bytea,bytea,bytea,bytea),public.novu_rust_operator_token_guard(bytea,bytea,bytea,bytea) TO self_api; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_self(text,text,text,text,bigint) TO self_owner; GRANT INSERT ON public.novu_rust_operator_token_revocations,public.novu_rust_operator_token_revocation_audit TO self_owner; GRANT USAGE ON SEQUENCE public.novu_rust_operator_token_revocation_audit_id_seq TO self_owner; ALTER FUNCTION public.novu_rust_operator_jwt_self_revoke(text,text,text,text,bigint,bytea) OWNER TO self_owner; INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname='self_api'; INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES ('https://issuer.test','user-1','console','self-a')").await.unwrap();
+    let actor_url = url.replacen("postgres://postgres@", "postgres://self_api@", 1);
+    let config = json!({"issuer":"https://issuer.test","audience":"swallow","keys":[{"kid":"key","pem":std::str::from_utf8(PUBLIC).unwrap()}],"check_token_revocation":true});
+    let app = novu_rust_api::router(Arc::new(connect(&actor_url).await)).layer(Extension(
+        Arc::new(AccessTokenVerifier::from_json(&config.to_string()).unwrap()),
+    ));
+    let no_guard =
+        novu_rust_api::router(Arc::new(connect(&actor_url).await)).layer(Extension(Arc::new(
+            AccessTokenVerifier::new("https://issuer.test", "swallow", &[("key", PUBLIC)]).unwrap(),
+        )));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let one = token_with_id("user-1", "console", now + 120, "self-one");
+    let other = token_with_id("user-1", "console", now + 120, "self-other");
+    assert_eq!(
+        no_guard
+            .oneshot(self_revoke_request(&one, "self-a", ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(self_revoke_request(&one, "self-a", ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    db.batch_execute("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_self_revoke(text,text,text,text,bigint,bytea) TO self_api").await.unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(self_revoke_request(&one, "self-a", "{}"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(self_revoke_request(&one, "self-b", ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    db.batch_execute("CREATE FUNCTION public.self_audit_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$; CREATE TRIGGER self_audit_failure BEFORE INSERT ON public.novu_rust_operator_token_revocation_audit FOR EACH ROW EXECUTE FUNCTION public.self_audit_failure()").await.unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(self_revoke_request(&one, "self-a", ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(request(&one, "environmentId=self-a"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    db.batch_execute("DROP TRIGGER self_audit_failure ON public.novu_rust_operator_token_revocation_audit; DROP FUNCTION public.self_audit_failure()").await.unwrap();
+    let second_app = novu_rust_api::router(Arc::new(connect(&actor_url).await)).layer(Extension(
+        Arc::new(AccessTokenVerifier::from_json(&config.to_string()).unwrap()),
+    ));
+    let mut blocker = connect(&url).await;
+    let tx = blocker.transaction().await.unwrap();
+    tx.query_one("SELECT 1 FROM public.novu_rust_operator_jwt_identities WHERE environment_id='self-a' AND subject='user-1' FOR UPDATE",&[]).await.unwrap();
+    let in_flight = tokio::spawn({
+        let app = app.clone();
+        let token = one.clone();
+        async move {
+            app.oneshot(request(&token, "environmentId=self-a"))
+                .await
+                .unwrap()
+                .status()
+        }
+    });
+    let mut guarded = false;
+    for _ in 0..100 {
+        guarded=db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity a JOIN pg_locks l ON l.pid=a.pid WHERE a.query LIKE 'WITH swallow_token_gate%' AND a.wait_event_type='Lock' AND l.locktype='advisory' AND l.granted)",&[]).await.unwrap().get(0);
+        if guarded {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(guarded);
+    let revoke = tokio::spawn({
+        let token = one.clone();
+        async move {
+            second_app
+                .oneshot(self_revoke_request(&token, "self-a", ""))
+                .await
+                .unwrap()
+        }
+    });
+    let mut blocked = false;
+    for _ in 0..100 {
+        blocked=db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity a JOIN pg_locks l ON l.pid=a.pid WHERE a.query LIKE 'SELECT public.novu_rust_operator_jwt_self_revoke%' AND l.locktype='advisory' AND NOT l.granted)",&[]).await.unwrap().get(0);
+        if blocked {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(blocked, "self revocation must wait for a guarded operation");
+    tx.commit().await.unwrap();
+    assert_eq!(in_flight.await.unwrap(), StatusCode::OK);
+    let response = revoke.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(
+        app.clone()
+            .oneshot(request(&one, "environmentId=self-a"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(request(&other, "environmentId=self-a"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.oneshot(self_revoke_request(&one, "self-a", ""))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let row=db.query_one("SELECT (SELECT count(*) FROM public.novu_rust_operator_token_revocations WHERE reason='self-revocation'),(SELECT count(*) FROM public.novu_rust_operator_token_revocation_audit WHERE reason='self-revocation')",&[]).await.unwrap();
+    assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1)), (1, 1));
+}
 #[tokio::test]
 #[ignore = "requires fully migrated disposable PostgreSQL and role creation"]
 async fn verifies_token_mapping_scope_revocation_and_expiry() {

@@ -338,6 +338,7 @@ fn router_with_webhook_configs_and_jwt_policy(
         )
         .route("/v1/experimental/console/subscribers", get(console_subscribers::list))
         .route("/v1/experimental/operator/me", get(operator_identity::me))
+        .route("/v1/experimental/operator/token/revoke-self", post(operator_identity::revoke_self))
         .route("/v1/experimental/operator/subscribers", get(operator_identity::subscribers))
         .route("/v1/experimental/operator/alerts", get(operator_identity::alerts))
         .route("/v1/experimental/operator/resend-result", get(operator_identity::resend_result))

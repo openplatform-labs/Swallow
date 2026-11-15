@@ -163,6 +163,61 @@ pub(super) async fn me(
 ) -> Response {
     query(db, headers, uri, verifier, Lookup::Identity).await
 }
+
+pub(super) async fn revoke_self(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+    body: Bytes,
+) -> Response {
+    let identity = match authenticate(&db, &headers, verifier).await {
+        Ok(value) => value,
+        Err(status) => return failure(status, uri.path()),
+    };
+    if !identity.revocation_guard {
+        return failure(StatusCode::SERVICE_UNAVAILABLE, uri.path());
+    }
+    let params: Vec<_> = form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).collect();
+    if !body.is_empty()
+        || params.len() != 1
+        || params[0].0 != "environmentId"
+        || params[0].1.is_empty()
+        || params[0].1.len() > 512
+        || params[0].1.contains('\0')
+    {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    }
+    let Ok(exp) = i64::try_from(identity.expires_at) else {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    };
+    let id = ring::digest::digest(&ring::digest::SHA256, identity.token_id.as_bytes());
+    let env = params[0].1.as_ref();
+    match db
+        .query_one(
+            "SELECT public.novu_rust_operator_jwt_self_revoke($1,$2,$3,$4,$5,$6)",
+            &[
+                &identity.issuer,
+                &identity.subject,
+                &identity.client_id,
+                &env,
+                &exp,
+                &id.as_ref(),
+            ],
+        )
+        .await
+    {
+        Ok(row) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(serde_json::json!({"created":row.get::<_,bool>(0)})),
+        )
+            .into_response(),
+        Err(e) if e.code().is_some_and(|c| c.code() == "42501") => {
+            failure(StatusCode::UNAUTHORIZED, uri.path())
+        }
+        Err(_) => failure(StatusCode::INTERNAL_SERVER_ERROR, uri.path()),
+    }
+}
 pub(super) async fn subscribers(
     State(db): State<Arc<Client>>,
     headers: HeaderMap,
