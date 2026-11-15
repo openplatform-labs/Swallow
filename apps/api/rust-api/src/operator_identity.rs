@@ -23,6 +23,7 @@ enum Lookup {
     PermissionIdentity,
     PermissionAudit,
     PermissionChangeRequest,
+    ResendAutoHealthJobs,
     ResendAutoHealth,
     ResendResult,
     ResendJobs,
@@ -310,6 +311,15 @@ pub(super) async fn slack_decision_request(
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
 ) -> Response {
     query(db, headers, uri, verifier, Lookup::SlackDecisionRequest).await
+}
+
+pub(super) async fn resend_auto_health_jobs(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::ResendAutoHealthJobs).await
 }
 
 pub(super) async fn resend_auto_health(
@@ -1401,6 +1411,7 @@ async fn query(
         | Lookup::SlackResult
         | Lookup::SendgridResult => &["environmentId", "jobId"],
         Lookup::ResendAutoHealth => &["environmentId", "graceSeconds"],
+        Lookup::ResendAutoHealthJobs => &["environmentId", "graceSeconds", "filter", "after"],
         Lookup::ResendJobs => &["environmentId", "after", "status"],
         Lookup::TwilioJobs | Lookup::FcmJobs | Lookup::SlackJobs | Lookup::SendgridJobs => {
             &["environmentId", "after"]
@@ -1455,6 +1466,36 @@ async fn query(
         return failure(StatusCode::UNAUTHORIZED, "Unauthorized", "Unauthorized");
     };
     let result = match lookup {
+        Lookup::ResendAutoHealthJobs => {
+            let Some(grace) = params.get("graceSeconds").and_then(|v| {
+                v.parse::<i32>()
+                    .ok()
+                    .filter(|n| (1..=86400).contains(n) && n.to_string() == *v)
+            }) else {
+                return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+            };
+            let Some(filter) = params.get("filter").filter(|v| {
+                [
+                    "rate-limited",
+                    "exhausted",
+                    "guard-deferred",
+                    "overdue-auto",
+                ]
+                .contains(&v.as_str())
+            }) else {
+                return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+            };
+            let after = match params.get("after") {
+                Some(value) => match Uuid::parse_str(value) {
+                    Ok(v) => Some(v),
+                    Err(_) => {
+                        return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+                    }
+                },
+                None => None,
+            };
+            guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_resend_auto_health_jobs($1,$2,$3,$4,$5,$6,$7,$8)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&grace,&filter,&after]).await
+        }
         Lookup::ResendAutoHealth => {
             let Some(grace) = params.get("graceSeconds").and_then(|v| {
                 v.parse::<i32>()

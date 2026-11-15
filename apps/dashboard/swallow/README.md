@@ -1,3 +1,7 @@
+Resend 자동 재시도 상태 화면에서 오래된 429·횟수 소진·보호 설정 연기·예약 기한 초과의 작업 목록을 선택하고 기존 발송 상세를 열 수 있다. 워커 0166과 API 0092, 집계 권한과 별도의 JWT 목록 권한, API DB `alert_view` 및 함수 EXECUTE가 필요하다. 발송 상세는 별도의 Resend 결과 권한이 필요하다. 목록은 payload·수신자를 표시하지 않지만 UUID와 시각은 민감할 수 있다. 페이지와 집계는 서로 다른 시점이며 UUID 순서는 시간순이 아니다. 조회 권한이 회수되면 다음 조회에서 기존 목록을 지운다.
+
+Angular 테스트 184개와 빌드가 통과했다. 실제 브라우저·제한 API DB 계정·테스트 JWT·임시 PostgreSQL에서 합성 보류 작업 목록·상세 연결과 목록 권한 회수 후 결과 제거를 확인했다. API 시험은 네 필터, 별도 권한 및 21건의 두 페이지를 검증했다. 실제 IdP·외부 발송·운영 HA는 미검증이며 기존 CSS 예산 경고가 있다. 재현은 `SWALLOW_UI_RESEND_AUTO_HEALTH_FIXTURE=true bash scripts/preview-channel-results-local.sh`와 별도 UI 서버를 사용한다.
+
 운영 경보 화면에서 운영자 JWT를 선택하면 Resend 자동 재시도 상태를 조회할 수 있다. 기준 시간은 이 조회에만 적용되며 실제 경보의 설정은 바꾸지 않는다. 오래된 429, 그중 횟수 소진, 보호 설정으로 연기된 작업과 예약 기한이 지난 자동 재시도 작업을 보여주며 건수는 겹칠 수 있다. 워커 0165와 API 0091, 별도의 환경별 JWT 모니터링 권한·API DB `alert_view` 및 함수 실행 권한이 필요하다. 발송 결과·정책 권한만으로는 사용할 수 없다. 조회 실패나 인증 변경 시 이전 수치를 지우며, JavaScript의 안전한 정수 범위를 벗어난 응답은 거절한다.
 
 Angular 테스트 182개와 빌드가 통과했다. 실제 브라우저·제한 API DB 계정·테스트 JWT·임시 PostgreSQL에서 합성 보류 건수 표시와 JWT 권한 회수 후 거절·기존 결과 제거를 확인했다. 실제 IdP·외부 발송·운영 HA는 미검증이며 기존 CSS 예산 경고가 있다. 재현은 `SWALLOW_UI_RESEND_AUTO_HEALTH_FIXTURE=true bash scripts/preview-channel-results-local.sh`와 별도 UI 서버를 사용한다. 집계 의미와 한계는 [워커 README](../../worker/rust-queue/README.md)를 참고한다.

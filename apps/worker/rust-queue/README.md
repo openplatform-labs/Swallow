@@ -1,3 +1,7 @@
+워커 0166은 `delivery-reconcile list-resend-auto ENV GRACE_SECONDS FILTER [AFTER_JOB]`으로 0165의 주의 집계에 해당하는 작업을 UUID 순 20건씩 조회한다. FILTER는 `rate-limited`, `exhausted`, `guard-deferred`, `overdue-auto` 중 하나다. 환경별 `alert_view`와 `GRANT EXECUTE ON FUNCTION public.novu_rust_resend_auto_retry_jobs(text,integer,text,uuid)`가 필요하다. 작업 UUID·상태·대기 시각·현재 시도 상태와 HTTP 상태만 반환하고 payload·수신자·공급자 ID는 반환하지 않는다. UUID와 시각도 운영 정보이므로 접근을 제한한다. 각 페이지와 집계는 별도 스냅샷이라 동시 변경 시 누락·건수 차이가 날 수 있고 UUID는 시간순이 아니다. 정렬 인덱스 생성의 잠금·쓰기 비용과 대규모 조회 부하를 검토한다.
+
+제한 DB 로그인·실제 CLI·임시 PostgreSQL에서 목록을 확인했고, 별도 API JWT 시험에서 네 필터와 21건의 두 페이지, 권한 분리와 payload 비노출을 검증했다. 실제 IdP·외부 발송·운영 HA는 미검증이다.
+
 워커 0165는 환경별 Resend 429·자동 재시도 주의 상태를 집계한다. `delivery-reconcile check-resend-auto ENV GRACE_SECONDS`는 JSON의 `rateLimited`(기준 시간 이상 실패한 429), `exhausted`(그중 활성 정책의 횟수를 소진한 건), `guardDeferred`(보호 설정 불일치로 보류된 pending 건), `overdueAuto`(예약 시각과 기준 시간이 지난 자동 재시도 pending 건)를 반환한다. `exhausted`는 `rateLimited`의 부분집합이며 다른 항목도 겹칠 수 있다. GRACE_SECONDS는 1~86,400초다. 정상은 종료 0, 하나라도 양수면 2, 권한·DB·설정 오류는 1이다. 조회 DB 로그인에는 해당 환경의 `alert_view`와 `GRANT EXECUTE ON FUNCTION public.novu_rust_resend_auto_retry_health(text,integer)`가 필요하다.
 
 선택적으로 `SWALLOW_ALERT_RESEND_AUTO_GRACE_SECONDS=300`을 설정하면 기존 `send-delivery-alert`가 이 집계를 Slack·이메일 대상에 포함한다. 생략하면 비활성화되며 기존 Resend 전달 상태 검사와 독립적으로 켜거나 끌 수 있다. 검사 자체의 실패도 경보를 시도하고 오류로 종료한다. 모니터링 로그인에 위 조회 권한과 기존 발송 경로의 권한을 부여하고, 누락 실행·DB 장애·경보 전송 결과는 별도로 감시한다. `new-condition` 쿨다운에서는 기존 미확인 실패 작업과 같은 조건 범주를 공유하므로 이미 그 범주가 활성 상태인 동안 다른 항목이 추가되어도 별도 즉시 경보가 보장되지 않는다. 한 검사가 실패하면 공유 범주를 정상으로 지우지 않는다.

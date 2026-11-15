@@ -48,9 +48,11 @@ INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) SELECT gen_ra
 SQL
 if [[ "${SWALLOW_UI_RESEND_AUTO_HEALTH_FIXTURE:-false}" == true ]]; then
  "$pgbin/psql" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
-GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_auto_health(text,text,text,text,bigint,integer) TO ui_channel_results_fixture;
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_auto_health(text,text,text,text,bigint,integer),public.novu_rust_operator_jwt_resend_auto_health_jobs(text,text,text,text,bigint,integer,text,uuid),public.novu_rust_operator_jwt_resend_result(text,text,text,text,bigint,uuid) TO ui_channel_results_fixture;
 INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'ui-fixture-env',rolname,'alert_view',oid FROM pg_roles WHERE rolname='ui_channel_results_fixture';
 INSERT INTO public.novu_rust_operator_jwt_resend_auto_health_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
+INSERT INTO public.novu_rust_operator_jwt_resend_auto_health_job_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
+INSERT INTO public.novu_rust_operator_jwt_resend_result_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
 INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status,last_error) VALUES ('44444444-4444-4444-8444-444444444444','ui-fixture-env','experimental_resend_email','{}','pending','Resend automatic retry requires evidence guards');
 SQL
 fi

@@ -1,3 +1,9 @@
+## Resend 자동 재시도 주의 작업 목록
+
+워커 0166·API 0092와 Angular 화면은 자동 재시도 상태의 오래된 429·횟수 소진·보호 설정 연기·예약 기한 초과를 UUID순 페이지로 조회하고 기존 발송 상세로 연결한다. 집계 JWT 권한과 별도 목록 권한, API DB `alert_view` 및 함수 EXECUTE가 필요하며 상세에는 Resend 결과 권한이 별도로 필요하다. 목록은 payload·수신자를 반환하지 않는다. 페이지와 집계는 서로 다른 시점이고 UUID는 시간순이 아니다.
+
+제한 DB 로그인·테스트 JWT·임시 PostgreSQL에서 네 필터, 권한 분리와 두 페이지를 검증하고 실제 CLI를 실행했다. Angular 테스트 184개·빌드 및 실제 브라우저에서 목록·상세 연결과 권한 회수 후 목록 제거를 확인했다. 실제 IdP·외부 발송·운영 HA와 대규모 인덱스 부하는 미검증이다. 적용 조건은 [화면 README](apps/dashboard/swallow/README.md)·[API README](apps/api/rust-api/README.md)를 참고한다.
+
 ## Resend 자동 재시도 상태 조회 화면
 
 API 0091은 워커 0165의 자동 재시도 주의 집계를 JWT 운영자에게 제공한다. 기존 발송 결과·정책 권한과 독립된 환경별 JWT 모니터링 권한 및 API DB 로그인 `alert_view` 권한이 필요하다. Angular 운영 경보 화면은 조회 기준 시간을 선택해 네 집계를 보여주며 이 값은 경보 설정을 변경하지 않는다.
