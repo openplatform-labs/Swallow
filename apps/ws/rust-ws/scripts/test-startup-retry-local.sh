@@ -22,6 +22,8 @@ cargo build --quiet --locked --offline --bin novu-rust-ws
 binary=target/debug/novu-rust-ws
 if env -u SWALLOW_WS_STARTUP_RETRY_SECONDS "$binary" >"$dir/default.log" 2>&1; then echo 'default startup should fail when DB is down' >&2; exit 1; fi
 if SWALLOW_WS_STARTUP_RETRY_SECONDS=301 "$binary" >"$dir/invalid.log" 2>&1; then echo 'invalid retry duration accepted' >&2; exit 1; fi
+if NOVU_WS_LISTENER_RECONNECT_TIMEOUT_SECONDS=0 "$binary" >"$dir/invalid-listener.log" 2>&1; then echo 'invalid listener timeout accepted' >&2; exit 1; fi
+rg -q 'invalid WS listener reconnect timeout' "$dir/invalid-listener.log"
 if SWALLOW_WS_STARTUP_RETRY_SECONDS=2 "$binary" >"$dir/deadline.log" 2>&1; then echo 'retry deadline should fail' >&2; exit 1; fi
 rg -q 'retry deadline exceeded' "$dir/deadline.log"
 SWALLOW_WS_STARTUP_RETRY_SECONDS=30 "$binary" >"$dir/terminate.log" 2>&1 & ws_pid=$!
@@ -35,4 +37,5 @@ if curl -fsS --max-time 1 "http://127.0.0.1:$ws_port/health/ready" >/dev/null 2>
 for ((i=0;i<100;i++)); do curl -fsS --max-time 1 "http://127.0.0.1:$ws_port/health/ready" >/dev/null 2>&1 && break; kill -0 "$ws_pid"; ((i<99)) || { echo 'WS did not become ready' >&2; exit 1; }; sleep 0.1; done
 kill -TERM "$ws_pid"; wait "$ws_pid"; ws_pid=
 TEST_PSQL="$pgbin/psql" TEST_PG_URL="postgres://postgres@127.0.0.1:$pg_port/postgres" TEST_PG_PORT="$pg_port" TEST_WS_BINARY="$(pwd)/$binary" node tests/startup_listener_retry.cjs
+TEST_PSQL="$pgbin/psql" TEST_PG_URL="postgres://postgres@127.0.0.1:$pg_port/postgres" TEST_PG_PORT="$pg_port" TEST_WS_BINARY="$(pwd)/$binary" node tests/runtime_listener_retry.cjs
 echo 'WS startup retry, deadline, termination and database recovery passed.'

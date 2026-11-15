@@ -501,6 +501,16 @@ fn spawn_cleanup(
     });
 }
 
+// Abort a listener driver if setup is cancelled before its handle is returned.
+struct AbortListenerOnDrop(Option<tokio::task::JoinHandle<()>>);
+impl Drop for AbortListenerOnDrop {
+    fn drop(&mut self) {
+        if let Some(driver) = self.0.take() {
+            driver.abort();
+        }
+    }
+}
+
 // A dedicated listener connection is driven independently of query traffic.
 // LISTEN must be active before the server accepts sockets.
 async fn start_event_listener(
@@ -549,18 +559,17 @@ async fn start_event_listener(
             }
         }
     });
+    let mut guard = AbortListenerOnDrop(Some(driver));
     if let Err(error) = client
         .batch_execute("LISTEN novu_rust_subscriber_deleted")
         .await
     {
-        driver.abort();
         return Err(error.into());
     }
     if let Err(error) = client.batch_execute("LISTEN novu_rust_ws_events").await {
-        driver.abort();
         return Err(error.into());
     }
-    Ok((client, driver))
+    Ok((client, guard.0.take().expect("listener driver present")))
 }
 
 // Startup retries are opt-in and share a single deadline across both DB connections.
@@ -674,6 +683,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
         Err(_) => return Err("NOVU_WS_EVENT_LOOKUP_TIMEOUT_SECONDS must be valid Unicode".into()),
     };
+    let listener_reconnect_timeout =
+        match std::env::var("NOVU_WS_LISTENER_RECONNECT_TIMEOUT_SECONDS") {
+            Err(std::env::VarError::NotPresent) => None,
+            Ok(value) => {
+                let seconds: u64 = value
+                    .parse()
+                    .map_err(|_| "invalid WS listener reconnect timeout")?;
+                if !(1..=300).contains(&seconds) {
+                    return Err("invalid WS listener reconnect timeout".into());
+                }
+                Some(std::time::Duration::from_secs(seconds))
+            }
+            Err(_) => return Err("invalid WS listener reconnect timeout".into()),
+        };
     let startup_retry_seconds: u64 = match std::env::var("SWALLOW_WS_STARTUP_RETRY_SECONDS") {
         Ok(value) => value
             .parse()
@@ -733,7 +756,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             }
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                match start_event_listener(&database_url, event_tx.clone()).await {
+                let result = if let Some(timeout) = listener_reconnect_timeout {
+                    match tokio::time::timeout(
+                        timeout,
+                        start_event_listener(&database_url, event_tx.clone()),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err("socket event listener reconnect timed out".into()),
+                    }
+                } else {
+                    start_event_listener(&database_url, event_tx.clone()).await
+                };
+                match result {
                     Ok(reconnected) => {
                         listener = reconnected;
                         listener_ready_task.store(true, Ordering::SeqCst);
