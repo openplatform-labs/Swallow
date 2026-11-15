@@ -1,0 +1,111 @@
+//! Standalone Discord webhook worker; use a process supervisor and external monitoring.
+use base64::{Engine, engine::general_purpose::STANDARD};
+use novu_postgres_queue::{discord::Webhook, discord_queue, slack_webhook::valid_destination};
+use std::{error::Error, time::Duration};
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    novu_postgres_queue::shutdown::run_until_signal(run).await
+}
+
+async fn run(
+    stop: novu_postgres_queue::shutdown::Stop,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let environment = std::env::var("NOVU_DISCORD_ENVIRONMENT_ID")?;
+    if environment.trim().is_empty() {
+        return Err("Discord environment is required".into());
+    }
+    let destination = std::env::var("NOVU_DISCORD_WEBHOOK_DESTINATION_ID")?;
+    if !valid_destination(&destination) {
+        return Err("invalid Discord webhook destination ID".into());
+    }
+    let url = novu_rust_contracts::secret::from_env(
+        "NOVU_DISCORD_WEBHOOK_URL",
+        "NOVU_DISCORD_WEBHOOK_URL_FILE",
+    )?
+    .ok_or("Discord webhook URL required")?;
+    let provider = Webhook::new(&url)?;
+    let endpoint_hash =
+        STANDARD.encode(ring::digest::digest(&ring::digest::SHA256, url.as_bytes()).as_ref());
+    let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
+    let timeout = match std::env::var("NOVU_DISCORD_WEBHOOK_DB_TIMEOUT_SECONDS") {
+        Ok(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|n| (1..=300).contains(n))
+            .ok_or("invalid Discord database timeout")?,
+        Err(std::env::VarError::NotPresent) => 30,
+        Err(_) => return Err("invalid Discord database timeout".into()),
+    };
+    let timeout = Duration::from_secs(timeout);
+    loop {
+        if stop.requested() {
+            return Ok(());
+        }
+        let connection = tokio::time::timeout(timeout, config.connect(tls.clone())).await;
+        if let Ok(Ok((mut db, driver))) = connection {
+            let task = tokio::spawn(driver);
+            let statement_timeout = format!("{}ms", timeout.as_millis());
+            let configured = matches!(
+                tokio::time::timeout(
+                    timeout,
+                    db.query_one(
+                        "SELECT set_config('statement_timeout',$1,false)",
+                        &[&statement_timeout]
+                    )
+                )
+                .await,
+                Ok(Ok(_))
+            );
+            if configured {
+                match tokio::time::timeout(timeout, db.query_opt("INSERT INTO novu_rust_discord_destinations(environment_id,destination_id,endpoint_hash) VALUES ($1,$2,$3) ON CONFLICT (environment_id,destination_id) DO UPDATE SET endpoint_hash=EXCLUDED.endpoint_hash WHERE novu_rust_discord_destinations.endpoint_hash=EXCLUDED.endpoint_hash RETURNING 1", &[&environment,&destination,&endpoint_hash])).await {
+                    Ok(Ok(Some(_))) => {},
+                    Ok(Ok(None)) => { task.abort(); return Err("Discord webhook destination already uses a different endpoint".into()); },
+                    _ => { task.abort(); let _=task.await; eprintln!("Discord webhook destination registration failed; reconnecting"); stop.wait(Duration::from_secs(2)).await; continue; }
+                }
+            }
+            let mut recovery = tokio::time::Instant::now();
+            if configured {
+                loop {
+                    if stop.requested() {
+                        break;
+                    }
+                    if tokio::time::Instant::now() >= recovery {
+                        if !matches!(
+                            tokio::time::timeout(
+                                timeout,
+                                discord_queue::recover_expired(&mut db, &environment, &destination)
+                            )
+                            .await,
+                            Ok(Ok(_))
+                        ) {
+                            break;
+                        }
+                        recovery = tokio::time::Instant::now() + Duration::from_secs(5);
+                    }
+                    if stop.requested() {
+                        break;
+                    }
+                    match tokio::time::timeout(
+                        timeout,
+                        discord_queue::process_one(&mut db, &environment, &destination, &provider),
+                    )
+                    .await
+                    {
+                        Ok(Ok(true)) => {}
+                        Ok(Ok(false)) => stop.wait(Duration::from_secs(1)).await,
+                        _ => break,
+                    }
+                }
+            }
+            // Dropping the client alone can leave the driver running while a
+            // cancelled transaction waits on the server. Abort it before retry.
+            task.abort();
+            let _ = task.await;
+        }
+        if stop.requested() {
+            return Ok(());
+        }
+        eprintln!("Discord worker database operation stopped; reconnecting");
+        stop.wait(Duration::from_secs(2)).await;
+    }
+}

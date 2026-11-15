@@ -2,6 +2,7 @@
 pub mod alerts;
 pub mod db_probe;
 pub mod discord;
+pub mod discord_queue;
 pub mod email_step_policy;
 pub mod fcm;
 #[cfg(test)]
