@@ -3,7 +3,7 @@ use crate::sendgrid::Email;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{Client, header};
 use serde_json::{Value, json};
-use std::{fmt, time::Duration};
+use std::{fmt, path::Path, time::Duration};
 
 pub struct Config {
     pub api_key: String,
@@ -150,6 +150,18 @@ impl Resend {
             config,
         })
     }
+    /// Reload before claiming a new job. Failed validation leaves the old key
+    /// in memory; the caller must not dispatch while this method fails.
+    pub fn reload_api_key_file(&mut self, path: &Path) -> Result<(), SendError> {
+        let key = novu_rust_contracts::secret::read(None, Some(path))
+            .map_err(|_| SendError::InvalidConfiguration)?
+            .ok_or(SendError::InvalidConfiguration)?;
+        if header::HeaderValue::from_str(&format!("Bearer {key}")).is_err() {
+            return Err(SendError::InvalidConfiguration);
+        }
+        self.config.api_key = key;
+        Ok(())
+    }
     /// Sends one request. A transport error or invalid success body is ambiguous.
     pub async fn send(
         &self,
@@ -277,6 +289,45 @@ mod tests {
             request_body(&config(), &email),
             Err(SendError::InvalidMessage)
         );
+    }
+    #[tokio::test]
+    async fn key_file_reload_updates_subsequent_requests_without_exposing_errors() {
+        let dir = std::env::temp_dir().join(format!("swallow-resend-key-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let key = dir.join("key");
+        std::fs::write(&key, "re_test\n").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/emails", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for expected in ["re_test", "re_rotated"] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0; 4096];
+                while !bytes.windows(4).any(|v| v == b"\r\n\r\n") {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                }
+                let headers = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+                assert!(headers.contains(&format!("authorization: bearer {expected}\r\n")));
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"id\":\"ok\"}").await.unwrap();
+            }
+        });
+        let mut provider = Resend::with_endpoint(config(), &endpoint).unwrap();
+        provider.reload_api_key_file(&key).unwrap();
+        assert_eq!(provider.send(&message(), None).await.unwrap(), "ok");
+        std::fs::write(&key, "invalid\nsecret").unwrap();
+        assert_eq!(
+            provider.reload_api_key_file(&key),
+            Err(SendError::InvalidConfiguration)
+        );
+        assert_eq!(provider.config.api_key, "re_test");
+        std::fs::write(dir.join("replacement"), "re_rotated\n").unwrap();
+        std::fs::rename(dir.join("replacement"), &key).unwrap();
+        provider.reload_api_key_file(&key).unwrap();
+        assert_eq!(provider.send(&message(), None).await.unwrap(), "ok");
+        server.await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[tokio::test]
     async fn requests_and_responses_are_bounded() {
