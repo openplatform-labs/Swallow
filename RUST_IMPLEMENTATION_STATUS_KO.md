@@ -1,5 +1,7 @@
 ## Slack 공유 대기 상태 조회와 경보
 
+- 공유 경보 조건 설정 보호: `SWALLOW_ALERT_REQUIRE_DISTINCT_SHARED_CHECKS=true`를 선택하면 `new-condition` 실행에서 실패 작업·Resend 자동 재시도·Slack 공유 대기 중 둘 이상을 동시에 켠 구성을 DB 연결 전에 거절한다. 기본값은 기존 동작이다. 실제 CLI 시험으로 세 충돌 조합과 단일 검사·기존 정책을 확인했다. 서로 다른 프로세스가 같은 대상 ID를 쓰는지 확인하지 않으며 독립 비트 구현을 대체하지 않는다. 별도 일정·대상 설정은 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
 - Slack 워커 DB 연결 복구 시험: 위 프로세스 인계 시험에서 남은 워커의 PostgreSQL 연결을 작업 사이에 강제 종료하고 새 연결 및 추가 10건 보류를 확인했다. 실제 DB 서버 장애 전환, 발송 중 연결 단절, 다중 호스트와 외부 Slack은 미검증이다. 공유 경보 비트로 인한 억제는 별도 일정과 대상 ID로 분리할 수 있으며 설정 및 중복 경보 가능성은 [워커 README](apps/worker/rust-queue/README.md)에 기록했다.
 
 - Slack 공유 대기 프로세스 시험: 임시 PostgreSQL 17에 실제 Slack 워커 두 개를 연결해 작업 10건을 보류하고 한 프로세스를 강제 종료한 뒤 나머지 워커가 추가 10건을 보류하는 것을 확인했다. 발송 시도 기록은 0건이었다. 단일 호스트·단일 DB·관리자 계정 시험으로 실제 Slack 429, 진행 중 요청, 호스트·DB 장애 전환, 네트워크 분할 및 제한 권한 배포는 검증하지 않았다. 재현은 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.

@@ -39,6 +39,18 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok("destination") | Err(std::env::VarError::NotPresent) => false,
         _ => return Err("invalid alert cooldown policy".into()),
     };
+    // These checks share condition bits in the legacy mask.
+    let require_distinct = env_bool("SWALLOW_ALERT_REQUIRE_DISTINCT_SHARED_CHECKS", false)?;
+    if require_distinct && on_new_condition {
+        let enabled = [
+            env_bool("SWALLOW_ALERT_FAILED_JOBS_ENABLED", false)?,
+            env_optional_i32("SWALLOW_ALERT_RESEND_AUTO_GRACE_SECONDS")?.is_some(),
+            env_optional_i32("SWALLOW_ALERT_SLACK_COOLDOWN_GRACE_SECONDS")?.is_some(),
+        ];
+        if enabled.into_iter().filter(|value| *value).count() > 1 {
+            return Err("shared alert condition checks require separate invocations and target IDs".into());
+        }
+    }
     let grace: i32 = args[1].parse()?;
     let heartbeat: i32 = args[2].parse()?;
     let cooldown: i32 = args[3].parse()?;
