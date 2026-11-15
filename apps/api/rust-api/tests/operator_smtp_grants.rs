@@ -120,6 +120,13 @@ async fn smtp_grants_are_independent_conditional_and_audited() {
     let app = novu_rust_api::router(Arc::new(api)).layer(Extension(Arc::new(
         AccessTokenVerifier::new("https://issuer.test", "swallow", &[("key", PUBLIC)]).unwrap(),
     )));
+    let api2 = connect(&url).await;
+    api2.batch_execute(&format!("SET SESSION AUTHORIZATION {role}"))
+        .await
+        .unwrap();
+    let app2 = novu_rust_api::router(Arc::new(api2)).layer(Extension(Arc::new(
+        AccessTokenVerifier::new("https://issuer.test", "swallow", &[("key", PUBLIC)]).unwrap(),
+    )));
     let token = jwt("admin");
     let path = format!("/v1/experimental/operator/smtp-review-grants?environmentId={env}");
     let read = format!(
@@ -176,8 +183,7 @@ async fn smtp_grants_are_independent_conditional_and_audited() {
         response(app.clone(), &token, "GET", &request, None).await.1["found"],
         true
     );
-    let audit =
-        format!("/v1/experimental/operator/smtp-review-grants/audit?environmentId={env}");
+    let audit = format!("/v1/experimental/operator/smtp-review-grants/audit?environmentId={env}");
     assert_eq!(
         response(app.clone(), &token, "GET", &audit, None).await.0,
         StatusCode::UNAUTHORIZED
@@ -214,6 +220,83 @@ async fn smtp_grants_are_independent_conditional_and_audited() {
             .await
             .1,
         json!({"found":false})
+    );
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_smtp_credential_health(text,text,text,text,bigint,integer,integer) TO {role}")).await.unwrap();
+    let credential = format!(
+        "/v1/experimental/operator/smtp-credential-health?environmentId={env}&maxAgeSeconds=60&minimumHealthy=1"
+    );
+    assert_eq!(
+        response(app.clone(), &target, "GET", &credential, None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let credential_grant = json!({"requestId":Uuid::new_v4(),"targetIssuer":"https://issuer.test","targetSubject":"target","targetClientId":"console","resource":"smtp-review","permission":"credential-health","expected":false,"desired":true,"reason":"credentials"});
+    let (first, second) = tokio::join!(
+        response(
+            app.clone(),
+            &token,
+            "PUT",
+            &path,
+            Some(credential_grant.clone())
+        ),
+        response(
+            app2.clone(),
+            &token,
+            "PUT",
+            &path,
+            Some(credential_grant.clone())
+        )
+    );
+    assert_eq!((first.0, second.0), (StatusCode::OK, StatusCode::OK));
+    assert_ne!(first.1["replayed"], second.1["replayed"]);
+    assert_eq!(
+        response(app.clone(), &target, "GET", &credential, None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let mut revoke_credential = credential_grant.clone();
+    revoke_credential["requestId"] = Uuid::new_v4().to_string().into();
+    revoke_credential["expected"] = true.into();
+    revoke_credential["desired"] = false.into();
+    db.batch_execute("CREATE FUNCTION public.test_smtp_credential_grant_reject() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'audit unavailable'; END $$; CREATE TRIGGER test_smtp_credential_grant_reject BEFORE INSERT ON public.novu_rust_operator_jwt_smtp_review_grant_audit FOR EACH ROW EXECUTE FUNCTION public.test_smtp_credential_grant_reject()").await.unwrap();
+    assert_eq!(
+        response(
+            app.clone(),
+            &token,
+            "PUT",
+            &path,
+            Some(revoke_credential.clone())
+        )
+        .await
+        .0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        response(app.clone(), &target, "GET", &credential, None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    db.batch_execute("DROP TRIGGER test_smtp_credential_grant_reject ON public.novu_rust_operator_jwt_smtp_review_grant_audit; DROP FUNCTION public.test_smtp_credential_grant_reject()").await.unwrap();
+    assert_eq!(
+        response(app.clone(), &token, "PUT", &path, Some(revoke_credential))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        response(app.clone(), &target, "GET", &credential, None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        response(app.clone(), &target, "GET", &target_list, None)
+            .await
+            .0,
+        StatusCode::OK
     );
     let revoke = json!({"requestId":Uuid::new_v4(),"targetIssuer":"https://issuer.test","targetSubject":"target","targetClientId":"console","resource":"smtp-review","permission":"list","expected":true,"desired":false,"reason":"done"});
     db.batch_execute("CREATE FUNCTION public.test_smtp_grant_reject() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test audit failure'; END $$; CREATE TRIGGER test_smtp_grant_reject BEFORE INSERT ON public.novu_rust_operator_jwt_smtp_review_grant_audit FOR EACH ROW EXECUTE FUNCTION public.test_smtp_grant_reject()").await.unwrap();
