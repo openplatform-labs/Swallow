@@ -19,6 +19,23 @@ describe('workflow trigger',()=>{
     expect(JSON.parse(fetcher.mock.calls[0][1]!.body as string)).toEqual({name:'welcome',to:'person',payload:{},transactionId:id});expect(c.status()).toBe('unknown');expect(c.transaction()).toBe(id);
     await c.submit();expect(fetcher).toHaveBeenCalledTimes(1);c.reset();expect(c.status()).toBe('idle');fixture.destroy();expect(c.apiKey).toBe('');
   });
+  it('includes an optional Resend schedule alongside the SendGrid sandbox override',async()=>{
+    const id='22222222-2222-4222-8222-222222222222';vi.spyOn(crypto,'randomUUID').mockReturnValue(id);
+    const fetcher=vi.spyOn(globalThis,'fetch').mockResolvedValue(new Response(JSON.stringify({data:{acknowledged:true,status:'processed',transactionId:id}}),{status:201}));
+    const {fixture,c}=setup();c.resendScheduleEnabled=true;c.resendSchedule=' 2026-12-01T09:00:00+09:00 ';fixture.detectChanges();expect(fixture.nativeElement.textContent).toContain('다른 채널은 즉시 실행될 수 있습니다');await c.submit();
+    expect(JSON.parse(fetcher.mock.calls[0][1]!.body as string).overrides.providers).toEqual({sendgrid:{mailSettings:{sandboxMode:{enable:true}}},resend:{_passthrough:{body:{scheduledAt:'2026-12-01T09:00:00+09:00'}}}});expect(c.status()).toBe('accepted');fixture.destroy();
+  });
+  it('rejects malformed selected schedules without sending or storing a transaction',async()=>{
+    const fetcher=vi.spyOn(globalThis,'fetch');const {fixture,c}=setup();c.resendScheduleEnabled=true;c.rememberTransaction=true;
+    for(const value of ['','tomorrow','2026-12-01T09:00:00','2026-02-29T09:00:00Z','2026-12-01T25:00:00Z','2026-12-01T09:00:00+24:00']){c.resendSchedule=value;await c.submit();expect(c.status()).toBe('invalid');expect(c.transaction()).toBe('');}
+    expect(fetcher).not.toHaveBeenCalled();expect(sessionStorage.length).toBe(0);fixture.destroy();
+  });
+  it('sends only the selected Resend schedule with operator authentication',async()=>{
+    const id='22222222-2222-4222-8222-222222222222';vi.spyOn(crypto,'randomUUID').mockReturnValue(id);
+    const fetcher=vi.spyOn(globalThis,'fetch').mockResolvedValue(new Response(JSON.stringify({data:{acknowledged:true,status:'processed',transactionId:id}}),{status:201}));
+    const {fixture,c}=setup();c.executeAuth='jwt';c.executeToken='aaa.bbb.ccc';c.executeEnvironment='env-a';c.mode='normal';c.resendScheduleEnabled=true;c.resendSchedule='2028-02-29T00:00:00Z';await c.submit();
+    expect(fetcher.mock.calls[0][0]).toBe('https://api.example.test/v1/experimental/operator/events/trigger?environmentId=env-a');expect(JSON.parse(fetcher.mock.calls[0][1]!.body as string).overrides).toEqual({providers:{resend:{_passthrough:{body:{scheduledAt:'2028-02-29T00:00:00Z'}}}}});fixture.destroy();
+  });
   it('fails closed on unsafe origin, invalid payload and mismatched acknowledgement',async()=>{
     const id='33333333-3333-4333-8333-333333333333';vi.spyOn(crypto,'randomUUID').mockReturnValue(id);
     const fetcher=vi.spyOn(globalThis,'fetch').mockResolvedValue(new Response(JSON.stringify({data:{acknowledged:true,status:'processed',transactionId:'different'}}),{status:201}));const {fixture,c}=setup();

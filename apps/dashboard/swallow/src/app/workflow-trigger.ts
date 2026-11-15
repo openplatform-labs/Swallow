@@ -2,10 +2,22 @@ import { Component, Input, OnDestroy, OnInit, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { ExecutionAudit } from './execution-audit';
 
+function validSchedule(value:string):boolean {
+  if(value.length>64)return false;
+  const match=/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/.exec(value);
+  if(!match)return false;
+  const [,y,m,d,h,min,sec,offset]=match;
+  const year=Number(y),month=Number(m),day=Number(d);
+  const leap=year%4===0&&(year%100!==0||year%400===0);
+  const days=[31,leap?29:28,31,30,31,30,31,31,30,31,30,31];
+  return year>0&&month>=1&&month<=12&&day>=1&&day<=days[month-1]&&Number(h)<=23&&Number(min)<=59&&Number(sec)<=59&&(offset==='Z'||(Number(offset.slice(1,3))<=23&&Number(offset.slice(4,6))<=59));
+}
+
 @Component({selector:'app-workflow-trigger',imports:[FormsModule,ExecutionAudit],templateUrl:'./workflow-trigger.html'})
 export class WorkflowTrigger implements OnInit, OnDestroy {
   @Input() apiOrigin='';
   apiKey=''; workflow=''; subscriber=''; payload='{}'; mode:'sandbox'|'normal'='sandbox';
+  resendScheduleEnabled=false; resendSchedule='';
   executeAuth:'api-key'|'jwt'='api-key'; executeToken=''; executeEnvironment='';
   lookupAuth:'api-key'|'jwt'='api-key'; lookupToken=''; lookupEnvironment='';
   rememberTransaction=false;
@@ -67,9 +79,13 @@ export class WorkflowTrigger implements OnInit, OnDestroy {
       if(!key||/[\r\n\0]/.test(key)||!['api-key','jwt'].includes(auth)||(auth==='api-key'&&key.length>4096)||(auth==='jwt'&&(key.length>16384||!/^[-_A-Za-z0-9]+\.[-_A-Za-z0-9]+\.[-_A-Za-z0-9]+$/.test(key)||!environment||new TextEncoder().encode(environment).length>512||/[\r\n\0]/.test(environment)))||!workflow||!subscriber||new TextEncoder().encode(workflow).length>512||new TextEncoder().encode(subscriber).length>512||/[\r\n\0]/.test(workflow+subscriber)||!['sandbox','normal'].includes(this.mode)||new TextEncoder().encode(this.payload).length>65536)throw new Error('input');
       endpoint=auth==='jwt'?`/v1/experimental/operator/events/trigger?${new URLSearchParams({environmentId:environment})}`:'/v1/events/trigger';authorization=`${auth==='jwt'?'Bearer':'ApiKey'} ${key}`;
       const payload:unknown=JSON.parse(this.payload);if(!payload||Array.isArray(payload)||typeof payload!=='object')throw new Error('payload');
+      const schedule=this.resendSchedule.trim();if(this.resendScheduleEnabled&&!validSchedule(schedule))throw new Error('schedule');
       const transactionId=crypto.randomUUID();
       body={name:workflow,to:subscriber,payload,transactionId};
-      if(this.mode==='sandbox')body['overrides']={providers:{sendgrid:{mailSettings:{sandboxMode:{enable:true}}}}};
+      const providers:Record<string,unknown>={};
+      if(this.mode==='sandbox')providers['sendgrid']={mailSettings:{sandboxMode:{enable:true}}};
+      if(this.resendScheduleEnabled)providers['resend']={_passthrough:{body:{scheduledAt:schedule}}};
+      if(Object.keys(providers).length)body['overrides']={providers};
       if(this.rememberTransaction) {
         try {if(sessionStorage.getItem(this.storageKey)!==null)throw new Error('record already exists');sessionStorage.setItem(this.storageKey,JSON.stringify({version:1,transactionId,origin}));}
         catch {this.storageError.set(true);throw new Error('storage unavailable');}
