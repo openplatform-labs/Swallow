@@ -488,6 +488,24 @@ describe('Swallow console', () => {
     app.setSection('overview');expect(app.resendResult()).toBeNull();expect(app.alertKey).toBe('');expect(app.resendJobId).toBe('');
   });
 
+  it('prepares a fenced Resend decision and safely recovers a lost response', async () => {
+    const job='1889f88e-c0a3-4ab5-b861-2fdc1f26f254', attempt='2889f88e-c0a3-4ab5-b861-2fdc1f26f254';
+    const row={jobId:job,jobStatus:'failed',result:'unknown',attemptState:'rejected',attemptId:attempt,attemptHttpStatus:429,retryAfterSeconds:30,retryNotBefore:'2026-01-01 00:00:30+00',providerIdKnown:false,providerIdAmbiguous:false,autoCorrelated:false,autoCorrelationConflict:false,autoCorrelatedAt:null,lastCompletedScanAt:null};
+    const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify(row))).mockRejectedValueOnce(new Error('response lost')).mockResolvedValueOnce(new Response(JSON.stringify({found:false})));
+    const fixture=TestBed.createComponent(App), app=fixture.componentInstance;app.setSection('alerts');app.alertAuthMode='jwt';app.alertEnvironment='env-a';app.alertKey='aaa.bbb.ccc';app.resendJobId=job;await app.loadResend();
+    app.resendDecisionReason='reviewed';await app.prepareResendDecision();const draft=app.resendDecisionSnapshot()!;expect(draft.body.attemptId).toBe(attempt);expect(app.resendDecisionStatus()).toBe('prepared');
+    await app.submitResendDecision();expect(mock).toHaveBeenCalledTimes(1);app.resendDecisionConfirmed=true;await app.submitResendDecision();expect(app.resendDecisionStatus()).toBe('unknown');expect(JSON.parse(mock.mock.calls[1][1]!.body as string)).toEqual(draft.body);
+    await app.lookupResendDecision();expect(app.resendLookupStatus()).toBe('missing');expect(app.resendDecisionStatus()).toBe('unknown');app.resetResendDecision();expect(app.resendDecisionStatus()).toBe('unknown');
+    mock.mockResolvedValueOnce(new Response(JSON.stringify({requestId:draft.body.requestId,replayed:true,availableAt:'2026-01-01T00:00:30Z'})));app.resendRetryConfirmed=true;await app.submitResendDecision(true);expect(app.resendDecisionStatus()).toBe('recorded');expect(mock.mock.calls[3][1]!.body).toEqual(mock.mock.calls[1][1]!.body);expect(app.resendResult()).toBeNull();fixture.destroy();
+  });
+  it('requires the 429 attempt and supported delay, and fences authentication changes', async () => {
+    const job='1889f88e-c0a3-4ab5-b861-2fdc1f26f254',attempt='2889f88e-c0a3-4ab5-b861-2fdc1f26f254';
+    const row={jobId:job,jobStatus:'failed',result:'unknown',attemptState:'rejected',attemptId:attempt,attemptHttpStatus:429,retryAfterSeconds:null,retryNotBefore:null,providerIdKnown:false,providerIdAmbiguous:false,autoCorrelated:false,autoCorrelationConflict:false,autoCorrelatedAt:null,lastCompletedScanAt:null};
+    const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify(row)));
+    const fixture=TestBed.createComponent(App),app=fixture.componentInstance;app.setSection('alerts');app.alertAuthMode='jwt';app.alertEnvironment='env-a';app.alertKey='aaa.bbb.ccc';app.resendJobId=job;await app.loadResend();app.resendDecisionReason='reviewed';await app.prepareResendDecision();expect(app.resendDecisionStatus()).toBe('idle');
+    app.resendDecisionMode='immediate';await app.prepareResendDecision();expect(app.resendDecisionStatus()).toBe('prepared');app.alertKey='ddd.eee.fff';app.resendDecisionConfirmed=true;await app.submitResendDecision();expect(app.resendDecisionStatus()).toBe('prepared');expect(mock).toHaveBeenCalledTimes(1);expect(app.resendDecisionMessage()).toContain('같은 토큰');fixture.destroy();
+  });
+
   it('shows the provider status and accepts older APIs without a status field', async () => {
     const job='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
     const row={jobId:job,jobStatus:'failed',result:'unknown',attemptState:'rejected',providerIdKnown:false,providerIdAmbiguous:false,autoCorrelated:false,autoCorrelationConflict:false,autoCorrelatedAt:null,lastCompletedScanAt:null};

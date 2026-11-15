@@ -26,7 +26,9 @@ type SubscriberEditSnapshot = {id:string;generation:string;revision:string;profi
 type Subscriber = { id: string; firstName: string; lastName: string; email: string };
 type AlertSlot = { channel: string; targetId: string; state: string; lastStartedAt: string | null; attemptId?: string | null };
 type AlertCursor = { channel: string; targetId: string };
-type ResendResult = { jobId:string; jobStatus:string; result:string; attemptState:string|null; attemptHttpStatus:number|null|undefined; retryAfterSeconds:number|null|undefined; retryNotBefore:string|null|undefined; providerIdKnown:boolean; providerIdAmbiguous:boolean; autoCorrelated:boolean; autoCorrelationConflict:boolean; autoCorrelatedAt:string|null; lastCompletedScanAt:string|null };
+type ResendResult = { jobId:string; jobStatus:string; result:string; attemptState:string|null; attemptId?:string|null; attemptHttpStatus:number|null|undefined; retryAfterSeconds:number|null|undefined; retryNotBefore:string|null|undefined; providerIdKnown:boolean; providerIdAmbiguous:boolean; autoCorrelated:boolean; autoCorrelationConflict:boolean; autoCorrelatedAt:string|null; lastCompletedScanAt:string|null };
+type ResendDecisionBody = {requestId:string;jobId:string;attemptId:string;mode:'immediate'|'after';reason:string};
+type ResendDecisionSnapshot = {origin:string;environment:string;keyHash:string;body:ResendDecisionBody};
 type WorkflowChannel = 'email'|'sms'|'push'|'slack';
 type WorkflowResource = WorkflowChannel|'email-provider';
 type WorkflowChangeRequest = {requestId:string;workflow:string;resource:WorkflowResource;expected:unknown;desired:unknown;reason:string};
@@ -150,6 +152,15 @@ export class App implements OnDestroy {
   readonly resendResult = signal<ResendResult|null>(null);
   private resendSequence = 0;
   private resendAbort: AbortController|null = null;
+  resendDecisionMode:'immediate'|'after'='after'; resendDecisionReason=''; resendDecisionConfirmed=false; resendRetryConfirmed=false; resendResetConfirmed=false; resendDecisionLookupId='';
+  readonly resendDecisionStatus=signal<'idle'|'preparing'|'prepared'|'sending'|'recorded'|'unknown'|'unavailable'>('idle');
+  readonly resendDecisionSnapshot=signal<ResendDecisionSnapshot|null>(null);
+  readonly resendDecisionMessage=signal(''); readonly resendDecisionSchedule=signal('');
+  readonly resendLookupStatus=signal<'idle'|'loading'|'found'|'missing'|'error'>('idle');
+  readonly resendLookupRecord=signal<(ResendDecisionBody & {availableAt:string;createdAt:string})|null>(null);
+  private resendDecisionSequence=0; private resendDecisionAbort:AbortController|null=null;
+  private resendLookupSequence=0; private resendLookupAbort:AbortController|null=null;
+
   resendJobsFilter: ''|'unknown'|'rejected'|'rate-limited' = '';
   readonly resendJobs = signal<ResendResult[]>([]);
   readonly resendJobsStatus = signal<'idle'|'loading'|'loaded'|'error'>('idle');
@@ -352,6 +363,7 @@ export class App implements OnDestroy {
     if (this.oidcExpiryTimer !== null) clearTimeout(this.oidcExpiryTimer);
     this.oidcExpiryTimer = null;
     this.oidcSession = null;
+    this.cancelResendDecisionContext();
     this.alertKey='';
     this.resendJobId='';
     this.clearResend();
@@ -1124,7 +1136,7 @@ export class App implements OnDestroy {
     if(this.fcmBusy||this.slackBusy)return;
     if(this.oidcRevokeStatus()==='sending')return;
     if(this.sendgridWriteStatus()==='sending')return;
-    if (this.slackDecisionBusy || this.resendPolicyBusy || (this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying' || this.subscriberDeleteRetryStatus()==='retrying') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || (this.grantChangeStatus()==='sending'||this.resendPolicyBusy) || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
+    if (this.resendDecisionStatus()==='sending' || this.resendDecisionStatus()==='preparing' || this.slackDecisionBusy || this.resendPolicyBusy || (this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying' || this.subscriberDeleteRetryStatus()==='retrying') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || (this.grantChangeStatus()==='sending'||this.resendPolicyBusy) || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     if (this.section()==='workflows' && next!=='workflows') {this.clearWorkflow(true);this.forgetWorkflowRequest();}
     if (this.section()==='channels' && next!=='channels') this.clearSendgrid(true);
     if (this.section() === 'subscribers' && next !== 'subscribers') this.forgetKey();
@@ -1240,6 +1252,7 @@ export class App implements OnDestroy {
 
   clearAlerts(): void {
     if (this.decisionStatus() === 'sending') return;
+    this.cancelResendDecisionContext();
     this.stopAlertRefresh();
     this.alertRequestId++;
     this.alertAbort?.abort();
@@ -1304,10 +1317,59 @@ export class App implements OnDestroy {
   private parseResendResult(value:unknown,job?:string): ResendResult {
       if (typeof value!=='object' || value===null) throw new Error('API 응답 형식을 확인해 주세요.');
       const row=value as Record<string,unknown>;
-      if (typeof row['jobId']!=='string' || (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(row['jobId']) || (job!==undefined && row['jobId'].toLowerCase()!==job.toLowerCase())) || typeof row['jobStatus']!=='string' || !['pending','running','completed','failed','cancelled'].includes(row['jobStatus']) || typeof row['result']!=='string' || !['unknown','pending','delivered','failed','partial','conflicting','complained'].includes(row['result']) || !(row['attemptState']===null || (typeof row['attemptState']==='string' && ['dispatching','accepted','rejected','unknown'].includes(row['attemptState']))) || !(row['attemptHttpStatus']===undefined || row['attemptHttpStatus']===null || (Number.isInteger(row['attemptHttpStatus']) && (row['attemptHttpStatus'] as number)>=100 && (row['attemptHttpStatus'] as number)<=599)) || !(row['retryAfterSeconds']===undefined || row['retryAfterSeconds']===null || (Number.isInteger(row['retryAfterSeconds']) && (row['retryAfterSeconds'] as number)>=0 && (row['retryAfterSeconds'] as number)<=86400)) || !(row['retryNotBefore']===undefined || row['retryNotBefore']===null || typeof row['retryNotBefore']==='string') || ((row['retryAfterSeconds']===null)!==(row['retryNotBefore']===null)) || ((row['retryAfterSeconds']===undefined)!==(row['retryNotBefore']===undefined)) || typeof row['providerIdKnown']!=='boolean' || typeof row['providerIdAmbiguous']!=='boolean' || typeof row['autoCorrelated']!=='boolean' || typeof row['autoCorrelationConflict']!=='boolean' || !(row['autoCorrelatedAt']===null || typeof row['autoCorrelatedAt']==='string') || !(row['lastCompletedScanAt']===null || typeof row['lastCompletedScanAt']==='string')) throw new Error('API 응답 형식을 확인해 주세요.');
+      if (typeof row['jobId']!=='string' || (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(row['jobId']) || (job!==undefined && row['jobId'].toLowerCase()!==job.toLowerCase())) || typeof row['jobStatus']!=='string' || !['pending','running','completed','failed','cancelled'].includes(row['jobStatus']) || typeof row['result']!=='string' || !['unknown','pending','delivered','failed','partial','conflicting','complained'].includes(row['result']) || !(row['attemptState']===null || (typeof row['attemptState']==='string' && ['dispatching','accepted','rejected','unknown'].includes(row['attemptState']))) || !(row['attemptId']===undefined || row['attemptId']===null || (typeof row['attemptId']==='string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(row['attemptId']))) || (row['attemptId']!==undefined && ((row['attemptId']===null)!==(row['attemptState']===null))) || !(row['attemptHttpStatus']===undefined || row['attemptHttpStatus']===null || (Number.isInteger(row['attemptHttpStatus']) && (row['attemptHttpStatus'] as number)>=100 && (row['attemptHttpStatus'] as number)<=599)) || !(row['retryAfterSeconds']===undefined || row['retryAfterSeconds']===null || (Number.isInteger(row['retryAfterSeconds']) && (row['retryAfterSeconds'] as number)>=0 && (row['retryAfterSeconds'] as number)<=86400)) || !(row['retryNotBefore']===undefined || row['retryNotBefore']===null || typeof row['retryNotBefore']==='string') || ((row['retryAfterSeconds']===null)!==(row['retryNotBefore']===null)) || ((row['retryAfterSeconds']===undefined)!==(row['retryNotBefore']===undefined)) || typeof row['providerIdKnown']!=='boolean' || typeof row['providerIdAmbiguous']!=='boolean' || typeof row['autoCorrelated']!=='boolean' || typeof row['autoCorrelationConflict']!=='boolean' || !(row['autoCorrelatedAt']===null || typeof row['autoCorrelatedAt']==='string') || !(row['lastCompletedScanAt']===null || typeof row['lastCompletedScanAt']==='string')) throw new Error('API 응답 형식을 확인해 주세요.');
       if (((row['autoCorrelationConflict'] || row['providerIdAmbiguous']) && row['result']==='delivered') || (row['autoCorrelationConflict'] && !row['autoCorrelated']) || (row['autoCorrelated'] !== (typeof row['autoCorrelatedAt']==='string'))) throw new Error('API 응답 형식을 확인해 주세요.');
       const result=row as ResendResult;
-      return {jobId:result.jobId,jobStatus:result.jobStatus,result:result.result,attemptState:result.attemptState,attemptHttpStatus:result.attemptHttpStatus,retryAfterSeconds:result.retryAfterSeconds,retryNotBefore:result.retryNotBefore,providerIdKnown:result.providerIdKnown,providerIdAmbiguous:result.providerIdAmbiguous,autoCorrelated:result.autoCorrelated,autoCorrelationConflict:result.autoCorrelationConflict,autoCorrelatedAt:result.autoCorrelatedAt,lastCompletedScanAt:result.lastCompletedScanAt};
+      return {jobId:result.jobId,jobStatus:result.jobStatus,result:result.result,attemptState:result.attemptState,attemptId:result.attemptId,attemptHttpStatus:result.attemptHttpStatus,retryAfterSeconds:result.retryAfterSeconds,retryNotBefore:result.retryNotBefore,providerIdKnown:result.providerIdKnown,providerIdAmbiguous:result.providerIdAmbiguous,autoCorrelated:result.autoCorrelated,autoCorrelationConflict:result.autoCorrelationConflict,autoCorrelatedAt:result.autoCorrelatedAt,lastCompletedScanAt:result.lastCompletedScanAt};
+  }
+
+  private resendUuid(value:unknown):value is string { return typeof value==='string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value); }
+  cancelResendDecisionContext():void {
+    this.resendDecisionSequence++; this.resendDecisionAbort?.abort(); this.resendDecisionAbort=null;
+    this.clearResendLookup();
+    if(this.resendDecisionStatus()==='sending') this.resendDecisionStatus.set('unknown');
+    else if(['preparing','prepared','recorded','unavailable'].includes(this.resendDecisionStatus())) {this.resendDecisionStatus.set('idle');this.resendDecisionSnapshot.set(null);this.resendDecisionReason='';this.resendDecisionSchedule.set('');this.resendDecisionLookupId='';}
+    this.resendDecisionConfirmed=false;this.resendRetryConfirmed=false;
+  }
+  async prepareResendDecision():Promise<void> {
+    const result=this.resendResult(), reason=this.resendDecisionReason.trim(), key=this.alertKey.trim(), environment=this.alertEnvironment.trim();
+    if(this.resendDecisionStatus()!=='idle'||this.alertAuthMode!=='jwt'||!this.validJwt(key)||!this.validEnvironment(environment)||!result||result.jobStatus!=='failed'||result.attemptState!=='rejected'||result.attemptHttpStatus!==429||!this.resendUuid(result.attemptId)||!['immediate','after'].includes(this.resendDecisionMode)|| (this.resendDecisionMode==='after' && (!result.retryNotBefore || result.retryAfterSeconds===null || result.retryAfterSeconds===undefined)) || !reason || new TextEncoder().encode(reason).length>512 || reason.includes('\0')) return;
+    const seq=++this.resendDecisionSequence;this.resendDecisionStatus.set('preparing');this.resendDecisionMessage.set('');
+    try {const origin=this.validatedOrigin(),requestId=crypto.randomUUID(),keyHash=await this.credentialFingerprint(key);
+      this.expireOidcIfNeeded();if(seq!==this.resendDecisionSequence)return;
+      if(this.alertKey.trim()!==key||this.alertEnvironment.trim()!==environment||this.validatedOrigin()!==origin||this.resendResult()!==result){this.resendDecisionStatus.set('idle');return;}
+      this.resendDecisionSnapshot.set({origin,environment,keyHash,body:{requestId,jobId:result.jobId,attemptId:result.attemptId,mode:this.resendDecisionMode,reason}});
+      this.resendDecisionLookupId=requestId;this.clearResendLookup();this.resendDecisionConfirmed=false;this.resendDecisionStatus.set('prepared');
+    }catch{if(seq===this.resendDecisionSequence)this.resendDecisionStatus.set('unavailable');}
+  }
+  async submitResendDecision(retry=false):Promise<void> {
+    const snapshot=this.resendDecisionSnapshot(), status=this.resendDecisionStatus(), key=this.alertKey.trim();
+    if(!snapshot || !(retry ? status==='unknown'&&this.resendRetryConfirmed : status==='prepared'&&this.resendDecisionConfirmed) || this.alertAuthMode!=='jwt'||!this.validJwt(key))return;
+    const seq=++this.resendDecisionSequence;this.resendDecisionStatus.set('sending');this.resendDecisionMessage.set('');
+    const controller=new AbortController();this.resendDecisionAbort=controller;
+    try {const keyHash=await this.credentialFingerprint(key);this.expireOidcIfNeeded();if(seq!==this.resendDecisionSequence)return;
+      if(keyHash!==snapshot.keyHash||this.alertKey.trim()!==key||this.alertEnvironment.trim()!==snapshot.environment||this.validatedOrigin()!==snapshot.origin){this.resendDecisionStatus.set(retry?'unknown':'prepared');this.resendDecisionMessage.set('준비할 때와 같은 토큰, 환경 및 API 주소가 필요합니다.');return;}
+      const params=new URLSearchParams({environmentId:snapshot.environment});
+      const response=await fetch(`${snapshot.origin}/v1/experimental/operator/resend-429-decision?${params}`,{method:'POST',headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},body:JSON.stringify(snapshot.body),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      if(!response.ok)throw new Error('uncertain');const value:unknown=await response.json();if(!value||typeof value!=='object')throw new Error('response');const row=value as Record<string,unknown>;
+      if(row['requestId']!==snapshot.body.requestId||typeof row['replayed']!=='boolean'||typeof row['availableAt']!=='string'||!row['availableAt'])throw new Error('response');
+      this.expireOidcIfNeeded();if(seq!==this.resendDecisionSequence)return;this.resendDecisionSchedule.set(row['availableAt']);this.resendDecisionStatus.set('recorded');this.clearResend();this.clearResendJobs();
+    }catch{if(seq===this.resendDecisionSequence)this.resendDecisionStatus.set('unknown');}finally{if(seq===this.resendDecisionSequence){this.resendDecisionAbort=null;this.resendDecisionConfirmed=false;this.resendRetryConfirmed=false;}}
+  }
+  resetResendDecision():void {if(['sending','preparing'].includes(this.resendDecisionStatus())||(this.resendDecisionStatus()==='unknown'&&!this.resendResetConfirmed))return;this.resendDecisionSequence++;this.resendDecisionSnapshot.set(null);this.resendDecisionStatus.set('idle');this.resendDecisionReason='';this.resendDecisionConfirmed=false;this.resendRetryConfirmed=false;this.resendResetConfirmed=false;this.resendDecisionSchedule.set('');this.resendDecisionMessage.set('');this.clearResendLookup();this.resendDecisionLookupId='';}
+  clearResendLookup():void {this.resendLookupSequence++;this.resendLookupAbort?.abort();this.resendLookupAbort=null;this.resendLookupRecord.set(null);this.resendLookupStatus.set('idle');}
+  async lookupResendDecision():Promise<void> {
+    const requestId=this.resendDecisionLookupId.trim().toLowerCase(),key=this.alertKey.trim(),environment=this.alertEnvironment.trim();
+    if(!this.resendUuid(requestId)||!this.validJwt(key)||!this.validEnvironment(environment)||this.alertAuthMode!=='jwt'||this.resendDecisionStatus()==='sending')return;
+    this.clearResendLookup();const seq=this.resendLookupSequence,controller=new AbortController();this.resendLookupAbort=controller;this.resendLookupStatus.set('loading');
+    try {const origin=this.validatedOrigin(),params=new URLSearchParams({environmentId:environment,requestId});const response=await fetch(`${origin}/v1/experimental/operator/resend-429-decision/request?${params}`,{headers:{Authorization:`Bearer ${key}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});if(!response.ok)throw new Error('request');const value:unknown=await response.json();if(!value||typeof value!=='object')throw new Error('response');const row=value as Record<string,unknown>;
+      if(seq!==this.resendLookupSequence)return;if(row['found']===false){this.resendLookupStatus.set('missing');return;}
+      if(row['found']!==true||row['requestId']!==requestId||!this.resendUuid(row['jobId'])||!this.resendUuid(row['attemptId'])||!['immediate','after'].includes(row['mode'] as string)||typeof row['reason']!=='string'||typeof row['availableAt']!=='string'||typeof row['createdAt']!=='string')throw new Error('response');
+      const record={requestId,jobId:row['jobId'] as string,attemptId:row['attemptId'] as string,mode:row['mode'] as 'immediate'|'after',reason:row['reason'] as string,availableAt:row['availableAt'] as string,createdAt:row['createdAt'] as string};const snap=this.resendDecisionSnapshot();
+      if(snap&&snap.body.requestId===requestId&&(snap.body.jobId!==record.jobId||snap.body.attemptId!==record.attemptId||snap.body.mode!==record.mode||snap.body.reason!==record.reason))throw new Error('response');
+      this.resendLookupRecord.set(record);this.resendLookupStatus.set('found');
+      if(snap&&snap.body.requestId===requestId&&snap.environment===environment&&snap.origin===origin&&await this.credentialFingerprint(key)===snap.keyHash&&seq===this.resendLookupSequence&&this.alertKey.trim()===key){this.resendDecisionSchedule.set(record.availableAt);this.resendDecisionStatus.set('recorded');this.clearResend();this.clearResendJobs();}
+    }catch{if(seq===this.resendLookupSequence)this.resendLookupStatus.set('error');}finally{if(seq===this.resendLookupSequence)this.resendLookupAbort=null;}
   }
 
   clearResendJobs(): void {
