@@ -1,0 +1,17 @@
+<section class="card subscriber-card"><div class="card-block"><div class="card-eyebrow">WORKFLOW TRIGGER</div><h2>워크플로 실행</h2>
+<p>환경 API 키와 기존 구독자 ID로 실행합니다. 접수 응답은 전달 완료를 뜻하지 않습니다.</p>
+<p class="subscriber-hint">SendGrid 시험 모드는 SendGrid 이메일 요청만 검증합니다. 워크플로의 Inbox, SMS, 푸시, 채팅과 다른 이메일 공급자는 실제로 실행될 수 있습니다.</p>
+<form class="subscriber-form" (ngSubmit)="submit()">
+  <label for="trigger-key">환경 API 키</label><input id="trigger-key" name="triggerKey" type="password" [(ngModel)]="apiKey" autocomplete="off" spellcheck="false" [disabled]="status()==='sending'" required>
+  <label for="trigger-workflow">워크플로 식별자</label><input id="trigger-workflow" name="triggerWorkflow" [(ngModel)]="workflow" [disabled]="status()==='sending'" required>
+  <label for="trigger-subscriber">기존 구독자 ID</label><input id="trigger-subscriber" name="triggerSubscriber" [(ngModel)]="subscriber" [disabled]="status()==='sending'" required>
+  <label for="trigger-payload">페이로드 JSON 객체</label><textarea id="trigger-payload" name="triggerPayload" [(ngModel)]="payload" [disabled]="status()==='sending'"></textarea>
+  <label for="trigger-mode">SendGrid 이메일 방식</label><select id="trigger-mode" name="triggerMode" [(ngModel)]="mode" [disabled]="status()==='sending'"><option value="sandbox">시험 검증 (이메일 전달 없음)</option><option value="normal">일반 발송</option></select>
+  <button class="btn btn-primary" type="submit" [disabled]="status()==='sending'||status()==='accepted'||status()==='unknown'">워크플로 실행</button>
+  <button class="btn btn-outline" type="button" (click)="reset()" [disabled]="status()==='sending'">새 요청 준비</button>
+</form>
+@if(status()==='invalid'){<p role="alert">입력값과 API 주소, JSON 객체를 확인하세요.</p>}
+@if(status()==='sending'){<p role="status">요청 중입니다. 거래 ID: {{transaction()}}</p>}
+@if(status()==='accepted'){<p role="status">접수 상태: {{outcome()}} · 거래 ID: {{transaction()}}. 실제 채널 처리 결과는 발송 이력에서 확인하세요.</p>}
+@if(status()==='unknown'){<p role="alert">요청 결과가 불명입니다. 거래 ID {{transaction()}}로 이력을 확인한 뒤 새 요청을 준비하세요. 새 요청은 다른 거래 ID를 사용합니다.</p>}
+</div></section>

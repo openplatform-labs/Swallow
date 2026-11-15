@@ -19,6 +19,7 @@ import { AlertTimingGrants } from './alert-timing-grants';
 import { DiscordRetryPolicyGrants } from './discord-retry-policy-grants';
 import { ResendAutoHealth } from './resend-auto-health';
 import { SendgridResults } from './sendgrid-results';
+import { WorkflowTrigger } from './workflow-trigger';
 import { ClrAlertModule } from '@clr/angular/emphasis/alert';
 import { OperatorOidc, type PreparedOidc, type VerifiedSession } from './operator-oidc';
 
@@ -64,7 +65,7 @@ type SendgridKey = {identifier:string;active:boolean};
 type SendgridKeyAudit = {id:string;identifier:string;action:string;userId:string;recordedAt:string};
 
 @Component({
-  imports: [FormsModule, ClrAlertModule, FcmIntegrations, SlackIntegrations, TwilioResults, FcmResults, DiscordReviews, SmtpReviews, SmtpScope, DiscordEndpoints, SlackResults, SendgridResults, ResendAutoPolicy, ResendCooldownPolicy, DiscordPolicy, DiscordRetryPolicy, DiscordCooldown, AlertTiming, AlertTimingGrants, DiscordRetryPolicyGrants, ResendAutoHealth],
+  imports: [FormsModule, ClrAlertModule, FcmIntegrations, SlackIntegrations, TwilioResults, FcmResults, DiscordReviews, SmtpReviews, SmtpScope, DiscordEndpoints, SlackResults, SendgridResults, WorkflowTrigger, ResendAutoPolicy, ResendCooldownPolicy, DiscordPolicy, DiscordRetryPolicy, DiscordCooldown, AlertTiming, AlertTimingGrants, DiscordRetryPolicyGrants, ResendAutoHealth],
   selector: 'app-root',
   styleUrl: './app.css',
   templateUrl: './app.html',
