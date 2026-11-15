@@ -102,12 +102,7 @@ pub fn request_body(config: &Config, email: &Email) -> Result<Value, SendError> 
             || file.name.is_empty()
             || file.name.len() > 255
             || file.name.contains(['\r', '\n'])
-            || match file.disposition.as_deref() {
-                None => false,
-                Some("attachment") => file.cid.is_some(),
-                Some("inline") => file.cid.as_ref().is_none_or(|cid| cid.is_empty() || cid.len() >= 128),
-                Some(_) => true,
-            }
+            || !novu_rust_contracts::email::supports_resend_attachment_disposition(file.disposition.as_deref(), file.cid.as_deref())
             || file
                 .cid
                 .as_ref()

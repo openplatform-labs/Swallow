@@ -239,6 +239,38 @@ async fn resend_alternatives_policy_checks_effective_override_without_partial_tr
 }
 
 #[tokio::test]
+#[ignore = "requires fully migrated disposable PostgreSQL"]
+async fn resend_attachment_policy_rejects_unrepresentable_dispositions_before_trigger() {
+    use axum::Extension;
+    let _queue_guard=QUEUE_TEST_LOCK.lock().await;
+    let url=std::env::var("TEST_DATABASE_URL").unwrap();
+    let (db,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);
+    db.batch_execute("INSERT INTO public.novu_rust_users VALUES ('attachment-policy-user'); INSERT INTO public.novu_rust_environments VALUES ('attachment-policy-env','org'); INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,in_app_content,email_subject,email_html,email_provider,inbox_metadata) VALUES ('attachment-policy-env','resend-workflow',true,true,'Hello','Hello','<p>Hello</p>','resend','{\"id\":\"resend-policy\"}'),('attachment-policy-env','sendgrid-workflow',true,true,'Hello','Hello','<p>Hello</p>','sendgrid','{\"id\":\"sendgrid-policy\"}')").await.unwrap();
+    let hash=format!("{:x}",Sha256::digest(b"attachment-policy-key"));db.execute("INSERT INTO public.novu_rust_api_keys(key_hash,environment_id,user_id) VALUES($1,'attachment-policy-env','attachment-policy-user')",&[&hash]).await.unwrap();
+    let (api,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);
+    let default=novu_rust_api::router_with_subscriber_secret(Arc::new(api),None);let strict=default.clone().layer(Extension(novu_rust_api::RejectResendAttachmentDisposition(true)));
+    let request=|workflow:&str,transaction:&str,attachment:Value| Request::builder().method("POST").uri("/v1/events/trigger").header("authorization","ApiKey attachment-policy-key").header("content-type","application/json").body(Body::from(json!({"name":workflow,"to":{"subscriberId":transaction,"email":"recipient@example.test"},"transactionId":transaction,"payload":{"attachments":[attachment]}}).to_string())).unwrap();
+    let base=json!({"name":"image.png","mime":"image/png","file":"YQ=="});
+    for (id, disposition, cid, status) in [
+        ("inline-ok",Some("inline"),Some("logo"),StatusCode::CREATED),
+        ("attachment-ok",Some("attachment"),None,StatusCode::CREATED),
+        ("implicit-ok",None,Some("logo"),StatusCode::CREATED),
+        ("inline-missing",Some("inline"),None,StatusCode::UNPROCESSABLE_ENTITY),
+        ("attachment-cid",Some("attachment"),Some("logo"),StatusCode::UNPROCESSABLE_ENTITY),
+    ] {
+        let mut attachment=base.clone(); if let Some(v)=disposition {attachment["disposition"]=json!(v);} if let Some(v)=cid {attachment["cid"]=json!(v);}
+        assert_eq!(strict.clone().oneshot(request("resend-workflow",id,attachment)).await.unwrap().status(),status,"{id}");
+    }
+    let long=json!({"name":"image.png","mime":"image/png","file":"YQ==","disposition":"inline","cid":"x".repeat(128)});
+    assert_eq!(strict.clone().oneshot(request("resend-workflow","inline-long",long.clone())).await.unwrap().status(),StatusCode::UNPROCESSABLE_ENTITY);
+    for id in ["inline-missing","attachment-cid","inline-long"] {assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_trigger_transactions WHERE transaction_id=$1",&[&id]).await.unwrap().get::<_,i64>(0),0);}
+    assert_eq!(default.clone().oneshot(request("resend-workflow","defer-long",long.clone())).await.unwrap().status(),StatusCode::CREATED);
+    assert_eq!(strict.clone().oneshot(request("sendgrid-workflow","other-provider",long.clone())).await.unwrap().status(),StatusCode::CREATED);
+    db.execute("UPDATE public.novu_rust_workflows SET email_step_active=false WHERE environment_id='attachment-policy-env' AND identifier='resend-workflow'",&[]).await.unwrap();
+    assert_eq!(strict.oneshot(request("resend-workflow","inactive",long)).await.unwrap().status(),StatusCode::CREATED);
+}
+
+#[tokio::test]
 #[ignore = "requires fully migrated disposable PostgreSQL and loopback"]
 async fn sendgrid_tracking_reaches_mock_provider_with_layer_precedence() {
     use tokio::io::{AsyncReadExt,AsyncWriteExt};

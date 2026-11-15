@@ -149,12 +149,15 @@ pub struct RuntimeConfig {
     require_jwt_exp: bool,
     reassert_fcm_registration: bool,
     reject_resend_alternatives: bool,
+    reject_resend_attachment_disposition: bool,
     operator_verifier: Option<Arc<operator_access_token::AccessTokenVerifier>>,
     operator_reload: Option<(std::path::PathBuf, std::time::Duration, bool)>,
     operator_reload_health: Option<Arc<std::sync::Mutex<(std::time::Instant, bool)>>>,
 }
 #[derive(Clone, Copy)]
 pub struct RejectResendAlternatives(pub bool);
+#[derive(Clone, Copy)]
+pub struct RejectResendAttachmentDisposition(pub bool);
 impl RuntimeConfig {
     pub fn from_env() -> Self {
         Self::try_from_env().expect("invalid API runtime configuration")
@@ -183,6 +186,11 @@ impl RuntimeConfig {
                 _ => return Err(invalid()),
             };
         let reject_resend_alternatives = match std::env::var("SWALLOW_RESEND_ALTERNATIVES_POLICY").as_deref() {
+            Ok("defer") | Err(std::env::VarError::NotPresent) => false,
+            Ok("reject") => true,
+            _ => return Err(invalid()),
+        };
+        let reject_resend_attachment_disposition = match std::env::var("SWALLOW_RESEND_ATTACHMENT_POLICY").as_deref() {
             Ok("defer") | Err(std::env::VarError::NotPresent) => false,
             Ok("reject") => true,
             _ => return Err(invalid()),
@@ -336,6 +344,7 @@ impl RuntimeConfig {
             require_jwt_exp,
             reassert_fcm_registration,
             reject_resend_alternatives,
+            reject_resend_attachment_disposition,
             operator_verifier,
             operator_reload_health: operator_reload.as_ref().map(|_| Arc::new(std::sync::Mutex::new((std::time::Instant::now(), true)))),
             operator_reload,
@@ -396,7 +405,8 @@ impl RuntimeConfig {
             self.require_jwt_exp,
             self.reassert_fcm_registration,
         );
-        let router = router.layer(Extension(RejectResendAlternatives(self.reject_resend_alternatives)));
+        let router = router.layer(Extension(RejectResendAlternatives(self.reject_resend_alternatives)))
+            .layer(Extension(RejectResendAttachmentDisposition(self.reject_resend_attachment_disposition)));
         match &self.operator_verifier {
             Some(verifier) => router.layer(Extension(verifier.clone())),
             None => router,
@@ -3704,6 +3714,7 @@ async fn trigger(
     State(db): State<Arc<Client>>,
     headers: HeaderMap,
     reject_resend: Option<Extension<RejectResendAlternatives>>,
+    reject_resend_attachment: Option<Extension<RejectResendAttachmentDisposition>>,
     bytes: Bytes,
 ) -> (StatusCode, Json<Value>) {
     let environment_id = match authenticate(&db, &headers, "/v1/events/trigger").await {
@@ -3712,7 +3723,7 @@ async fn trigger(
     };
     let key=headers.get("authorization").and_then(|v|v.to_str().ok()).and_then(|v|v.strip_prefix("ApiKey ")).expect("authenticate validated key");
     let key_hash=format!("{:x}",Sha256::digest(key.as_bytes()));
-    trigger_inner(db,environment_id,TriggerAuth::ApiKey(key_hash),reject_resend,bytes).await
+    trigger_inner(db,environment_id,TriggerAuth::ApiKey(key_hash),reject_resend,reject_resend_attachment,bytes).await
 }
 
 enum TriggerAuth { ApiKey(String), Operator(operator_identity::Authenticated) }
@@ -3720,7 +3731,8 @@ enum TriggerAuth { ApiKey(String), Operator(operator_identity::Authenticated) }
 async fn operator_trigger(
     State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,
     verifier:Option<Extension<Arc<operator_access_token::AccessTokenVerifier>>>,
-    reject_resend:Option<Extension<RejectResendAlternatives>>,bytes:Bytes,
+    reject_resend:Option<Extension<RejectResendAlternatives>>,
+    reject_resend_attachment:Option<Extension<RejectResendAttachmentDisposition>>,bytes:Bytes,
 ) -> Response {
     let failure=|status:StatusCode,message:&str,label:&str|{let mut r=error_at(status,message,label,uri.path()).into_response();r.headers_mut().insert(axum::http::header::CACHE_CONTROL,axum::http::HeaderValue::from_static("no-store"));r};
     let identity=match operator_identity::authenticate(&db,&headers,verifier).await {Ok(v)=>v,Err(status)=>return failure(status,"Operator authentication failed",if status==StatusCode::SERVICE_UNAVAILABLE {"Service Unavailable"} else {"Unauthorized"})};
@@ -3734,12 +3746,12 @@ async fn operator_trigger(
         Ok(_)=>{},Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>return failure(StatusCode::UNAUTHORIZED,"Unauthorized","Unauthorized"),
         Err(_)=>return failure(StatusCode::INTERNAL_SERVER_ERROR,"Internal server error","Internal Server Error"),
     }
-    let (status,Json(mut body))=trigger_inner(db,environment,TriggerAuth::Operator(identity),reject_resend,bytes).await;
+    let (status,Json(mut body))=trigger_inner(db,environment,TriggerAuth::Operator(identity),reject_resend,reject_resend_attachment,bytes).await;
     if body.get("path").is_some(){body["path"]=json!(uri.path());}
     let mut response=(status,Json(body)).into_response();response.headers_mut().insert(axum::http::header::CACHE_CONTROL,axum::http::HeaderValue::from_static("no-store"));response
 }
 
-async fn trigger_inner(db:Arc<Client>,environment_id:String,auth:TriggerAuth,reject_resend:Option<Extension<RejectResendAlternatives>>,bytes:Bytes) -> ApiError {
+async fn trigger_inner(db:Arc<Client>,environment_id:String,auth:TriggerAuth,reject_resend:Option<Extension<RejectResendAlternatives>>,reject_resend_attachment:Option<Extension<RejectResendAttachmentDisposition>>,bytes:Bytes) -> ApiError {
     let body: Value = match serde_json::from_slice(&bytes) {
         Ok(body) => body,
         Err(_) => return error(StatusCode::BAD_REQUEST, "Invalid JSON", "Bad Request"),
@@ -4182,6 +4194,16 @@ async fn trigger_inner(db:Arc<Client>,environment_id:String,auth:TriggerAuth,rej
             Ok(value) => value,
             Err(()) => return error(StatusCode::NOT_IMPLEMENTED,"Unsupported email attachments","Not Implemented"),
         };
+        if reject_resend_attachment.is_some_and(|Extension(policy)| policy.0)
+            && row.get::<_, Option<String>>(11).as_deref() == Some("resend")
+            && row.get::<_, bool>(13)
+            && row.get::<_, Option<String>>(5).is_some()
+            && row.get::<_, Option<String>>(6).is_some()
+            && email_attachments.iter().any(|attachment| !novu_rust_contracts::email::supports_resend_attachment_disposition(
+                attachment.get("disposition").and_then(Value::as_str), attachment.get("cid").and_then(Value::as_str)))
+        {
+            return error(StatusCode::UNPROCESSABLE_ENTITY,"Unsupported Resend attachment disposition","Unprocessable Entity");
+        }
         let queue_kind = if email_attachments.is_empty() {
             novu_rust_contracts::EXPERIMENTAL_IN_APP_JOB_KIND
         } else {
