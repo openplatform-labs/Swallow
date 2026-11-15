@@ -33,6 +33,14 @@ async fn run(
         sender_name: std::env::var("NOVU_SENDGRID_SENDER_NAME")?,
         region,
     })?;
+    let reload_key_file = match std::env::var("NOVU_SENDGRID_RELOAD_API_KEY").as_deref() {
+        Ok("true") => Some(std::path::PathBuf::from(
+            std::env::var_os("NOVU_SENDGRID_API_KEY_FILE")
+                .ok_or("SendGrid key reload requires a key file")?,
+        )),
+        Ok("false") | Err(std::env::VarError::NotPresent) => None,
+        _ => return Err("invalid SendGrid key reload setting".into()),
+    };
     match std::env::var("NOVU_SENDGRID_DISPATCH_TRACKING").as_deref() {
         Ok("true") => provider = provider.with_dispatch_tracking(),
         Ok("false") | Err(std::env::VarError::NotPresent) => {}
@@ -112,6 +120,13 @@ async fn run(
                     }
                     if stop.requested() {
                         break;
+                    }
+                    if let Some(path) = &reload_key_file
+                        && provider.reload_api_key_file(path).is_err()
+                    {
+                        eprintln!("SendGrid key reload failed; dispatch paused");
+                        stop.wait(Duration::from_secs(2)).await;
+                        continue;
                     }
                     match tokio::time::timeout(
                         timeout,

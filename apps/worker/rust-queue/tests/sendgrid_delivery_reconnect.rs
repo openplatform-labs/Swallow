@@ -69,6 +69,136 @@ fn invalid_timeout_is_rejected_before_connecting() {
     }
 }
 
+#[test]
+fn key_reload_requires_a_file_and_valid_setting() {
+    for setting in ["true", "invalid"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sendgrid-worker"))
+            .env("DATABASE_URL", "postgresql://localhost/unused")
+            .env("NOVU_SENDGRID_ENVIRONMENT_ID", "env")
+            .env("NOVU_SENDGRID_API_KEY", "fixture-token")
+            .env_remove("NOVU_SENDGRID_API_KEY_FILE")
+            .env("NOVU_SENDGRID_FROM", "from@example.test")
+            .env("NOVU_SENDGRID_SENDER_NAME", "fixture")
+            .env("NOVU_SENDGRID_RELOAD_API_KEY", setting)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture-token"));
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database"]
+async fn key_reload_pauses_claims_until_file_is_valid() {
+    let url = std::env::var("TEST_DATABASE_URL").unwrap();
+    let db = connect(&url).await;
+    db.batch_execute("CREATE TABLE novu_rust_environments(id text PRIMARY KEY,organization_id text NOT NULL); INSERT INTO novu_rust_environments VALUES ('env','org')").await.unwrap();
+    db.batch_execute(include_str!(
+        "../migrations/0120_email_workflow_worker_policy.sql"
+    ))
+    .await
+    .unwrap();
+    db.batch_execute(queue::MIGRATION).await.unwrap();
+    db.batch_execute(queue::sendgrid_queue::MIGRATION)
+        .await
+        .unwrap();
+    for sql in [
+        queue::sendgrid_queue::DISPATCH_ID_MIGRATION,
+        queue::sendgrid_queue::DISPATCH_PROOF_MIGRATION,
+        queue::reconciliation::MIGRATION,
+        queue::reconciliation::RETRY_DISPATCH_MIGRATION,
+        include_str!("../../../api/rust-api/migrations/0004_sendgrid_webhooks.sql"),
+        include_str!("../../../api/rust-api/migrations/0008_sendgrid_dispatch_identity.sql"),
+        include_str!("../../../api/rust-api/migrations/0009_sendgrid_dispatch_proof.sql"),
+    ] {
+        db.batch_execute(sql).await.unwrap();
+    }
+    db.batch_execute(queue::in_app::EMAIL_MESSAGES_MIGRATION)
+        .await
+        .unwrap();
+    db.batch_execute("ALTER TABLE novu_rust_email_messages ADD COLUMN delivery_state text NOT NULL DEFAULT 'not_attempted'").await.unwrap();
+    let dir = std::env::temp_dir().join(format!("swallow-sendgrid-reload-{}", Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let key = dir.join("key");
+    let log = dir.join("stderr");
+    std::fs::write(&key, "fixture-key-before").unwrap();
+    let mut process = Worker(
+        Command::new(env!("CARGO_BIN_EXE_sendgrid-worker"))
+            .env("DATABASE_URL", &url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("NOVU_SENDGRID_ENVIRONMENT_ID", "env")
+            .env_remove("NOVU_SENDGRID_API_KEY")
+            .env("NOVU_SENDGRID_API_KEY_FILE", &key)
+            .env("NOVU_SENDGRID_RELOAD_API_KEY", "true")
+            .env("NOVU_SENDGRID_FROM", "from@example.test")
+            .env("NOVU_SENDGRID_SENDER_NAME", "fixture")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&log).unwrap()))
+            .spawn()
+            .unwrap(),
+    );
+    for _ in 0..100 {
+        if db.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_email_workflow_worker_config WHERE environment_id='env')", &[]).await.unwrap().get::<_, bool>(0) { break; }
+        assert!(
+            process.0.try_wait().unwrap().is_none(),
+            "worker exited early"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    std::fs::write(&key, "invalid\nfixture-key").unwrap();
+    let mut paused = false;
+    for _ in 0..100 {
+        let output = std::fs::read_to_string(&log).unwrap();
+        assert!(!output.contains("fixture-key"));
+        if output.contains("key reload failed") {
+            paused = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(paused, "worker did not pause on invalid key");
+    let job = Uuid::new_v4();
+    // Unknown field guarantees failure before any provider request.
+    db.execute(
+        "INSERT INTO novu_queue_jobs(id,environment_id,kind,payload) VALUES ($1,'env',$2,$3)",
+        &[
+            &job,
+            &queue::sendgrid_queue::JOB_KIND,
+            &json!({"invalid":true}),
+        ],
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        db.query_one("SELECT status FROM novu_queue_jobs WHERE id=$1", &[&job])
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        "pending"
+    );
+    std::fs::write(dir.join("replacement"), "fixture-key-after").unwrap();
+    std::fs::rename(dir.join("replacement"), &key).unwrap();
+    let mut resumed = false;
+    for _ in 0..100 {
+        if db
+            .query_one("SELECT status FROM novu_queue_jobs WHERE id=$1", &[&job])
+            .await
+            .unwrap()
+            .get::<_, String>(0)
+            == "failed"
+        {
+            resumed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(resumed, "worker did not resume after key replacement");
+    assert!(process.0.try_wait().unwrap().is_none());
+    drop(process);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[tokio::test]
 #[ignore = "restarts a disposable PostgreSQL container"]
 async fn workers_reconnect_and_preserve_uncertain_attempts() {
@@ -76,7 +206,11 @@ async fn workers_reconnect_and_preserve_uncertain_attempts() {
     let container = std::env::var("TEST_PG_CONTAINER").unwrap();
     let mut db = connect(&url).await;
     db.batch_execute("CREATE TABLE novu_rust_environments(id text PRIMARY KEY,organization_id text NOT NULL); INSERT INTO novu_rust_environments VALUES ('env','org')").await.unwrap();
-    db.batch_execute(include_str!("../migrations/0120_email_workflow_worker_policy.sql")).await.unwrap();
+    db.batch_execute(include_str!(
+        "../migrations/0120_email_workflow_worker_policy.sql"
+    ))
+    .await
+    .unwrap();
     db.batch_execute(queue::MIGRATION).await.unwrap();
     db.batch_execute(queue::sendgrid_queue::MIGRATION)
         .await

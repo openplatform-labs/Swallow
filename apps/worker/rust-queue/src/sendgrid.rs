@@ -2,7 +2,7 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{Client, header};
 use serde_json::{Map, Value, json};
-use std::{fmt, time::Duration};
+use std::{fmt, path::Path, time::Duration};
 
 /// Settings for one integration. This value must not be logged.
 pub struct Config {
@@ -269,6 +269,17 @@ impl Sendgrid {
             dispatch_tracking: false,
         })
     }
+    /// Reload before claiming a new job. The caller must pause on failure.
+    pub fn reload_api_key_file(&mut self, path: &Path) -> Result<(), SendError> {
+        let key = novu_rust_contracts::secret::read(None, Some(path))
+            .map_err(|_| SendError::InvalidConfiguration)?
+            .ok_or(SendError::InvalidConfiguration)?;
+        if header::HeaderValue::from_str(&format!("Bearer {key}")).is_err() {
+            return Err(SendError::InvalidConfiguration);
+        }
+        self.config.api_key = key;
+        Ok(())
+    }
     /// Send once; ambiguous network failures are never automatically retried.
     pub async fn send(&self, message: &Email) -> Result<Receipt, SendError> {
         let body = request_body(&self.config, message)?;
@@ -326,6 +337,51 @@ mod tests {
             html: "<p>Hello</p>".into(),
             ..Email::default()
         }
+    }
+    #[tokio::test]
+    async fn key_file_reload_updates_subsequent_requests_without_exposing_errors() {
+        let dir =
+            std::env::temp_dir().join(format!("swallow-sendgrid-key-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let key = dir.join("key");
+        std::fs::write(&key, "sg.test\n").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v3/mail/send", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for expected in ["sg.test", "sg.rotated"] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0; 4096];
+                while !bytes.windows(4).any(|v| v == b"\r\n\r\n") {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                }
+                let headers = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+                assert!(headers.contains(&format!("authorization: bearer {expected}\r\n")));
+                socket
+                    .write_all(
+                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut provider = Sendgrid::with_endpoint(config(), &endpoint).unwrap();
+        provider.reload_api_key_file(&key).unwrap();
+        assert!(provider.send(&message()).await.is_ok());
+        std::fs::write(&key, "invalid\nsecret").unwrap();
+        assert_eq!(
+            provider.reload_api_key_file(&key),
+            Err(SendError::InvalidConfiguration)
+        );
+        assert_eq!(provider.config.api_key, "sg.test");
+        std::fs::write(dir.join("replacement"), "sg.rotated\n").unwrap();
+        std::fs::rename(dir.join("replacement"), &key).unwrap();
+        provider.reload_api_key_file(&key).unwrap();
+        assert!(provider.send(&message()).await.is_ok());
+        server.await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn rejects_invalid_dynamic_templates() {
