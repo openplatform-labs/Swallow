@@ -50,6 +50,20 @@ async fn resend_passthrough_content_reaches_provider_with_layer_precedence() {
     db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'resend-pass-env',rolname,'alert_view',oid FROM pg_roles WHERE rolname=session_user",&[]).await.unwrap();
     let health=novu_postgres_queue::reconciliation::resend_health(&db,"resend-pass-env",60,60).await.unwrap();assert_eq!(health["eligibleJobs"],0);
     let scoped=novu_postgres_queue::reconciliation::scoped_provider_health(&db,"resend-pass-env","resend",60,60).await.unwrap();assert_eq!(scoped["eligibleJobs"],0);
+    db.execute("UPDATE public.novu_queue_jobs SET resend_delivery_result='pending' WHERE id=$1",&[&job]).await.unwrap();
+    assert_eq!(novu_postgres_queue::reconciliation::resend_health(&db,"resend-pass-env",60,60).await.unwrap()["eligibleJobs"],0);
+    assert_eq!(novu_postgres_queue::reconciliation::scoped_provider_health(&db,"resend-pass-env","resend",60,60).await.unwrap()["eligibleJobs"],0);
+    db.execute("UPDATE public.novu_queue_jobs SET resend_delivery_result='failed' WHERE id=$1",&[&job]).await.unwrap();
+    assert_eq!(novu_postgres_queue::reconciliation::resend_health(&db,"resend-pass-env",60,60).await.unwrap()["eligibleJobs"],1);
+    assert_eq!(novu_postgres_queue::reconciliation::scoped_provider_health(&db,"resend-pass-env","resend",60,60).await.unwrap()["eligibleJobs"],1);
+    db.execute("UPDATE public.novu_queue_jobs SET resend_delivery_result=NULL WHERE id=$1",&[&job]).await.unwrap();
+    // A provider ID collision makes acceptance ambiguous even before projection runs.
+    let collision=uuid::Uuid::new_v4();
+    db.execute("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES($1,'resend-pass-env','experimental_resend_email','{}','completed')",&[&collision]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_resend_attempts(job_id,environment_id,state,provider_message_id) VALUES($1,'resend-pass-env','accepted','fixture-id')",&[&collision]).await.unwrap();
+    let health=novu_postgres_queue::reconciliation::resend_health(&db,"resend-pass-env",60,60).await.unwrap();assert_eq!(health["eligibleJobs"],1);assert_eq!(health["overdueUndelivered"],1);
+    let scoped=novu_postgres_queue::reconciliation::scoped_provider_health(&db,"resend-pass-env","resend",60,60).await.unwrap();assert_eq!(scoped["eligibleJobs"],1);assert_eq!(scoped["overdueUndelivered"],1);
+    db.execute("DELETE FROM public.novu_rust_resend_attempts WHERE job_id=$1",&[&collision]).await.unwrap();db.execute("DELETE FROM public.novu_queue_jobs WHERE id=$1",&[&collision]).await.unwrap();
     let uncertain=uuid::Uuid::new_v4();db.execute("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status,available_at,resend_scheduled_at) VALUES($1,'resend-pass-env','experimental_resend_email','{}','failed',clock_timestamp()-interval '10 minutes',clock_timestamp()+interval '1 hour')",&[&uncertain]).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_resend_attempts(job_id,environment_id,state) VALUES($1,'resend-pass-env','unknown')",&[&uncertain]).await.unwrap();
     let health=novu_postgres_queue::reconciliation::resend_health(&db,"resend-pass-env",60,60).await.unwrap();assert_eq!(health["eligibleJobs"],1);
