@@ -14,9 +14,15 @@ pub struct SmtpAlert {
     username: String,
     password: String,
     ca_fingerprint: Option<String>,
+    ca_pem: Option<String>,
 }
 impl SmtpAlert {
     pub fn from_env() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::from_env_with_password_file(None)
+    }
+    pub fn from_env_with_password_file(
+        path: Option<&std::path::Path>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let host = std::env::var("SWALLOW_SMTP_HOST")?;
         let from = std::env::var("SWALLOW_SMTP_FROM")?;
         let tls = std::env::var("SWALLOW_SMTP_TLS").unwrap_or_else(|_| "starttls".into());
@@ -40,10 +46,17 @@ impl SmtpAlert {
             Err(std::env::VarError::NotPresent) => None,
             Err(_) => return Err("invalid SMTP username".into()),
         };
-        let password = novu_rust_contracts::secret::from_env(
-            "SWALLOW_SMTP_PASSWORD",
-            "SWALLOW_SMTP_PASSWORD_FILE",
-        )?;
+        let password = if let Some(path) = path {
+            if std::env::var_os("SWALLOW_SMTP_PASSWORD").is_some() {
+                return Err("conflicting SMTP password sources".into());
+            }
+            Some(novu_rust_contracts::secret::read_regular_file(path)?)
+        } else {
+            novu_rust_contracts::secret::from_env(
+                "SWALLOW_SMTP_PASSWORD",
+                "SWALLOW_SMTP_PASSWORD_FILE",
+            )?
+        };
         let ca_pem = match std::env::var_os("SWALLOW_SMTP_CA_FILE") {
             Some(path) => Some(novu_rust_contracts::secret::read_regular_multiline_file(
                 std::path::Path::new(&path),
@@ -130,7 +143,29 @@ impl SmtpAlert {
             username: username.unwrap_or_default(),
             password: password.unwrap_or_default(),
             ca_fingerprint,
+            ca_pem,
         })
+    }
+    /// Rebuild the transport only after the replacement secret validates.
+    pub fn reload_password_file(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let password = novu_rust_contracts::secret::read_regular_file(path)?;
+        if password == self.password {
+            return Ok(());
+        }
+        let replacement = Self::new(
+            self.host.clone(),
+            self.port.parse()?,
+            self.tls.clone(),
+            self.from.clone(),
+            Some(self.username.clone()),
+            Some(password),
+            self.ca_pem.clone(),
+        )?;
+        *self = replacement;
+        Ok(())
     }
     pub fn binding_parts(&self) -> Vec<&str> {
         let mut values = vec![

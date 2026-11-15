@@ -17,7 +17,21 @@ async fn run(
         Ok("false") | Err(std::env::VarError::NotPresent) => false,
         _ => return Err("invalid SMTP scoped RLS setting".into()),
     };
-    let provider = SmtpAlert::from_env().map_err(|_| "invalid SMTP configuration")?;
+    let reload_path = match std::env::var("NOVU_SMTP_RELOAD_PASSWORD").as_deref() {
+        Ok("true") => Some(std::path::PathBuf::from(
+            std::env::var_os("SWALLOW_SMTP_PASSWORD_FILE")
+                .ok_or("SMTP password reload requires a file")?,
+        )),
+        Ok("false") | Err(std::env::VarError::NotPresent) => None,
+        _ => return Err("invalid SMTP password reload setting".into()),
+    };
+    let exit_on_reload_failure = match std::env::var("NOVU_SMTP_RELOAD_FAILURE_POLICY").as_deref() {
+        Ok("pause") | Err(std::env::VarError::NotPresent) => false,
+        Ok("exit") if reload_path.is_some() => true,
+        _ => return Err("invalid SMTP reload failure policy".into()),
+    };
+    let mut provider = SmtpAlert::from_env_with_password_file(reload_path.as_deref())
+        .map_err(|_| "invalid SMTP configuration")?;
     let policy = email_step_policy::Policy::from_env()?;
     let seconds = match std::env::var("NOVU_SMTP_DB_TIMEOUT_SECONDS") {
         Ok(v) => v
@@ -105,6 +119,18 @@ async fn run(
                             break;
                         }
                         recovery = tokio::time::Instant::now() + Duration::from_secs(5);
+                    }
+                    if let Some(path) = &reload_path
+                        && provider.reload_password_file(path).is_err()
+                    {
+                        eprintln!("SMTP password reload failed; dispatch paused");
+                        if exit_on_reload_failure {
+                            task.abort();
+                            let _ = task.await;
+                            return Err("SMTP password reload failed".into());
+                        }
+                        stop.wait(Duration::from_secs(2)).await;
+                        continue;
                     }
                     match tokio::time::timeout(
                         timeout,
