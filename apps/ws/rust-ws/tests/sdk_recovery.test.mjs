@@ -69,20 +69,42 @@ test('a new disconnect aborts stale refresh and starts another', async () => {
 
 test('retries connection timeout and cancels pending retries on stop', async () => {
   const { sdk, emit } = client();
-  let attempts = 0, refreshed = 0;
+  let attempts = 0, refreshed = 0, errors = [];
   sdk.socket.connect = async () => {
     if (++attempts === 2) emit('socket.connect.resolved');
+    else emit('socket.connect.resolved', {error: new Error('connection refused')});
     return {};
   };
   const stop = startSocketRecovery(sdk, {
     retryDelayMs: 5, connectTimeoutMs: 10,
     refresh: () => { refreshed++; },
+    onError: error => errors.push(error.message),
   });
   emit('socket.disconnect.resolved');
   await until(() => refreshed === 1);
   assert.equal(attempts, 2);
+  assert.deepEqual(errors, ['connection refused']);
   emit('socket.disconnect.resolved');
   stop();
   await delay(40);
   assert.equal(attempts, 2);
+});
+
+test('stopping from a connection error does not schedule another attempt', async () => {
+  const { sdk, emit } = client();
+  let attempts = 0, reports = 0, stop;
+  sdk.socket.connect = async () => {
+    attempts++;
+    emit('socket.connect.resolved', { error: new Error('unauthorized') });
+    return {};
+  };
+  stop = startSocketRecovery(sdk, {
+    retryDelayMs: 5, connectTimeoutMs: 1000,
+    refresh: () => { throw new Error('unexpected refresh'); },
+    onError: () => { reports++; stop(); },
+  });
+  emit('socket.disconnect.resolved');
+  await until(() => reports === 1);
+  await delay(30);
+  assert.equal(attempts, 1);
 });

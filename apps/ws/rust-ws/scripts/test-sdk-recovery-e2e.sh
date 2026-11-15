@@ -37,7 +37,7 @@ CARGO_INCREMENTAL=0 cargo build --locked --offline --manifest-path ../../worker/
 CARGO_INCREMENTAL=0 cargo build --locked --offline --target-dir target >/dev/null
 export DATABASE_URL="postgresql://postgres@127.0.0.1:$pg_port/novu_recovery" NOVU_POSTGRES_ALLOW_INSECURE=true JWT_SECRET=local-recovery-fixture-secret
 LISTEN_ADDR="127.0.0.1:$api_port" ../../api/rust-api/target/debug/novu-rust-api >/dev/null 2>&1 & api_pid=$!
-LISTEN_ADDR="127.0.0.1:$ws_port" NOVU_WS_DISCONNECT_ON_EVENT_GAP=true NOVU_WS_EVENT_LOOKUP_RECOVERY=probe target/debug/novu-rust-ws >/dev/null 2>&1 & ws_pid=$!
+LISTEN_ADDR="127.0.0.1:$ws_port" NOVU_WS_DISCONNECT_ON_EVENT_GAP=true NOVU_WS_EVENT_LOOKUP_RECOVERY=probe NOVU_WS_ENABLE_HEALTH_ENDPOINTS=true target/debug/novu-rust-ws >/dev/null 2>&1 & ws_pid=$!
 ../../worker/rust-queue/target/debug/in-app-worker >/dev/null 2>&1 & worker_pid=$!
 for ((i=0;i<60;i++)); do
   if curl -fsS "http://127.0.0.1:$ws_port/socket.io/?EIO=4&transport=polling" >/dev/null 2>&1 && curl -s -o /dev/null "http://127.0.0.1:$api_port/v1/inbox/session"; then break; fi

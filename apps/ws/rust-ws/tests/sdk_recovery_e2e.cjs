@@ -15,7 +15,7 @@ function sql(query) {
 (async()=>{
   const { startSocketRecovery }=await import('../sdk/recovery.mjs');
   const sdk=new Novu({applicationIdentifier:'recovery-app',subscriberId:'alice',apiUrl:process.env.NOVU_RUST_URL,socketUrl:process.env.RUST_WS_URL,socketOptions:{reconnectionDelay:100,reconnectionDelayMax:250}});
-  let connects=0, disconnects=0, notifications=0, recovered, refreshCount=0, errors=[];
+  let connects=0, disconnects=0, notifications=[], recovered, refreshCount=0, errors=[];
   sdk.on('socket.connect.resolved',({error})=>{if(!error)connects++});
   sdk.on('socket.disconnect.resolved',()=>disconnects++);
   const stop=startSocketRecovery(sdk,{
@@ -26,7 +26,7 @@ function sql(query) {
       if(!signal.aborted) { recovered=result.data.notifications; refreshCount++; }
     },
   });
-  sdk.on('notifications.notification_received',()=>notifications++);
+  sdk.on('notifications.notification_received',({result})=>notifications.push(result));
   try {
     await until(()=>connects===1,'SDK failed to connect');
     const initial=await sdk.notifications.list({useCache:false});
@@ -53,12 +53,15 @@ function sql(query) {
       console.error({connects,disconnects,refreshCount,recovered,errors});
       throw error;
     }
-    assert.equal(notifications,0,'unexpected live replay during listener gap');
+    assert.equal(notifications.length,0,'unexpected live replay during listener gap');
     assert(connects>=2);
     const item=recovered.find(item=>item.transactionId==='recovery-gap-1');
     assert.equal(item.body,'hello recovery');
     assert.equal(item.workflow,undefined,'missing metadata must not fabricate a workflow');
     assert.equal(item.data,undefined,'missing metadata must not infer payload mapping');
+    const seen=await item.seen();
+    assert(!seen.error, String(seen.error?.originalError ?? seen.error));
+    assert.equal(sql("SELECT is_seen FROM novu_rust_in_app_messages WHERE transaction_id='recovery-gap-1'"),'t');
     sql("UPDATE novu_rust_in_app_messages SET data=jsonb_build_object('explicit',true) WHERE transaction_id='recovery-gap-1'");
     const withData=await sdk.notifications.list({useCache:false});
     assert(!withData.error, String(withData.error));
@@ -99,6 +102,19 @@ function sql(query) {
     const restored=await sdk.notifications.list({useCache:false});
     assert(!restored.error, String(restored.error));
     assert.equal(restored.data.notifications[0].workflow.id,'64a000000000000000000004');
+    await until(async()=>(await fetch(process.env.RUST_WS_URL+'/health/ready')).status===204,'WS did not become ready');
+    const live=await fetch(process.env.NOVU_RUST_URL+'/v1/events/trigger',{
+      method:'POST',headers:{'content-type':'application/json','authorization':'ApiKey compat-key'},
+      body:JSON.stringify({name:'greeting',to:{subscriberId:'alice'},transactionId:'recovery-live-1',payload:{}}),
+    });
+    assert.equal(live.status,201,await live.text());
+    await until(()=>notifications.some(n=>n.transactionId==='recovery-live-1'),'SDK did not receive new live notification after recovery');
+    const liveItem=notifications.find(n=>n.transactionId==='recovery-live-1');
+    assert.equal(liveItem.body,'hello recovery');
+    sql("UPDATE novu_rust_workflows SET inbox_metadata=NULL WHERE environment_id='env-a' AND identifier='greeting'");
+    const deleted=await item.delete();
+    assert(!deleted.error, String(deleted.error?.originalError ?? deleted.error));
+    assert.equal(sql("SELECT count(*) FROM novu_rust_in_app_messages WHERE transaction_id='recovery-gap-1'"),'0');
     console.log('real SDK recovered Inbox state from Rust API after a lost WS event');
   } finally {
     stop();

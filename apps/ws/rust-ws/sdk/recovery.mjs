@@ -39,7 +39,10 @@ export function startSocketRecovery(novu, {
     try { onError(error); } catch { /* reporting must not disable recovery */ }
   }
   const unsubscribeConnect = novu.on('socket.connect.resolved', ({ error } = {}) => {
-    if (error) return;
+    if (error) {
+      if (recovering && !stopped) report(error);
+      return;
+    }
     connected = true;
     cancelWait();
   });
@@ -68,7 +71,7 @@ export function startSocketRecovery(novu, {
             if (stopped) break;
             const result = await novu.socket.connect();
             if (result?.error) throw result.error;
-            if (!connected) await wait(connectTimeoutMs);
+            if (!stopped && !connected) await wait(connectTimeoutMs);
           } catch (error) {
             resetting = false;
             report(error);
@@ -88,7 +91,7 @@ export function startSocketRecovery(novu, {
       } catch (error) {
         if (!stopped && generation === epoch) {
           report(error);
-          await wait(retryDelayMs);
+          if (!stopped) await wait(retryDelayMs);
         }
       } finally {
         if (activeRefresh === controller) activeRefresh = undefined;
