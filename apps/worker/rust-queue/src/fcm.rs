@@ -215,6 +215,7 @@ pub enum SendError {
     Transport,
     Provider(u16),
     RateLimited(Option<u32>),
+    RateLimitedMissing,
     InvalidDeviceToken(u16),
     InvalidResponse,
     OAuth(crate::google_oauth::AuthError),
@@ -226,7 +227,7 @@ impl std::fmt::Display for SendError {
             Self::UnsupportedMessage => f.write_str("unsupported FCM message"),
             Self::Transport => f.write_str("FCM transport failed"),
             Self::Provider(code) => write!(f, "FCM returned HTTP {code}"),
-            Self::RateLimited(_) => f.write_str("FCM returned HTTP 429"),
+            Self::RateLimited(_) | Self::RateLimitedMissing => f.write_str("FCM returned HTTP 429"),
             Self::InvalidDeviceToken(code) => {
                 write!(f, "FCM returned HTTP {code}: invalid device token")
             }
@@ -992,6 +993,10 @@ impl Fcm {
             let retry_after = (status == 429)
                 .then(|| crate::slack::retry_after_seconds(response.headers()))
                 .flatten();
+            let retry_after_missing = status == 429
+                && !response
+                    .headers()
+                    .contains_key(reqwest::header::RETRY_AFTER);
             // The source Firebase SDK exposes error.message to the provider.
             // Bound the body and keep only the classification, never the raw
             // provider response, which can contain sensitive data.
@@ -1002,7 +1007,11 @@ impl Fcm {
                     Ok(None) => break,
                     Err(_) => {
                         return Err(if status == 429 {
-                            SendError::RateLimited(retry_after)
+                            if retry_after_missing {
+                                SendError::RateLimitedMissing
+                            } else {
+                                SendError::RateLimited(retry_after)
+                            }
                         } else {
                             SendError::Provider(status)
                         });
@@ -1010,7 +1019,11 @@ impl Fcm {
                 };
                 if bytes.len() + chunk.len() > 16 * 1024 {
                     return Err(if status == 429 {
-                        SendError::RateLimited(retry_after)
+                        if retry_after_missing {
+                            SendError::RateLimitedMissing
+                        } else {
+                            SendError::RateLimited(retry_after)
+                        }
                     } else {
                         SendError::Provider(status)
                     });
@@ -1027,7 +1040,11 @@ impl Fcm {
                 return Err(SendError::InvalidDeviceToken(status));
             }
             return Err(if status == 429 {
-                SendError::RateLimited(retry_after)
+                if retry_after_missing {
+                    SendError::RateLimitedMissing
+                } else {
+                    SendError::RateLimited(retry_after)
+                }
             } else {
                 SendError::Provider(status)
             });

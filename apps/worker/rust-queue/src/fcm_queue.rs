@@ -16,21 +16,30 @@ pub const RETRY_AFTER_MIGRATION: &str = include_str!("../migrations/0184_fcm_ret
 pub enum RateLimitPolicy {
     Continue,
     DelayKnown,
+    DelayDefault,
 }
 impl RateLimitPolicy {
     pub fn from_env() -> Result<Self, &'static str> {
         match std::env::var("SWALLOW_FCM_MULTICAST_429_POLICY").as_deref() {
             Ok("continue") | Err(std::env::VarError::NotPresent) => Ok(Self::Continue),
             Ok("delay-known") => Ok(Self::DelayKnown),
+            Ok("delay-default") => Ok(Self::DelayDefault),
             _ => Err("invalid FCM multicast 429 policy"),
         }
     }
 }
 
-fn continuation_delay(policy: RateLimitPolicy, retry_after: Option<i32>) -> i32 {
+fn continuation_delay(
+    policy: RateLimitPolicy,
+    retry_after: Option<i32>,
+    header_missing: bool,
+) -> i32 {
     match policy {
         RateLimitPolicy::Continue => 0,
         RateLimitPolicy::DelayKnown => retry_after.map(|seconds| seconds.max(60)).unwrap_or(0),
+        RateLimitPolicy::DelayDefault => retry_after
+            .map(|seconds| seconds.max(60))
+            .unwrap_or(if header_missing { 60 } else { 0 }),
     }
 }
 
@@ -909,6 +918,7 @@ async fn process_one_inner(
         Err(SendError::RateLimited(seconds)) => seconds.map(|v| v as i32),
         _ => None,
     };
+    let header_missing = matches!(&result, Err(SendError::RateLimitedMissing));
     let (state, status, id) = match result {
         Ok(id) => (
             "accepted",
@@ -923,7 +933,9 @@ async fn process_one_inner(
         Err(SendError::Provider(code) | SendError::InvalidDeviceToken(code)) => {
             ("rejected", Some(i32::from(code)), None)
         }
-        Err(SendError::RateLimited(_)) => ("rejected", Some(429), None),
+        Err(SendError::RateLimited(_) | SendError::RateLimitedMissing) => {
+            ("rejected", Some(429), None)
+        }
         Err(SendError::Transport | SendError::InvalidResponse) => ("unknown", None, None),
         Err(_) => ("rejected", None, None),
     };
@@ -974,7 +986,7 @@ async fn process_one_inner(
             refresh_group(&tx, environment, job.id, history_index, group_size).await?;
         }
         if attempted.len() + 1 < messages.len() {
-            let delay = continuation_delay(rate_limit_policy, retry_after);
+            let delay = continuation_delay(rate_limit_policy, retry_after, header_missing);
             tx.execute("UPDATE novu_queue_jobs SET status='pending',available_at=clock_timestamp()+make_interval(secs=>$3::integer::double precision),lease_token=NULL,lease_until=NULL WHERE id=$1 AND lease_token=$2",&[&job.id,&job.lease_token,&delay]).await?;
         } else {
             finish(&tx, &job).await?;
@@ -1003,13 +1015,34 @@ mod tests {
     #[test]
     fn continuation_respects_selected_policy_and_known_advice() {
         use super::{RateLimitPolicy, continuation_delay};
-        assert_eq!(continuation_delay(RateLimitPolicy::Continue, Some(120)), 0);
-        assert_eq!(continuation_delay(RateLimitPolicy::DelayKnown, Some(0)), 60);
         assert_eq!(
-            continuation_delay(RateLimitPolicy::DelayKnown, Some(120)),
+            continuation_delay(RateLimitPolicy::Continue, Some(120), false),
+            0
+        );
+        assert_eq!(
+            continuation_delay(RateLimitPolicy::DelayKnown, Some(0), false),
+            60
+        );
+        assert_eq!(
+            continuation_delay(RateLimitPolicy::DelayKnown, Some(120), false),
             120
         );
-        assert_eq!(continuation_delay(RateLimitPolicy::DelayKnown, None), 0);
+        assert_eq!(
+            continuation_delay(RateLimitPolicy::DelayKnown, None, true),
+            0
+        );
+        assert_eq!(
+            continuation_delay(RateLimitPolicy::DelayDefault, None, true),
+            60
+        );
+        assert_eq!(
+            continuation_delay(RateLimitPolicy::DelayDefault, None, false),
+            0
+        );
+        assert_eq!(
+            continuation_delay(RateLimitPolicy::DelayDefault, Some(120), false),
+            120
+        );
     }
     use super::*;
     use serde_json::json;
@@ -1319,6 +1352,12 @@ mod tests {
     }
 
     async fn mock(statuses: Vec<u16>) -> (Fcm, tokio::task::JoinHandle<Vec<String>>) {
+        mock_with_headers(statuses, "Retry-After: 120\r\n").await
+    }
+    async fn mock_with_headers(
+        statuses: Vec<u16>,
+        rate_limit_headers: &'static str,
+    ) -> (Fcm, tokio::task::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
@@ -1355,7 +1394,7 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(150)).await;
                 }
                 let response = r#"{"name":"projects/demo/messages/123"}"#;
-                socket.write_all(format!("HTTP/1.1 {status} Test\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{response}",if status == 429 {"Retry-After: 120\r\n"} else {""},response.len()).as_bytes()).await.unwrap();
+                socket.write_all(format!("HTTP/1.1 {status} Test\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{response}",if status == 429 {rate_limit_headers} else {""},response.len()).as_bytes()).await.unwrap();
             }
             targets
         });
@@ -2045,6 +2084,58 @@ mod tests {
             ["rejected", "accepted"]
         );
 
+        // Missing Retry-After gets the optional default; an invalid header does not.
+        for (test_env, headers, should_delay) in [
+            ("missing-header", "", true),
+            ("bad-header", "Retry-After: 999999\r\n", false),
+        ] {
+            let id = Uuid::new_v4();
+            let payload = json!({"title":"Hi","content":"Hello","targets":["a","b"]});
+            crate::enqueue(&db, id, test_env, JOB_KIND, &payload)
+                .await
+                .unwrap();
+            let (provider, server) = mock_with_headers(vec![429, 200], headers).await;
+            assert!(
+                process_one_with_rate_limit_policy(
+                    &mut db,
+                    test_env,
+                    Some(&provider),
+                    None,
+                    false,
+                    crate::push_step_policy::Policy::Snapshot,
+                    crate::push_step_policy::PreferencePolicy::Snapshot,
+                    crate::push_step_policy::TargetPolicy::Reference,
+                    RateLimitPolicy::DelayDefault
+                )
+                .await
+                .unwrap()
+            );
+            let row=db.query_one("SELECT j.available_at>clock_timestamp()+interval '45 seconds',a.retry_after_seconds FROM public.novu_queue_jobs j JOIN public.novu_rust_fcm_attempts a ON a.job_id=j.id WHERE j.id=$1 AND a.target_index=0",&[&id]).await.unwrap();
+            assert_eq!(row.get::<_, bool>(0), should_delay);
+            assert_eq!(row.get::<_, Option<i32>>(1), None);
+            if should_delay {
+                assert!(
+                    !process_one(&mut other_db, test_env, &provider)
+                        .await
+                        .unwrap()
+                );
+                db.execute("UPDATE public.novu_queue_jobs SET available_at=clock_timestamp()-interval '1 second' WHERE id=$1",&[&id]).await.unwrap();
+            }
+            assert!(
+                process_one(&mut other_db, test_env, &provider)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(server.await.unwrap(), ["a", "b"]);
+            let attempts=db.query("SELECT state FROM public.novu_rust_fcm_attempts WHERE job_id=$1 ORDER BY target_index",&[&id]).await.unwrap();
+            assert_eq!(
+                attempts
+                    .iter()
+                    .map(|r| r.get::<_, String>(0))
+                    .collect::<Vec<_>>(),
+                ["rejected", "accepted"]
+            );
+        }
         let payload = json!({"title":"Hi","content":"Hello","targets":["a","b","c"]});
         let other = Uuid::new_v4();
         let id = Uuid::new_v4();
