@@ -29,6 +29,8 @@ enum Lookup {
     TwilioDelayedHealth,
     FcmPartialHealth,
     FcmPartialJobs,
+    FcmUnreviewed,
+    FcmReviewRequest,
     ResendResult,
     ResendJobs,
     TwilioResult,
@@ -385,6 +387,13 @@ pub(super) async fn fcm_partial_jobs(
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
 ) -> Response {
     query(db, headers, uri, verifier, Lookup::FcmPartialJobs).await
+}
+
+pub(super) async fn fcm_unreviewed(State(db): State<Arc<Client>>, headers: HeaderMap, OriginalUri(uri): OriginalUri, verifier: Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
+    query(db,headers,uri,verifier,Lookup::FcmUnreviewed).await
+}
+pub(super) async fn fcm_review_request(State(db): State<Arc<Client>>, headers: HeaderMap, OriginalUri(uri): OriginalUri, verifier: Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
+    query(db,headers,uri,verifier,Lookup::FcmReviewRequest).await
 }
 
 pub(super) async fn resend_result(
@@ -1545,7 +1554,7 @@ async fn query(
     let allowed: &[&str] = match lookup {
         Lookup::Subscribers => &["environmentId", "name", "after", "before", "limit"],
         Lookup::Alerts => &["environmentId", "afterChannel", "afterTarget"],
-        Lookup::DecisionRequest | Lookup::SlackDecisionRequest | Lookup::Resend429Request | Lookup::TwilioRetryRequest => &["environmentId", "requestId"],
+        Lookup::DecisionRequest | Lookup::SlackDecisionRequest | Lookup::Resend429Request | Lookup::TwilioRetryRequest | Lookup::FcmReviewRequest => &["environmentId", "requestId"],
         Lookup::Identity | Lookup::ResendAutoPolicyRead => &["environmentId"],
         Lookup::PermissionIdentity => &["environmentId", "issuer", "subject", "clientId"],
         Lookup::PermissionAudit => &["environmentId", "before"],
@@ -1560,6 +1569,7 @@ async fn query(
         Lookup::ResendAutoHealth | Lookup::SlackCooldownHealth | Lookup::TwilioDelayedHealth => &["environmentId", "graceSeconds"],
         Lookup::FcmPartialHealth => &["environmentId", "windowSeconds"],
         Lookup::FcmPartialJobs => &["environmentId", "windowSeconds", "after"],
+        Lookup::FcmUnreviewed => &["environmentId", "after"],
         Lookup::ResendAutoHealthJobs => &["environmentId", "graceSeconds", "filter", "after"],
         Lookup::ResendJobs => &["environmentId", "after", "status"],
         Lookup::TwilioJobs | Lookup::FcmJobs | Lookup::SlackJobs | Lookup::SendgridJobs => {
@@ -1727,6 +1737,14 @@ async fn query(
             let Some(window)=params.get("windowSeconds").and_then(|v|v.parse::<i32>().ok().filter(|n|(1..=604800).contains(n)&&n.to_string()==*v)) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};
             let after=match params.get("after") {Some(value)=>match Uuid::parse_str(value) {Ok(id)=>Some(id),Err(_)=>return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request")},None=>None};
             guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_fcm_partial_jobs($1,$2,$3,$4,$5,$6,$7)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&window,&after]).await
+        }
+        Lookup::FcmUnreviewed => {
+            let after=match params.get("after") {Some(value)=>match Uuid::parse_str(value) {Ok(id)=>Some(id),Err(_)=>return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request")},None=>None};
+            guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_fcm_unreviewed($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&after]).await
+        }
+        Lookup::FcmReviewRequest => {
+            let Some(request)=params.get("requestId").and_then(|id|Uuid::parse_str(id).ok()) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};
+            guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_fcm_review_request($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request]).await
         }
         Lookup::ResendAutoPolicyRead => {
             guarded_query(
@@ -2745,6 +2763,29 @@ pub(super) async fn slack_retry_after(
             response
         }
         Err(_) => failure(StatusCode::INTERNAL_SERVER_ERROR, uri.path()),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all="camelCase",deny_unknown_fields)]
+struct FcmReviewBody { request_id:String,job_id:String,revision:String,reason:String }
+pub(super) async fn fcm_review(
+    State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,
+    verifier:Option<Extension<Arc<AccessTokenVerifier>>>,body:Bytes,
+) -> Response {
+    let identity=match authenticate(&db,&headers,verifier).await {Ok(v)=>v,Err(status)=>return failure(status,uri.path())};
+    let params:Vec<_>=form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).collect();
+    if params.len()!=1 || params[0].0!="environmentId" || params[0].1.is_empty() || params[0].1.len()>512 || params[0].1.contains('\0') {return failure(StatusCode::BAD_REQUEST,uri.path());}
+    let Some(input)=(body.len()<=4096).then(||serde_json::from_slice::<FcmReviewBody>(&body).ok()).flatten() else {return failure(StatusCode::BAD_REQUEST,uri.path());};
+    if input.reason.contains('\0') || input.revision.contains('\0') {return failure(StatusCode::BAD_REQUEST,uri.path());}
+    let (Ok(request),Ok(job),Ok(exp))=(Uuid::parse_str(&input.request_id),Uuid::parse_str(&input.job_id),i64::try_from(identity.expires_at)) else {return failure(StatusCode::BAD_REQUEST,uri.path());};
+    let env=params[0].1.as_ref();
+    match guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_fcm_review($1,$2,$3,$4,$5,$6,$7,$8,$9)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&job,&input.revision,&input.reason]).await {
+        Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
+        Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
+        Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
+        Err(e) if e.code().is_some_and(|c|matches!(c.code(),"P4090"|"40001"))=>{let mut response=error_at(StatusCode::CONFLICT,"Review conflict","Conflict",uri.path()).into_response();response.headers_mut().insert(header::CACHE_CONTROL,header::HeaderValue::from_static("no-store"));response},
+        Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path()),
     }
 }
 
