@@ -1,6 +1,7 @@
 import { Component, OnDestroy, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { FcmIntegrations } from './fcm-integrations';
+import { SlackIntegrations } from './slack-integrations';
 import { ClrAlertModule } from '@clr/angular/emphasis/alert';
 import { OperatorOidc, type PreparedOidc, type VerifiedSession } from './operator-oidc';
 
@@ -43,7 +44,7 @@ type SendgridKey = {identifier:string;active:boolean};
 type SendgridKeyAudit = {id:string;identifier:string;action:string;userId:string;recordedAt:string};
 
 @Component({
-  imports: [FormsModule, ClrAlertModule, FcmIntegrations],
+  imports: [FormsModule, ClrAlertModule, FcmIntegrations, SlackIntegrations],
   selector: 'app-root',
   styleUrl: './app.css',
   templateUrl: './app.html',
@@ -63,6 +64,7 @@ export class App implements OnDestroy {
   readonly checkedAt = signal<string | null>(null);
   readonly detail = signal('');
   fcmBusy=false;
+  slackBusy=false;
   sendgridApiKey='';
   sendgridIdentifier='';
   sendgridPublicKey='';
@@ -992,7 +994,7 @@ export class App implements OnDestroy {
   }
 
   setSection(next: Section): void {
-    if(this.fcmBusy)return;
+    if(this.fcmBusy||this.slackBusy)return;
     if(this.oidcRevokeStatus()==='sending')return;
     if(this.sendgridWriteStatus()==='sending')return;
     if ((this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying' || this.subscriberDeleteRetryStatus()==='retrying') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
