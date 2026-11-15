@@ -1039,10 +1039,10 @@ async fn process_claimed(
                 &[
                     &email_job_id,
                     &job.environment_id,
-                    &if email_provider == "resend" {
-                        crate::resend_queue::JOB_KIND
-                    } else {
-                        crate::sendgrid_queue::JOB_KIND
+                    &match email_provider.as_str() {
+                        "resend" => crate::resend_queue::JOB_KIND,
+                        "smtp" => crate::smtp_queue::JOB_KIND,
+                        _ => crate::sendgrid_queue::JOB_KIND,
                     },
                     &email_payload,
                 ],

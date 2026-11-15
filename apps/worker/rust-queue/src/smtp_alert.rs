@@ -161,6 +161,88 @@ impl SmtpAlert {
             .map_err(|_| ())?;
         self.transport.send(email).await.map(|_| ()).map_err(|_| ())
     }
+    /// Build the supported workflow subset before reserving a send.
+    pub fn prepare_workflow(&self, email: &crate::sendgrid::Email) -> Result<Message, ()> {
+        use lettre::message::{Mailbox, MultiPart, SinglePart};
+        fn address(value: &str) -> Result<lettre::Address, ()> {
+            if value.len() > 320 || value.contains(['\r', '\n', '\0', '<', '>']) {
+                return Err(());
+            }
+            value.parse().map_err(|_| ())
+        }
+        if email.to.is_empty()
+            || email
+                .to
+                .len()
+                .saturating_add(email.cc.len())
+                .saturating_add(email.bcc.len())
+                > 1000
+            || email.subject.contains(['\r', '\n', '\0'])
+            || email.subject.len() > 998
+            || email.html.len() > 1_048_576
+            || email.text.as_ref().is_some_and(|v| v.len() > 1_048_576)
+            || !email.attachments.is_empty()
+            || !email.alternatives.is_empty()
+            || !email.headers.is_empty()
+            || !email.custom_data.is_empty()
+            || email.ip_pool_name.is_some()
+        {
+            return Err(());
+        }
+        let from = address(
+            email
+                .from
+                .as_deref()
+                .filter(|v| !v.is_empty())
+                .unwrap_or(&self.from),
+        )?;
+        let name = email
+            .sender_name
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .cloned();
+        if name
+            .as_ref()
+            .is_some_and(|s| s.len() > 256 || s.contains(['\r', '\n', '\0']))
+        {
+            return Err(());
+        }
+        let mut builder = Message::builder()
+            .from(Mailbox::new(name, from))
+            .subject(email.subject.as_str());
+        for value in &email.to {
+            builder = builder.to(Mailbox::new(None, address(value)?));
+        }
+        for value in &email.cc {
+            builder = builder.cc(Mailbox::new(None, address(value)?));
+        }
+        for value in &email.bcc {
+            builder = builder.bcc(Mailbox::new(None, address(value)?));
+        }
+        if let Some(reply) = email.reply_to.as_ref().filter(|s| !s.is_empty()) {
+            builder = builder.reply_to(Mailbox::new(None, address(reply)?));
+        }
+        match &email.text {
+            Some(text) => builder
+                .multipart(
+                    MultiPart::alternative()
+                        .singlepart(SinglePart::plain(text.clone()))
+                        .singlepart(SinglePart::html(email.html.clone())),
+                )
+                .map_err(|_| ()),
+            None => builder
+                .header(ContentType::TEXT_HTML)
+                .body(email.html.clone())
+                .map_err(|_| ()),
+        }
+    }
+    pub async fn deliver_workflow(&self, message: Message) -> Result<(), ()> {
+        self.transport
+            .send(message)
+            .await
+            .map(|_| ())
+            .map_err(|_| ())
+    }
     #[cfg(test)]
     fn test_transport(host: String, port: u16) -> Self {
         Self {
@@ -392,6 +474,27 @@ mod tests {
         );
         assert!(!wrong_host_server.wait().unwrap().success());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn workflow_messages_keep_bcc_out_of_headers_and_reject_unsupported_fields() {
+        let provider = SmtpAlert::test_transport("127.0.0.1".into(), 25);
+        let mut email = crate::sendgrid::Email {
+            to: vec!["visible@example.test".into()],
+            cc: vec!["copy@example.test".into()],
+            bcc: vec!["hidden@example.test".into()],
+            subject: "fixture".into(),
+            html: "<p>Hello</p>".into(),
+            text: Some("Hello".into()),
+            ..Default::default()
+        };
+        let msg = provider.prepare_workflow(&email).unwrap();
+        let encoded = String::from_utf8(msg.formatted()).unwrap();
+        assert!(!encoded.to_lowercase().contains("bcc:"));
+        assert!(!encoded.contains("hidden@example.test"));
+        assert_eq!(msg.envelope().to().len(), 3);
+        assert!(encoded.contains("multipart/alternative"));
+        email.headers.insert("X-Test".into(), "value".into());
+        assert!(provider.prepare_workflow(&email).is_err());
     }
     #[test]
     fn validates_tls_credentials_and_sender() {
