@@ -94,6 +94,7 @@ async fn scoped_key_rotation_and_concurrent_limit() {
         include_str!("../migrations/0004_sendgrid_webhooks.sql"),
         include_str!("../migrations/0064_sendgrid_key_management.sql"),
         include_str!("../migrations/0065_sendgrid_key_audit_access.sql"),
+        include_str!("../migrations/0066_sendgrid_key_activation.sql"),
     ] {
         db.batch_execute(sql).await.unwrap();
     }
@@ -261,7 +262,7 @@ async fn scoped_key_rotation_and_concurrent_limit() {
         StatusCode::INTERNAL_SERVER_ERROR
     );
     assert_eq!(db.query_one("SELECT count(*) FROM novu_rust_sendgrid_webhook_keys WHERE environment_id='a' AND key_id='rollback'",&[]).await.unwrap().get::<_,i64>(0),0);
-    db.batch_execute("DROP TRIGGER reject_key_audit ON public.novu_rust_sendgrid_key_audit; CREATE ROLE sendgrid_key_api LOGIN; GRANT USAGE ON SCHEMA public TO sendgrid_key_api; GRANT SELECT ON public.novu_rust_api_keys,public.novu_rust_users TO sendgrid_key_api; GRANT EXECUTE ON FUNCTION public.novu_rust_sendgrid_keys_list(text,text,text),public.novu_rust_sendgrid_key_change(text,text,text,text,text,uuid),public.novu_rust_sendgrid_key_audit_list(text,text,uuid) TO sendgrid_key_api").await.unwrap();
+    db.batch_execute("DROP TRIGGER reject_key_audit ON public.novu_rust_sendgrid_key_audit; CREATE ROLE sendgrid_key_api LOGIN; GRANT USAGE ON SCHEMA public TO sendgrid_key_api; GRANT SELECT ON public.novu_rust_api_keys,public.novu_rust_users TO sendgrid_key_api; GRANT EXECUTE ON FUNCTION public.novu_rust_sendgrid_keys_list(text,text,text),public.novu_rust_sendgrid_key_change(text,text,text,text,text,uuid),public.novu_rust_sendgrid_key_audit_list(text,text,uuid),public.novu_rust_sendgrid_key_set_active(text,text,text,boolean,text,uuid) TO sendgrid_key_api").await.unwrap();
     let (limited, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move {
         driver.await.unwrap();
@@ -309,6 +310,179 @@ async fn scoped_key_rotation_and_concurrent_limit() {
         .await
         .0,
         StatusCode::OK
+    );
+    let (standby, standby_key) = key_pair();
+    let standby_path = format!("{base}/standby");
+    assert_eq!(
+        call(
+            limited_app.clone(),
+            "POST",
+            base,
+            "a-key",
+            json!({"identifier":"standby","publicKey":standby})
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        signed_webhook(app.clone(), &standby_key).await,
+        StatusCode::BAD_REQUEST
+    );
+    db.batch_execute("CREATE TRIGGER reject_key_audit BEFORE INSERT ON public.novu_rust_sendgrid_key_audit FOR EACH ROW EXECUTE FUNCTION public.reject_key_audit()").await.unwrap();
+    assert_eq!(
+        call(
+            limited_app.clone(),
+            "PATCH",
+            &standby_path,
+            "a-key",
+            json!({"active":false})
+        )
+        .await
+        .0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        signed_webhook(app.clone(), &standby_key).await,
+        StatusCode::BAD_REQUEST
+    );
+    db.batch_execute("DROP TRIGGER reject_key_audit ON public.novu_rust_sendgrid_key_audit")
+        .await
+        .unwrap();
+    assert_eq!(
+        call(
+            limited_app.clone(),
+            "PATCH",
+            &standby_path,
+            "read-key",
+            json!({"active":false})
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    let disabled = call(
+        limited_app.clone(),
+        "PATCH",
+        &standby_path,
+        "a-key",
+        json!({"active":false}),
+    )
+    .await;
+    assert_eq!(disabled.0, StatusCode::OK);
+    assert_eq!(disabled.1["data"]["changed"], true);
+    assert_eq!(
+        signed_webhook(app.clone(), &standby_key).await,
+        StatusCode::UNAUTHORIZED
+    );
+    let repeated = call(
+        limited_app.clone(),
+        "PATCH",
+        &standby_path,
+        "a-key",
+        json!({"active":false}),
+    )
+    .await;
+    assert_eq!(repeated.1["data"]["changed"], false);
+    assert_eq!(
+        call(
+            limited_app.clone(),
+            "PATCH",
+            &standby_path,
+            "a-key",
+            json!({"active":true,"publicKey":public_key()})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        call(
+            limited_app.clone(),
+            "POST",
+            base,
+            "a-key",
+            json!({"identifier":"fills-limit","publicKey":public_key()})
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        call(
+            limited_app.clone(),
+            "PATCH",
+            &standby_path,
+            "a-key",
+            json!({"active":true,"publicKey":standby})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        call(
+            limited_app.clone(),
+            "DELETE",
+            &format!("{base}/fills-limit"),
+            "a-key",
+            json!({})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(
+            limited_app.clone(),
+            "POST",
+            base,
+            "b-key",
+            json!({"identifier":"other-env","publicKey":standby})
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        call(
+            limited_app.clone(),
+            "PATCH",
+            &standby_path,
+            "a-key",
+            json!({"active":true,"publicKey":standby})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        call(
+            limited_app.clone(),
+            "DELETE",
+            &format!("{base}/other-env"),
+            "b-key",
+            json!({})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(
+            limited_app.clone(),
+            "PATCH",
+            &standby_path,
+            "a-key",
+            json!({"active":true,"publicKey":standby})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        signed_webhook(app.clone(), &standby_key).await,
+        StatusCode::BAD_REQUEST
     );
     let audit_path = "/v1/experimental/sendgrid-webhook-key-audit".to_string();
     assert_eq!(

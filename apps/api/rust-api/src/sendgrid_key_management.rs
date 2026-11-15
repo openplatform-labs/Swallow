@@ -252,3 +252,60 @@ pub async fn delete(
 ) -> ApiError {
     change(&db, &headers, &uri.to_string(), "delete", &id, None).await
 }
+
+pub async fn set_active(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiError {
+    let path = uri.to_string();
+    let (env, hash) = match identity(&db, &headers, &path).await {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if !valid_id(&id) {
+        return fail(StatusCode::BAD_REQUEST, &path);
+    }
+    let Ok(Value::Object(obj)) = serde_json::from_slice::<Value>(&body) else {
+        return fail(StatusCode::BAD_REQUEST, &path);
+    };
+    let Some(active) = obj.get("active").and_then(Value::as_bool) else {
+        return fail(StatusCode::BAD_REQUEST, &path);
+    };
+    let public = if active {
+        let Some(value) = obj.get("publicKey").and_then(Value::as_str) else {
+            return fail(StatusCode::BAD_REQUEST, &path);
+        };
+        if obj.len() != 2 || !valid_public_key(value) {
+            return fail(StatusCode::BAD_REQUEST, &path);
+        }
+        Some(value)
+    } else {
+        if obj.len() != 1 {
+            return fail(StatusCode::BAD_REQUEST, &path);
+        }
+        None
+    };
+    match db
+        .query_one(
+            "SELECT public.novu_rust_sendgrid_key_set_active($1,$2,$3,$4,$5,$6)",
+            &[&hash, &env, &id, &active, &public, &Uuid::new_v4()],
+        )
+        .await
+    {
+        Ok(row) => match row.get::<_, String>(0).as_str() {
+            "ok" | "unchanged" => (
+                StatusCode::OK,
+                Json(
+                    json!({"data":{"identifier":id,"active":active,"changed":row.get::<_,String>(0)=="ok"}}),
+                ),
+            ),
+            "missing" => fail(StatusCode::NOT_FOUND, &path),
+            "conflict" | "limit" => fail(StatusCode::CONFLICT, &path),
+            _ => fail(StatusCode::INTERNAL_SERVER_ERROR, &path),
+        },
+        Err(error) => db_error(error, &path),
+    }
+}
