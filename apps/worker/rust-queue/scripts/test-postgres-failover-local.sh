@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$(cd ../../.. && pwd)
 scenario=${SWALLOW_LOCAL_FAILOVER_SCENARIO:-alert-binding}
-case "$scenario" in alert-binding|alert-scheduler|alert-v2|alert-v3|alert-timing|trigger-key|trigger-inflight|execution-grant-inflight|sendgrid-inflight|sendgrid-sandbox-inflight|smtp|smtp-rls|smtp-resolution|discord-manual-retry|discord-cooldown|discord-inflight|in-app|resend|resend-cooldown|resend-invalid|resend-replay-inflight|twilio|fcm|fcm-delay|fcm-exp|fcm-exp-repeat|fcm-review) ;; *) echo 'invalid local failover scenario' >&2; exit 2;; esac
+case "$scenario" in alert-binding|alert-scheduler|alert-v2|alert-v3|alert-timing|trigger-key|trigger-inflight|execution-grant-inflight|sendgrid-inflight|sendgrid-sandbox-inflight|smtp|smtp-rls|smtp-resolution|discord-manual-retry|discord-cooldown|discord-inflight|in-app|resend|resend-cooldown|resend-invalid|resend-replay-inflight|resend-reconciliation|twilio|fcm|fcm-delay|fcm-exp|fcm-exp-repeat|fcm-review) ;; *) echo 'invalid local failover scenario' >&2; exit 2;; esac
 pgbin=${SWALLOW_TEST_POSTGRES_BIN:-/opt/homebrew/opt/postgresql@17/bin}
 [[ -x "$pgbin/pg_ctl" && -x "$pgbin/pg_basebackup" ]] || { echo 'PostgreSQL 17 server binaries are required' >&2; exit 1; }
 testdir=$(mktemp -d /private/tmp/swallow-alert-ha.XXXXXX)
@@ -73,6 +73,9 @@ elif [[ "$scenario" == resend-replay-inflight ]]; then
   cp target/debug/resend-worker "$testdir/resend-worker-mock"
   cargo build --quiet --locked --bin resend-worker
   TEST_RESEND_WORKER="$testdir/resend-worker-mock" TEST_PSQL="$pgbin/psql" TEST_FIXTURE_DIR="$testdir" python3 tests/resend_replay_failover.py
+elif [[ "$scenario" == resend-reconciliation ]]; then
+  cargo build --quiet --locked --manifest-path "$root/apps/api/rust-api/Cargo.toml" --bin novu-rust-api
+  TEST_API_BINARY="$root/apps/api/rust-api/target/debug/novu-rust-api" TEST_PSQL="$pgbin/psql" TEST_FIXTURE_DIR="$testdir" TEST_ROOT="$root" python3 tests/resend_reconciliation_failover.py
 elif [[ "$scenario" == resend-invalid ]]; then
   cargo build --quiet --locked --bin resend-worker
   target_dir=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
