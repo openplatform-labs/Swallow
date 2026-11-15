@@ -221,6 +221,7 @@ async fn detects_actual_primary_standby_and_session_read_only() {
                 "--slot=fixture_probe_slot",
                 "--start",
                 "--status-interval=1",
+                "--fsync-interval=1",
                 "-f",
                 "-",
             ])
@@ -239,8 +240,19 @@ async fn detects_actual_primary_standby_and_session_read_only() {
         .query_one("SELECT pg_catalog.pg_reload_conf()", &[])
         .await
         .unwrap();
+    // The slot was created after the earlier WAL burst. Ensure it has fresh
+    // data to decode and acknowledge; ALTER SYSTEM itself does not emit WAL.
+    // This connection has synchronous_commit=off, so it cannot deadlock
+    // while the synchronous receiver is still becoming ready.
+    writer
+        .query_one(
+            "SELECT pg_catalog.pg_logical_emit_message(true,'probe','quorum-fixture')",
+            &[],
+        )
+        .await
+        .unwrap();
     let mut ready = false;
-    for _ in 0..100 {
+    for _ in 0..300 {
         let row=primary.query_one("SELECT count(*) FROM pg_catalog.pg_stat_replication WHERE application_name IN ('standby1','logical_probe') AND state='streaming' AND sync_state='quorum' AND flush_lsn IS NOT NULL",&[]).await.unwrap();
         if row.get::<_, i64>(0) == 2 {
             ready = true;
@@ -248,10 +260,23 @@ async fn detects_actual_primary_standby_and_session_read_only() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(
-        ready,
-        "physical and logical senders did not become synchronous quorum members"
-    );
+    if !ready {
+        let rows=primary.query("SELECT application_name,state,sync_state,flush_lsn::text FROM pg_catalog.pg_stat_replication WHERE application_name IN ('standby1','logical_probe') ORDER BY application_name", &[]).await.unwrap();
+        let states: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<_, String>(0),
+                    r.get::<_, String>(1),
+                    r.get::<_, String>(2),
+                    r.get::<_, Option<String>>(3),
+                )
+            })
+            .collect();
+        panic!(
+            "physical and logical senders did not become synchronous quorum members: {states:?}"
+        );
+    }
     assert!(
         healthy(
             &limited,
