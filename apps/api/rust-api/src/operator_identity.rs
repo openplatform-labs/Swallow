@@ -60,6 +60,8 @@ enum Lookup {
     TriggerGrantAudit,
     ExecutionAudit,
     ExecutionGrantRead,
+    ExecutionGrantRequest,
+    ExecutionGrantHistory,
     WorkflowRead,
     WorkflowAudit,
     WorkflowRequest,
@@ -574,6 +576,8 @@ pub(super) async fn workflow_trigger_result(
 ) -> Response {query(db,headers,uri,verifier,Lookup::TriggerResult).await}
 pub(super) async fn trigger_grant_read(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {query(db,headers,uri,verifier,Lookup::TriggerGrantRead).await}
 pub(super) async fn trigger_grant_request(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {query(db,headers,uri,verifier,Lookup::TriggerGrantRequest).await}
+pub(super) async fn execution_grant_request(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {query(db,headers,uri,verifier,Lookup::ExecutionGrantRequest).await}
+pub(super) async fn execution_grant_history(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {query(db,headers,uri,verifier,Lookup::ExecutionGrantHistory).await}
 pub(super) async fn execution_grant_read(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {query(db,headers,uri,verifier,Lookup::ExecutionGrantRead).await}
 pub(super) async fn execution_audit(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {query(db,headers,uri,verifier,Lookup::ExecutionAudit).await}
 pub(super) async fn trigger_grant_audit(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {query(db,headers,uri,verifier,Lookup::TriggerGrantAudit).await}
@@ -2615,6 +2619,8 @@ async fn query(
         Lookup::SubscriberGrantRequest | Lookup::TriggerGrantRequest => &["environmentId", "requestId"],
         Lookup::SubscriberGrantAudit | Lookup::TriggerGrantAudit | Lookup::ExecutionAudit => &["environmentId", "after"],
         Lookup::ExecutionGrantRead => &["environmentId","targetIssuer","targetSubject","targetClientId","workflow"],
+        Lookup::ExecutionGrantRequest => &["environmentId","requestId"],
+        Lookup::ExecutionGrantHistory => &["environmentId","after"],
         Lookup::SubscriberActivityAudit => &["environmentId", "kind", "after"],
         Lookup::SubscriberGrantRead | Lookup::TriggerGrantRead => &[
             "environmentId",
@@ -3025,6 +3031,14 @@ async fn query(
                 ],
             )
             .await
+        }
+        Lookup::ExecutionGrantRequest => {
+            let Some(request)=params.get("requestId").and_then(|v|Uuid::parse_str(v).ok()) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};
+            guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_execution_grant_request($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request]).await
+        }
+        Lookup::ExecutionGrantHistory => {
+            let after=match params.get("after") {Some(v)=>match Uuid::parse_str(v){Ok(v)=>Some(v),Err(_)=>return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request")},None=>None};
+            guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_execution_grant_history($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&after]).await
         }
         Lookup::ExecutionGrantRead => {
             let (Some(issuer),Some(subject),Some(client),Some(workflow))=(params.get("targetIssuer"),params.get("targetSubject"),params.get("targetClientId"),params.get("workflow")) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};
