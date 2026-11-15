@@ -58,6 +58,8 @@ pub struct AccessTokenVerifier {
     keys: HashMap<String, DecodingKey>,
     max_token_lifetime_seconds: Option<u64>,
     check_token_revocation: bool,
+    audience: String,
+    introspection: Option<crate::operator_introspection::Introspection>,
 }
 
 impl AccessTokenVerifier {
@@ -125,7 +127,23 @@ impl AccessTokenVerifier {
             keys: decoding_keys,
             max_token_lifetime_seconds: None,
             check_token_revocation: false,
+            audience: audience.to_owned(),
+            introspection: None,
         })
+    }
+
+    pub fn set_introspection(&mut self, config: crate::operator_introspection::Introspection) {
+        self.introspection = Some(config);
+    }
+    pub async fn introspect(
+        &self,
+        token: &str,
+        identity: &VerifiedSubject,
+    ) -> crate::operator_introspection::Outcome {
+        match &self.introspection {
+            Some(config) => config.check(token, identity, &self.audience).await,
+            None => crate::operator_introspection::Outcome::Active(None),
+        }
     }
 
     pub fn checks_token_revocation(&self) -> bool {

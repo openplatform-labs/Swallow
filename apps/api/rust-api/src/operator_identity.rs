@@ -79,9 +79,8 @@ async fn authenticate(
     if values.next().is_some() {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    let identity = token
-        .and_then(|t| verifier.verify(t))
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let token = token.ok_or(StatusCode::UNAUTHORIZED)?;
+    let mut identity = verifier.verify(token).ok_or(StatusCode::UNAUTHORIZED)?;
     if verifier.checks_token_revocation() {
         let hash = |s: &str| ring::digest::digest(&ring::digest::SHA256, s.as_bytes());
         let issuer = hash(&identity.issuer);
@@ -103,6 +102,25 @@ async fn authenticate(
         if row.get::<_, bool>(0) {
             return Err(StatusCode::UNAUTHORIZED);
         }
+    }
+    match verifier.introspect(token, &identity).await {
+        crate::operator_introspection::Outcome::Active(expiration) => {
+            if let Some(expiration) = expiration {
+                identity.expires_at = identity.expires_at.min(expiration);
+            }
+        }
+        crate::operator_introspection::Outcome::Inactive => return Err(StatusCode::UNAUTHORIZED),
+        crate::operator_introspection::Outcome::Unavailable => {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
+    // Introspection can take time; never accept an access token that expired during it.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .as_secs();
+    if now >= identity.expires_at {
+        return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(Authenticated {
         identity,

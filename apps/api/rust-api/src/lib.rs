@@ -10,6 +10,7 @@ mod inbox_context;
 mod inbox_data;
 mod preferences;
 pub mod operator_access_token;
+pub mod operator_introspection;
 mod operator_identity;
 pub mod resend_webhook;
 mod sendgrid_webhook;
@@ -226,7 +227,13 @@ impl RuntimeConfig {
             return Err(invalid());
         }
         let operator_config = novu_rust_contracts::secret::from_env("SWALLOW_OPERATOR_JWT_CONFIG", "SWALLOW_OPERATOR_JWT_CONFIG_FILE").map_err(|_| invalid())?;
-        let operator_verifier = operator_config.map(|value| operator_access_token::AccessTokenVerifier::from_json(&value).map(Arc::new).map_err(|_| invalid())).transpose()?;
+        let introspection = operator_introspection::Introspection::from_env().map_err(|_| invalid())?;
+        if introspection.is_some() && operator_config.is_none() { return Err(invalid()); }
+        let operator_verifier = operator_config.map(|value| {
+            let mut verifier=operator_access_token::AccessTokenVerifier::from_json(&value).map_err(|_| invalid())?;
+            if let Some(config)=introspection {verifier.set_introspection(config);}
+            Ok::<_,std::io::Error>(Arc::new(verifier))
+        }).transpose()?;
         Ok(Self {
             secret,
             keys,

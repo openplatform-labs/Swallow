@@ -1178,6 +1178,7 @@ dependencies = [
  "libc",
  "novu-postgres-queue",
  "novu-rust-contracts",
+ "reqwest",
  "ring",
  "rsa",
  "ryu",
