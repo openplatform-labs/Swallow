@@ -157,6 +157,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let resend_enabled = env_bool("SWALLOW_ALERT_RESEND_ENABLED", true)?;
     let attempts_enabled = env_bool("SWALLOW_ALERT_ATTEMPTS_ENABLED", false)?;
     let slack_jobs_enabled = env_bool("SWALLOW_ALERT_SLACK_JOBS_ENABLED", false)?;
+    let smtp_enabled = env_bool("SWALLOW_ALERT_SMTP_ENABLED", false)?;
+    if smtp_enabled && on_new_condition && !conditions_v2 { return Err("SMTP health with new-condition policy requires v2 conditions".into()); }
     let discord_enabled = env_bool("SWALLOW_ALERT_DISCORD_ENABLED", false)?;
     let discord_retry_grace = env_optional_i32("SWALLOW_ALERT_DISCORD_RETRY_GRACE_SECONDS")?;
     if discord_retry_grace.is_some_and(|v| !(1..=86400).contains(&v)) { return Err("invalid Discord retry grace".into()); }
@@ -227,6 +229,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     if !resend_enabled
         && !attempts_enabled
         && !discord_enabled
+        && !smtp_enabled
         && discord_retry_grace.is_none()
         && !slack_jobs_enabled
         && !slack_policy_enabled
@@ -433,6 +436,13 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     } else {
         None
     };
+    let smtp_health = if smtp_enabled {
+        let result = tokio::time::timeout(operation_timeout, db.query_one("SELECT * FROM public.novu_rust_smtp_health($1)", &[&args[0]])).await;
+        Some(match result {
+            Ok(Ok(row)) => match (u64::try_from(row.get::<_,i64>(0)),u64::try_from(row.get::<_,i64>(1)),u64::try_from(row.get::<_,i64>(2))) { (Ok(a),Ok(b),Ok(c)) => Ok((a,b,c)), _ => Err(()) },
+            _ => { eprintln!("SMTP health check failed"); Err(()) }
+        })
+    } else { None };
     let discord_retry_health = if let Some(grace)=discord_retry_grace {
         let result=tokio::time::timeout(operation_timeout,db.query_one("SELECT * FROM public.novu_rust_discord_retry_health($1,$2)",&[&args[0],&grace])).await;
         Some(match result {Ok(Ok(row))=>match(u64::try_from(row.get::<_,i64>(0)),u64::try_from(row.get::<_,i64>(1))){(Ok(a),Ok(b))=>Ok((a,b)),_=>Err(())},_=>{eprintln!("Discord retry health check failed");Err(())}})
@@ -604,7 +614,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         });
         Some(match values {Some(value)=>Ok(value),None=>{eprintln!("FCM cooldown check failed");Err(())}})
     } else {None};
-    let unhealthy = discord_retry_health.is_some_and(|v| !matches!(v,Ok((_,0)))) || discord_health.is_some_and(|v| !matches!(v,Ok((0,0,0,0)))) || fcm_credentials.is_some_and(|value| match value {
+    let unhealthy = smtp_health.is_some_and(|v| !matches!(v,Ok((0,0,0)))) || discord_retry_health.is_some_and(|v| !matches!(v,Ok((_,0)))) || discord_health.is_some_and(|v| !matches!(v,Ok((0,0,0,0)))) || fcm_credentials.is_some_and(|value| match value {
         Ok((healthy, failed, _, minimum)) => healthy < minimum || failed > 0,
         Err(()) => true,
     }) || sendgrid_webhook_keys.is_some_and(|v| !matches!(v, Ok(1..=10)))
@@ -652,6 +662,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         fcm_credentials,
         slack_attempts,
         slack_policy_cancelled,
+        smtp_health,
         discord_health,
         discord_retry_health,
         email_policy_cancelled,
@@ -713,7 +724,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         println!("{{\"status\":\"healthy\"}}");
         return Ok(());
     }
-    let mut error = discord_retry_health.is_some_and(|v| v.is_err()) || discord_health.is_some_and(|v| v.is_err()) || configuration_error
+    let mut error = smtp_health.is_some_and(|v| v.is_err()) || discord_retry_health.is_some_and(|v| v.is_err()) || discord_health.is_some_and(|v| v.is_err()) || configuration_error
         || observation_error
         || sendgrid_webhook_keys.is_some_and(|v| v.is_err())
         || fcm_credentials.is_some_and(|v| v.is_err())
