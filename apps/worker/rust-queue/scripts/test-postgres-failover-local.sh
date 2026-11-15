@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$(cd ../../.. && pwd)
 scenario=${SWALLOW_LOCAL_FAILOVER_SCENARIO:-alert-binding}
-case "$scenario" in alert-binding|resend) ;; *) echo 'invalid local failover scenario' >&2; exit 2;; esac
+case "$scenario" in alert-binding|resend|twilio) ;; *) echo 'invalid local failover scenario' >&2; exit 2;; esac
 pgbin=${SWALLOW_TEST_POSTGRES_BIN:-/opt/homebrew/opt/postgresql@17/bin}
 [[ -x "$pgbin/pg_ctl" && -x "$pgbin/pg_basebackup" ]] || { echo 'PostgreSQL 17 server binaries are required' >&2; exit 1; }
 testdir=$(mktemp -d /private/tmp/swallow-alert-ha.XXXXXX)
@@ -46,6 +46,13 @@ if [[ "$scenario" == resend ]]; then
   target_dir=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
   export TEST_RESEND_WORKER_BINARY="$target_dir/debug/resend-worker"
   cargo test --locked --lib resend_failover_test::synchronous_failover_during_resend_dispatch_preserves_unknown -- --ignored
+elif [[ "$scenario" == twilio ]]; then
+  cargo build --quiet --locked --bin twilio-worker
+  cargo build --quiet --locked --manifest-path "$root/apps/api/rust-api/Cargo.toml" --bin novu-rust-api
+  worker_target=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+  api_target=$(cargo metadata --format-version 1 --no-deps --manifest-path "$root/apps/api/rust-api/Cargo.toml" | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+  export TEST_TWILIO_WORKER_BINARY="$worker_target/debug/twilio-worker" TEST_TWILIO_WEBHOOK_API_BINARY="$api_target/debug/novu-rust-api"
+  cargo test --locked --lib twilio_failover_test::synchronous_failover_during_twilio_dispatch_preserves_unknown -- --ignored
 else
   cargo test --locked --test alert_binding_failover -- --ignored
 fi
