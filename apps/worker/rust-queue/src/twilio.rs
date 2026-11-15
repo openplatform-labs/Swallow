@@ -2,7 +2,7 @@
 use chrono::{DateTime, SecondsFormat, Utc};
 use reqwest::{Client, header};
 use serde::{Deserialize, Serialize};
-use std::{fmt, time::Duration};
+use std::{fmt, path::Path, time::Duration};
 
 /// Credentials must not be logged or stored in queue payloads.
 pub struct Config {
@@ -12,6 +12,57 @@ pub struct Config {
     pub api_key_secret: Option<String>,
     pub from: String,
     pub region: Region,
+}
+
+// A single file keeps API key SID and secret together during rotation.
+#[derive(Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+enum FileCredentials {
+    AuthToken {
+        auth_token: String,
+    },
+    ApiKey {
+        api_key_sid: String,
+        api_key_secret: String,
+    },
+}
+
+fn file_credentials(path: &Path) -> Result<FileCredentials, SendError> {
+    let input = novu_rust_contracts::secret::read(None, Some(path))
+        .map_err(|_| SendError::InvalidConfiguration)?
+        .ok_or(SendError::InvalidConfiguration)?;
+    let credentials: FileCredentials =
+        serde_json::from_str(&input).map_err(|_| SendError::InvalidConfiguration)?;
+    let valid = |s: &str| !s.is_empty() && s.len() <= 16384 && !s.contains(['\r', '\n', '\0']);
+    let valid_credentials = match &credentials {
+        FileCredentials::AuthToken { auth_token } => valid(auth_token),
+        FileCredentials::ApiKey {
+            api_key_sid,
+            api_key_secret,
+        } => valid(api_key_sid) && !api_key_sid.contains(':') && valid(api_key_secret),
+    };
+    if !valid_credentials {
+        return Err(SendError::InvalidConfiguration);
+    }
+    Ok(credentials)
+}
+
+fn apply_credentials(config: &mut Config, credentials: FileCredentials) {
+    match credentials {
+        FileCredentials::AuthToken { auth_token } => {
+            config.auth_token = auth_token;
+            config.api_key_sid = None;
+            config.api_key_secret = None;
+        }
+        FileCredentials::ApiKey {
+            api_key_sid,
+            api_key_secret,
+        } => {
+            config.auth_token.clear();
+            config.api_key_sid = Some(api_key_sid);
+            config.api_key_secret = Some(api_key_secret);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -205,6 +256,18 @@ pub struct Twilio {
     status_callback_base: Option<String>,
 }
 impl Twilio {
+    /// Start with credentials loaded atomically from one file.
+    pub fn with_credentials_file(mut config: Config, path: &Path) -> Result<Self, SendError> {
+        apply_credentials(&mut config, file_credentials(path)?);
+        Self::new(config)
+    }
+
+    /// Reload before claiming a new job. The caller must pause on failure.
+    pub fn reload_credentials_file(&mut self, path: &Path) -> Result<(), SendError> {
+        let credentials = file_credentials(path)?;
+        apply_credentials(&mut self.config, credentials);
+        Ok(())
+    }
     pub fn new(config: Config) -> Result<Self, SendError> {
         let origin = match config.region {
             Region::Us => "https://api.twilio.com",
@@ -358,6 +421,79 @@ mod tests {
             from: "+15550000001".into(),
             region: Region::Us,
         }
+    }
+
+    #[test]
+    fn credential_file_rejects_ambiguous_and_malformed_values() {
+        let path =
+            std::env::temp_dir().join(format!("swallow-twilio-invalid-{}", uuid::Uuid::new_v4()));
+        for input in [
+            r#"{"mode":"api_key","api_key_sid":"SK","api_key_secret":""}"#,
+            r#"{"mode":"api_key","api_key_sid":"SK:bad","api_key_secret":"secret"}"#,
+            r#"{"mode":"auth_token","auth_token":"secret","api_key_sid":"SK"}"#,
+            r#"{"mode":"auth_token","auth_token":"secret\nnext"}"#,
+            r#"{"mode":"unknown","auth_token":"secret"}"#,
+        ] {
+            std::fs::write(&path, input).unwrap();
+            assert!(file_credentials(&path).is_err());
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn credential_file_rotates_both_basic_auth_modes_atomically() {
+        let dir = std::env::temp_dir().join(format!("swallow-twilio-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("credentials");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for expected in [
+                "AC00000000000000000000000000000001:token-new",
+                "SKnew:secret-new",
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0; 4096];
+                while !bytes.windows(4).any(|v| v == b"\r\n\r\n") {
+                    let count = socket.read(&mut buf).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buf[..count]);
+                }
+                let request = String::from_utf8_lossy(&bytes);
+                assert!(request.contains(&format!(
+                    "authorization: Basic {}\r\n",
+                    STANDARD.encode(expected)
+                )));
+                let body = r#"{"sid":"SM123","date_created":"Wed, 28 Oct 2026 10:00:00 +0000"}"#;
+                socket.write_all(format!("HTTP/1.1 201 Created\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let mut provider = Twilio::with_origin(config(false), &origin).unwrap();
+        let sms = Sms {
+            to: "+15550000002".into(),
+            content: "hello".into(),
+            ..Sms::default()
+        };
+        std::fs::write(&path, r#"{"mode":"auth_token","auth_token":"token-new"}"#).unwrap();
+        provider.reload_credentials_file(&path).unwrap();
+        assert!(provider.send(&sms).await.is_ok());
+        std::fs::write(&path, r#"{"mode":"api_key","api_key_sid":"SKnew"}"#).unwrap();
+        assert_eq!(
+            provider.reload_credentials_file(&path),
+            Err(SendError::InvalidConfiguration)
+        );
+        assert_eq!(provider.config.auth_token, "token-new");
+        std::fs::write(
+            dir.join("next"),
+            r#"{"mode":"api_key","api_key_sid":"SKnew","api_key_secret":"secret-new"}"#,
+        )
+        .unwrap();
+        std::fs::rename(dir.join("next"), &path).unwrap();
+        provider.reload_credentials_file(&path).unwrap();
+        assert!(provider.send(&sms).await.is_ok());
+        server.await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

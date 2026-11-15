@@ -23,7 +23,22 @@ async fn run(
         Ok("eu") => Region::Eu,
         _ => return Err("invalid NOVU_TWILIO_REGION".into()),
     };
-    let mut provider = Twilio::new(Config {
+    let credentials_file =
+        std::env::var_os("NOVU_TWILIO_CREDENTIALS_FILE").map(std::path::PathBuf::from);
+    if credentials_file.is_some()
+        && [
+            "NOVU_TWILIO_AUTH_TOKEN",
+            "NOVU_TWILIO_AUTH_TOKEN_FILE",
+            "NOVU_TWILIO_API_KEY_SID",
+            "NOVU_TWILIO_API_KEY_SECRET",
+            "NOVU_TWILIO_API_KEY_SECRET_FILE",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+    {
+        return Err("Twilio credential sources conflict".into());
+    }
+    let provider_config = Config {
         account_sid: std::env::var("NOVU_TWILIO_ACCOUNT_SID")?,
         auth_token: novu_rust_contracts::secret::from_env(
             "NOVU_TWILIO_AUTH_TOKEN",
@@ -37,7 +52,12 @@ async fn run(
         )?,
         from: std::env::var("NOVU_TWILIO_FROM")?,
         region,
-    })?;
+    };
+    let mut provider = if let Some(path) = &credentials_file {
+        Twilio::with_credentials_file(provider_config, path)?
+    } else {
+        Twilio::new(provider_config)?
+    };
     if let Ok(base) = std::env::var("NOVU_TWILIO_STATUS_CALLBACK_BASE_URL") {
         provider = provider.with_status_callback(&base, &environment)?;
     }
@@ -111,6 +131,13 @@ async fn run(
                     }
                     if stop.requested() {
                         break;
+                    }
+                    if let Some(path) = &credentials_file
+                        && provider.reload_credentials_file(path).is_err()
+                    {
+                        eprintln!("Twilio credentials reload failed; dispatch paused");
+                        stop.wait(Duration::from_secs(2)).await;
+                        continue;
                     }
                     match tokio::time::timeout(
                         timeout,

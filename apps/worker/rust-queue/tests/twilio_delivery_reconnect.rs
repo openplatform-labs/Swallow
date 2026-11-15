@@ -75,6 +75,136 @@ fn invalid_timeout_is_rejected_before_connecting() {
     }
 }
 
+#[test]
+fn credential_file_cannot_be_combined_with_other_sources() {
+    let output = Command::new(env!("CARGO_BIN_EXE_twilio-worker"))
+        .env("DATABASE_URL", "postgresql://localhost/unused")
+        .env("NOVU_TWILIO_ENVIRONMENT_ID", "env")
+        .env("NOVU_TWILIO_ACCOUNT_SID", "ACfixture")
+        .env("NOVU_TWILIO_FROM", "+15550000001")
+        .env("NOVU_TWILIO_AUTH_TOKEN", "fixture-sensitive-token")
+        .env("NOVU_TWILIO_CREDENTIALS_FILE", "/nonexistent/test-file")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("credential sources conflict"));
+    assert!(!error.contains("fixture-sensitive-token"));
+    assert!(!error.contains("/nonexistent/test-file"));
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database"]
+async fn credential_reload_pauses_claims_until_file_is_valid() {
+    let url = std::env::var("TEST_DATABASE_URL").unwrap();
+    let db = connect(&url).await;
+    db.batch_execute("CREATE TABLE novu_rust_environments(id text PRIMARY KEY,organization_id text NOT NULL); INSERT INTO novu_rust_environments VALUES ('env','org')").await.unwrap();
+    db.batch_execute(include_str!(
+        "../migrations/0121_sms_workflow_worker_policy.sql"
+    ))
+    .await
+    .unwrap();
+    db.batch_execute(queue::MIGRATION).await.unwrap();
+    db.batch_execute(queue::twilio_queue::MIGRATION)
+        .await
+        .unwrap();
+    db.batch_execute(queue::in_app::SMS_MESSAGES_MIGRATION)
+        .await
+        .unwrap();
+    db.batch_execute("ALTER TABLE novu_rust_sms_messages ADD COLUMN delivery_state text NOT NULL DEFAULT 'not_attempted'").await.unwrap();
+    let dir = std::env::temp_dir().join(format!("swallow-twilio-reload-{}", Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let key = dir.join("key");
+    let log = dir.join("stderr");
+    std::fs::write(
+        &key,
+        r#"{"mode":"auth_token","auth_token":"fixture-key-before"}"#,
+    )
+    .unwrap();
+    let mut process = Worker(
+        Command::new(env!("CARGO_BIN_EXE_twilio-worker"))
+            .env("DATABASE_URL", &url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("NOVU_TWILIO_ENVIRONMENT_ID", "env")
+            .env_remove("NOVU_TWILIO_AUTH_TOKEN")
+            .env("NOVU_TWILIO_CREDENTIALS_FILE", &key)
+            .env("NOVU_TWILIO_ACCOUNT_SID", "ACfixture")
+            .env("NOVU_TWILIO_FROM", "+15550000001")
+            .env_remove("NOVU_TWILIO_AUTH_TOKEN_FILE")
+            .env_remove("NOVU_TWILIO_API_KEY_SID")
+            .env_remove("NOVU_TWILIO_API_KEY_SECRET")
+            .env_remove("NOVU_TWILIO_API_KEY_SECRET_FILE")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&log).unwrap()))
+            .spawn()
+            .unwrap(),
+    );
+    for _ in 0..100 {
+        if db.query_one("SELECT EXISTS(SELECT 1 FROM novu_rust_sms_workflow_worker_config WHERE environment_id='env')", &[]).await.unwrap().get::<_, bool>(0) { break; }
+        assert!(
+            process.0.try_wait().unwrap().is_none(),
+            "worker exited early"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    std::fs::write(&key, "invalid\nfixture-key").unwrap();
+    let mut paused = false;
+    for _ in 0..100 {
+        let output = std::fs::read_to_string(&log).unwrap();
+        assert!(!output.contains("fixture-key"));
+        if output.contains("credentials reload failed") {
+            paused = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(paused, "worker did not pause on invalid key");
+    let job = Uuid::new_v4();
+    // Unknown field guarantees failure before any provider request.
+    db.execute(
+        "INSERT INTO novu_queue_jobs(id,environment_id,kind,payload) VALUES ($1,'env',$2,$3)",
+        &[
+            &job,
+            &queue::twilio_queue::JOB_KIND,
+            &json!({"invalid":true}),
+        ],
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        db.query_one("SELECT status FROM novu_queue_jobs WHERE id=$1", &[&job])
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        "pending"
+    );
+    std::fs::write(
+        dir.join("replacement"),
+        r#"{"mode":"api_key","api_key_sid":"SKnew","api_key_secret":"fixture-key-after"}"#,
+    )
+    .unwrap();
+    std::fs::rename(dir.join("replacement"), &key).unwrap();
+    let mut resumed = false;
+    for _ in 0..100 {
+        if db
+            .query_one("SELECT status FROM novu_queue_jobs WHERE id=$1", &[&job])
+            .await
+            .unwrap()
+            .get::<_, String>(0)
+            == "failed"
+        {
+            resumed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(resumed, "worker did not resume after key replacement");
+    assert!(process.0.try_wait().unwrap().is_none());
+    drop(process);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[tokio::test]
 #[ignore = "restarts a disposable PostgreSQL container"]
 async fn workers_reconnect_and_preserve_uncertain_attempts() {
