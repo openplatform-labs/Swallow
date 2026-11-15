@@ -498,6 +498,8 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/operator/smtp-scope/audit", get(operator_identity::smtp_scope_audit))
         .route("/v1/experimental/operator/smtp-attention", get(operator_identity::smtp_attention))
         .route("/v1/experimental/operator/smtp-review", post(operator_identity::smtp_review))
+        .route("/v1/experimental/operator/smtp-resolution", post(operator_identity::smtp_resolve))
+        .route("/v1/experimental/operator/smtp-resolution-request", get(operator_identity::smtp_resolution_request))
         .route("/v1/experimental/operator/smtp-review-request", get(operator_identity::smtp_review_request))
         .route("/v1/experimental/operator/discord-attention", get(operator_identity::discord_attention))
         .route("/v1/experimental/operator/discord-review", post(operator_identity::discord_review))

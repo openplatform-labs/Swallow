@@ -1,3 +1,5 @@
+SMTP 불명 결과 판정 API: API 0132는 환경별 JWT 접수·재시도 권한과 API DB 로그인 권한을 모두 검사하고 판정 및 요청 재조회를 제공한다. JWT별 요청 ID를 분리하며 시도 revision 충돌과 감사 저장 실패 시 판정을 롤백한다. 제한 API DB 로그인·서명 테스트 JWT·격리 로컬 PostgreSQL에서 권한 회수, 환경 격리, 서로 다른 JWT의 동일 요청 ID, 재시도 및 롤백을 검증했다. DB와 JWT 권한은 DBA가 별도로 설정한다. 관리 UI·권한 위임과 실제 IdP·외부 발송·운영 HA는 미구현 또는 미검증이다. [API README](apps/api/rust-api/README.md)를 참고한다.
+
 SMTP 판정 이력 조회: 워커 0222와 `smtp-resolution-history` CLI는 판정 권한과 독립된 환경별 DB 조회 권한을 사용해 작업별 판정과 사유를 페이지로 제공한다. 제한 로그인·격리 로컬 PostgreSQL에서 환경 격리, 직접 테이블 접근 거절, 같은 시각의 103건 페이지, CLI 커서와 권한 회수를 검증했다. SMTP 판정 및 실제 워커·모의 릴레이 재시도 회귀도 통과했다. 동시 커밋의 완전한 수집과 위변조 방지는 보장하지 않으며 초기 권한은 DBA가 설정한다. HTTP·UI와 운영 HA는 미구현 또는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
 SMTP 운영자 재시도 워커 연계 시험: 격리 로컬 PostgreSQL·실제 SMTP 워커 두 프로세스·모의 STARTTLS 릴레이에서 DATA 수신 후 첫 워커를 종료했다. 자동 재발송이 없음을 확인하고 제한 운영자 계정으로 재시도를 선택한 뒤 새 시도와 발송, 작업·메시지·감사 상태를 검증했다. 첫 DATA도 모의 서버에 도착하므로 근거가 틀린 재시도의 중복 가능성을 보여 준다. 강제 임대 만료를 사용했으며 실제 공급자·최종 수신·HTTP·UI 및 다중 호스트 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
