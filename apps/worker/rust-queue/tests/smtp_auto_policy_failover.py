@@ -35,15 +35,18 @@ def until(predicate,message):
 try:
     sql(primary,"""CREATE ROLE smtp_policy_ha_api LOGIN; GRANT USAGE ON SCHEMA public TO smtp_policy_ha_api;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_smtp_auto_policy_read(text,text,text,text,bigint),public.novu_rust_operator_jwt_smtp_auto_policy_change(text,text,text,text,bigint,uuid,bigint,boolean,integer,integer,text,text),public.novu_rust_operator_jwt_smtp_auto_policy_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_smtp_auto_policy_audit_read(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_smtp_auto_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_smtp_auto_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_smtp_auto_grant_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_smtp_auto_grant_audit_read(text,text,text,text,bigint,uuid) TO smtp_policy_ha_api;
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_smtp_auto_worker_health(text,text,text,text,bigint,integer,integer) TO smtp_policy_ha_api;
 INSERT INTO public.novu_rust_environments VALUES('smtp-policy-ha','org'),('smtp-other-ha','org');
 INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES('https://issuer.test','admin','console','smtp-policy-ha'),('https://issuer.test','target','console','smtp-policy-ha');
 INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname='smtp_policy_ha_api';
 INSERT INTO public.novu_rust_operator_jwt_smtp_auto_policy_grants VALUES('https://issuer.test','admin','console','smtp-policy-ha',true,true,true,true);
+INSERT INTO public.novu_rust_operator_jwt_smtp_auto_worker_grants VALUES('https://issuer.test','admin','console','smtp-policy-ha',true);
+INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'smtp-policy-ha',rolname,'alert_view',oid FROM pg_roles WHERE rolname='smtp_policy_ha_api';
 INSERT INTO public.novu_rust_operator_jwt_smtp_auto_grant_admins VALUES('https://issuer.test','admin','console','smtp-policy-ha',true,true);
 INSERT INTO public.novu_rust_operator_jwt_smtp_auto_grant_audit_viewers VALUES('https://issuer.test','admin','console','smtp-policy-ha');
 INSERT INTO public.novu_rust_smtp_auto_admins SELECT 'smtp-policy-ha',rolname,oid,true,true,true FROM pg_roles WHERE rolname='smtp_policy_ha_api';
 CREATE ROLE smtp_auto_ha_worker LOGIN; GRANT USAGE ON SCHEMA public TO smtp_auto_ha_worker;
-GRANT EXECUTE ON FUNCTION public.novu_rust_smtp_auto_retry_batch(text,integer) TO smtp_auto_ha_worker;
+GRANT EXECUTE ON FUNCTION public.novu_rust_smtp_auto_retry_batch(text,integer),public.novu_rust_smtp_auto_retry_batch_observed(text,integer) TO smtp_auto_ha_worker;
 INSERT INTO public.novu_rust_smtp_auto_retry_workers SELECT 'smtp-policy-ha',rolname,oid FROM pg_roles WHERE rolname='smtp_auto_ha_worker';""")
     pub=(root/'apps/api/rust-api/tests/fixtures/operator_jwt/test-only-public.pem').read_text();keys=directory/'smtp-policy-keys.json';keys.write_text(json.dumps({'issuer':'https://issuer.test','audience':'swallow','keys':[{'kid':'fixture','pem':pub}]}))
     sock=socket.socket();sock.bind(('127.0.0.1',0));port=sock.getsockname()[1];sock.close();base=f'http://127.0.0.1:{port}'
@@ -58,7 +61,8 @@ INSERT INTO public.novu_rust_smtp_auto_retry_workers SELECT 'smtp-policy-ha',rol
     status,result=call(grants,admin,'PUT',grant);assert status==200 and result['changed'] is True
     assert call(policy,target)[0]==200
     until(lambda:sql(standby,"SELECT count(*) FROM public.novu_rust_operator_jwt_smtp_auto_policy_audit WHERE environment_id='smtp-policy-ha'")=='1' and sql(standby,"SELECT count(*) FROM public.novu_rust_operator_jwt_smtp_auto_grant_audit WHERE environment_id='smtp-policy-ha'")=='1','changes did not replicate')
-    worker_cfg={**os.environ,'DATABASE_URL':os.environ['TEST_FAILOVER_URL'].replace('postgres://postgres@','postgres://smtp_auto_ha_worker@',1),'NOVU_POSTGRES_ALLOW_INSECURE':'true','NOVU_SMTP_ENVIRONMENT_ID':'smtp-policy-ha','SWALLOW_SMTP_AUTO_RETRY_INTERVAL_SECONDS':'1'}
+    worker_cfg={**os.environ,'DATABASE_URL':os.environ['TEST_FAILOVER_URL'].replace('postgres://postgres@','postgres://smtp_auto_ha_worker@',1),'NOVU_POSTGRES_ALLOW_INSECURE':'true','NOVU_SMTP_ENVIRONMENT_ID':'smtp-policy-ha','SWALLOW_SMTP_AUTO_RETRY_INTERVAL_SECONDS':'1','SWALLOW_SMTP_AUTO_WORKER_HEALTH':'true'}
+    worker_health='/v1/experimental/operator/smtp-auto-worker-health?environmentId=smtp-policy-ha&maxAgeSeconds=30&minimumHealthy=1'
     job_sql="""INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES('11111111-1111-4111-8111-111111111111','smtp-policy-ha','experimental_smtp_email','{}','failed');
 INSERT INTO public.novu_rust_smtp_attempts(job_id,environment_id,state,updated_at) VALUES('11111111-1111-4111-8111-111111111111','smtp-policy-ha','unknown',clock_timestamp()-interval '1 hour');"""
     if inflight:
@@ -69,7 +73,7 @@ INSERT INTO public.novu_rust_smtp_attempts(job_id,environment_id,state,updated_a
         until(lambda:sql(primary,"SELECT count(*) FROM pg_stat_activity WHERE application_name='smtp_auto_inflight_fixture' AND wait_event='PgSleep'")=='1','retry transaction did not reach uncommitted state')
     else:
         worker=subprocess.Popen([os.environ['TEST_AUTO_WORKER']],env=worker_cfg,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-        time.sleep(2);assert worker.poll() is None
+        until(lambda:(lambda result: result[0]==200 and result[1]['healthy']==1)(call(worker_health,admin)),'worker heartbeat missing before promotion');assert worker.poll() is None
     control(os.environ['TEST_LOCAL_PRIMARY_DATA'],'-m','immediate','stop');control(os.environ['TEST_LOCAL_STANDBY_DATA'],'promote')
     if inflight:
         assert transaction.wait(timeout=10)!=0
@@ -90,6 +94,9 @@ INSERT INTO public.novu_rust_smtp_attempts(job_id,environment_id,state,updated_a
     else:
         sql(standby,job_sql)
     until(lambda:sql(standby,"SELECT count(*) FROM public.novu_rust_smtp_auto_retries WHERE environment_id='smtp-policy-ha'")=='1','retry did not run after promotion')
+    until(lambda:(lambda result: result[0]==200 and result[1]['healthy']==1)(call(worker_health,admin)),'worker heartbeat missing after promotion')
+    if not inflight:
+        status,health=call(worker_health,admin);assert status==200 and health['healthy']==1 and health['stale']>=1
     assert worker.poll() is None
     assert sql(standby,"SELECT status FROM public.novu_queue_jobs WHERE id='11111111-1111-4111-8111-111111111111'")=='pending'
     assert sql(standby,"SELECT count(*) FROM public.novu_rust_smtp_attempts WHERE job_id='11111111-1111-4111-8111-111111111111'")=='0'
