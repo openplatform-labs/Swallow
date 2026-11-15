@@ -128,6 +128,11 @@ async fn sendgrid_ip_pool_override_reaches_provider_body() {
             json!({"providers":{"sendgrid":{"ipPoolName":"provider-pool"}},"steps":{"mail-step":{"providers":{"sendgrid":{"ipPoolName":"step-pool"}}}}}),
             "step-pool",
         ),
+        (
+            "empty-provider",
+            json!({"email":{"ipPoolName":"channel-pool"},"providers":{"sendgrid":{"ipPoolName":""}}}),
+            "",
+        ),
     ];
     for (case, overrides, expected) in cases {
         let body = json!({"name":"pool-workflow","to":{"subscriberId":format!("person-{case}"),"email":"recipient@example.test"},"payload":{},"transactionId":format!("pool-{case}"),"overrides":overrides});

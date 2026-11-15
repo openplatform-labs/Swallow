@@ -1,8 +1,8 @@
 ## SendGrid IP 풀 선택
 
-SendGrid 워커의 `NOVU_SENDGRID_IP_POOL_NAME`으로 기본 IP 풀을 선택할 수 있다. 트리거의 `overrides.email.ipPoolName`, `overrides.sendgrid.ipPoolName`, `overrides.providers.sendgrid.ipPoolName`, 해당 단계의 `overrides.steps.<stepId>.providers.sendgrid.ipPoolName`은 차례로 앞 설정을 덮는다. 최종 값이 빈 문자열이면 워커 기본값을 사용한다. 설정이 없으면 공급자 요청과 작업 payload에서 풀 필드를 생략한다. override 사용 전 모든 SendGrid 워커를 업데이트해야 한다. 풀의 유효성·권한과 실제 전송 가능 여부는 SendGrid가 판단한다. 이 구현은 다른 공급자에 IP 풀을 적용하지 않는다.
+SendGrid 워커의 `NOVU_SENDGRID_IP_POOL_NAME`으로 기본 IP 풀을 선택할 수 있다. 트리거의 `overrides.email.ipPoolName`, `overrides.sendgrid.ipPoolName`, `overrides.providers.sendgrid.ipPoolName`, 해당 단계의 `overrides.steps.<stepId>.providers.sendgrid.ipPoolName`은 차례로 앞 설정을 덮는다. 이메일 채널 값이 빈 문자열이면 워커 기본값을 사용한다. 공급자 또는 단계 override가 빈 문자열을 명시하면 원본처럼 빈 값을 공급자에 전달한다. 설정이 없으면 공급자 요청과 작업 payload에서 풀 필드를 생략한다. override 사용 전 모든 SendGrid 워커를 업데이트해야 한다. 풀의 유효성·권한과 실제 전송 가능 여부는 SendGrid가 판단한다. 이 구현은 다른 공급자에 IP 풀을 적용하지 않는다.
 
-로컬 PostgreSQL 17에서 API 트리거부터 워크플로 작업·SendGrid 요청 본문까지 네 override의 우선순위를 확인했고 모의 HTTP에서 기본값·override·빈 값 대체를 검증했다. 원본 소스의 옵션 및 기본값 우선순위를 확인했으나 원본 서버와 실제 SendGrid 전송은 이번에 비교하지 않았다. Docker 저장소가 읽기 전용이어서 DB 테스트는 임시 로컬 인스턴스를 사용했다.
+로컬 PostgreSQL 17에서 API 트리거부터 워크플로 작업·SendGrid 요청 본문까지 네 override의 우선순위를 확인했고 모의 HTTP에서 기본값·override·빈 값 대체를 검증했다. 원본 Novu 공급자 소스와 동일 버전 SendGrid SDK를 이용해 기본값, 채널·공급자 override와 빈 문자열의 6개 요청 사례를 비교했다. 원본 서버와 실제 SendGrid 전송은 비교하지 않았다. Docker 저장소가 읽기 전용이어서 DB 테스트는 임시 로컬 인스턴스를 사용했다.
 
 ## SendGrid 운영 CLI 결과 일관성
 

@@ -130,3 +130,51 @@ fn original_sendgrid_wire_body() {
         original
     );
 }
+
+#[test]
+#[ignore = "requires original source, esbuild, and isolated SendGrid dependencies"]
+fn original_sendgrid_ip_pool_precedence() {
+    use novu_postgres_queue::sendgrid::request_body_with_default_pool;
+    let output = Command::new("node")
+        .arg("tests/reference_sendgrid_ip_pool.cjs")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let original: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
+    let config = Config {
+        api_key: "SG.fixture".into(),
+        from: "sender@example.test".into(),
+        sender_name: "Sender".into(),
+        region: Region::Global,
+    };
+    let mut email = Email {
+        to: vec!["a@example.test".into()],
+        subject: "Hi".into(),
+        html: "<p>Hi</p>".into(),
+        ..Email::default()
+    };
+    let mut actual = Vec::new();
+    let pool = |email: &Email, default| {
+        request_body_with_default_pool(&config, email, default)
+            .unwrap()
+            .get("ip_pool_name")
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    actual.push(pool(&email, None));
+    actual.push(pool(&email, Some("default-pool")));
+    email.ip_pool_name = Some("override-pool".into());
+    actual.push(pool(&email, Some("default-pool")));
+    email.ip_pool_name = Some(String::new());
+    actual.push(pool(&email, Some("default-pool")));
+    email.ip_pool_name = Some("provider-pool".into());
+    email.ip_pool_explicit_provider = true;
+    actual.push(pool(&email, Some("default-pool")));
+    email.ip_pool_name = Some(String::new());
+    actual.push(pool(&email, Some("default-pool")));
+    assert_eq!(actual, original);
+}

@@ -31,6 +31,7 @@ pub struct Email {
     pub provider_from_without_name: bool,
     pub reply_to: Option<String>,
     pub ip_pool_name: Option<String>,
+    pub ip_pool_explicit_provider: bool,
     pub subject: String,
     pub html: String,
     pub text: Option<String>,
@@ -171,7 +172,7 @@ pub fn request_body(config: &Config, message: &Email) -> Result<Value, SendError
     if let Some(pool) = message
         .ip_pool_name
         .as_deref()
-        .filter(|value| !value.is_empty())
+        .filter(|value| message.ip_pool_explicit_provider || !value.is_empty())
     {
         body["ip_pool_name"] = json!(pool);
     }
@@ -226,6 +227,21 @@ pub fn request_body(config: &Config, message: &Email) -> Result<Value, SendError
     }
     if !message.headers.is_empty() {
         body["headers"] = json!(message.headers);
+    }
+    Ok(body)
+}
+
+/// Apply the integration default after per-message and provider overrides.
+pub fn request_body_with_default_pool(
+    config: &Config,
+    message: &Email,
+    default: Option<&str>,
+) -> Result<Value, SendError> {
+    let mut body = request_body(config, message)?;
+    if body.get("ip_pool_name").is_none() {
+        if let Some(pool) = default.filter(|value| !value.is_empty()) {
+            body["ip_pool_name"] = json!(pool);
+        }
     }
     Ok(body)
 }
@@ -297,16 +313,8 @@ impl Sendgrid {
     }
     /// Send once; ambiguous network failures are never automatically retried.
     pub async fn send(&self, message: &Email) -> Result<Receipt, SendError> {
-        let mut body = request_body(&self.config, message)?;
-        if body.get("ip_pool_name").is_none() {
-            if let Some(pool) = self
-                .default_ip_pool
-                .as_deref()
-                .filter(|value| !value.is_empty())
-            {
-                body["ip_pool_name"] = json!(pool);
-            }
-        }
+        let body =
+            request_body_with_default_pool(&self.config, message, self.default_ip_pool.as_deref())?;
         let response = self
             .http
             .post(&self.endpoint)
@@ -421,7 +429,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/v3/mail/send", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
-            for expected in ["default-pool", "override-pool", "default-pool"] {
+            for expected in ["default-pool", "override-pool", "default-pool", ""] {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut bytes = Vec::new();
                 let mut buf = [0; 4096];
@@ -463,6 +471,8 @@ mod tests {
         email.ip_pool_name = Some("override-pool".into());
         provider.send(&email).await.unwrap();
         email.ip_pool_name = Some(String::new());
+        provider.send(&email).await.unwrap();
+        email.ip_pool_explicit_provider = true;
         provider.send(&email).await.unwrap();
         server.await.unwrap();
     }
