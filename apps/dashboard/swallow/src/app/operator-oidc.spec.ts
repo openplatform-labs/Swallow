@@ -46,6 +46,34 @@ describe('operator OIDC configuration',()=>{
     await expect(service.prepare(settings)).rejects.toThrow('response too large');expect(cancelled).toBe(true);
     await expect(service.prepare(settings)).rejects.toThrow();await expect(service.prepare(settings)).rejects.toThrow('response too large');expect(fetchMock).toHaveBeenCalledTimes(3);
   });
+  it('uses a bounded no-redirect transport for both token clients without replacing global fetch',async()=>{
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValue(new Response('{"ok":true}',{headers:{'Content-Type':'application/json'}}));
+    const popup=vi.spyOn(UserManager.prototype,'signinPopup').mockImplementation(async function(this:UserManager){
+      type Service={fetchWithTimeout:(url:string,init:RequestInit & {timeoutInSeconds:number})=>Promise<Response>};
+      type Internal={_client:{_tokenClient:{_jsonService:Service};_validator:{_tokenClient:{_jsonService:Service}}}};
+      const c=(this as unknown as Internal)._client;
+      for(const service of [c._tokenClient._jsonService,c._validator._tokenClient._jsonService]){
+        await service.fetchWithTimeout(metadata.token_endpoint,{method:'POST',body:'fixture-code',timeoutInSeconds:5});
+        await expect(service.fetchWithTimeout('https://other.test/token',{method:'POST',timeoutInSeconds:5})).rejects.toThrow('invalid OIDC token request');
+      }
+      throw new Error('fixture completed');
+    });
+    vi.spyOn(UserManager.prototype,'removeUser').mockResolvedValue();
+    await expect(new OperatorOidc().signIn({settings,metadata})).rejects.toThrow('fixture completed');
+    expect(popup).toHaveBeenCalledOnce();expect(fetchMock).toHaveBeenCalledTimes(2);
+    for(const [url,init] of fetchMock.mock.calls){expect(url).toBe(metadata.token_endpoint);expect(init).toEqual(expect.objectContaining({redirect:'error',credentials:'omit',cache:'no-store',method:'POST'}));}
+    expect(globalThis.fetch).toBe(fetchMock);
+  });
+  it('rejects oversized token endpoint responses before parsing',async()=>{
+    vi.spyOn(globalThis,'fetch').mockResolvedValue(new Response('x'.repeat(65537),{headers:{'Content-Type':'application/json'}}));
+    vi.spyOn(UserManager.prototype,'signinPopup').mockImplementation(async function(this:UserManager){
+      const c=(this as unknown as {_client:{_validator:{_tokenClient:{_jsonService:{fetchWithTimeout:(url:string,init:RequestInit)=>Promise<Response>}}}}})._client;
+      await c._validator._tokenClient._jsonService.fetchWithTimeout(metadata.token_endpoint,{method:'POST'});
+      throw new Error('unexpected');
+    });
+    vi.spyOn(UserManager.prototype,'removeUser').mockResolvedValue();
+    await expect(new OperatorOidc().signIn({settings,metadata})).rejects.toThrow('response too large');
+  });
   it('bounds signing keys and operator identity responses',async()=>{
     const {privateKey,publicKey}=await generateKeyPair('RS256');const jwk={...(await exportJWK(publicKey)),kid:'test',alg:'RS256',use:'sig'};
     vi.spyOn(UserManager.prototype,'signinPopup').mockImplementation(async args=>({expired:false,token_type:'Bearer',access_token:accessToken,id_token:await new SignJWT({nonce:args?.nonce}).setProtectedHeader({alg:'RS256',kid:'test'}).setIssuer(settings.issuer).setAudience(settings.clientId).setSubject('alice').setIssuedAt().setExpirationTime('1m').sign(privateKey)} as User));

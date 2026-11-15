@@ -13,7 +13,8 @@ const privateKey=await importPKCS8(privatePem,'RS256');
 const jwk=await exportJWK(await importSPKI(publicPem,'RS256'));
 Object.assign(jwk,{kid:'key',use:'sig',alg:'RS256'});
 const codes=new Map(),refreshTokens=new Map(),accessTokens=new Set();
-let revokedCount=0,lastRevoked=null,revokedAccessCount=0;
+let revokedCount=0,lastRevoked=null,revokedAccessCount=0,redirectLeaks=0,tokenAttempts=0;
+let redirectToken=process.env.SWALLOW_TEST_OIDC_TOKEN_REDIRECT==='true';
 const refreshEnabled=process.env.SWALLOW_TEST_OIDC_REFRESH==='true';
 const lifetime=refreshEnabled ? Number(process.env.SWALLOW_TEST_OIDC_LIFETIME||9) : 600;
 if(!Number.isInteger(lifetime)||lifetime<3||lifetime>600)throw new Error('invalid test lifetime');
@@ -29,6 +30,9 @@ const server=createServer(async(req,res)=>{
     json({issuer,authorization_endpoint:`${issuer}/authorize`,token_endpoint:`${issuer}/token`,jwks_uri:`${issuer}/jwks`,...(refreshEnabled?{revocation_endpoint:`${issuer}/revoke`}:{}),response_types_supported:['code'],subject_types_supported:['public'],id_token_signing_alg_values_supported:['RS256'],code_challenge_methods_supported:['S256'],token_endpoint_auth_methods_supported:['none']});return;
   }
   if(req.method==='GET' && url.pathname==='/jwks'){json({keys:[jwk]});return;}
+  if(req.method==='POST' && url.pathname==='/fixture/token-redirect'){redirectToken=url.searchParams.get('enabled')==='true';json({enabled:redirectToken});return;}
+  if(req.method==='GET' && url.pathname==='/fixture/redirect-observations'){json({attempts:tokenAttempts,leaks:redirectLeaks});return;}
+  if(req.method==='POST' && url.pathname==='/fixture/token-leak'){redirectLeaks++;json({error:'unexpected_redirect'},400);return;}
   if(req.method==='GET' && url.pathname==='/fixture/revocation-count'){json({count:revokedCount,accessCount:revokedAccessCount});return;}
   if(req.method==='GET' && url.pathname==='/fixture/replay-revoked'){
     if(!lastRevoked){json({error:'no_revoked_token'},404);return;}
@@ -51,6 +55,8 @@ const server=createServer(async(req,res)=>{
     res.writeHead(302,{Location:redirect.toString()}).end();return;
   }
   if(req.method==='POST' && url.pathname==='/token'){
+    tokenAttempts++;
+    if(redirectToken){res.writeHead(307,{Location:`${issuer}/fixture/token-leak`}).end();return;}
     let raw='';for await(const chunk of req){raw+=chunk;if(raw.length>8192){json({error:'invalid_request'},400);return;}}
     const p=new URLSearchParams(raw);
     if(p.get('grant_type')==='refresh_token'){

@@ -51,6 +51,30 @@ async function boundedText(response: Response, limit: number): Promise<string> {
   } finally { reader.releaseLock(); }
 }
 
+// oidc-client-ts 3.5.0 has no per-instance fetch hook. Restrict only its two
+// token clients, fail closed if a future version changes their structure, and
+// leave the application-wide fetch untouched. Both code and refresh use POST.
+function secureTokenTransport(manager:UserManager, tokenEndpoint:string):void {
+  type FetchService={fetchWithTimeout:(input:RequestInfo|URL,init?:RequestInit & {timeoutInSeconds?:number})=>Promise<Response>};
+  type InternalClient={_tokenClient?:{_jsonService?:FetchService};_validator?:{_tokenClient?:{_jsonService?:FetchService}}};
+  const client=(manager as unknown as {_client?:InternalClient})._client;
+  const services=[client?._tokenClient?._jsonService,client?._validator?._tokenClient?._jsonService];
+  if(services.some(service=>!service || typeof service.fetchWithTimeout!=='function') || services[0]===services[1])throw new Error('unsupported OIDC token transport');
+  for(const service of services as FetchService[]){
+    service.fetchWithTimeout=async(input,init={})=>{
+      const url=typeof input==='string'?input:input instanceof URL?input.href:input.url;
+      if(url!==tokenEndpoint || init.method?.toUpperCase()!=='POST')throw new Error('invalid OIDC token request');
+      const {timeoutInSeconds,...options}=init;
+      const timeout=typeof timeoutInSeconds==='number' && Number.isFinite(timeoutInSeconds) && timeoutInSeconds>0 ? Math.min(timeoutInSeconds,30)*1000 : 10000;
+      const signal=options.signal?AbortSignal.any([options.signal,AbortSignal.timeout(timeout)]):AbortSignal.timeout(timeout);
+      const response=await fetch(input,{...options,credentials:'omit',redirect:'error',cache:'no-store',signal});
+      const text=await boundedText(response,65536);
+      const headers=new Headers(response.headers);headers.delete('content-length');
+      return new Response(text,{status:response.status,statusText:response.statusText,headers});
+    };
+  }
+}
+
 function revocationEndpoint(prepared:PreparedOidc):string|null {
   if(typeof prepared.metadata.revocation_endpoint!=='string')return null;
   try {
@@ -94,6 +118,7 @@ export class OperatorOidc {
     const stateStore=new WebStorageStateStore({store:new InMemoryWebStorage()});
     const userStore=new WebStorageStateStore({store:new InMemoryWebStorage()});
     const manager=new UserManager({authority:settings.issuer,client_id:settings.clientId,redirect_uri:callback,popup_redirect_uri:callback,response_type:'code',scope:settings.scope,metadata,resource:settings.resource || undefined,extraQueryParams:settings.audience ? {audience:settings.audience} : undefined,stateStore,userStore,automaticSilentRenew:false,loadUserInfo:false,disablePKCE:false});
+    secureTokenTransport(manager,metadata.token_endpoint!);
     try {
       const nonce=crypto.randomUUID();
       const user=await manager.signinPopup({nonce});
