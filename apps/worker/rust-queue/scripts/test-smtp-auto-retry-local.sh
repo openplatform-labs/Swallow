@@ -11,6 +11,6 @@ PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print
 export TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/postgres" DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/postgres" NOVU_POSTGRES_ALLOW_INSECURE=true CARGO_INCREMENTAL=0
 cargo run --quiet --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --bin migrate-worker -- apply api "$ROOT/apps/api/rust-api/migrations" --through 17
 cargo run --quiet --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --bin migrate-worker -- apply worker "$ROOT/apps/worker/rust-queue/migrations"
-cargo build --quiet --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --bin smtp-worker --bin smtp-auto-retry-worker
+cargo build --quiet --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --bin smtp-worker --bin smtp-auto-retry-worker --bin delivery-reconcile
 TEST_PSQL="$TEST_PG_BIN/psql" TEST_WORKER_DIR="$ROOT/apps/worker/rust-queue/target/debug" python3 "$ROOT/apps/worker/rust-queue/tests/smtp_auto_retry_process.py"
 cargo test --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --test smtp_auto_admin -- --ignored

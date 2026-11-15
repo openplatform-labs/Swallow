@@ -37,10 +37,11 @@ server=Server(('127.0.0.1',0),Relay);thread=threading.Thread(target=server.serve
 try:
     env='smtp-auto-fixture';other='smtp-auto-other';first=str(uuid.uuid4());second=str(uuid.uuid4());old=str(uuid.uuid4());reviewed=str(uuid.uuid4())
     sql("""CREATE ROLE smtp_auto_fixture LOGIN; GRANT USAGE ON SCHEMA public TO smtp_auto_fixture;
-GRANT EXECUTE ON FUNCTION public.novu_rust_smtp_auto_retry_batch(text,integer),public.novu_rust_smtp_auto_history(text,bigint) TO smtp_auto_fixture;
+GRANT EXECUTE ON FUNCTION public.novu_rust_smtp_auto_retry_batch(text,integer),public.novu_rust_smtp_auto_history(text,bigint),public.novu_rust_smtp_auto_retry_health(text,integer) TO smtp_auto_fixture;
 INSERT INTO public.novu_rust_environments VALUES('smtp-auto-fixture','org'),('smtp-auto-other','org');
 INSERT INTO public.novu_rust_smtp_auto_retry_workers SELECT 'smtp-auto-fixture',rolname,oid FROM pg_roles WHERE rolname='smtp_auto_fixture';
 INSERT INTO public.novu_rust_smtp_auto_admins SELECT 'smtp-auto-fixture',rolname,oid,false,false,true FROM pg_roles WHERE rolname='smtp_auto_fixture';
+INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'smtp-auto-fixture',rolname,'alert_view',oid FROM pg_roles WHERE rolname='smtp_auto_fixture';
 INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) VALUES ('%s','smtp-auto-fixture','experimental_smtp_email','{"to":["first@example.test"],"subject":"successful","html":"hello"}');"""%first)
     cfg={**os.environ,'NOVU_POSTGRES_ALLOW_INSECURE':'true','NOVU_SMTP_ENVIRONMENT_ID':env,'SWALLOW_SMTP_HOST':'127.0.0.1','SWALLOW_SMTP_PORT':str(server.server_address[1]),'SWALLOW_SMTP_TLS':'none','SWALLOW_SMTP_FROM':'sender@example.test'}
     for key in ('SWALLOW_SMTP_USERNAME','SWALLOW_SMTP_PASSWORD','SWALLOW_SMTP_PASSWORD_FILE','SWALLOW_SMTP_CA_FILE','SWALLOW_SMTP_TRANSPORT_GUARD'):cfg.pop(key,None)
@@ -56,6 +57,11 @@ INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_pr
 SELECT public.novu_rust_ack_smtp('smtp-auto-fixture','%s',a.revision,j.failure_revision,'fixture','reviewed') FROM public.novu_queue_jobs j JOIN public.novu_rust_smtp_attempts a ON a.job_id=j.id WHERE j.id='%s';"""%(reviewed,reviewed,reviewed,reviewed))
     runner_url=db.replace('postgres://postgres@','postgres://smtp_auto_fixture@',1)
     runner={**os.environ,'DATABASE_URL':runner_url,'NOVU_POSTGRES_ALLOW_INSECURE':'true','NOVU_SMTP_ENVIRONMENT_ID':env,'SWALLOW_SMTP_AUTO_RETRY_INTERVAL_SECONDS':'1'}
+    def health(grace='1'):
+        p=subprocess.run([str(pathlib.Path(work)/'delivery-reconcile'),'check-smtp-auto',env,grace],env=runner,capture_output=True,text=True,timeout=10)
+        return p.returncode,json.loads(p.stdout) if p.stdout else None
+    assert health()==(0,{'enabled':False,'eligible':0,'overdue':0,'exhausted':0})
+    assert subprocess.run([str(pathlib.Path(work)/'delivery-reconcile'),'check-smtp-auto','smtp-auto-other','1'],env=runner,capture_output=True,timeout=10).returncode==1
     denied=subprocess.run([psql,runner_url,'-q','-At','-v','ON_ERROR_STOP=1','-c',"SELECT public.novu_rust_smtp_auto_retry_batch('smtp-auto-other',1)"],capture_output=True,timeout=10)
     assert denied.returncode!=0
     for _ in range(2):children.append(subprocess.Popen([str(pathlib.Path(work)/'smtp-auto-retry-worker')],env=runner,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL))
@@ -64,6 +70,8 @@ SELECT public.novu_rust_ack_smtp('smtp-auto-fixture','%s',a.revision,j.failure_r
     time.sleep(2)
     assert sql("SELECT count(*) FROM public.novu_rust_smtp_auto_retries")=='0'
     assert sql("SELECT count(*) FROM public.novu_queue_jobs j JOIN public.novu_rust_smtp_attempts a ON a.job_id=j.id WHERE j.id='%s' AND j.status='failed' AND a.state='unknown'"%first)=='1'
+    assert health()==(2,{'enabled':True,'eligible':1,'overdue':1,'exhausted':0})
+    assert health('0')[0]==1
     sql("DROP TRIGGER fixture_smtp_retry_audit_fail ON public.novu_rust_smtp_auto_retries; DROP FUNCTION public.fixture_smtp_retry_audit_fail()")
     until(lambda:sql("SELECT count(*) FROM public.novu_queue_jobs j JOIN public.novu_rust_smtp_attempts a ON a.job_id=j.id WHERE j.id='%s' AND j.status='completed' AND a.state='accepted'"%first)=='1','automatic replay did not reach relay')
     assert sql("SELECT count(*) FROM public.novu_rust_smtp_auto_retries WHERE job_id='%s'"%first)=='1'
@@ -77,6 +85,7 @@ SELECT public.novu_rust_ack_smtp('smtp-auto-fixture','%s',a.revision,j.failure_r
     sql("UPDATE public.novu_rust_smtp_attempts SET updated_at=clock_timestamp()-interval '20 seconds' WHERE job_id='%s'"%second)
     time.sleep(3)
     assert sql("SELECT count(*) FROM public.novu_rust_smtp_auto_retries WHERE job_id='%s'"%second)=='1'
+    assert health()==(2,{'enabled':True,'eligible':0,'overdue':0,'exhausted':1})
     history=subprocess.run([psql,runner_url,'-q','-At','-v','ON_ERROR_STOP=1','-c',"SELECT public.novu_rust_smtp_auto_history('smtp-auto-fixture',NULL)"],capture_output=True,text=True,timeout=10)
     assert history.returncode==0
     rows=json.loads(history.stdout)['data'];assert len(rows)==2 and {row['jobId'] for row in rows}=={first,second}

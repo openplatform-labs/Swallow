@@ -564,6 +564,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let rows=db.query("SELECT * FROM public.novu_rust_smtp_scope_audit_read($1,$2)",&[&args[1],&after]).await?;
         let data:Vec<_>=rows.iter().map(|r|serde_json::json!({"id":r.get::<_,String>(0),"databasePrincipal":r.get::<_,String>(1),"principalOid":r.get::<_,String>(2),"previousEnvironment":r.get::<_,Option<String>>(3),"environmentId":r.get::<_,Option<String>>(4),"previousEnabled":r.get::<_,Option<bool>>(5),"enabled":r.get::<_,bool>(6),"actor":r.get::<_,String>(7),"actorOid":r.get::<_,Option<String>>(8),"recordedAt":r.get::<_,String>(9)})).collect();
         println!("{}",serde_json::json!({"data":data}));
+    } else if args.len() == 3 && args[0] == "check-smtp-auto" {
+        let grace=args[2].parse::<i32>()?;
+        let row=db.query_one("SELECT * FROM public.novu_rust_smtp_auto_retry_health($1,$2)",&[&args[1],&grace]).await?;
+        let (enabled,eligible,overdue,exhausted)=(row.get::<_,bool>(0),row.get::<_,i64>(1),row.get::<_,i64>(2),row.get::<_,i64>(3));
+        println!("{}",serde_json::json!({"enabled":enabled,"eligible":eligible,"overdue":overdue,"exhausted":exhausted}));
+        if overdue>0 || exhausted>0 {std::process::exit(2);}
     } else if args.len() == 2 && args[0] == "check-smtp" {
         let row = db.query_one("SELECT * FROM public.novu_rust_smtp_health($1)",&[&args[1]]).await?;
         let (unknown,stranded,pre_dispatch)=(row.get::<_,i64>(0),row.get::<_,i64>(1),row.get::<_,i64>(2));
