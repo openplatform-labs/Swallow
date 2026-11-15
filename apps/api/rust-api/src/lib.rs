@@ -348,6 +348,7 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/operator/token/revoke-self", post(operator_identity::revoke_self))
         .route("/v1/experimental/operator/subscribers", get(operator_identity::subscribers))
         .route("/v1/experimental/operator/alerts", get(operator_identity::alerts))
+        .route("/v1/experimental/operator/resend-auto-health", get(operator_identity::resend_auto_health))
         .route("/v1/experimental/operator/resend-result", get(operator_identity::resend_result))
         .route("/v1/experimental/operator/twilio-result", get(operator_identity::twilio_result))
         .route("/v1/experimental/operator/twilio-jobs", get(operator_identity::twilio_jobs))

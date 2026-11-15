@@ -1,0 +1,7 @@
+<section class="card decision-card"><div class="card-block"><div class="card-eyebrow">RESEND RETRY HEALTH</div><h2>Resend 자동 재시도 상태</h2>
+<p>별도의 모니터링 권한이 필요합니다. 기준 시간은 이 조회에만 적용되며 경보 설정을 변경하지 않습니다.</p>
+<form class="decision-form" (ngSubmit)="load()"><label for="resend-auto-health-grace">기준 시간(초)</label><input id="resend-auto-health-grace" name="resendAutoHealthGrace" type="number" min="1" max="86400" step="1" [(ngModel)]="graceSeconds" (ngModelChange)="clear()" required><button type="submit" class="btn btn-outline" [disabled]="status()==='loading'">재시도 상태 조회</button></form>
+@if(status()==='loading'){<p role="status">조회 중입니다.</p>}
+@else if(status()==='error'){<p role="alert" class="subscriber-error">조회하지 못했습니다. 인증, 모니터링 권한과 기준 시간을 확인하세요.</p>}
+@else if(health();as value){<p role="status">기준 시간 이상 실패한 429: <strong>{{ value.rateLimited }}</strong>건<br>그중 재시도 횟수 소진: <strong>{{ value.exhausted }}</strong>건<br>보호 설정 불일치로 연기: <strong>{{ value.guardDeferred }}</strong>건<br>예약 기한이 지나 대기 중: <strong>{{ value.overdueAuto }}</strong>건</p><p>일부 건수는 겹칩니다. 이 값은 조회 시점의 DB 상태이며 외부 전달이나 모든 워커의 정상 동작을 보장하지 않습니다.</p>}
+</div></section>

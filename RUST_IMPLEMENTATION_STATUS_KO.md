@@ -1,3 +1,9 @@
+## Resend 자동 재시도 상태 조회 화면
+
+API 0091은 워커 0165의 자동 재시도 주의 집계를 JWT 운영자에게 제공한다. 기존 발송 결과·정책 권한과 독립된 환경별 JWT 모니터링 권한 및 API DB 로그인 `alert_view` 권한이 필요하다. Angular 운영 경보 화면은 조회 기준 시간을 선택해 네 집계를 보여주며 이 값은 경보 설정을 변경하지 않는다.
+
+제한 API DB 로그인·테스트 JWT·임시 PostgreSQL에서 권한 분리와 회수, 환경 격리 및 잘못된 기준 시간을 검증했다. Angular 테스트 182개와 빌드가 통과했고 실제 브라우저에서 합성 보류 건수 표시와 권한 회수 후 결과 제거를 확인했다. 실제 IdP·외부 발송·운영 HA는 미검증이며 기존 CSS 예산 경고가 있다. 설정은 [화면 README](apps/dashboard/swallow/README.md)와 [API README](apps/api/rust-api/README.md)를 참고한다.
+
 ## Resend 자동 재시도 상태 경보
 
 워커 0165와 `delivery-reconcile check-resend-auto`는 오래된 429, 현재 정책의 재시도 횟수 소진, 보호 설정 불일치로 연기된 작업 및 기한이 지난 자동 재시도 작업을 환경별로 집계한다. 별도 설정 `SWALLOW_ALERT_RESEND_AUTO_GRACE_SECONDS`을 켜면 기존 Slack·이메일 경보에 포함된다. 제한 DB 계정에는 환경별 `alert_view`와 집계 함수 EXECUTE가 필요하다. 일부 집계는 서로 겹치며, `new-condition`에서는 기존 미확인 실패 작업과 같은 쿨다운 범주를 사용한다.
