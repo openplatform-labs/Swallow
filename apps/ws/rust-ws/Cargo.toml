@@ -1,5 +1,6 @@
 [package]
 name = "novu-rust-ws"
+default-run = "novu-rust-ws"
 version = "0.1.0"
 edition = "2024"
 publish = false
