@@ -12,7 +12,9 @@ const publicPem=await readFile(new URL('../../../api/rust-api/tests/fixtures/ope
 const privateKey=await importPKCS8(privatePem,'RS256');
 const jwk=await exportJWK(await importSPKI(publicPem,'RS256'));
 Object.assign(jwk,{kid:'key',use:'sig',alg:'RS256'});
-const codes=new Map();
+const codes=new Map(),refreshTokens=new Map();
+const refreshEnabled=process.env.SWALLOW_TEST_OIDC_REFRESH==='true';
+const lifetime=refreshEnabled?9:600;
 const server=createServer(async(req,res)=>{
   res.setHeader('Access-Control-Allow-Origin',origin);
   res.setHeader('Access-Control-Allow-Methods','GET, POST, OPTIONS');
@@ -29,19 +31,28 @@ const server=createServer(async(req,res)=>{
     const p=url.searchParams;
     if(p.get('client_id')!=='console'||p.get('redirect_uri')!==callback||p.get('response_type')!=='code'||p.get('code_challenge_method')!=='S256'||!p.get('code_challenge')||!p.get('state')||!p.get('nonce')){json({error:'invalid_request'},400);return;}
     const code=randomBytes(24).toString('base64url');
-    codes.set(code,{challenge:p.get('code_challenge'),nonce:p.get('nonce'),created:Date.now()});
+    codes.set(code,{challenge:p.get('code_challenge'),nonce:p.get('nonce'),scope:p.get('scope')||'openid',created:Date.now()});
     const redirect=new URL(callback);redirect.searchParams.set('code',code);redirect.searchParams.set('state',p.get('state'));
     res.writeHead(302,{Location:redirect.toString()}).end();return;
   }
   if(req.method==='POST' && url.pathname==='/token'){
     let raw='';for await(const chunk of req){raw+=chunk;if(raw.length>8192){json({error:'invalid_request'},400);return;}}
-    const p=new URLSearchParams(raw);const saved=codes.get(p.get('code'));codes.delete(p.get('code'));
+    const p=new URLSearchParams(raw);
+    if(p.get('grant_type')==='refresh_token'){
+      const token=p.get('refresh_token'), saved=refreshTokens.get(token);refreshTokens.delete(token);
+      if(!refreshEnabled||!saved||p.get('client_id')!=='console'){json({error:'invalid_grant'},400);return;}
+      const now=Math.floor(Date.now()/1000);const next=randomBytes(24).toString('base64url');refreshTokens.set(next,saved);
+      const access=await new SignJWT({client_id:'console',jti:randomUUID()}).setProtectedHeader({alg:'RS256',typ:'at+jwt',kid:'key'}).setIssuer(issuer).setSubject('ui-fixture').setAudience('swallow').setIssuedAt(now).setExpirationTime(now+lifetime).sign(privateKey);
+      json({access_token:access,refresh_token:next,token_type:'Bearer',expires_in:lifetime,scope:saved.scope});return;
+    }
+    const saved=codes.get(p.get('code'));codes.delete(p.get('code'));
     const challenge=createHash('sha256').update(p.get('code_verifier')||'').digest('base64url');
     if(!saved||Date.now()-saved.created>60000||p.get('client_id')!=='console'||p.get('redirect_uri')!==callback||p.get('grant_type')!=='authorization_code'||challenge!==saved.challenge){json({error:'invalid_grant'},400);return;}
     const now=Math.floor(Date.now()/1000);
-    const access=await new SignJWT({client_id:'console',jti:randomUUID()}).setProtectedHeader({alg:'RS256',typ:'at+jwt',kid:'key'}).setIssuer(issuer).setSubject('ui-fixture').setAudience('swallow').setIssuedAt(now).setExpirationTime(now+600).sign(privateKey);
+    const access=await new SignJWT({client_id:'console',jti:randomUUID()}).setProtectedHeader({alg:'RS256',typ:'at+jwt',kid:'key'}).setIssuer(issuer).setSubject('ui-fixture').setAudience('swallow').setIssuedAt(now).setExpirationTime(now+lifetime).sign(privateKey);
     const id=await new SignJWT({nonce:saved.nonce}).setProtectedHeader({alg:'RS256',kid:'key'}).setIssuer(issuer).setSubject('ui-fixture').setAudience('console').setIssuedAt(now).setExpirationTime(now+600).sign(privateKey);
-    json({access_token:access,id_token:id,token_type:'Bearer',expires_in:600,scope:'openid'});return;
+    const refresh=refreshEnabled&&saved.scope.split(/\s+/).includes('offline_access')?randomBytes(24).toString('base64url'):undefined;if(refresh)refreshTokens.set(refresh,{scope:saved.scope});
+    json({access_token:access,id_token:id,refresh_token:refresh,token_type:'Bearer',expires_in:lifetime,scope:saved.scope});return;
   }
   json({error:'not_found'},404);
 });

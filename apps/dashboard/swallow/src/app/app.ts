@@ -252,6 +252,8 @@ export class App implements OnDestroy {
   oidcResource = '';
   oidcAudience = '';
   oidcEnvironment = '';
+  oidcAutoRenew = false;
+  readonly oidcRenewError = signal(false);
   readonly oidcStatus = signal<'idle' | 'preparing' | 'ready' | 'signing' | 'signed-in' | 'expired' | 'error'>('idle');
   readonly oidcSubject = signal('');
   oidcRevokeConfirmed = false;
@@ -260,6 +262,7 @@ export class App implements OnDestroy {
   private oidcSession: VerifiedSession | null = null;
   private oidcSequence = 0;
   private oidcExpiryTimer: ReturnType<typeof setTimeout> | null = null;
+  private oidcRenewTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly oidc = new OperatorOidc();
   permissionEnvironment = '';
   permissionKey = '';
@@ -329,7 +332,9 @@ export class App implements OnDestroy {
     this.alertRequestId++; this.alertAbort?.abort(); this.alertAbort=null;
     this.clearWorkflow(true);
     this.forgetWorkflowRequest();
-    this.oidcSequence++;
+    this.oidcSequence++;this.oidc.dispose();
+    if(this.oidcRenewTimer !== null) clearTimeout(this.oidcRenewTimer);
+    this.oidcRenewTimer=null;
     if (this.oidcExpiryTimer !== null) clearTimeout(this.oidcExpiryTimer);
     this.oidcExpiryTimer = null;
     this.oidcSession = null;
@@ -345,7 +350,14 @@ export class App implements OnDestroy {
     const session=this.oidcSession;
     if (!session || Date.now() < session.expiresAt*1000) return false;
     if (this.oidcExpiryTimer !== null) clearTimeout(this.oidcExpiryTimer);
-    this.oidcExpiryTimer=null; this.oidcSession=null; this.oidcSubject.set(''); this.oidcStatus.set('expired');
+    if (this.oidcRenewTimer !== null) clearTimeout(this.oidcRenewTimer);
+    this.oidcExpiryTimer=null;this.oidcRenewTimer=null;this.oidc.dispose();
+    this.oidcSession=null; this.oidcSubject.set(''); this.oidcStatus.set('expired');
+    this.clearOidcCredentials(session);
+    return true;
+  }
+
+  private clearOidcCredentials(session: VerifiedSession):void {
     // Preserve decision outcome and request ID, including an in-flight or uncertain decision.
     if (this.apiKey===session.token) { this.apiKey=''; this.clearSubscribers(); this.resetSubscriberEdit(); this.clearSubscriberProfileLookup(); this.clearSubscriberCreateLookup(); this.clearSubscriberDeleteLookup(); }
     if (this.alertKey===session.token) {
@@ -368,8 +380,8 @@ export class App implements OnDestroy {
       if(this.workflowStatus()!=='saving'){this.workflowStatus.set('idle');this.workflowMessage.set('');this.workflowExpected=null;this.workflowTitle='';this.workflowContent='';this.workflowHasContent=false;this.workflowConfirmed=false;}
       if(this.providerStatus()!=='saving'){this.providerStatus.set('idle');this.providerMessage.set('');this.providerExpected=null;this.providerConfirmed=false;}
     }
-    return true;
   }
+
 
   private scheduleOidcExpiry(): void {
     if (!this.oidcSession || this.expireOidcIfNeeded()) return;
@@ -377,11 +389,44 @@ export class App implements OnDestroy {
     this.oidcExpiryTimer=setTimeout(()=>{ this.oidcExpiryTimer=null; this.scheduleOidcExpiry(); },delay);
   }
 
+  private scheduleOidcRenew():void {
+    if(this.oidcRenewTimer!==null)clearTimeout(this.oidcRenewTimer);
+    const session=this.oidcSession;
+    if(!session || !this.oidcPrepared?.settings.allowRefresh || this.oidcRenewError())return;
+    const remaining=session.expiresAt*1000-Date.now();
+    const due=Math.max(1,remaining-Math.min(60000,Math.max(1000,Math.floor(remaining/3))));
+    const delay=Math.min(2147483647,due);
+    this.oidcRenewTimer=setTimeout(()=>{this.oidcRenewTimer=null;if(due>delay)this.scheduleOidcRenew();else void this.renewOidc();},delay);
+  }
+
+  private async renewOidc():Promise<void> {
+    const old=this.oidcSession,sequence=this.oidcSequence;
+    if(!old || this.expireOidcIfNeeded() || this.oidcRevokeStatus()==='sending')return;
+    try {
+      const next=await this.oidc.renew();
+      if(sequence!==this.oidcSequence || this.oidcSession!==old || this.oidcRevokeStatus()==='sending' || this.expireOidcIfNeeded())return;
+      if(next.subject!==old.subject || next.environmentId!==old.environmentId || next.expiresAt<=old.expiresAt)throw new Error('invalid renewal');
+      const subscribers=this.apiKey===old.token,alerts=this.alertKey===old.token,permissions=this.permissionKey===old.token,workflow=this.workflowKey===old.token,lookup=this.lookupKey===old.token;
+      this.clearOidcCredentials(old);
+      if(subscribers)this.apiKey=next.token;
+      if(alerts)this.alertKey=next.token;
+      if(permissions)this.permissionKey=next.token;
+      if(workflow)this.workflowKey=next.token;
+      if(lookup)this.lookupKey=next.token;
+      this.oidcSession=next;this.oidcSubject.set(next.subject);this.oidcRenewError.set(false);
+      if(this.oidcExpiryTimer!==null)clearTimeout(this.oidcExpiryTimer);
+      this.oidcExpiryTimer=null;this.scheduleOidcExpiry();this.scheduleOidcRenew();
+    } catch {
+      if(sequence===this.oidcSequence && this.oidcSession===old){this.oidc.dispose();this.oidcRenewError.set(true);}
+    }
+  }
+
   resetOidc(): void {
     if (this.oidcRevokeStatus()==='sending') return;
     if ((this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying' || this.subscriberDeleteRetryStatus()==='retrying') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     if (this.oidcExpiryTimer !== null) clearTimeout(this.oidcExpiryTimer);
-    this.oidcExpiryTimer=null;
+    if (this.oidcRenewTimer !== null) clearTimeout(this.oidcRenewTimer);
+    this.oidcExpiryTimer=null;this.oidcRenewTimer=null;this.oidcRenewError.set(false);this.oidc.dispose();
     this.oidcSequence++; this.oidcPrepared = null; this.oidcSession = null;
     this.oidcStatus.set('idle'); this.oidcSubject.set('');
     this.forgetKey(); this.forgetAlertKey(); this.clearPermissions(true);this.clearWorkflow(true);this.forgetWorkflowRequest();
@@ -392,7 +437,7 @@ export class App implements OnDestroy {
     this.oidcRevokeStatus.set('idle'); this.oidcRevokeConfirmed=false;
     this.resetOidc(); const sequence=this.oidcSequence; this.oidcStatus.set('preparing');
     try {
-      const prepared=await this.oidc.prepare({issuer:this.oidcIssuer,clientId:this.oidcClientId,scope:this.oidcScope,resource:this.oidcResource,audience:this.oidcAudience,apiOrigin:this.apiOrigin,environmentId:this.oidcEnvironment});
+      const prepared=await this.oidc.prepare({issuer:this.oidcIssuer,clientId:this.oidcClientId,scope:this.oidcScope,resource:this.oidcResource,audience:this.oidcAudience,apiOrigin:this.apiOrigin,environmentId:this.oidcEnvironment,allowRefresh:this.oidcAutoRenew});
       if (sequence !== this.oidcSequence) return;
       this.oidcPrepared=prepared; this.oidcStatus.set('ready');
     } catch { if (sequence === this.oidcSequence) this.oidcStatus.set('error'); }
@@ -404,7 +449,7 @@ export class App implements OnDestroy {
     try {
       const session=await this.oidc.signIn(prepared);
       if (sequence !== this.oidcSequence) return;
-      this.oidcSession=session; this.oidcSubject.set(session.subject); this.oidcStatus.set('signed-in'); this.scheduleOidcExpiry();
+      this.oidcSession=session; this.oidcSubject.set(session.subject); this.oidcStatus.set('signed-in'); this.scheduleOidcExpiry(); this.scheduleOidcRenew();
     } catch { if (sequence === this.oidcSequence) this.oidcStatus.set('error'); }
   }
 

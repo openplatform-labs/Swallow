@@ -40,6 +40,28 @@ describe('operator OIDC configuration',()=>{
     const service=new OperatorOidc();await expect(service.signIn({settings,metadata})).rejects.toThrow('response too large');await expect(service.signIn({settings,metadata})).rejects.toThrow('response too large');
     expect(fetchMock).toHaveBeenCalledTimes(3);expect(remove).toHaveBeenCalledTimes(2);
   });
+  it('requires explicit opt-in for refresh tokens and verifies the renewed identity',async()=>{
+    const {privateKey,publicKey}=await generateKeyPair('RS256');const jwk={...(await exportJWK(publicKey)),kid:'test',alg:'RS256',use:'sig'};
+    vi.spyOn(UserManager.prototype,'signinPopup').mockImplementation(async args=>({expired:false,token_type:'Bearer',access_token:accessToken,refresh_token:'secret-refresh',id_token:await new SignJWT({nonce:args?.nonce}).setProtectedHeader({alg:'RS256',kid:'test'}).setIssuer(settings.issuer).setAudience(settings.clientId).setSubject('alice').setIssuedAt().setExpirationTime('1m').sign(privateKey)} as User));
+    const silent=vi.spyOn(UserManager.prototype,'signinSilent').mockResolvedValue({expired:false,token_type:'Bearer',access_token:accessToken,refresh_token:'rotated-secret'} as User);
+    vi.spyOn(UserManager.prototype,'removeUser').mockResolvedValue();
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify(metadata))).mockResolvedValueOnce(new Response(JSON.stringify({keys:[jwk]}))).mockResolvedValueOnce(new Response(JSON.stringify({issuer:settings.issuer,subject:'alice',clientId:'console',environmentId:'env'}))).mockResolvedValueOnce(new Response(JSON.stringify({issuer:settings.issuer,subject:'mallory',clientId:'console',environmentId:'env'})));
+    const service=new OperatorOidc();const prepared=await service.prepare({...settings,allowRefresh:true,resource:'https://api.test/'});expect(prepared.settings.scope).toBe('openid offline_access');await service.signIn(prepared);
+    await expect(service.renew()).rejects.toThrow('identity mismatch');await expect(service.renew()).rejects.toThrow('refresh unavailable');expect(silent).toHaveBeenCalledOnce();expect(silent).toHaveBeenCalledWith(expect.objectContaining({resource:'https://api.test/'}));expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+  it('rejects an opted-in login if the provider does not issue a refresh token',async()=>{
+    const {privateKey,publicKey}=await generateKeyPair('RS256');const jwk={...(await exportJWK(publicKey)),kid:'test',alg:'RS256',use:'sig'};
+    vi.spyOn(UserManager.prototype,'signinPopup').mockImplementation(async args=>({expired:false,token_type:'Bearer',access_token:accessToken,id_token:await new SignJWT({nonce:args?.nonce}).setProtectedHeader({alg:'RS256',kid:'test'}).setIssuer(settings.issuer).setAudience(settings.clientId).setSubject('alice').setIssuedAt().setExpirationTime('1m').sign(privateKey)} as User));
+    const remove=vi.spyOn(UserManager.prototype,'removeUser').mockResolvedValue();vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({keys:[jwk]}))).mockResolvedValueOnce(new Response(JSON.stringify({issuer:settings.issuer,subject:'alice',clientId:'console',environmentId:'env'})));
+    const service=new OperatorOidc();await expect(service.signIn({settings:{...settings,allowRefresh:true},metadata})).rejects.toThrow('refresh token unavailable');expect(remove).toHaveBeenCalled();await expect(service.renew()).rejects.toThrow('refresh unavailable');
+  });
+  it('discards a refresh that completes after logout',async()=>{
+    const {privateKey,publicKey}=await generateKeyPair('RS256');const jwk={...(await exportJWK(publicKey)),kid:'test',alg:'RS256',use:'sig'};
+    vi.spyOn(UserManager.prototype,'signinPopup').mockImplementation(async args=>({expired:false,token_type:'Bearer',access_token:accessToken,refresh_token:'secret',id_token:await new SignJWT({nonce:args?.nonce}).setProtectedHeader({alg:'RS256',kid:'test'}).setIssuer(settings.issuer).setAudience(settings.clientId).setSubject('alice').setIssuedAt().setExpirationTime('1m').sign(privateKey)} as User));
+    let finish!:(user:User)=>void;vi.spyOn(UserManager.prototype,'signinSilent').mockReturnValue(new Promise(done=>finish=done));const remove=vi.spyOn(UserManager.prototype,'removeUser').mockResolvedValue();
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({keys:[jwk]}))).mockResolvedValueOnce(new Response(JSON.stringify({issuer:settings.issuer,subject:'alice',clientId:'console',environmentId:'env'})));
+    const service=new OperatorOidc();await service.signIn({settings:{...settings,allowRefresh:true},metadata});const pending=service.renew();service.dispose();finish({expired:false,token_type:'Bearer',access_token:accessToken,refresh_token:'late'} as User);await expect(pending).rejects.toThrow('refresh cancelled');expect(fetchMock).toHaveBeenCalledTimes(2);expect(remove).toHaveBeenCalled();await expect(service.renew()).rejects.toThrow('refresh unavailable');
+  });
   it('accepts a session only when the API-verified identity matches the selected client',async()=>{
     const {privateKey,publicKey}=await generateKeyPair('RS256');
     const jwk={...(await exportJWK(publicKey)),kid:'test',alg:'RS256',use:'sig'};

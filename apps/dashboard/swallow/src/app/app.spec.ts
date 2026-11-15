@@ -682,6 +682,40 @@ describe('Swallow console', () => {
     fixture.destroy();
   });
 
+  it('automatically renews an opted-in session and replaces copied credentials without losing an uncertain request', async () => {
+    vi.useFakeTimers();vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));const now=Math.floor(Date.now()/1000);
+    vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));
+    vi.spyOn(OperatorOidc.prototype,'signIn').mockResolvedValue({token:'old.token.value',subject:'alice',environmentId:'env-a',expiresAt:now+90});
+    const renew=vi.spyOn(OperatorOidc.prototype,'renew').mockResolvedValue({token:'new.token.value',subject:'alice',environmentId:'env-a',expiresAt:now+180});
+    const fixture=TestBed.createComponent(App),app=fixture.componentInstance;app.oidcAutoRenew=true;app.oidcIssuer='https://issuer.test';app.oidcClientId='console';app.oidcEnvironment='env-a';await app.prepareOidc();await app.signInOidc();app.useOidc('alerts');
+    app.useOidcForDecision('retry');app.decisionStatus.set('unknown');app.decisionRequestId.set('saved');
+    await vi.advanceTimersByTimeAsync(60000);expect(renew).toHaveBeenCalledOnce();expect(app.oidcStatus()).toBe('signed-in');expect(app.alertKey).toBe('new.token.value');expect(app.retryKey).toBe('');expect(app.decisionStatus()).toBe('unknown');expect(app.decisionRequestId()).toBe('saved');expect(app.oidcRenewError()).toBe(false);fixture.destroy();
+  });
+  it('does not retry a failed refresh or restore a session after logout', async () => {
+    vi.useFakeTimers();vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));const now=Math.floor(Date.now()/1000);
+    vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));vi.spyOn(OperatorOidc.prototype,'signIn').mockResolvedValue({token:'old.token.value',subject:'alice',environmentId:'env-a',expiresAt:now+90});
+    const renew=vi.spyOn(OperatorOidc.prototype,'renew').mockRejectedValueOnce(new Error('lost response'));
+    const fixture=TestBed.createComponent(App),app=fixture.componentInstance;app.oidcAutoRenew=true;app.oidcIssuer='https://issuer.test';app.oidcClientId='console';app.oidcEnvironment='env-a';await app.prepareOidc();await app.signInOidc();await vi.advanceTimersByTimeAsync(60000);expect(app.oidcRenewError()).toBe(true);await vi.advanceTimersByTimeAsync(30000);expect(renew).toHaveBeenCalledOnce();expect(app.oidcStatus()).toBe('expired');fixture.destroy();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));let finish!:(session:{token:string;subject:string;environmentId:string;expiresAt:number})=>void;renew.mockReturnValueOnce(new Promise(done=>finish=done));const fixture2=TestBed.createComponent(App),app2=fixture2.componentInstance;app2.oidcAutoRenew=true;app2.oidcIssuer='https://issuer.test';app2.oidcClientId='console';app2.oidcEnvironment='env-a';await app2.prepareOidc();await app2.signInOidc();await vi.advanceTimersByTimeAsync(60000);app2.resetOidc();finish({token:'new.token.value',subject:'alice',environmentId:'env-a',expiresAt:now+180});await Promise.resolve();await Promise.resolve();expect(app2.oidcStatus()).toBe('idle');expect(app2.oidcSubject()).toBe('');fixture2.destroy();
+  });
+  it('does not install a refreshed token while self-revocation is in flight', async () => {
+    vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));const now=Math.floor(Date.now()/1000);vi.spyOn(OperatorOidc.prototype,'signIn').mockResolvedValue({token:'old.token.value',subject:'alice',environmentId:'env-a',expiresAt:now+90});
+    let finishRenew!:(session:{token:string;subject:string;environmentId:string;expiresAt:number})=>void;vi.spyOn(OperatorOidc.prototype,'renew').mockReturnValue(new Promise(done=>finishRenew=done));let finishRevoke!:(response:Response)=>void;vi.spyOn(globalThis,'fetch').mockReturnValue(new Promise(done=>finishRevoke=done));
+    const fixture=TestBed.createComponent(App),app=fixture.componentInstance;app.oidcAutoRenew=true;app.oidcIssuer='https://issuer.test';app.oidcClientId='console';app.oidcEnvironment='env-a';await app.prepareOidc();await app.signInOidc();
+    const internal=app as unknown as {renewOidc:()=>Promise<void>};const pending=internal.renewOidc();app.oidcRevokeConfirmed=true;const revoke=app.revokeOidcToken();finishRenew({token:'new.token.value',subject:'alice',environmentId:'env-a',expiresAt:now+180});await pending;finishRevoke(new Response(JSON.stringify({created:true})));await revoke;expect(app.oidcStatus()).toBe('idle');expect(app.oidcSubject()).toBe('');fixture.destroy();
+  });
+  it('finishes an in-flight self-revocation even if the local token expires', async () => {
+    vi.useFakeTimers();vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));const now=Math.floor(Date.now()/1000);
+    vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));vi.spyOn(OperatorOidc.prototype,'signIn').mockResolvedValue({token:'old.token.value',subject:'alice',environmentId:'env-a',expiresAt:now+2});
+    let finish!:(response:Response)=>void;vi.spyOn(globalThis,'fetch').mockReturnValue(new Promise(done=>finish=done));
+    const fixture=TestBed.createComponent(App),app=fixture.componentInstance;app.oidcIssuer='https://issuer.test';app.oidcClientId='console';app.oidcEnvironment='env-a';await app.prepareOidc();await app.signInOidc();app.oidcRevokeConfirmed=true;const pending=app.revokeOidcToken();await vi.advanceTimersByTimeAsync(2000);expect(app.oidcStatus()).toBe('expired');finish(new Response(JSON.stringify({created:true})));await pending;expect(app.oidcRevokeStatus()).toBe('revoked');expect(app.oidcStatus()).toBe('idle');fixture.destroy();
+  });
+  it('does not revive an expired session when a delayed refresh completes', async () => {
+    vi.useFakeTimers();vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));const now=Math.floor(Date.now()/1000);
+    vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));vi.spyOn(OperatorOidc.prototype,'signIn').mockResolvedValue({token:'old.token.value',subject:'alice',environmentId:'env-a',expiresAt:now+90});
+    let finish!:(session:{token:string;subject:string;environmentId:string;expiresAt:number})=>void;vi.spyOn(OperatorOidc.prototype,'renew').mockReturnValue(new Promise(done=>finish=done));
+    const fixture=TestBed.createComponent(App),app=fixture.componentInstance;app.oidcAutoRenew=true;app.oidcIssuer='https://issuer.test';app.oidcClientId='console';app.oidcEnvironment='env-a';await app.prepareOidc();await app.signInOidc();app.useOidc('alerts');await vi.advanceTimersByTimeAsync(90000);expect(app.oidcStatus()).toBe('expired');expect(app.alertKey).toBe('');finish({token:'new.token.value',subject:'alice',environmentId:'env-a',expiresAt:now+180});await Promise.resolve();await Promise.resolve();expect(app.oidcStatus()).toBe('expired');expect(app.alertKey).toBe('');fixture.destroy();
+  });
   it('uses an operator session only after login and removes it on local logout', async () => {
     vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));
     vi.spyOn(OperatorOidc.prototype,'signIn').mockResolvedValue({token:'aaa.bbb.ccc',subject:'alice',environmentId:'env-a',expiresAt:Math.floor(Date.now()/1000)+600});

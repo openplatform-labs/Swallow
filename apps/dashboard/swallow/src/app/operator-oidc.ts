@@ -1,7 +1,7 @@
 import { InMemoryWebStorage, UserManager, WebStorageStateStore, type OidcMetadata } from 'oidc-client-ts';
 import { createRemoteJWKSet, customFetch, decodeJwt, jwtVerify } from 'jose';
 
-export type OidcSettings = { issuer: string; clientId: string; scope: string; resource: string; audience: string; apiOrigin: string; environmentId: string };
+export type OidcSettings = { issuer: string; clientId: string; scope: string; resource: string; audience: string; apiOrigin: string; environmentId: string; allowRefresh?: boolean };
 export type VerifiedSession = { token: string; subject: string; environmentId: string; expiresAt: number };
 export type PreparedOidc = { settings: OidcSettings; metadata: Partial<OidcMetadata> };
 
@@ -37,10 +37,20 @@ async function boundedText(response: Response, limit: number): Promise<string> {
 }
 
 export class OperatorOidc {
+  private active: {manager:UserManager; settings:OidcSettings; subject:string} | null=null;
+  private generation=0;
+  dispose(): void {
+    this.generation++;
+    const active=this.active;this.active=null;
+    if(active) void active.manager.removeUser().catch(()=>{});
+  }
+
   async prepare(input: OidcSettings): Promise<PreparedOidc> {
-    const settings: OidcSettings={issuer:input.issuer.trim(),clientId:input.clientId.trim(),scope:input.scope.trim(),resource:input.resource.trim(),audience:input.audience.trim(),apiOrigin:input.apiOrigin.trim(),environmentId:input.environmentId.trim()};
+    const settings: OidcSettings={issuer:input.issuer.trim(),clientId:input.clientId.trim(),scope:input.scope.trim(),resource:input.resource.trim(),audience:input.audience.trim(),apiOrigin:input.apiOrigin.trim(),environmentId:input.environmentId.trim(),allowRefresh:input.allowRefresh === true};
     const issuer=secureUrl(settings.issuer,true); secureUrl(settings.apiOrigin,false);
-    if (issuer.search || !settings.clientId || settings.clientId.length>256 || !settings.environmentId || new TextEncoder().encode(settings.environmentId).length>512 || settings.resource.length>2048 || settings.audience.length>2048 || settings.scope.length>512 || !settings.scope.split(/\s+/).includes('openid') || settings.scope.split(/\s+/).includes('offline_access')) throw new Error('invalid settings');
+    if (issuer.search || !settings.clientId || settings.clientId.length>256 || !settings.environmentId || new TextEncoder().encode(settings.environmentId).length>512 || settings.resource.length>2048 || settings.audience.length>2048 || settings.scope.length>512 || !settings.scope.split(/\s+/).includes('openid') || (!settings.allowRefresh && settings.scope.split(/\s+/).includes('offline_access'))) throw new Error('invalid settings');
+    if(settings.allowRefresh && !settings.scope.split(/\s+/).includes('offline_access'))settings.scope+=' offline_access';
+    if(settings.scope.length>512)throw new Error('invalid settings');
     const response=await fetch(`${settings.issuer.replace(/\/$/,'')}/.well-known/openid-configuration`,{credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
     if (!response.ok) throw new Error('discovery unavailable');
     const text=await boundedText(response,65536);
@@ -54,6 +64,8 @@ export class OperatorOidc {
   }
 
   async signIn(prepared: PreparedOidc): Promise<VerifiedSession> {
+    this.dispose();
+    const generation=this.generation;
     const {settings,metadata}=prepared;
     const callback=`${window.location.origin}/oidc-callback`;
     const stateStore=new WebStorageStateStore({store:new InMemoryWebStorage()});
@@ -62,24 +74,52 @@ export class OperatorOidc {
     try {
       const nonce=crypto.randomUUID();
       const user=await manager.signinPopup({nonce});
+      if(generation!==this.generation)throw new Error('login cancelled');
       if (user.expired || user.token_type.toLowerCase()!=='bearer' || !user.access_token || user.access_token.length>16384) throw new Error('invalid token');
       if (!user.id_token || user.id_token.length>16384 || typeof metadata.jwks_uri !== 'string') throw new Error('invalid identity token');
       const jwks=createRemoteJWKSet(secureUrl(metadata.jwks_uri,true),{timeoutDuration:5000,[customFetch]:async(url,options)=>{const response=await fetch(url,{...options,credentials:'omit',redirect:'error',cache:'no-store'});if(!response.ok)return response;const body=await boundedText(response,262144);const headers=new Headers(response.headers);headers.delete('content-length');return new Response(body,{status:response.status,statusText:response.statusText,headers});}});
       const {payload}=await jwtVerify(user.id_token,jwks,{issuer:settings.issuer,audience:settings.clientId,algorithms:['RS256','ES256'],requiredClaims:['sub','exp','iat','nonce']});
       if (payload['nonce']!==nonce || typeof payload.iat!=='number' || payload.iat>Math.floor(Date.now()/1000) || (Array.isArray(payload.aud) && payload.aud.length>1 && payload['azp']!==settings.clientId) || (payload['azp']!==undefined && payload['azp']!==settings.clientId)) throw new Error('invalid identity token');
-      const params=new URLSearchParams({environmentId:settings.environmentId});
-      const response=await fetch(`${new URL(settings.apiOrigin).origin}/v1/experimental/operator/me?${params}`,{headers:{Authorization:`Bearer ${user.access_token}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
-      if (!response.ok) throw new Error('operator access denied');
-      const identity: unknown=JSON.parse(await boundedText(response,16384));
-      if (typeof identity!=='object' || identity===null || !('issuer' in identity) || identity.issuer!==settings.issuer || !('environmentId' in identity) || identity.environmentId!==settings.environmentId || !('clientId' in identity) || identity.clientId!==settings.clientId || !('subject' in identity) || typeof identity.subject!=='string' || !identity.subject || payload.sub!==identity.subject) throw new Error('identity mismatch');
-      // The API has validated the access token. Its exp is used here only to
-      // clear the local session; authorization remains entirely server-side.
-      const exp=decodeJwt(user.access_token).exp;
-      if (typeof exp!=='number' || !Number.isSafeInteger(exp) || exp<=Math.floor(Date.now()/1000)) throw new Error('invalid token expiry');
-      const expiresAt=typeof user.expires_at==='number' && Number.isFinite(user.expires_at) ? Math.min(exp,user.expires_at) : exp;
-      if (expiresAt<=Date.now()/1000) throw new Error('invalid token expiry');
-      return {token:user.access_token,subject:identity.subject,environmentId:settings.environmentId,expiresAt};
-    } finally { await manager.removeUser(); }
+      const session=await this.verifyAccess(user,settings,payload.sub);
+      if(generation!==this.generation)throw new Error('login cancelled');
+      if(settings.allowRefresh){
+        if(!user.refresh_token || user.refresh_token.length>16384)throw new Error('refresh token unavailable');
+        this.active={manager,settings,subject:session.subject};
+      }
+      return session;
+    } finally { if(this.active?.manager!==manager) await manager.removeUser(); }
+  }
+
+  private async verifyAccess(user: import('oidc-client-ts').User, settings:OidcSettings, subject:unknown): Promise<VerifiedSession> {
+    if(user.expired || user.token_type.toLowerCase()!=='bearer' || !user.access_token || user.access_token.length>16384)throw new Error('invalid token');
+    const params=new URLSearchParams({environmentId:settings.environmentId});
+    const response=await fetch(`${new URL(settings.apiOrigin).origin}/v1/experimental/operator/me?${params}`,{headers:{Authorization:`Bearer ${user.access_token}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
+    if(!response.ok)throw new Error('operator access denied');
+    const identity: unknown=JSON.parse(await boundedText(response,16384));
+    if(typeof identity!=='object' || identity===null || !('issuer' in identity) || identity.issuer!==settings.issuer || !('environmentId' in identity) || identity.environmentId!==settings.environmentId || !('clientId' in identity) || identity.clientId!==settings.clientId || !('subject' in identity) || typeof identity.subject!=='string' || !identity.subject || subject!==identity.subject)throw new Error('identity mismatch');
+    const exp=decodeJwt(user.access_token).exp;
+    if(typeof exp!=='number' || !Number.isSafeInteger(exp) || exp<=Math.floor(Date.now()/1000))throw new Error('invalid token expiry');
+    const expiresAt=typeof user.expires_at==='number' && Number.isFinite(user.expires_at) ? Math.min(exp,user.expires_at) : exp;
+    if(expiresAt<=Date.now()/1000)throw new Error('invalid token expiry');
+    return {token:user.access_token,subject:identity.subject,environmentId:settings.environmentId,expiresAt};
+  }
+
+  async renew():Promise<VerifiedSession> {
+    const active=this.active,generation=this.generation;
+    if(!active)throw new Error('refresh unavailable');
+    try {
+      const user=await active.manager.signinSilent({silentRequestTimeoutInSeconds:10,resource:active.settings.resource || undefined});
+      if(generation!==this.generation || this.active!==active)throw new Error('refresh cancelled');
+      if(!user?.refresh_token || user.refresh_token.length>16384)throw new Error('refresh token unavailable');
+      const session=await this.verifyAccess(user,active.settings,active.subject);
+      if(generation!==this.generation || this.active!==active)throw new Error('refresh cancelled');
+      return session;
+    } catch(error) {
+      if(this.active===active)this.dispose();
+      else await active.manager.removeUser();
+      throw error;
+    }
+
   }
 }
 
