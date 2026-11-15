@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$(cd ../../.. && pwd)
 scenario=${SWALLOW_LOCAL_FAILOVER_SCENARIO:-alert-binding}
-case "$scenario" in alert-binding|alert-scheduler|alert-v2|resend|twilio|fcm|fcm-delay|fcm-review) ;; *) echo 'invalid local failover scenario' >&2; exit 2;; esac
+case "$scenario" in alert-binding|alert-scheduler|alert-v2|resend|resend-cooldown|twilio|fcm|fcm-delay|fcm-review) ;; *) echo 'invalid local failover scenario' >&2; exit 2;; esac
 pgbin=${SWALLOW_TEST_POSTGRES_BIN:-/opt/homebrew/opt/postgresql@17/bin}
 [[ -x "$pgbin/pg_ctl" && -x "$pgbin/pg_basebackup" ]] || { echo 'PostgreSQL 17 server binaries are required' >&2; exit 1; }
 testdir=$(mktemp -d /private/tmp/swallow-alert-ha.XXXXXX)
@@ -41,11 +41,15 @@ done
 export TEST_PRIMARY_URL="$DATABASE_URL" TEST_STANDBY_URL="postgres://postgres@127.0.0.1:$standby_port/postgres"
 export TEST_FAILOVER_URL="postgres://postgres@127.0.0.1:$standby_port,127.0.0.1:$primary_port/postgres?target_session_attrs=read-write&connect_timeout=2"
 export TEST_LOCAL_PRIMARY_DATA="$testdir/primary" TEST_LOCAL_STANDBY_DATA="$testdir/standby" TEST_LOCAL_PG_CTL="$pgbin/pg_ctl"
-if [[ "$scenario" == resend ]]; then
+if [[ "$scenario" == resend || "$scenario" == resend-cooldown ]]; then
   cargo build --quiet --locked --bin resend-worker
   target_dir=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
   export TEST_RESEND_WORKER_BINARY="$target_dir/debug/resend-worker"
-  cargo test --locked --lib resend_failover_test::synchronous_failover_during_resend_dispatch_preserves_unknown -- --ignored
+  if [[ "$scenario" == resend-cooldown ]]; then
+    cargo test --locked --lib resend_failover_test::synchronous_failover_preserves_resend_shared_cooldown -- --ignored
+  else
+    cargo test --locked --lib resend_failover_test::synchronous_failover_during_resend_dispatch_preserves_unknown -- --ignored
+  fi
 elif [[ "$scenario" == fcm || "$scenario" == fcm-delay ]]; then
   cargo build --quiet --locked --bin fcm-worker
   target_dir=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')

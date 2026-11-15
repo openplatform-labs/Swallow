@@ -366,3 +366,64 @@ async fn synchronous_failover_during_resend_dispatch_preserves_unknown() {
     );
     proxy_task.abort();
 }
+
+#[tokio::test]
+#[ignore = "requires disposable local synchronous PostgreSQL primary and standby; stops the primary"]
+async fn synchronous_failover_preserves_resend_shared_cooldown() {
+    let primary=std::env::var("TEST_PRIMARY_URL").unwrap();
+    let standby=std::env::var("TEST_STANDBY_URL").unwrap();
+    let cluster=std::env::var("TEST_FAILOVER_URL").unwrap();
+    let mut db=connect(&primary).await;
+    let env="resend-cooldown-ha";
+    db.execute("INSERT INTO public.novu_rust_environments VALUES($1,'org')", &[&env]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_resend_cooldown_policies(environment_id,fallback_seconds) VALUES($1,300)", &[&env]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_resend_cooldown_workers SELECT $1,rolname,oid FROM pg_roles WHERE rolname=session_user", &[&env]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,rolname,'alert_view',oid FROM pg_roles WHERE rolname=session_user", &[&env]).await.unwrap();
+    assert!(resend_queue::register_worker_policy(&db,env,false,true).await.unwrap());
+    let first=Uuid::new_v4();
+    enqueue(&db,first,env,resend_queue::JOB_KIND,&json!({"to":["fixture@example.test"],"subject":"fixture","html":"test"})).await.unwrap();
+    let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider=Resend::test_endpoint(Config {api_key:"fixture".into(),from:"sender@example.test".into(),sender_name:String::new()}, &format!("http://{}/emails",listener.local_addr().unwrap())).unwrap();
+    let mocked=tokio::spawn(async move {let (mut socket,_)=listener.accept().await.unwrap();let mut buf=[0u8;4096];assert!(socket.read(&mut buf).await.unwrap()>0);socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 300\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();});
+    assert!(resend_queue::process_one_with_registered_policy_and_cooldown(&mut db,env,&provider,false,crate::email_step_policy::Policy::Snapshot,false,false,false,true).await.unwrap());
+    mocked.await.unwrap();
+    let deadline:String=db.query_one("SELECT not_before::text FROM public.novu_rust_resend_cooldown_policies WHERE environment_id=$1", &[&env]).await.unwrap().get(0);
+    let replica=connect(&standby).await;
+    tokio::time::timeout(Duration::from_secs(10),async {
+        loop {
+            let row=replica.query_opt("SELECT p.not_before::text,a.state,a.http_status FROM public.novu_rust_resend_cooldown_policies p JOIN public.novu_rust_resend_attempts a ON a.environment_id=p.environment_id WHERE p.environment_id=$1 AND a.job_id=$2", &[&env,&first]).await.unwrap();
+            if row.is_some_and(|r|r.get::<_,String>(0)==deadline && r.get::<_,String>(1)=="rejected" && r.get::<_,Option<i32>>(2)==Some(429)) {break;}
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }).await.expect("committed cooldown and attempt were not replayed");
+    let pgctl=std::env::var("TEST_LOCAL_PG_CTL").unwrap();
+    let primary_data=std::env::var("TEST_LOCAL_PRIMARY_DATA").unwrap();
+    let standby_data=std::env::var("TEST_LOCAL_STANDBY_DATA").unwrap();
+    assert!(Command::new(&pgctl).args(["-D",&primary_data,"-m","immediate","stop"]).stdout(Stdio::null()).status().unwrap().success());
+    assert!(Command::new(&pgctl).args(["-D",&standby_data,"promote","-w"]).stdout(Stdio::null()).status().unwrap().success());
+    let promoted=connect(&standby).await;
+    let persisted:String=promoted.query_one("SELECT not_before::text FROM public.novu_rust_resend_cooldown_policies WHERE environment_id=$1", &[&env]).await.unwrap().get(0);
+    assert_eq!(persisted,deadline);
+    let second=Uuid::new_v4();
+    enqueue(&promoted,second,env,resend_queue::JOB_KIND,&json!({"to":["fixture@example.test"],"subject":"deferred","html":"test"})).await.unwrap();
+    let proxy=TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_url=format!("http://{}",proxy.local_addr().unwrap());
+    let _worker=Worker(Command::new(std::env::var("TEST_RESEND_WORKER_BINARY").unwrap()).env_clear()
+        .env("DATABASE_URL",&cluster).env("NOVU_POSTGRES_ALLOW_INSECURE","true")
+        .env("NOVU_RESEND_ENVIRONMENT_ID",env).env("NOVU_RESEND_API_KEY","fixture")
+        .env("NOVU_RESEND_FROM","sender@example.test").env("NOVU_RESEND_SHARED_COOLDOWN","true")
+        .env("NOVU_RESEND_DB_TIMEOUT_SECONDS","10").env("HTTPS_PROXY",&proxy_url).env("NO_PROXY","")
+        .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    tokio::time::timeout(Duration::from_secs(20),async {
+        loop {
+            let row=promoted.query_one("SELECT status,last_error,available_at::text,(SELECT count(*) FROM public.novu_rust_resend_attempts a WHERE a.job_id=j.id) FROM public.novu_queue_jobs j WHERE id=$1", &[&second]).await.unwrap();
+            if row.get::<_,String>(0)=="pending" && row.get::<_,Option<String>>(1).as_deref()==Some("Resend shared cooldown active") {
+                assert_eq!(row.get::<_,String>(2),deadline);assert_eq!(row.get::<_,i64>(3),0);break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }).await.expect("worker did not defer after promotion");
+    let health=crate::resend_cooldown::health(&promoted,env,60).await.unwrap();
+    assert_eq!(health["active"],true);assert_eq!(health["deferred"],1);
+    assert!(tokio::time::timeout(Duration::from_secs(1),proxy.accept()).await.is_err(),"deferred worker opened provider connection");
+}
