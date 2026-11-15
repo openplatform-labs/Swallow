@@ -1,4 +1,6 @@
-SMTP 추가 MIME 본문: SMTP 워커가 큐 메시지의 `alternatives`를 제한적으로 지원해 달력 초대 등을 HTML·텍스트와 함께 보낼 수 있다. MIME 유형과 크기를 발송 예약 전 검증하고 인라인 이미지·일반 첨부파일과 함께 구성한다. 실제 워커·로컬 PostgreSQL·모의 STARTTLS 서버에서 MIME을 파싱해 확인한다. 현재 트리거·관리 API는 추가 본문을 노출하지 않으므로 시험은 생성된 작업에 큐 필드를 직접 넣는다. 실제 메일 클라이언트·원본 Novu 전체 호환·운영 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+SMTP 추가 본문 트리거 연결: `overrides.email.alternatives`의 `contentType`과 문자열 `content`를 제한적으로 검증하여 워크플로와 이메일 작업에 전달한다. 실제 Rust HTTP API·인앱 워커·제한 SMTP 워커·모의 STARTTLS 서버에서 달력 본문과 첨부파일 발송 및 잘못된 구조 거절을 검증한다. MIME 문법은 발송 전에 워커에서 검사하고, 템플릿 렌더링·제공자/단계 override·관리 UI는 미구현이다. 원본 Novu 비교·실제 메일 수신·운영 HA는 미검증이다. 본문은 큐에 남고 첨부파일 보존 정리 대상이 아니다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
+SMTP 추가 MIME 본문: SMTP 워커가 큐 메시지의 `alternatives`를 제한적으로 지원해 달력 초대 등을 HTML·텍스트와 함께 보낼 수 있다. MIME 유형과 크기를 발송 예약 전 검증하고 인라인 이미지·일반 첨부파일과 함께 구성한다. 실제 워커·로컬 PostgreSQL·모의 STARTTLS 서버에서 MIME을 파싱해 확인한다. 트리거 연결은 위 최신 항목을 참고하며 관리 UI는 아직 없다. 실제 메일 클라이언트·원본 Novu 전체 호환·운영 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
 SMTP CA 상태 기록 정리: 워커 0238과 `delivery-reconcile prune-smtp-ca`는 환경별 별도 권한으로 24시간보다 오래된 종료 세션의 CA 관측만 제한된 배치로 삭제하고 감사를 같은 트랜잭션에 남긴다. 현재 세션과 최근 관측을 보존하며 제한 로그인·로컬 PostgreSQL에서 권한 회수와 감사 실패 롤백, CLI를 확인한다. 직접 특권 접근·외부 위변조 방지 감사·운영 부하·다중 호스트 HA는 별도 과제다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 

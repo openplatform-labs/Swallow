@@ -3765,6 +3765,15 @@ async fn trigger(
                                 .all(|v| v.as_str().is_some_and(|s| !s.is_empty()))
                         }),
                         "replaceToRecipient" => value.is_boolean(),
+                        "alternatives" => value.as_array().is_some_and(|items| {
+                            items.len() <= 10 && items.iter().all(|item| {
+                                item.as_object().is_some_and(|part| {
+                                    part.len() == 2
+                                        && part.get("contentType").and_then(Value::as_str).is_some_and(|v| !v.is_empty() && v.len() <= 255 && !v.chars().any(char::is_control))
+                                        && part.get("content").and_then(Value::as_str).is_some()
+                                })
+                            }) && items.iter().filter_map(|item| item.get("content").and_then(Value::as_str)).map(str::len).sum::<usize>() <= 1_048_576
+                        }),
                         "headers" => value
                             .as_object()
                             .is_some_and(|items| items.values().all(Value::is_string)),

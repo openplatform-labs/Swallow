@@ -109,8 +109,15 @@ env -i PATH="$PATH" DATABASE_URL="$DATABASE_URL" NOVU_POSTGRES_ALLOW_INSECURE=tr
 env -i PATH="$PATH" DATABASE_URL="postgres://smtp_fixture_worker@127.0.0.1:$DB_PORT/postgres" NOVU_POSTGRES_ALLOW_INSECURE=true NOVU_SMTP_ENVIRONMENT_ID=attachment-env SWALLOW_SMTP_SCOPED_RLS="${TEST_SMTP_RLS:-false}" SWALLOW_EMAIL_WORKFLOW_STEP_POLICY="${TEST_EMAIL_POLICY:-snapshot}" SWALLOW_SMTP_HOST=localhost SWALLOW_SMTP_PORT="$SMTP_PORT" SWALLOW_SMTP_FROM=sender@example.test SWALLOW_SMTP_TLS=starttls SWALLOW_SMTP_USERNAME=fixture-user SWALLOW_SMTP_PASSWORD_FILE="$TEST_DIR/password" SWALLOW_SMTP_CA_FILE="$TEST_DIR/cert" "$WORKER/target/debug/smtp-worker" >"$TEST_DIR/smtp.log" 2>&1 & SMTP_PID=$!
 for _ in $(seq 1 100); do curl -fsS "http://127.0.0.1:$API_PORT/health/ready" >/dev/null 2>&1 && break; kill -0 "$API_PID"; sleep 0.1; done
 cat > "$TEST_DIR/request.json" <<'JSON'
-{"name":"smtp-attachment","to":{"subscriberId":"recipient","email":"recipient@example.test"},"transactionId":"smtp-attachment-http","overrides":{"email":{"headers":{"X-Swallow-Test":"fixture-value","List-Unsubscribe":"<https://example.test/unsubscribe>"}}},"payload":{"attachments":[{"file":"aGVsbG8=","name":"hello.txt","mime":"text/plain"},{"file":{"type":"Buffer","data":[0,1,255]},"name":"logo.png","mime":"image/png","cid":"logo","channels":["email"]}]}}
+{"name":"smtp-attachment","to":{"subscriberId":"recipient","email":"recipient@example.test"},"transactionId":"smtp-attachment-http","overrides":{"email":{"alternatives":[{"contentType":"text/calendar; method=REQUEST; charset=utf-8","content":"BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n"}],"headers":{"X-Swallow-Test":"fixture-value","List-Unsubscribe":"<https://example.test/unsubscribe>"}}},"payload":{"attachments":[{"file":"aGVsbG8=","name":"hello.txt","mime":"text/plain"},{"file":{"type":"Buffer","data":[0,1,255]},"name":"logo.png","mime":"image/png","cid":"logo","channels":["email"]}]}}
 JSON
+python3 - "$TEST_DIR/request.json" "$TEST_DIR/invalid.json" <<'PY2'
+import json,sys
+v=json.load(open(sys.argv[1]));v['transactionId']='invalid-alternatives';v['overrides']['email']['alternatives']=[{'contentType':'text/calendar','content':'ok','unexpected':True}]
+json.dump(v,open(sys.argv[2],'w'))
+PY2
+INVALID=$(curl -sS -o "$TEST_DIR/invalid-response" -w '%{http_code}' -H 'Authorization: ApiKey fixture-api-key' -H 'Content-Type: application/json' --data-binary @"$TEST_DIR/invalid.json" "http://127.0.0.1:$API_PORT/v1/events/trigger")
+[[ "$INVALID" == 501 ]] || { echo "invalid alternative returned $INVALID" >&2; exit 1; }
 STATUS=$(curl -sS -o "$TEST_DIR/response" -w '%{http_code}' -H 'Authorization: ApiKey fixture-api-key' -H 'Content-Type: application/json' --data-binary @"$TEST_DIR/request.json" "http://127.0.0.1:$API_PORT/v1/events/trigger")
 [[ "$STATUS" == 201 ]] || { echo "trigger returned $STATUS" >&2; cat "$TEST_DIR/response" >&2; exit 1; }
 # The worker may claim a job, but without attempt INSERT it must not contact the relay.
@@ -141,6 +148,7 @@ import email,sys
 m=email.message_from_binary_file(open(sys.argv[1],'rb'))
 assert m['X-Swallow-Test']=='fixture-value'
 assert m['List-Unsubscribe']=='<https://example.test/unsubscribe>'
+c=[x for x in m.walk() if x.get_content_type()=='text/calendar']; assert len(c)==1 and c[0].get_param('method')=='REQUEST' and b'BEGIN:VCALENDAR' in c[0].get_payload(decode=True)
 p={x.get_filename():x for x in m.walk() if x.get_filename()}
 assert set(p)=={'hello.txt','logo.png'}
 assert p['hello.txt'].get_payload(decode=True)==b'hello'
