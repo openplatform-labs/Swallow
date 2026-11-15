@@ -2505,6 +2505,28 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     assert_eq!(value["result"], "delivered");
     assert_eq!(value["autoCorrelated"], true);
     assert_eq!(value["autoCorrelationConflict"], false);
+    assert!(value["attemptHttpStatus"].is_null());
+    db.execute(
+        "UPDATE public.novu_rust_resend_attempts SET http_status=429 WHERE job_id=$1",
+        &[&job],
+    )
+    .await
+    .unwrap();
+    let response = app
+        .clone()
+        .oneshot(result_request(&token, &result_query))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(value["attemptHttpStatus"], 429);
+    db.execute(
+        "UPDATE public.novu_rust_resend_attempts SET http_status=NULL WHERE job_id=$1",
+        &[&job],
+    )
+    .await
+    .unwrap();
     db.batch_execute("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) SELECT gen_random_uuid(),'jwt-alert-a','experimental_resend_email','{\"private\":\"hidden\"}'::jsonb FROM generate_series(1,21); INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) VALUES(gen_random_uuid(),'jwt-alert-b','experimental_resend_email','{}')").await.unwrap();
     let jobs_request = |jwt: &str, query: &str| {
         Request::builder()

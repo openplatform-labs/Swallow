@@ -1,3 +1,9 @@
+## Resend result HTTP status
+
+API migration `0084` adds `attemptHttpStatus` (integer or null) to the existing experimental operator Resend result and job-list responses. The existing result/list grants and JWT checks remain in force; the same result permission now exposes this additional operational metadata. The value is the HTTP status stored for the current attempt, not proof of delivery or a complete provider response. A null status can mean there is no attempt or no recorded HTTP response. After a manual retry deletes the previous attempt, the old status is not returned by this field; the retry audit retains the prior status. Historical provider bodies, `Retry-After` and credentials are not returned. Older API instances omit the field; upgrade all instances and apply the migration before relying on it. Reapplying API migration 0048 manually restores the older function; apply 0084 again. The migration replaces a SECURITY DEFINER function, retaining its owner and grants, which must remain trusted.
+
+The Rust API integration test uses disposable local PostgreSQL and restricted operator credentials to verify the returned status and existing authorization. The Angular screen shows 429 for rejected attempts, validates the response, and indicates when an older API omits the field; Angular tests cover both versions and invalid input. No real Resend rate limiting, browser-to-API flow for this field, production HA or full Novu compatibility was verified. For the separate manual retry workflow and its risks see the worker README.
+
 ## Optional operator token introspection
 
 Experimental operator JWT routes can optionally check token activity with an [RFC 7662](https://www.rfc-editor.org/rfc/rfc7662) endpoint on every request, after the existing pinned signature and claims verification. Configure the existing `SWALLOW_OPERATOR_JWT_CONFIG` or `SWALLOW_OPERATOR_JWT_CONFIG_FILE` and set these variables on every API instance:

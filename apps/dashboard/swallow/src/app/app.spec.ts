@@ -454,6 +454,16 @@ describe('Swallow console', () => {
     app.setSection('overview');expect(app.resendResult()).toBeNull();expect(app.alertKey).toBe('');expect(app.resendJobId).toBe('');
   });
 
+  it('shows the provider status and accepts older APIs without a status field', async () => {
+    const job='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
+    const row={jobId:job,jobStatus:'failed',result:'unknown',attemptState:'rejected',providerIdKnown:false,providerIdAmbiguous:false,autoCorrelated:false,autoCorrelationConflict:false,autoCorrelatedAt:null,lastCompletedScanAt:null};
+    vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({...row,attemptHttpStatus:429}))).mockResolvedValueOnce(new Response(JSON.stringify(row))).mockResolvedValueOnce(new Response(JSON.stringify({...row,attemptHttpStatus:999})));
+    const fixture=TestBed.createComponent(App);const app=fixture.componentInstance;app.setSection('alerts');app.alertAuthMode='jwt';app.alertEnvironment='env-a';app.alertKey='aaa.bbb.ccc';app.resendJobId=job;
+    await app.loadResend();fixture.detectChanges();expect(app.resendResult()?.attemptHttpStatus).toBe(429);expect(fixture.nativeElement.textContent).toContain('속도 제한');
+    await app.loadResend();fixture.detectChanges();expect(app.resendResult()?.attemptHttpStatus).toBeUndefined();expect(fixture.nativeElement.textContent).toContain('API 업데이트 필요');
+    await app.loadResend();expect(app.resendStatus()).toBe('error');expect(app.resendResult()).toBeNull();
+  });
+
   it('rejects malformed Resend requests and results without retaining stale data', async () => {
     const job='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
     const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response('',{status:401})).mockResolvedValueOnce(new Response(JSON.stringify({jobId:job,result:'delivered'}),{status:200})).mockResolvedValueOnce(new Response(JSON.stringify({jobId:job,jobStatus:'completed',result:'delivered',attemptState:'accepted',providerIdKnown:true,providerIdAmbiguous:false,autoCorrelated:true,autoCorrelationConflict:true,autoCorrelatedAt:'today',lastCompletedScanAt:null}),{status:200}));
