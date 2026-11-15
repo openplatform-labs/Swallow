@@ -369,7 +369,13 @@ impl Twilio {
 
     /// Submits once. A transport or malformed response does not prove non-delivery.
     pub async fn send(&self, sms: &Sms) -> Result<Receipt, SendError> {
-        let body = form_body(&request_body(&self.config, sms)?)?;
+        let body = self.prepare(sms)?;
+        self.send_prepared(body).await
+    }
+    pub(crate) fn prepare(&self, sms: &Sms) -> Result<String, SendError> {
+        form_body(&request_body(&self.config, sms)?)
+    }
+    pub(crate) async fn send_prepared(&self, body: String) -> Result<Receipt, SendError> {
         let (username, password) =
             match self.config.api_key_sid.as_deref().filter(|v| !v.is_empty()) {
                 Some(key) => (key, self.config.api_key_secret.as_deref().unwrap_or("")),

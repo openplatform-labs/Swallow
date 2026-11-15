@@ -247,7 +247,7 @@ pub async fn process_one_with_step_policy(
         sms.content = option("content").unwrap_or(&content).to_owned();
         sms.from = option("from").map(str::to_owned);
     }
-    if policy != crate::sms_step_policy::Policy::Snapshot && !lock_live(&tx, &job).await? {
+    if !lock_live(&tx, &job).await? {
         tx.rollback().await?;
         return Ok(true);
     }
@@ -270,9 +270,28 @@ pub async fn process_one_with_step_policy(
     )
     .await?;
     apply_status_callback(&mut sms, provider, job.id, dispatch);
+    let prepared = provider.prepare(&sms);
+    if !lock_live(&tx, &job).await? {
+        tx.rollback().await?;
+        return Ok(true);
+    }
+    let prepared = match prepared {
+        Ok(body) => body,
+        Err(_) => {
+            tx.execute("UPDATE novu_rust_twilio_attempts SET state='rejected',updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$2 AND state='dispatching'", &[&job.id,&environment]).await?;
+            tx.execute("UPDATE novu_rust_sms_messages SET delivery_state='rejected',status='error',error_id='unexpected_sms_error',error_text='invalid sms request' WHERE environment_id=$1 AND sms_job_id=$2", &[&environment,&job.id]).await?;
+            tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='invalid sms request',lease_token=NULL,lease_until=NULL WHERE id=$1 AND environment_id=$2", &[&job.id,&environment]).await?;
+            tx.commit().await?;
+            return Ok(true);
+        }
+    };
     tx.execute("UPDATE novu_rust_sms_messages SET delivery_state='dispatching' WHERE environment_id=$1 AND sms_job_id=$2", &[&environment,&job.id]).await?;
+    if !lock_live(&tx, &job).await? {
+        tx.rollback().await?;
+        return Ok(true);
+    }
     tx.commit().await?;
-    let (state, status, provider_id, diagnostic, retry_after) = match provider.send(&sms).await {
+    let (state, status, provider_id, diagnostic, retry_after) = match provider.send_prepared(prepared).await {
         Ok(receipt) => (
             "accepted",
             None,
@@ -355,6 +374,44 @@ pub async fn recover_expired(client: &mut Client, environment: &str) -> Result<u
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    #[ignore = "requires fully migrated disposable PostgreSQL and loopback"]
+    async fn invalid_sms_is_rejected_before_dispatch_reservation() {
+        use super::*;
+        use crate::twilio::{Config,Region};
+        use serde_json::json;
+        use tokio::{io::{AsyncReadExt,AsyncWriteExt},net::TcpListener};
+        use tokio_postgres::NoTls;
+        let (mut db,driver)=tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(),NoTls).await.unwrap();tokio::spawn(driver);
+        let env=format!("twilio-invalid-{}",Uuid::new_v4());
+        db.execute("INSERT INTO public.novu_rust_environments VALUES($1,'org')",&[&env]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,sms_content,inbox_metadata) VALUES($1,'fixture',true,true,'hello','{\"id\":\"64a000000000000000000051\"}')",&[&env]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES($1,'alice','64a000000000000000000054','{\"phone\":\"+15550000002\"}')",&[&env]).await.unwrap();
+        crate::enqueue(&db,Uuid::new_v4(),&env,crate::in_app::JOB_KIND,&json!({"workflow":"fixture","transactionId":"invalid-sms","content":"","payload":{},"recipients":[{"subscriberId":"alice"}],"recipientIdentitySnapshot":{"alice":"64a000000000000000000054"},"severityOverride":null})).await.unwrap();
+        assert!(crate::in_app::process_one(&mut db).await.unwrap());
+        let job:Uuid=db.query_one("SELECT sms_job_id FROM public.novu_rust_sms_step_outcomes WHERE environment_id=$1 AND transaction_id='invalid-sms'",&[&env]).await.unwrap().get(0);
+        // Simulate a malformed queued provider field; the HTTP API rejects this shape.
+        db.execute("UPDATE public.novu_queue_jobs SET payload=jsonb_set(payload,'{provider_data,mediaUrl}','{\"invalid\":true}'::jsonb,true) WHERE id=$1",&[&job]).await.unwrap();
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base=format!("https://events.example.test/webhooks/organizations/org/environments/{env}/sms/twilio");
+        let provider=Twilio::test_origin(Config{account_sid:"ACfixture".into(),auth_token:"fixture".into(),api_key_sid:None,api_key_secret:None,from:"+15550000001".into(),region:Region::Us},&format!("http://{}",listener.local_addr().unwrap())).unwrap().with_status_callback(&base,&env).unwrap();
+        db.batch_execute("CREATE FUNCTION public.test_twilio_invalid_fail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$; CREATE TRIGGER test_twilio_invalid_fail BEFORE UPDATE OF delivery_state ON public.novu_rust_sms_messages FOR EACH ROW WHEN (NEW.delivery_state='rejected') EXECUTE FUNCTION public.test_twilio_invalid_fail()").await.unwrap();
+        assert!(process_one(&mut db,&env,&provider).await.is_err());
+        assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_twilio_attempts WHERE job_id=$1",&[&job]).await.unwrap().get::<_,i64>(0),0);
+        assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_twilio_dispatch_ids WHERE job_id=$1",&[&job]).await.unwrap().get::<_,i64>(0),0);
+        db.batch_execute("DROP TRIGGER test_twilio_invalid_fail ON public.novu_rust_sms_messages; DROP FUNCTION public.test_twilio_invalid_fail()").await.unwrap();
+        db.execute("UPDATE public.novu_queue_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1",&[&job]).await.unwrap();
+        assert_eq!(recover_expired(&mut db,&env).await.unwrap(),1);
+        assert!(process_one(&mut db,&env,&provider).await.unwrap());
+        assert!(tokio::time::timeout(Duration::from_millis(300),listener.accept()).await.is_err());
+        let row=db.query_one("SELECT j.status,j.last_error,a.state,a.http_status,a.dispatch_id,m.status,m.delivery_state,m.error_text FROM public.novu_queue_jobs j JOIN public.novu_rust_twilio_attempts a ON a.job_id=j.id JOIN public.novu_rust_sms_messages m ON m.sms_job_id=j.id AND m.environment_id=j.environment_id WHERE j.id=$1",&[&job]).await.unwrap();
+        assert_eq!(row.get::<_,String>(0),"failed");assert_eq!(row.get::<_,String>(1),"invalid sms request");assert_eq!(row.get::<_,String>(2),"rejected");assert_eq!(row.get::<_,Option<i32>>(3),None);assert!(row.get::<_,Option<Uuid>>(4).is_some());assert_eq!(row.get::<_,String>(5),"error");assert_eq!(row.get::<_,String>(6),"rejected");assert_eq!(row.get::<_,String>(7),"invalid sms request");
+        let valid=Uuid::new_v4();crate::enqueue(&db,valid,&env,JOB_KIND,&json!({"to":"+15550000002","content":"hello","from":null})).await.unwrap();
+        let server=tokio::spawn(async move {let (mut socket,_)=listener.accept().await.unwrap();let mut request=[0u8;4096];assert!(socket.read(&mut request).await.unwrap()>0);let body=r#"{"sid":"SM123","date_created":"Wed, 28 Oct 2026 10:00:00 +0000"}"#;socket.write_all(format!("HTTP/1.1 201 Created\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();});
+        assert!(process_one(&mut db,&env,&provider).await.unwrap());server.await.unwrap();
+        let row=db.query_one("SELECT j.status,a.state,a.provider_message_id FROM public.novu_queue_jobs j JOIN public.novu_rust_twilio_attempts a ON a.job_id=j.id WHERE j.id=$1",&[&valid]).await.unwrap();
+        assert_eq!(row.get::<_,String>(0),"completed");assert_eq!(row.get::<_,String>(1),"accepted");assert_eq!(row.get::<_,Option<String>>(2).as_deref(),Some("SM123"));
+    }
     #[test]
     fn callback_is_job_bound_and_respects_overrides() {
         use super::*;
