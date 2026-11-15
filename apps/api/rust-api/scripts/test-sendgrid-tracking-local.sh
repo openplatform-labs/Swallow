@@ -19,3 +19,6 @@ cargo test --locked --manifest-path "$API/Cargo.toml" --test workflow_email_atta
 cargo test --locked --manifest-path "$API/Cargo.toml" --test workflow_email_attachments sendgrid_sandbox_workflow_records_validation_without_delivery -- --ignored
 cargo test --locked --manifest-path "$API/Cargo.toml" --test workflow_email_attachments trigger_lookup_is_environment_scoped_and_distinguishes_missing_jobs -- --ignored
 cargo test --locked --manifest-path "$API/Cargo.toml" --test operator_trigger_lookup -- --ignored
+cargo test --locked --manifest-path "$API/Cargo.toml" --test trigger_key_guard -- --ignored
+"$TEST_PG_BIN/createdb" -h 127.0.0.1 -p "$PORT" -U postgres trigger_contract
+TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/trigger_contract" NOVU_ALLOW_RECREATED_SUBSCRIBER=true cargo test --locked --manifest-path "$API/Cargo.toml" --test api_postgres trigger_api_contract -- --ignored

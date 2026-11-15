@@ -3705,6 +3705,8 @@ async fn trigger(
         Ok(value) => value,
         Err(response) => return response,
     };
+    let key=headers.get("authorization").and_then(|v|v.to_str().ok()).and_then(|v|v.strip_prefix("ApiKey ")).expect("authenticate validated key");
+    let key_hash=format!("{:x}",Sha256::digest(key.as_bytes()));
     let body: Value = match serde_json::from_slice(&bytes) {
         Ok(body) => body,
         Err(_) => return error(StatusCode::BAD_REQUEST, "Invalid JSON", "Bad Request"),
@@ -4193,13 +4195,17 @@ async fn trigger(
         let data = json!({"organizationId": organization_id, "workflow": name, "transactionId": txn, "recipients": recipients, "topicKeys": topic_keys, "topicExclusions": topic_exclusions, "actor": actor, "content": content, "payload": payload, "emailAttachments":email_attachments, "tags": tags, "contextKeys": context_keys, "severity": severity, "severityOverride": override_severity, "emailOverride": email_override, "smsOverride": sms_override, "emailFlatProviderOverride":flat,"smsFlatProviderOverride":sms_flat,"pushFlatProviderOverride":fcm_flat,"emailProviderOverrides":providers,"emailStepOverrides":steps});
         // The ledger and queue entry are inserted atomically. This provisional deduplication
         // policy is not yet equivalent to Novu's tier-dependent retention behaviour.
-        let result = db.execute("WITH accepted AS (INSERT INTO novu_rust_trigger_transactions (environment_id, transaction_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING 1), contexts AS (INSERT INTO novu_rust_contexts (environment_id,context_key,data) SELECT $1, entry->>'key', COALESCE(NULLIF(entry->'data','null'::jsonb),'{}'::jsonb) FROM accepted CROSS JOIN jsonb_array_elements($6::jsonb) entry ON CONFLICT (environment_id,context_key) DO UPDATE SET data=CASE WHEN EXISTS (SELECT 1 FROM jsonb_array_elements($6::jsonb) element WHERE element->>'key'=EXCLUDED.context_key AND element->'data' <> 'null'::jsonb) THEN EXCLUDED.data ELSE novu_rust_contexts.data END, updated_at=CASE WHEN EXISTS (SELECT 1 FROM jsonb_array_elements($6::jsonb) element WHERE element->>'key'=EXCLUDED.context_key AND element->'data' <> 'null'::jsonb) AND novu_rust_contexts.data IS DISTINCT FROM EXCLUDED.data THEN now() ELSE novu_rust_contexts.updated_at END RETURNING 1) INSERT INTO novu_queue_jobs (id, environment_id, kind, payload) SELECT $3, $1, $4, $5::jsonb || jsonb_build_object('recipientIdentitySnapshot',(SELECT COALESCE(jsonb_object_agg(r->>'subscriberId',s.internal_id),'{}'::jsonb) FROM jsonb_array_elements($5::jsonb->'recipients') r LEFT JOIN novu_rust_subscribers s ON s.environment_id=$1 AND s.subscriber_id=r->>'subscriberId'),'actorIdentitySnapshot',(SELECT s.internal_id FROM novu_rust_subscribers s WHERE s.environment_id=$1 AND s.subscriber_id=$5::jsonb->'actor'->>'subscriberId'),'topicIdentitySnapshot',(SELECT COALESCE(jsonb_object_agg(t.subscriber_id,s.internal_id),'{}'::jsonb) FROM novu_rust_topic_subscribers t JOIN novu_rust_subscribers s ON s.environment_id=t.environment_id AND s.subscriber_id=t.subscriber_id WHERE t.environment_id=$1 AND t.topic_key IN (SELECT jsonb_array_elements_text($5::jsonb->'topicKeys')))) FROM accepted", &[&environment_id, &txn, &Uuid::new_v4(), &queue_kind, &data, &context_entries]).await;
-        if result.is_err() {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal server error",
-                "Internal Server Error",
-            );
+        let result = db.query_one("WITH auth AS MATERIALIZED (SELECT public.novu_rust_lock_trigger_api_key($7,$1) AS ok), accepted AS (INSERT INTO novu_rust_trigger_transactions (environment_id, transaction_id) SELECT $1,$2 FROM auth WHERE ok ON CONFLICT DO NOTHING RETURNING 1), contexts AS (INSERT INTO novu_rust_contexts (environment_id,context_key,data) SELECT $1, entry->>'key', COALESCE(NULLIF(entry->'data','null'::jsonb),'{}'::jsonb) FROM accepted CROSS JOIN jsonb_array_elements($6::jsonb) entry ON CONFLICT (environment_id,context_key) DO UPDATE SET data=CASE WHEN EXISTS (SELECT 1 FROM jsonb_array_elements($6::jsonb) element WHERE element->>'key'=EXCLUDED.context_key AND element->'data' <> 'null'::jsonb) THEN EXCLUDED.data ELSE novu_rust_contexts.data END, updated_at=CASE WHEN EXISTS (SELECT 1 FROM jsonb_array_elements($6::jsonb) element WHERE element->>'key'=EXCLUDED.context_key AND element->'data' <> 'null'::jsonb) AND novu_rust_contexts.data IS DISTINCT FROM EXCLUDED.data THEN now() ELSE novu_rust_contexts.updated_at END RETURNING 1) , enqueued AS (INSERT INTO novu_queue_jobs (id, environment_id, kind, payload) SELECT $3, $1, $4, $5::jsonb || jsonb_build_object('recipientIdentitySnapshot',(SELECT COALESCE(jsonb_object_agg(r->>'subscriberId',s.internal_id),'{}'::jsonb) FROM jsonb_array_elements($5::jsonb->'recipients') r LEFT JOIN novu_rust_subscribers s ON s.environment_id=$1 AND s.subscriber_id=r->>'subscriberId'),'actorIdentitySnapshot',(SELECT s.internal_id FROM novu_rust_subscribers s WHERE s.environment_id=$1 AND s.subscriber_id=$5::jsonb->'actor'->>'subscriberId'),'topicIdentitySnapshot',(SELECT COALESCE(jsonb_object_agg(t.subscriber_id,s.internal_id),'{}'::jsonb) FROM novu_rust_topic_subscribers t JOIN novu_rust_subscribers s ON s.environment_id=t.environment_id AND s.subscriber_id=t.subscriber_id WHERE t.environment_id=$1 AND t.topic_key IN (SELECT jsonb_array_elements_text($5::jsonb->'topicKeys')))) FROM accepted RETURNING 1) SELECT auth.ok,(SELECT count(*) FROM enqueued) FROM auth", &[&environment_id, &txn, &Uuid::new_v4(), &queue_kind, &data, &context_entries, &key_hash]).await;
+        match result {
+            Ok(row) if row.get::<_,bool>(0) => {},
+            Ok(_) => return error(StatusCode::UNAUTHORIZED,"Unauthorized","Unauthorized"),
+            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR,"Internal server error","Internal Server Error"),
+        }
+    } else {
+        match db.query_one("SELECT public.novu_rust_lock_trigger_api_key($1,$2)",&[&key_hash,&environment_id]).await {
+            Ok(row) if row.get::<_,bool>(0) => {},
+            Ok(_) => return error(StatusCode::UNAUTHORIZED,"Unauthorized","Unauthorized"),
+            Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR,"Internal server error","Internal Server Error"),
         }
     }
     (

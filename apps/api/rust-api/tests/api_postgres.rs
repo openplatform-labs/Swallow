@@ -313,6 +313,8 @@ async fn trigger_api_contract_inner() {
         .await
         .unwrap();
     db.batch_execute(novu_rust_api::MIGRATION).await.unwrap();
+    db.batch_execute("DROP FUNCTION IF EXISTS public.novu_rust_lock_trigger_api_key(text,text)").await.unwrap();
+    db.batch_execute(include_str!("../migrations/0157_trigger_key_guard.sql")).await.unwrap();
     db.batch_execute(include_str!(
         "../migrations/0011_workflow_provider_permissions.sql"
     ))
