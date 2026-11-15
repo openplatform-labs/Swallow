@@ -6,7 +6,12 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use ring::hmac;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path as FsPath, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 use tokio_postgres::Client;
 use uuid::Uuid;
 
@@ -19,7 +24,19 @@ pub struct Config {
     public_url: String,
     public_path: String,
     auth_tokens: Vec<Vec<u8>>,
+    reload: Option<Arc<Reload>>,
     require_dispatch_account: bool,
+}
+
+struct Reload {
+    path: PathBuf,
+    permits: Arc<tokio::sync::Semaphore>,
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TokenBundle {
+    current: String,
+    previous: Option<String>,
 }
 
 impl Config {
@@ -62,8 +79,60 @@ impl Config {
             public_url,
             public_path,
             auth_tokens,
+            reload: None,
             require_dispatch_account: false,
         })
+    }
+    fn read_bundle(path: &FsPath) -> Option<Vec<Vec<u8>>> {
+        let raw = novu_rust_contracts::secret::read_regular_file(path).ok()?;
+        let bundle: TokenBundle = serde_json::from_str(&raw).ok()?;
+        let mut tokens = vec![bundle.current];
+        if let Some(previous) = bundle.previous {
+            tokens.push(previous);
+        }
+        if tokens
+            .iter()
+            .any(|s| s.is_empty() || s.len() > 16384 || s.contains(['\r', '\n', '\0']))
+            || (tokens.len() == 2 && tokens[0] == tokens[1])
+        {
+            return None;
+        }
+        Some(tokens.into_iter().map(String::into_bytes).collect())
+    }
+    pub fn new_reloading(
+        environment: String,
+        account_sid: String,
+        public_url: String,
+        path: PathBuf,
+    ) -> Option<Self> {
+        if path.as_os_str().is_empty() {
+            return None;
+        }
+        let tokens = Self::read_bundle(&path)?;
+        let mut config = Self::new_with_tokens(environment, account_sid, public_url, tokens)?;
+        config.auth_tokens.clear();
+        config.reload = Some(Arc::new(Reload {
+            path,
+            permits: Arc::new(tokio::sync::Semaphore::new(16)),
+        }));
+        Some(config)
+    }
+    async fn reload_bundle(&self) -> Option<Vec<Vec<u8>>> {
+        let reload = self.reload.as_ref()?;
+        let permit = reload.permits.clone().try_acquire_owned().ok()?;
+        let path = reload.path.clone();
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                Self::read_bundle(&path)
+            }),
+        )
+        .await
+        {
+            Ok(Ok(Some(tokens))) => Some(tokens),
+            _ => None,
+        }
     }
     pub fn require_dispatch_account(mut self, required: bool) -> Self {
         self.require_dispatch_account = required;
@@ -71,31 +140,46 @@ impl Config {
     }
 
     pub fn from_env() -> Option<Self> {
-        let current = novu_rust_contracts::secret::from_env(
-            "NOVU_TWILIO_WEBHOOK_AUTH_TOKEN",
-            "NOVU_TWILIO_WEBHOOK_AUTH_TOKEN_FILE",
-        )
-        .ok()??;
-        let previous = novu_rust_contracts::secret::from_env(
-            "NOVU_TWILIO_WEBHOOK_PREVIOUS_AUTH_TOKEN",
-            "NOVU_TWILIO_WEBHOOK_PREVIOUS_AUTH_TOKEN_FILE",
-        )
-        .ok()?;
-        let mut tokens = vec![current.into_bytes()];
-        if let Some(previous) = previous {
-            tokens.push(previous.into_bytes());
-        }
-        let required = match std::env::var("NOVU_TWILIO_WEBHOOK_REQUIRE_DISPATCH_ACCOUNT").as_deref() {
-            Ok("true") => true,
-            Ok("false") | Err(std::env::VarError::NotPresent) => false,
-            _ => return None,
+        let required =
+            match std::env::var("NOVU_TWILIO_WEBHOOK_REQUIRE_DISPATCH_ACCOUNT").as_deref() {
+                Ok("true") => true,
+                Ok("false") | Err(std::env::VarError::NotPresent) => false,
+                _ => return None,
+            };
+        let environment = std::env::var("NOVU_TWILIO_WEBHOOK_ENVIRONMENT_ID").ok()?;
+        let account = std::env::var("NOVU_TWILIO_WEBHOOK_ACCOUNT_SID").ok()?;
+        let url = std::env::var("NOVU_TWILIO_WEBHOOK_URL").ok()?;
+        let config = if let Some(path) = std::env::var_os("NOVU_TWILIO_WEBHOOK_TOKEN_BUNDLE_FILE") {
+            if [
+                "NOVU_TWILIO_WEBHOOK_AUTH_TOKEN",
+                "NOVU_TWILIO_WEBHOOK_AUTH_TOKEN_FILE",
+                "NOVU_TWILIO_WEBHOOK_PREVIOUS_AUTH_TOKEN",
+                "NOVU_TWILIO_WEBHOOK_PREVIOUS_AUTH_TOKEN_FILE",
+            ]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some())
+            {
+                return None;
+            }
+            Self::new_reloading(environment, account, url, PathBuf::from(path))?
+        } else {
+            let current = novu_rust_contracts::secret::from_env(
+                "NOVU_TWILIO_WEBHOOK_AUTH_TOKEN",
+                "NOVU_TWILIO_WEBHOOK_AUTH_TOKEN_FILE",
+            )
+            .ok()??;
+            let previous = novu_rust_contracts::secret::from_env(
+                "NOVU_TWILIO_WEBHOOK_PREVIOUS_AUTH_TOKEN",
+                "NOVU_TWILIO_WEBHOOK_PREVIOUS_AUTH_TOKEN_FILE",
+            )
+            .ok()?;
+            let mut tokens = vec![current.into_bytes()];
+            if let Some(previous) = previous {
+                tokens.push(previous.into_bytes());
+            }
+            Self::new_with_tokens(environment, account, url, tokens)?
         };
-        Self::new_with_tokens(
-            std::env::var("NOVU_TWILIO_WEBHOOK_ENVIRONMENT_ID").ok()?,
-            std::env::var("NOVU_TWILIO_WEBHOOK_ACCOUNT_SID").ok()?,
-            std::env::var("NOVU_TWILIO_WEBHOOK_URL").ok()?,
-            tokens,
-        ).map(|config| config.require_dispatch_account(required))
+        Some(config.require_dispatch_account(required))
     }
 }
 
@@ -263,8 +347,16 @@ async fn receive_inner(
         return StatusCode::UNAUTHORIZED;
     };
     let signed = signed_data(&expected_url, &fields);
+    let reloaded = if config.reload.is_some() {
+        match config.reload_bundle().await {
+            Some(tokens) => Some(tokens),
+            None => return StatusCode::SERVICE_UNAVAILABLE,
+        }
+    } else {
+        None
+    };
     let mut valid = false;
-    for token in &config.auth_tokens {
+    for token in reloaded.as_deref().unwrap_or(&config.auth_tokens) {
         let key = hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, token);
         valid |= hmac::verify(&key, &signed, &signature).is_ok();
     }

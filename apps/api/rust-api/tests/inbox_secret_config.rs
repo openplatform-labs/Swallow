@@ -33,6 +33,7 @@ fn server() -> Command {
         .env_remove("NOVU_TWILIO_WEBHOOK_URL")
         .env_remove("NOVU_TWILIO_WEBHOOK_AUTH_TOKEN")
         .env_remove("NOVU_TWILIO_WEBHOOK_AUTH_TOKEN_FILE")
+        .env_remove("NOVU_TWILIO_WEBHOOK_TOKEN_BUNDLE_FILE")
         .env_remove("NOVU_TWILIO_WEBHOOK_PREVIOUS_AUTH_TOKEN")
         .env_remove("NOVU_TWILIO_WEBHOOK_PREVIOUS_AUTH_TOKEN_FILE")
         .stdout(Stdio::null());
@@ -323,6 +324,61 @@ fn previous_resend_secret_file_is_accepted_without_exposing_path_or_secret() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("whsec_"));
     assert!(!stderr.contains(path.to_str().unwrap()));
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn twilio_token_bundle_requires_valid_exclusive_configuration() {
+    let path = std::env::temp_dir().join(format!(
+        "swallow-twilio-bundle-config-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let check = |contents: &str, conflict: bool, expected: bool| {
+        fs::write(&path, contents).unwrap();
+        let mut command = server();
+        command.env("SWALLOW_API_STRICT_SECURITY_CONFIG","true").env("NOVU_TWILIO_WEBHOOK_ENVIRONMENT_ID","env")
+        .env("NOVU_TWILIO_WEBHOOK_ACCOUNT_SID","AC11111111111111111111111111111111").env("NOVU_TWILIO_WEBHOOK_URL","https://events.example.test/webhooks/organizations/org/environments/env/sms/twilio")
+        .env("NOVU_TWILIO_WEBHOOK_TOKEN_BUNDLE_FILE",&path).stderr(Stdio::piped());
+        if conflict {
+            command.env("NOVU_TWILIO_WEBHOOK_AUTH_TOKEN", "test-secret");
+        }
+        let mut child = command.spawn().unwrap();
+        let deadline =
+            std::time::Instant::now() + Duration::from_secs(if expected { 1 } else { 5 });
+        let exited = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        if exited.is_none() {
+            child.kill().unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            exited.is_none(),
+            expected,
+            "unexpected startup configuration outcome"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("sensitive-test-token"));
+        assert!(!stderr.contains(path.to_str().unwrap()));
+    };
+    check(r#"{"current":"sensitive-test-token"}"#, false, true);
+    check(r#"{"current":"sensitive-test-token"}"#, true, false);
+    check(
+        r#"{"current":"sensitive-test-token","previous":"sensitive-test-token"}"#,
+        false,
+        false,
+    );
+    check(
+        r#"{"current":"sensitive-test-token","extra":"x"}"#,
+        false,
+        false,
+    );
     fs::remove_file(path).unwrap();
 }
 
