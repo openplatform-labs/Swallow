@@ -6,5 +6,25 @@
 <form class="subscriber-form" (ngSubmit)="load()"><label for="slack-job">작업 UUID</label><input id="slack-job" name="slackJobId" [(ngModel)]="jobId" (ngModelChange)="clearResult()" autocomplete="off" required><button type="submit" class="btn btn-primary" [disabled]="resultStatus()==='loading'">Slack 상태 조회</button></form>
 @if(resultStatus()==='loading'){<p role="status">결과를 조회 중입니다.</p>} @else if(resultStatus()==='error'){<p role="alert">결과를 조회하지 못했습니다. 인증, 권한과 작업 UUID를 확인하세요.</p>}
 @else if(result();as item){<p role="status">종류: {{item.kind}} · 작업 상태: {{item.jobStatus}} · 발송 시도: {{item.attemptState || '없음'}}<br>현재 발송 시도 ID: {{item.attemptId === undefined ? 'API 업데이트 필요' : (item.attemptId || '없음')}}<br>확인 분류: {{item.failureCategory || '—'}} · 공급자 ID 기록: {{item.providerIdKnown?'있음':'없음'}} · 판정 이력: {{item.hasResolutionHistory?'있음':'없음'}}</p>}
+<section aria-label="Slack 발송 판정">
+<h3>현재 시도 판정</h3><p>판정에는 별도 운영자 권한이 필요합니다. 재시도는 중복 발송될 수 있으며 접수 판정은 사용자 수신을 보장하지 않습니다.</p>
+@if(decisionStatus()==='idle') {
+ <form class="decision-form" (ngSubmit)="prepareDecision()">
+  <label for="slack-decision">판정</label><select id="slack-decision" name="slackDecision" [(ngModel)]="decisionChoice"><option value="retry">재시도 허용</option><option value="accepted">공급자 접수로 판정</option></select>
+  <label for="slack-decision-reason">조사 사유</label><input id="slack-decision-reason" name="slackDecisionReason" [(ngModel)]="decisionReason" autocomplete="off" required>
+  <button class="btn btn-outline" type="submit">현재 시도 판정 준비</button>
+ </form><p>먼저 실패한 작업의 현재 결과를 조회하고 공급자 상태를 독립적으로 확인하세요.</p>
+} @else if(decisionStatus()==='unavailable') {<p role="alert">요청 ID를 생성할 수 없습니다.</p><button type="button" class="btn btn-outline" (click)="resetDecision()">다시 준비</button>}
+@if(decisionSnapshot();as decision) {
+ <p>요청 ID: <strong>{{decision.requestId}}</strong> · 작업: {{decision.jobId}} · 시도: {{decision.attemptId}} · 판정: {{decision.decision}}</p>
+ <p>사유: {{decision.reason}}</p><p>요청 ID를 별도로 기록하세요. 결과가 불명일 때 같은 운영자와 환경에서 아래 조회에 사용합니다.</p>
+ @if(decisionStatus()==='prepared') {<label><input type="checkbox" name="slackDecisionConfirm" [(ngModel)]="decisionConfirmed"> 조사 결과와 판정 내용을 확인했습니다.</label> <button type="button" class="btn btn-danger-outline" (click)="submitDecision()" [disabled]="!decisionConfirmed">판정 요청</button> <button type="button" class="btn btn-outline" (click)="resetDecision()">취소</button>}
+ @else if(decisionStatus()==='sending') {<p role="status">판정을 요청하고 있습니다.</p>}
+ @else if(decisionStatus()==='recorded') {<p role="status">판정이 기록되었습니다. 현재 작업 상태를 다시 조회하세요.</p><button type="button" class="btn btn-outline" (click)="resetDecision()">새 판정 준비</button>}
+ @else if(decisionStatus()==='unknown') {<p role="alert">요청 결과가 불명입니다. 자동 재시도하지 않습니다. 요청 ID와 서버 감사 및 현재 작업을 확인하세요. 조회 결과가 없어도 요청이 진행 중일 수 있습니다.</p><label><input type="checkbox" name="slackResetConfirm" [(ngModel)]="resetConfirmed"> 기존 요청의 결과를 독립적으로 조사했습니다.</label> <button type="button" class="btn btn-outline" (click)="resetDecision()" [disabled]="!resetConfirmed">검토 후 새 판정 준비</button>}
+}
+<form class="decision-form" (ngSubmit)="lookupDecision()"><label for="slack-request-id">판정 요청 ID 조회</label><input id="slack-request-id" name="slackRequestId" [(ngModel)]="lookupId" (ngModelChange)="clearLookup()" autocomplete="off" [disabled]="decisionStatus()==='sending'" required><button type="submit" class="btn btn-outline" [disabled]="decisionStatus()==='sending'||lookupStatus()==='loading'">Slack 요청 결과 조회</button></form>
+@if(lookupStatus()==='found'){@if(lookupRecord();as found){<p role="status">현재 인증으로 확인된 요청: 작업 {{found.jobId}} · 시도 {{found.attemptId}} · 판정 {{found.decision}} · 사유 {{found.reason}}</p>}} @else if(lookupStatus()==='not-found'){<p role="status">조회 시점에 기록이 없습니다. 요청이 아직 진행 중일 수 있습니다.</p>} @else if(lookupStatus()==='error'){<p role="alert">요청 결과를 확인하지 못했습니다. 인증, 환경과 판정 권한을 확인하세요.</p>}
+</section>
 <p>시도 ID는 조회 시점의 값이며 Slack의 접수 증거가 아닙니다. 재시도 전 현재 ID를 다시 확인하세요. 접수 상태는 실제 수신을 보장하지 않습니다. 판정 이력은 과거 기록을 포함하므로 현재 시도의 판정 여부를 증명하지 않습니다. 목록은 UUID순이며 단일 시점의 스냅샷이 아닙니다.</p>
 </div></section>

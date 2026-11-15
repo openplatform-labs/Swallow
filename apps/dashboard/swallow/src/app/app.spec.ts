@@ -418,6 +418,10 @@ describe('Swallow console', () => {
     expect(app.workflowStatus()).toBe('idle');expect(app.workflowContent).toBe('');
   });
 
+  it('prevents section changes while a Slack decision request is sending',()=>{
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('alerts');app.slackDecisionBusy=true;app.setSection('overview');expect(app.section()).toBe('alerts');app.slackDecisionBusy=false;app.setSection('overview');expect(app.section()).toBe('overview');
+  });
+
   it('pages Resend jobs and selects a job using a fresh result request', async () => {
     const row=(n:number)=>({jobId:`00000000-0000-0000-0000-${n.toString().padStart(12,'0')}`,jobStatus:'completed',result:'unknown',attemptState:null,providerIdKnown:false,providerIdAmbiguous:false,autoCorrelated:false,autoCorrelationConflict:false,autoCorrelatedAt:null,lastCompletedScanAt:null,secret:'hidden'});
     const page1=Array.from({length:20},(_,i)=>row(i+1)); const page2=[row(21)];

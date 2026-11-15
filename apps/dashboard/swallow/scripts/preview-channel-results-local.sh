@@ -46,6 +46,13 @@ INSERT INTO public.novu_rust_operator_jwt_sendgrid_result_grants VALUES ('https:
 INSERT INTO public.novu_rust_operator_jwt_sendgrid_jobs_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
 INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) SELECT gen_random_uuid(),'ui-fixture-env','experimental_sendgrid_email','{}' FROM generate_series(1,21);
 SQL
+if [[ "${SWALLOW_UI_SLACK_DECISION_FIXTURE:-false}" == true ]]; then
+ "$pgbin/psql" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_slack_resolve(text,text,text,text,bigint,uuid,uuid,uuid,text,text),public.novu_rust_operator_jwt_slack_decision_request(text,text,text,text,bigint,uuid) TO ui_channel_results_fixture;
+INSERT INTO public.novu_rust_operator_jwt_slack_decision_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env','retry');
+INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'ui-fixture-env',rolname,'slack_retry',oid FROM pg_roles WHERE rolname='ui_channel_results_fixture';
+SQL
+fi
 node --input-type=module - "$root" "$testdir" <<'JS'
 import {readFile,writeFile} from 'node:fs/promises';
 import {SignJWT,importPKCS8} from './node_modules/jose/dist/webapi/index.js';

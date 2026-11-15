@@ -18,6 +18,27 @@ describe('Slack operator results',()=>{
     await c.load();fixture.detectChanges();expect(c.result()?.attemptId).toBe(attempt);expect(fixture.nativeElement.textContent).toContain(attempt);
     await c.load();expect(c.resultStatus()).toBe('error');expect(c.result()).toBeNull();fixture.destroy();
   });
+  it('requires confirmation, preserves unknown outcomes and checks the request ID',async()=>{
+    const attempt='22222222-2222-4222-8222-222222222222';let fail!:(error:Error)=>void;
+    const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({...row,attemptId:attempt}))).mockImplementationOnce(()=>new Promise((_,reject)=>{fail=reject;}));
+    const fixture=TestBed.createComponent(SlackResults);const c=fixture.componentInstance;c.apiOrigin='https://api.example.test';c.environment='env';c.token='aaa.bbb.ccc';c.jobId=id;await c.load();c.decisionReason='ticket-123';c.prepareDecision();
+    const draft=c.decisionSnapshot()!;expect(draft.attemptId).toBe(attempt);expect(c.decisionStatus()).toBe('prepared');await c.submitDecision();expect(mock).toHaveBeenCalledTimes(1);
+    c.decisionConfirmed=true;const busy=vi.fn();c.busyChange.subscribe(busy);const pending=c.submitDecision();expect(c.decisionStatus()).toBe('sending');await c.submitDecision();expect(mock).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(mock.mock.calls[1][1]!.body as string)).toEqual(draft);fail(new Error('lost response'));await pending;expect(c.decisionStatus()).toBe('unknown');expect(busy.mock.calls).toEqual([[true],[false]]);c.resetDecision();expect(c.decisionStatus()).toBe('unknown');
+    mock.mockResolvedValueOnce(new Response(JSON.stringify({found:false}))).mockResolvedValueOnce(new Response(JSON.stringify({found:true,...draft,createdAt:'2026-01-01'})));
+    await c.lookupDecision();expect(c.lookupStatus()).toBe('not-found');expect(c.decisionStatus()).toBe('unknown');await c.lookupDecision();expect(c.lookupStatus()).toBe('found');expect(c.decisionStatus()).toBe('recorded');expect(c.result()).toBeNull();fixture.destroy();
+  });
+  it('does not treat a lookup under changed credentials as proof of the earlier request',async()=>{
+    const attempt='22222222-2222-4222-8222-222222222222';let finish!:(r:Response)=>void;
+    const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({...row,attemptId:attempt}))).mockReturnValueOnce(new Promise(done=>{finish=done;}));
+    const fixture=TestBed.createComponent(SlackResults);const c=fixture.componentInstance;c.apiOrigin='https://api.example.test';c.environment='env';c.token='aaa.bbb.ccc';c.jobId=id;await c.load();c.decisionReason='ticket';c.prepareDecision();c.decisionConfirmed=true;const draft=c.decisionSnapshot()!;
+    const pending=c.submitDecision();c.token='ddd.eee.fff';c.ngOnChanges();finish(new Response(JSON.stringify({recorded:true,replayed:false})));await pending;expect(c.decisionStatus()).toBe('unknown');
+    mock.mockResolvedValueOnce(new Response(JSON.stringify({found:true,...draft,createdAt:'2026-01-01'})));await c.lookupDecision();expect(c.lookupStatus()).toBe('found');expect(c.decisionStatus()).toBe('unknown');expect(c.lookupRecord()?.jobId).toBe(id);fixture.destroy();
+  });
+  it('rejects an acceptance decision for a rejected attempt and records successful retry',async()=>{
+    const attempt='22222222-2222-4222-8222-222222222222';const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({...row,attemptState:'rejected',attemptId:attempt}))).mockResolvedValueOnce(new Response(JSON.stringify({recorded:true,replayed:false})));
+    const fixture=TestBed.createComponent(SlackResults);const c=fixture.componentInstance;c.apiOrigin='https://api.example.test';c.environment='env';c.token='aaa.bbb.ccc';c.jobId=id;await c.load();c.decisionReason='checked';c.decisionChoice='accepted';c.prepareDecision();expect(c.decisionStatus()).toBe('idle');c.decisionChoice='retry';c.prepareDecision();c.decisionConfirmed=true;await c.submitDecision();expect(c.decisionStatus()).toBe('recorded');expect(c.result()).toBeNull();expect(mock).toHaveBeenCalledTimes(2);fixture.destroy();
+  });
   it('rejects unsupported response values and clears results on denial',async()=>{
     vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({...row,failureCategory:'raw private error'}))).mockResolvedValueOnce(new Response('',{status:403}));const fixture=TestBed.createComponent(SlackResults);const c=fixture.componentInstance;c.apiOrigin='https://api.example.test';c.environment='env';c.token='aaa.bbb.ccc';c.jobId=id;await c.load();expect(c.resultStatus()).toBe('error');expect(c.result()).toBeNull();await c.list();expect(c.listStatus()).toBe('error');expect(c.rows()).toEqual([]);
     fixture.destroy();

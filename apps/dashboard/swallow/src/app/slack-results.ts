@@ -1,15 +1,21 @@
-import { Component, Input, OnChanges, OnDestroy, signal } from '@angular/core';
+import { Component, EventEmitter, Input, OnChanges, OnDestroy, Output, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { validChannelPage } from './channel-page';
+type Decision={requestId:string;jobId:string;attemptId:string;decision:'retry'|'accepted';reason:string};
 type Result={jobId:string;jobStatus:string;kind:string;attemptState:string|null;attemptId?:string|null;providerIdKnown:boolean;hasResolutionHistory:boolean;failureCategory:string|null};
 @Component({selector:'app-slack-results',imports:[FormsModule],templateUrl:'./slack-results.html'})
 export class SlackResults implements OnChanges,OnDestroy {
-  @Input() apiOrigin='';@Input() environment='';@Input() token='';
+  @Input() apiOrigin='';@Input() environment='';@Input() token='';@Output() busyChange=new EventEmitter<boolean>();
+  decisionChoice:'retry'|'accepted'='retry';decisionReason='';decisionConfirmed=false;resetConfirmed=false;lookupId='';
+  readonly decisionStatus=signal<'idle'|'prepared'|'sending'|'recorded'|'unknown'|'unavailable'>('idle');
+  readonly decisionSnapshot=signal<Decision|null>(null);readonly lookupStatus=signal<'idle'|'loading'|'found'|'not-found'|'error'>('idle');readonly lookupRecord=signal<Decision|null>(null);
+  private decisionToken:string|null=null;
+  private decisionAbort:AbortController|null=null;private decisionSequence=0;private lookupSequence=0;private lookupAbort:AbortController|null=null;
   jobId=''; readonly rows=signal<Result[]>([]); readonly result=signal<Result|null>(null); readonly next=signal<string|null>(null);
   readonly listStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');readonly resultStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');
   private listSequence=0;private resultSequence=0;private listAbort:AbortController|null=null;private resultAbort:AbortController|null=null;
   ngOnChanges():void {this.clear();} ngOnDestroy():void {this.clear();this.token='';}
-  clear():void {this.listSequence++;this.resultSequence++;this.listAbort?.abort();this.resultAbort?.abort();this.listAbort=null;this.resultAbort=null;this.rows.set([]);this.result.set(null);this.next.set(null);this.listStatus.set('idle');this.resultStatus.set('idle');this.jobId='';}
+  clear():void {this.listSequence++;this.resultSequence++;this.listAbort?.abort();this.resultAbort?.abort();this.listAbort=null;this.resultAbort=null;this.rows.set([]);this.result.set(null);this.next.set(null);this.listStatus.set('idle');this.resultStatus.set('idle');this.jobId='';this.lookupSequence++;this.lookupAbort?.abort();this.lookupAbort=null;this.lookupStatus.set('idle');this.lookupRecord.set(null);this.decisionToken=null;if(this.decisionStatus()==='sending'){this.decisionSequence++;this.decisionAbort?.abort();this.decisionAbort=null;this.decisionStatus.set('unknown');this.busyChange.emit(false);}else if(this.decisionStatus()==='prepared'){this.decisionStatus.set('idle');this.decisionSnapshot.set(null);}this.decisionConfirmed=false;}
   clearResult():void {this.resultSequence++;this.resultAbort?.abort();this.resultAbort=null;this.result.set(null);this.resultStatus.set('idle');}
   private validUuid(value:unknown):value is string {return typeof value==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);}
   private origin():string {const url=new URL(this.apiOrigin.trim());if(!['http:','https:'].includes(url.protocol)||url.username||url.password||url.pathname!=='/'||url.search||url.hash||(url.protocol==='http:'&&!['localhost','127.0.0.1','[::1]'].includes(url.hostname)))throw new Error('origin');return url.origin;}
@@ -26,4 +32,36 @@ export class SlackResults implements OnChanges,OnDestroy {
     try{const params=this.params();if(!this.validUuid(this.jobId.trim()))throw new Error('job');params.set('jobId',this.jobId.trim());const response=await fetch(`${this.origin()}/v1/experimental/operator/slack-result?${params}`,{headers:{Authorization:`Bearer ${this.token.trim()}`},credentials:'omit',cache:'no-store',redirect:'error',signal:controller.signal});if(!response.ok)throw new Error('request');const result=this.parse(await response.json());if(result.jobId.toLowerCase()!==this.jobId.trim().toLowerCase())throw new Error('response');if(seq!==this.resultSequence)return;this.result.set(result);this.resultStatus.set('loaded');
     }catch{if(seq===this.resultSequence){this.result.set(null);this.resultStatus.set('error');}}
   }
+  prepareDecision():void {
+    const result=this.result(),reason=this.decisionReason.trim();
+    if(this.decisionStatus()!=='idle'||!result||result.jobStatus!=='failed'||!this.validUuid(result.attemptId)||!['unknown','rejected'].includes(result.attemptState || '')||!['retry','accepted'].includes(this.decisionChoice)||(this.decisionChoice==='accepted'&&result.attemptState!=='unknown')||!reason||new TextEncoder().encode(reason).length>512||/[\0]/.test(reason))return;
+    try {const requestId=crypto.randomUUID();this.decisionSnapshot.set({requestId,jobId:result.jobId,attemptId:result.attemptId,decision:this.decisionChoice,reason});this.clearLookup();this.lookupId=requestId;this.decisionConfirmed=false;this.decisionStatus.set('prepared');}
+    catch {this.decisionStatus.set('unavailable');}
+  }
+  async submitDecision():Promise<void> {
+    const snapshot=this.decisionSnapshot();if(!snapshot||this.decisionStatus()!=='prepared'||!this.decisionConfirmed)return;
+    let url:string,params:URLSearchParams;try{url=this.origin();params=this.params();}catch{this.decisionStatus.set('unknown');return;}
+    const sequence=++this.decisionSequence,controller=new AbortController();this.decisionAbort=controller;this.decisionToken=this.token.trim();this.decisionStatus.set('sending');this.busyChange.emit(true);
+    try {
+      const response=await fetch(`${url}/v1/experimental/operator/slack-decision?${params}`,{method:'POST',headers:{Authorization:`Bearer ${this.token.trim()}`,'Content-Type':'application/json'},body:JSON.stringify(snapshot),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      if(!response.ok)throw new Error('uncertain');const value:unknown=await response.json();
+      if(!value||typeof value!=='object'||(value as Record<string,unknown>)['recorded']!==true||typeof (value as Record<string,unknown>)['replayed']!=='boolean')throw new Error('uncertain');
+      if(sequence!==this.decisionSequence)return;this.decisionStatus.set('recorded');this.clearResult();this.rows.set([]);this.next.set(null);this.listStatus.set('idle');
+    } catch {if(sequence===this.decisionSequence)this.decisionStatus.set('unknown');}
+    finally {if(sequence===this.decisionSequence){this.decisionAbort=null;this.busyChange.emit(false);}}
+  }
+  resetDecision():void {if(this.decisionStatus()==='sending'||(this.decisionStatus()==='unknown'&&!this.resetConfirmed))return;this.decisionSnapshot.set(null);this.decisionStatus.set('idle');this.decisionToken=null;this.decisionConfirmed=false;this.resetConfirmed=false;this.decisionReason='';this.clearLookup();this.lookupId='';}
+  clearLookup():void {this.lookupSequence++;this.lookupAbort?.abort();this.lookupAbort=null;this.lookupRecord.set(null);this.lookupStatus.set('idle');}
+  async lookupDecision():Promise<void> {
+    const requestId=this.lookupId.trim().toLowerCase();if(!this.validUuid(requestId)||this.decisionStatus()==='sending')return;
+    const sequence=++this.lookupSequence;this.lookupAbort?.abort();const controller=new AbortController();this.lookupAbort=controller;this.lookupRecord.set(null);this.lookupStatus.set('loading');
+    try {const params=this.params();params.set('requestId',requestId);const response=await fetch(`${this.origin()}/v1/experimental/operator/slack-decision-request?${params}`,{headers:{Authorization:`Bearer ${this.token.trim()}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      if(!response.ok)throw new Error('request');const value:unknown=await response.json();if(!value||typeof value!=='object')throw new Error('response');const row=value as Record<string,unknown>;
+      if(row['found']===false){if(sequence===this.lookupSequence)this.lookupStatus.set('not-found');return;}
+      if(row['found']!==true||row['requestId']!==requestId||!this.validUuid(row['jobId'])||!this.validUuid(row['attemptId'])||!['retry','accepted'].includes(row['decision'] as string)||typeof row['reason']!=='string'||typeof row['createdAt']!=='string')throw new Error('response');
+      const snap=this.decisionSnapshot();if(snap&&snap.requestId===requestId&&(snap.jobId!==row['jobId']||snap.attemptId!==row['attemptId']||snap.decision!==row['decision']||snap.reason!==row['reason']))throw new Error('response');
+      if(sequence!==this.lookupSequence)return;this.lookupRecord.set({requestId,jobId:row['jobId'] as string,attemptId:row['attemptId'] as string,decision:row['decision'] as 'retry'|'accepted',reason:row['reason'] as string});this.lookupStatus.set('found');if(snap&&snap.requestId===requestId&&this.decisionToken!==null&&this.decisionToken===this.token.trim()) {this.decisionStatus.set('recorded');this.clearResult();this.rows.set([]);this.next.set(null);this.listStatus.set('idle');}
+    }catch{if(sequence===this.lookupSequence)this.lookupStatus.set('error');}finally{if(sequence===this.lookupSequence)this.lookupAbort=null;}
+  }
+
 }
