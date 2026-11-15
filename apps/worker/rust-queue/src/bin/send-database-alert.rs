@@ -126,6 +126,7 @@ async fn run() -> Result<()> {
         twilio_delayed: None,
         fcm_partial: None,
         fcm_unreviewed: None,
+        fcm_cooldown: None,
         failed_jobs: None,
         failed_jobs_check_failed: false,
         database_probe: Some((args[1].clone(), false)),

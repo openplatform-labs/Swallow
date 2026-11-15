@@ -43,6 +43,12 @@ fn continuation_delay(
     }
 }
 
+/// Environment-scoped aggregate shared-cooldown status.
+pub async fn cooldown_health(db:&Client,environment:&str,grace:i32)->Result<serde_json::Value,Error> {
+    let row=db.query_one("SELECT active,not_before,fallback_seconds,deferred,overdue FROM public.novu_rust_fcm_cooldown_health($1,$2)",&[&environment,&grace]).await?;
+    Ok(serde_json::json!({"active":row.get::<_,bool>(0),"notBefore":row.get::<_,Option<String>>(1),"fallbackSeconds":row.get::<_,i32>(2),"deferred":row.get::<_,i64>(3),"overdue":row.get::<_,i64>(4)}))
+}
+
 async fn claim(client: &Client, environment: &str) -> Result<Option<ClaimedJob>, Error> {
     let token = Uuid::new_v4();
     let lease = Duration::from_secs(60).as_secs_f64();

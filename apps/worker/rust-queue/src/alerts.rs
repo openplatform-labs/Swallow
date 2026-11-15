@@ -324,6 +324,7 @@ pub struct Alert {
     pub twilio_delayed: Option<Result<(u64, u64, u64), ()>>,
     pub fcm_partial: Option<Result<u64, ()>>,
     pub fcm_unreviewed: Option<Result<u64, ()>>,
+    pub fcm_cooldown: Option<Result<(bool,u64,u64), ()>>,
     pub failed_jobs: Option<u64>,
     pub failed_jobs_check_failed: bool,
     pub database_probe: Option<(String, bool)>,
@@ -363,10 +364,11 @@ impl Alert {
             || self.twilio_delayed.is_some_and(|value| matches!(value,Ok((a,b,c)) if a>0||b>0||c>0))
             || self.fcm_partial.is_some_and(|value| matches!(value,Ok(n) if n>0))
             || self.fcm_unreviewed.is_some_and(|value| matches!(value,Ok(n) if n>0))
+            || self.fcm_cooldown.is_some_and(|value| matches!(value,Ok((active,deferred,overdue)) if active||deferred>0||overdue>0))
         {
             mask |= 1 << 18;
         }
-        if self.failed_jobs_check_failed || self.resend_auto.is_some_and(|value| value.is_err()) || self.slack_cooldown.is_some_and(|value| value.is_err()) || self.twilio_delayed.is_some_and(|value| value.is_err()) || self.fcm_partial.is_some_and(|value| value.is_err()) || self.fcm_unreviewed.is_some_and(|value| value.is_err()) {
+        if self.failed_jobs_check_failed || self.resend_auto.is_some_and(|value| value.is_err()) || self.slack_cooldown.is_some_and(|value| value.is_err()) || self.twilio_delayed.is_some_and(|value| value.is_err()) || self.fcm_partial.is_some_and(|value| value.is_err()) || self.fcm_unreviewed.is_some_and(|value| value.is_err()) || self.fcm_cooldown.is_some_and(|value| value.is_err()) {
             mask |= 1 << 19;
         }
         if self
@@ -432,6 +434,8 @@ impl Alert {
         if self.fcm_partial.is_some_and(|v| v.is_err()) { mask |= 1_i64 << 39; }
         if self.fcm_unreviewed.is_some_and(|v| matches!(v, Ok(n) if n>0)) { mask |= 1_i64 << 40; }
         if self.fcm_unreviewed.is_some_and(|v| v.is_err()) { mask |= 1_i64 << 41; }
+        if self.fcm_cooldown.is_some_and(|v| matches!(v, Ok((active,deferred,overdue)) if active||deferred>0||overdue>0)) { mask |= 1_i64 << 42; }
+        if self.fcm_cooldown.is_some_and(|v| v.is_err()) { mask |= 1_i64 << 43; }
         mask
     }
     pub fn observed_condition_mask_v2(&self) -> i64 {
@@ -448,6 +452,8 @@ impl Alert {
         if self.fcm_partial.is_some() { known |= 1_i64 << 39; }
         if self.fcm_unreviewed.is_some_and(|v| v.is_ok()) { known |= 1_i64 << 40; }
         if self.fcm_unreviewed.is_some() { known |= 1_i64 << 41; }
+        if self.fcm_cooldown.is_some_and(|v| v.is_ok()) { known |= 1_i64 << 42; }
+        if self.fcm_cooldown.is_some() { known |= 1_i64 << 43; }
         known
     }
     /// Bits whose current state was actually observed, excluding unavailable or disabled checks.
@@ -488,17 +494,18 @@ impl Alert {
         }
         // Both checks share the existing failed-job cooldown category. Do
         // not mark it observed healthy if either enabled check failed.
-        if (self.failed_jobs.is_some() || self.resend_auto.is_some() || self.slack_cooldown.is_some() || self.twilio_delayed.is_some() || self.fcm_partial.is_some() || self.fcm_unreviewed.is_some())
+        if (self.failed_jobs.is_some() || self.resend_auto.is_some() || self.slack_cooldown.is_some() || self.twilio_delayed.is_some() || self.fcm_partial.is_some() || self.fcm_unreviewed.is_some() || self.fcm_cooldown.is_some())
             && !self.failed_jobs_check_failed
             && !self.resend_auto.is_some_and(|value| value.is_err())
             && !self.slack_cooldown.is_some_and(|value| value.is_err())
             && !self.twilio_delayed.is_some_and(|value| value.is_err())
             && !self.fcm_partial.is_some_and(|value| value.is_err())
             && !self.fcm_unreviewed.is_some_and(|value| value.is_err())
+            && !self.fcm_cooldown.is_some_and(|value| value.is_err())
         {
             known |= 1 << 18;
         }
-        if self.failed_jobs.is_some() || self.failed_jobs_check_failed || self.resend_auto.is_some() || self.slack_cooldown.is_some() || self.twilio_delayed.is_some() || self.fcm_partial.is_some() || self.fcm_unreviewed.is_some()
+        if self.failed_jobs.is_some() || self.failed_jobs_check_failed || self.resend_auto.is_some() || self.slack_cooldown.is_some() || self.twilio_delayed.is_some() || self.fcm_partial.is_some() || self.fcm_unreviewed.is_some() || self.fcm_cooldown.is_some()
         {
             known |= 1 << 19;
         }
@@ -633,6 +640,9 @@ impl Alert {
         }
         if let Some(result)=self.twilio_delayed {
             match result { Ok((pending,expired,blocked))=>details.push(format!("Twilio delayed retries overdue: {pending}; expired leases: {expired}; callback blocked: {blocked}")),Err(())=>details.push("Twilio delayed retry check failed".into()) }
+        }
+        if let Some(result)=self.fcm_cooldown {
+            match result {Ok((active,deferred,overdue))=>details.push(format!("FCM shared cooldown active: {active}; deferred jobs: {deferred}; overdue deferred jobs: {overdue}")),Err(())=>details.push("FCM shared cooldown check failed".into())}
         }
         if let Some(result) = self.fcm_unreviewed {
             match result { Ok(count) => details.push(format!("unreviewed FCM partial jobs: {count}")), Err(()) => details.push("FCM unreviewed check failed".into()) }
@@ -1422,6 +1432,7 @@ mod tests {
             twilio_delayed: None,
             fcm_partial: None,
             fcm_unreviewed: None,
+            fcm_cooldown: None,
             failed_jobs: None,
             failed_jobs_check_failed: false,
             database_probe: None,
@@ -1544,6 +1555,18 @@ mod tests {
         assert_eq!(sent.0,Some(Ok(())));assert_eq!(sent.1,Some(Ok(())));
         for payload in [server.await.unwrap(),email_server.await.unwrap()] {assert!(payload.contains("unreviewed FCM partial jobs: 3"));}
         a.fcm_unreviewed=Some(Err(()));assert_eq!(a.observed_condition_mask_v2()&(1_i64<<40),0);assert_ne!(a.condition_mask_v2()&(1_i64<<41),0);
+    }
+    #[tokio::test]
+    async fn fcm_cooldown_alert_has_independent_v2_bits_and_both_destinations() {
+        let mut a=alert();a.resend_enabled=false;a.fcm_cooldown=Some(Ok((true,2,1)));
+        assert_eq!(a.condition_mask_v2(),1_i64<<42);assert_ne!(a.observed_condition_mask_v2()&(1_i64<<42),0);
+        let (url,server)=mock_server("200 OK","ok").await;let slack=SlackWebhook::with_endpoint(url).unwrap();
+        let (email_url,email_server)=mock_server("200 OK",r#"{"id":"mock-email"}"#).await;
+        let email=AlertEmailProvider::Resend(crate::resend::Resend::test_endpoint(crate::resend::Config{api_key:"re_test".into(),from:"sender@example.test".into(),sender_name:String::new()},email_url.as_str()).unwrap());
+        let sent=send_uncoordinated_selected(&a,Some(&slack),Some((&email,"ops@example.test")),Duration::from_secs(2),false).await;
+        assert_eq!(sent.0,Some(Ok(())));assert_eq!(sent.1,Some(Ok(())));
+        for payload in [server.await.unwrap(),email_server.await.unwrap()] {assert!(payload.contains("FCM shared cooldown active: true; deferred jobs: 2; overdue deferred jobs: 1"));}
+        a.fcm_cooldown=Some(Err(()));assert_eq!(a.observed_condition_mask_v2()&(1_i64<<42),0);assert_ne!(a.condition_mask_v2()&(1_i64<<43),0);
     }
     #[test]
     fn v2_independent_shared_checks_preserve_unknown_and_sign_bit() {
@@ -2375,6 +2398,7 @@ mod tests {
             twilio_delayed: None,
             fcm_partial: None,
             fcm_unreviewed: None,
+            fcm_cooldown: None,
             failed_jobs: None,
             failed_jobs_check_failed: false,
             database_probe: None,
