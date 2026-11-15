@@ -329,6 +329,22 @@ async fn smtp_grants_are_independent_conditional_and_audited() {
     let row=db.query_one("SELECT can_list,can_review FROM public.novu_rust_operator_jwt_smtp_review_grants WHERE environment_id=$1 AND subject='target'",&[&env]).await.unwrap();
     assert!(!row.get::<_, bool>(0));
     assert!(row.get::<_, bool>(1));
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_smtp_ca_health(text,text,text,text,bigint,integer,integer) TO {role}")).await.unwrap();
+    let ca = format!("/v1/experimental/operator/smtp-ca-health?environmentId={env}&maxAgeSeconds=60&minimumHealthy=1");
+    assert_eq!(response(app.clone(),&target,"GET",&ca,None).await.0,StatusCode::UNAUTHORIZED);
+    let ca_grant = json!({"requestId":Uuid::new_v4(),"targetIssuer":"https://issuer.test","targetSubject":"target","targetClientId":"console","resource":"smtp-review","permission":"ca-health","expected":false,"desired":true,"reason":"CA health"});
+    let (first,second)=tokio::join!(response(app.clone(),&token,"PUT",&path,Some(ca_grant.clone())),response(app2.clone(),&token,"PUT",&path,Some(ca_grant.clone())));
+    assert_eq!((first.0,second.0),(StatusCode::OK,StatusCode::OK));
+    assert_ne!(first.1["replayed"],second.1["replayed"]);
+    assert_eq!(response(app.clone(),&target,"GET",&ca,None).await.0,StatusCode::OK);
+    assert_eq!(response(app.clone(),&target,"GET",&credential,None).await.0,StatusCode::UNAUTHORIZED);
+    let mut ca_revoke=ca_grant.clone();ca_revoke["requestId"]=Uuid::new_v4().to_string().into();ca_revoke["expected"]=true.into();ca_revoke["desired"]=false.into();
+    db.batch_execute("CREATE FUNCTION public.test_smtp_ca_grant_reject() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'audit unavailable'; END $$; CREATE TRIGGER test_smtp_ca_grant_reject BEFORE INSERT ON public.novu_rust_operator_jwt_smtp_review_grant_audit FOR EACH ROW EXECUTE FUNCTION public.test_smtp_ca_grant_reject()").await.unwrap();
+    assert_eq!(response(app.clone(),&token,"PUT",&path,Some(ca_revoke.clone())).await.0,StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response(app.clone(),&target,"GET",&ca,None).await.0,StatusCode::OK);
+    db.batch_execute("DROP TRIGGER test_smtp_ca_grant_reject ON public.novu_rust_operator_jwt_smtp_review_grant_audit; DROP FUNCTION public.test_smtp_ca_grant_reject()").await.unwrap();
+    assert_eq!(response(app.clone(),&token,"PUT",&path,Some(ca_revoke)).await.0,StatusCode::OK);
+    assert_eq!(response(app.clone(),&target,"GET",&ca,None).await.0,StatusCode::UNAUTHORIZED);
     let cross = format!(
         "/v1/experimental/operator/smtp-review-grants?environmentId={other}&targetIssuer=https%3A%2F%2Fissuer.test&targetSubject=target&targetClientId=console&resource=smtp-review&permission=review"
     );

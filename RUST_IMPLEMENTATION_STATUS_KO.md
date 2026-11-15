@@ -1,4 +1,6 @@
-SMTP CA 상태 API·관리 화면: API 0150과 Angular 관리 화면에서 CA 파일 검증 상태를 독립 JWT 권한으로 조회한다. 제한 DB 계정·테스트 JWT·로컬 PostgreSQL API 시험과 실제 브라우저에서 CA 조회 허용 및 암호 상태 조회 거절을 확인했다. Angular 301건과 빌드가 통과했으며 번들 크기 경고가 있다. CA 조회 권한 초기 등록은 DBA가 직접 수행하고 권한 위임 UI는 아직 없다. 실제 IdP·릴레이 신뢰·다중 호스트 HA는 미검증이다. [API README](apps/api/rust-api/README.md)와 [관리 화면 README](apps/dashboard/swallow/README.md)를 참고한다.
+SMTP CA 조회 권한 위임: API 0151과 권한 관리 화면에서 CA 상태 조회 JWT 권한을 부여·회수하고 요청·감사를 확인한다. 기존 SMTP 검토 권한 관리자의 범위가 확대되므로 적용 전 관리자 권한을 검토해야 한다. 제한 DB 로그인·테스트 JWT·로컬 PostgreSQL에서 동시 재제출, 감사 실패 롤백, 암호 권한과 분리 및 회수를 검증했고 실제 브라우저·API에서 권한 변경과 조회를 확인한다. Angular 301건과 빌드가 통과했고 번들 크기 경고가 있다. 최초 관리자와 DB 권한은 DBA가 설정하며 실제 IdP·외부 감사·운영 HA는 미검증이다. [API README](apps/api/rust-api/README.md)를 참고한다.
+
+SMTP CA 상태 API·관리 화면: API 0150과 Angular 관리 화면에서 CA 파일 검증 상태를 독립 JWT 권한으로 조회한다. 제한 DB 계정·테스트 JWT·로컬 PostgreSQL API 시험과 실제 브라우저에서 CA 조회 허용 및 암호 상태 조회 거절을 확인했다. Angular 301건과 빌드가 통과했으며 번들 크기 경고가 있다. CA 조회 권한 위임은 위 최신 항목을 참고하며 최초 위임 관리자는 DBA가 등록한다. 실제 IdP·릴레이 신뢰·다중 호스트 HA는 미검증이다. [API README](apps/api/rust-api/README.md)와 [관리 화면 README](apps/dashboard/swallow/README.md)를 참고한다.
 
 SMTP CA 상태 경보: 선택형 최소 정상 워커 수·최대 관측 나이로 CA 파일 오류와 조회 실패를 Slack·이메일 경보에 포함한다. 목적지별 대기 또는 v3 신규 조건 경보를 선택할 수 있으며 암호 상태와 별도 비트를 사용한다. 제한 DB 로그인·실제 경보 명령과 모의 Slack·Resend로 정책·본문을 시험한다. 실제 경보 수신·릴레이 신뢰·다중 호스트 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
