@@ -27,6 +27,7 @@ type Subscriber = { id: string; firstName: string; lastName: string; email: stri
 type AlertSlot = { channel: string; targetId: string; state: string; lastStartedAt: string | null; attemptId?: string | null };
 type AlertCursor = { channel: string; targetId: string };
 type ResendResult = { jobId:string; jobStatus:string; result:string; attemptState:string|null; attemptId?:string|null; attemptHttpStatus:number|null|undefined; retryAfterSeconds:number|null|undefined; retryNotBefore:string|null|undefined; providerIdKnown:boolean; providerIdAmbiguous:boolean; autoCorrelated:boolean; autoCorrelationConflict:boolean; autoCorrelatedAt:string|null; lastCompletedScanAt:string|null };
+type ResendDecisionAudit = {id:string;actorIssuer:string;actorSubject:string;actorClientId:string;databasePrincipal:string;requestId:string;jobId:string;attemptId:string;mode:'immediate'|'after';reason:string;availableAt:string;recordedAt:string};
 type ResendDecisionBody = {requestId:string;jobId:string;attemptId:string;mode:'immediate'|'after';reason:string};
 type ResendDecisionSnapshot = {origin:string;environment:string;keyHash:string;body:ResendDecisionBody};
 type WorkflowChannel = 'email'|'sms'|'push'|'slack';
@@ -160,6 +161,9 @@ export class App implements OnDestroy {
   readonly resendLookupRecord=signal<(ResendDecisionBody & {availableAt:string;createdAt:string})|null>(null);
   private resendDecisionSequence=0; private resendDecisionAbort:AbortController|null=null;
   private resendLookupSequence=0; private resendLookupAbort:AbortController|null=null;
+  readonly resendAuditStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle'); readonly resendAuditRows=signal<ResendDecisionAudit[]>([]); readonly resendAuditNext=signal<string|null>(null); readonly resendAuditPage=signal(1);
+  private resendAuditSequence=0;private resendAuditAbort:AbortController|null=null;private resendAuditHistory:(string|null)[]=[null];
+
 
   resendJobsFilter: ''|'unknown'|'rejected'|'rate-limited' = '';
   readonly resendJobs = signal<ResendResult[]>([]);
@@ -387,7 +391,7 @@ export class App implements OnDestroy {
     // Preserve decision outcome and request ID, including an in-flight or uncertain decision.
     if (this.apiKey===session.token) { this.apiKey=''; this.clearSubscribers(); this.resetSubscriberEdit(); this.clearSubscriberProfileLookup(); this.clearSubscriberCreateLookup(); this.clearSubscriberDeleteLookup(); }
     if (this.alertKey===session.token) {
-      this.stopAlertRefresh();
+      this.stopAlertRefresh();this.cancelResendDecisionContext();
       this.alertKey=''; this.clearResend(); this.clearResendJobs();
       this.alertRequestId++; this.alertAbort?.abort(); this.alertAbort=null;
       this.alertSlots.set([]); this.alertStatus.set('idle'); this.alertError.set('');
@@ -1326,7 +1330,7 @@ export class App implements OnDestroy {
   private resendUuid(value:unknown):value is string { return typeof value==='string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value); }
   cancelResendDecisionContext():void {
     this.resendDecisionSequence++; this.resendDecisionAbort?.abort(); this.resendDecisionAbort=null;
-    this.clearResendLookup();
+    this.clearResendLookup();this.clearResendAudit();
     if(this.resendDecisionStatus()==='sending') this.resendDecisionStatus.set('unknown');
     else if(['preparing','prepared','recorded','unavailable'].includes(this.resendDecisionStatus())) {this.resendDecisionStatus.set('idle');this.resendDecisionSnapshot.set(null);this.resendDecisionReason='';this.resendDecisionSchedule.set('');this.resendDecisionLookupId='';}
     this.resendDecisionConfirmed=false;this.resendRetryConfirmed=false;
@@ -1370,6 +1374,24 @@ export class App implements OnDestroy {
       this.resendLookupRecord.set(record);this.resendLookupStatus.set('found');
       if(snap&&snap.body.requestId===requestId&&snap.environment===environment&&snap.origin===origin&&await this.credentialFingerprint(key)===snap.keyHash&&seq===this.resendLookupSequence&&this.alertKey.trim()===key){this.resendDecisionSchedule.set(record.availableAt);this.resendDecisionStatus.set('recorded');this.clearResend();this.clearResendJobs();}
     }catch{if(seq===this.resendLookupSequence)this.resendLookupStatus.set('error');}finally{if(seq===this.resendLookupSequence)this.resendLookupAbort=null;}
+  }
+
+  clearResendAudit():void {this.resendAuditSequence++;this.resendAuditAbort?.abort();this.resendAuditAbort=null;this.resendAuditRows.set([]);this.resendAuditNext.set(null);this.resendAuditPage.set(1);this.resendAuditHistory=[null];this.resendAuditStatus.set('idle');}
+  async loadResendAudit(direction?:'next'|'previous'):Promise<void> {
+    this.expireOidcIfNeeded();
+    if(this.resendDecisionStatus()==='sending'||this.resendDecisionStatus()==='preparing')return;
+    if(direction==='previous'&&this.resendAuditPage()<=1)return;const cursor=direction==='next'?this.resendAuditNext():direction==='previous'?this.resendAuditHistory[this.resendAuditPage()-2]:null;if((direction==='next'&&!cursor)||cursor===undefined)return;
+    const page=direction==='next'?this.resendAuditPage()+1:direction==='previous'?this.resendAuditPage()-1:1,seq=++this.resendAuditSequence;
+    this.resendAuditAbort?.abort();const controller=new AbortController();this.resendAuditAbort=controller;this.resendAuditRows.set([]);this.resendAuditNext.set(null);this.resendAuditStatus.set('loading');
+    try {this.expireOidcIfNeeded();const key=this.alertKey.trim(),environment=this.alertEnvironment.trim(),origin=this.validatedOrigin();if(this.alertAuthMode!=='jwt'||!this.validJwt(key)||!this.validEnvironment(environment))throw new Error('credentials');const params=new URLSearchParams({environmentId:environment});if(cursor)params.set('after',cursor);
+      const response=await fetch(`${origin}/v1/experimental/operator/resend-429-decision/audit?${params}`,{headers:{Authorization:`Bearer ${key}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});if(!response.ok)throw new Error('request');const value:unknown=await response.json();if(!value||typeof value!=='object')throw new Error('response');const data=value as Record<string,unknown>;
+      if(!Array.isArray(data['data'])||data['data'].length>50||typeof data['hasMore']!=='boolean'||!(data['next']===null||typeof data['next']==='string'))throw new Error('page');
+      const rows:ResendDecisionAudit[]=data['data'].map((value:unknown)=>{if(!value||typeof value!=='object')throw new Error('row');const r=value as Record<string,unknown>;
+        if(!this.resendUuid(r['id'])||!this.resendUuid(r['requestId'])||!this.resendUuid(r['jobId'])||!this.resendUuid(r['attemptId'])||!['immediate','after'].includes(r['mode'] as string)||['actorIssuer','actorSubject','actorClientId','databasePrincipal','reason','availableAt','recordedAt'].some(k=>typeof r[k]!=='string'||(r[k] as string).length===0))throw new Error('row');
+        return {id:r['id'],actorIssuer:r['actorIssuer'] as string,actorSubject:r['actorSubject'] as string,actorClientId:r['actorClientId'] as string,databasePrincipal:r['databasePrincipal'] as string,requestId:r['requestId'],jobId:r['jobId'],attemptId:r['attemptId'],mode:r['mode'] as 'immediate'|'after',reason:r['reason'] as string,availableAt:r['availableAt'] as string,recordedAt:r['recordedAt'] as string};});
+      const ids=rows.map(r=>r.id.toLowerCase());if(ids.some((id,i)=>(i>0&&ids[i-1]>=id)||(!!cursor&&id<=cursor.toLowerCase()))||(data['hasMore']?rows.length!==50||typeof data['next']!=='string'||data['next'].toLowerCase()!==ids[ids.length-1]:data['next']!==null))throw new Error('page');
+      this.expireOidcIfNeeded();if(seq!==this.resendAuditSequence)return;this.resendAuditRows.set(rows);this.resendAuditNext.set(data['next'] as string|null);this.resendAuditPage.set(page);this.resendAuditHistory=this.resendAuditHistory.slice(0,page-1);this.resendAuditHistory.push(cursor);this.resendAuditStatus.set('loaded');
+    }catch{this.expireOidcIfNeeded();if(seq===this.resendAuditSequence)this.resendAuditStatus.set('error');}finally{if(seq===this.resendAuditSequence)this.resendAuditAbort=null;}
   }
 
   clearResendJobs(): void {

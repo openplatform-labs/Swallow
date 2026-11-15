@@ -70,6 +70,14 @@ INSERT INTO public.novu_rust_operator_jwt_slack_decision_grants VALUES ('https:/
 INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'ui-fixture-env',rolname,'slack_retry',oid FROM pg_roles WHERE rolname='ui_channel_results_fixture';
 SQL
 fi
+if [[ "${SWALLOW_UI_RESEND_429_AUDIT_FIXTURE:-false}" == true ]]; then
+ "$pgbin/psql" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_429_audit_read(text,text,text,text,bigint,uuid) TO ui_channel_results_fixture;
+INSERT INTO public.novu_rust_operator_jwt_resend_429_audit_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
+INSERT INTO public.novu_rust_operator_jwt_resend_429_audit(id,environment_id,actor_issuer,actor_subject,actor_client,database_principal,request_id,job_id,attempt_id,mode,reason,available_at)
+SELECT ('aaaaaaaa-aaaa-4aaa-8aaa-'||lpad(n::text,12,'0'))::uuid,'ui-fixture-env','https://issuer.test','fixture-operator','console','ui_channel_results_fixture',gen_random_uuid(),gen_random_uuid(),gen_random_uuid(),CASE WHEN n%2=0 THEN 'after' ELSE 'immediate' END,'audit fixture '||n,clock_timestamp() FROM generate_series(1,51) n;
+SQL
+fi
 if [[ "${SWALLOW_UI_RESEND_429_GRANT_FIXTURE:-false}" == true ]]; then
  "$pgbin/psql" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_429_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_resend_429_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_resend_429_grant_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_resend_429_grant_audit_read(text,text,text,text,bigint,uuid) TO ui_channel_results_fixture;

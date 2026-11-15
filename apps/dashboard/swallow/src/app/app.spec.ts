@@ -497,6 +497,19 @@ describe('Swallow console', () => {
     app.setSection('overview');expect(app.resendResult()).toBeNull();expect(app.alertKey).toBe('');expect(app.resendJobId).toBe('');
   });
 
+  it('pages Resend decision audits and clears in-flight data on authentication change', async () => {
+    const row=(n:number)=>({id:`00000000-0000-0000-0000-${n.toString().padStart(12,'0')}`,actorIssuer:'issuer',actorSubject:'operator',actorClientId:'console',databasePrincipal:'api',requestId:'11111111-1111-1111-1111-111111111111',jobId:'22222222-2222-2222-2222-222222222222',attemptId:'33333333-3333-3333-3333-333333333333',mode:'after',reason:'ticket',availableAt:'2026-01-01',recordedAt:'2026-01-01',hidden:'secret'});
+    const first=Array.from({length:50},(_,i)=>row(i+1));let finish!:(response:Response)=>void;
+    const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:first,hasMore:true,next:first[49].id}))).mockResolvedValueOnce(new Response(JSON.stringify({data:[row(51)],hasMore:false,next:null}))).mockReturnValueOnce(new Promise(done=>finish=done));
+    const fixture=TestBed.createComponent(App),app=fixture.componentInstance;app.setSection('alerts');app.alertAuthMode='jwt';app.alertEnvironment='env-a';app.alertKey='aaa.bbb.ccc';await app.loadResendAudit();expect(app.resendAuditRows()).toHaveLength(50);expect(JSON.stringify(app.resendAuditRows())).not.toContain('secret');expect(app.resendAuditPage()).toBe(1);
+    await app.loadResendAudit('next');expect(app.resendAuditPage()).toBe(2);expect(app.resendAuditRows()[0].id).toBe(row(51).id);expect(new URL(mock.mock.calls[1][0] as string).searchParams.get('after')).toBe(first[49].id);
+    const pending=app.loadResendAudit('previous');app.alertKey='';app.clearAlerts();finish(new Response(JSON.stringify({data:first,hasMore:true,next:first[49].id})));await pending;expect(app.resendAuditStatus()).toBe('idle');expect(app.resendAuditRows()).toEqual([]);fixture.destroy();
+  });
+  it('refuses malformed Resend decision audits and clears data when access is denied', async () => {
+    const row={id:'00000000-0000-0000-0000-000000000001',actorIssuer:'issuer',actorSubject:'operator',actorClientId:'console',databasePrincipal:'api',requestId:'11111111-1111-1111-1111-111111111111',jobId:'22222222-2222-2222-2222-222222222222',attemptId:'33333333-3333-3333-3333-333333333333',mode:'immediate',reason:'ticket',availableAt:'today',recordedAt:'today'};
+    vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[row],hasMore:false,next:null}))).mockResolvedValueOnce(new Response('',{status:401})).mockResolvedValueOnce(new Response(JSON.stringify({data:[{...row,mode:'unknown'}],hasMore:false,next:null})));
+    const fixture=TestBed.createComponent(App),app=fixture.componentInstance;app.setSection('alerts');app.alertAuthMode='jwt';app.alertEnvironment='env-a';app.alertKey='aaa.bbb.ccc';await app.loadResendAudit();expect(app.resendAuditRows()).toHaveLength(1);await app.loadResendAudit();expect(app.resendAuditStatus()).toBe('error');expect(app.resendAuditRows()).toEqual([]);await app.loadResendAudit();expect(app.resendAuditStatus()).toBe('error');expect(app.resendAuditRows()).toEqual([]);fixture.destroy();
+  });
   it('prepares a fenced Resend decision and safely recovers a lost response', async () => {
     const job='1889f88e-c0a3-4ab5-b861-2fdc1f26f254', attempt='2889f88e-c0a3-4ab5-b861-2fdc1f26f254';
     const row={jobId:job,jobStatus:'failed',result:'unknown',attemptState:'rejected',attemptId:attempt,attemptHttpStatus:429,retryAfterSeconds:30,retryNotBefore:'2026-01-01 00:00:30+00',providerIdKnown:false,providerIdAmbiguous:false,autoCorrelated:false,autoCorrelationConflict:false,autoCorrelatedAt:null,lastCompletedScanAt:null};
