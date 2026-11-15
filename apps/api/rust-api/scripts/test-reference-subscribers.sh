@@ -53,12 +53,19 @@ if [[ "${NOVU_TEST_MONGO_REPLICA:-0}" == 1 ]]; then
   done
 fi
 root=../..
-for file in migrations/*.sql "$root"/worker/rust-queue/migrations/*.sql; do
-  # This API migration adds an index to the worker-owned FCM integration table.
-  [[ "$file" == migrations/0018_fcm_integration_management.sql ]] && continue
+for file in migrations/*.sql; do
+  # Later API migrations depend on worker-owned subscriber tables.
+  [[ "$file" == migrations/0018_fcm_integration_management.sql || ! "${file##*/}" < 0056 ]] && continue
+  docker exec -i "$postgres" psql -v ON_ERROR_STOP=1 -U postgres -d novu_compat < "$file" >/dev/null
+done
+for file in "$root"/worker/rust-queue/migrations/*.sql; do
   docker exec -i "$postgres" psql -v ON_ERROR_STOP=1 -U postgres -d novu_compat < "$file" >/dev/null
 done
 docker exec -i "$postgres" psql -v ON_ERROR_STOP=1 -U postgres -d novu_compat < migrations/0018_fcm_integration_management.sql >/dev/null
+for file in migrations/*.sql; do
+  [[ "${file##*/}" < 0056 ]] && continue
+  docker exec -i "$postgres" psql -v ON_ERROR_STOP=1 -U postgres -d novu_compat < "$file" >/dev/null
+done
 if [[ "${NOVU_TEST_WS_DELIVERY:-0}" == 1 ]]; then
   for file in "$root"/ws/rust-ws/migrations/*.sql; do
     docker exec -i "$postgres" psql -v ON_ERROR_STOP=1 -U postgres -d novu_compat < "$file" >/dev/null
