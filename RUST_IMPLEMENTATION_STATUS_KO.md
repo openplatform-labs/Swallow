@@ -1,3 +1,5 @@
+Discord 워커·DB 장애 전환 시험: Docker PostgreSQL 동기 복제에서 발송 예약을 복제한 뒤 실제 워커와 주 DB를 종료하고 대기 DB를 승격했다. 두 워커가 불명 시도를 보존하고 다른 대기 작업을 처리했으며, 로컬 프록시 연결 수로 즉시 중복 시도가 없음을 확인했다. 프록시는 TLS를 맺지 않아 Discord 수신을 증명하지 않는다. 단일 호스트·관리자 계정·강제 임대 만료 시험이며 실제 공급자, 비동기 복제·분할 뇌 및 운영 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
 Discord 권한 위임 화면: Angular 설정 화면에서 목록·검토 권한과 요청·감사 이력을 관리한다. Angular 테스트 238건과 빌드가 통과했고 Docker PostgreSQL, 제한 API 로그인, 테스트 JWT 및 실제 브라우저에서 권한 부여, 검토 확인, 이력 조회와 목록 권한 회수를 검증했다. 실제 외부 IdP·Discord 및 운영 HA는 검증하지 않았다. [대시보드 README](apps/dashboard/swallow/README.md)를 참고한다.
 
 Discord 권한 위임 API: API 0119는 Discord 전용 관리자의 목록·검토 권한 부여와 회수, 별도 감사 조회 및 요청 ID 재제출을 지원한다. 제한 DB 로그인과 테스트 JWT·Docker PostgreSQL에서 권한 분리, 자기 변경 거절, 권한별 회수와 감사 실패 롤백을 확인했다. 실제 IdP·운영 HA는 미검증이다. [API README](apps/api/rust-api/README.md)를 참고한다.
