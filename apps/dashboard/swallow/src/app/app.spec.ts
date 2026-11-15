@@ -1293,3 +1293,31 @@ describe('Swallow console', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
+
+describe('operator key reload health', () => {
+  afterEach(() => { vi.restoreAllMocks(); });
+  it('distinguishes healthy, unhealthy and unavailable responses', async () => {
+    const mock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(JSON.stringify({status:'healthy'}), {status:200}))
+      .mockResolvedValueOnce(new Response(JSON.stringify({status:'unhealthy'}), {status:503}))
+      .mockResolvedValueOnce(new Response('', {status:404}));
+    const fixture = TestBed.createComponent(App), app = fixture.componentInstance;
+    await app.checkOperatorKeyHealth();
+    expect(app.operatorKeyHealth()).toBe('healthy');
+    expect(mock).toHaveBeenCalledWith('http://127.0.0.1:3000/health/operator-keys', expect.objectContaining({credentials:'omit', redirect:'error', cache:'no-store'}));
+    await app.checkOperatorKeyHealth(); expect(app.operatorKeyHealth()).toBe('unhealthy');
+    fixture.detectChanges(); expect(fixture.nativeElement.textContent).toContain('키 갱신이 실패했거나 지연');
+    await app.checkOperatorKeyHealth(); expect(app.operatorKeyHealth()).toBe('unavailable');
+    fixture.destroy();
+  });
+  it('discards late responses after origin changes', async () => {
+    let finish!: (response:Response)=>void;
+    vi.spyOn(globalThis,'fetch').mockReturnValueOnce(new Promise<Response>(resolve=>finish=resolve));
+    const fixture=TestBed.createComponent(App), app=fixture.componentInstance;
+    const pending=app.checkOperatorKeyHealth();
+    app.apiOrigin='https://other.example'; app.connectionChanged();
+    finish(new Response(JSON.stringify({status:'healthy'}),{status:200})); await pending;
+    expect(app.operatorKeyHealth()).toBe('idle');
+    fixture.destroy();
+  });
+});

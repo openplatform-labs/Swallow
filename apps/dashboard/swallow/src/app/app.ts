@@ -72,6 +72,8 @@ export class App implements OnDestroy {
   readonly status = signal<ConnectionState>('unchecked');
   readonly checkedAt = signal<string | null>(null);
   readonly detail = signal('');
+  readonly operatorKeyHealth = signal<'idle'|'checking'|'healthy'|'unhealthy'|'unavailable'>('idle');
+  private operatorKeyHealthSequence = 0;
   resendPolicyBusy=false;
   fcmBusy=false;
   slackBusy=false;
@@ -358,6 +360,7 @@ export class App implements OnDestroy {
   private grantRequestAbort:AbortController|null=null;
 
   ngOnDestroy(): void {
+    this.operatorKeyHealthSequence++;
     this.clearSendgrid(true);
     this.stopAlertRefresh();
     this.alertRequestId++; this.alertAbort?.abort(); this.alertAbort=null;
@@ -1162,6 +1165,8 @@ export class App implements OnDestroy {
     this.status.set('unchecked');
     this.checkedAt.set(null);
     this.detail.set('');
+    this.operatorKeyHealthSequence++;
+    this.operatorKeyHealth.set('idle');
   }
 
   clearSendgrid(forgetKey=false):void {
@@ -2031,6 +2036,25 @@ export class App implements OnDestroy {
       this.subscriberError.set(error instanceof Error && (error.message.startsWith('주소') || error.message.startsWith('원격') || error.message.startsWith('API ') || error.message.startsWith('구독자') || error.message.startsWith('인증')) ? error.message : '서버에 연결할 수 없습니다.');
     } finally {
       if (id === this.subscriberRequestId) this.subscriberAbort = null;
+    }
+  }
+
+  async checkOperatorKeyHealth(): Promise<void> {
+    const sequence = ++this.operatorKeyHealthSequence;
+    this.operatorKeyHealth.set('checking');
+    try {
+      const origin = this.validatedOrigin();
+      const response = await fetch(`${origin}/health/operator-keys`, {
+        cache: 'no-store', credentials: 'omit', redirect: 'error', signal: AbortSignal.timeout(5000),
+      });
+      const body: unknown = await response.json();
+      if (sequence !== this.operatorKeyHealthSequence) return;
+      if (typeof body !== 'object' || body === null || !('status' in body)) throw new Error('invalid response');
+      if (response.status === 200 && body.status === 'healthy') this.operatorKeyHealth.set('healthy');
+      else if (response.status === 503 && body.status === 'unhealthy') this.operatorKeyHealth.set('unhealthy');
+      else this.operatorKeyHealth.set('unavailable');
+    } catch {
+      if (sequence === this.operatorKeyHealthSequence) this.operatorKeyHealth.set('unavailable');
     }
   }
 
