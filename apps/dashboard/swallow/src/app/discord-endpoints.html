@@ -17,5 +17,9 @@
 </form>
 @if(message()){<p role="status">{{message()}}</p>}
 @if(writeStatus()==='unknown'){<label><input type="checkbox" name="discordEndpointResolved" [(ngModel)]="ackUnknown"> 현재 목록과 서버 감사 기록을 확인하고 이 화면의 요청 상태를 지웁니다.</label><button type="button" class="btn btn-outline" [disabled]="!ackUnknown" (click)="clear()">결과 확인 후 계속</button>}
+<h3>Discord 연결 변경 이력</h3><p>API 키에 별도 감사 권한이 필요합니다. UUID 순서는 시간순이 아니며 페이지는 단일 스냅샷이 아닙니다. 실패한 요청과 직접 DB 변경은 기록되지 않습니다.</p>
+<button type="button" class="btn btn-outline" (click)="audit()" [disabled]="auditStatus()==='loading' || writeStatus()==='sending'">연결 이력 조회</button>
+@if(auditStatus()==='loading'){<p role="status">이력을 조회 중입니다.</p>} @else if(auditStatus()==='error'){<p role="alert">이력을 조회하지 못했습니다. 인증과 감사 권한을 확인하세요.</p>}
+@else if(auditStatus()==='loaded') { @if(audits().length===0){<p>조회된 변경 이력이 없습니다.</p>} @else {<div class="table-wrap"><table class="table"><thead><tr><th>기록</th><th>연결 ID</th><th>작업</th><th>사용자</th></tr></thead><tbody>@for(row of audits();track row.id){<tr><td>{{row.recordedAt}}<br>{{row.id}}</td><td>{{row.identifier}}</td><td>{{row.action}}</td><td>{{row.userId}}</td></tr>}</tbody></table></div>}<button type="button" class="btn btn-sm btn-outline" (click)="audit(true)" [disabled]="!auditNext() || writeStatus()==='sending'">이력 다음</button> }
 <p>수정·삭제는 조회한 revision이 변경되면 거절됩니다. 결과가 불명인 경우 자동으로 재요청하지 말고 서버 기록을 확인하세요. 화면을 떠나거나 새로고침하면 요청 상태가 사라집니다. 이 API는 Novu 원본 연결 API가 아닌 Swallow 확장입니다.</p>
 </div></section>

@@ -31,11 +31,11 @@ GRANT SELECT ON public.novu_rust_users,public.novu_rust_api_keys,public.novu_rus
 GRANT SELECT,UPDATE ON public.novu_rust_subscribers TO ui_fixture_api;
 GRANT SELECT,INSERT,UPDATE,DELETE ON public.novu_rust_discord_workflow_endpoints TO ui_fixture_api;
 GRANT INSERT ON public.novu_rust_discord_endpoint_audit TO ui_fixture_api;
-GRANT EXECUTE ON FUNCTION public.novu_rust_lock_discord_endpoint_grant(text,text,text) TO ui_fixture_api;
+GRANT EXECUTE ON FUNCTION public.novu_rust_lock_discord_endpoint_grant(text,text,text),public.novu_rust_discord_endpoint_audit_list(text,text,uuid) TO ui_fixture_api;
 INSERT INTO public.novu_rust_users VALUES('fixture-user');
 INSERT INTO public.novu_rust_environments VALUES('fixture-env','fixture-org');
 INSERT INTO public.novu_rust_api_keys(key_hash,environment_id,user_id) VALUES(encode(sha256('fixture-api-key'::bytea),'hex'),'fixture-env','fixture-user');
-INSERT INTO public.novu_rust_discord_endpoint_permissions VALUES(encode(sha256('fixture-api-key'::bytea),'hex'),'read'),(encode(sha256('fixture-api-key'::bytea),'hex'),'write');
+INSERT INTO public.novu_rust_discord_endpoint_permissions VALUES(encode(sha256('fixture-api-key'::bytea),'hex'),'read'),(encode(sha256('fixture-api-key'::bytea),'hex'),'write'),(encode(sha256('fixture-api-key'::bytea),'hex'),'audit');
 INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id) VALUES('fixture-env','alice','alice-generation');
 INSERT INTO public.novu_rust_discord_destinations VALUES('fixture-env','first','hash1'),('fixture-env','second','hash2');
 SQL
@@ -85,7 +85,9 @@ await page.click('app-discord-endpoints button:has-text("연결 목록 조회")'
 await page.selectOption('select[name="discordEndpointOperation"]','delete');await page.click('app-discord-endpoints button:has-text("변경 대상 조회")');await page.waitForFunction(()=>document.querySelector('app-discord-endpoints')?.innerText.includes('조회한 대상: browser-binding'));
 await page.click('input[name="discordEndpointConfirm"]');await page.click('app-discord-endpoints button:has-text("연결 작업 실행")');await page.waitForFunction(()=>document.querySelector('app-discord-endpoints')?.innerText.includes('변경 응답을 확인했습니다.'));
 await page.click('app-discord-endpoints button:has-text("연결 목록 조회")');await page.waitForFunction(()=>document.querySelector('app-discord-endpoints')?.innerText.includes('조회된 연결이 없습니다.'));
-console.log('Discord endpoint browser create, list, update and delete passed');
+await page.click('app-discord-endpoints button:has-text("연결 이력 조회")');
+await page.waitForFunction(()=>{const tables=[...document.querySelectorAll('app-discord-endpoints table')];return tables.some(t=>t.innerText.includes('browser-binding')&&t.innerText.includes('create')&&t.innerText.includes('update')&&t.innerText.includes('delete'));});
+console.log('Discord endpoint browser create, list, update, delete and audit passed');
 '''
 with open(root+'/browser.mjs','w') as f:f.write('const API='+json.dumps(api)+'; const UI='+json.dumps(ui)+'; const ROOT='+json.dumps(root)+'; const SPACE='+json.dumps(int(space) if space else None)+';\n'+script)
 PY

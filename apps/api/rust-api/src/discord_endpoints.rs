@@ -223,6 +223,41 @@ pub(super) async fn list(
     }
 }
 
+pub(super) async fn audit(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+) -> ApiError {
+    let path = uri.to_string();
+    let (env, hash) = match access(&db, &headers, &path, "audit").await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let mut after: Option<Uuid> = None;
+    for (name, value) in form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()) {
+        if name != "after" || after.is_some() {
+            return fail(StatusCode::BAD_REQUEST, "Invalid cursor", &path);
+        }
+        after = match Uuid::parse_str(&value) {
+            Ok(v) => Some(v),
+            Err(_) => return fail(StatusCode::BAD_REQUEST, "Invalid cursor", &path),
+        };
+    }
+    let rows = match db.query("SELECT id,identifier,action,user_id,recorded_at FROM public.novu_rust_discord_endpoint_audit_list($1,$2,$3)", &[&hash, &env, &after]).await {
+        Ok(v) => v,
+        Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE) => return fail(StatusCode::FORBIDDEN, "Forbidden", &path),
+        Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error", &path),
+    };
+    let more = rows.len() > 100;
+    let data: Vec<Value> = rows.iter().take(100).map(|row| json!({
+        "id": row.get::<_,Uuid>(0).to_string(), "identifier": row.get::<_,String>(1),
+        "action": row.get::<_,String>(2), "userId": row.get::<_,String>(3),
+        "recordedAt": row.get::<_,String>(4)
+    })).collect();
+    let next = if more {data.last().and_then(|v|v["id"].as_str())} else {None};
+    (StatusCode::OK, Json(json!({"data":data,"nextCursor":next})))
+}
+
 pub(super) async fn update(
     State(db): State<Arc<Client>>,
     headers: HeaderMap,

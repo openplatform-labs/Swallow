@@ -584,6 +584,7 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/slack-integrations/{integration}/connections", get(slack_integrations::list_connections).post(slack_integrations::create_connection))
         .route("/v1/experimental/slack-integrations/{integration}/connections/{connection}", get(slack_integrations::get_connection).delete(slack_integrations::delete_connection))
         .route("/v1/experimental/discord-endpoints", post(discord_endpoints::create).get(discord_endpoints::list))
+        .route("/v1/experimental/discord-endpoint-audit", get(discord_endpoints::audit))
         .route("/v1/experimental/discord-endpoints/{identifier}", get(discord_endpoints::get).patch(discord_endpoints::update).delete(discord_endpoints::delete))
         .route("/v1/channel-endpoints", post(slack_endpoints::create).get(slack_endpoints::list))
         .route("/v1/channel-endpoints/{identifier}", get(slack_endpoints::get).patch(slack_endpoints::update).delete(slack_endpoints::delete))

@@ -23,4 +23,9 @@ describe('Discord endpoints',()=>{
   let finish!:(r:Response)=>void;vi.spyOn(globalThis,'fetch').mockReturnValueOnce(new Promise(resolve=>finish=resolve));const {fixture,c}=setup();const pending=c.list();c.key='new-key';c.clear();finish(new Response(JSON.stringify({data:[row],next:null})));await pending;expect(c.rows()).toEqual([]);fixture.destroy();
   const appFixture=TestBed.createComponent(App),app=appFixture.componentInstance;app.setSection('channels');app.discordEndpointsBusy=true;app.setSection('overview');expect(app.section()).toBe('channels');app.discordEndpointsBusy=false;app.setSection('overview');expect(app.section()).toBe('overview');appFixture.destroy();
  });
+ it('loads only valid audit pages and clears them after credentials change',async()=>{
+  const record=(n:number)=>({id:`11111111-1111-4111-8111-${String(n).padStart(12,'0')}`,identifier:'binding',action:'create',userId:'operator',recordedAt:'today',secret:'not-retained'});const first=Array.from({length:100},(_,i)=>record(i+1));
+  const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:first,nextCursor:first[99].id}))).mockResolvedValueOnce(new Response(JSON.stringify({data:[record(101)],nextCursor:null}))).mockResolvedValueOnce(new Response(JSON.stringify({data:[{...record(1),action:'other'}],nextCursor:null})));
+  const {fixture,c}=setup();await c.audit();expect(c.audits().length).toBe(100);expect(JSON.stringify(c.audits())).not.toContain('not-retained');await c.audit(true);expect(c.audits().length).toBe(1);expect(new URL(mock.mock.calls[1][0] as string).searchParams.get('after')).toBe(first[99].id);c.key='another';c.clear();expect(c.audits()).toEqual([]);await c.audit();expect(c.auditStatus()).toBe('error');fixture.destroy();
+ });
 });

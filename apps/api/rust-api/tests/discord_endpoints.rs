@@ -49,13 +49,14 @@ async fn scoped_crud_revision_and_audit_are_atomic() {
         include_str!("../../../worker/rust-queue/migrations/0202_discord_webhook_queue.sql"),
         include_str!("../../../worker/rust-queue/migrations/0203_discord_workflow.sql"),
         include_str!("../migrations/0117_discord_endpoint_permissions.sql"),
+        include_str!("../migrations/0122_discord_endpoint_audit_read.sql"),
     ] {
         db.batch_execute(sql).await.unwrap();
     }
     let role = format!("discord_api_{}", uuid::Uuid::new_v4().simple());
     let a = format!("{:x}", Sha256::digest(b"discord-key-a"));
     let b = format!("{:x}", Sha256::digest(b"discord-key-b"));
-    db.batch_execute(&"CREATE ROLE discord_api_test NOLOGIN; INSERT INTO novu_rust_users VALUES('u'); INSERT INTO novu_rust_environments VALUES ('a','org'),('b','org'); INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id) VALUES('a','alice','old'),('b','alice','other'); INSERT INTO novu_rust_discord_destinations VALUES('a','one','hash'),('a','two','hash2'),('b','one','hash3'); GRANT SELECT ON novu_rust_users,novu_rust_api_keys,novu_rust_discord_destinations TO discord_api_test; GRANT SELECT,UPDATE ON novu_rust_subscribers TO discord_api_test; GRANT SELECT,INSERT,UPDATE,DELETE ON novu_rust_discord_workflow_endpoints TO discord_api_test; GRANT INSERT ON novu_rust_discord_endpoint_audit TO discord_api_test; GRANT EXECUTE ON FUNCTION novu_rust_lock_discord_endpoint_grant(text,text,text) TO discord_api_test".replace("discord_api_test", &role)).await.unwrap();
+    db.batch_execute(&"CREATE ROLE discord_api_test NOLOGIN; INSERT INTO novu_rust_users VALUES('u'); INSERT INTO novu_rust_environments VALUES ('a','org'),('b','org'); INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id) VALUES('a','alice','old'),('b','alice','other'); INSERT INTO novu_rust_discord_destinations VALUES('a','one','hash'),('a','two','hash2'),('b','one','hash3'); GRANT SELECT ON novu_rust_users,novu_rust_api_keys,novu_rust_discord_destinations TO discord_api_test; GRANT SELECT,UPDATE ON novu_rust_subscribers TO discord_api_test; GRANT SELECT,INSERT,UPDATE,DELETE ON novu_rust_discord_workflow_endpoints TO discord_api_test; GRANT INSERT ON novu_rust_discord_endpoint_audit TO discord_api_test; GRANT EXECUTE ON FUNCTION novu_rust_lock_discord_endpoint_grant(text,text,text),novu_rust_discord_endpoint_audit_list(text,text,uuid) TO discord_api_test".replace("discord_api_test", &role)).await.unwrap();
     db.execute("INSERT INTO novu_rust_api_keys(key_hash,environment_id,user_id) VALUES ($1,'a','u'),($2,'b','u')", &[&a,&b]).await.unwrap();
     let (api, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(driver);
@@ -166,6 +167,26 @@ async fn scoped_crud_revision_and_audit_are_atomic() {
         .get::<_, Vec<String>>(0),
         vec!["create", "update", "delete"]
     );
+    let audit_path = "/v1/experimental/discord-endpoint-audit";
+    assert_eq!(request(app.clone(), "GET", audit_path, "discord-key-a", Value::Null).await.0, StatusCode::FORBIDDEN);
+    db.execute("INSERT INTO novu_rust_discord_endpoint_permissions VALUES($1,'audit')", &[&a]).await.unwrap();
+    let (status, audit) = request(app.clone(), "GET", audit_path, "discord-key-a", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);assert_eq!(audit["data"].as_array().unwrap().len(), 3);
+    assert!(audit.to_string().find(&a).is_none());
+    assert_eq!(request(app.clone(), "GET", audit_path, "discord-key-b", Value::Null).await.0, StatusCode::FORBIDDEN);
+    db.execute("INSERT INTO novu_rust_discord_endpoint_permissions VALUES($1,'audit')", &[&b]).await.unwrap();
+    let other_audit = request(app.clone(), "GET", audit_path, "discord-key-b", Value::Null).await;
+    assert_eq!(other_audit.0, StatusCode::OK);
+    assert_eq!(other_audit.1["data"], json!([]));
+    assert_eq!(request(app.clone(), "GET", &format!("{audit_path}?after=invalid"), "discord-key-a", Value::Null).await.0, StatusCode::BAD_REQUEST);
+    db.batch_execute("INSERT INTO public.novu_rust_discord_endpoint_audit(id,environment_id,identifier,action,key_hash,user_id) SELECT gen_random_uuid(),'a','ep','create','hidden','u' FROM generate_series(1,101)").await.unwrap();
+    let first=request(app.clone(),"GET",audit_path,"discord-key-a",Value::Null).await.1;
+    assert_eq!(first["data"].as_array().unwrap().len(),100);
+    let next=first["nextCursor"].as_str().unwrap();
+    let second=request(app.clone(),"GET",&format!("{audit_path}?after={next}"),"discord-key-a",Value::Null).await.1;
+    assert_eq!(second["data"].as_array().unwrap().len(),4);assert!(second["nextCursor"].is_null());
+    db.execute("DELETE FROM novu_rust_discord_endpoint_permissions WHERE key_hash=$1 AND permission='audit'", &[&a]).await.unwrap();
+    assert_eq!(request(app.clone(), "GET", audit_path, "discord-key-a", Value::Null).await.0, StatusCode::FORBIDDEN);
     db.execute("DELETE FROM novu_rust_discord_endpoint_permissions WHERE key_hash=$1 AND permission='read'",&[&a]).await.unwrap();
     assert_eq!(
         request(app.clone(), "GET", path, "discord-key-a", Value::Null)
