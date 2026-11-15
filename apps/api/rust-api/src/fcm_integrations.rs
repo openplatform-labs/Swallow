@@ -218,18 +218,42 @@ pub(super) async fn update(
     let Some(obj) = value.as_object() else {
         return fail(StatusCode::BAD_REQUEST, "Invalid integration", &path);
     };
-    if obj.len() != 1 {
-        return fail(StatusCode::BAD_REQUEST, "Only active can be updated", &path);
-    };
+    if obj
+        .keys()
+        .any(|key| !["active", "expectedActive", "expectedInternalId"].contains(&key.as_str()))
+    {
+        return fail(StatusCode::BAD_REQUEST, "Unsupported field", &path);
+    }
     let Some(active) = obj.get("active").and_then(Value::as_bool) else {
         return fail(StatusCode::BAD_REQUEST, "Invalid active", &path);
     };
+    let (expected_active, expected_id) =
+        match (obj.get("expectedActive"), obj.get("expectedInternalId")) {
+            (None, None) => (None, None),
+            (Some(Value::Bool(active)), Some(Value::String(id)))
+                if !id.is_empty() && id.len() <= 128 =>
+            {
+                (Some(*active), Some(id.as_str()))
+            }
+            _ => return fail(StatusCode::BAD_REQUEST, "Invalid expected state", &path),
+        };
     let audit = Uuid::new_v4();
     let sql = format!(
-        "WITH auth AS MATERIALIZED (SELECT public.novu_rust_lock_fcm_integration_grant($1,$2,'write') AS ok), target AS MATERIALIZED (SELECT i.* FROM public.novu_rust_fcm_integrations i CROSS JOIN auth a WHERE a.ok AND i.environment_id=$2 AND i.identifier=$3 FOR UPDATE OF i), written AS (UPDATE public.novu_rust_fcm_integrations i SET active=$4 FROM target t WHERE i.environment_id=t.environment_id AND i.internal_id=t.internal_id RETURNING i.*), audited AS (INSERT INTO public.novu_rust_fcm_integration_audit(id,environment_id,integration_internal_id,identifier,action,old_active,new_active,key_hash,user_id) SELECT $5,$2,w.internal_id,w.identifier,'update',t.active,w.active,$1,k.user_id FROM written w JOIN target t ON t.internal_id=w.internal_id JOIN public.novu_rust_api_keys k ON k.key_hash=$1 RETURNING 1) SELECT a.ok,(SELECT {DTO} FROM written i),(SELECT count(*) FROM audited) FROM auth a"
+        "WITH auth AS MATERIALIZED (SELECT public.novu_rust_lock_fcm_integration_grant($1,$2,'write') AS ok), target AS MATERIALIZED (SELECT i.* FROM public.novu_rust_fcm_integrations i CROSS JOIN auth a WHERE a.ok AND i.environment_id=$2 AND i.identifier=$3 FOR UPDATE OF i), written AS (UPDATE public.novu_rust_fcm_integrations i SET active=$4 FROM target t WHERE i.environment_id=t.environment_id AND i.internal_id=t.internal_id AND ($6::boolean IS NULL OR (t.active=$6 AND t.internal_id=$7)) RETURNING i.*), audited AS (INSERT INTO public.novu_rust_fcm_integration_audit(id,environment_id,integration_internal_id,identifier,action,old_active,new_active,key_hash,user_id) SELECT $5,$2,w.internal_id,w.identifier,'update',t.active,w.active,$1,k.user_id FROM written w JOIN target t ON t.internal_id=w.internal_id JOIN public.novu_rust_api_keys k ON k.key_hash=$1 RETURNING 1) SELECT a.ok,(SELECT {DTO} FROM written i),(SELECT count(*) FROM audited),EXISTS(SELECT 1 FROM target) FROM auth a"
     );
     match db
-        .query_one(&sql, &[&hash, &env, &identifier, &active, &audit])
+        .query_one(
+            &sql,
+            &[
+                &hash,
+                &env,
+                &identifier,
+                &active,
+                &audit,
+                &expected_active,
+                &expected_id,
+            ],
+        )
         .await
     {
         Ok(row) if !row.get::<_, bool>(0) => {
@@ -237,6 +261,9 @@ pub(super) async fn update(
         }
         Ok(row) => match row.get::<_, Option<Value>>(1) {
             Some(value) => (StatusCode::OK, Json(json!({"data":value}))),
+            None if row.get::<_, bool>(3) => {
+                fail(StatusCode::CONFLICT, "Integration changed", &path)
+            }
             None => fail(StatusCode::NOT_FOUND, "Integration not found", &path),
         },
         Err(_) => fail(

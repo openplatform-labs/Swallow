@@ -199,6 +199,76 @@ async fn fcm_metadata_management_is_scoped_authorized_and_audited() {
         ),
         (true, false)
     );
+    // The conditional form compares the identity and state while holding the row lock.
+    let target = format!("{path}/main");
+    for body in [
+        json!({"active":true,"expectedActive":true,"expectedInternalId":id}),
+        json!({"active":true,"expectedActive":false,"expectedInternalId":"other"}),
+    ] {
+        assert_eq!(
+            request(app.clone(), "PATCH", &target, "a-key", body)
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+    }
+    assert_eq!(
+        request(
+            app.clone(),
+            "PATCH",
+            &target,
+            "a-key",
+            json!({"active":true,"expectedActive":false})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(setup.query_one("SELECT count(*) FROM novu_rust_fcm_integration_audit WHERE environment_id='a' AND identifier='main'",&[]).await.unwrap().get::<_,i64>(0),3);
+    assert_eq!(
+        request(
+            app.clone(),
+            "PATCH",
+            &target,
+            "a-key",
+            json!({"active":true,"expectedActive":false,"expectedInternalId":id})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(
+            app.clone(),
+            "PATCH",
+            &target,
+            "a-key",
+            json!({"active":false,"expectedActive":true,"expectedInternalId":id})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let tx = setup.transaction().await.unwrap();
+    tx.execute("UPDATE novu_rust_fcm_integrations SET active=true WHERE environment_id='a' AND identifier='main'",&[]).await.unwrap();
+    let waiting_app = app.clone();
+    let waiting_id = id.clone();
+    let pending = tokio::spawn(async move {
+        request(
+            waiting_app,
+            "PATCH",
+            "/v1/experimental/fcm-integrations/main",
+            "a-key",
+            json!({"active":true,"expectedActive":false,"expectedInternalId":waiting_id}),
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(!pending.is_finished());
+    tx.commit().await.unwrap();
+    assert_eq!(pending.await.unwrap().0, StatusCode::CONFLICT);
+    assert_eq!(setup.query_one("SELECT count(*) FROM novu_rust_fcm_integration_audit WHERE environment_id='a' AND identifier='main'",&[]).await.unwrap().get::<_,i64>(0),5);
+    setup.execute("UPDATE novu_rust_fcm_integrations SET active=false WHERE environment_id='a' AND identifier='main'",&[]).await.unwrap();
     setup.batch_execute("INSERT INTO novu_rust_fcm_integrations(environment_id,internal_id,identifier,active) SELECT 'a','legacy-'||lpad(x::text,3,'0'),'legacy-'||x,false FROM generate_series(1,101) x").await.unwrap();
     let (_, page) = request(app.clone(), "GET", path, "a-key", Value::Null).await;
     assert_eq!(page["data"].as_array().unwrap().len(), 100);

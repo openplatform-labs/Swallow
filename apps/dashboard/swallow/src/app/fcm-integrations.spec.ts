@@ -15,7 +15,13 @@ describe('FCM integration management',()=>{
     const mock=vi.spyOn(globalThis,'fetch').mockImplementation(async()=>new Response(JSON.stringify({data:row}),{status:201}));
     const fixture=TestBed.createComponent(FcmIntegrations);const component=fixture.componentInstance;component.apiOrigin='https://api.example.test';component.key='fixture';component.identifier='push-main';
     await component.save('create');expect(mock).not.toHaveBeenCalled();component.confirmed=true;await component.save('create');expect(component.writeStatus()).toBe('saved');expect(mock.mock.calls[0][1]).toMatchObject({method:'POST',body:JSON.stringify({identifier:'push-main',active:false})});
-    component.confirmed=true;await component.save('update');expect(mock.mock.calls[1][0]).toBe('https://api.example.test/v1/experimental/fcm-integrations/push-main');expect(mock.mock.calls[1][1]).toMatchObject({method:'PATCH',body:'{"active":false}'});expect(component.writeStatus()).toBe('saved');fixture.destroy();
+    component.select(row);component.confirmed=true;await component.save('update');expect(mock.mock.calls[1][0]).toBe('https://api.example.test/v1/experimental/fcm-integrations/push-main');expect(mock.mock.calls[1][1]).toMatchObject({method:'PATCH',body:'{"active":false,"expectedActive":false,"expectedInternalId":"fixture-id"}'});expect(component.writeStatus()).toBe('saved');fixture.destroy();
+  });
+  it('requires a fresh selection and clears it after a conflict',async()=>{
+    const mock=vi.spyOn(globalThis,'fetch').mockResolvedValue(new Response('',{status:409}));
+    const fixture=TestBed.createComponent(FcmIntegrations);const component=fixture.componentInstance;component.apiOrigin='https://api.example.test';component.key='fixture';component.identifier=row.identifier;component.confirmed=true;
+    await component.save('update');expect(mock).not.toHaveBeenCalled();component.select(row);component.active=true;component.confirmed=true;await component.save('update');
+    expect(mock).toHaveBeenCalledOnce();expect(component.writeStatus()).toBe('rejected');expect(component.selected()).toBeNull();component.confirmed=true;await component.save('update');expect(mock).toHaveBeenCalledOnce();fixture.destroy();
   });
   it('marks lost responses unknown, blocks resubmission, and clears secrets on destruction',async()=>{
     const mock=vi.spyOn(globalThis,'fetch').mockRejectedValue(new Error('network'));const fixture=TestBed.createComponent(FcmIntegrations);const component=fixture.componentInstance;
