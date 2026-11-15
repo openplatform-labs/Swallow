@@ -52,9 +52,15 @@ async fn fcm_metadata_management_is_scoped_authorized_and_audited() {
         include_str!("../../../worker/rust-queue/migrations/0051_multiple_fcm_channels.sql"),
         include_str!("../migrations/0018_fcm_integration_management.sql"),
         include_str!("../migrations/0019_lock_active_fcm_integration.sql"),
+        include_str!("../migrations/0072_fcm_integration_audit_access.sql"),
     ] {
         db.batch_execute(sql).await.unwrap();
     }
+    db.batch_execute(include_str!(
+        "../migrations/0072_fcm_integration_audit_access.sql"
+    ))
+    .await
+    .unwrap();
     db.batch_execute("INSERT INTO novu_rust_users VALUES ('u'); INSERT INTO novu_rust_environments VALUES ('a','org'),('b','org')").await.unwrap();
     let hash = |key: &[u8]| format!("{:x}", Sha256::digest(key));
     let (a, b, read) = (hash(b"a-key"), hash(b"b-key"), hash(b"read-key"));
@@ -269,6 +275,81 @@ async fn fcm_metadata_management_is_scoped_authorized_and_audited() {
     assert_eq!(pending.await.unwrap().0, StatusCode::CONFLICT);
     assert_eq!(setup.query_one("SELECT count(*) FROM novu_rust_fcm_integration_audit WHERE environment_id='a' AND identifier='main'",&[]).await.unwrap().get::<_,i64>(0),5);
     setup.execute("UPDATE novu_rust_fcm_integrations SET active=false WHERE environment_id='a' AND identifier='main'",&[]).await.unwrap();
+    let audit_path = "/v1/experimental/fcm-integration-audit";
+    assert_eq!(
+        request(app.clone(), "GET", audit_path, "a-key", Value::Null)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    setup
+        .execute(
+            "INSERT INTO novu_rust_fcm_integration_permissions VALUES ($1,'audit'),($2,'audit')",
+            &[&a, &b],
+        )
+        .await
+        .unwrap();
+    let (status, audit) = request(app.clone(), "GET", audit_path, "a-key", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(audit["data"].as_array().unwrap().len(), 5);
+    assert!(
+        audit["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|v| v["identifier"] == "main" && v["userId"] == "u" && v.get("keyHash").is_none())
+    );
+    assert_eq!(
+        request(app.clone(), "GET", audit_path, "b-key", Value::Null)
+            .await
+            .1["data"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        request(
+            app.clone(),
+            "GET",
+            &format!("{audit_path}?after=bad"),
+            "a-key",
+            Value::Null
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    let cursor = audit["data"][0]["id"].as_str().unwrap();
+    assert_eq!(
+        request(
+            app.clone(),
+            "GET",
+            &format!("{audit_path}?after={cursor}"),
+            "a-key",
+            Value::Null
+        )
+        .await
+        .1["data"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    setup.execute("INSERT INTO public.novu_rust_fcm_integration_audit(id,environment_id,integration_internal_id,identifier,action,old_active,new_active,key_hash,user_id) SELECT gen_random_uuid(),'a',$1,'main','update',false,true,$2,'u' FROM generate_series(1,101)",&[&id,&a]).await.unwrap();
+    let (_, first) = request(app.clone(), "GET", audit_path, "a-key", Value::Null).await;
+    assert_eq!(first["data"].as_array().unwrap().len(), 100);
+    let cursor = first["nextCursor"].as_str().unwrap();
+    let (_, second) = request(
+        app.clone(),
+        "GET",
+        &format!("{audit_path}?after={cursor}"),
+        "a-key",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(second["data"].as_array().unwrap().len(), 6);
+    assert!(second["nextCursor"].is_null());
     setup.batch_execute("INSERT INTO novu_rust_fcm_integrations(environment_id,internal_id,identifier,active) SELECT 'a','legacy-'||lpad(x::text,3,'0'),'legacy-'||x,false FROM generate_series(1,101) x").await.unwrap();
     let (_, page) = request(app.clone(), "GET", path, "a-key", Value::Null).await;
     assert_eq!(page["data"].as_array().unwrap().len(), 100);
@@ -284,7 +365,7 @@ async fn fcm_metadata_management_is_scoped_authorized_and_audited() {
     .await;
     assert_eq!(next["data"].as_array().unwrap().len(), 2);
     assert_eq!(next["hasMore"], false);
-    setup.batch_execute("CREATE ROLE fcm_api_limited NOLOGIN; GRANT USAGE ON SCHEMA public TO fcm_api_limited; GRANT SELECT ON novu_rust_api_keys,novu_rust_users TO fcm_api_limited; GRANT SELECT,INSERT,UPDATE ON novu_rust_fcm_integrations TO fcm_api_limited; GRANT INSERT ON novu_rust_fcm_integration_audit TO fcm_api_limited; GRANT EXECUTE ON FUNCTION public.novu_rust_lock_fcm_integration_grant(text,text,text) TO fcm_api_limited").await.unwrap();
+    setup.batch_execute("CREATE ROLE fcm_api_limited NOLOGIN; GRANT USAGE ON SCHEMA public TO fcm_api_limited; GRANT SELECT ON novu_rust_api_keys,novu_rust_users TO fcm_api_limited; GRANT SELECT,INSERT,UPDATE ON novu_rust_fcm_integrations TO fcm_api_limited; GRANT INSERT ON novu_rust_fcm_integration_audit TO fcm_api_limited; GRANT EXECUTE ON FUNCTION public.novu_rust_lock_fcm_integration_grant(text,text,text),public.novu_rust_fcm_integration_audit_list(text,text,uuid) TO fcm_api_limited").await.unwrap();
     let (limited, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move { driver.await.unwrap() });
     limited
@@ -300,7 +381,26 @@ async fn fcm_metadata_management_is_scoped_authorized_and_audited() {
             .await
             .is_err()
     );
+    assert!(
+        limited
+            .query("SELECT * FROM public.novu_rust_fcm_integration_audit", &[])
+            .await
+            .is_err()
+    );
     let limited_app = novu_rust_api::router_with_subscriber_secret(Arc::new(limited), None);
+    assert_eq!(
+        request(limited_app.clone(), "GET", audit_path, "a-key", Value::Null)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    setup.execute("DELETE FROM novu_rust_fcm_integration_permissions WHERE key_hash=$1 AND permission='audit'",&[&a]).await.unwrap();
+    assert_eq!(
+        request(limited_app.clone(), "GET", audit_path, "a-key", Value::Null)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
     assert_eq!(
         request(
             limited_app,

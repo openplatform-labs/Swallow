@@ -273,3 +273,50 @@ pub(super) async fn update(
         ),
     }
 }
+
+/// Environment-scoped audit with a separate API-key grant.
+pub(super) async fn audit(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+) -> ApiError {
+    let path = uri.to_string();
+    let (env, hash) = match access(&db, &headers, &path, "audit").await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let mut after: Option<Uuid> = None;
+    for (name, value) in form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()) {
+        if name != "after" || after.is_some() {
+            return fail(StatusCode::BAD_REQUEST, "Invalid pagination", &path);
+        }
+        after = match Uuid::parse_str(&value) {
+            Ok(v) => Some(v),
+            Err(_) => return fail(StatusCode::BAD_REQUEST, "Invalid pagination", &path),
+        };
+    }
+    let rows = match db.query("SELECT id,integration_internal_id,identifier,action,old_active,new_active,user_id,recorded_at FROM public.novu_rust_fcm_integration_audit_list($1,$2,$3)",&[&hash,&env,&after]).await {
+        Ok(rows) => rows,
+        Err(e) if e.code()==Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE) => return fail(StatusCode::FORBIDDEN,"Forbidden",&path),
+        Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR,"Internal server error",&path),
+    };
+    let more = rows.len() > 100;
+    let data: Vec<Value> = rows
+        .iter()
+        .take(100)
+        .map(|row| {
+            json!({
+                "id":row.get::<_,Uuid>(0).to_string(),"internalId":row.get::<_,String>(1),
+                "identifier":row.get::<_,String>(2),"action":row.get::<_,String>(3),
+                "oldActive":row.get::<_,Option<bool>>(4),"newActive":row.get::<_,bool>(5),
+                "userId":row.get::<_,String>(6),"recordedAt":row.get::<_,String>(7)
+            })
+        })
+        .collect();
+    let next = if more {
+        data.last().and_then(|v| v["id"].as_str())
+    } else {
+        None
+    };
+    (StatusCode::OK, Json(json!({"data":data,"nextCursor":next})))
+}

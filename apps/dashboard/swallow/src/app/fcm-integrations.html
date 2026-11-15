@@ -12,4 +12,14 @@
 <div><button type="submit" class="btn btn-primary" [disabled]="!confirmed || writeStatus()==='sending' || writeStatus()==='unknown' || listStatus()==='loading'">등록</button><button type="button" class="btn btn-outline" (click)="save('update')" [disabled]="!selected() || !confirmed || writeStatus()==='sending' || writeStatus()==='unknown' || listStatus()==='loading'">상태 변경</button></div></form>
 @if(message()){<p role="status">{{message()}}</p>}
 <p>워커의 자격증명은 별도로 구성해야 합니다. 활성화가 자격증명 검증이나 푸시 수신을 보장하지 않습니다. 상태 변경은 목록에서 대상을 선택해야 하며 조회한 상태가 바뀌면 거절됩니다. 결과가 불명인 경우 목록과 서버 감사 기록을 확인하세요.</p>
+<h3>FCM 통합 변경 이력</h3>
+<p>별도의 감사 조회 권한이 필요합니다. UUID순 조회이므로 시간순이나 단일 스냅샷을 보장하지 않습니다.</p>
+<button type="button" class="btn btn-outline" (click)="audit()" [disabled]="auditStatus()==='loading' || writeStatus()==='sending'">변경 이력 조회</button>
+@if(auditStatus()==='loading'){<p role="status">변경 이력을 조회 중입니다.</p>}
+@else if(auditStatus()==='error'){<p role="alert">변경 이력을 조회하지 못했습니다. 인증과 감사 조회 권한을 확인하세요.</p>}
+@else if(auditStatus()==='loaded'){
+  @if(audits().length===0){<p>조회된 변경 이력이 없습니다.</p>}
+  @else {<div class="table-wrap"><table class="table"><thead><tr><th>기록</th><th>통합</th><th>변경</th><th>사용자</th></tr></thead><tbody>@for(row of audits();track row.id){<tr><td>{{row.recordedAt}}<br>{{row.id}}</td><td>{{row.identifier}}<br>{{row.internalId}}</td><td>{{row.action}}: {{row.oldActive===null ? '—' : row.oldActive ? '활성' : '비활성'}} → {{row.newActive ? '활성' : '비활성'}}</td><td>{{row.userId}}</td></tr>}</tbody></table></div>}
+  <button type="button" class="btn btn-sm btn-outline" (click)="audit(true)" [disabled]="!auditNext() || writeStatus()==='sending'">다음</button>
+}
 </div></section>
