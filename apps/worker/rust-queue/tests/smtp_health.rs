@@ -172,6 +172,51 @@ async fn scoped_health_and_alert_selection() {
         );
         assert!(String::from_utf8_lossy(&result.stderr).contains("requires operator review"));
     }
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_smtp_attention(text,uuid),public.novu_rust_ack_smtp(text,uuid,uuid,bigint,text,text) TO {role}")).await.unwrap();
+    assert!(reader.query("SELECT * FROM public.novu_rust_smtp_attention($1,NULL)",&[&other]).await.is_err());
+    let listed=Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .env_clear().env("DATABASE_URL",role_url.as_str()).env("NOVU_POSTGRES_ALLOW_INSECURE","true")
+        .args(["list-smtp",&env]).output().unwrap();
+    assert_eq!(listed.status.code(),Some(0));
+    let listing:serde_json::Value=serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listing["data"].as_array().unwrap().len(),3);
+    assert!(!String::from_utf8_lossy(&listed.stdout).contains("fixture"));
+    let rows=reader.query("SELECT * FROM public.novu_rust_smtp_attention($1,NULL)",&[&env]).await.unwrap();
+    let unknown=rows.iter().find(|r|r.get::<_,Uuid>(0)==ids[0]).unwrap();
+    let attempt:Option<Uuid>=unknown.get(3); let failure:i64=unknown.get(4);
+    let stmt="SELECT public.novu_rust_ack_smtp($1,$2,$3,$4,'operator','verified externally')";
+    assert!(reader.query_one(stmt,&[&env,&ids[0],&attempt,&failure]).await.is_err());
+    db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,$2,'queue_ack',oid FROM pg_roles WHERE rolname::text=$2", &[&env,&role]).await.unwrap();
+    let stranded=rows.iter().find(|r|r.get::<_,Uuid>(0)==ids[2]).unwrap();
+    let stranded_attempt:Option<Uuid>=stranded.get(3); let stranded_failure:i64=stranded.get(4);
+    assert!(reader.query_one(stmt,&[&env,&ids[2],&stranded_attempt,&stranded_failure]).await.is_err());
+    assert!(reader.query_one(stmt,&[&env,&ids[0],&Some(Uuid::new_v4()),&failure]).await.is_err());
+    assert!(reader.query_one(stmt,&[&env,&ids[0],&attempt,&(failure+1)]).await.is_err());
+    db.batch_execute("CREATE FUNCTION public.smtp_review_fail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test audit failure'; END $$; CREATE TRIGGER smtp_review_fail BEFORE INSERT ON public.novu_rust_smtp_reviews FOR EACH ROW EXECUTE FUNCTION public.smtp_review_fail()").await.unwrap();
+    assert!(reader.query_one(stmt,&[&env,&ids[0],&attempt,&failure]).await.is_err());
+    assert_eq!(reader.query_one("SELECT * FROM public.novu_rust_smtp_health($1)",&[&env]).await.unwrap().get::<_,i64>(0),1);
+    db.batch_execute("DROP TRIGGER smtp_review_fail ON public.novu_rust_smtp_reviews; DROP FUNCTION public.smtp_review_fail()").await.unwrap();
+    let (reader2,driver)=tokio_postgres::connect(role_url.as_str(),NoTls).await.unwrap(); tokio::spawn(driver);
+    let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&env,&ids[0],&attempt,&failure];
+    let (a,b)=tokio::join!(reader.query_one(stmt,params),reader2.query_one(stmt,params));
+    let values=[a.unwrap().get::<_,bool>(0),b.unwrap().get::<_,bool>(0)]; assert_eq!(values.iter().filter(|x|**x).count(),1);
+    let after=reader.query_one("SELECT * FROM public.novu_rust_smtp_health($1)",&[&env]).await.unwrap();
+    assert_eq!((after.get::<_,i64>(0),after.get::<_,i64>(1),after.get::<_,i64>(2)),(0,1,1));
+    let no_attempt:Option<Uuid>=None;
+    let pre=rows.iter().find(|r|r.get::<_,Uuid>(0)==ids[3]).unwrap(); let pre_revision:i64=pre.get(4);
+    let ack=Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .env_clear().env("DATABASE_URL",role_url.as_str()).env("NOVU_POSTGRES_ALLOW_INSECURE","true")
+        .args(["ack-smtp",&env,&ids[3].to_string(),"-",&pre_revision.to_string(),"operator","checked"]).output().unwrap();
+    assert_eq!(ack.status.code(),Some(0),"{}",String::from_utf8_lossy(&ack.stderr));
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&ack.stdout).unwrap(),json!({"recorded":true}));
+    assert_eq!(reader.query_one("SELECT * FROM public.novu_rust_smtp_health($1)",&[&env]).await.unwrap().get::<_,i64>(2),0);
+    let unchanged=db.query_one("SELECT j.status,a.state FROM public.novu_queue_jobs j JOIN public.novu_rust_smtp_attempts a ON a.job_id=j.id WHERE j.id=$1", &[&ids[0]]).await.unwrap();
+    assert_eq!((unchanged.get::<_,String>(0),unchanged.get::<_,String>(1)),("failed".into(),"unknown".into()));
+    db.execute("UPDATE public.novu_rust_smtp_attempts SET state=state WHERE job_id=$1", &[&ids[0]]).await.unwrap();
+    assert_eq!(reader.query_one("SELECT * FROM public.novu_rust_smtp_health($1)",&[&env]).await.unwrap().get::<_,i64>(0),1);
+    assert!(reader.query_one(stmt,&[&env,&ids[0],&attempt,&failure]).await.is_err());
+    db.execute("DELETE FROM public.novu_rust_delivery_operator_grants WHERE environment_id=$1 AND database_principal=$2 AND decision='queue_ack'", &[&env,&role]).await.unwrap();
+    assert!(reader.query_one(stmt,&[&env,&ids[3],&no_attempt,&pre_revision]).await.is_err());
     db.execute("DELETE FROM public.novu_rust_delivery_operator_grants WHERE environment_id=$1 AND database_principal=$2 AND decision='alert_view'", &[&env,&role]).await.unwrap();
     assert!(reader.query_one("SELECT * FROM public.novu_rust_smtp_health($1)", &[&env]).await.is_err());
     assert_eq!(alert(role_url.as_str(), &env, true).status.code(), Some(1));
