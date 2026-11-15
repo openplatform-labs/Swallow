@@ -1,0 +1,16 @@
+<section class="card subscriber-card"><div class="card-block"><div class="card-eyebrow">EXECUTION AUDIT</div><h2>운영자 실행 이력</h2>
+<p>별도 이력 조회 권한이 있는 운영자 JWT로 해당 환경의 실행 접수를 조회합니다. API 키 실행, 중복 요청, 실패한 권한 확인과 실제 전달 결과는 표시되지 않습니다.</p>
+<form class="subscriber-form" (ngSubmit)="load()">
+<label for="execution-audit-env">환경 ID</label><input id="execution-audit-env" name="executionAuditEnv" [(ngModel)]="environment" (ngModelChange)="clear()" autocomplete="off" required>
+<label for="execution-audit-token">운영자 접근 토큰</label><input id="execution-audit-token" name="executionAuditToken" type="password" [(ngModel)]="token" (ngModelChange)="clear()" autocomplete="off" spellcheck="false" required>
+<button type="submit" class="btn btn-outline" [disabled]="status()==='loading'">이력 조회</button></form>
+<p class="subscriber-hint">순서는 기록 시간이 아닌 ID 기준입니다. 조회 중 새 기록이 추가되면 빠질 수 있으므로 처음부터 다시 조회하세요.</p>
+@if(status()==='loading'){<p role="status">조회 중입니다.</p>}
+@if(status()==='denied'){<p role="alert">접근이 거부됐습니다. 토큰과 별도의 실행 이력 조회 권한을 확인하세요.</p>}
+@if(status()==='error'){<p role="alert">조회 결과를 확인하지 못했습니다. API 주소와 입력값 및 서버 상태를 확인하세요.</p>}
+@if(status()==='loaded'){
+  @if(rows().length===0){<p>조회된 이력이 없습니다.</p>}
+  @else {<div class="table-wrap"><table class="table"><thead><tr><th>기록</th><th>워크플로와 거래</th><th>운영자</th></tr></thead><tbody>@for(row of rows();track row.id){<tr><td>{{row.recordedAt}}<br>{{row.id}}</td><td>{{row.workflowIdentifier}}<br>{{row.transactionId}}</td><td>{{row.issuer}}<br>{{row.subject}} · {{row.clientId}}<br>DB: {{row.databasePrincipal}}</td></tr>}</tbody></table></div>}
+  <p>{{page()}} 페이지</p><button type="button" class="btn btn-sm btn-outline" [disabled]="page()<=1" (click)="load('previous')">이전</button><button type="button" class="btn btn-sm btn-outline" [disabled]="!next()" (click)="load('next')">다음</button>
+}
+</div></section>

@@ -1,7 +1,8 @@
 import { Component, Input, OnDestroy, OnInit, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
+import { ExecutionAudit } from './execution-audit';
 
-@Component({selector:'app-workflow-trigger',imports:[FormsModule],templateUrl:'./workflow-trigger.html'})
+@Component({selector:'app-workflow-trigger',imports:[FormsModule,ExecutionAudit],templateUrl:'./workflow-trigger.html'})
 export class WorkflowTrigger implements OnInit, OnDestroy {
   @Input() apiOrigin='';
   apiKey=''; workflow=''; subscriber=''; payload='{}'; mode:'sandbox'|'normal'='sandbox';

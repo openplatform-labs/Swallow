@@ -33,3 +33,5 @@
   @if(lookupResult();as result){<p role="status">접수 기록: {{result.recorded?'있음':'없음'}} · 부모 작업 수: {{result.jobCount===2?'2개 이상':result.jobCount}} @if(result.job){· 작업 {{result.job.jobId}} · 상태 {{result.job.jobStatus}}}<br>부모 작업 상태는 개별 채널 전달 결과가 아닙니다.</p>}
 }
 </div></section>
+
+<app-execution-audit [apiOrigin]="apiOrigin"></app-execution-audit>
