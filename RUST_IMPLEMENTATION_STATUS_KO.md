@@ -1,3 +1,5 @@
+SMTP 발송 중 워커 종료 시험: 임시 로컬 PostgreSQL·실제 SMTP 워커 두 개·모의 STARTTLS 서버에서 첫 메시지 DATA 수신 직후 응답 전에 워커를 종료했다. 임대를 강제로 만료시킨 뒤 다른 워커가 첫 시도를 `unknown`으로 유지하고 재발송하지 않으면서 별도 대기 작업을 처리하는 것을 확인했다. 관리자 계정·강제 만료·단일 DB 시험이며 실제 릴레이 수락, DB 장애 전환·분할 뇌 및 다중 호스트 운영 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
 SMTP 첨부 HTTP 종단 간 시험: 실제 HTTP API, 인앱 워커와 SMTP 워커 및 모의 인증 STARTTLS 서버를 임시 로컬 PostgreSQL에서 실행했다. Base64와 Buffer 첨부 트리거 후 수신 MIME의 원본 바이트·CID와 부모·SMTP 자식 보관 시각을 확인했다. 관리자 DB 계정과 모의 서버를 사용했으며 실제 SMTP 공급자·제한 운영 DB 권한·Novu 서버 비교·다중 호스트 HA는 미검증이다. 재현 명령은 [워커 README](apps/worker/rust-queue/README.md)에 있다.
 
 SMTP 첨부 보관 정리: 워커 0216은 기존 선택형 첨부 정리 대상에 완료된 워크플로 SMTP 작업을 추가한다. 기존 완료 작업은 마이그레이션 시점부터 보관 기간을 계산한다. 부모·자식 작업 사본은 각각 처리하며 대기·실패·독립 SMTP 작업은 제외한다. 임시 로컬 PostgreSQL에서 업그레이드, 권한·환경 격리, 감사 실패 롤백, 정리 후 재실행 차단과 제외 대상을 검증했다. WAL·백업·복제본의 안전한 삭제와 운영 부하·HA는 보장하지 않는다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
