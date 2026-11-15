@@ -1,6 +1,24 @@
+선택형 Resend 429 자동 재시도는 워커 0161 적용 후 DB 관리자가 환경별 정책을 등록하고, 해당 환경의 모든 Resend 워커를 새 버전과 아래 설정으로 통일해 사용한다. 기본값은 꺼짐이며 기존 수동 지연·즉시 재시도도 계속 선택할 수 있다. 정책의 `not_before` 기본값은 등록 시각이고 그 이전에 시작한 발송 시도는 자동 예약하지 않는다. 비활성 후 다시 활성화할 때는 `not_before=clock_timestamp()`도 함께 지정한다. 운영자가 별도로 과거 시각을 지정하면 오래된 작업도 대상이 될 수 있다. DB 직접 변경과 기존 바이너리는 정책을 우회하므로 활성화 전 모든 이전 워커를 중지·교체한다.
+
+```sql
+-- 환경과 최대 횟수는 운영자가 선택한다. 1~10회, 기존 정책은 명시적으로 수정한다.
+INSERT INTO public.novu_rust_resend_auto_retry_policy(environment_id,enabled,max_retries)
+VALUES ('ENV',true,3);
+GRANT EXECUTE ON FUNCTION public.novu_rust_resend_auto_retry(text) TO worker_role;
+-- worker_role에 환경별 기존 retry 권한도 필요하다.
+INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid)
+SELECT 'ENV',rolname,'retry',oid FROM pg_roles WHERE rolname='worker_role';
+```
+
+모든 해당 환경 워커에 `NOVU_RESEND_AUTO_RETRY_429=true`, `NOVU_RESEND_RETRY_EVIDENCE_GUARD=true`, `NOVU_RESEND_CORRELATION_TAG=true`, `NOVU_RESEND_RETRY_CORRELATION_GUARD=true`, `NOVU_RESEND_IDEMPOTENCY_SCOPE=retry`를 설정한다. 자동 모드에서 필수 설정이 빠진 워커는 시작을 거절한다. 기존 idempotency 정책 및 배포 전환 절차도 지켜야 한다. 자동 검사에는 함수 실행 권한과 환경별 retry 권한이 필요하다. 정책이 없거나 비활성이면 예약하지 않는다. 정책 변경은 검사 트랜잭션과 잠금으로 직렬화되지만 이미 예약된 작업은 취소되지 않는다.
+
+워커는 약 5초마다 해당 환경의 429 실패 건 하나를 검사한다. 지원되는 `Retry-After`가 있고 이전 판정이 모두 429 재시도이며 총 재시도 판정 횟수가 정책 상한보다 작을 때만 기존 지연 판정과 감사 기록을 사용한다. 기존 수동 재시도도 이 상한에 포함한다. 결과 불명, 헤더 누락, 다른 상태·과거 비429 판정과 확인된 콜백은 자동 재시도하지 않는다. 재시도 준비 시 기존의 공급자 ID·상관 태그 증거 검사를 전체 이력에 적용한다. 검사와 발송 준비 후에 도착한 콜백까지 차단하지 못하며, 태그가 없거나 외부 시스템에서 누락된 증거는 식별하지 못한다. 실패한 검사와 DB 연결은 운영자가 감시해야 한다. 이 기능은 환경별 고정 횟수 제한이지 공급자 계정 전체의 처리율 제한이 아니다. DB 시계, 복제 장애 전환과 이전 버전 혼합 운영은 별도 고려가 필요하다. 잘못된 429 판정, 프록시 응답, 지연된 증거 또는 멱등성 기간·요청 내용 변경으로 중복이 발생할 수 있다. 자동 모드는 retry별 멱등성 키를 사용하므로 특히 공급자 접수 여부가 불확실하면 켜지 않는다.
+
+임시 PostgreSQL 17·제한 DB 로그인·모의 Resend와 실제 큐 함수에서 기본 비활성, 권한·환경 격리, 두 동시 예약 중 한 건, 최대 횟수, 오래된 상관 태그의 예약 전·후 콜백 차단을 확인했다. 실제 워커 프로세스에서 모의 429 작업의 미래 예약도 확인했으며 외부 발송은 하지 않았다. 실제 Resend 429와 다중 호스트 HA, 혼합 버전 배포는 미검증이다. 재현: `TEST_DATABASE_URL=... cargo test --features test-mocks --test resend_auto_429 -- --ignored` (전체 마이그레이션을 적용한 폐기 가능한 DB와 역할 생성 권한 필요). 활성 검사에는 워커마다 약 5초에 DB 호출 1회가 추가되고, 선택된 재시도에는 감사·큐 변경 트랜잭션이 추가된다.
+
 Resend 429의 대기 안내를 적용하려면 워커 0160 적용 후 `delivery-reconcile resend-retry-after ENV JOB OPERATOR REASON`을 선택한다. 환경별 기존 `retry` 권한과 별도의 `GRANT EXECUTE ON FUNCTION public.novu_rust_resolve_resend_after(text,uuid,text,text) TO 운영자_DB_역할`이 필요하다. 별도 scoped 설정 없이 이 함수 경로를 사용한다. 실패한 Resend 429에 유효한 대기 안내가 있을 때만 기존 증거 검사와 감사·큐 변경을 한 트랜잭션에서 수행하고, 작업을 DB 시계 기준 안내 시각 이후로 예약한다. 안내가 이미 지났으면 즉시 대기열에 넣는다. 기존 `retry ENV JOB - OPERATOR REASON`은 즉시 재시도로 계속 사용할 수 있다.
 
-감사 행의 `resend_retry_not_before`에는 원래 안내 시각이 기록된다. 시도·안내가 없거나 이미 변경된 작업, 해당 공급자 콜백 증거가 있는 경우는 거절한다. 동시 결정은 작업 잠금으로 직렬화하며 감사 기록 오류는 전체 변경을 롤백한다. DB 직접 수정과 기존 즉시 재시도 경로는 이 선택형 대기를 우회할 수 있다. DB 시계 변경, 데이터 손실·비동기 장애 전환, 대기 기간 중 공급자 상태 변경, 다른 작업·계정 전체의 요청률은 보호하지 않는다. 이 명령은 운영자의 명시적 판정이며 자동 판정·자동 재시도는 제공하지 않는다. 잘못된 판정과 공급자 수신 확인의 한계로 중복 발송이 가능하다.
+감사 행의 `resend_retry_not_before`에는 원래 안내 시각이 기록된다. 시도·안내가 없거나 이미 변경된 작업, 해당 공급자 콜백 증거가 있는 경우는 거절한다. 동시 결정은 작업 잠금으로 직렬화하며 감사 기록 오류는 전체 변경을 롤백한다. DB 직접 수정과 기존 즉시 재시도 경로는 이 선택형 대기를 우회할 수 있다. DB 시계 변경, 데이터 손실·비동기 장애 전환, 대기 기간 중 공급자 상태 변경, 다른 작업·계정 전체의 요청률은 보호하지 않는다. 이 명령은 운영자의 명시적 판정이며 별도 자동 정책은 위 최신 항목을 참고한다. 잘못된 판정과 공급자 수신 확인의 한계로 중복 발송이 가능하다.
 
 임시 로컬 PostgreSQL 17, 제한 DB 계정과 실제 CLI에서 권한·환경 격리, 누락된 안내와 콜백 거절, 감사 실패 롤백, 두 동시 결정 중 하나만 성공, 감사 시각 보존을 확인했다. 실제 큐 함수와 모의 Resend에서 기한 전 미처리 및 기한을 테스트에서 앞당긴 뒤 발송을 확인했다. 실제 Resend 429와 다중 호스트 HA는 미검증이다. 재현: `TEST_DATABASE_URL=... cargo test --features test-mocks --test resend_retry_after_schedule -- --ignored` (전체 서비스 마이그레이션을 적용한 폐기 가능한 DB와 역할 생성 권한 필요).
 

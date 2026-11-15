@@ -70,6 +70,14 @@ async fn run(
         Ok("retry") => true,
         _ => return Err("invalid Resend idempotency scope".into()),
     };
+    let auto_429 = match std::env::var("NOVU_RESEND_AUTO_RETRY_429").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid Resend automatic 429 retry setting".into()),
+    };
+    if auto_429 && !(retry_guard && correlation && correlation_guard && retry_key) {
+        return Err("automatic 429 retries require both evidence guards, correlation tags and retry-scoped idempotency".into());
+    }
     let timeout = Duration::from_secs(timeout);
     loop {
         if stop.requested() {
@@ -91,6 +99,7 @@ async fn run(
                 Ok(Ok(_))
             );
             let mut recovery = tokio::time::Instant::now();
+            let mut auto_retry = tokio::time::Instant::now();
             if configured {
                 match tokio::time::timeout(
                     timeout,
@@ -150,6 +159,23 @@ async fn run(
                             break;
                         }
                         recovery = tokio::time::Instant::now() + Duration::from_secs(5);
+                    }
+                    if auto_429 && tokio::time::Instant::now() >= auto_retry {
+                        if !matches!(
+                            tokio::time::timeout(
+                                timeout,
+                                db.query_one(
+                                    "SELECT public.novu_rust_resend_auto_retry($1)",
+                                    &[&environment]
+                                )
+                            )
+                            .await,
+                            Ok(Ok(_))
+                        ) {
+                            eprintln!("Resend automatic retry check failed; reconnecting");
+                            break;
+                        }
+                        auto_retry = tokio::time::Instant::now() + Duration::from_secs(5);
                     }
                     if stop.requested() {
                         break;

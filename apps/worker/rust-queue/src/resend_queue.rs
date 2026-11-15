@@ -210,7 +210,7 @@ async fn process_one_inner(
         return Ok(true);
     }
     if correlation_guard {
-        let evidence = tx.query_opt("SELECT r.retry_correlation_id,r.retry_provider_message_id FROM (SELECT retry_correlation_id,retry_provider_message_id FROM novu_rust_delivery_reconciliations WHERE environment_id=$1 AND job_id=$2 AND target_index IS NULL AND decision='retry' ORDER BY decision_order DESC LIMIT 1) r WHERE r.retry_correlation_id IS NOT NULL AND EXISTS(SELECT 1 FROM novu_rust_resend_delivery_events e WHERE e.environment_id=$1 AND e.correlation_id=r.retry_correlation_id)", &[&environment,&job.id]).await?;
+        let evidence = tx.query_opt("SELECT r.retry_correlation_id,r.retry_provider_message_id FROM novu_rust_delivery_reconciliations r WHERE r.environment_id=$1 AND r.job_id=$2 AND r.target_index IS NULL AND r.decision='retry' AND r.retry_correlation_id IS NOT NULL AND EXISTS(SELECT 1 FROM novu_rust_resend_delivery_events e WHERE e.environment_id=$1 AND e.correlation_id=r.retry_correlation_id) ORDER BY r.decision_order DESC LIMIT 1", &[&environment,&job.id]).await?;
         if let Some(evidence) = evidence {
             let tag: Uuid = evidence.get(0);
             let provider_id: Option<String> = evidence.get(1);
@@ -224,7 +224,7 @@ async fn process_one_inner(
         }
     }
     if retry_guard {
-        let evidence = tx.query_opt("SELECT r.retry_provider_message_id FROM (SELECT retry_provider_message_id FROM novu_rust_delivery_reconciliations WHERE environment_id=$1 AND job_id=$2 AND target_index IS NULL AND decision='retry' ORDER BY decision_order DESC LIMIT 1) r WHERE r.retry_provider_message_id IS NOT NULL AND r.retry_provider_message_id<>'' AND EXISTS(SELECT 1 FROM novu_rust_resend_delivery_events e WHERE e.environment_id=$1 AND e.email_id=r.retry_provider_message_id)", &[&environment,&job.id]).await?;
+        let evidence = tx.query_opt("SELECT r.retry_provider_message_id FROM novu_rust_delivery_reconciliations r WHERE r.environment_id=$1 AND r.job_id=$2 AND r.target_index IS NULL AND r.decision='retry' AND r.retry_provider_message_id IS NOT NULL AND r.retry_provider_message_id<>'' AND EXISTS(SELECT 1 FROM novu_rust_resend_delivery_events e WHERE e.environment_id=$1 AND e.email_id=r.retry_provider_message_id) ORDER BY r.decision_order DESC LIMIT 1", &[&environment,&job.id]).await?;
         if let Some(evidence) = evidence {
             let provider_id: String = evidence.get(0);
             let inserted = tx.execute("INSERT INTO novu_rust_resend_attempts(job_id,environment_id,state,provider_message_id) VALUES ($1,$2,'unknown',$3) ON CONFLICT(job_id) DO NOTHING", &[&job.id,&environment,&provider_id]).await?;
