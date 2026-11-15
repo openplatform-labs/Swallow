@@ -52,6 +52,7 @@ struct ApiState {
     selection: Arc<Mutex<()>>,
     routing: Routing,
     max_inflight_per_connection: usize,
+    ready_require_capacity: bool,
     timeout: Duration,
     draining: Arc<AtomicBool>,
 }
@@ -149,7 +150,13 @@ async fn live() -> Response {
 async fn ready(State(shared): State<ApiState>) -> Response {
     let mut probes = tokio::task::JoinSet::new();
     if !shared.draining.load(Ordering::Acquire) {
-        for slot in shared.connections.iter() {
+        for (index, slot) in shared.connections.iter().enumerate() {
+            if shared.ready_require_capacity
+                && shared.inflight[index].load(Ordering::Relaxed)
+                    >= shared.max_inflight_per_connection
+            {
+                continue;
+            }
             let current = slot
                 .read()
                 .ok()
@@ -158,6 +165,9 @@ async fn ready(State(shared): State<ApiState>) -> Response {
             if let Some(current) = current {
                 let slot = slot.clone();
                 let timeout = shared.timeout;
+                let inflight = shared.inflight.clone();
+                let require_capacity = shared.ready_require_capacity;
+                let limit = shared.max_inflight_per_connection;
                 probes.spawn(async move {
                     let query_ok = matches!(
                         tokio::time::timeout(timeout, current.db.simple_query("SELECT 1")).await,
@@ -172,7 +182,9 @@ async fn ready(State(shared): State<ApiState>) -> Response {
                                 .map(|active| Arc::ptr_eq(&active.db, &current.db))
                         })
                         .unwrap_or(false);
-                    query_ok && still_current
+                    query_ok
+                        && still_current
+                        && (!require_capacity || inflight[index].load(Ordering::Relaxed) < limit)
                 });
             }
         }
@@ -332,6 +344,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if max_inflight_per_connection > 1000 {
         return Err("invalid API inflight limit".into());
     }
+    let ready_require_capacity =
+        match std::env::var("SWALLOW_API_READY_REQUIRE_CAPACITY").as_deref() {
+            Ok("true") => true,
+            Ok("false") | Err(std::env::VarError::NotPresent) => false,
+            _ => return Err("invalid API readiness capacity setting".into()),
+        };
+    if ready_require_capacity && max_inflight_per_connection == 0 {
+        return Err("API readiness capacity requires an inflight limit".into());
+    }
     let health_endpoints = match std::env::var("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED").as_deref() {
         Ok("true") => true,
         Ok("false") | Err(std::env::VarError::NotPresent) => false,
@@ -350,6 +371,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         selection: Arc::new(Mutex::new(())),
         routing,
         max_inflight_per_connection,
+        ready_require_capacity,
         timeout,
         draining: Arc::new(AtomicBool::new(false)),
     };
