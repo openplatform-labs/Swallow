@@ -124,6 +124,7 @@ async fn run() -> Result<()> {
         resend_auto: None,
         slack_cooldown: None,
         twilio_delayed: None,
+        fcm_partial: None,
         failed_jobs: None,
         failed_jobs_check_failed: false,
         database_probe: Some((args[1].clone(), false)),
