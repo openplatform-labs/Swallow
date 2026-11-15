@@ -454,6 +454,12 @@ async fn process_claimed(
         tx.rollback().await?;
         return Err(LeaseLost.into());
     }
+    if let Some(expected)=data.get("expectedWorkflowInternalId") {
+        let expected=expected.as_str().filter(|v|!v.is_empty()&&v.len()<=512).ok_or(InvalidJob("invalid workflow generation"))?;
+        if !data.get("severityOverride").is_some() || !tx.query_one("SELECT public.novu_rust_lock_workflow_generation($1,$2,$3)",&[&job.environment_id,&workflow,&expected]).await?.get::<_,bool>(0) {
+            return Err(InvalidJob("workflow generation changed").into());
+        }
+    }
     let discord_workflow = if discord_workflow {
         // The guard holds the environment policy lock until this transaction commits.
         tx.query_one("SELECT public.novu_rust_discord_workflow_guard($1,$2,$3)", &[&job.environment_id,&job.id,&job.lease_token]).await?.get::<_,bool>(0)

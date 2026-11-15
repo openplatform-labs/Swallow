@@ -1609,3 +1609,7 @@ Apply worker migration `0243`, upgrade all workers, projectors, monitors, API in
 ### SendGrid sandbox in-flight failover
 
 `SWALLOW_LOCAL_FAILOVER_SCENARIO=sendgrid-sandbox-inflight scripts/test-postgres-failover-local.sh` uses a disposable synchronous PostgreSQL primary and standby on one host. An in-process queue handler sends a sandbox request to a loopback server which delays HTTP 200; the test stops the primary after the attempt is replicated and promotes the standby before releasing the response. It forcibly expires the lease and starts two actual workers: the attempt becomes `unknown`, cannot be manually marked accepted or changed to a real-send payload, and makes no proxy connection during the observation period. A newly queued normal send makes one proxy connection, confirming the workers continue processing. This is not a real SendGrid request, real lease wait, network timeout, asynchronous replication, split-brain/fencing, multi-host deployment or automated production failover test; test workers use an administrative DB login. Docker is not used.
+
+### Workflow generation guard
+
+Generation-bound operator JWT triggers require worker migration `0245`, function EXECUTE privileges for each in-app worker DB login, and all older in-app workers to be drained and upgraded before the feature is enabled. Older workers ignore the generation field; there is no automatic mixed-version fence. See the API README's optional workflow generation binding section for deployment order, tests and limitations.
