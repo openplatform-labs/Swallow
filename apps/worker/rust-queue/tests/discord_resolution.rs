@@ -358,6 +358,46 @@ async fn discord_resolution_is_scoped_fenced_and_delivers_retry() {
             .await
             .unwrap()
     );
+    // Advance only the fixture schedule, then race two queue consumers.
+    db.execute("UPDATE public.novu_queue_jobs SET available_at=clock_timestamp()-interval '1 second' WHERE id=$1",&[&delayed]).await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!(
+        "http://{}/api/webhooks/1/secret",
+        listener.local_addr().unwrap()
+    );
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut data = [0_u8; 8192];
+        let n = socket.read(&mut data).await.unwrap();
+        assert!(String::from_utf8_lossy(&data[..n]).contains("wait=true"));
+        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 36\r\nConnection: close\r\n\r\n{\"id\":\"2\",\"timestamp\":\"2026-01-01Z\"}").await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept())
+                .await
+                .is_err()
+        );
+    });
+    let delayed_provider = Webhook::test_endpoint(&endpoint).unwrap();
+    let (mut db2, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(driver);
+    let (a, b) = tokio::join!(
+        discord_queue::process_one(&mut db, &env, "one", &delayed_provider),
+        discord_queue::process_one(&mut db2, &env, "one", &delayed_provider)
+    );
+    let mut selected = [a.unwrap(), b.unwrap()];
+    selected.sort();
+    assert_eq!(selected, [false, true]);
+    server.await.unwrap();
+    let row=db.query_one("SELECT j.status,a.state,a.revision,(SELECT count(*) FROM public.novu_rust_discord_resolutions WHERE job_id=j.id AND request_id=$2 AND decision='retry_after') FROM public.novu_queue_jobs j JOIN public.novu_rust_discord_attempts a ON a.job_id=j.id WHERE j.id=$1",&[&delayed,&delayed_id]).await.unwrap();
+    assert_eq!(
+        (
+            row.get::<_, String>(0),
+            row.get::<_, String>(1),
+            row.get::<_, i64>(3)
+        ),
+        ("completed".into(), "accepted".into(), 1)
+    );
+    assert_ne!(row.get::<_, Uuid>(2), delayed_rev);
     let no_guidance = Uuid::new_v4();
     db.execute("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES($1,$2,'experimental_discord_webhook',jsonb_build_object('destination','one','content','missing'),'failed')",&[&no_guidance,&env]).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_discord_attempts(job_id,environment_id,state,http_status) VALUES($1,$2,'rejected',429)",&[&no_guidance,&env]).await.unwrap();
