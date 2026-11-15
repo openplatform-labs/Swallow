@@ -221,6 +221,7 @@ pub enum SendError {
     InvalidMessage,
     Transport,
     Provider(u16),
+    RateLimited(Option<u32>),
     InvalidResponse,
 }
 impl fmt::Display for SendError {
@@ -230,6 +231,7 @@ impl fmt::Display for SendError {
             Self::InvalidMessage => f.write_str("invalid Twilio message"),
             Self::Transport => f.write_str("Twilio transport failed"),
             Self::Provider(status) => write!(f, "Twilio returned HTTP {status}"),
+            Self::RateLimited(_) => f.write_str("Twilio returned HTTP 429"),
             Self::InvalidResponse => f.write_str("invalid Twilio response"),
         }
     }
@@ -386,6 +388,9 @@ impl Twilio {
             .await
             .map_err(|_| SendError::Transport)?;
         let status = response.status();
+        if status.as_u16() == 429 {
+            return Err(SendError::RateLimited(crate::slack::retry_after_seconds(response.headers())));
+        }
         if !status.is_success() {
             return Err(SendError::Provider(status.as_u16()));
         }
@@ -544,7 +549,7 @@ mod tests {
                 assert_eq!(form.get("From").unwrap(), "+15550000001");
                 assert_eq!(form.get("Body").unwrap(), "Hello & 한글");
                 let body = r#"{"sid":"SM123","date_created":"Wed, 28 Oct 2026 10:00:00 +0000"}"#;
-                socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nLocation: http://127.0.0.1:1/\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                socket.write_all(format!("HTTP/1.1 {status} Test\r\nRetry-After: 120\r\nContent-Length: {}\r\nLocation: http://127.0.0.1:1/\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
             });
             let provider = Twilio::with_origin(config(api_key), &origin).unwrap();
             let result = provider
@@ -565,7 +570,7 @@ mod tests {
                     }
                 );
             } else {
-                assert_eq!(result.err(), Some(SendError::Provider(status)));
+                assert_eq!(result.err(), Some(if status == 429 {SendError::RateLimited(Some(120))} else {SendError::Provider(status)}));
             }
             server.await.unwrap();
         }

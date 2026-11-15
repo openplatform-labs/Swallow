@@ -12,6 +12,7 @@ pub const MIGRATION: &str = include_str!("../migrations/0041_experimental_twilio
 pub const DISPATCH_ID_MIGRATION: &str =
     include_str!("../migrations/0055_twilio_attempt_identity.sql");
 pub const DISPATCH_ACCOUNT_MIGRATION: &str = include_str!("../migrations/0177_twilio_dispatch_account.sql");
+pub const RETRY_AFTER_MIGRATION: &str = include_str!("../migrations/0178_twilio_retry_after.sql");
 
 fn valid_phone(value: Option<&str>) -> Option<&str> {
     value.filter(|v| !v.trim().is_empty())
@@ -263,13 +264,15 @@ pub async fn process_one_with_step_policy(
     apply_status_callback(&mut sms, provider, job.id, dispatch);
     tx.execute("UPDATE novu_rust_sms_messages SET delivery_state='dispatching' WHERE environment_id=$1 AND sms_job_id=$2", &[&environment,&job.id]).await?;
     tx.commit().await?;
-    let (state, status, provider_id, diagnostic) = match provider.send(&sms).await {
+    let (state, status, provider_id, diagnostic, retry_after) = match provider.send(&sms).await {
         Ok(receipt) => (
             "accepted",
             None,
             Some(receipt.id.chars().take(1024).collect::<String>()),
             None,
+            None,
         ),
+        Err(SendError::RateLimited(seconds)) => ("rejected", Some(429), None, Some("sms provider rejected request"), seconds.map(|s| s as i32)),
         Err(SendError::Provider(code))
             if !(400..500).contains(&code) || [408, 409].contains(&code) =>
         {
@@ -278,6 +281,7 @@ pub async fn process_one_with_step_policy(
                 Some(i32::from(code)),
                 None,
                 Some("sms provider outcome unknown"),
+                None,
             )
         }
         Err(SendError::Provider(code)) => (
@@ -285,18 +289,19 @@ pub async fn process_one_with_step_policy(
             Some(i32::from(code)),
             None,
             Some("sms provider rejected request"),
+            None,
         ),
         Err(SendError::Transport | SendError::InvalidResponse) => {
-            ("unknown", None, None, Some("sms delivery outcome unknown"))
+            ("unknown", None, None, Some("sms delivery outcome unknown"), None)
         }
-        Err(_) => ("rejected", None, None, Some("invalid sms request")),
+        Err(_) => ("rejected", None, None, Some("invalid sms request"), None),
     };
     let tx = client.transaction().await?;
     if !lock_live(&tx, &job).await? {
         tx.rollback().await?;
         return Ok(true);
     }
-    let updated = tx.execute("UPDATE novu_rust_twilio_attempts SET state=$2,http_status=$3,provider_message_id=$4,updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$5 AND state='dispatching'", &[&job.id,&state,&status,&provider_id,&environment]).await?;
+    let updated = tx.execute("UPDATE novu_rust_twilio_attempts SET state=$2,http_status=$3,provider_message_id=$4,retry_after_seconds=$6,retry_not_before=clock_timestamp()+make_interval(secs=>$6::integer::double precision),updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$5 AND state='dispatching'", &[&job.id,&state,&status,&provider_id,&environment,&retry_after]).await?;
     if updated == 1 {
         tx.execute("UPDATE novu_rust_sms_messages SET delivery_state=$3 WHERE environment_id=$1 AND sms_job_id=$2", &[&environment,&job.id,&state]).await?;
         if state == "accepted" {
@@ -536,6 +541,7 @@ mod tests {
         db.batch_execute(MIGRATION).await.unwrap();
         db.batch_execute(DISPATCH_ID_MIGRATION).await.unwrap();
         db.batch_execute(DISPATCH_ACCOUNT_MIGRATION).await.unwrap();
+        db.batch_execute(RETRY_AFTER_MIGRATION).await.unwrap();
         db.batch_execute(crate::reconciliation::MIGRATION)
             .await
             .unwrap();
@@ -632,7 +638,7 @@ mod tests {
                 } else {
                     r#"{"sid":"SM123","date_created":"Wed, 28 Oct 2026 10:00:00 +0000"}"#
                 };
-                socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                socket.write_all(format!("HTTP/1.1 {status} Test\r\nRetry-After: 120\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
                 captured_dispatch
             });
             let provider = Twilio::test_origin(
@@ -656,6 +662,9 @@ mod tests {
             assert_eq!(count, 1);
             let account: String = db.query_one("SELECT account_sid FROM novu_rust_twilio_dispatch_ids WHERE id=$1", &[&captured_dispatch]).await.unwrap().get(0);
             assert_eq!(account, "ACfixture");
+            let retry = db.query_one("SELECT retry_after_seconds, retry_not_before>clock_timestamp()+interval '100 seconds' FROM novu_rust_twilio_attempts WHERE job_id=$1", &[&id]).await.unwrap();
+            assert_eq!(retry.get::<_,Option<i32>>(0), if status==429 {Some(120)} else {None});
+            assert_eq!(retry.get::<_,Option<bool>>(1), if status==429 {Some(true)} else {None});
             assert_eq!(row.get::<_, String>(0), expected);
             let delivery_state: String = db
                 .query_one(

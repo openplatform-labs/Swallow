@@ -271,3 +271,5 @@ Angular 테스트 156개와 빌드가 통과했다. 실제 브라우저, 로컬 
 Angular 테스트 158개와 빌드가 통과했다. 실제 브라우저·로컬 테스트 OIDC 공급자·Rust API·임시 PostgreSQL에서 세 항목을 함께 요청해 각각 수락 또는 회수 기록을 확인하고 테스트 갱신 토큰 재사용이 거절되는 것을 확인했다. 실제 외부 IdP, 운영 HA 및 모든 실패 조합은 미검증이다.
 
 The JWT operations screen can query the optional Slack shared cooldown snapshot. Provision the separate API 0098 identity grant, API database `alert_view` and function EXECUTE, and a worker cooldown policy; see the Rust API README. The threshold affects this query only. A failed lookup clears the previous result. The snapshot does not show whether every worker has enabled the guard. The local preview fixture flag `SWALLOW_UI_SLACK_COOLDOWN_HEALTH_FIXTURE=true` seeds a policy and deferred jobs for browser testing; it does not contact Slack.
+
+The Twilio result view shows 429 retry guidance when API 0099 and worker 0178 provide it. Older API responses without these optional fields remain supported. The values do not schedule a retry; verify current evidence before choosing an existing retry operation.

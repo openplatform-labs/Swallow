@@ -2,7 +2,7 @@ import { TestBed } from '@angular/core/testing';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { TwilioResults } from './twilio-results';
 const id='11111111-1111-4111-8111-000000000001';
-const row={jobId:id,jobStatus:'completed',result:'delivered',attemptState:'accepted',providerIdKnown:true,providerIdAmbiguous:false,lastCompletedScanAt:null};
+const row={jobId:id,jobStatus:'completed',result:'delivered',attemptState:'accepted',providerIdKnown:true,providerIdAmbiguous:false,lastCompletedScanAt:null,attemptHttpStatus:null,retryAfterSeconds:null,retryNotBefore:null};
 const page=Array.from({length:20},(_,i)=>({...row,jobId:`11111111-1111-4111-8111-${String(i+1).padStart(12,'0')}`}));
 const last=page[19].jobId;
 describe('Twilio operator results',()=>{
@@ -24,4 +24,5 @@ describe('Twilio operator results',()=>{
   it('rejects unsafe origin and ignores delayed data after identity changes',async()=>{
     let resolve!:(r:Response)=>void;const mock=vi.spyOn(globalThis,'fetch').mockImplementation(()=>new Promise(r=>resolve=r));const fixture=TestBed.createComponent(TwilioResults);const c=fixture.componentInstance;c.apiOrigin='http://remote.example.test';c.environment='env';c.token='aaa.bbb.ccc';await c.list();expect(mock).not.toHaveBeenCalled();c.apiOrigin='https://api.example.test';const pending=c.list();c.token='ddd.eee.fff';c.ngOnChanges();resolve(new Response(JSON.stringify({data:[row],hasMore:false,next:null})));await pending;expect(c.rows()).toEqual([]);expect(c.listStatus()).toBe('idle');fixture.destroy();expect(c.token).toBe('');
   });
+  it('shows bounded 429 guidance and rejects inconsistent responses',async()=>{vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({...row,jobStatus:'failed',result:'unknown',attemptState:'rejected',attemptHttpStatus:429,retryAfterSeconds:120,retryNotBefore:'2026-11-15 12:00:00+00'}))).mockResolvedValueOnce(new Response(JSON.stringify({...row,retryAfterSeconds:120,retryNotBefore:null})));const fixture=TestBed.createComponent(TwilioResults);const c=fixture.componentInstance;c.apiOrigin='https://api.example.test';c.environment='env';c.token='aaa.bbb.ccc';c.jobId=id;await c.load();fixture.detectChanges();expect(fixture.nativeElement.textContent).toContain('120초');await c.load();expect(c.resultStatus()).toBe('error');fixture.destroy();});
 });

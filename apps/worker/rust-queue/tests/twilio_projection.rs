@@ -28,6 +28,7 @@ async fn projects_only_matching_current_attempt_and_recovers_on_rescan() {
         queue::twilio_queue::MIGRATION,
         queue::twilio_queue::DISPATCH_ID_MIGRATION,
         queue::twilio_queue::DISPATCH_ACCOUNT_MIGRATION,
+        queue::twilio_queue::RETRY_AFTER_MIGRATION,
         queue::in_app::SMS_MESSAGES_MIGRATION,
         projection::MIGRATION,
         include_str!("../../../api/rust-api/migrations/0005_twilio_webhooks.sql"),

@@ -1,5 +1,7 @@
 ## Slack 공유 대기 상태 조회와 경보
 
+- Twilio 429 대기 안내: 워커 0178이 숫자형 `Retry-After`와 안내 시각을 기록하고 API 0099와 Angular 화면이 기존 권한으로 표시한다. 모의 Twilio·격리 PostgreSQL 워커, 제한 JWT API, Angular 196개 테스트 및 실제 로컬 브라우저에서 120초 안내를 확인했다. 자동·지연 재시도는 구현하지 않았고 기존 수동 재시도는 안내를 강제하지 않는다. 실제 Twilio 429·운영 HA는 미검증이다. 배포 순서와 제약은 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
 - Twilio 엄격 콜백 장애 전환 시험: 로컬 PostgreSQL 17 동기 복제 환경에서 모의 SMS 요청을 보류하는 동안 발송 계정·시도 ID가 복제된 것을 확인하고 주 서버를 중지해 복제본을 승격했다. 두 실제 워커가 결과 불명으로 복구한 뒤 엄격 모드의 실제 API가 서명된 합성 콜백을 수락·중복 제거했고 메시지 결과는 `unknown`으로 유지됐다. 최초 발송은 큐 함수·모의 공급자이며 단일 호스트·관리자 계정 시험이다. 실제 Twilio, 비동기 복제·네트워크 분할 및 운영 HA는 미검증이다. 재현은 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
 - Twilio 콜백 엄격 선택: `NOVU_TWILIO_WEBHOOK_REQUIRE_DISPATCH_ACCOUNT=true`는 서명된 시도별 콜백 중 저장된 계정이 일치한 것만 받는다. 기본값은 이전 호환 동작이다. 격리 PostgreSQL과 서명된 합성 요청으로 미연결·작업 단위·계정 미기록 거절 및 일치 수락을 확인했다. API 시작 설정 검증은 병렬 실행 중 한 차례 예상과 다른 프로세스 상태로 실패했고 단독 재실행은 통과했다. 과거 작업·구버전 워커의 콜백도 거절하므로 전환 전 미처리 건을 고려해야 하며 실제 Twilio·운영 HA는 미검증이다. [API README](apps/api/rust-api/README.md)를 참고한다.

@@ -51,6 +51,7 @@ async fn current_events_invalidate_and_linked_duplicates_are_idempotent() {
         novu_postgres_queue::twilio_queue::MIGRATION,
         novu_postgres_queue::twilio_queue::DISPATCH_ID_MIGRATION,
         novu_postgres_queue::twilio_queue::DISPATCH_ACCOUNT_MIGRATION,
+        novu_postgres_queue::twilio_queue::RETRY_AFTER_MIGRATION,
         novu_postgres_queue::in_app::SMS_MESSAGES_MIGRATION,
         novu_postgres_queue::twilio_projection::MIGRATION,
         include_str!("../migrations/0005_twilio_webhooks.sql"),

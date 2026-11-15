@@ -1310,6 +1310,7 @@ mod tests {
             crate::twilio_queue::MIGRATION,
             crate::twilio_queue::DISPATCH_ID_MIGRATION,
             crate::twilio_queue::DISPATCH_ACCOUNT_MIGRATION,
+            crate::twilio_queue::RETRY_AFTER_MIGRATION,
             crate::fcm_queue::MIGRATION,
             crate::in_app::DELIVERY_STATE_MIGRATION,
         ] {
