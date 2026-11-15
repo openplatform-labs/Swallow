@@ -24,6 +24,22 @@ describe('operator OIDC configuration',()=>{
     await expect(service.prepare({...settings,scope:'openid offline_access'})).rejects.toThrow();
     await expect(service.prepare({...settings,issuer:'http://external.test'})).rejects.toThrow();
   });
+  it('rejects oversized and invalid UTF-8 discovery while reading the stream',async()=>{
+    let cancelled=false;
+    const body=new ReadableStream<Uint8Array>({pull(controller){controller.enqueue(new Uint8Array(40000).fill(97));},cancel(){cancelled=true;}});
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(body)).mockResolvedValueOnce(new Response(new Uint8Array([0xff]))).mockResolvedValueOnce(new Response('{}',{headers:{'content-length':'65537'}}));
+    const service=new OperatorOidc();
+    await expect(service.prepare(settings)).rejects.toThrow('response too large');expect(cancelled).toBe(true);
+    await expect(service.prepare(settings)).rejects.toThrow();await expect(service.prepare(settings)).rejects.toThrow('response too large');expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+  it('bounds signing keys and operator identity responses',async()=>{
+    const {privateKey,publicKey}=await generateKeyPair('RS256');const jwk={...(await exportJWK(publicKey)),kid:'test',alg:'RS256',use:'sig'};
+    vi.spyOn(UserManager.prototype,'signinPopup').mockImplementation(async args=>({expired:false,token_type:'Bearer',access_token:accessToken,id_token:await new SignJWT({nonce:args?.nonce}).setProtectedHeader({alg:'RS256',kid:'test'}).setIssuer(settings.issuer).setAudience(settings.clientId).setSubject('alice').setIssuedAt().setExpirationTime('1m').sign(privateKey)} as User));
+    const remove=vi.spyOn(UserManager.prototype,'removeUser').mockResolvedValue();
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response('x'.repeat(262145))).mockResolvedValueOnce(new Response(JSON.stringify({keys:[jwk]}))).mockResolvedValueOnce(new Response('x'.repeat(16385)));
+    const service=new OperatorOidc();await expect(service.signIn({settings,metadata})).rejects.toThrow('response too large');await expect(service.signIn({settings,metadata})).rejects.toThrow('response too large');
+    expect(fetchMock).toHaveBeenCalledTimes(3);expect(remove).toHaveBeenCalledTimes(2);
+  });
   it('accepts a session only when the API-verified identity matches the selected client',async()=>{
     const {privateKey,publicKey}=await generateKeyPair('RS256');
     const jwk={...(await exportJWK(publicKey)),kid:'test',alg:'RS256',use:'sig'};

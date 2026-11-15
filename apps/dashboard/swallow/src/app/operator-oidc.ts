@@ -11,6 +11,31 @@ function secureUrl(value: string, allowPath: boolean): URL {
   return url;
 }
 
+// Enforce limits while consuming the stream, before allocating the full response.
+async function boundedText(response: Response, limit: number): Promise<string> {
+  const declared=response.headers.get('content-length');
+  if(declared && /^\d+$/.test(declared) && Number(declared)>limit) {
+    void response.body?.cancel().catch(()=>{});
+    throw new Error('response too large');
+  }
+  if(!response.body) throw new Error('empty response');
+  const reader=response.body.getReader(),decoder=new TextDecoder('utf-8',{fatal:true});
+  let size=0,text='';
+  try {
+    for (;;) {
+      const {done,value}=await reader.read();
+      if(done) break;
+      size+=value.byteLength;
+      if(size>limit) throw new Error('response too large');
+      text+=decoder.decode(value,{stream:true});
+    }
+    return text+decoder.decode();
+  } catch(error) {
+    void reader.cancel().catch(()=>{});
+    throw error;
+  } finally { reader.releaseLock(); }
+}
+
 export class OperatorOidc {
   async prepare(input: OidcSettings): Promise<PreparedOidc> {
     const settings: OidcSettings={issuer:input.issuer.trim(),clientId:input.clientId.trim(),scope:input.scope.trim(),resource:input.resource.trim(),audience:input.audience.trim(),apiOrigin:input.apiOrigin.trim(),environmentId:input.environmentId.trim()};
@@ -18,7 +43,7 @@ export class OperatorOidc {
     if (issuer.search || !settings.clientId || settings.clientId.length>256 || !settings.environmentId || new TextEncoder().encode(settings.environmentId).length>512 || settings.resource.length>2048 || settings.audience.length>2048 || settings.scope.length>512 || !settings.scope.split(/\s+/).includes('openid') || settings.scope.split(/\s+/).includes('offline_access')) throw new Error('invalid settings');
     const response=await fetch(`${settings.issuer.replace(/\/$/,'')}/.well-known/openid-configuration`,{credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
     if (!response.ok) throw new Error('discovery unavailable');
-    const text=await response.text(); if (text.length>65536) throw new Error('metadata too large');
+    const text=await boundedText(response,65536);
     const metadata: unknown=JSON.parse(text);
     if (typeof metadata !== 'object' || metadata === null || !('issuer' in metadata) || metadata.issuer !== settings.issuer || !('authorization_endpoint' in metadata) || typeof metadata.authorization_endpoint !== 'string' || !('token_endpoint' in metadata) || typeof metadata.token_endpoint !== 'string') throw new Error('invalid metadata');
     secureUrl(metadata.authorization_endpoint,true); secureUrl(metadata.token_endpoint,true);
@@ -39,13 +64,13 @@ export class OperatorOidc {
       const user=await manager.signinPopup({nonce});
       if (user.expired || user.token_type.toLowerCase()!=='bearer' || !user.access_token || user.access_token.length>16384) throw new Error('invalid token');
       if (!user.id_token || user.id_token.length>16384 || typeof metadata.jwks_uri !== 'string') throw new Error('invalid identity token');
-      const jwks=createRemoteJWKSet(secureUrl(metadata.jwks_uri,true),{timeoutDuration:5000,[customFetch]:(url,options)=>fetch(url,{...options,credentials:'omit',redirect:'error',cache:'no-store'})});
+      const jwks=createRemoteJWKSet(secureUrl(metadata.jwks_uri,true),{timeoutDuration:5000,[customFetch]:async(url,options)=>{const response=await fetch(url,{...options,credentials:'omit',redirect:'error',cache:'no-store'});if(!response.ok)return response;const body=await boundedText(response,262144);const headers=new Headers(response.headers);headers.delete('content-length');return new Response(body,{status:response.status,statusText:response.statusText,headers});}});
       const {payload}=await jwtVerify(user.id_token,jwks,{issuer:settings.issuer,audience:settings.clientId,algorithms:['RS256','ES256'],requiredClaims:['sub','exp','iat','nonce']});
       if (payload['nonce']!==nonce || typeof payload.iat!=='number' || payload.iat>Math.floor(Date.now()/1000) || (Array.isArray(payload.aud) && payload.aud.length>1 && payload['azp']!==settings.clientId) || (payload['azp']!==undefined && payload['azp']!==settings.clientId)) throw new Error('invalid identity token');
       const params=new URLSearchParams({environmentId:settings.environmentId});
       const response=await fetch(`${new URL(settings.apiOrigin).origin}/v1/experimental/operator/me?${params}`,{headers:{Authorization:`Bearer ${user.access_token}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
       if (!response.ok) throw new Error('operator access denied');
-      const identity: unknown=await response.json();
+      const identity: unknown=JSON.parse(await boundedText(response,16384));
       if (typeof identity!=='object' || identity===null || !('issuer' in identity) || identity.issuer!==settings.issuer || !('environmentId' in identity) || identity.environmentId!==settings.environmentId || !('clientId' in identity) || identity.clientId!==settings.clientId || !('subject' in identity) || typeof identity.subject!=='string' || !identity.subject || payload.sub!==identity.subject) throw new Error('identity mismatch');
       // The API has validated the access token. Its exp is used here only to
       // clear the local session; authorization remains entirely server-side.
