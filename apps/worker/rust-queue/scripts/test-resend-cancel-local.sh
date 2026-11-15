@@ -17,8 +17,12 @@ CREATE ROLE cancel_fixture LOGIN; CREATE ROLE cancel_unprivileged LOGIN; CREATE 
 GRANT USAGE ON SCHEMA public TO cancel_fixture,cancel_unprivileged,cancel_resolver;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_reserve(text,uuid,uuid,text),public.novu_rust_resend_cancel_finish(text,uuid,text,integer),public.novu_rust_resend_cancel_get(text,uuid) TO cancel_fixture,cancel_unprivileged;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_resolve(text,uuid,uuid,text,text),public.novu_rust_resend_cancel_resolution_get(text,uuid),public.novu_rust_resend_cancel_get(text,uuid) TO cancel_resolver,cancel_fixture;
+GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_health(text,integer),public.novu_rust_reserve_alert_v3(text,text,text,integer,bigint,bigint,bigint,bigint),public.novu_rust_observe_alert_conditions_v3(text,text,text,bigint,bigint,bigint,bigint) TO cancel_fixture;
 INSERT INTO public.novu_rust_environments VALUES ('cancel-env','org'),('cancel-other','org');
 INSERT INTO public.novu_rust_resend_cancel_operators(environment_id,database_principal,principal_oid,can_cancel,can_read,can_resolve) SELECT 'cancel-env',rolname,oid,rolname='cancel_fixture',true,rolname='cancel_resolver' FROM pg_roles WHERE rolname IN ('cancel_fixture','cancel_resolver');
+INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'cancel-env',rolname,decision,oid FROM pg_roles CROSS JOIN (VALUES ('alert_view'),('alert_send')) AS x(decision) WHERE rolname='cancel_fixture';
+INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES('cancel-env','slack','blocked','rejected');
+INSERT INTO public.novu_rust_alert_v2_targets(environment_id,channel,target_id) VALUES('cancel-env','slack','blocked');
 INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status,resend_scheduled_at) VALUES
  ('11111111-1111-4111-8111-111111111111','cancel-env','experimental_resend_email','{}','completed',clock_timestamp()+interval '1 hour'),
  ('22222222-2222-4222-8222-222222222222','cancel-env','experimental_resend_email','{}','completed',clock_timestamp()+interval '1 hour'),
@@ -31,5 +35,6 @@ SQL
 cargo build --quiet --locked --manifest-path "$WORKER/Cargo.toml" --features test-mocks --bin resend-cancel
 cp "$WORKER/target/debug/resend-cancel" "$DIR/cancel-fixture"
 cargo build --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin resend-cancel
-TEST_CANCEL="$DIR/cancel-fixture" TEST_PSQL="$TEST_PG_BIN/psql" TEST_PORT="$PORT" python3 "$WORKER/tests/resend_cancel_process.py"
+cargo build --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin delivery-reconcile --bin send-delivery-alert
+TEST_CANCEL="$DIR/cancel-fixture" TEST_WORKER_DIR="$WORKER/target/debug" TEST_PSQL="$TEST_PG_BIN/psql" TEST_PORT="$PORT" python3 "$WORKER/tests/resend_cancel_process.py"
 echo 'Resend cancellation restricted CLI and mock provider tests passed.'

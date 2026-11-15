@@ -24,6 +24,18 @@ try:
     replay=run('cancel','cancel-env',req1,job1,'fixture');assert replay.returncode==0 and json.loads(replay.stdout)['fresh'] is False
     bad=run('cancel','cancel-env',req1,job1,'different');assert bad.returncode!=0
     unknown=run('cancel','cancel-env',req2,job2,'fixture');assert unknown.returncode==2 and json.loads(unknown.stdout)['state']=='unknown'
+    health_bin=os.path.join(env['TEST_WORKER_DIR'],'delivery-reconcile')
+    def health(environment='cancel-env',grace='60'):
+        return subprocess.run([health_bin,'check-resend-cancel',environment,grace],env=env,text=True,capture_output=True,timeout=10)
+    current=health();assert current.returncode==0 and json.loads(current.stdout)=={'unknown':1,'overdue':0}
+    assert health('cancel-other').returncode!=0
+    assert health('cancel-env','0').returncode!=0
+    subprocess.run([env['TEST_PSQL'],os.environ['DATABASE_URL'],'-v','ON_ERROR_STOP=1','-c',"UPDATE public.novu_rust_resend_cancel_requests SET created_at=clock_timestamp()-interval '5 minutes' WHERE request_id='%s'"%req2],check=True,capture_output=True)
+    current=health();assert current.returncode==2 and json.loads(current.stdout)=={'unknown':1,'overdue':1}
+    alert_env={**env,'SWALLOW_ALERT_RESEND_ENABLED':'false','SWALLOW_ALERT_RESEND_CANCEL_GRACE_SECONDS':'60','SWALLOW_ALERT_SCOPED_DELIVERY':'true','SWALLOW_ALERT_COOLDOWN_POLICY':'new-condition','SWALLOW_ALERT_CONDITIONS_V3':'true','SWALLOW_ALERT_SLACK_WEBHOOK':'https://hooks.slack.com/services/A/B/C','SWALLOW_ALERT_SLACK_TARGET_ID':'blocked'}
+    alert=subprocess.run([os.path.join(env['TEST_WORKER_DIR'],'send-delivery-alert'),'cancel-env','300','120','60'],env=alert_env,text=True,capture_output=True,timeout=15)
+    assert alert.returncode==2 and 'requires operator review' in alert.stderr,(alert.stdout,alert.stderr)
+    assert subprocess.run([os.path.join(env['TEST_WORKER_DIR'],'send-delivery-alert'),'cancel-env','300','120','60'],env={**alert_env,'SWALLOW_ALERT_CONDITIONS_V3':'false'},capture_output=True,timeout=15).returncode==1
     replay=run('cancel','cancel-env',req2,job2,'fixture');assert replay.returncode==2 and json.loads(replay.stdout)['fresh'] is False
     competing=run('cancel','cancel-env','cccccccc-cccc-4ccc-8ccc-cccccccccccc',job2,'fixture');assert competing.returncode!=0
     status=run('get','cancel-env',req2);assert status.returncode==0 and json.loads(status.stdout)['request']['state']=='unknown'
