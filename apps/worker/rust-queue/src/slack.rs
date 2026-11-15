@@ -119,8 +119,8 @@ impl Slack {
             endpoint,
         })
     }
-    #[cfg(test)]
-    pub(crate) fn test_endpoint(token: String, endpoint: &str) -> Result<Self, SendError> {
+    #[cfg(any(test, feature = "test-mocks"))]
+    pub fn test_endpoint(token: String, endpoint: &str) -> Result<Self, SendError> {
         Self::with_endpoint(token, Url::parse(endpoint).map_err(|_| SendError::Invalid)?)
     }
     pub async fn send(&self, message: &Message) -> Result<String, SendError> {
