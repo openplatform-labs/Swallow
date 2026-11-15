@@ -10,7 +10,7 @@ use socketioxide::{
 };
 use std::{
     error::Error,
-    future::{IntoFuture, poll_fn},
+    future::{Future, IntoFuture, poll_fn},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -563,6 +563,41 @@ async fn start_event_listener(
     Ok((client, driver))
 }
 
+// Startup retries are opt-in and share a single deadline across both DB connections.
+async fn retry_startup<T, F, Fut>(
+    deadline: Option<tokio::time::Instant>,
+    #[cfg(unix)] sigterm: &mut tokio::signal::unix::Signal,
+    mut operation: F,
+) -> Result<T, Box<dyn Error + Send + Sync>>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, Box<dyn Error + Send + Sync>>>,
+{
+    let Some(deadline) = deadline else {
+        return operation().await;
+    };
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err("WS startup database retry deadline exceeded".into());
+        }
+        let attempt_deadline = deadline.min(now + std::time::Duration::from_secs(3));
+        let attempt = tokio::time::timeout_at(attempt_deadline, operation());
+        #[cfg(unix)]
+        let outcome = tokio::select! { result=attempt => result, _=sigterm.recv()=>return Err("WS startup interrupted".into()), _=tokio::signal::ctrl_c()=>return Err("WS startup interrupted".into()) };
+        #[cfg(not(unix))]
+        let outcome = tokio::select! { result=attempt => result, _=tokio::signal::ctrl_c()=>return Err("WS startup interrupted".into()) };
+        if let Ok(Ok(value)) = outcome {
+            return Ok(value);
+        }
+        let wake = deadline.min(tokio::time::Instant::now() + std::time::Duration::from_secs(1));
+        #[cfg(unix)]
+        tokio::select! { _=tokio::time::sleep_until(wake)=>{}, _=sigterm.recv()=>return Err("WS startup interrupted".into()), _=tokio::signal::ctrl_c()=>return Err("WS startup interrupted".into()) };
+        #[cfg(not(unix))]
+        tokio::select! { _=tokio::time::sleep_until(wake)=>{}, _=tokio::signal::ctrl_c()=>return Err("WS startup interrupted".into()) };
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let drain_seconds: u64 = match std::env::var("SWALLOW_WS_DRAIN_SECONDS") {
@@ -603,12 +638,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .into_bytes();
     let (mut query_config, tls) = novu_rust_contracts::postgres::configure(&database_url)?;
     query_config.application_name("novu-rust-ws-query");
-    let client = Database::connect(&query_config, &tls).await?;
-    let db = Arc::new(Database {
-        config: query_config,
-        tls,
-        client: Mutex::new(client),
-    });
     let (layer, io) = SocketIo::new_layer();
     let disconnect_on_gap = match std::env::var("NOVU_WS_DISCONNECT_ON_EVENT_GAP").as_deref() {
         Ok("true") => true,
@@ -645,6 +674,35 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
         Err(_) => return Err("NOVU_WS_EVENT_LOOKUP_TIMEOUT_SECONDS must be valid Unicode".into()),
     };
+    let startup_retry_seconds: u64 = match std::env::var("SWALLOW_WS_STARTUP_RETRY_SECONDS") {
+        Ok(value) => value
+            .parse()
+            .map_err(|_| "invalid WS startup retry duration")?,
+        Err(std::env::VarError::NotPresent) => 0,
+        Err(_) => return Err("invalid WS startup retry duration".into()),
+    };
+    if startup_retry_seconds > 300 {
+        return Err("invalid WS startup retry duration".into());
+    }
+    let startup_deadline = (startup_retry_seconds > 0).then(|| {
+        tokio::time::Instant::now() + std::time::Duration::from_secs(startup_retry_seconds)
+    });
+    let client = retry_startup(
+        startup_deadline,
+        #[cfg(unix)]
+        &mut sigterm,
+        || async {
+            Database::connect(&query_config, &tls)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
+        },
+    )
+    .await?;
+    let db = Arc::new(Database {
+        config: query_config,
+        tls,
+        client: Mutex::new(client),
+    });
     // Even generations mean LISTEN is active. Every outage changes the generation,
     // including an outage that ends while a socket is being registered.
     let listener_generation = Arc::new(AtomicU64::new(0));
@@ -652,7 +710,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Each failure changes the epoch, preventing an older probe from clearing it.
     let event_generation = Arc::new(AtomicU64::new(0));
     let (event_tx, mut event_rx) = mpsc::channel::<ListenerEvent>(1024);
-    let initial_listener = start_event_listener(&database_url, event_tx.clone()).await?;
+    let initial_listener = retry_startup(
+        startup_deadline,
+        #[cfg(unix)]
+        &mut sigterm,
+        || start_event_listener(&database_url, event_tx.clone()),
+    )
+    .await?;
     let listener_ready = Arc::new(AtomicBool::new(true));
     let listener_ready_task = listener_ready.clone();
     let listener_generation_task = listener_generation.clone();
