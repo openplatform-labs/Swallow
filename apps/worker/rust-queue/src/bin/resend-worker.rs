@@ -14,6 +14,7 @@ async fn run(
     stop: novu_postgres_queue::shutdown::Stop,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let step_policy = novu_postgres_queue::email_step_policy::Policy::from_env()?;
+    let shared_cooldown = novu_postgres_queue::resend_cooldown::enabled_from_env()?;
     let environment = std::env::var("NOVU_RESEND_ENVIRONMENT_ID")?;
     if environment.trim().is_empty() {
         return Err("environment is required".into());
@@ -126,14 +127,14 @@ async fn run(
                 }
                 match tokio::time::timeout(
                     timeout,
-                    resend_queue::register_idempotency_scope(&db, &environment, retry_key),
+                    resend_queue::register_worker_policy(&db, &environment, retry_key, shared_cooldown),
                 )
                 .await
                 {
                     Ok(Ok(true)) => {}
                     Ok(Ok(false)) => {
                         task.abort();
-                        return Err("Resend workers have different idempotency scopes".into());
+                        return Err("Resend workers have different idempotency or shared cooldown policies".into());
                     }
                     _ => {
                         task.abort();
@@ -142,6 +143,12 @@ async fn run(
                         stop.wait(Duration::from_secs(2)).await;
                         continue;
                     }
+                }
+                if shared_cooldown && !matches!(tokio::time::timeout(timeout, db.query_one("SELECT public.novu_rust_resend_cooldown_check($1)", &[&environment])).await, Ok(Ok(_))) {
+                    task.abort(); let _ = task.await;
+                    eprintln!("Resend shared cooldown check unavailable; reconnecting");
+                    stop.wait(Duration::from_secs(2)).await;
+                    continue;
                 }
                 loop {
                     if stop.requested() {
@@ -189,7 +196,7 @@ async fn run(
                     }
                     match tokio::time::timeout(
                         timeout,
-                        resend_queue::process_one_with_registered_policy(
+                        resend_queue::process_one_with_registered_policy_and_cooldown(
                             &mut db,
                             &environment,
                             &provider,
@@ -198,6 +205,7 @@ async fn run(
                             correlation,
                             correlation_guard,
                             retry_key,
+                            shared_cooldown,
                         ),
                     )
                     .await

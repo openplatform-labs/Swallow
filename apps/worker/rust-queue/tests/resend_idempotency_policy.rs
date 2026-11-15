@@ -245,3 +245,34 @@ async fn workers_reject_conflicting_scopes_and_isolate_environments() {
         "retry"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires a fully migrated disposable PostgreSQL database"]
+async fn workers_reject_conflicting_shared_cooldown_settings() {
+    let url=std::env::var("TEST_DATABASE_URL").unwrap();
+    let (db,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();
+    tokio::spawn(async move {driver.await.unwrap()});
+    let on=format!("resend-guard-on-{}",Uuid::new_v4());
+    let off=format!("resend-guard-off-{}",Uuid::new_v4());
+    db.execute("INSERT INTO public.novu_rust_environments VALUES($1,'org'),($2,'org')", &[&on,&off]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_resend_cooldown_policies(environment_id,fallback_seconds) VALUES($1,30)", &[&on]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_resend_cooldown_workers SELECT $1,rolname,oid FROM pg_roles WHERE rolname=session_user", &[&on]).await.unwrap();
+    let start=|environment:&str,enabled:bool| Worker(Command::new(env!("CARGO_BIN_EXE_resend-worker"))
+        .env_clear().env("DATABASE_URL",&url).env("NOVU_POSTGRES_ALLOW_INSECURE","true")
+        .env("NOVU_RESEND_ENVIRONMENT_ID",environment).env("NOVU_RESEND_API_KEY","re_test")
+        .env("NOVU_RESEND_FROM","test@example.test").env("NOVU_RESEND_SHARED_COOLDOWN",enabled.to_string())
+        .env("HTTPS_PROXY","http://127.0.0.1:9").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    let mut a=start(&on,true); let mut b=start(&off,false);
+    wait_for_scope(&db,&on,"job").await;wait_for_scope(&db,&off,"job").await;
+    assert!(a.0.try_wait().unwrap().is_none());assert!(b.0.try_wait().unwrap().is_none());
+    for (environment,enabled) in [(&on,false),(&off,true)] {
+        let mut conflicting=start(environment,enabled);
+        let status=tokio::time::timeout(Duration::from_secs(10),async {
+            loop {if let Some(status)=conflicting.0.try_wait().unwrap(){break status} tokio::time::sleep(Duration::from_millis(30)).await;}
+        }).await.unwrap();
+        assert!(!status.success());
+    }
+    let states=db.query("SELECT shared_cooldown FROM public.novu_rust_resend_idempotency_policy WHERE environment_id=ANY($1) ORDER BY environment_id", &[&vec![&on,&off]]).await.unwrap();
+    let flags:Vec<bool>=states.iter().map(|row|row.get(0)).collect();
+    assert!(flags.contains(&true) && flags.contains(&false));
+}

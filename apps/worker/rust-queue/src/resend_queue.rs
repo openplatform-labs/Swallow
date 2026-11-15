@@ -28,6 +28,12 @@ pub async fn register_idempotency_scope(
     Ok(client.query_opt("INSERT INTO public.novu_rust_resend_idempotency_policy(environment_id,scope) VALUES ($1,$2) ON CONFLICT(environment_id) DO UPDATE SET scope=EXCLUDED.scope WHERE novu_rust_resend_idempotency_policy.scope=EXCLUDED.scope RETURNING 1", &[&environment,&scope]).await?.is_some())
 }
 
+/// Atomically bind idempotency and cooldown settings among upgraded workers.
+pub async fn register_worker_policy(client: &Client, environment: &str, retry_key: bool, cooldown: bool) -> Result<bool, Error> {
+    let scope = if retry_key { "retry" } else { "job" };
+    Ok(client.query_opt("INSERT INTO public.novu_rust_resend_idempotency_policy(environment_id,scope,shared_cooldown) VALUES($1,$2,$3) ON CONFLICT(environment_id) DO UPDATE SET shared_cooldown=EXCLUDED.shared_cooldown WHERE novu_rust_resend_idempotency_policy.scope=EXCLUDED.scope AND (novu_rust_resend_idempotency_policy.shared_cooldown IS NULL OR novu_rust_resend_idempotency_policy.shared_cooldown=EXCLUDED.shared_cooldown) RETURNING 1", &[&environment,&scope,&cooldown]).await?.is_some())
+}
+
 async fn claim(client: &Client, environment: &str) -> Result<Option<ClaimedJob>, Error> {
     let token = Uuid::new_v4();
     let row=client.query_opt("WITH candidate AS (SELECT id FROM novu_queue_jobs WHERE environment_id=$1 AND kind=$2 AND status='pending' AND available_at<=now() ORDER BY available_at,created_at,id FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE novu_queue_jobs j SET status='running',attempts=j.attempts+1,lease_token=$3,lease_until=clock_timestamp()+interval '60 seconds' FROM candidate WHERE j.id=candidate.id RETURNING j.id,j.environment_id,j.kind,j.payload,j.attempts", &[&environment,&JOB_KIND,&token]).await?;
@@ -144,6 +150,8 @@ pub async fn process_one_with_retry_key(
         correlation_guard,
         retry_key,
         false,
+        false,
+        false,
     )
     .await
 }
@@ -169,8 +177,20 @@ pub async fn process_one_with_registered_policy(
         correlation_guard,
         retry_key,
         true,
+        false,
+        false,
     )
     .await
+}
+
+/// Worker path with optional environment-scoped 429 cooldown.
+pub async fn process_one_with_registered_policy_and_cooldown(
+    client: &mut Client, environment: &str, provider: &Resend, retry_guard: bool,
+    policy: crate::email_step_policy::Policy, correlation_enabled: bool,
+    correlation_guard: bool, retry_key: bool, cooldown: bool,
+) -> Result<bool, Error> {
+    process_one_inner(client, environment, provider, retry_guard, policy, correlation_enabled,
+        correlation_guard, retry_key, true, cooldown, true).await
 }
 
 async fn process_one_inner(
@@ -183,6 +203,8 @@ async fn process_one_inner(
     correlation_guard: bool,
     retry_key: bool,
     registered: bool,
+    cooldown: bool,
+    enforce_cooldown_policy: bool,
 ) -> Result<bool, Error> {
     let Some(job) = claim(client, environment).await? else {
         return Ok(false);
@@ -203,10 +225,17 @@ async fn process_one_inner(
         )
         .await?;
     }
+    if enforce_cooldown_policy {
+        tx.query_one("SELECT public.novu_rust_check_resend_shared_cooldown($1,$2)", &[&environment,&cooldown]).await?;
+    }
     let subscriber =
         crate::sendgrid_queue::lock_workflow_subscriber(&tx, environment, &email).await?;
     if !live(&tx, &job).await? {
         tx.rollback().await?;
+        return Ok(true);
+    }
+    if cooldown && crate::resend_cooldown::defer(&tx, &job).await? {
+        tx.commit().await?;
         return Ok(true);
     }
     if registered {
@@ -368,6 +397,10 @@ async fn process_one_inner(
     }
     let updated=tx.execute("UPDATE novu_rust_resend_attempts SET state=$3,http_status=$4,provider_message_id=$5,updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$2 AND state='dispatching'", &[&job.id,&environment,&state,&code,&id]).await?;
     if updated == 1 {
+        if cooldown && code == Some(429) {
+            let seconds = retry_after.and_then(|value| i32::try_from(value).ok());
+            crate::resend_cooldown::record(&tx, environment, seconds).await?;
+        }
         if let Some(seconds) = retry_after {
             let seconds = i32::try_from(seconds).expect("bounded retry-after");
             tx.execute("UPDATE public.novu_rust_resend_attempts SET retry_after_seconds=$3, retry_not_before=clock_timestamp()+make_interval(secs => $3::integer::double precision) WHERE job_id=$1 AND environment_id=$2", &[&job.id,&environment,&seconds]).await?;
@@ -421,6 +454,61 @@ mod tests {
         net::TcpListener,
     };
     use tokio_postgres::NoTls;
+
+    #[tokio::test]
+    #[ignore = "requires migrated disposable PostgreSQL and loopback"]
+    async fn shared_resend_cooldown_defers_other_jobs_and_fences_policy() {
+        let url=std::env::var("TEST_DATABASE_URL").unwrap();
+        let (mut db,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();
+        tokio::spawn(async move { driver.await.unwrap() });
+        let env=format!("resend-cooldown-{}",Uuid::new_v4());
+        db.execute("INSERT INTO public.novu_rust_environments VALUES($1,'org')", &[&env]).await.unwrap();
+        assert!(register_worker_policy(&db,&env,false,true).await.unwrap());
+        assert!(register_worker_policy(&db,&env,false,true).await.unwrap());
+        assert!(!register_worker_policy(&db,&env,false,false).await.unwrap());
+        assert!(!register_worker_policy(&db,&env,true,true).await.unwrap());
+        assert!(db.query_one("SELECT public.novu_rust_check_resend_shared_cooldown($1,false)", &[&env]).await.is_err());
+        db.execute("INSERT INTO public.novu_rust_resend_cooldown_policies(environment_id,fallback_seconds) VALUES($1,45)", &[&env]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_resend_cooldown_workers SELECT $1,rolname,oid FROM pg_roles WHERE rolname=session_user", &[&env]).await.unwrap();
+        let first=Uuid::new_v4();
+        enqueue(&db,first,&env,JOB_KIND,&json!({"to":["to@example.test"],"subject":"first","html":"test"})).await.unwrap();
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider=Resend::test_endpoint(Config {api_key:"fixture".into(),from:"from@example.test".into(),sender_name:String::new()}, &format!("http://{}/emails",listener.local_addr().unwrap())).unwrap();
+        let server=tokio::spawn(async move {
+            let (mut socket,_)=listener.accept().await.unwrap();let mut data=[0u8;4096]; assert!(socket.read(&mut data).await.unwrap()>0);
+            socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        });
+        assert!(process_one_with_registered_policy_and_cooldown(&mut db,&env,&provider,false,crate::email_step_policy::Policy::Snapshot,false,false,false,true).await.unwrap());
+        server.await.unwrap();
+        let row=db.query_one("SELECT state,http_status FROM public.novu_rust_resend_attempts WHERE job_id=$1", &[&first]).await.unwrap();
+        assert_eq!(row.get::<_,String>(0),"rejected"); assert_eq!(row.get::<_,Option<i32>>(1),Some(429));
+        assert!(db.query_one("SELECT not_before>clock_timestamp()+interval '20 seconds' FROM public.novu_rust_resend_cooldown_policies WHERE environment_id=$1", &[&env]).await.unwrap().get::<_,bool>(0));
+        let second=Uuid::new_v4();
+        enqueue(&db,second,&env,JOB_KIND,&json!({"to":["to@example.test"],"subject":"second","html":"test"})).await.unwrap();
+        let (mut second_db,second_driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();
+        tokio::spawn(async move {second_driver.await.unwrap()});
+        assert!(process_one_with_registered_policy_and_cooldown(&mut second_db,&env,&provider,false,crate::email_step_policy::Policy::Snapshot,false,false,false,true).await.unwrap());
+        let row=db.query_one("SELECT status,last_error,available_at>clock_timestamp(),EXISTS(SELECT 1 FROM public.novu_rust_resend_attempts a WHERE a.job_id=j.id) FROM public.novu_queue_jobs j WHERE id=$1", &[&second]).await.unwrap();
+        assert_eq!(row.get::<_,String>(0),"pending");assert_eq!(row.get::<_,String>(1),"Resend shared cooldown active");assert!(row.get::<_,bool>(2));assert!(!row.get::<_,bool>(3));
+        db.execute("UPDATE public.novu_rust_resend_cooldown_policies SET not_before='-infinity' WHERE environment_id=$1", &[&env]).await.unwrap();
+        db.query_one("SELECT public.novu_rust_resend_cooldown_record($1,NULL)", &[&env]).await.unwrap();
+        assert!(db.query_one("SELECT not_before>clock_timestamp()+interval '35 seconds' FROM public.novu_rust_resend_cooldown_policies WHERE environment_id=$1", &[&env]).await.unwrap().get::<_,bool>(0));
+        let role=format!("resend_guard_{}",Uuid::new_v4().simple());
+        db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cooldown_check(text),public.novu_rust_resend_cooldown_record(text,integer) TO {role}")).await.unwrap();
+        let (other,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(async move {driver.await.unwrap()});
+        other.batch_execute(&format!("SET SESSION AUTHORIZATION {role}")).await.unwrap();
+        assert!(other.query_one("SELECT public.novu_rust_resend_cooldown_check($1)", &[&env]).await.is_err());
+        db.execute("INSERT INTO public.novu_rust_resend_cooldown_workers SELECT $1,rolname,oid FROM pg_roles WHERE rolname::text=$2", &[&env,&role]).await.unwrap();
+        assert!(other.query_one("SELECT public.novu_rust_resend_cooldown_check($1)", &[&env]).await.is_ok());
+        assert!(other.query_one("SELECT public.novu_rust_resend_cooldown_check($1)", &[&"other-environment"]).await.is_err());
+        let tx=db.transaction().await.unwrap();
+        tx.query_one("SELECT public.novu_rust_resend_cooldown_check($1)", &[&env]).await.unwrap();
+        let env2=env.clone();
+        let mut update=tokio::spawn(async move { other.query_one("SELECT public.novu_rust_resend_cooldown_record($1,30)", &[&env2]).await });
+        assert!(tokio::time::timeout(Duration::from_millis(200),&mut update).await.is_err());
+        tx.commit().await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(5),update).await.unwrap().unwrap().is_ok());
+    }
 
     #[tokio::test]
     #[ignore = "requires migrated disposable PostgreSQL and loopback"]

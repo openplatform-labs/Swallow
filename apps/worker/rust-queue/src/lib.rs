@@ -22,6 +22,7 @@ pub mod sendgrid_queue;
 pub mod shutdown;
 pub mod slack;
 pub mod slack_cooldown;
+pub mod resend_cooldown;
 pub mod slack_queue;
 pub mod slack_webhook;
 pub mod slack_webhook_queue;
