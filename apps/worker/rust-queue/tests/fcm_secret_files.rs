@@ -76,6 +76,7 @@ async fn worker_supports_token_pem_and_integration_files() {
         .env_remove("NOVU_FCM_ACCESS_TOKEN_FILE")
         .env_remove("NOVU_FCM_RELOAD_ACCESS_TOKEN")
         .env_remove("NOVU_FCM_RELOAD_INTEGRATIONS")
+        .env_remove("NOVU_FCM_RELOAD_SERVICE_ACCOUNT")
         .env_remove("NOVU_FCM_CLIENT_EMAIL")
         .env_remove("NOVU_FCM_PRIVATE_KEY")
         .env_remove("NOVU_FCM_PRIVATE_KEY_FILE")
@@ -376,6 +377,92 @@ async fn worker_supports_token_pem_and_integration_files() {
         "worker should resume after service account key replacement"
     );
     drop(map_worker);
+    for mode in 0..3 {
+        let mut c = command();
+        c.env("NOVU_FCM_RELOAD_SERVICE_ACCOUNT", "true")
+            .env("NOVU_FCM_CLIENT_EMAIL", "fixture@example.test");
+        match mode {
+            0 => {}
+            1 => {
+                c.env("NOVU_FCM_PRIVATE_KEY_FILE", &key)
+                    .env("NOVU_FCM_PRIVATE_KEY", "fixture-secret");
+            }
+            _ => {
+                c.env("NOVU_FCM_PRIVATE_KEY_FILE", &key)
+                    .env("NOVU_FCM_ACCESS_TOKEN", "fixture-secret");
+            }
+        }
+        let out = c.output().unwrap();
+        assert!(!out.status.success());
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("fixture-secret"));
+    }
+    let mut service_worker = Worker(
+        command()
+            .env("NOVU_FCM_RELOAD_SERVICE_ACCOUNT", "true")
+            .env("NOVU_FCM_CLIENT_EMAIL", "fixture@example.test")
+            .env("NOVU_FCM_PRIVATE_KEY_FILE", &key)
+            .spawn()
+            .unwrap(),
+    );
+    let mut connected = false;
+    for _ in 0..100 {
+        connected=db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='fcm_secret_fixture')",&[]).await.unwrap().get(0);
+        if connected {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(connected);
+    assert!(service_worker.0.try_wait().unwrap().is_none());
+    fs::write(&key, "bad private key").unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let service_job = uuid::Uuid::new_v4();
+    novu_postgres_queue::enqueue(
+        &db,
+        service_job,
+        "env",
+        novu_postgres_queue::fcm_queue::JOB_KIND,
+        &serde_json::json!({"unrecognized":true}),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        db.query_one(
+            "SELECT status FROM novu_queue_jobs WHERE id=$1",
+            &[&service_job]
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0),
+        "pending"
+    );
+    fs::write(
+        fixture.0.join("next"),
+        rotated["b"]["private_key"].as_str().unwrap(),
+    )
+    .unwrap();
+    fs::rename(fixture.0.join("next"), &key).unwrap();
+    let mut resumed = false;
+    for _ in 0..100 {
+        resumed = db
+            .query_one(
+                "SELECT status='failed' FROM novu_queue_jobs WHERE id=$1",
+                &[&service_job],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if resumed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        resumed,
+        "single service account worker should resume after key rotation"
+    );
+    drop(service_worker);
     let result = command()
         .env("NOVU_FCM_ACCESS_TOKEN_FILE", &token)
         .env("SWALLOW_FCM_ENFORCE_ROUTING_CONFIG", "invalid")

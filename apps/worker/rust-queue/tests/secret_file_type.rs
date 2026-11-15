@@ -18,7 +18,15 @@ fn reloadable_workers_reject_fifo_at_startup() {
             .unwrap()
             .success()
     );
-    for provider in ["resend", "sendgrid", "twilio", "slack", "fcm", "fcm-map"] {
+    for provider in [
+        "resend",
+        "sendgrid",
+        "twilio",
+        "slack",
+        "fcm",
+        "fcm-map",
+        "fcm-service",
+    ] {
         let (bin, environment, file, flag) = match provider {
             "resend" => (
                 env!("CARGO_BIN_EXE_resend-worker"),
@@ -50,11 +58,17 @@ fn reloadable_workers_reject_fifo_at_startup() {
                 "NOVU_FCM_ACCESS_TOKEN_FILE",
                 Some("NOVU_FCM_RELOAD_ACCESS_TOKEN"),
             ),
-            _ => (
+            "fcm-map" => (
                 env!("CARGO_BIN_EXE_fcm-worker"),
                 "NOVU_FCM_ENVIRONMENT_ID",
                 "NOVU_FCM_INTEGRATIONS_FILE",
                 Some("NOVU_FCM_RELOAD_INTEGRATIONS"),
+            ),
+            _ => (
+                env!("CARGO_BIN_EXE_fcm-worker"),
+                "NOVU_FCM_ENVIRONMENT_ID",
+                "NOVU_FCM_PRIVATE_KEY_FILE",
+                Some("NOVU_FCM_RELOAD_SERVICE_ACCOUNT"),
             ),
         };
         let mut cmd = Command::new(bin);
@@ -72,6 +86,9 @@ fn reloadable_workers_reject_fifo_at_startup() {
             .stderr(Stdio::null());
         if let Some(flag) = flag {
             cmd.env(flag, "true");
+        }
+        if provider == "fcm-service" {
+            cmd.env("NOVU_FCM_CLIENT_EMAIL", "fixture@example.test");
         }
         let mut child = cmd.spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);

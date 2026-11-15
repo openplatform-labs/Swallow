@@ -118,6 +118,29 @@ fn reload_integration_file(
     Ok(Some((hash, providers)))
 }
 
+fn reload_service_account_file(
+    path: &std::path::Path,
+    previous_hash: &[u8],
+    project: &str,
+    email: &str,
+    invalid_token_policy: InvalidTokenPolicy,
+    cleanup_guard: TokenCleanupGuard,
+) -> Result<Option<(Vec<u8>, Fcm)>, ()> {
+    let raw =
+        novu_rust_contracts::secret::read_regular_multiline_file(path, 65_536).map_err(|_| ())?;
+    let hash = ring::digest::digest(&ring::digest::SHA256, raw.as_bytes())
+        .as_ref()
+        .to_vec();
+    if hash == previous_hash {
+        return Ok(None);
+    }
+    let provider = Fcm::with_service_account(project, email.to_owned(), &raw)
+        .map_err(|_| ())?
+        .with_invalid_token_policy(invalid_token_policy)
+        .with_token_cleanup_guard(cleanup_guard);
+    Ok(Some((hash, provider)))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     novu_postgres_queue::shutdown::run_until_signal(run).await
@@ -187,6 +210,30 @@ async fn run(
         Ok("false") | Err(std::env::VarError::NotPresent) => None,
         _ => return Err("invalid FCM integration reload setting".into()),
     };
+    let reload_service_account = match std::env::var("NOVU_FCM_RELOAD_SERVICE_ACCOUNT").as_deref() {
+        Ok("true") => {
+            if [
+                "NOVU_FCM_INTEGRATIONS",
+                "NOVU_FCM_INTEGRATIONS_FILE",
+                "NOVU_FCM_ACCESS_TOKEN",
+                "NOVU_FCM_ACCESS_TOKEN_FILE",
+                "NOVU_FCM_PRIVATE_KEY",
+            ]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some())
+                || reload_access_token.is_some()
+                || reload_integrations.is_some()
+            {
+                return Err("FCM service account reload sources conflict".into());
+            }
+            Some(std::path::PathBuf::from(
+                std::env::var_os("NOVU_FCM_PRIVATE_KEY_FILE")
+                    .ok_or("FCM service account reload requires a key file")?,
+            ))
+        }
+        Ok("false") | Err(std::env::VarError::NotPresent) => None,
+        _ => return Err("invalid FCM service account reload setting".into()),
+    };
     let integrations_raw = if let Some(path) = &reload_integrations {
         Some(novu_rust_contracts::secret::read_regular_multiline_file(
             path, 1_048_576,
@@ -203,6 +250,8 @@ async fn run(
             .as_ref()
             .to_vec()
     });
+    let mut service_hash: Option<Vec<u8>> = None;
+    let mut service_identity: Option<(String, String)> = None;
     let (provider, integrations) = if let Some(raw) = integrations_raw {
         (None, Some(build_integrations(&raw)?))
     } else {
@@ -212,6 +261,17 @@ async fn run(
                 &project,
                 novu_rust_contracts::secret::read_regular_file(path)?,
             )?
+        } else if let Some(path) = &reload_service_account {
+            let email = std::env::var("NOVU_FCM_CLIENT_EMAIL")?;
+            let raw = novu_rust_contracts::secret::read_regular_multiline_file(path, 65_536)?;
+            let fcm = Fcm::with_service_account(&project, email.clone(), &raw)?;
+            service_hash = Some(
+                ring::digest::digest(&ring::digest::SHA256, raw.as_bytes())
+                    .as_ref()
+                    .to_vec(),
+            );
+            service_identity = Some((project.clone(), email));
+            fcm
         } else if let Some(token) = novu_rust_contracts::secret::from_env(
             "NOVU_FCM_ACCESS_TOKEN",
             "NOVU_FCM_ACCESS_TOKEN_FILE",
@@ -430,6 +490,28 @@ async fn run(
                                 eprintln!(
                                     "FCM integration credential reload failed; dispatch paused"
                                 );
+                                stop.wait(Duration::from_secs(2)).await;
+                                continue;
+                            }
+                        }
+                    }
+                    if let Some(path) = &reload_service_account {
+                        let (project, email) = service_identity.as_ref().expect("service identity");
+                        match reload_service_account_file(
+                            path,
+                            service_hash.as_deref().expect("service hash"),
+                            project,
+                            email,
+                            invalid_token_policy,
+                            cleanup_guard,
+                        ) {
+                            Ok(Some((hash, new_provider))) => {
+                                service_hash = Some(hash);
+                                provider = Some(new_provider);
+                            }
+                            Ok(None) => {}
+                            Err(()) => {
+                                eprintln!("FCM service account key reload failed; dispatch paused");
                                 stop.wait(Duration::from_secs(2)).await;
                                 continue;
                             }
