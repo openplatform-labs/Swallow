@@ -169,6 +169,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         _ => return Err("invalid Discord cooldown alert mode".into()),
     };
     let discord_cooldown_grace = env_optional_i32("SWALLOW_ALERT_DISCORD_COOLDOWN_GRACE_SECONDS")?;
+    let bind_discord_cooldown = env_bool("SWALLOW_ALERT_BIND_DISCORD_COOLDOWN", false)?;
     if discord_cooldown_grace.is_some_and(|v| !(1..=86400).contains(&v)) { return Err("invalid Discord cooldown grace".into()); }
     if discord_cooldown_grace.is_some() && on_new_condition && !extended_conditions { return Err("Discord cooldown health with new-condition policy requires v2 conditions".into()); }
     let discord_retry_grace = env_optional_i32("SWALLOW_ALERT_DISCORD_RETRY_GRACE_SECONDS")?;
@@ -308,6 +309,20 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
             }
         }
         tokio::time::timeout(operation_timeout, tx.commit()).await.map_err(|_| "shared alert check binding commit timed out")??;
+    }
+    if bind_discord_cooldown {
+        let mode = if discord_cooldown_grace.is_none() { "none" } else if discord_cooldown_overdue_only { "overdue" } else { "all" };
+        let tx = tokio::time::timeout(operation_timeout, db.transaction()).await.map_err(|_| "Discord alert binding timed out")??;
+        for (channel, target, enabled) in [("slack", slack_id.as_str(), slack.is_some()), ("email", email_id.as_str(), email.is_some())] {
+            if enabled {
+                let result = tokio::time::timeout(operation_timeout, tx.query_one(
+                    "SELECT public.novu_rust_bind_discord_alert_mode($1,$2,$3,$4,$5)",
+                    &[&args[0], &channel, &target, &mode, &discord_cooldown_grace],
+                )).await;
+                if !matches!(result, Ok(Ok(ref row)) if row.get::<_,bool>(0)) { return Err("Discord alert binding failed".into()); }
+            }
+        }
+        tokio::time::timeout(operation_timeout, tx.commit()).await.map_err(|_| "Discord alert binding commit timed out")??;
     }
     let mut failed_checks = [false; 5];
     let resend = if resend_enabled {
