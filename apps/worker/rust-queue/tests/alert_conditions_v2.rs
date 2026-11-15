@@ -105,3 +105,54 @@ async fn independent_bits_bypass_and_recover_without_access_to_other_environment
             .is_err()
     );
 }
+
+#[tokio::test]
+#[ignore = "requires fully migrated disposable PostgreSQL and role creation"]
+async fn v2_cli_uses_restricted_observe_and_reserve_paths() {
+    use std::process::Command;
+    let url = std::env::var("TEST_DATABASE_URL").unwrap();
+    let (admin, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    let environment = format!("alert-v2-cli-{}", Uuid::new_v4());
+    let role = format!("alert_v2_cli_{}", Uuid::new_v4().simple());
+    admin
+        .execute(
+            "INSERT INTO public.novu_rust_environments VALUES($1,'org')",
+            &[&environment],
+        )
+        .await
+        .unwrap();
+    admin.execute("INSERT INTO public.novu_rust_slack_cooldown_policies(environment_id,fallback_seconds,not_before) VALUES($1,30,clock_timestamp()+interval '2 minutes')",&[&environment]).await.unwrap();
+    admin.execute("INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES($1,'slack','blocked','rejected')",&[&environment]).await.unwrap();
+    admin.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'test-only'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_reserve_alert_v2(text,text,text,integer,bigint),public.novu_rust_observe_alert_conditions_v2(text,text,text,bigint,bigint),public.novu_rust_slack_cooldown_health(text,integer) TO {role}")).await.unwrap();
+    admin.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,$2,p,oid FROM pg_roles CROSS JOIN unnest(ARRAY['alert_view','alert_send']) p WHERE rolname::text=$2",&[&environment,&role]).await.unwrap();
+    let mut role_url = reqwest::Url::parse(&url).unwrap();
+    role_url.set_username(&role).unwrap();
+    role_url.set_password(Some("test-only")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"))
+        .env_clear()
+        .env("DATABASE_URL", role_url.as_str())
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .env("SWALLOW_ALERT_COOLDOWN_POLICY", "new-condition")
+        .env("SWALLOW_ALERT_CONDITIONS_V2", "true")
+        .env("SWALLOW_ALERT_SCOPED_DELIVERY", "true")
+        .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
+        .env("SWALLOW_ALERT_SLACK_COOLDOWN_GRACE_SECONDS", "60")
+        .env(
+            "SWALLOW_ALERT_SLACK_WEBHOOK",
+            "https://hooks.slack.com/services/A/B/C",
+        )
+        .env("SWALLOW_ALERT_SLACK_TARGET_ID", "blocked")
+        .args([&environment, "300", "120", "60"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires operator review"));
+}

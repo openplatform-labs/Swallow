@@ -40,6 +40,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         _ => return Err("invalid alert cooldown policy".into()),
     };
     // These checks share condition bits in the legacy mask.
+    let conditions_v2 = env_bool("SWALLOW_ALERT_CONDITIONS_V2", false)?;
     let require_distinct = env_bool("SWALLOW_ALERT_REQUIRE_DISTINCT_SHARED_CHECKS", false)?;
     let bind_shared = env_bool("SWALLOW_ALERT_BIND_SHARED_CHECKS", false)?;
     if bind_shared && (!require_distinct || !on_new_condition) {
@@ -152,6 +153,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     let scoped_delivery = env_bool("SWALLOW_ALERT_SCOPED_DELIVERY", false)?;
     let scoped_checks = env_bool("SWALLOW_ALERT_CHECK_SCOPED_ACCESS", false)?;
+    if conditions_v2 && (!on_new_condition || !scoped_delivery || require_distinct || bind_shared) { return Err("v2 alert conditions require scoped delivery and new-condition, without legacy shared-check guards".into()); }
     let resend_enabled = env_bool("SWALLOW_ALERT_RESEND_ENABLED", true)?;
     let attempts_enabled = env_bool("SWALLOW_ALERT_ATTEMPTS_ENABLED", false)?;
     let slack_jobs_enabled = env_bool("SWALLOW_ALERT_SLACK_JOBS_ENABLED", false)?;
@@ -586,14 +588,14 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                 && !matches!(
                     tokio::time::timeout(
                         operation_timeout,
-                        alerts::observe_conditions(
-                            &db,
-                            &args[0],
-                            channel,
-                            target,
-                            alert.condition_mask(),
-                            alert.observed_condition_mask(),
-                        )
+                        async {
+                            if conditions_v2 {
+                                db.query_one("SELECT public.novu_rust_observe_alert_conditions_v2($1,$2,$3,$4,$5)", &[&args[0], &channel, &target, &alert.condition_mask_v2(), &alert.observed_condition_mask_v2()]).await?;
+                                Ok(())
+                            } else {
+                                alerts::observe_conditions(&db, &args[0], channel, target, alert.condition_mask(), alert.observed_condition_mask()).await
+                            }
+                        }
                     )
                     .await,
                     Ok(Ok(()))
@@ -650,10 +652,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     } else {
         None
     };
-    let (slack_result, email_result) = alerts::dispatch_pair(
-        &mut db,
-        other.as_mut(),
-        alerts::DispatchPair {
+    let dispatch_config = alerts::DispatchPair {
             alert: &alert,
             slack: slack.as_ref().map(|p| (p, slack_id.as_str())),
             email: email
@@ -663,9 +662,12 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
             on_new: on_new_condition,
             scoped: scoped_delivery,
             timeout: operation_timeout,
-        },
-    )
-    .await;
+        };
+    let (slack_result, email_result) = if conditions_v2 {
+        alerts::dispatch_pair_v2(&mut db, other.as_mut(), dispatch_config).await
+    } else {
+        alerts::dispatch_pair(&mut db, other.as_mut(), dispatch_config).await
+    };
     for (channel, outcome) in [("Slack", slack_result), ("email", email_result)] {
         if let Some(outcome) = outcome {
             match outcome {

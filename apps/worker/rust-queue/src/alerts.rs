@@ -411,6 +411,27 @@ impl Alert {
         }
         mask
     }
+    /// V2 assigns separate condition and failure bits to the three shared checks.
+    pub fn condition_mask_v2(&self) -> i64 {
+        let mut mask = i64::from(self.condition_mask() as u32) & !((1_i64 << 18) | (1_i64 << 19));
+        if self.failed_jobs.is_some_and(|n| n > 0) { mask |= 1_i64 << 18; }
+        if self.failed_jobs_check_failed { mask |= 1_i64 << 19; }
+        if self.resend_auto.is_some_and(|v| matches!(v, Ok((a,b,c,d)) if a>0 || b>0 || c>0 || d>0)) { mask |= 1_i64 << 32; }
+        if self.resend_auto.is_some_and(|v| v.is_err()) { mask |= 1_i64 << 33; }
+        if self.slack_cooldown.is_some_and(|v| matches!(v, Ok((active,deferred,overdue)) if active || deferred>0 || overdue>0)) { mask |= 1_i64 << 34; }
+        if self.slack_cooldown.is_some_and(|v| v.is_err()) { mask |= 1_i64 << 35; }
+        mask
+    }
+    pub fn observed_condition_mask_v2(&self) -> i64 {
+        let mut known = i64::from(self.observed_condition_mask() as u32) & !((1_i64 << 18) | (1_i64 << 19));
+        if self.failed_jobs.is_some() && !self.failed_jobs_check_failed { known |= 1_i64 << 18; }
+        if self.failed_jobs.is_some() || self.failed_jobs_check_failed { known |= 1_i64 << 19; }
+        if self.resend_auto.is_some_and(|v| v.is_ok()) { known |= 1_i64 << 32; }
+        if self.resend_auto.is_some() { known |= 1_i64 << 33; }
+        if self.slack_cooldown.is_some_and(|v| v.is_ok()) { known |= 1_i64 << 34; }
+        if self.slack_cooldown.is_some() { known |= 1_i64 << 35; }
+        known
+    }
     /// Bits whose current state was actually observed, excluding unavailable or disabled checks.
     pub fn observed_condition_mask(&self) -> i32 {
         let mut known = 0;
@@ -1113,6 +1134,34 @@ pub async fn dispatch_pair(
     }
 }
 
+/// Versioned scoped dispatch. Call only with all senders for a target using V2.
+pub async fn dispatch_pair_v2(db: &mut PgClient, other: Option<&mut PgClient>, cfg: DispatchPair<'_>) -> (DispatchOutcome, DispatchOutcome) {
+    async fn dispatch_v2<F, Fut>(db: &mut PgClient, cfg: &DispatchPair<'_>, channel: &str, target: &str, send: F) -> DbResult<Dispatch>
+    where F: FnOnce(Uuid) -> Fut, Fut: std::future::Future<Output=Result<(), AlertError>> {
+        let mask = cfg.alert.condition_mask_v2();
+        let row = db.query_one("SELECT result,attempt_id FROM public.novu_rust_reserve_alert_v2($1,$2,$3,$4,$5)", &[&cfg.alert.environment,&channel,&target,&cfg.cooldown,&mask]).await?;
+        let result: String = row.get(0); let id: Option<Uuid> = row.get(1);
+        match (result.as_str(), id) {
+            ("cooldown",None) => Ok(Dispatch::CoolingDown), ("inflight",None) => Ok(Dispatch::InFlight),
+            ("blocked",None) => Ok(Dispatch::NeedsReview), ("claimed",Some(id)) => {
+                let result = send(id).await;
+                let recorded = finish_scoped(db,&cfg.alert.environment,channel,target,id,&result).await?;
+                if result.is_ok() && recorded { Ok(Dispatch::Accepted) } else { Ok(Dispatch::NeedsReview) }
+            }, _ => Err("invalid v2 reservation result".into())
+        }
+    }
+    async fn slack(db: &mut PgClient,cfg: &DispatchPair<'_>) -> DispatchOutcome {
+        let (provider,target)=cfg.slack?;
+        Some(tokio::time::timeout(cfg.timeout,dispatch_v2(db,cfg,"slack",target,|_|provider.send(cfg.alert))).await.unwrap_or_else(|_|Err("Slack dispatch timed out".into())))
+    }
+    async fn email(db: &mut PgClient,cfg: &DispatchPair<'_>) -> DispatchOutcome {
+        let (provider,target,recipient)=cfg.email?;
+        if recipient.is_empty() || recipient.len() > 320 || recipient.contains(['\r', '\n', '<', '>']) || !recipient.contains('@') { return Some(Err("invalid alert recipient".into())); }
+        Some(tokio::time::timeout(cfg.timeout,dispatch_v2(db,cfg,"email",target,|id|async move { send_selected_email(provider,recipient,cfg.alert,&format!("swallow-alert/{id}")).await })).await.unwrap_or_else(|_|Err("email dispatch timed out".into())))
+    }
+    if let Some(other)=other { tokio::join!(slack(db,&cfg),email(other,&cfg)) } else { (slack(db,&cfg).await,email(db,&cfg).await) }
+}
+
 pub fn parallel_delivery_from_env() -> DbResult<bool> {
     match std::env::var("SWALLOW_ALERT_DELIVERY_POLICY").as_deref() {
         Ok("parallel") => Ok(true),
@@ -1405,6 +1454,36 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[ignore = "requires fully migrated disposable PostgreSQL"]
+    async fn v2_dispatch_new_condition_bypasses_cooldown_with_mock_slack() {
+        let url=std::env::var("TEST_DATABASE_URL").unwrap();
+        let (mut db,driver)=tokio_postgres::connect(&url,tokio_postgres::NoTls).await.unwrap();
+        tokio::spawn(async move {let _=driver.await;});
+        let env=format!("alert-v2-mock-{}",uuid::Uuid::new_v4());
+        db.execute("INSERT INTO public.novu_rust_environments VALUES($1,'org')",&[&env]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,rolname,'alert_send',oid FROM pg_roles WHERE rolname=current_user",&[&env]).await.unwrap();
+        let mut a=alert();a.environment=env;a.resend_enabled=false;a.failed_jobs=Some(1);
+        let (url,server)=mock_server("200 OK","ok").await;let slack=SlackWebhook::with_endpoint(url).unwrap();
+        let run=|a: &Alert| a.condition_mask_v2();assert_eq!(run(&a),1<<18);
+        let cfg=DispatchPair {alert:&a,slack:Some((&slack,"ops")),email:None,cooldown:60,on_new:true,scoped:true,timeout:Duration::from_secs(3)};
+        assert_eq!(dispatch_pair_v2(&mut db,None,cfg).await.0.unwrap().unwrap(),Dispatch::Accepted);server.await.unwrap();
+        a.slack_cooldown=Some(Ok((true,0,0)));
+        let (url,server)=mock_server("200 OK","ok").await;let slack=SlackWebhook::with_endpoint(url).unwrap();
+        let cfg=DispatchPair {alert:&a,slack:Some((&slack,"ops")),email:None,cooldown:60,on_new:true,scoped:true,timeout:Duration::from_secs(3)};
+        assert_eq!(dispatch_pair_v2(&mut db,None,cfg).await.0.unwrap().unwrap(),Dispatch::Accepted);server.await.unwrap();
+        let cfg=DispatchPair {alert:&a,slack:Some((&slack,"ops")),email:None,cooldown:60,on_new:true,scoped:true,timeout:Duration::from_secs(3)};
+        assert_eq!(dispatch_pair_v2(&mut db,None,cfg).await.0.unwrap().unwrap(),Dispatch::CoolingDown);
+    }
+    #[test]
+    fn v2_independent_shared_checks_preserve_unknown_and_sign_bit() {
+        let mut a=alert(); a.resend_enabled=false; a.failed_jobs=Some(1); a.resend_auto=Some(Ok((0,0,0,0))); a.slack_cooldown=Some(Ok((false,0,0)));
+        let first=a.condition_mask_v2(); assert_eq!(first,1_i64<<18);
+        a.resend_auto=Some(Ok((1,0,0,0))); assert_eq!(a.condition_mask_v2() ^ first,1_i64<<32);
+        a.slack_cooldown=Some(Ok((true,0,0))); assert_ne!(a.condition_mask_v2() & (1_i64<<34),0);
+        a.resend_auto=Some(Err(())); assert_eq!(a.observed_condition_mask_v2() & (1_i64<<32),0); assert_ne!(a.condition_mask_v2() & (1_i64<<33),0); assert_ne!(a.observed_condition_mask_v2() & (1_i64<<34),0);
+        a.fcm_credentials=Some(Err(())); assert_ne!(a.condition_mask_v2() & (1_i64<<31),0); assert_eq!(a.condition_mask_v2() & !a.observed_condition_mask_v2(),0);
+    }
     #[test]
     fn slack_cooldown_health_shares_failed_job_bits_without_clearing_failed_checks() {
         let mut a=alert();a.resend_enabled=false;a.slack_cooldown=Some(Ok((false,0,0)));
