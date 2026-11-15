@@ -4263,6 +4263,58 @@ pub(super) async fn discord_review(State(db):State<Arc<Client>>,headers:HeaderMa
     }
 }
 
+#[derive(Clone, Copy)]
+enum SmtpScopeQuery { Read, Request, Audit }
+pub(super) async fn smtp_scope_read(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {smtp_scope_query(db,headers,uri,verifier,SmtpScopeQuery::Read).await}
+pub(super) async fn smtp_scope_request(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {smtp_scope_query(db,headers,uri,verifier,SmtpScopeQuery::Request).await}
+pub(super) async fn smtp_scope_audit(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {smtp_scope_query(db,headers,uri,verifier,SmtpScopeQuery::Audit).await}
+async fn smtp_scope_query(db:Arc<Client>,headers:HeaderMap,uri:Uri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>,kind:SmtpScopeQuery) -> Response {
+    let identity=match authenticate(&db,&headers,verifier).await {Ok(v)=>v,Err(status)=>return failure(status,uri.path())};
+    let mut env=None;let mut target=None;let mut cursor=None;
+    for (key,value) in form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()) {
+        match key.as_ref() {
+            "environmentId" if env.is_none() && !value.is_empty() && value.len()<=512 && !value.contains('\0') => env=Some(value.into_owned()),
+            "targetLogin" if matches!(kind,SmtpScopeQuery::Read) && target.is_none() && !value.is_empty() && value.len()<=63 && !value.contains('\0') => target=Some(value.into_owned()),
+            "after" if matches!(kind,SmtpScopeQuery::Audit) && cursor.is_none() => match Uuid::parse_str(&value) {Ok(v)=>cursor=Some(v),Err(_)=>return failure(StatusCode::BAD_REQUEST,uri.path())},
+            "requestId" if matches!(kind,SmtpScopeQuery::Request) && cursor.is_none() => match Uuid::parse_str(&value) {Ok(v)=>cursor=Some(v),Err(_)=>return failure(StatusCode::BAD_REQUEST,uri.path())},
+            _=>return failure(StatusCode::BAD_REQUEST,uri.path()),
+        }
+    }
+    let Some(env)=env else{return failure(StatusCode::BAD_REQUEST,uri.path())};
+    if (matches!(kind,SmtpScopeQuery::Read) && target.is_none()) || (matches!(kind,SmtpScopeQuery::Request) && cursor.is_none()) {return failure(StatusCode::BAD_REQUEST,uri.path());}
+    let Ok(exp)=i64::try_from(identity.expires_at) else{return failure(StatusCode::BAD_REQUEST,uri.path())};
+    let result=match kind {
+        SmtpScopeQuery::Read=>guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_smtp_scope_read($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&target]).await,
+        SmtpScopeQuery::Request=>guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_smtp_scope_request($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&cursor]).await,
+        SmtpScopeQuery::Audit=>guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_smtp_scope_audit_read($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&cursor]).await,
+    };
+    match result {
+        Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
+        Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
+        Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
+        Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path()),
+    }
+}
+#[derive(serde::Deserialize)]
+#[serde(rename_all="camelCase",deny_unknown_fields)]
+struct SmtpScopeChange { request_id:String,target_login:String,expected:String,desired:bool,reason:String }
+pub(super) async fn smtp_scope_change(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>,body:Bytes) -> Response {
+    let identity=match authenticate(&db,&headers,verifier).await {Ok(v)=>v,Err(status)=>return failure(status,uri.path())};
+    let params:Vec<_>=form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).collect();
+    if params.len()!=1 || params[0].0!="environmentId" || params[0].1.is_empty() || params[0].1.len()>512 || params[0].1.contains('\0') {return failure(StatusCode::BAD_REQUEST,uri.path());}
+    let Some(input)=(body.len()<=4096).then(||serde_json::from_slice::<SmtpScopeChange>(&body).ok()).flatten() else{return failure(StatusCode::BAD_REQUEST,uri.path());};
+    if input.target_login.is_empty() || input.target_login.len()>63 || input.target_login.contains('\0') || !["absent","enabled","disabled"].contains(&input.expected.as_str()) || input.reason.trim().is_empty() || input.reason.len()>512 || input.reason.contains('\0') {return failure(StatusCode::BAD_REQUEST,uri.path());}
+    let (Ok(request),Ok(exp))=(Uuid::parse_str(&input.request_id),i64::try_from(identity.expires_at)) else{return failure(StatusCode::BAD_REQUEST,uri.path());};
+    let env=params[0].1.as_ref();
+    match guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_smtp_scope_change($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&input.target_login,&input.expected,&input.desired,&input.reason]).await {
+        Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
+        Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
+        Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
+        Err(e) if e.code().is_some_and(|c|matches!(c.code(),"P4090"|"40001"))=>{let mut response=error_at(StatusCode::CONFLICT,"Scope conflict","Conflict",uri.path()).into_response();response.headers_mut().insert(header::CACHE_CONTROL,header::HeaderValue::from_static("no-store"));response},
+        Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path()),
+    }
+}
+
 #[derive(Clone,Copy)]
 enum SmtpQuery { Attention, Request }
 pub(super) async fn smtp_attention(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {

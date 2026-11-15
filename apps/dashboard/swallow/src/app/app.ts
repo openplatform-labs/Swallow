@@ -5,6 +5,7 @@ import { SlackIntegrations } from './slack-integrations';
 import { TwilioResults } from './twilio-results';
 import { FcmResults } from './fcm-results';
 import { DiscordReviews } from './discord-reviews';
+import { SmtpScope } from './smtp-scope';
 import { SmtpReviews } from './smtp-reviews';
 import { DiscordEndpoints } from './discord-endpoints';
 import { SlackResults } from './slack-results';
@@ -60,7 +61,7 @@ type SendgridKey = {identifier:string;active:boolean};
 type SendgridKeyAudit = {id:string;identifier:string;action:string;userId:string;recordedAt:string};
 
 @Component({
-  imports: [FormsModule, ClrAlertModule, FcmIntegrations, SlackIntegrations, TwilioResults, FcmResults, DiscordReviews, SmtpReviews, DiscordEndpoints, SlackResults, SendgridResults, ResendAutoPolicy, ResendCooldownPolicy, DiscordPolicy, DiscordRetryPolicy, DiscordRetryPolicyGrants, ResendAutoHealth],
+  imports: [FormsModule, ClrAlertModule, FcmIntegrations, SlackIntegrations, TwilioResults, FcmResults, DiscordReviews, SmtpReviews, SmtpScope, DiscordEndpoints, SlackResults, SendgridResults, ResendAutoPolicy, ResendCooldownPolicy, DiscordPolicy, DiscordRetryPolicy, DiscordRetryPolicyGrants, ResendAutoHealth],
   selector: 'app-root',
   styleUrl: './app.css',
   templateUrl: './app.html',
@@ -86,7 +87,8 @@ export class App implements OnDestroy {
   discordPolicyBusy=false;
   discordRetryPolicyBusy=false;
   discordRetryPolicyGrantsBusy=false;
-  get policyBusy():boolean { return this.resendPolicyBusy || this.resendCooldownPolicyBusy || this.discordPolicyBusy || this.discordRetryPolicyBusy || this.discordRetryPolicyGrantsBusy; }
+  smtpScopeBusy = false;
+  get policyBusy():boolean { return this.smtpScopeBusy || this.resendPolicyBusy || this.resendCooldownPolicyBusy || this.discordPolicyBusy || this.discordRetryPolicyBusy || this.discordRetryPolicyGrantsBusy; }
   fcmBusy=false;
   slackBusy=false;
   discordEndpointsBusy=false;
