@@ -4708,3 +4708,23 @@ pub(super) async fn smtp_resolution_history(State(db):State<Arc<Client>>,headers
         Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path()),
     }
 }
+
+
+pub(super) async fn smtp_failure(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
+    let identity=match authenticate(&db,&headers,verifier).await {Ok(v)=>v,Err(status)=>return failure(status,uri.path())};
+    let mut env=None;let mut job=None;
+    for (key,value) in form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()) {
+        match key.as_ref() {
+            "environmentId" if env.is_none() && !value.is_empty() && value.len()<=512 && !value.contains('\0') => env=Some(value.into_owned()),
+            "jobId" if job.is_none() => match Uuid::parse_str(&value) {Ok(v)=>job=Some(v),Err(_)=>return failure(StatusCode::BAD_REQUEST,uri.path())},
+            _=>return failure(StatusCode::BAD_REQUEST,uri.path()),
+        }
+    }
+    let (Some(env),Some(job),Ok(exp))=(env,job,i64::try_from(identity.expires_at)) else {return failure(StatusCode::BAD_REQUEST,uri.path());};
+    match guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_smtp_failure_lookup($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&job]).await {
+        Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
+        Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
+        Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
+        Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path()),
+    }
+}

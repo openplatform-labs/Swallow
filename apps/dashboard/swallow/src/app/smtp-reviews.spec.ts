@@ -47,4 +47,13 @@ describe('Smtp operator reviews',()=>{
     const {fixture,c}=component();c.historyJob=job;const pending=c.loadHistory();c.environment='other';c.ngOnChanges();resolve(new Response(JSON.stringify({data:[],next:null})));await pending;expect(c.historyStatus()).toBe('idle');await c.loadHistory();expect(c.historyStatus()).toBe('error');fixture.destroy();
   });
 
+  it('finds an acknowledged failure and prepares a resolution',async()=>{
+    vi.spyOn(crypto,'randomUUID').mockReturnValue(requestId);const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({found:true,...row,reviewed:true})));
+    const {fixture,c}=component();c.findJob=job;await c.findFailure();expect(c.foundReviewed()).toBe(true);fixture.detectChanges();expect(fixture.nativeElement.textContent).toContain('검토 확인된 상태');c.reason='relay evidence';c.prepare(c.rows()[0],'accepted');expect(c.review()?.decision).toBe('accepted');expect(mock.mock.calls[0][0]).toContain('/smtp-failure?');fixture.destroy();
+  });
+  it('does not display a failure returned for a different job',async()=>{
+    vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({found:true,...row,jobId:'44444444-4444-4444-8444-444444444444',reviewed:true})));
+    const {fixture,c}=component();c.findJob=job;await c.findFailure();expect(c.listStatus()).toBe('error');expect(c.rows()).toEqual([]);fixture.destroy();
+  });
+
 });

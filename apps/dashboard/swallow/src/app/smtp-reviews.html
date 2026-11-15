@@ -2,6 +2,8 @@
   <div class="card-eyebrow">SMTP</div><h2>SMTP 발송 실패 검토</h2>
   <p>운영자 JWT와 환경을 사용합니다. 목록 조회와 확인에는 별도 권한이 필요합니다. 검토 확인은 발송 상태를 바꾸지 않습니다. 결과 판정에는 별도 권한과 릴레이의 독립적인 증거가 필요합니다.</p>
   <button type="button" class="btn btn-outline" (click)="list()" [disabled]="listStatus()==='loading' || reviewStatus()==='sending'">미확인 작업 조회</button>
+  <form class="decision-form" (ngSubmit)="findFailure()"><label for="smtp-find-job">확인된 실패를 포함해 작업 UUID로 조회</label><input id="smtp-find-job" class="clr-input" name="smtpFindJob" [(ngModel)]="findJob" (ngModelChange)="clearList()" autocomplete="off" required><button type="submit" class="btn btn-outline" [disabled]="listStatus()==='loading' || reviewStatus()==='sending'">실패 작업 조회</button></form>
+  @if(foundReviewed()===true){<p>이 실패는 검토 확인된 상태입니다. 확인은 발송 결과 판정과 다릅니다.</p>}
   @if(listStatus()==='loading'){<p role="status">작업을 조회 중입니다.</p>} @else if(listStatus()==='error'){<p role="alert">목록을 조회하지 못했습니다. 인증과 권한을 확인하세요.</p>}
   @else if(listStatus()==='loaded'){
     @if(rows().length===0){<p>조회된 작업이 없습니다.</p>} @else {

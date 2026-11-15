@@ -18,3 +18,7 @@ cargo test --locked --manifest-path "$ROOT/apps/api/rust-api/Cargo.toml" --test 
 "$TEST_PG_BIN/createdb" -h 127.0.0.1 -p "$PORT" -U postgres smtp_history_test
 export TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/smtp_history_test"
 cargo test --locked --manifest-path "$ROOT/apps/api/rust-api/Cargo.toml" --test operator_smtp_resolution_history -- --ignored
+
+"$TEST_PG_BIN/createdb" -h 127.0.0.1 -p "$PORT" -U postgres smtp_review_test
+export TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/smtp_review_test"
+cargo test --locked --manifest-path "$ROOT/apps/api/rust-api/Cargo.toml" --test operator_smtp_review -- --ignored

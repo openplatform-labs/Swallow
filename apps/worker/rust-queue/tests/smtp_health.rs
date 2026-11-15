@@ -172,7 +172,7 @@ async fn scoped_health_and_alert_selection() {
         );
         assert!(String::from_utf8_lossy(&result.stderr).contains("requires operator review"));
     }
-    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_smtp_attention(text,uuid),public.novu_rust_ack_smtp(text,uuid,uuid,bigint,text,text) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_smtp_attention(text,uuid),public.novu_rust_ack_smtp(text,uuid,uuid,bigint,text,text),public.novu_rust_smtp_failure_lookup(text,uuid) TO {role}")).await.unwrap();
     assert!(reader.query("SELECT * FROM public.novu_rust_smtp_attention($1,NULL)",&[&other]).await.is_err());
     let listed=Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
         .env_clear().env("DATABASE_URL",role_url.as_str()).env("NOVU_POSTGRES_ALLOW_INSECURE","true")
@@ -200,6 +200,13 @@ async fn scoped_health_and_alert_selection() {
     let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&env,&ids[0],&attempt,&failure];
     let (a,b)=tokio::join!(reader.query_one(stmt,params),reader2.query_one(stmt,params));
     let values=[a.unwrap().get::<_,bool>(0),b.unwrap().get::<_,bool>(0)]; assert_eq!(values.iter().filter(|x|**x).count(),1);
+    let found=Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .env_clear().env("DATABASE_URL",role_url.as_str()).env("NOVU_POSTGRES_ALLOW_INSECURE","true")
+        .args(["get-smtp",&env,&ids[0].to_string()]).output().unwrap();
+    assert_eq!(found.status.code(),Some(0),"{}",String::from_utf8_lossy(&found.stderr));
+    let found:serde_json::Value=serde_json::from_slice(&found.stdout).unwrap();
+    assert_eq!(found["found"],true);assert_eq!(found["reviewed"],true);assert_eq!(found["attemptRevision"],attempt.unwrap().to_string());assert!(!found.to_string().contains("fixture"));
+    assert!(reader.query("SELECT * FROM public.novu_rust_smtp_failure_lookup($1,$2)",&[&other,&ids[1]]).await.is_err());
     let after=reader.query_one("SELECT * FROM public.novu_rust_smtp_health($1)",&[&env]).await.unwrap();
     assert_eq!((after.get::<_,i64>(0),after.get::<_,i64>(1),after.get::<_,i64>(2)),(0,1,1));
     let no_attempt:Option<Uuid>=None;
