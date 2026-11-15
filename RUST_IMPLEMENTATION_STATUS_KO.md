@@ -1,3 +1,5 @@
+Discord 환경 정책 관리: 워커 0207과 CLI는 환경별 활성화 정책의 조회·변경·요청 조회·감사를 별도 DB 권한으로 제공한다. revision 충돌과 동일 요청 재제출을 처리하며, Docker PostgreSQL의 제한 로그인에서 동시 변경, 감사 실패 롤백, 정책 잠금 및 직접 변경의 revision 증가를 검증했다. HTTP·JWT API와 UI, 실제 운영 부하·HA는 미구현 또는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
 Discord 구버전 워커 시험: 실제 `75cd2ecc` 워커가 Docker PostgreSQL의 활성 정책에서 작업 완료를 거절당하고 알림·Discord 작업을 롤백하는 것을 확인했다. 구버전 종료 및 강제 임대 만료 후 현재 워커가 복구해 Discord 작업 하나를 생성했다. 단일 호스트·관리자 DB 계정 시험이며 실제 Discord 발송, 운영 부하·다중 호스트 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)에 재현 방법이 있다.
 
 Discord 워크플로 혼합 배포 보호: 워커 0206은 환경별 선택 정책과 트랜잭션 표식을 추가한다. 활성 환경에서 구버전 또는 비활성 워커의 작업 완료를 거절하고 롤백해 새 워커가 복구할 수 있게 한다. Docker PostgreSQL에서 제한 역할, 정책 변경 잠금, 오래된 임대 및 비활성 환경을 검증했고 실제 구버전 시험은 위 항목을 참고한다. 초기 정책은 모두 비활성이며 기존 활성 배포에는 정책 설정과 워커 교체가 필요하다. [워커 README](apps/worker/rust-queue/README.md)의 배포 순서를 따른다.
