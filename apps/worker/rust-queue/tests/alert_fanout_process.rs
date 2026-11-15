@@ -16,7 +16,8 @@ esac
 case "${SWALLOW_ALERT_EMAIL_TARGET_ID:-}" in
   mail-a) test -z "${NOVU_SENDGRID_IP_POOL_NAME:-}" || exit 8; test -z "${SWALLOW_ALERT_SLACK_WEBHOOK:-}" || exit 8; test -z "${NOVU_RESEND_API_KEY:-}" || exit 8; test "$SWALLOW_ALERT_EMAIL_PROVIDER" = resend || exit 8; printf '%s\n' 'email mail-a' >> "$FANOUT_TEST_LOG"; exit 1;;
   mail-b) test -z "${SWALLOW_ALERT_SLACK_WEBHOOK:-}" || exit 8; test -z "${NOVU_SENDGRID_API_KEY:-}" || exit 8; test "$SWALLOW_ALERT_EMAIL_PROVIDER" = sendgrid || exit 8; test "$NOVU_SENDGRID_REGION" = eu || exit 8; test "$NOVU_SENDGRID_IP_POOL_NAME" = pool-b || exit 8; printf '%s\n' 'email mail-b' >> "$FANOUT_TEST_LOG"; exit 0;;
-  mail-c) test -z "${NOVU_SENDGRID_IP_POOL_NAME:-}" || exit 8; printf '%s\n' 'email mail-c' >> "$FANOUT_TEST_LOG"; exit 0;;
+  mail-smtp) test "$SWALLOW_ALERT_EMAIL_PROVIDER" = smtp || exit 8; test "$SWALLOW_SMTP_HOST" = smtp.example.test || exit 8; test "$SWALLOW_SMTP_PORT" = 587 || exit 8; test "$SWALLOW_SMTP_TLS" = starttls || exit 8; test "$SWALLOW_SMTP_USERNAME" = fixture-user || exit 8; test -n "$SWALLOW_SMTP_PASSWORD_FILE" || exit 8; test -z "${SWALLOW_SMTP_PASSWORD:-}" || exit 8; test -z "${NOVU_RESEND_API_KEY:-}" || exit 8; printf '%s\n' 'email mail-smtp' >> "$FANOUT_TEST_LOG"; exit 0;;
+  mail-c) test -z "${SWALLOW_SMTP_PASSWORD:-}" || exit 8; test -z "${SWALLOW_SMTP_HOST:-}" || exit 8; test -z "${NOVU_SENDGRID_IP_POOL_NAME:-}" || exit 8; printf '%s\n' 'email mail-c' >> "$FANOUT_TEST_LOG"; exit 0;;
 esac
 exit 9
 "#;
@@ -32,7 +33,8 @@ exit 9
       {"channel":"email","id":"mail-a","provider":"resend","to":"one@example.test","from":"sender@example.test","api_key_file":dir.join("key-a")},
       {"channel":"slack","id":"ops-b","webhook_file":dir.join("slack")},
       {"channel":"email","id":"mail-b","provider":"sendgrid","to":"two@example.test","from":"sender@example.test","api_key_file":dir.join("key-b"),"region":"eu","ip_pool_name":"pool-b"},
-      {"channel":"email","id":"mail-c","provider":"sendgrid","to":"three@example.test","from":"sender@example.test","api_key_file":dir.join("key-c")}
+      {"channel":"email","id":"mail-c","provider":"sendgrid","to":"three@example.test","from":"sender@example.test","api_key_file":dir.join("key-c")},
+      {"channel":"email","id":"mail-smtp","provider":"smtp","to":"four@example.test","from":"sender@example.test","smtp_host":"smtp.example.test","smtp_port":587,"smtp_tls":"starttls","smtp_username":"fixture-user","smtp_password_file":dir.join("smtp-key")}
     ]});
     std::fs::write(&config, serde_json::to_vec(&targets).unwrap()).unwrap();
     for mode in ["delivery", "database"] {
@@ -50,12 +52,14 @@ exit 9
             .env("NOVU_RESEND_API_KEY", "inherited-email-secret")
             .env("NOVU_SENDGRID_API_KEY", "inherited-sendgrid-secret")
             .env("NOVU_SENDGRID_IP_POOL_NAME", "inherited-pool")
+            .env("SWALLOW_SMTP_PASSWORD", "inherited-smtp-secret")
+            .env("SWALLOW_SMTP_HOST", "inherited-host")
             .output()
             .unwrap();
         assert_eq!(out.status.code(), Some(1));
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
-            "slack ops-a\nemail mail-a\nslack ops-b\nemail mail-b\nemail mail-c\n"
+            "slack ops-a\nemail mail-a\nslack ops-b\nemail mail-b\nemail mail-c\nemail mail-smtp\n"
         );
         let stdout = String::from_utf8(out.stdout).unwrap();
         let stderr = String::from_utf8(out.stderr).unwrap();
@@ -65,6 +69,7 @@ exit 9
             "inherited-slack-secret",
             "inherited-email-secret",
             "inherited-sendgrid-secret",
+            "inherited-smtp-secret",
             "one@example.test",
         ] {
             assert!(!stdout.contains(secret));
@@ -90,6 +95,22 @@ exit 9
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
+    for invalid in [
+        serde_json::json!({"channel":"email","id":"x","provider":"smtp","to":"one@example.test","from":"sender@example.test","smtp_host":"smtp.example.test","smtp_tls":"plain"}),
+        serde_json::json!({"channel":"email","id":"x","provider":"smtp","to":"one@example.test","from":"sender@example.test","smtp_host":"smtp.example.test","smtp_username":"user"}),
+    ] {
+        std::fs::write(
+            &config,
+            serde_json::to_vec(&serde_json::json!({"targets":[invalid]})).unwrap(),
+        )
+        .unwrap();
+        let result = Command::new(&fanout)
+            .args(["delivery", "env", "300", "120", "60"])
+            .arg(&config)
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(1));
+    }
     std::fs::remove_dir_all(dir).unwrap();
 }
 

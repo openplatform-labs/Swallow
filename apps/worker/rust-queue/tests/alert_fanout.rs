@@ -351,3 +351,106 @@ async fn configuration_binding_rejects_divergent_email_sender_settings() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires fully migrated disposable PostgreSQL"]
+async fn smtp_without_starttls_is_unknown_and_not_resent() {
+    use std::io::{BufRead, BufReader, Write};
+    let url = std::env::var("TEST_DATABASE_URL").unwrap();
+    let (db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move { driver.await.unwrap() });
+    let env = format!("smtp-alert-{}", Uuid::new_v4().simple());
+    db.execute(
+        "INSERT INTO novu_rust_environments VALUES ($1,'org')",
+        &[&env],
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,rolname,'alert_send',oid FROM pg_roles WHERE rolname=session_user",&[&env]).await.unwrap();
+    let job = Uuid::new_v4();
+    novu_postgres_queue::enqueue(&db, job, &env, "fixture", &serde_json::json!({}))
+        .await
+        .unwrap();
+    db.execute("UPDATE novu_queue_jobs SET available_at=clock_timestamp()-interval '5 minutes' WHERE id=$1",&[&job]).await.unwrap();
+    let dir = std::env::temp_dir().join(format!("swallow-smtp-fanout-{}", Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let config = dir.join("targets.json");
+    let password = dir.join("password");
+    std::fs::write(&password, "fixture-secret").unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    std::fs::write(&config,serde_json::to_vec(&serde_json::json!({"targets":[{"channel":"email","id":"smtp-ops","provider":"smtp","to":"ops@example.test","from":"sender@example.test","smtp_host":"127.0.0.1","smtp_port":port,"smtp_tls":"starttls","smtp_username":"fixture-user","smtp_password_file":password}]})).unwrap()).unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(v) => break v,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("{e}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(b"220 localhost ESMTP\r\n").unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.to_ascii_uppercase().starts_with("EHLO"));
+        stream
+            .write_all(b"250-localhost\r\n250 AUTH PLAIN\r\n")
+            .unwrap();
+        line.clear();
+        let n = reader.read_line(&mut line).unwrap_or(0);
+        assert!(
+            n == 0
+                || (!line.to_ascii_uppercase().starts_with("AUTH")
+                    && !line.to_ascii_uppercase().starts_with("MAIL"))
+        );
+        listener
+    });
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_alert-fanout"))
+            .args(["delivery", &env, "300", "120", "60"])
+            .arg(&config)
+            .env("DATABASE_URL", &url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
+            .env("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS", "60")
+            .env("SWALLOW_ALERT_OPERATION_TIMEOUT_SECONDS", "5")
+            .env_remove("SWALLOW_ALERT_SCOPED_DELIVERY")
+            .env_remove("SWALLOW_ALERT_CHECK_SCOPED_ACCESS")
+            .env_remove("SWALLOW_ALERT_BINDING_KEY")
+            .env_remove("SWALLOW_ALERT_BINDING_KEY_FILE")
+            .output()
+            .unwrap()
+    };
+    let first = run();
+    assert_eq!(
+        first.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let listener = server.join().unwrap();
+    let state:String=db.query_one("SELECT state FROM novu_rust_alert_delivery_slots WHERE environment_id=$1 AND channel='email' AND target_id='smtp-ops'",&[&env]).await.unwrap().get(0);
+    assert_eq!(state, "unknown");
+    let second = run();
+    assert_eq!(second.status.code(), Some(2));
+    assert!(matches!(listener.accept(),Err(e) if e.kind()==std::io::ErrorKind::WouldBlock));
+    let attempts:i64=db.query_one("SELECT count(*) FROM novu_rust_alert_delivery_attempts WHERE environment_id=$1 AND channel='email' AND target_id='smtp-ops'",&[&env]).await.unwrap().get(0);
+    assert_eq!(attempts, 1);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(!combined.contains("fixture-secret"));
+    assert!(!combined.contains("ops@example.test"));
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -29,7 +29,12 @@ enum Target {
         to: String,
         provider: Provider,
         from: String,
-        api_key_file: String,
+        api_key_file: Option<String>,
+        smtp_host: Option<String>,
+        smtp_port: Option<u16>,
+        smtp_tls: Option<String>,
+        smtp_username: Option<String>,
+        smtp_password_file: Option<String>,
         sender_name: Option<String>,
         region: Option<String>,
         ip_pool_name: Option<String>,
@@ -40,6 +45,7 @@ enum Target {
 enum Provider {
     Resend,
     Sendgrid,
+    Smtp,
 }
 impl Target {
     fn key(&self) -> (&str, &str) {
@@ -78,21 +84,61 @@ impl Target {
                     region,
                     provider,
                     ip_pool_name,
+                    smtp_host,
+                    smtp_port,
+                    smtp_tls,
+                    smtp_username,
+                    smtp_password_file,
                     ..
                 } => {
+                    let no_smtp = smtp_host.is_none()
+                        && smtp_port.is_none()
+                        && smtp_tls.is_none()
+                        && smtp_username.is_none()
+                        && smtp_password_file.is_none();
                     email(to)
                         && email(from)
-                        && path(api_key_file)
                         && sender_name
                             .as_ref()
                             .is_none_or(|v| v.len() <= 256 && !v.contains(['\r', '\n', '\0']))
                         && match provider {
-                            Provider::Resend => region.is_none() && ip_pool_name.is_none(),
+                            Provider::Resend => {
+                                no_smtp
+                                    && api_key_file.as_ref().is_some_and(|v| path(v))
+                                    && region.is_none()
+                                    && ip_pool_name.is_none()
+                            }
                             Provider::Sendgrid => {
-                                region.as_ref().is_none_or(|v| v == "global" || v == "eu")
+                                no_smtp
+                                    && api_key_file.as_ref().is_some_and(|v| path(v))
+                                    && region.as_ref().is_none_or(|v| v == "global" || v == "eu")
                                     && ip_pool_name.as_ref().is_none_or(|v| {
                                         v.len() <= 256 && !v.contains(['\r', '\n', '\0'])
                                     })
+                            }
+                            Provider::Smtp => {
+                                api_key_file.is_none()
+                                    && sender_name.is_none()
+                                    && region.is_none()
+                                    && ip_pool_name.is_none()
+                                    && smtp_host.as_ref().is_some_and(|v| {
+                                        !v.is_empty()
+                                            && v.len() <= 253
+                                            && v.bytes().all(|b| {
+                                                b.is_ascii_alphanumeric() || b == b'.' || b == b'-'
+                                            })
+                                    })
+                                    && smtp_port.is_none_or(|v| v > 0)
+                                    && smtp_tls
+                                        .as_ref()
+                                        .is_none_or(|v| v == "tls" || v == "starttls")
+                                    && smtp_username.as_ref().is_none_or(|v| {
+                                        !v.is_empty()
+                                            && v.len() <= 1024
+                                            && !v.contains(['\r', '\n', '\0'])
+                                    })
+                                    && smtp_username.is_some() == smtp_password_file.is_some()
+                                    && smtp_password_file.as_ref().is_none_or(|v| path(v))
                             }
                         }
                 }
@@ -118,6 +164,13 @@ impl Target {
             "NOVU_SENDGRID_SENDER_NAME",
             "NOVU_SENDGRID_REGION",
             "NOVU_SENDGRID_IP_POOL_NAME",
+            "SWALLOW_SMTP_HOST",
+            "SWALLOW_SMTP_PORT",
+            "SWALLOW_SMTP_TLS",
+            "SWALLOW_SMTP_FROM",
+            "SWALLOW_SMTP_USERNAME",
+            "SWALLOW_SMTP_PASSWORD",
+            "SWALLOW_SMTP_PASSWORD_FILE",
         ] {
             cmd.env_remove(key);
         }
@@ -133,6 +186,11 @@ impl Target {
                 provider,
                 from,
                 api_key_file,
+                smtp_host,
+                smtp_port,
+                smtp_tls,
+                smtp_username,
+                smtp_password_file,
                 sender_name,
                 region,
                 ip_pool_name,
@@ -144,7 +202,7 @@ impl Target {
                     Provider::Resend => {
                         cmd.env("SWALLOW_ALERT_EMAIL_PROVIDER", "resend")
                             .env("NOVU_RESEND_FROM", from)
-                            .env("NOVU_RESEND_API_KEY_FILE", api_key_file);
+                            .env("NOVU_RESEND_API_KEY_FILE", api_key_file.as_deref().unwrap());
                         if let Some(name) = sender_name {
                             cmd.env("NOVU_RESEND_SENDER_NAME", name);
                         }
@@ -152,7 +210,10 @@ impl Target {
                     Provider::Sendgrid => {
                         cmd.env("SWALLOW_ALERT_EMAIL_PROVIDER", "sendgrid")
                             .env("NOVU_SENDGRID_FROM", from)
-                            .env("NOVU_SENDGRID_API_KEY_FILE", api_key_file)
+                            .env(
+                                "NOVU_SENDGRID_API_KEY_FILE",
+                                api_key_file.as_deref().unwrap(),
+                            )
                             .env(
                                 "NOVU_SENDGRID_SENDER_NAME",
                                 sender_name.as_deref().unwrap_or(""),
@@ -162,6 +223,23 @@ impl Target {
                         }
                         if let Some(pool) = ip_pool_name {
                             cmd.env("NOVU_SENDGRID_IP_POOL_NAME", pool);
+                        }
+                    }
+                    Provider::Smtp => {
+                        cmd.env("SWALLOW_ALERT_EMAIL_PROVIDER", "smtp")
+                            .env("SWALLOW_SMTP_FROM", from)
+                            .env("SWALLOW_SMTP_HOST", smtp_host.as_deref().unwrap());
+                        if let Some(port) = smtp_port {
+                            cmd.env("SWALLOW_SMTP_PORT", port.to_string());
+                        }
+                        if let Some(tls) = smtp_tls {
+                            cmd.env("SWALLOW_SMTP_TLS", tls);
+                        }
+                        if let Some(user) = smtp_username {
+                            cmd.env("SWALLOW_SMTP_USERNAME", user);
+                        }
+                        if let Some(password) = smtp_password_file {
+                            cmd.env("SWALLOW_SMTP_PASSWORD_FILE", password);
                         }
                     }
                 }

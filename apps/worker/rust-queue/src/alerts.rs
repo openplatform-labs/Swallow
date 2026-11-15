@@ -772,6 +772,7 @@ pub struct SlackWebhook {
 pub enum AlertEmailProvider {
     Resend(Resend),
     Sendgrid(crate::sendgrid::Sendgrid),
+    Smtp(crate::smtp_alert::SmtpAlert),
 }
 
 pub fn email_from_env() -> DbResult<Option<(String, AlertEmailProvider)>> {
@@ -821,8 +822,12 @@ pub fn email_from_env() -> DbResult<Option<(String, AlertEmailProvider)>> {
             }
             AlertEmailProvider::Sendgrid(provider)
         }
+        Ok("smtp") => AlertEmailProvider::Smtp(crate::smtp_alert::SmtpAlert::from_env().map_err(|_| "invalid SMTP configuration")?),
         _ => return Err("invalid email alert provider".into()),
     };
+    if matches!(&provider, AlertEmailProvider::Smtp(_)) && (to.len()>320 || to.contains(['\r','\n','\0','<','>']) || to.parse::<lettre::Address>().is_err()) {
+        return Err("invalid SMTP recipient".into());
+    }
     Ok(Some((to, provider)))
 }
 /// The same secret must be configured on every cooperating sender.
@@ -909,6 +914,7 @@ pub async fn bind_email_destination(
     let name = match provider {
         AlertEmailProvider::Resend(_) => "resend",
         AlertEmailProvider::Sendgrid(_) => "sendgrid",
+        AlertEmailProvider::Smtp(_) => "smtp",
     };
     let fingerprint = match profile {
         EmailBindingProfile::Destination => destination_fingerprint(key, "email", name, recipient),
@@ -926,6 +932,9 @@ pub async fn bind_email_destination(
                     for part in provider.binding_parts() { add(part); }
                 }
                 AlertEmailProvider::Sendgrid(provider) => {
+                    for part in provider.binding_parts() { add(part); }
+                }
+                AlertEmailProvider::Smtp(provider) => {
                     for part in provider.binding_parts() { add(part); }
                 }
             }
@@ -1075,6 +1084,11 @@ async fn send_selected_email(
     match provider {
         AlertEmailProvider::Resend(provider) => {
             send_email(provider, recipient, alert, idempotency_key).await
+        }
+        AlertEmailProvider::Smtp(provider) => {
+            if recipient.is_empty() || recipient.len()>320 || recipient.contains(['\r','\n','<','>']) || !recipient.contains('@') { return Err(AlertError::InvalidConfiguration); }
+            let text=alert.text()?;
+            provider.send(recipient,text).await.map_err(|_| AlertError::Unknown)
         }
         AlertEmailProvider::Sendgrid(provider) => {
             if recipient.is_empty()

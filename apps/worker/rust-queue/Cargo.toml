@@ -22,6 +22,7 @@ serde_urlencoded = "0.7"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 ring = "0.17"
 httpdate = "1"
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls", "rustls-tls", "webpki-roots"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
