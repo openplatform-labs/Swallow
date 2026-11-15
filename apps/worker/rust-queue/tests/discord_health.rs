@@ -174,6 +174,209 @@ async fn scoped_health_and_alert_selection() {
         );
         assert!(String::from_utf8_lossy(&result.stderr).contains("requires operator review"));
     }
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_discord_attention(text,uuid),public.novu_rust_ack_discord(text,uuid,uuid,bigint,text,text) TO {role}")).await.unwrap();
+    let attention = reader
+        .query(
+            "SELECT * FROM public.novu_rust_discord_attention($1,NULL)",
+            &[&env],
+        )
+        .await
+        .unwrap();
+    assert_eq!(attention.len(), 4);
+    let listed = Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .env_clear()
+        .env("DATABASE_URL", role_url.as_str())
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .args(["list-discord", &env])
+        .output()
+        .unwrap();
+    assert_eq!(listed.status.code(), Some(0));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&listed.stdout).unwrap()["data"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    assert!(!String::from_utf8_lossy(&listed.stdout).contains("fixture"));
+
+    let unknown = attention
+        .iter()
+        .find(|r| r.get::<_, Uuid>(0) == ids[0])
+        .unwrap();
+    let revision: Uuid = unknown.get::<_, Option<Uuid>>(4).unwrap();
+    let failure: i64 = unknown.get(5);
+    let attempt = Some(revision);
+    assert!(
+        reader
+            .query_one(
+                "SELECT public.novu_rust_ack_discord($1,$2,$3,$4,'operator','checked')",
+                &[&env, &ids[0], &attempt, &failure]
+            )
+            .await
+            .is_err()
+    );
+    db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,$2,'queue_ack',oid FROM pg_roles WHERE rolname::text=$2", &[&env,&role]).await.unwrap();
+    let stranded = attention
+        .iter()
+        .find(|r| r.get::<_, Uuid>(0) == ids[2])
+        .unwrap();
+    let stranded_revision: Option<Uuid> = stranded.get(4);
+    let stranded_failure: i64 = stranded.get(5);
+    assert!(
+        reader
+            .query_one(
+                "SELECT public.novu_rust_ack_discord($1,$2,$3,$4,'operator','checked')",
+                &[&env, &ids[2], &stranded_revision, &stranded_failure]
+            )
+            .await
+            .is_err()
+    );
+    db.batch_execute("CREATE FUNCTION public.discord_review_fail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test audit failure'; END $$; CREATE TRIGGER discord_review_fail BEFORE INSERT ON public.novu_rust_discord_reviews FOR EACH ROW EXECUTE FUNCTION public.discord_review_fail()").await.unwrap();
+    assert!(
+        reader
+            .query_one(
+                "SELECT public.novu_rust_ack_discord($1,$2,$3,$4,'operator','checked')",
+                &[&env, &ids[0], &attempt, &failure]
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        db.query_one("SELECT count(*) FROM public.novu_rust_discord_reviews", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    db.batch_execute("DROP TRIGGER discord_review_fail ON public.novu_rust_discord_reviews; DROP FUNCTION public.discord_review_fail()").await.unwrap();
+    let cli = Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .env_clear()
+        .env("DATABASE_URL", role_url.as_str())
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .args([
+            "ack-discord",
+            &env,
+            &ids[0].to_string(),
+            &revision.to_string(),
+            &failure.to_string(),
+            "operator",
+            "checked",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        cli.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&cli.stdout).unwrap()["recorded"],
+        true
+    );
+    assert!(
+        !reader
+            .query_one(
+                "SELECT public.novu_rust_ack_discord($1,$2,$3,$4,'operator','checked')",
+                &[&env, &ids[0], &attempt, &failure]
+            )
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
+    let row = reader
+        .query_one("SELECT * FROM public.novu_rust_discord_health($1)", &[&env])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, i64>(0), 0);
+    db.execute(
+        "UPDATE public.novu_rust_discord_attempts SET state='rejected' WHERE job_id=$1",
+        &[&ids[0]],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE public.novu_rust_discord_attempts SET state='unknown' WHERE job_id=$1",
+        &[&ids[0]],
+    )
+    .await
+    .unwrap();
+    assert!(
+        reader
+            .query_one(
+                "SELECT public.novu_rust_ack_discord($1,$2,$3,$4,'operator','checked')",
+                &[&env, &ids[0], &attempt, &failure]
+            )
+            .await
+            .is_err()
+    );
+    let row = reader
+        .query_one("SELECT * FROM public.novu_rust_discord_health($1)", &[&env])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, i64>(0), 1);
+    let attention = reader
+        .query(
+            "SELECT * FROM public.novu_rust_discord_attention($1,NULL)",
+            &[&env],
+        )
+        .await
+        .unwrap();
+    let current = attention
+        .iter()
+        .find(|r| r.get::<_, Uuid>(0) == ids[0])
+        .unwrap();
+    let current_revision: Option<Uuid> = current.get(4);
+    let current_failure: i64 = current.get(5);
+    let (reader2, driver) = tokio_postgres::connect(role_url.as_str(), NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(driver);
+    let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] =
+        &[&env, &ids[0], &current_revision, &current_failure];
+    let sql = "SELECT public.novu_rust_ack_discord($1,$2,$3,$4,'operator','checked')";
+    let (one, two) = tokio::join!(
+        reader.query_one(sql, params),
+        reader2.query_one(sql, params)
+    );
+    assert_ne!(
+        one.unwrap().get::<_, bool>(0),
+        two.unwrap().get::<_, bool>(0)
+    );
+    let pre = attention
+        .iter()
+        .find(|r| r.get::<_, Uuid>(0) == ids[3])
+        .unwrap();
+    let no_attempt: Option<Uuid> = None;
+    let pre_rev: i64 = pre.get(5);
+    assert!(
+        reader
+            .query_one(sql, &[&env, &ids[3], &no_attempt, &pre_rev])
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
+    let row = reader
+        .query_one("SELECT * FROM public.novu_rust_discord_health($1)", &[&env])
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            row.get::<_, i64>(0),
+            row.get::<_, i64>(1),
+            row.get::<_, i64>(2),
+            row.get::<_, i64>(3)
+        ),
+        (0, 1, 1, 0)
+    );
+    assert_eq!(
+        db.query_one("SELECT count(*) FROM public.novu_rust_discord_reviews", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        3
+    );
     db.execute("DELETE FROM public.novu_rust_delivery_operator_grants WHERE environment_id=$1 AND database_principal=$2 AND decision='alert_view'", &[&env,&role]).await.unwrap();
     let result = alert(role_url.as_str(), &env, false);
     assert_eq!(result.status.code(), Some(1));
