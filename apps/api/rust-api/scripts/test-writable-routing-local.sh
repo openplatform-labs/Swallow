@@ -31,4 +31,5 @@ SQL
 "$TEST_PG_BIN/pg_basebackup" -h 127.0.0.1 -p "$PRIMARY_PORT" -U postgres -D "$TEST_DIR/standby" -R -X stream --checkpoint=fast
 "$TEST_PG_BIN/pg_ctl" -D "$TEST_DIR/standby" -o "-h 127.0.0.1 -p $STANDBY_PORT" -l "$TEST_DIR/standby.log" start >/dev/null
 TEST_PRIMARY_ADDR="127.0.0.1:$PRIMARY_PORT" TEST_STANDBY_ADDR="127.0.0.1:$STANDBY_PORT" \
+ TEST_PRIMARY_DATA="$TEST_DIR/primary" TEST_STANDBY_DATA="$TEST_DIR/standby" TEST_PG_CTL="$TEST_PG_BIN/pg_ctl" \
  cargo test --locked --manifest-path "$API/Cargo.toml" --test api_readiness_writable writable_routing_handles_mixed_and_read_only_connections -- --ignored --nocapture

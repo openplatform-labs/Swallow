@@ -330,7 +330,7 @@ async fn create_subscriber(port: u16, id: &str) -> u16 {
 }
 
 #[tokio::test]
-#[ignore = "requires migrated primary, standby and test API key"]
+#[ignore = "requires disposable migrated primary/standby; stops primary and promotes standby"]
 async fn writable_routing_handles_mixed_and_read_only_connections() {
     use std::sync::atomic::Ordering;
     let primary = std::env::var("TEST_PRIMARY_ADDR").unwrap();
@@ -442,5 +442,80 @@ async fn writable_routing_handles_mixed_and_read_only_connections() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(exited, "invalid writable routing policy was accepted");
+
+    // Wait for committed test writes to replay before simulating an abrupt primary stop.
+    let replay_lsn: String = admin
+        .query_one("SELECT pg_current_wal_insert_lsn()::text", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let mut replicated = false;
+    for _ in 0..100 {
+        replicated = observer
+            .query_one(
+                "SELECT pg_last_wal_replay_lsn() >= $1::text::pg_lsn",
+                &[&replay_lsn],
+            )
+            .await
+            .unwrap()
+            .get::<_, Option<bool>>(0)
+            .unwrap_or(false);
+        if replicated {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        replicated,
+        "standby did not replay committed fixture writes"
+    );
+    let ctl = std::env::var("TEST_PG_CTL").unwrap();
+    let primary_data = std::env::var("TEST_PRIMARY_DATA").unwrap();
+    let standby_data = std::env::var("TEST_STANDBY_DATA").unwrap();
+    assert!(
+        Command::new(&ctl)
+            .args(["stop", "-D", &primary_data, "-m", "immediate", "-w"])
+            .stdout(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        create_subscriber(standby_port, "before-promotion").await,
+        503
+    );
+    assert!(
+        Command::new(&ctl)
+            .args(["promote", "-D", &standby_data, "-w"])
+            .stdout(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        !observer
+            .query_one("SELECT pg_is_in_recovery()", &[])
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
+    assert_eq!(
+        create_subscriber(standby_port, "after-promotion-direct").await,
+        201
+    );
+    let mut recovered = None;
+    for i in 0..30 {
+        let id = format!("after-promotion-{i}");
+        let code = create_subscriber(port, &id).await;
+        if code == 201 {
+            recovered = Some(id);
+            break;
+        }
+        assert_eq!(code, 503, "unexpected post-promotion response");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let recovered = recovered.expect("mixed-connection API did not recover after promotion");
+    assert!(observer.query_one("SELECT EXISTS(SELECT 1 FROM public.novu_rust_subscribers WHERE environment_id='routing-test' AND subscriber_id=$1)", &[&recovered]).await.unwrap().get::<_,bool>(0));
+    assert!(observer.query_one("SELECT EXISTS(SELECT 1 FROM public.novu_rust_subscribers WHERE environment_id='routing-test' AND subscriber_id='after-promotion-direct')",&[]).await.unwrap().get::<_,bool>(0));
     task.abort();
 }
