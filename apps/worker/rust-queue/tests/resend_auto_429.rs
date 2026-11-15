@@ -290,3 +290,155 @@ fn worker_rejects_automatic_retry_without_required_evidence_guards() {
             .contains("automatic 429 retries require both evidence guards")
     );
 }
+
+#[tokio::test]
+#[ignore = "requires migrated disposable PostgreSQL with role creation"]
+async fn automatic_retry_dispatch_is_fenced_even_when_policy_is_disabled() {
+    let url = std::env::var("TEST_DATABASE_URL").unwrap();
+    let mut db = connect(&url).await;
+    let env = format!("auto-fence-{}", Uuid::new_v4());
+    db.execute(
+        "INSERT INTO public.novu_rust_environments VALUES ($1,'org')",
+        &[&env],
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,session_user,'retry',oid FROM pg_roles WHERE rolname=session_user", &[&env]).await.unwrap();
+    assert!(
+        queue::resend_queue::register_idempotency_scope(&db, &env, true)
+            .await
+            .unwrap()
+    );
+    db.execute("INSERT INTO public.novu_rust_resend_auto_retry_policy(environment_id,enabled,max_retries) VALUES ($1,true,1)", &[&env]).await.unwrap();
+    let job = Uuid::new_v4();
+    queue::enqueue(
+        &db,
+        job,
+        &env,
+        queue::resend_queue::JOB_KIND,
+        &json!({"to":["recipient@example.test"],"subject":"test","html":"test"}),
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE public.novu_queue_jobs SET status='failed' WHERE id=$1",
+        &[&job],
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO public.novu_rust_resend_attempts(job_id,environment_id,state,http_status,retry_after_seconds,retry_not_before,correlation_id) VALUES ($1,$2,'rejected',429,0,clock_timestamp(),$3)", &[&job,&env,&Uuid::new_v4()]).await.unwrap();
+    assert!(automatic(&db, &env).await.unwrap());
+    assert!(db.query_one("SELECT resend_auto_retry FROM public.novu_rust_delivery_reconciliations WHERE job_id=$1", &[&job]).await.unwrap().get::<_,bool>(0));
+    db.execute("UPDATE public.novu_rust_resend_auto_retry_policy SET enabled=false WHERE environment_id=$1", &[&env]).await.unwrap();
+    for flags in [
+        (false, true, true, true),
+        (true, false, true, true),
+        (true, true, false, true),
+        (true, true, true, false),
+    ] {
+        let row = db
+            .query_one(
+                "SELECT public.novu_rust_resend_auto_dispatch_allowed($1,$2,$3,$4,$5,$6)",
+                &[&env, &job, &flags.0, &flags.1, &flags.2, &flags.3],
+            )
+            .await
+            .unwrap();
+        assert!(!row.get::<_, bool>(0));
+    }
+    let role = format!("fence_{}", Uuid::new_v4().simple());
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'test-only'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_resend_auto_dispatch_allowed(text,uuid,boolean,boolean,boolean,boolean) TO {role}")).await.unwrap();
+    let mut role_url = reqwest::Url::parse(&url).unwrap();
+    role_url.set_username(&role).unwrap();
+    role_url.set_password(Some("test-only")).unwrap();
+    let restricted = connect(role_url.as_str()).await;
+    assert!(
+        restricted
+            .query(
+                "SELECT * FROM public.novu_rust_delivery_reconciliations",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        !restricted
+            .query_one(
+                "SELECT public.novu_rust_resend_auto_dispatch_allowed($1,$2,false,true,true,true)",
+                &[&env, &job]
+            )
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider = Resend::test_endpoint(
+        Config {
+            api_key: "re_test".into(),
+            from: "sender@example.test".into(),
+            sender_name: String::new(),
+        },
+        &format!("http://{}/emails", listener.local_addr().unwrap()),
+    )
+    .unwrap();
+    assert!(
+        queue::resend_queue::process_one_with_registered_policy(
+            &mut db,
+            &env,
+            &provider,
+            false,
+            queue::email_step_policy::Policy::Snapshot,
+            false,
+            false,
+            true
+        )
+        .await
+        .unwrap()
+    );
+    let row=db.query_one("SELECT j.status,j.last_error,(SELECT count(*) FROM public.novu_rust_resend_attempts WHERE job_id=j.id) FROM public.novu_queue_jobs j WHERE j.id=$1", &[&job]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "pending");
+    assert_eq!(
+        row.get::<_, String>(1),
+        "Resend automatic retry requires evidence guards"
+    );
+    assert_eq!(row.get::<_, i64>(2), 0);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+            .await
+            .is_err()
+    );
+    db.execute("UPDATE public.novu_queue_jobs SET available_at=clock_timestamp()-interval '1 second' WHERE id=$1", &[&job]).await.unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut bytes = [0; 4096];
+        assert!(socket.read(&mut bytes).await.unwrap() > 0);
+        let body = r#"{"id":"guarded-ok"}"#;
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    assert!(
+        queue::resend_queue::process_one_with_registered_policy(
+            &mut db,
+            &env,
+            &provider,
+            true,
+            queue::email_step_policy::Policy::Snapshot,
+            true,
+            true,
+            true
+        )
+        .await
+        .unwrap()
+    );
+    server.await.unwrap();
+    let row=db.query_one("SELECT j.status,a.state FROM public.novu_queue_jobs j JOIN public.novu_rust_resend_attempts a ON a.job_id=j.id WHERE j.id=$1", &[&job]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "completed");
+    assert_eq!(row.get::<_, String>(1), "accepted");
+}

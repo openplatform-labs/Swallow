@@ -209,6 +209,28 @@ async fn process_one_inner(
         tx.rollback().await?;
         return Ok(true);
     }
+    if registered {
+        let allowed: bool = tx
+            .query_one(
+                "SELECT public.novu_rust_resend_auto_dispatch_allowed($1,$2,$3,$4,$5,$6)",
+                &[
+                    &environment,
+                    &job.id,
+                    &retry_guard,
+                    &correlation_enabled,
+                    &correlation_guard,
+                    &retry_key,
+                ],
+            )
+            .await?
+            .get(0);
+        if !allowed {
+            tx.execute("UPDATE public.novu_queue_jobs SET status='pending',available_at=clock_timestamp()+interval '5 seconds',last_error='Resend automatic retry requires evidence guards',lease_token=NULL,lease_until=NULL WHERE id=$1 AND environment_id=$2 AND status='running' AND lease_token=$3", &[&job.id,&environment,&job.lease_token]).await?;
+            tx.commit().await?;
+            eprintln!("Resend automatic retry requires evidence guards; job deferred");
+            return Ok(true);
+        }
+    }
     if correlation_guard {
         let evidence = tx.query_opt("SELECT r.retry_correlation_id,r.retry_provider_message_id FROM novu_rust_delivery_reconciliations r WHERE r.environment_id=$1 AND r.job_id=$2 AND r.target_index IS NULL AND r.decision='retry' AND r.retry_correlation_id IS NOT NULL AND EXISTS(SELECT 1 FROM novu_rust_resend_delivery_events e WHERE e.environment_id=$1 AND e.correlation_id=r.retry_correlation_id) ORDER BY r.decision_order DESC LIMIT 1", &[&environment,&job.id]).await?;
         if let Some(evidence) = evidence {
