@@ -10,11 +10,26 @@ pub const MIGRATION: &str = include_str!("../migrations/0097_sendgrid_delivery_p
 /// Locks one job. The webhook takes the same job lock before inserting events.
 /// An older or unverified callback cannot be treated as evidence for this dispatch.
 pub async fn project(client: &mut Client, environment: &str, job: Uuid) -> Result<bool> {
+    project_with_policy(client, environment, job, None).await
+}
+
+/// With a scoped policy, hold authorization locks for the entire projection transaction.
+pub async fn project_with_policy(
+    client: &mut Client,
+    environment: &str,
+    job: Uuid,
+    scoped_policy: Option<bool>,
+) -> Result<bool> {
     let tx = client
         .build_transaction()
         .isolation_level(IsolationLevel::RepeatableRead)
         .start()
         .await?;
+    if let Some(policy) = scoped_policy {
+        if !crate::projection_policy::check_scoped(&tx, environment, "sendgrid", policy).await? {
+            return Err("projection heartbeat policy changed".into());
+        }
+    }
     let row=tx.query_opt("SELECT a.state,a.dispatch_id,(SELECT count(*) FROM novu_rust_email_messages m WHERE m.environment_id=j.environment_id AND m.email_job_id=j.id) FROM novu_queue_jobs j JOIN novu_rust_sendgrid_attempts a ON a.job_id=j.id AND a.environment_id=j.environment_id WHERE j.id=$1 AND j.environment_id=$2 AND j.kind=$3 FOR UPDATE OF j SKIP LOCKED", &[&job,&environment,&sendgrid_queue::JOB_KIND]).await?;
     let Some(row) = row else {
         tx.rollback().await?;

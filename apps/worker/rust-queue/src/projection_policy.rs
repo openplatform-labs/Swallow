@@ -38,8 +38,8 @@ pub async fn register_scoped(
 }
 
 /// Recheck a scoped registration while a connection is running.
-pub async fn check_scoped(
-    db: &Client,
+pub async fn check_scoped<C: tokio_postgres::GenericClient + Sync>(
+    db: &C,
     environment: &str,
     provider: &str,
     require_full_scan: bool,

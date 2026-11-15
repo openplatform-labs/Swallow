@@ -165,23 +165,14 @@ async fn run(
                         if stop.requested() {
                             return Ok(false);
                         }
-                        if scoped_policy
-                            && !tokio::time::timeout(
-                                timeout,
-                                novu_postgres_queue::projection_policy::check_scoped(
-                                    &db,
-                                    &environment,
-                                    "sendgrid",
-                                    require_full_scan,
-                                ),
-                            )
-                            .await??
-                        {
-                            return Err("projection heartbeat policy changed".into());
-                        }
                         let processed = tokio::time::timeout(
                             timeout,
-                            sendgrid_projection::project(&mut db, &environment, job),
+                            sendgrid_projection::project_with_policy(
+                                &mut db,
+                                &environment,
+                                job,
+                                scoped_policy.then_some(require_full_scan),
+                            ),
                         )
                         .await??;
                         skipped |= !processed;

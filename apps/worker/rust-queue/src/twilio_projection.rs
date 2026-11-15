@@ -21,11 +21,26 @@ fn classify(evidence: &Value) -> &'static str {
 }
 
 pub async fn project(client: &mut Client, environment: &str, job: Uuid) -> Result<bool> {
+    project_with_policy(client, environment, job, None).await
+}
+
+/// With a scoped policy, hold authorization locks for the entire projection transaction.
+pub async fn project_with_policy(
+    client: &mut Client,
+    environment: &str,
+    job: Uuid,
+    scoped_policy: Option<bool>,
+) -> Result<bool> {
     let tx = client
         .build_transaction()
         .isolation_level(IsolationLevel::RepeatableRead)
         .start()
         .await?;
+    if let Some(policy) = scoped_policy {
+        if !crate::projection_policy::check_scoped(&tx, environment, "twilio", policy).await? {
+            return Err("projection heartbeat policy changed".into());
+        }
+    }
     let found = tx.query_opt("SELECT id FROM novu_queue_jobs WHERE id=$1 AND environment_id=$2 AND kind=$3 FOR UPDATE SKIP LOCKED", &[&job,&environment,&twilio_queue::JOB_KIND]).await?;
     if found.is_none() {
         tx.rollback().await?;

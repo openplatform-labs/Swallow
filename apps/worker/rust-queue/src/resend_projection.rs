@@ -72,6 +72,17 @@ pub async fn project_with_auto_correlation(
     job: Uuid,
     auto: bool,
 ) -> Result<bool> {
+    project_with_policy(client, environment, job, auto, None).await
+}
+
+/// With a scoped policy, hold authorization locks through the projection commit.
+pub async fn project_with_policy(
+    client: &mut Client,
+    environment: &str,
+    job: Uuid,
+    auto: bool,
+    scoped_policy: Option<bool>,
+) -> Result<bool> {
     let tx = client
         .build_transaction()
         .isolation_level(if auto {
@@ -81,6 +92,11 @@ pub async fn project_with_auto_correlation(
         })
         .start()
         .await?;
+    if let Some(policy) = scoped_policy {
+        if !crate::projection_policy::check_scoped(&tx, environment, "resend", policy).await? {
+            return Err("projection heartbeat policy changed".into());
+        }
+    }
     let found=tx.query_opt("SELECT id FROM novu_queue_jobs WHERE id=$1 AND environment_id=$2 AND kind=$3 FOR UPDATE SKIP LOCKED", &[&job,&environment,&resend_queue::JOB_KIND]).await?;
     if found.is_none() {
         tx.rollback().await?;
