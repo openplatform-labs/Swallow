@@ -258,6 +258,8 @@ export class App implements OnDestroy {
   oidcIdpRevokeConfirmed=false;
   oidcIdpAccessConfirmed=false;
   oidcIdpAccessAlsoSwallow=true;
+  oidcIdpAccessAlsoRefresh=false;
+  readonly oidcIdpRefreshResult=signal<'idle'|'accepted'|'unknown'>('idle');
   readonly oidcIdpSwallowResult=signal<'idle'|'revoked'|'unknown'>('idle');
   readonly oidcIdpRevokeStatus=signal<'idle'|'sending'|'accepted'|'unknown'>('idle');
   readonly oidcStatus = signal<'idle' | 'preparing' | 'ready' | 'signing' | 'signed-in' | 'expired' | 'error'>('idle');
@@ -442,7 +444,7 @@ export class App implements OnDestroy {
 
   async prepareOidc(): Promise<void> {
     if (this.oidcStatus() === 'preparing' || this.oidcStatus() === 'signing' || this.oidcRevokeStatus()==='sending' || this.oidcIdpRevokeStatus()==='sending') return;
-    this.oidcRevokeStatus.set('idle'); this.oidcRevokeConfirmed=false;this.oidcIdpRevokeStatus.set('idle');this.oidcIdpRevokeConfirmed=false;this.oidcIdpAccessConfirmed=false;this.oidcIdpSwallowResult.set('idle');
+    this.oidcRevokeStatus.set('idle'); this.oidcRevokeConfirmed=false;this.oidcIdpRevokeStatus.set('idle');this.oidcIdpRevokeConfirmed=false;this.oidcIdpAccessConfirmed=false;this.oidcIdpAccessAlsoRefresh=false;this.oidcIdpSwallowResult.set('idle');this.oidcIdpRefreshResult.set('idle');
     this.resetOidc(); const sequence=this.oidcSequence; this.oidcStatus.set('preparing');
     try {
       const prepared=await this.oidc.prepare({issuer:this.oidcIssuer,clientId:this.oidcClientId,scope:this.oidcScope,resource:this.oidcResource,audience:this.oidcAudience,apiOrigin:this.apiOrigin,environmentId:this.oidcEnvironment,allowRefresh:this.oidcAutoRenew});
@@ -468,10 +470,14 @@ export class App implements OnDestroy {
   async revokeIdpAccess():Promise<void> {
     this.expireOidcIfNeeded();
     const session=this.oidcSession,prepared=this.oidcPrepared;
-    if(!session || !prepared || !this.oidcIdpAccessConfirmed || !this.canRevokeIdpAccess() || this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying' || this.subscriberDeleteRetryStatus()==='retrying' || this.decisionStatus()==='sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying')return;
+    if(!session || !prepared || !this.oidcIdpAccessConfirmed || !this.canRevokeIdpAccess() || (this.oidcIdpAccessAlsoRefresh && !this.canRevokeIdpRefresh()) || this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying' || this.subscriberDeleteRetryStatus()==='retrying' || this.decisionStatus()==='sending' || this.permissionChangeStatus()==='sending' || this.grantChangeStatus()==='sending' || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying')return;
     const sequence=this.oidcSequence;
     if(this.oidcRenewTimer!==null)clearTimeout(this.oidcRenewTimer);this.oidcRenewTimer=null;
-    this.oidcIdpRevokeStatus.set('sending');this.oidcIdpSwallowResult.set('idle');
+    this.oidcIdpRevokeStatus.set('sending');this.oidcIdpSwallowResult.set('idle');this.oidcIdpRefreshResult.set('idle');
+    if(this.oidcIdpAccessAlsoRefresh) {
+      try {await this.oidc.revokeRefresh();this.oidcIdpRefreshResult.set('accepted');} catch {this.oidcIdpRefreshResult.set('unknown');}
+    }
+    if(sequence!==this.oidcSequence)return;
     if(this.oidcIdpAccessAlsoSwallow)this.oidcIdpSwallowResult.set(await this.requestSelfRevocation(session));
     if(sequence!==this.oidcSequence)return;
     let outcome:'accepted'|'unknown'='unknown';
