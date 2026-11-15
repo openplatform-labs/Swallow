@@ -18,4 +18,5 @@ export DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/postgres" NOVU_POSTGRES
 cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply api "$API/migrations" --through 17
 cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply worker "$WORKER/migrations"
 cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply api "$API/migrations"
-TEST_DATABASE_URL="$DATABASE_URL" cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test operator_key_probe_alert -- --ignored
+cargo build --quiet --locked --manifest-path "$API/Cargo.toml" --bin novu-rust-api
+TEST_API_BINARY="$API/target/debug/novu-rust-api" TEST_DATABASE_URL="$DATABASE_URL" cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test operator_key_probe_alert -- --ignored
