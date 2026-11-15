@@ -299,6 +299,39 @@ async fn detects_actual_primary_standby_and_session_read_only() {
             "physical and logical senders did not become synchronous quorum members: {states:?}"
         );
     }
+    // Exercise the actual alert command with an intentionally blocked local
+    // destination, so the unhealthy probe cannot send anything externally.
+    primary.batch_execute("INSERT INTO public.novu_rust_environments VALUES ('probe-fixture','org'); INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'probe-fixture',rolname,'alert_send',oid FROM pg_roles WHERE rolname=session_user; INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES ('probe-fixture','slack','db-primary','rejected')").await.unwrap();
+    for (reject, expected) in [("false", 0), ("true", 2)] {
+        let output = tokio::time::timeout(
+            Duration::from_secs(15),
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_send-database-alert"))
+                .env_clear()
+                .args(["probe-fixture", "primary", "60"])
+                .env("DATABASE_URL", std::env::var("TEST_PRIMARY_URL").unwrap())
+                .env("SWALLOW_DB_PROBE_URL", &probe_url)
+                .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+                .env("SWALLOW_DB_PROBE_ROLE", "synchronous-primary")
+                .env("SWALLOW_DB_PROBE_REJECT_LOGICAL_SYNC", reject)
+                .env(
+                    "SWALLOW_ALERT_SLACK_WEBHOOK",
+                    "https://hooks.slack.com/services/A/B/C",
+                )
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if reject == "true" {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("requires operator review"));
+        }
+    }
     assert!(
         !healthy(
             &limited,
