@@ -28,6 +28,8 @@ enum Lookup {
     SlackCooldownHealth,
     ResendCooldownHealth,
     FcmCooldownHealth,
+    DiscordRetryHealth,
+    DiscordRetryList,
     FcmUnrecordedClaimHealth,
     FcmUnrecordedClaimList,
     TwilioDelayedHealth,
@@ -400,6 +402,12 @@ pub(super) async fn slack_cooldown_health(
     query(db, headers, uri, verifier, Lookup::SlackCooldownHealth).await
 }
 
+pub(super) async fn discord_retry_health(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
+    query(db,headers,uri,verifier,Lookup::DiscordRetryHealth).await
+}
+pub(super) async fn discord_retry_list(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
+    query(db,headers,uri,verifier,Lookup::DiscordRetryList).await
+}
 pub(super) async fn fcm_unrecorded_claim_health(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
     query(db,headers,uri,verifier,Lookup::FcmUnrecordedClaimHealth).await
 }
@@ -1995,6 +2003,8 @@ async fn query(
         | Lookup::SlackResult
         | Lookup::SendgridResult => &["environmentId", "jobId"],
         Lookup::ResendAutoHealth | Lookup::SlackCooldownHealth | Lookup::ResendCooldownHealth | Lookup::FcmCooldownHealth | Lookup::TwilioDelayedHealth => &["environmentId", "graceSeconds"],
+        Lookup::DiscordRetryHealth => &["environmentId", "graceSeconds"],
+        Lookup::DiscordRetryList => &["environmentId", "graceSeconds", "filter", "after"],
         Lookup::FcmUnrecordedClaimHealth => &["environmentId", "minGap", "graceSeconds"],
         Lookup::FcmUnrecordedClaimList => &["environmentId", "minGap", "graceSeconds", "after"],
         Lookup::FcmPartialHealth => &["environmentId", "windowSeconds"],
@@ -2165,6 +2175,13 @@ async fn query(
                 ],
             )
             .await
+        }
+        Lookup::DiscordRetryHealth | Lookup::DiscordRetryList => {
+            let Some(grace)=params.get("graceSeconds").and_then(|v|v.parse::<i32>().ok().filter(|n|(1..=86400).contains(n)&&n.to_string()==*v)) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};
+            let list=matches!(lookup,Lookup::DiscordRetryList);
+            let overdue=if list {match params.get("filter").map(String::as_str) {Some("all")=>false,Some("overdue")=>true,_=>return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request")}} else {false};
+            let after=match params.get("after") { Some(v)=>match Uuid::parse_str(v){Ok(v)=>Some(v),Err(_)=>return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request")},None=>None};
+            guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_discord_retry_diagnostics($1,$2,$3,$4,$5,$6,$7,$8,$9)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&grace,&list,&overdue,&after]).await
         }
         Lookup::FcmUnrecordedClaimHealth | Lookup::FcmUnrecordedClaimList => {
             let Some(gap)=params.get("minGap").and_then(|v|v.parse::<i32>().ok().filter(|n|(2..=100000).contains(n)&&n.to_string()==*v)) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};
