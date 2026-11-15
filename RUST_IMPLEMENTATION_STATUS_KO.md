@@ -1,5 +1,7 @@
 ## Slack 공유 대기 상태 조회와 경보
 
+- 운영자 OIDC 엔드포인트 보안: HTTPS 발급자가 인증·토큰·JWKS를 HTTP 로컬 주소로 지정하는 경우 검색과 로그인 직전에 거절한다. 로컬 개발용 HTTP 발급자는 기존처럼 허용한다. Angular 테스트 212개와 빌드, Docker PostgreSQL·로컬 OIDC 공급자·실제 브라우저 로그인으로 검증했다. 첫 브라우저 시도는 fixture의 DB 함수 권한 누락으로 실패해 임시 권한을 부여해 성공했고 재현 스크립트를 수정했다. 최초 컴파일의 TypeScript 인덱스 오류도 수정 후 재시험했다. 실제 외부 IdP 및 리다이렉트 정책은 미검증이다. [관리 화면 README](apps/dashboard/swallow/README.md)를 참고한다.
+
 - FCM 대기 원인 변경 경보: `SWALLOW_ALERT_FCM_COOLDOWN_DISTINCT_SOURCE=true`를 선택하면 활성 대기의 429·503·원인 불명을 별도 64비트 경보 조건으로 다룬다. 제한 계정·임시 PostgreSQL과 모의 Slack에서 429→503→429 재경보와 같은 원인의 반복 억제를 확인했다. 이전 경보 실행기는 새 조건을 이해하지 못하므로 같은 대상의 모든 실행기를 함께 업데이트해야 한다. 실제 외부 수신과 운영 HA는 미검증이며 자세한 설정은 [워커 README](apps/worker/rust-queue/README.md)에 기록했다.
 
 - FCM 공유 대기 원인 경보: 워커 0194와 `SWALLOW_ALERT_FCM_COOLDOWN_SOURCE_ENABLED=true`를 사용하면 Slack·메일 경보에 현재 대기 종료 시각을 연장한 HTTP 429 또는 503을 표시한다. 제한 DB 계정·실제 경보 CLI에서 별도 권한, 환경 격리와 실패 처리를 확인하고 모의 Slack·Resend에서 경보 내용을 검증했다. 선택형 원인별 조건은 위 최신 항목을 참고하며 실제 외부 수신·운영 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.

@@ -11,6 +11,21 @@ function secureUrl(value: string, allowPath: boolean): URL {
   return url;
 }
 
+// Remote issuers cannot downgrade code, token, or key transport to plaintext.
+// Loopback HTTP remains available when the issuer itself is a local HTTP fixture.
+function validateDiscovery(settings:OidcSettings, metadata:unknown): asserts metadata is Partial<OidcMetadata> {
+  const issuer=secureUrl(settings.issuer,true);
+  secureUrl(settings.apiOrigin,false);
+  if(issuer.search || typeof metadata!=='object' || metadata===null || !('issuer' in metadata) || metadata.issuer!==settings.issuer)throw new Error('invalid metadata');
+  const fields=metadata as Record<string,unknown>;
+  for(const key of ['authorization_endpoint','token_endpoint','jwks_uri'] as const){
+    const value=fields[key];if(typeof value!=='string')throw new Error('invalid metadata');
+    const endpoint=secureUrl(value,true);
+    if(issuer.protocol==='https:' && endpoint.protocol!=='https:')throw new Error('insecure OIDC endpoint');
+  }
+  if(!('code_challenge_methods_supported' in metadata) || !Array.isArray(metadata.code_challenge_methods_supported) || !metadata.code_challenge_methods_supported.includes('S256'))throw new Error('PKCE unavailable');
+}
+
 // Enforce limits while consuming the stream, before allocating the full response.
 async function boundedText(response: Response, limit: number): Promise<string> {
   const declared=response.headers.get('content-length');
@@ -66,15 +81,12 @@ export class OperatorOidc {
     if (!response.ok) throw new Error('discovery unavailable');
     const text=await boundedText(response,65536);
     const metadata: unknown=JSON.parse(text);
-    if (typeof metadata !== 'object' || metadata === null || !('issuer' in metadata) || metadata.issuer !== settings.issuer || !('authorization_endpoint' in metadata) || typeof metadata.authorization_endpoint !== 'string' || !('token_endpoint' in metadata) || typeof metadata.token_endpoint !== 'string') throw new Error('invalid metadata');
-    secureUrl(metadata.authorization_endpoint,true); secureUrl(metadata.token_endpoint,true);
-    if (!('jwks_uri' in metadata) || typeof metadata.jwks_uri !== 'string') throw new Error('invalid metadata');
-    secureUrl(metadata.jwks_uri,true);
-    if (!('code_challenge_methods_supported' in metadata) || !Array.isArray(metadata.code_challenge_methods_supported) || !metadata.code_challenge_methods_supported.includes('S256')) throw new Error('PKCE unavailable');
+    validateDiscovery(settings,metadata);
     return {settings,metadata:metadata as Partial<OidcMetadata>};
   }
 
   async signIn(prepared: PreparedOidc): Promise<VerifiedSession> {
+    validateDiscovery(prepared.settings,prepared.metadata);
     this.dispose();
     const generation=this.generation;
     const {settings,metadata}=prepared;

@@ -24,6 +24,20 @@ describe('operator OIDC configuration',()=>{
     await expect(service.prepare({...settings,scope:'openid offline_access'})).rejects.toThrow();
     await expect(service.prepare({...settings,issuer:'http://external.test'})).rejects.toThrow();
   });
+  it('rejects HTTPS issuer endpoint downgrades before login, while retaining local HTTP fixtures',async()=>{
+    const fetchMock=vi.spyOn(globalThis,'fetch');const popup=vi.spyOn(UserManager.prototype,'signinPopup');const service=new OperatorOidc();
+    for(const key of ['authorization_endpoint','token_endpoint','jwks_uri'] as const){
+      const unsafe={...metadata,[key]:'http://127.0.0.1:9000/endpoint'};
+      fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(unsafe)));
+      await expect(service.prepare(settings)).rejects.toThrow('insecure OIDC endpoint');
+      await expect(service.signIn({settings,metadata:unsafe})).rejects.toThrow('insecure OIDC endpoint');
+    }
+    expect(popup).not.toHaveBeenCalled();
+    const localSettings={...settings,issuer:'http://127.0.0.1:9000'};
+    const localMetadata={...metadata,issuer:localSettings.issuer,authorization_endpoint:'http://127.0.0.1:9000/authorize',token_endpoint:'http://127.0.0.1:9000/token',jwks_uri:'http://127.0.0.1:9000/jwks'};
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(localMetadata)));
+    expect((await service.prepare(localSettings)).metadata.issuer).toBe(localSettings.issuer);
+  });
   it('rejects oversized and invalid UTF-8 discovery while reading the stream',async()=>{
     let cancelled=false;
     const body=new ReadableStream<Uint8Array>({pull(controller){controller.enqueue(new Uint8Array(40000).fill(97));},cancel(){cancelled=true;}});

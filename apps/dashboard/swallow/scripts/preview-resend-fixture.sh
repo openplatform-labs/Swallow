@@ -128,6 +128,7 @@ SQL
 fi
 if [[ "${SWALLOW_UI_TEST_OIDC:-false}" == true ]]; then
   docker exec -i "$name" psql -q -v ON_ERROR_STOP=1 -U postgres -d ui_test <<'SQL'
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_self(text,text,text,text,bigint) TO ui_resend_fixture;
 INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES ('http://127.0.0.1:4251','ui-fixture','console','ui-fixture-env');
 SQL
 fi
