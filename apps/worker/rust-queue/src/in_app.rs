@@ -313,7 +313,17 @@ pub async fn process_one_with_chat_options(
             // Store only a fixed diagnostic, never the job payload or rendered content.
             // A false return means ownership was already lost. Do not overwrite
             // a newer lease; the recovery loop will handle an expired job.
-            crate::fail(client, job.id, job.lease_token, &error.to_string()).await?;
+            if discord_workflow {
+                let tx=client.transaction().await?;
+                let live=tx.query_opt("SELECT 1 FROM public.novu_queue_jobs WHERE id=$1 AND environment_id=$2 AND status='running' AND lease_token=$3 AND lease_until>clock_timestamp() FOR UPDATE", &[&job.id,&job.environment_id,&job.lease_token]).await?;
+                if live.is_some() {
+                    tx.query_one("SELECT public.novu_rust_discord_workflow_guard($1,$2,$3)", &[&job.environment_id,&job.id,&job.lease_token]).await?;
+                    tx.execute("UPDATE public.novu_queue_jobs SET status='failed',last_error=$3,lease_token=NULL,lease_until=NULL WHERE id=$1 AND lease_token=$2 AND lease_until>clock_timestamp()", &[&job.id,&job.lease_token,&error.to_string()]).await?;
+                }
+                tx.commit().await?;
+            } else {
+                crate::fail(client, job.id, job.lease_token, &error.to_string()).await?;
+            }
             Ok(true)
         }
         Err(error) => Err(error),
@@ -444,6 +454,10 @@ async fn process_claimed(
         tx.rollback().await?;
         return Err(LeaseLost.into());
     }
+    let discord_workflow = if discord_workflow {
+        // The guard holds the environment policy lock until this transaction commits.
+        tx.query_one("SELECT public.novu_rust_discord_workflow_guard($1,$2,$3)", &[&job.environment_id,&job.id,&job.lease_token]).await?.get::<_,bool>(0)
+    } else { false };
     // The reference's first workflow worker resolves the trigger identifier
     // after enqueue. Older queued jobs retain their previous semantics.
     let (

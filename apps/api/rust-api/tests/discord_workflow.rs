@@ -145,7 +145,7 @@ async fn trigger_renders_and_guards_subscriber_endpoint_and_preferences() {
             &mut db,
             Duration::from_secs(60),
             false,
-            false
+            true
         )
         .await
         .unwrap()
@@ -160,7 +160,82 @@ async fn trigger_renders_and_guards_subscriber_endpoint_and_preferences() {
         .get::<_, i64>(0),
         0
     );
-    produce(&mut db, app.clone(), "success").await;
+    db.batch_execute(
+        "UPDATE public.novu_rust_discord_workflow_policy SET enabled=true WHERE environment_id='a'",
+    )
+    .await
+    .unwrap();
+    let invalid = uuid::Uuid::new_v4();
+    novu_postgres_queue::enqueue(
+        &db,
+        invalid,
+        "a",
+        novu_postgres_queue::in_app::JOB_KIND,
+        &json!({"recipientIdentitySnapshot":{}}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        novu_postgres_queue::in_app::process_one_with_chat_options(
+            &mut db,
+            Duration::from_secs(60),
+            false,
+            true
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(
+        db.query_one(
+            "SELECT status FROM public.novu_queue_jobs WHERE id=$1",
+            &[&invalid]
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0),
+        "failed"
+    );
+    trigger(app.clone(), "legacy-worker").await;
+    // A disabled or pre-fence worker may claim, but its transaction cannot
+    // commit the parent or its domain writes while Discord is enabled.
+    assert!(
+        novu_postgres_queue::in_app::process_one_with_chat_options(
+            &mut db,
+            Duration::from_secs(60),
+            false,
+            false
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        db.query_one(
+            "SELECT count(*) FROM public.novu_queue_jobs WHERE kind=$1",
+            &[&novu_postgres_queue::discord_queue::WORKFLOW_KIND]
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0),
+        0
+    );
+    db.batch_execute("UPDATE public.novu_queue_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE kind='experimental_static_in_app' AND status='running'").await.unwrap();
+    assert_eq!(
+        novu_postgres_queue::requeue_expired(&db, novu_postgres_queue::in_app::JOB_KIND)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(
+        novu_postgres_queue::in_app::process_one_with_chat_options(
+            &mut db,
+            Duration::from_secs(60),
+            false,
+            true
+        )
+        .await
+        .unwrap()
+    );
+
     assert!(
         novu_postgres_queue::discord_queue::process_one(&mut db, "a", "dest", &provider)
             .await
