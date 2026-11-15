@@ -142,7 +142,89 @@ async fn verifies_token_mapping_scope_revocation_and_expiry() {
             .await
             .is_err()
     );
-    db.execute("INSERT INTO public.novu_rust_operator_token_revocations(issuer_hash,subject_hash,client_hash,token_id_hash,reason) VALUES (sha256(convert_to('https://issuer.test','UTF8')),sha256(convert_to('user-1','UTF8')),sha256(convert_to('console','UTF8')),sha256(convert_to('one','UTF8')),'fixture')", &[]).await.unwrap();
+    db.batch_execute("CREATE ROLE jwt_revoke_admin LOGIN; CREATE ROLE jwt_revoke_reader LOGIN; GRANT USAGE ON SCHEMA public TO jwt_revoke_admin,jwt_revoke_reader; GRANT EXECUTE ON FUNCTION public.novu_rust_admin_revoke_operator_token(bytea,bytea,bytea,bytea,text) TO jwt_revoke_admin,jwt_revoke_reader; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_token_revocation_audit_page(bigint,integer) TO jwt_revoke_admin,jwt_revoke_reader; INSERT INTO public.novu_rust_operator_token_revocation_admins SELECT rolname,oid,rolname='jwt_revoke_admin',rolname='jwt_revoke_reader' FROM pg_roles WHERE rolname IN ('jwt_revoke_admin','jwt_revoke_reader')").await.unwrap();
+    db.batch_execute("CREATE ROLE jwt_revoke_owner NOLOGIN; CREATE ROLE jwt_revoke_audit_owner NOLOGIN; GRANT USAGE ON SCHEMA public TO jwt_revoke_owner,jwt_revoke_audit_owner; GRANT SELECT,UPDATE ON public.novu_rust_operator_token_revocation_admins TO jwt_revoke_owner,jwt_revoke_audit_owner; GRANT INSERT ON public.novu_rust_operator_token_revocations,public.novu_rust_operator_token_revocation_audit TO jwt_revoke_owner; GRANT USAGE ON SEQUENCE public.novu_rust_operator_token_revocation_audit_id_seq TO jwt_revoke_owner; GRANT SELECT ON public.novu_rust_operator_token_revocation_audit TO jwt_revoke_audit_owner; ALTER FUNCTION public.novu_rust_admin_revoke_operator_token(bytea,bytea,bytea,bytea,text) OWNER TO jwt_revoke_owner; ALTER FUNCTION public.novu_rust_operator_token_revocation_audit_page(bigint,integer) OWNER TO jwt_revoke_audit_owner").await.unwrap();
+    let admin =
+        connect(&url.replacen("postgres://postgres@", "postgres://jwt_revoke_admin@", 1)).await;
+    let reader =
+        connect(&url.replacen("postgres://postgres@", "postgres://jwt_revoke_reader@", 1)).await;
+    let revoke_sql = "SELECT public.novu_rust_admin_revoke_operator_token(sha256(convert_to('https://issuer.test','UTF8')),sha256(convert_to('user-1','UTF8')),sha256(convert_to('console','UTF8')),sha256(convert_to($1,'UTF8')),$2)";
+    assert!(
+        reader
+            .query_one(revoke_sql, &[&"one", &"fixture"])
+            .await
+            .is_err()
+    );
+    assert!(
+        admin
+            .query(
+                "SELECT * FROM public.novu_rust_operator_token_revocations",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        admin
+            .query(
+                "SELECT * FROM public.novu_rust_operator_token_revocation_audit_page(NULL,100)",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    db.batch_execute("CREATE FUNCTION public.test_revoke_audit_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture audit failure'; END $$; CREATE TRIGGER test_revoke_audit_failure BEFORE INSERT ON public.novu_rust_operator_token_revocation_audit FOR EACH ROW EXECUTE FUNCTION public.test_revoke_audit_failure()").await.unwrap();
+    assert!(
+        admin
+            .query_one(revoke_sql, &[&"one", &"fixture"])
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        db.query_one(
+            "SELECT count(*) FROM public.novu_rust_operator_token_revocations",
+            &[]
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0),
+        0
+    );
+    db.batch_execute("DROP TRIGGER test_revoke_audit_failure ON public.novu_rust_operator_token_revocation_audit; DROP FUNCTION public.test_revoke_audit_failure()").await.unwrap();
+    assert!(
+        admin
+            .query_one(revoke_sql, &[&"one", &"fixture"])
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
+    assert!(
+        !admin
+            .query_one(revoke_sql, &[&"one", &"different reason"])
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
+    let audits=reader.query("SELECT actor::text,reason FROM public.novu_rust_operator_token_revocation_audit_page(NULL,100)",&[]).await.unwrap();
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].get::<_, String>(0), "jwt_revoke_admin");
+    assert_eq!(audits[0].get::<_, String>(1), "fixture");
+    db.batch_execute("UPDATE public.novu_rust_operator_token_revocation_admins SET can_revoke=false WHERE database_principal='jwt_revoke_admin'; UPDATE public.novu_rust_operator_token_revocation_admins SET can_read_audit=false WHERE database_principal='jwt_revoke_reader'").await.unwrap();
+    assert!(
+        admin
+            .query_one(revoke_sql, &[&"another", &"fixture"])
+            .await
+            .is_err()
+    );
+    assert!(
+        reader
+            .query(
+                "SELECT * FROM public.novu_rust_operator_token_revocation_audit_page(NULL,100)",
+                &[]
+            )
+            .await
+            .is_err()
+    );
     assert_eq!(
         guarded
             .clone()
