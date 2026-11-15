@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Two real recovery workers, actual SMTP worker and an isolated mock relay."""
-import os,pathlib,socket,socketserver,subprocess,threading,time,uuid
+import json,os,pathlib,socket,socketserver,subprocess,threading,time,uuid
 psql=os.environ['TEST_PSQL'];db=os.environ['DATABASE_URL'];work=os.environ['TEST_WORKER_DIR'];children=[];messages=[];lock=threading.Lock()
 def sql(query):
     p=subprocess.run([psql,db,'-q','-At','-v','ON_ERROR_STOP=1','-c',query],capture_output=True,text=True,timeout=10)
@@ -37,9 +37,10 @@ server=Server(('127.0.0.1',0),Relay);thread=threading.Thread(target=server.serve
 try:
     env='smtp-auto-fixture';other='smtp-auto-other';first=str(uuid.uuid4());second=str(uuid.uuid4());old=str(uuid.uuid4());reviewed=str(uuid.uuid4())
     sql("""CREATE ROLE smtp_auto_fixture LOGIN; GRANT USAGE ON SCHEMA public TO smtp_auto_fixture;
-GRANT EXECUTE ON FUNCTION public.novu_rust_smtp_auto_retry_batch(text,integer) TO smtp_auto_fixture;
+GRANT EXECUTE ON FUNCTION public.novu_rust_smtp_auto_retry_batch(text,integer),public.novu_rust_smtp_auto_history(text,bigint) TO smtp_auto_fixture;
 INSERT INTO public.novu_rust_environments VALUES('smtp-auto-fixture','org'),('smtp-auto-other','org');
 INSERT INTO public.novu_rust_smtp_auto_retry_workers SELECT 'smtp-auto-fixture',rolname,oid FROM pg_roles WHERE rolname='smtp_auto_fixture';
+INSERT INTO public.novu_rust_smtp_auto_admins SELECT 'smtp-auto-fixture',rolname,oid,false,false,true FROM pg_roles WHERE rolname='smtp_auto_fixture';
 INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) VALUES ('%s','smtp-auto-fixture','experimental_smtp_email','{"to":["first@example.test"],"subject":"successful","html":"hello"}');"""%first)
     cfg={**os.environ,'NOVU_POSTGRES_ALLOW_INSECURE':'true','NOVU_SMTP_ENVIRONMENT_ID':env,'SWALLOW_SMTP_HOST':'127.0.0.1','SWALLOW_SMTP_PORT':str(server.server_address[1]),'SWALLOW_SMTP_TLS':'none','SWALLOW_SMTP_FROM':'sender@example.test'}
     for key in ('SWALLOW_SMTP_USERNAME','SWALLOW_SMTP_PASSWORD','SWALLOW_SMTP_PASSWORD_FILE','SWALLOW_SMTP_CA_FILE','SWALLOW_SMTP_TRANSPORT_GUARD'):cfg.pop(key,None)
@@ -76,6 +77,10 @@ SELECT public.novu_rust_ack_smtp('smtp-auto-fixture','%s',a.revision,j.failure_r
     sql("UPDATE public.novu_rust_smtp_attempts SET updated_at=clock_timestamp()-interval '20 seconds' WHERE job_id='%s'"%second)
     time.sleep(3)
     assert sql("SELECT count(*) FROM public.novu_rust_smtp_auto_retries WHERE job_id='%s'"%second)=='1'
+    history=subprocess.run([psql,runner_url,'-q','-At','-v','ON_ERROR_STOP=1','-c',"SELECT public.novu_rust_smtp_auto_history('smtp-auto-fixture',NULL)"],capture_output=True,text=True,timeout=10)
+    assert history.returncode==0
+    rows=json.loads(history.stdout)['data'];assert len(rows)==2 and {row['jobId'] for row in rows}=={first,second}
+    assert 'example.test' not in history.stdout
     with lock:assert messages.count('successful')==2 and messages.count('repeated')==2, messages
     print('Explicit SMTP auto retry duplicated a lost reply, respected cutoff and retry limit with two workers.')
 finally:

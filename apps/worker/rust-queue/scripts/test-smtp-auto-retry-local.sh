@@ -13,3 +13,4 @@ cargo run --quiet --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.t
 cargo run --quiet --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --bin migrate-worker -- apply worker "$ROOT/apps/worker/rust-queue/migrations"
 cargo build --quiet --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --bin smtp-worker --bin smtp-auto-retry-worker
 TEST_PSQL="$TEST_PG_BIN/psql" TEST_WORKER_DIR="$ROOT/apps/worker/rust-queue/target/debug" python3 "$ROOT/apps/worker/rust-queue/tests/smtp_auto_retry_process.py"
+cargo test --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --test smtp_auto_admin -- --ignored
