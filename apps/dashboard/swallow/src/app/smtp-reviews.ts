@@ -2,7 +2,8 @@ import { Component, EventEmitter, Input, OnChanges, OnDestroy, Output, signal } 
 import { FormsModule } from '@angular/forms';
 
 type SmtpRow = {jobId:string;status:string;attemptState:string|null;attemptRevision:string|null;failureRevision:string;attempts:number};
-type HistoryRow = {actor:string;actorOid:string;requestId:string;jobId:string;attemptRevision:string;failureRevision:string;decision:'accepted'|'retry';reason:string;createdAt:string};
+type HistoryOperator = {issuer:string;subject:string;clientId:string;requestId:string};
+type HistoryRow = {operator:HistoryOperator|null;actor:string;actorOid:string;requestId:string;jobId:string;attemptRevision:string;failureRevision:string;decision:'accepted'|'retry';reason:string;createdAt:string};
 type HistoryCursor = {actorOid:string;requestId:string};
 type Review = {requestId:string;jobId:string;attemptRevision:string|null;failureRevision:string;reason:string;decision?:'accepted'|'retry'};
 @Component({selector:'app-smtp-reviews',imports:[FormsModule],templateUrl:'./smtp-reviews.html'})
@@ -55,7 +56,8 @@ export class SmtpReviews implements OnChanges,OnDestroy {
       const value:unknown=await response.json();if(!value||typeof value!=='object')throw new Error('page');const page=value as Record<string,unknown>;if(!Array.isArray(page['data'])||page['data'].length>100)throw new Error('page');
       const rows:HistoryRow[]=page['data'].map((value:unknown)=>{if(!value||typeof value!=='object')throw new Error('row');const r=value as Record<string,unknown>;
         if(typeof r['actor']!=='string'||!this.oid(r['actorOid'])||!this.uuid(r['requestId'])||!this.uuid(r['jobId'])||r['jobId'].toLowerCase()!==job||!this.uuid(r['attemptRevision'])||!this.revision(r['failureRevision'])||!['accepted','retry'].includes(r['decision'] as string)||typeof r['reason']!=='string'||typeof r['createdAt']!=='string')throw new Error('row');
-        return {actor:r['actor'],actorOid:r['actorOid'],requestId:r['requestId'],jobId:r['jobId'],attemptRevision:r['attemptRevision'],failureRevision:r['failureRevision'],decision:r['decision'] as 'accepted'|'retry',reason:r['reason'],createdAt:r['createdAt']};});
+        let operator:HistoryOperator|null=null;if(r['operator']!==null){if(!r['operator']||typeof r['operator']!=='object')throw new Error('operator');const o=r['operator'] as Record<string,unknown>;if(typeof o['issuer']!=='string'||typeof o['subject']!=='string'||typeof o['clientId']!=='string'||!this.uuid(o['requestId']))throw new Error('operator');operator={issuer:o['issuer'],subject:o['subject'],clientId:o['clientId'],requestId:o['requestId']};}
+        return {operator,actor:r['actor'],actorOid:r['actorOid'],requestId:r['requestId'],jobId:r['jobId'],attemptRevision:r['attemptRevision'],failureRevision:r['failureRevision'],decision:r['decision'] as 'accepted'|'retry',reason:r['reason'],createdAt:r['createdAt']};});
       let next:HistoryCursor|null=null;if(page['next']!==null){if(!page['next']||typeof page['next']!=='object'||rows.length!==100)throw new Error('cursor');const n=page['next'] as Record<string,unknown>;if(!this.oid(n['actorOid'])||!this.uuid(n['requestId'])||n['actorOid']!==rows.at(-1)?.actorOid||n['requestId']!==rows.at(-1)?.requestId)throw new Error('cursor');next={actorOid:n['actorOid'],requestId:n['requestId']};}
       if(seq!==this.historySeq)return;this.history.set(rows);this.historyNext.set(next);this.historyStatus.set('loaded');
     }catch{if(seq===this.historySeq)this.historyStatus.set('error');}finally{if(seq===this.historySeq)this.historyAbort=null;}

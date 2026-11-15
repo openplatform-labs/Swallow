@@ -129,6 +129,7 @@ async fn history_requires_separate_jwt_and_db_access() {
     let (status, page) = response(app.clone(), &token, "GET", &path, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(page["data"].as_array().unwrap().len(), 100);
+    assert!(page["data"][0]["operator"].is_null());
     assert_eq!(page["data"][0]["failureRevision"], "9223372036854775807");
     let second = format!(
         "{path}&beforeActorOid={}&beforeRequestId={}",

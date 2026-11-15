@@ -101,7 +101,7 @@ async fn smtp_resolution_requires_both_permissions_and_isolates_jwt_requests() {
     .await
     .unwrap();
     db.execute("INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES('https://issuer.test','alice','console',$1),('https://issuer.test','bob','console',$1),('https://issuer.test','alice','console',$2)",&[&env,&other]).await.unwrap();
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_smtp_resolve(text,text,text,text,bigint,uuid,uuid,uuid,bigint,text,text),public.novu_rust_operator_jwt_smtp_resolution_request(text,text,text,text,bigint,uuid,text) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_smtp_resolve(text,text,text,text,bigint,uuid,uuid,uuid,bigint,text,text),public.novu_rust_operator_jwt_smtp_resolution_request(text,text,text,text,bigint,uuid,text),public.novu_rust_operator_jwt_smtp_resolution_history(text,text,text,text,bigint,uuid,oid,uuid) TO {role}")).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname::text=$1",&[&role]).await.unwrap();
     let first = Uuid::new_v4();
     let second = Uuid::new_v4();
@@ -291,5 +291,69 @@ async fn smtp_resolution_requires_both_permissions_and_isolates_jwt_requests() {
         .unwrap()
         .get::<_, i64>(0),
         0
+    );
+    db.execute("INSERT INTO public.novu_rust_operator_jwt_smtp_resolution_history_viewers VALUES('https://issuer.test','alice','console',$1)",&[&env]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_smtp_resolution_audit_viewers SELECT $1,rolname,oid FROM pg_roles WHERE rolname::text=$2",&[&env,&role]).await.unwrap();
+    let history = format!(
+        "/v1/experimental/operator/smtp-resolution-history?environmentId={env}&jobId={first}"
+    );
+    let (status, page) = response(app.clone(), &alice, "GET", &history, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        page["data"][0]["operator"],
+        json!({"issuer":"https://issuer.test","subject":"alice","clientId":"console","requestId":id})
+    );
+    let history_bob = format!(
+        "/v1/experimental/operator/smtp-resolution-history?environmentId={env}&jobId={second}"
+    );
+    let (_, page_bob) = response(app.clone(), &alice, "GET", &history_bob, None).await;
+    assert_eq!(page_bob["data"][0]["operator"]["subject"], "bob");
+    let fourth = Uuid::new_v4();
+    db.execute("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES($1,$2,'experimental_smtp_email','{}','failed')",&[&fourth,&env]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_smtp_attempts(job_id,environment_id,state) VALUES($1,$2,'unknown')",&[&fourth,&env]).await.unwrap();
+    let row=db.query_one("SELECT a.revision,j.failure_revision FROM public.novu_rust_smtp_attempts a JOIN public.novu_queue_jobs j ON j.id=a.job_id WHERE j.id=$1",&[&fourth]).await.unwrap();
+    let fourth_rev: Uuid = row.get(0);
+    let fourth_failure: i64 = row.get(1);
+    let fourth_id = Uuid::new_v4();
+    let fourth_input = json!({"requestId":fourth_id,"jobId":fourth,"attemptRevision":fourth_rev,"failureRevision":fourth_failure.to_string(),"decision":"retry","reason":"relay did not accept"});
+    db.batch_execute("CREATE FUNCTION public.smtp_attribution_test_fail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'attribution unavailable'; END $$; CREATE TRIGGER smtp_attribution_test_fail BEFORE INSERT ON public.novu_rust_smtp_resolution_jwt_attribution FOR EACH ROW EXECUTE FUNCTION public.smtp_attribution_test_fail()").await.unwrap();
+    assert_eq!(
+        response(
+            app.clone(),
+            &alice,
+            "POST",
+            &path,
+            Some(fourth_input.clone())
+        )
+        .await
+        .0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        db.query_one(
+            "SELECT status FROM public.novu_queue_jobs WHERE id=$1",
+            &[&fourth]
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0),
+        "failed"
+    );
+    assert_eq!(
+        db.query_one(
+            "SELECT count(*) FROM public.novu_rust_smtp_resolutions WHERE job_id=$1",
+            &[&fourth]
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0),
+        0
+    );
+    db.batch_execute("DROP TRIGGER smtp_attribution_test_fail ON public.novu_rust_smtp_resolution_jwt_attribution; DROP FUNCTION public.smtp_attribution_test_fail()").await.unwrap();
+    assert_eq!(
+        response(app.clone(), &alice, "POST", &path, Some(fourth_input))
+            .await
+            .0,
+        StatusCode::OK
     );
 }

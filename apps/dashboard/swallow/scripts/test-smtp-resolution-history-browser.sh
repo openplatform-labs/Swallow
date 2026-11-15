@@ -91,7 +91,7 @@ await fill('input[name="smtpReviewReason"]','relay accepted evidence');await pag
 await page.click('input[name="smtpReviewConfirm"]');await page.click('app-smtp-reviews button:has-text("판정 요청")');
 await page.waitForFunction(()=>document.querySelector('app-smtp-reviews')?.innerText.includes('판정이 기록되었습니다.'));
 await page.click('app-smtp-reviews button:has-text("요청 결과 조회")');await page.waitForFunction(()=>document.querySelector('app-smtp-reviews')?.innerText.includes('확인된 요청:'));
-await fill('input[name="smtpHistoryJob"]','11111111-1111-4111-8111-000000000001');await page.click('app-smtp-reviews button:has-text("판정 이력 조회")');await page.waitForFunction(()=>[...document.querySelectorAll('app-smtp-reviews table')].some(t=>t.innerText.includes('relay accepted evidence')&&t.innerText.includes('ui_fixture_api')));
+await fill('input[name="smtpHistoryJob"]','11111111-1111-4111-8111-000000000001');await page.click('app-smtp-reviews button:has-text("판정 이력 조회")');await page.waitForFunction(()=>[...document.querySelectorAll('app-smtp-reviews table')].some(t=>t.innerText.includes('relay accepted evidence')&&t.innerText.includes('ui_fixture_api')&&t.innerText.includes('https://issuer.test / admin / console')));
 await page.click('app-smtp-reviews button:has-text("새 검토 준비")');await page.click('app-smtp-reviews button:has-text("미확인 작업 조회")');
 await page.waitForFunction(()=>document.querySelector('app-smtp-reviews table')?.innerText.includes('11111111-1111-4111-8111-000000000002'));
 await fill('input[name="smtpReviewReason"]','relay did not accept');await page.click('app-smtp-reviews tbody tr:nth-child(1) button:has-text("재발송 준비")');
