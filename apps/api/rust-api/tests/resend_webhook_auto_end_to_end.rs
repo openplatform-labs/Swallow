@@ -315,6 +315,11 @@ async fn real_http_and_worker_project_signed_events() {
     db.execute("INSERT INTO novu_rust_resend_webhook_lock_grants SELECT 'env',$1,oid FROM pg_roles WHERE rolname::text=$1",&[&role]).await.unwrap();
     let mut api_db = reqwest::Url::parse(&url).unwrap();
     api_db.set_username(&role).unwrap();
+    let projection_role = format!("resend_proj_{}", Uuid::new_v4().simple());
+    db.batch_execute(&format!("CREATE ROLE {projection_role} LOGIN; GRANT USAGE ON SCHEMA public TO {projection_role}; GRANT SELECT ON public.novu_rust_environments,public.novu_queue_jobs,public.novu_rust_resend_attempts,public.novu_rust_resend_recipients,public.novu_rust_resend_delivery_events,public.novu_rust_delivery_reconciliations,public.novu_rust_resend_auto_correlations,public.novu_rust_email_messages TO {projection_role}; GRANT UPDATE ON public.novu_queue_jobs,public.novu_rust_resend_attempts,public.novu_rust_email_messages TO {projection_role}; GRANT INSERT ON public.novu_rust_resend_auto_correlations TO {projection_role}; GRANT EXECUTE ON FUNCTION public.novu_rust_register_projection_policy(text,text,boolean),public.novu_rust_check_projection_policy(text,text,boolean),public.novu_rust_scoped_projection_heartbeat(text,text,boolean) TO {projection_role}")).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_projection_policy_logins SELECT 'env','resend',rolname,oid FROM pg_roles WHERE rolname::text=$1",&[&projection_role]).await.unwrap();
+    let mut projection_db = reqwest::Url::parse(&url).unwrap();
+    projection_db.set_username(&projection_role).unwrap();
     let job = Uuid::new_v4();
     let tag = Uuid::new_v4();
     queue::enqueue(&db, job, "env", queue::resend_queue::JOB_KIND, &json!({}))
@@ -379,9 +384,10 @@ async fn real_http_and_worker_project_signed_events() {
     let mut worker = Process(
         std::process::Command::new(std::env::var("TEST_RESEND_PROJECTION_BINARY").unwrap())
             .env_clear()
-            .env("DATABASE_URL", &url)
+            .env("DATABASE_URL", projection_db.as_str())
             .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
             .env("NOVU_RESEND_ENVIRONMENT_ID", "env")
+            .env("SWALLOW_PROJECTION_SCOPED_POLICY", "true")
             .env("NOVU_RESEND_PROJECTION_AUTO_CORRELATE", "true")
             .env("NOVU_RESEND_PROJECTION_SCAN_INTERVAL_SECONDS", "1")
             .stdout(std::process::Stdio::null())
@@ -433,6 +439,7 @@ async fn real_http_and_worker_project_signed_events() {
         reqwest::StatusCode::NO_CONTENT
     );
     wait_for_result(&db, job, "pending").await;
+    db.execute("DELETE FROM public.novu_rust_projection_policy_logins WHERE environment_id='env' AND provider='resend' AND database_principal=$1",&[&projection_role]).await.unwrap();
     assert_eq!(
         send_http(
             &origin,
@@ -446,6 +453,11 @@ async fn real_http_and_worker_project_signed_events() {
         .await,
         reqwest::StatusCode::NO_CONTENT
     );
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let row=db.query_one("SELECT j.resend_delivery_result,m.resend_delivery_result FROM novu_queue_jobs j JOIN novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1",&[&job]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "unknown");
+    assert_eq!(row.get::<_, String>(1), "unknown");
+    db.execute("INSERT INTO public.novu_rust_projection_policy_logins SELECT 'env','resend',rolname,oid FROM pg_roles WHERE rolname::text=$1",&[&projection_role]).await.unwrap();
     wait_for_result(&db, job, "partial").await;
     assert_eq!(
         send_http(
