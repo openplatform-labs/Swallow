@@ -4730,3 +4730,45 @@ pub(super) async fn smtp_failure(State(db):State<Arc<Client>>,headers:HeaderMap,
         Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path()),
     }
 }
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all="camelCase",deny_unknown_fields)]
+struct DiscordResolutionBody {request_id:String,job_id:String,attempt_revision:Option<String>,failure_revision:String,decision:String,reason:String}
+pub(super) async fn discord_resolve(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>,body:Bytes) -> Response {
+    let identity=match authenticate(&db,&headers,verifier).await {Ok(v)=>v,Err(status)=>return failure(status,uri.path())};
+    let params:Vec<_>=form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).collect();
+    if params.len()!=1 || params[0].0!="environmentId" || params[0].1.is_empty() || params[0].1.len()>512 || params[0].1.contains('\0') {return failure(StatusCode::BAD_REQUEST,uri.path());}
+    let Some(input)=(body.len()<=4096).then(||serde_json::from_slice::<DiscordResolutionBody>(&body).ok()).flatten() else{return failure(StatusCode::BAD_REQUEST,uri.path());};
+    if input.reason.trim().is_empty() || input.reason.len()>512 || input.reason.contains('\0') || !matches!(input.decision.as_str(),"accepted"|"retry") {return failure(StatusCode::BAD_REQUEST,uri.path());}
+    let (Ok(request),Ok(job),Ok(failure_revision),Ok(exp))=(Uuid::parse_str(&input.request_id),Uuid::parse_str(&input.job_id),input.failure_revision.parse::<i64>(),i64::try_from(identity.expires_at)) else{return failure(StatusCode::BAD_REQUEST,uri.path());};
+    let attempt=match input.attempt_revision {Some(value)=>match Uuid::parse_str(&value){Ok(id)=>Some(id),Err(_)=>return failure(StatusCode::BAD_REQUEST,uri.path())},None=>None};
+    if attempt.is_none() && input.decision!="retry" {return failure(StatusCode::BAD_REQUEST,uri.path());}
+    if failure_revision<0 || failure_revision.to_string()!=input.failure_revision {return failure(StatusCode::BAD_REQUEST,uri.path());}
+    let env=params[0].1.as_ref();
+    match guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_discord_resolve($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&job,&attempt,&failure_revision,&input.decision,&input.reason]).await {
+        Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
+        Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
+        Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
+        Err(e) if e.code().is_some_and(|c|matches!(c.code(),"P4090"|"40001"))=>{let mut response=error_at(StatusCode::CONFLICT,"Resolution conflict","Conflict",uri.path()).into_response();response.headers_mut().insert(header::CACHE_CONTROL,header::HeaderValue::from_static("no-store"));response},
+        Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path()),
+    }
+}
+pub(super) async fn discord_resolution_request(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
+    let identity=match authenticate(&db,&headers,verifier).await {Ok(v)=>v,Err(status)=>return failure(status,uri.path())};
+    let mut env=None;let mut request=None;let mut decision=None;
+    for (key,value) in form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()) {
+        match key.as_ref() {
+            "environmentId" if env.is_none() && !value.is_empty() && value.len()<=512 && !value.contains('\0') => env=Some(value.into_owned()),
+            "requestId" if request.is_none() => match Uuid::parse_str(&value) {Ok(v)=>request=Some(v),Err(_)=>return failure(StatusCode::BAD_REQUEST,uri.path())},
+            "decision" if decision.is_none() && matches!(value.as_ref(),"accepted"|"retry") => decision=Some(value.into_owned()),
+            _=>return failure(StatusCode::BAD_REQUEST,uri.path()),
+        }
+    }
+    let (Some(env),Some(request),Some(decision),Ok(exp))=(env,request,decision,i64::try_from(identity.expires_at)) else {return failure(StatusCode::BAD_REQUEST,uri.path());};
+    match guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_discord_resolution_request($1,$2,$3,$4,$5,$6,$7)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&decision]).await {
+        Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
+        Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
+        Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
+        Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path()),
+    }
+}

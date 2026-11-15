@@ -146,7 +146,7 @@ async fn discord_review_is_scoped_revision_fenced_and_idempotent() {
     );
     db.execute("UPDATE public.novu_rust_operator_jwt_discord_review_grants SET can_review=true WHERE environment_id=$1",&[&env]).await.unwrap();
     db.execute(
-        "UPDATE public.novu_rust_discord_attempts SET http_status=429 WHERE job_id=$1",
+        "UPDATE public.novu_rust_discord_attempts SET http_status=429,retry_after_seconds=90 WHERE job_id=$1",
         &[&job],
     )
     .await
@@ -166,6 +166,8 @@ async fn discord_review_is_scoped_revision_fenced_and_idempotent() {
     );
     let (_, updated) = response(app.clone(), &token, "GET", &list, None).await;
     let row = &updated["data"][0];
+    assert_eq!(row["retryAfterSeconds"],90);
+    assert!(row["retryNotBefore"].as_str().unwrap().ends_with('Z'));
     let input = json!({"requestId":request_id,"jobId":job,"attemptRevision":row["attemptRevision"],"failureRevision":row["failureRevision"],"reason":"reviewed"});
     assert_eq!(
         response(app.clone(), &token, "POST", &post, Some(input.clone()))

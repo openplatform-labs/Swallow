@@ -1,30 +1,30 @@
 <section class="card subscriber-card"><div class="card-block">
   <div class="card-eyebrow">DISCORD</div><h2>Discord 발송 실패 검토</h2>
-  <p>운영자 JWT와 환경을 사용합니다. 목록 조회와 확인에는 별도 권한이 필요합니다. 확인은 발송 여부를 판정하거나 재전송하지 않습니다.</p>
+  <p>운영자 JWT와 환경을 사용합니다. 목록 조회와 확인에는 별도 권한이 필요합니다. 검토 확인은 발송 상태를 바꾸지 않습니다. 판정에는 별도 권한과 독립적인 근거가 필요합니다.</p>
   <button type="button" class="btn btn-outline" (click)="list()" [disabled]="listStatus()==='loading' || reviewStatus()==='sending'">미확인 작업 조회</button>
   @if(listStatus()==='loading'){<p role="status">작업을 조회 중입니다.</p>} @else if(listStatus()==='error'){<p role="alert">목록을 조회하지 못했습니다. 인증과 권한을 확인하세요.</p>}
   @else if(listStatus()==='loaded'){
     @if(rows().length===0){<p>조회된 작업이 없습니다.</p>} @else {
-      <div class="table-wrap"><table class="table"><thead><tr><th>작업 UUID</th><th>작업 상태</th><th>발송 시도</th><th>HTTP</th><th>검토</th></tr></thead><tbody>
-      @for(row of rows();track row.jobId){<tr><td>{{row.jobId}}</td><td>{{row.status}}</td><td>{{row.attemptState ?? '시도 전'}}</td><td>{{row.httpStatus ?? '—'}}</td><td><button type="button" class="btn btn-sm btn-outline" (click)="prepare(row)" [disabled]="!reviewable(row) || reviewStatus()!=='idle' || !reason.trim()">검토 준비</button></td></tr>}
+      <div class="table-wrap"><table class="table"><thead><tr><th>작업 UUID</th><th>작업 상태</th><th>발송 시도</th><th>HTTP</th><th>429 대기 안내</th><th>검토 및 판정</th></tr></thead><tbody>
+      @for(row of rows();track row.jobId){<tr><td>{{row.jobId}}</td><td>{{row.status}}</td><td>{{row.attemptState ?? '시도 전'}}</td><td>{{row.httpStatus ?? '—'}}</td><td>{{row.retryAfterSeconds===null ? '없음' : row.retryAfterSeconds + '초' }}<br>{{row.retryNotBefore ?? ''}}</td><td><button type="button" class="btn btn-sm btn-outline" (click)="prepare(row)" [disabled]="!reviewable(row) || reviewStatus()!=='idle' || !reason.trim()">검토 준비</button> <button type="button" class="btn btn-sm btn-outline" (click)="prepare(row,'accepted')" [disabled]="!reviewable(row) || row.attemptState!=='unknown' || reviewStatus()!=='idle' || !reason.trim()">접수 판정</button> <button type="button" class="btn btn-sm btn-danger-outline" (click)="prepare(row,'retry')" [disabled]="!reviewable(row) || reviewStatus()!=='idle' || !reason.trim()">재발송 준비</button></td></tr>}
       </tbody></table></div>
     }
     <button type="button" class="btn btn-sm btn-outline" (click)="list(true)" [disabled]="!next() || reviewStatus()==='sending'">다음</button>
     <p>목록은 UUID순이며 페이지 간 단일 시점의 스냅샷이 아닙니다. 진행 중인 시도는 확인할 수 없습니다.</p>
   }
   <label for="discord-review-reason">검토 사유</label><input id="discord-review-reason" class="clr-input" name="discordReviewReason" [(ngModel)]="reason" [disabled]="reviewStatus()!=='idle'" autocomplete="off" maxlength="512">
-  <p>독립적으로 결과를 조사한 뒤 검토하세요. 사유에 비밀 값이나 개인정보를 넣지 마세요.</p>
+  <p>독립적으로 결과를 조사하세요. 재발송은 즉시 예약되며 중복될 수 있습니다. 429 대기 안내와 다른 발송자의 요청률도 확인하세요. 사유에 비밀 값이나 개인정보를 넣지 마세요.</p>
   @if(reviewStatus()==='unavailable'){<p role="alert">요청 ID를 생성할 수 없습니다.</p><button type="button" class="btn btn-outline" (click)="resetReview()">다시 준비</button>}
   @if(review();as item){
-    <p>요청 ID: <strong>{{item.requestId}}</strong> · 작업: {{item.jobId}}<br>시도 revision: {{item.attemptRevision ?? '없음'}} · 실패 revision: {{item.failureRevision}}<br>사유: {{item.reason}}</p>
+    <p>선택: <strong>{{item.decision==='accepted' ? '접수 판정' : item.decision==='retry' ? '재발송' : '검토 확인'}}</strong><br>요청 ID: <strong>{{item.requestId}}</strong> · 작업: {{item.jobId}}<br>시도 revision: {{item.attemptRevision ?? '없음'}} · 실패 revision: {{item.failureRevision}}<br>사유: {{item.reason}}</p>
     <p>요청 ID를 기록하세요. 화면을 떠나거나 새로고침하면 요청 정보가 지워집니다.</p>
-    @if(reviewStatus()==='prepared'){<label><input type="checkbox" name="discordReviewConfirm" [(ngModel)]="confirmed"> 대상과 조사 내용을 확인했습니다.</label> <button type="button" class="btn btn-danger-outline" (click)="submit()" [disabled]="!confirmed">검토 확인 요청</button> <button type="button" class="btn btn-outline" (click)="resetReview()">취소</button>}
+    @if(reviewStatus()==='prepared'){<label><input type="checkbox" name="discordReviewConfirm" [(ngModel)]="confirmed"> 대상과 조사 내용을 확인하고 위 선택의 결과를 이해했습니다.</label> <button type="button" class="btn btn-danger-outline" (click)="submit()" [disabled]="!confirmed">{{item.decision ? '판정 요청' : '검토 확인 요청'}}</button> <button type="button" class="btn btn-outline" (click)="resetReview()">취소</button>}
     @else if(reviewStatus()==='sending'){<p role="status">확인을 요청하고 있습니다.</p>}
-    @else if(reviewStatus()==='recorded'){<p role="status">{{recorded() ? '검토가 기록되었습니다.' : '이미 확인된 상태입니다.'}} 최신 목록을 다시 조회하세요.</p><button type="button" class="btn btn-outline" (click)="resetReview()">새 검토 준비</button>}
+    @else if(reviewStatus()==='recorded'){<p role="status">{{recorded() ? (item.decision ? '판정이 기록되었습니다.' : '검토가 기록되었습니다.') : '이미 확인된 상태입니다.'}} 최신 목록을 다시 조회하세요.</p><button type="button" class="btn btn-outline" (click)="resetReview()">새 검토 준비</button>}
     @else if(reviewStatus()==='unknown'){<p role="alert">요청 결과가 불명입니다. 요청 ID로 확인하세요. 조회 결과가 없어도 요청이 진행 중일 수 있습니다.</p><label><input type="checkbox" name="discordReviewRetryConfirm" [(ngModel)]="retryConfirmed"> 같은 요청을 재제출합니다.</label> <button type="button" class="btn btn-outline" (click)="submit(true)" [disabled]="!retryConfirmed">동일 요청 재제출</button><p>재제출에는 원래 토큰, 환경과 API 주소가 필요합니다.</p><label><input type="checkbox" name="discordReviewResetConfirm" [(ngModel)]="resetConfirmed"> 기존 요청 결과를 독립적으로 조사했습니다.</label> <button type="button" class="btn btn-outline" (click)="resetReview()" [disabled]="!resetConfirmed">검토 후 새 요청 준비</button>}
   }
   @if(message()){<p role="alert">{{message()}}</p>}
-  <form class="decision-form" (ngSubmit)="lookup()"><label for="discord-review-request">검토 요청 ID 조회</label><input id="discord-review-request" name="discordReviewRequestId" [(ngModel)]="lookupId" (ngModelChange)="clearLookup()" autocomplete="off" [disabled]="reviewStatus()==='sending'" required><button type="submit" class="btn btn-outline" [disabled]="reviewStatus()==='sending' || lookupStatus()==='loading'">요청 결과 조회</button></form>
+  <form class="decision-form" (ngSubmit)="lookup()"><label for="discord-review-request">요청 ID 조회</label><select name="discordLookupDecision" class="clr-select" [(ngModel)]="lookupDecision" (ngModelChange)="clearLookup()" [disabled]="reviewStatus()==='sending'"><option value="">검토 확인</option><option value="accepted">접수 판정</option><option value="retry">재발송</option></select><input id="discord-review-request" name="discordReviewRequestId" [(ngModel)]="lookupId" (ngModelChange)="clearLookup()" autocomplete="off" [disabled]="reviewStatus()==='sending'" required><button type="submit" class="btn btn-outline" [disabled]="reviewStatus()==='sending' || lookupStatus()==='loading'">요청 결과 조회</button></form>
   @if(lookupStatus()==='found'){@if(lookupRecord();as found){<p role="status">확인된 요청: 작업 {{found.jobId}} · 사유 {{found.reason}} · {{found.recorded ? '기록됨' : '이미 확인됨'}}</p>}} @else if(lookupStatus()==='not-found'){<p role="status">조회 시점에 기록이 없습니다. 요청이 아직 진행 중일 수 있습니다.</p>} @else if(lookupStatus()==='error'){<p role="alert">요청 결과를 조회하지 못했습니다. 인증과 권한을 확인하세요.</p>}
 </div></section>
 

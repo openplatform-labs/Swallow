@@ -4,7 +4,7 @@ import { DiscordReviews } from './discord-reviews';
 const job='11111111-1111-4111-8111-111111111111';
 const revision='22222222-2222-4222-8222-222222222222';
 const requestId='33333333-3333-4333-8333-333333333333';
-const row={jobId:job,kind:'experimental_discord_workflow',status:'failed',attemptState:'unknown',attemptRevision:revision,failureRevision:'7',attempts:1,httpStatus:null};
+const row={jobId:job,kind:'experimental_discord_workflow',status:'failed',attemptState:'unknown',attemptRevision:revision,failureRevision:'7',attempts:1,httpStatus:null,retryAfterSeconds:null,retryNotBefore:null};
 function component(){const fixture=TestBed.createComponent(DiscordReviews);const c=fixture.componentInstance;c.apiOrigin='https://api.example.test';c.environment='env';c.token='aaa.bbb.ccc';return {fixture,c};}
 describe('Discord operator reviews',()=>{
   afterEach(()=>vi.restoreAllMocks());
@@ -26,4 +26,13 @@ describe('Discord operator reviews',()=>{
     const running={...row,status:'running',attemptState:'dispatching'};const pre={...row,jobId:'44444444-4444-4444-8444-444444444444',attemptState:null,attemptRevision:null};vi.spyOn(crypto,'randomUUID').mockReturnValue(requestId);vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[running,pre],hasMore:false,next:null})));
     const {fixture,c}=component();await c.list();c.reason='checked';c.prepare(c.rows()[0]);expect(c.review()).toBeNull();c.prepare(c.rows()[1]);expect(c.review()?.attemptRevision).toBeNull();fixture.destroy();
   });
+  it('shows rate-limit guidance and resolves a lost retry request',async()=>{
+    const limited={...row,attemptState:'rejected',httpStatus:429,retryAfterSeconds:60,retryNotBefore:'2026-11-15T00:01:00Z'};vi.spyOn(crypto,'randomUUID').mockReturnValue(requestId);
+    const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[limited],hasMore:false,next:null}))).mockRejectedValueOnce(new Error('lost')).mockResolvedValueOnce(new Response(JSON.stringify({found:true,requestId,jobId:job,attemptRevision:revision,failureRevision:'7',decision:'retry',reason:'reviewed',recorded:true,createdAt:'2026-11-15T00:00:00Z'})));
+    const {fixture,c}=component();await c.list();fixture.detectChanges();expect(fixture.nativeElement.textContent).toContain('60초');expect(fixture.nativeElement.textContent).toContain('즉시 예약');c.reason='reviewed';c.prepare(c.rows()[0],'accepted');expect(c.review()).toBeNull();c.prepare(c.rows()[0],'retry');c.confirmed=true;await c.submit();expect(c.reviewStatus()).toBe('unknown');expect(mock.mock.calls[1][0]).toContain('/discord-resolution?');await c.lookup();expect(c.reviewStatus()).toBe('recorded');expect(mock.mock.calls[2][0]).toContain('decision=retry');fixture.destroy();
+  });
+  it('supports retrying pre-dispatch failures without allowing acceptance',async()=>{
+    const pre={...row,attemptState:null,attemptRevision:null};vi.spyOn(crypto,'randomUUID').mockReturnValue(requestId);vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[pre],hasMore:false,next:null})));const {fixture,c}=component();await c.list();c.reason='fixed';c.prepare(c.rows()[0],'accepted');expect(c.review()).toBeNull();c.prepare(c.rows()[0],'retry');expect(c.review()?.attemptRevision).toBeNull();fixture.destroy();
+  });
+
 });
