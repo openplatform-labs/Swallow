@@ -16,6 +16,10 @@ PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print
 export TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/postgres" CARGO_INCREMENTAL=0
 cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test smtp_resolution -- --ignored
 
+"$TEST_PG_BIN/createdb" -h 127.0.0.1 -p "$PORT" -U postgres smtp_history_test
+export TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/smtp_history_test"
+cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test smtp_resolution_history -- --ignored
+
 # The process test needs the complete schema in a separate disposable database.
 "$TEST_PG_BIN/createdb" -h 127.0.0.1 -p "$PORT" -U postgres smtp_worker_test
 export DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/smtp_worker_test" TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/smtp_worker_test" NOVU_POSTGRES_ALLOW_INSECURE=true
