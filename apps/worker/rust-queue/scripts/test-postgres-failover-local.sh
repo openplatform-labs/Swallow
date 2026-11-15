@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$(cd ../../.. && pwd)
 scenario=${SWALLOW_LOCAL_FAILOVER_SCENARIO:-alert-binding}
-case "$scenario" in alert-binding|alert-scheduler|alert-v2|alert-v3|alert-timing|trigger-key|trigger-inflight|sendgrid-inflight|sendgrid-sandbox-inflight|smtp|smtp-rls|smtp-resolution|discord-manual-retry|discord-cooldown|discord-inflight|in-app|resend|resend-cooldown|resend-invalid|twilio|fcm|fcm-delay|fcm-exp|fcm-exp-repeat|fcm-review) ;; *) echo 'invalid local failover scenario' >&2; exit 2;; esac
+case "$scenario" in alert-binding|alert-scheduler|alert-v2|alert-v3|alert-timing|trigger-key|trigger-inflight|execution-grant-inflight|sendgrid-inflight|sendgrid-sandbox-inflight|smtp|smtp-rls|smtp-resolution|discord-manual-retry|discord-cooldown|discord-inflight|in-app|resend|resend-cooldown|resend-invalid|twilio|fcm|fcm-delay|fcm-exp|fcm-exp-repeat|fcm-review) ;; *) echo 'invalid local failover scenario' >&2; exit 2;; esac
 pgbin=${SWALLOW_TEST_POSTGRES_BIN:-/opt/homebrew/opt/postgresql@17/bin}
 [[ -x "$pgbin/pg_ctl" && -x "$pgbin/pg_basebackup" ]] || { echo 'PostgreSQL 17 server binaries are required' >&2; exit 1; }
 testdir=$(mktemp -d /private/tmp/swallow-alert-ha.XXXXXX)
@@ -51,6 +51,8 @@ if [[ "$scenario" == alert-timing ]]; then
 elif [[ "$scenario" == trigger-key || "$scenario" == trigger-inflight ]]; then
   export TEST_TRIGGER_INFLIGHT=$([[ "$scenario" == trigger-inflight ]] && printf true || printf false)
   cargo test --locked --manifest-path "$root/apps/api/rust-api/Cargo.toml" --test trigger_key_failover -- --ignored --nocapture
+elif [[ "$scenario" == execution-grant-inflight ]]; then
+  cargo test --locked --manifest-path "$root/apps/api/rust-api/Cargo.toml" --test execution_grant_failover -- --ignored --nocapture
 elif [[ "$scenario" == sendgrid-inflight || "$scenario" == sendgrid-sandbox-inflight ]]; then
   export TEST_SENDGRID_SANDBOX=$([[ "$scenario" == sendgrid-sandbox-inflight ]] && printf true || printf false)
   cargo test --locked --features test-mocks --test sendgrid_inflight_failover -- --ignored --nocapture
