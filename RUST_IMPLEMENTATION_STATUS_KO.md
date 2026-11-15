@@ -1,3 +1,5 @@
+Resend 예약 화면 통합 검증: Angular jsdom 폼 → 실제 로컬 HTTP API → PostgreSQL → 워크플로 워커 → Resend 큐 작업의 예약 시각 보존을 확인했다. 제한 DB 로그인·JWT·실제 브라우저·실제 예약 발송과 운영 HA는 이 시험에서 검증하지 않았다. 첫 시도에서 테스트 초기화 대기와 큐 필드 경로를 수정했다. [대시보드 README](apps/dashboard/swallow/README.md)를 참고한다.
+
 Resend 예약 선택 UI: Angular 워크플로 실행 화면에서 선택적으로 RFC 3339 예약 시각을 입력해 Resend 전역 override를 전송한다. 다른 채널은 예약되지 않고 이미 접수된 예약은 UI에서 취소·변경할 수 없다. API 키·JWT 요청과 날짜 오류는 Angular 모의 시험으로 검증했으며 실제 브라우저·실제 예약 발송과 원본 전체 비교는 미검증이다. [대시보드 README](apps/dashboard/swallow/README.md)를 참고한다.
 
 Resend 예약 경보 보완: 워커 마이그레이션 0257과 새 직접 조회 바이너리는 동일 환경에서 공급자 메시지 ID가 중복되면 예약 시각 전이라도 해당 작업을 조사 대상으로 집계한다. 격리 PostgreSQL에서 양쪽 상태 조회의 ID 충돌·실패·미확정 및 정상 대기를 검증한다. 다른 DB에 존재하는 충돌이나 아직 알려지지 않은 ID, 운영 HA는 검증하지 않았다.
