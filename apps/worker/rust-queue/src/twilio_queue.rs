@@ -647,7 +647,7 @@ mod tests {
                 } else {
                     r#"{"sid":"SM123","date_created":"Wed, 28 Oct 2026 10:00:00 +0000"}"#
                 };
-                socket.write_all(format!("HTTP/1.1 {status} Test\r\nRetry-After: 120\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                socket.write_all(format!("HTTP/1.1 {status} Test\r\nDate: Wed, 21 Oct 2015 07:28:00 GMT\r\nRetry-After: Wed, 21 Oct 2015 07:30:00 GMT\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
                 captured_dispatch
             });
             let provider = Twilio::test_origin(

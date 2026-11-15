@@ -1,31 +1,8 @@
 //! Experimental FCM provider message planning and limited workflow/queue delivery.
+use crate::retry_after::retry_after_seconds;
 use reqwest::{Client, header};
 use serde_json::{Map, Value, json};
 use std::time::{Duration, SystemTime};
-
-// FCM can return either seconds or an HTTP date. Use the server's Date when
-// available so differences between provider and worker clocks do not shorten
-// the wait. The elapsed response time is deliberately not subtracted.
-fn retry_after_seconds(headers: &header::HeaderMap, now: SystemTime) -> Option<u32> {
-    let mut values = headers.get_all(header::RETRY_AFTER).iter();
-    let value = match (values.next(), values.next()) {
-        (Some(value), None) => value.to_str().ok()?,
-        _ => return None,
-    };
-    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
-        return value.parse::<u32>().ok().filter(|seconds| *seconds <= 86_400);
-    }
-    let deadline = httpdate::parse_http_date(value).ok()?;
-    let mut dates = headers.get_all(header::DATE).iter();
-    let base = match (dates.next(), dates.next()) {
-        (None, None) => now,
-        (Some(value), None) => httpdate::parse_http_date(value.to_str().ok()?).ok()?,
-        _ => return None,
-    };
-    let duration = deadline.duration_since(base).unwrap_or(Duration::ZERO);
-    let seconds = duration.as_secs().checked_add(u64::from(duration.subsec_nanos() > 0))?;
-    u32::try_from(seconds).ok().filter(|seconds| *seconds <= 86_400)
-}
 
 #[derive(Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]

@@ -70,16 +70,9 @@ pub fn request_body(message: &Message) -> Result<Value, SendError> {
     Ok(body)
 }
 
-/// Accept only a single bounded, unsigned number of seconds.
+/// Accept one bounded delay or HTTP date for both Slack and Twilio.
 pub(crate) fn retry_after_seconds(headers: &header::HeaderMap) -> Option<u32> {
-    let mut values = headers.get_all(header::RETRY_AFTER).iter();
-    match (values.next(), values.next()) {
-        (Some(value), None) => value.to_str().ok().and_then(|value| {
-            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) { return None; }
-            value.parse::<u32>().ok().filter(|seconds| *seconds <= 86_400)
-        }),
-        _ => None,
-    }
+    crate::retry_after::retry_after_seconds(headers, std::time::SystemTime::now())
 }
 
 pub struct Slack {
@@ -274,6 +267,8 @@ mod tests {
         for headers in [
             ("Retry-After: 0\r\n", Some(0)),
             ("Retry-After: 120\r\n", Some(120)),
+            ("Date: Wed, 21 Oct 2015 07:28:00 GMT\r\nRetry-After: Wed, 21 Oct 2015 07:30:00 GMT\r\n", Some(120)),
+            ("Date: invalid\r\nRetry-After: Wed, 21 Oct 2015 07:30:00 GMT\r\n", None),
             ("Retry-After: 86400\r\n", Some(86400)),
             ("Retry-After: 86401\r\n", None),
             ("Retry-After: -1\r\n", None),

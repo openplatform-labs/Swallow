@@ -1,3 +1,5 @@
+Slack·Twilio 429 날짜형 `Retry-After`: FCM·Resend와 공통 해석기를 사용하고 Slack 공유 대기 또는 Twilio 선택형 지연 예약의 안내에 반영한다. 기존에 날짜형이 미지원이어서 해당 응답의 동작이 바뀐다. 모의 Slack 앱·웹훅·워크플로와 Twilio SMS의 DB 저장을 임시 PostgreSQL에서 검증했고 네 채널의 헤더 단위 시험이 통과했다. 실제 공급자 날짜 응답과 운영 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)에 실행 방법과 시계 의존성을 기록했다.
+
 Resend 429의 `Retry-After` HTTP 날짜 지원: 서버 `Date` 또는 워커 시계를 기준으로 올림한 초를 기존 24시간 제한과 공유 대기 경로에 전달한다. 중복·유효하지 않은 날짜는 적용하지 않는다. 모의 공급자 단위 시험과 임시 PostgreSQL에서 시도 기록·다른 작업의 공유 대기 연기를 검증했다. 서버·워커·DB 시계 및 중간 프록시 설정에 의존하며 실제 Resend 429·운영 HA는 미검증이다. 자세한 조건은 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
 Resend 공유 대기 정책 변경 화면은 401·403 응답에 인증·권한 오류, 409에 충돌 안내를 추가한다. 앞선 요청의 처리 가능성을 배제하지 않고 결과 불명·요청 ID 보존 및 재조회 흐름은 유지한다. Angular 테스트 229건과 임시 PostgreSQL·실제 브라우저에서 권한 회수 후 오류 안내를 확인했다. 외부 프록시·IdP 및 운영 HA는 미검증이다.
