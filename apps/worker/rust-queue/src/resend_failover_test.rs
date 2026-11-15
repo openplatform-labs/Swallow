@@ -376,7 +376,7 @@ async fn synchronous_failover_preserves_resend_shared_cooldown() {
     let mut db=connect(&primary).await;
     let env="resend-cooldown-ha";
     db.execute("INSERT INTO public.novu_rust_environments VALUES($1,'org')", &[&env]).await.unwrap();
-    db.execute("INSERT INTO public.novu_rust_resend_cooldown_policies(environment_id,fallback_seconds) VALUES($1,300)", &[&env]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_resend_cooldown_policies(environment_id,fallback_seconds) VALUES($1,600)", &[&env]).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_resend_cooldown_workers SELECT $1,rolname,oid FROM pg_roles WHERE rolname=session_user", &[&env]).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,rolname,'alert_view',oid FROM pg_roles WHERE rolname=session_user", &[&env]).await.unwrap();
     assert!(resend_queue::register_worker_policy(&db,env,false,true).await.unwrap());
@@ -384,15 +384,17 @@ async fn synchronous_failover_preserves_resend_shared_cooldown() {
     enqueue(&db,first,env,resend_queue::JOB_KIND,&json!({"to":["fixture@example.test"],"subject":"fixture","html":"test"})).await.unwrap();
     let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
     let provider=Resend::test_endpoint(Config {api_key:"fixture".into(),from:"sender@example.test".into(),sender_name:String::new()}, &format!("http://{}/emails",listener.local_addr().unwrap())).unwrap();
-    let mocked=tokio::spawn(async move {let (mut socket,_)=listener.accept().await.unwrap();let mut buf=[0u8;4096];assert!(socket.read(&mut buf).await.unwrap()>0);socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 300\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();});
+    let mocked=tokio::spawn(async move {let (mut socket,_)=listener.accept().await.unwrap();let mut buf=[0u8;4096];assert!(socket.read(&mut buf).await.unwrap()>0);socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nDate: Wed, 21 Oct 2015 07:28:00 GMT\r\nRetry-After: Wed, 21 Oct 2015 07:33:00 GMT\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();});
     assert!(resend_queue::process_one_with_registered_policy_and_cooldown(&mut db,env,&provider,false,crate::email_step_policy::Policy::Snapshot,false,false,false,true).await.unwrap());
     mocked.await.unwrap();
+    let seconds: i32 = db.query_one("SELECT retry_after_seconds FROM public.novu_rust_resend_attempts WHERE job_id=$1 AND environment_id=$2", &[&first,&env]).await.unwrap().get(0);
+    assert_eq!(seconds,300);
     let deadline:String=db.query_one("SELECT not_before::text FROM public.novu_rust_resend_cooldown_policies WHERE environment_id=$1", &[&env]).await.unwrap().get(0);
     let replica=connect(&standby).await;
     tokio::time::timeout(Duration::from_secs(10),async {
         loop {
-            let row=replica.query_opt("SELECT p.not_before::text,a.state,a.http_status FROM public.novu_rust_resend_cooldown_policies p JOIN public.novu_rust_resend_attempts a ON a.environment_id=p.environment_id WHERE p.environment_id=$1 AND a.job_id=$2", &[&env,&first]).await.unwrap();
-            if row.is_some_and(|r|r.get::<_,String>(0)==deadline && r.get::<_,String>(1)=="rejected" && r.get::<_,Option<i32>>(2)==Some(429)) {break;}
+            let row=replica.query_opt("SELECT p.not_before::text,a.state,a.http_status,a.retry_after_seconds FROM public.novu_rust_resend_cooldown_policies p JOIN public.novu_rust_resend_attempts a ON a.environment_id=p.environment_id WHERE p.environment_id=$1 AND a.job_id=$2", &[&env,&first]).await.unwrap();
+            if row.is_some_and(|r|r.get::<_,String>(0)==deadline && r.get::<_,String>(1)=="rejected" && r.get::<_,Option<i32>>(2)==Some(429) && r.get::<_,Option<i32>>(3)==Some(300)) {break;}
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }).await.expect("committed cooldown and attempt were not replayed");
