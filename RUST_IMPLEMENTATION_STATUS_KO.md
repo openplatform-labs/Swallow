@@ -1,3 +1,9 @@
+## SendGrid IP 풀 선택
+
+SendGrid 워커의 `NOVU_SENDGRID_IP_POOL_NAME`으로 기본 IP 풀을 선택할 수 있다. 트리거의 `overrides.email.ipPoolName`, `overrides.sendgrid.ipPoolName`, `overrides.providers.sendgrid.ipPoolName`, 해당 단계의 `overrides.steps.<stepId>.providers.sendgrid.ipPoolName`은 차례로 앞 설정을 덮는다. 최종 값이 빈 문자열이면 워커 기본값을 사용한다. 설정이 없으면 공급자 요청과 작업 payload에서 풀 필드를 생략한다. override 사용 전 모든 SendGrid 워커를 업데이트해야 한다. 풀의 유효성·권한과 실제 전송 가능 여부는 SendGrid가 판단한다. 이 구현은 다른 공급자에 IP 풀을 적용하지 않는다.
+
+로컬 PostgreSQL 17에서 API 트리거부터 워크플로 작업·SendGrid 요청 본문까지 네 override의 우선순위를 확인했고 모의 HTTP에서 기본값·override·빈 값 대체를 검증했다. 원본 소스의 옵션 및 기본값 우선순위를 확인했으나 원본 서버와 실제 SendGrid 전송은 이번에 비교하지 않았다. Docker 저장소가 읽기 전용이어서 DB 테스트는 임시 로컬 인스턴스를 사용했다.
+
 ## SendGrid 운영 CLI 결과 일관성
 
 워커 `0150`은 `delivery-reconcile sendgrid-result`의 제한 권한 조회에서도 접수되지 않은 시도, 추적되지 않은 발송, 빈 수신자 목록 또는 수신자와 모순되는 `delivered`·`failed` 결과를 `unknown`으로 표시한다. 기존 권한은 유지된다. 기록된 수신자 목록 자체의 완전성이나 최신 이벤트 반영은 보증하지 않는다. 로컬 PostgreSQL 17에서 제한 계정과 실제 CLI로 모순·정상·수신자 누락 사례를 검증했고, 서명된 테스트 웹훅과 실제 집계 워커를 사용한 기존 통합 테스트도 통과했다. 테스트 서명은 실제 SendGrid 서비스가 아니며 운영 HA와 부하는 미검증이다. Docker 저장소가 읽기 전용이어서 테스트는 임시 로컬 DB로 수행했다.
@@ -1746,7 +1752,7 @@ Slack과 이메일을 함께 설정하면 한 채널의 설정 오류나 발송 
 
 - [0038 발송 결과 마이그레이션](apps/worker/rust-queue/migrations/0038_experimental_email_provider_result.sql)은 이메일 메시지에 provider 식별자와 `error` 상태를 추가한다. SendGrid 워커는 임대를 확인한 결과 트랜잭션에서 접수 시 식별자를 저장하고 오류 시 메시지 상태와 오류 ID를 갱신한다. [원본 서버 비교](apps/api/rust-api/tests/reference_email_workflow_compare.py)는 모의 429에 대한 요청 본문, `error` 상태와 `mail_unexpected_error`를 비교했다. 오류 응답에 민감한 정보가 포함될 수 있으므로 Rust는 원본과 달리 provider의 상세 오류를 저장하지 않고 고정 진단을 기록한다. 5xx·전송 오류는 실제 접수 여부가 불명확해도 로컬 상태는 `error`이며, 발송 후 임대 만료나 발송 전 잘못된 작업은 메시지가 `sent`로 남을 수 있다. 복구 시 이력 조정, 원본 재시도·웹훅·전체 작업 상태와 실제 provider 오류는 미구현 또는 미검증이다. 발송 결과마다 환경과 작업 ID로 제한된 메시지 갱신 1회가 추가된다.
 
-- 트리거 `overrides.email`의 `toRecipient`, `to`·`cc`·`bcc`, `replaceToRecipient`, `from`, `senderName`, `replyTo`, `subject`, `html`, `text`, `headers`, `customData`를 제한적으로 보존하고 이메일 작업에 적용한다. 기본 수신자에 추가한 `to`의 중복을 제거하고, 대체 모드의 비어 있지 않은 `to`는 구독자 이메일이 없어도 사용할 수 있다. [원본 종단 간 비교](apps/api/rust-api/tests/reference_email_workflow_compare.py)는 수신자 추가·중복 제거와 명시적 대체, 참조·숨은 참조, 발신·회신·제목·HTML·헤더·customData의 선택된 사례를 모의 SendGrid 요청까지 비교했다. 빈 `to`를 사용하는 대체 모드, `integrationIdentifier`, `ipPoolName`, 완전한 provider·단계별 override, 전체 검증·오류 계약과 실제 provider 전송은 아직 미구현 또는 미검증이다. 트리거 작업과 이메일 작업에 override와 주소·내용이 저장된다.
+- 트리거 `overrides.email`의 `toRecipient`, `to`·`cc`·`bcc`, `replaceToRecipient`, `from`, `senderName`, `replyTo`, `subject`, `html`, `text`, `headers`, `customData`를 제한적으로 보존하고 이메일 작업에 적용한다. 기본 수신자에 추가한 `to`의 중복을 제거하고, 대체 모드의 비어 있지 않은 `to`는 구독자 이메일이 없어도 사용할 수 있다. [원본 종단 간 비교](apps/api/rust-api/tests/reference_email_workflow_compare.py)는 수신자 추가·중복 제거와 명시적 대체, 참조·숨은 참조, 발신·회신·제목·HTML·헤더·customData의 선택된 사례를 모의 SendGrid 요청까지 비교했다. 빈 `to`를 사용하는 대체 모드, `integrationIdentifier`, 완전한 provider·단계별 override, 전체 검증·오류 계약과 실제 provider 전송은 아직 미구현 또는 미검증이다. 트리거 작업과 이메일 작업에 override와 주소·내용이 저장된다.
 
 - [0039 단계 ID 마이그레이션](apps/worker/rust-queue/migrations/0039_experimental_email_step_id.sql)은 실험 이메일 단계의 식별자를 저장한다. 트리거의 이메일 채널, 구형 `sendgrid`, `providers.sendgrid`, 현재 단계의 `steps.<stepId>.providers.sendgrid` 순서로 제한된 필드를 병합한다. 원본 provider의 추가 변환으로 provider 단계 `from`은 발신자 이름을 제거하고, provider 헤더 키가 camelCase로 추가되는 동작을 반영한다. [원본 종단 간 비교](apps/api/rust-api/tests/reference_email_workflow_compare.py)는 충돌하는 제목·참조·HTML과 전역 발신자·수신자·헤더 및 단계 헤더를 모의 SendGrid 요청까지 비교했다. 허용 필드는 subject·html·from·senderName·to·cc·bcc·headers로 제한하고 provider 헤더 이름은 ASCII 영문과 하이픈만 허용한다. `_passthrough`, 다른 provider·단계 설정, integration 선택, 헤더 충돌·다양한 문자 처리, 전체 중첩 병합과 원본 입력 오류 계약은 미구현 또는 미검증이다. override는 PostgreSQL 작업에 저장되며 새 워크플로 조회에는 단계 ID 열이 추가된다.
 

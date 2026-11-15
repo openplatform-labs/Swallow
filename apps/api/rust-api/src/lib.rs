@@ -3520,7 +3520,7 @@ async fn trigger(
                 Some(Value::Object(email))
                     if email.iter().all(|(key, value)| match key.as_str() {
                         "toRecipient" | "from" | "senderName" | "replyTo" | "subject" | "html"
-                        | "text" => value.is_string(),
+                        | "text" | "ipPoolName" => value.is_string(),
                         "to" | "cc" | "bcc" => value.as_array().is_some_and(|items| {
                             items
                                 .iter()
@@ -3581,10 +3581,11 @@ async fn trigger(
     let overrides = object.get("overrides").and_then(Value::as_object);
     // Provider/step layers are bounded to understood fields. Unknown
     // passthrough shapes must not be silently accepted.
-    let valid_layer = |layer: &Value| {
+    let valid_layer = |layer: &Value, allow_ip_pool: bool| {
         layer.as_object().is_some_and(|fields| {
             fields.iter().all(|(key, value)| match key.as_str() {
                 "subject" | "html" | "senderName" => value.is_string(),
+                "ipPoolName" => allow_ip_pool && value.is_string(),
                 "from" => value.as_str().is_some_and(|s| !s.is_empty()),
                 "to" | "cc" | "bcc" => value.as_array().is_some_and(|items| {
                     items
@@ -3693,14 +3694,15 @@ async fn trigger(
     let valid_providers = |value: &Value| {
         value.as_object().is_some_and(|entries| {
             entries.iter().all(|(key, layer)| match key.as_str() {
-                "sendgrid" | "resend" => valid_layer(layer),
+                "sendgrid" => valid_layer(layer, true),
+                "resend" => valid_layer(layer, false),
                 "twilio" => valid_sms_layer(layer),
                 "fcm" => valid_fcm_layer(layer),
                 _ => false,
             })
         })
     };
-    if flat.is_some_and(|v| !valid_layer(v))
+    if flat.is_some_and(|v| !valid_layer(v, true))
         || sms_flat.is_some_and(|v| !valid_sms_layer(v))
         || fcm_flat.is_some_and(|v| {
             !v.as_object().is_some_and(|fields| {

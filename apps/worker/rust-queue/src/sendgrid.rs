@@ -30,6 +30,7 @@ pub struct Email {
     pub sender_name: Option<String>,
     pub provider_from_without_name: bool,
     pub reply_to: Option<String>,
+    pub ip_pool_name: Option<String>,
     pub subject: String,
     pub html: String,
     pub text: Option<String>,
@@ -167,6 +168,13 @@ pub fn request_body(config: &Config, message: &Email) -> Result<Value, SendError
             .map(|(key, value)| (key.clone(), value.clone())),
     );
     let mut body = json!({"from":{"email":address,"name":name},"subject":message.subject,"personalizations":[personalization],"content":[{"value":message.html,"type":"text/html"}]});
+    if let Some(pool) = message
+        .ip_pool_name
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        body["ip_pool_name"] = json!(pool);
+    }
     if message.provider_from_without_name {
         body["from"] = json!({"email":address});
     }
@@ -227,6 +235,7 @@ pub struct Sendgrid {
     endpoint: String,
     config: Config,
     dispatch_tracking: bool,
+    default_ip_pool: Option<String>,
 }
 impl Sendgrid {
     pub fn new(config: Config) -> Result<Self, SendError> {
@@ -239,6 +248,12 @@ impl Sendgrid {
     /// Opt into an additional SendGrid custom argument for dispatch evidence.
     pub fn with_dispatch_tracking(mut self) -> Self {
         self.dispatch_tracking = true;
+        self
+    }
+
+    /// Set the integration default; a nonempty message override takes precedence.
+    pub fn with_default_ip_pool(mut self, pool: String) -> Self {
+        self.default_ip_pool = Some(pool);
         self
     }
 
@@ -267,6 +282,7 @@ impl Sendgrid {
             endpoint: endpoint.to_owned(),
             config,
             dispatch_tracking: false,
+            default_ip_pool: None,
         })
     }
     /// Reload before claiming a new job. The caller must pause on failure.
@@ -281,7 +297,16 @@ impl Sendgrid {
     }
     /// Send once; ambiguous network failures are never automatically retried.
     pub async fn send(&self, message: &Email) -> Result<Receipt, SendError> {
-        let body = request_body(&self.config, message)?;
+        let mut body = request_body(&self.config, message)?;
+        if body.get("ip_pool_name").is_none() {
+            if let Some(pool) = self
+                .default_ip_pool
+                .as_deref()
+                .filter(|value| !value.is_empty())
+            {
+                body["ip_pool_name"] = json!(pool);
+            }
+        }
         let response = self
             .http
             .post(&self.endpoint)
@@ -390,6 +415,56 @@ mod tests {
             request_body(&config(), &email),
             Err(SendError::InvalidMessage)
         );
+    }
+    #[tokio::test]
+    async fn ip_pool_override_takes_precedence_over_integration_default() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v3/mail/send", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for expected in ["default-pool", "override-pool", "default-pool"] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0; 4096];
+                loop {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..pos]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .and_then(|v| v.parse::<usize>().ok())
+                            })
+                            .unwrap();
+                        if bytes.len() >= pos + 4 + length {
+                            let body: Value =
+                                serde_json::from_slice(&bytes[pos + 4..pos + 4 + length]).unwrap();
+                            assert_eq!(body["ip_pool_name"], expected);
+                            break;
+                        }
+                    }
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let provider = Sendgrid::with_endpoint(config(), &endpoint)
+            .unwrap()
+            .with_default_ip_pool("default-pool".into());
+        let mut email = message();
+        provider.send(&email).await.unwrap();
+        email.ip_pool_name = Some("override-pool".into());
+        provider.send(&email).await.unwrap();
+        email.ip_pool_name = Some(String::new());
+        provider.send(&email).await.unwrap();
+        server.await.unwrap();
     }
     #[tokio::test]
     async fn posts_http_and_does_not_follow_redirects() {

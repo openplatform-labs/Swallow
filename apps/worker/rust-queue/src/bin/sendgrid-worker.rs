@@ -49,6 +49,11 @@ async fn run(
         sender_name: std::env::var("NOVU_SENDGRID_SENDER_NAME")?,
         region,
     })?;
+    match std::env::var("NOVU_SENDGRID_IP_POOL_NAME") {
+        Ok(pool) => provider = provider.with_default_ip_pool(pool),
+        Err(std::env::VarError::NotPresent) => {}
+        Err(_) => return Err("invalid SendGrid IP pool setting".into()),
+    }
     match std::env::var("NOVU_SENDGRID_DISPATCH_TRACKING").as_deref() {
         Ok("true") => provider = provider.with_dispatch_tracking(),
         Ok("false") | Err(std::env::VarError::NotPresent) => {}
