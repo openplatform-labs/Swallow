@@ -102,7 +102,7 @@ async fn discord_grants_are_independent_conditional_and_audited() {
     .await
     .unwrap();
     db.execute("INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES ('https://issuer.test','admin','console',$1),('https://issuer.test','target','console',$1),('https://issuer.test','target','console',$2)",&[&env,&other]).await.unwrap();
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_discord_resolution_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_discord_resolution_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_discord_resolution_grant_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_discord_resolution_grant_audit_read(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_discord_resolution_request(text,text,text,text,bigint,uuid,text) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_discord_resolution_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_discord_resolution_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_discord_resolution_grant_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_discord_resolution_grant_audit_read(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_discord_resolution_request(text,text,text,text,bigint,uuid,text),public.novu_rust_operator_jwt_discord_resolution_history(text,text,text,text,bigint,uuid,oid,uuid) TO {role}")).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname::text=$1",&[&role]).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,rolname,p,oid FROM pg_roles CROSS JOIN unnest(ARRAY['alert_view','queue_ack']) p WHERE rolname::text=$2",&[&env,&role]).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_discord_resolvers SELECT $1,rolname,oid,true,true FROM pg_roles WHERE rolname::text=$2",&[&env,&role]).await.unwrap();
@@ -256,5 +256,80 @@ async fn discord_grants_are_independent_conditional_and_audited() {
     assert_eq!(
         response(app.clone(), &token, "GET", &cross, None).await.0,
         StatusCode::UNAUTHORIZED
+    );
+    db.execute("INSERT INTO public.novu_rust_discord_resolution_audit_viewers SELECT $1,rolname,oid FROM pg_roles WHERE rolname::text=$2",&[&env,&role]).await.unwrap();
+    let history = format!(
+        "/v1/experimental/operator/discord-resolution-history?environmentId={env}&jobId={}",
+        Uuid::new_v4()
+    );
+    assert_eq!(
+        response(app.clone(), &target, "GET", &history, None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let change_history = json!({"requestId":Uuid::new_v4(),"targetIssuer":"https://issuer.test","targetSubject":"target","targetClientId":"console","resource":"discord-resolution","permission":"history","expected":false,"desired":true,"reason":"audit access"});
+    db.batch_execute("CREATE FUNCTION public.discord_history_grant_reject() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'audit failure'; END $$; CREATE TRIGGER discord_history_grant_reject BEFORE INSERT ON public.novu_rust_operator_jwt_discord_resolution_grant_audit FOR EACH ROW EXECUTE FUNCTION public.discord_history_grant_reject()").await.unwrap();
+    assert_eq!(
+        response(
+            app.clone(),
+            &token,
+            "PUT",
+            &path,
+            Some(change_history.clone())
+        )
+        .await
+        .0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        response(app.clone(), &target, "GET", &history, None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    db.batch_execute("DROP TRIGGER discord_history_grant_reject ON public.novu_rust_operator_jwt_discord_resolution_grant_audit; DROP FUNCTION public.discord_history_grant_reject()").await.unwrap();
+    assert_eq!(
+        response(
+            app.clone(),
+            &token,
+            "PUT",
+            &path,
+            Some(change_history.clone())
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        response(app.clone(), &token, "PUT", &path, Some(change_history))
+            .await
+            .1["replayed"],
+        true
+    );
+    assert_eq!(
+        response(app.clone(), &target, "GET", &history, None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let revoke_history = json!({"requestId":Uuid::new_v4(),"targetIssuer":"https://issuer.test","targetSubject":"target","targetClientId":"console","resource":"discord-resolution","permission":"history","expected":true,"desired":false,"reason":"audit complete"});
+    assert_eq!(
+        response(app.clone(), &token, "PUT", &path, Some(revoke_history))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        response(app.clone(), &target, "GET", &history, None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        response(app.clone(), &target, "GET", &target_lookup, None)
+            .await
+            .0,
+        StatusCode::OK
     );
 }
