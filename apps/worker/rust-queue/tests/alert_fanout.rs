@@ -27,6 +27,18 @@ async fn per_target_delivery_checks_control_real_alert_children() {
     let text=String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("slack failed: attention"),"{text}");
     assert!(text.contains("slack attempts: completed"),"{text}");
+    // One active cooldown, with no overdue jobs: recipients choose independent modes.
+    db.execute("INSERT INTO public.novu_rust_discord_shared_cooldown(environment_id,destination_id,not_before) VALUES($1,'ops',clock_timestamp()+interval '1 hour')", &[&env]).await.unwrap();
+    std::fs::write(&config,serde_json::to_vec(&serde_json::json!({"targets":[
+      {"channel":"slack","id":"failed","webhook_file":secret,"delivery_checks":{"resend":false,"discord_cooldown_mode":"all"},"delivery_thresholds":{"discord_cooldown_grace_seconds":60}},
+      {"channel":"slack","id":"attempts","webhook_file":secret,"delivery_checks":{"resend":false,"discord_cooldown_mode":"overdue"},"delivery_thresholds":{"discord_cooldown_grace_seconds":60}}
+    ]})).unwrap()).unwrap();
+    let output=Command::new(env!("CARGO_BIN_EXE_alert-fanout")).args(["delivery",env,"300","120","60"]).arg(&config).env("DATABASE_URL",&url).env("NOVU_POSTGRES_ALLOW_INSECURE","true").env("SWALLOW_ALERT_DISCORD_COOLDOWN_MODE","overdue").env_remove("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS").env_remove("SWALLOW_ALERT_BINDING_KEY").env_remove("SWALLOW_ALERT_BINDING_KEY_FILE").output().unwrap();
+    assert_eq!(output.status.code(),Some(2),"{}",String::from_utf8_lossy(&output.stderr));let text=String::from_utf8(output.stdout).unwrap();assert!(text.contains("slack failed: attention"),"{text}");assert!(text.contains("slack attempts: completed"),"{text}");
+    let discord_job=Uuid::new_v4();novu_postgres_queue::enqueue(&db,discord_job,env,novu_postgres_queue::discord_queue::JOB_KIND,&serde_json::json!({})).await.unwrap();
+    db.execute("UPDATE public.novu_queue_jobs SET last_error='Discord shared cooldown active',available_at=clock_timestamp()-interval '2 minutes' WHERE id=$1",&[&discord_job]).await.unwrap();
+    let output=Command::new(env!("CARGO_BIN_EXE_alert-fanout")).args(["delivery",env,"300","120","60"]).arg(&config).env("DATABASE_URL",&url).env("NOVU_POSTGRES_ALLOW_INSECURE","true").env_remove("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS").env_remove("SWALLOW_ALERT_BINDING_KEY").env_remove("SWALLOW_ALERT_BINDING_KEY_FILE").output().unwrap();
+    assert_eq!(output.status.code(),Some(2),"{}",String::from_utf8_lossy(&output.stderr));let text=String::from_utf8(output.stdout).unwrap();assert!(text.contains("slack failed: attention"),"{text}");assert!(text.contains("slack attempts: attention"),"{text}");db.execute("UPDATE public.novu_queue_jobs SET status='cancelled' WHERE id=$1",&[&discord_job]).await.unwrap();
     let pending=Uuid::new_v4();
     novu_postgres_queue::enqueue(&db,pending,env,"fixture",&serde_json::json!({})).await.unwrap();
     db.execute("UPDATE novu_queue_jobs SET available_at=clock_timestamp()-interval '120 seconds' WHERE id=$1", &[&pending]).await.unwrap();

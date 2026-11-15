@@ -25,6 +25,7 @@ struct DeliveryChecks {
     slack_jobs: Option<bool>,
     smtp: Option<bool>,
     discord: Option<bool>,
+    discord_cooldown_mode: Option<DiscordCooldownMode>,
     failed_jobs: Option<bool>,
     slack_missing_endpoints: Option<bool>,
     email_policy_cancelled: Option<bool>,
@@ -36,8 +37,14 @@ struct DeliveryChecks {
     fcm_cooldown_distinct_source: Option<bool>,
     fcm_unreviewed: Option<bool>,
 }
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum DiscordCooldownMode { All, Overdue }
 impl DeliveryChecks {
     fn apply(&self, cmd: &mut Command) {
+        if let Some(mode) = &self.discord_cooldown_mode {
+            cmd.env("SWALLOW_ALERT_DISCORD_COOLDOWN_MODE", match mode { DiscordCooldownMode::All => "all", DiscordCooldownMode::Overdue => "overdue" });
+        }
         for (key, value) in [
             ("SWALLOW_ALERT_RESEND_ENABLED", self.resend),
             ("SWALLOW_ALERT_ATTEMPTS_ENABLED", self.attempts),
