@@ -733,6 +733,7 @@ async fn process_claimed(
                     "to"|"cc"|"bcc" => v.as_array().is_none_or(|items| items.len()>50 || items.iter().any(|v|v.as_str().is_none_or(|s|s.is_empty()||s.contains(['\r','\n'])))),
                     "headers" => v.as_object().is_none_or(|items|items.len()>100 || items.iter().any(|(name,value)|reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() || value.as_str().is_none_or(|s|s.len()>4096 || reqwest::header::HeaderValue::from_str(s).is_err()))),
                     "tags" => !novu_rust_contracts::resend_tags::valid(v),
+                    "scheduledAt" => v.as_str().is_none_or(|s|s.len()>64 || chrono::DateTime::parse_from_rfc3339(s).is_err()),
                     _=>true,
                 }) {return Err(InvalidJob("invalid Resend passthrough").into());}
                 for (key,value) in body {

@@ -374,6 +374,7 @@ async fn process_one_inner(
             return Ok(true);
         }
     };
+    tx.execute("UPDATE public.novu_queue_jobs SET resend_scheduled_at=$3::text::timestamptz WHERE environment_id=$1 AND id=$2", &[&environment,&job.id,&email.resend_scheduled_at]).await?;
     if email.message_id.is_some() {
         tx.execute("UPDATE novu_rust_email_messages SET delivery_state='dispatching' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
     }

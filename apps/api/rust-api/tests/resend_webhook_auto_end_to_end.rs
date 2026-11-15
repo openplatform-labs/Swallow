@@ -156,6 +156,10 @@ async fn signed_recipient_events_resolve_unknown_and_preserve_conflicts() {
     assert_eq!(row.get::<_, String>(0), "failed");
     assert_eq!(row.get::<_, String>(1), "unknown");
     assert_eq!(row.get::<_, i64>(2), 0);
+    assert_eq!(send(app.clone(),"msg_scheduled","email.scheduled","provider-1",tag,"alice@example.test",secret).await,StatusCode::NO_CONTENT);
+    assert!(queue::resend_projection::project_with_auto_correlation(&mut projection,"env",job,true).await.unwrap());
+    let scheduled=projection.query_one("SELECT j.status,j.resend_delivery_result,a.state FROM novu_queue_jobs j JOIN novu_rust_resend_attempts a ON a.job_id=j.id WHERE j.id=$1",&[&job]).await.unwrap();
+    assert_eq!(scheduled.get::<_,String>(0),"completed");assert_eq!(scheduled.get::<_,String>(1),"pending");assert_eq!(scheduled.get::<_,String>(2),"accepted");
     assert_eq!(
         send(
             app.clone(),
@@ -213,7 +217,7 @@ async fn signed_recipient_events_resolve_unknown_and_preserve_conflicts() {
     assert_eq!(row.get::<_, String>(0), "partial");
     assert_eq!(row.get::<_, String>(1), "partial");
     assert_eq!(row.get::<_, i64>(2), 1);
-    assert_eq!(row.get::<_, i64>(3), 2);
+    assert_eq!(row.get::<_, i64>(3), 3);
     assert_eq!(
         send(
             app,

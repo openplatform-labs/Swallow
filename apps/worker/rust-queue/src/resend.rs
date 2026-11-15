@@ -45,6 +45,7 @@ pub fn request_body(config: &Config, email: &Email) -> Result<Value, SendError> 
         || !email.custom_data.is_empty()
         || (email.provider_from_without_name && email.from.as_deref().is_none_or(str::is_empty))
         || email.resend_tags.as_ref().is_some_and(|tags| !novu_rust_contracts::resend_tags::valid(&json!(tags)))
+        || email.resend_scheduled_at.as_ref().is_some_and(|s|s.len()>64 || chrono::DateTime::parse_from_rfc3339(s).is_err())
     {
         return Err(SendError::InvalidMessage);
     }
@@ -93,6 +94,7 @@ pub fn request_body(config: &Config, email: &Email) -> Result<Value, SendError> 
         body["headers"] = json!(email.headers);
     }
     if let Some(tags)=email.resend_tags.as_ref() {body["tags"]=json!(tags);}
+    if let Some(time)=email.resend_scheduled_at.as_ref() {body["scheduled_at"]=json!(time);}
     // Use an intentionally conservative limit below Resend's encoded 40 MB
     // limit. Explicit dispositions are representable only when they agree with CID.
     let mut size = 0usize;

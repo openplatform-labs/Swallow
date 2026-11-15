@@ -1,0 +1,20 @@
+ALTER TABLE public.novu_queue_jobs ADD COLUMN resend_scheduled_at timestamptz;
+CREATE OR REPLACE FUNCTION public.novu_rust_provider_health(p_environment text,p_provider text,p_grace integer,p_heartbeat integer)
+RETURNS TABLE(overdue bigint,eligible bigint,last_projection text,stale boolean)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
+BEGIN
+  IF p_provider IS NULL OR p_provider NOT IN ('resend','twilio') OR p_grace IS NULL OR p_grace NOT BETWEEN 1 AND 86400 OR p_heartbeat IS NULL OR p_heartbeat NOT BETWEEN 1 AND 86400 THEN RAISE EXCEPTION 'invalid provider or threshold' USING ERRCODE='22023'; END IF;
+  PERFORM public.novu_rust_assert_alert_view(p_environment);
+  IF p_provider='resend' THEN
+    RETURN QUERY SELECT count(*) FILTER(WHERE (j.resend_delivery_result IS DISTINCT FROM 'delivered' OR EXISTS(SELECT 1 FROM public.novu_rust_resend_attempts a JOIN public.novu_rust_resend_attempts b ON b.environment_id=a.environment_id AND b.provider_message_id=a.provider_message_id AND b.job_id<>a.job_id WHERE a.environment_id=j.environment_id AND a.job_id=j.id AND a.provider_message_id IS NOT NULL AND a.provider_message_id<>''))),count(*),
+      (SELECT h.last_completed_at::text FROM public.novu_rust_resend_projection_heartbeat h WHERE h.environment_id=p_environment),
+      coalesce((SELECT h.last_completed_at<statement_timestamp()-p_heartbeat*interval '1 second' FROM public.novu_rust_resend_projection_heartbeat h WHERE h.environment_id=p_environment),true)
+      FROM public.novu_queue_jobs j WHERE j.environment_id=p_environment AND j.kind='experimental_resend_email' AND j.status<>'cancelled' AND (CASE WHEN j.resend_scheduled_at IS NOT NULL AND (j.resend_delivery_result IS NULL OR j.resend_delivery_result='pending') AND EXISTS(SELECT 1 FROM public.novu_rust_resend_attempts x WHERE x.job_id=j.id AND x.environment_id=j.environment_id AND x.state='accepted') THEN greatest(j.available_at,j.resend_scheduled_at) ELSE j.available_at END)<=statement_timestamp()-p_grace*interval '1 second';
+  ELSE
+    RETURN QUERY SELECT count(*) FILTER(WHERE (j.twilio_delivery_result IS DISTINCT FROM 'delivered' OR EXISTS(SELECT 1 FROM public.novu_rust_twilio_attempts a JOIN public.novu_rust_twilio_attempts b ON b.environment_id=a.environment_id AND b.provider_message_id=a.provider_message_id AND b.job_id<>a.job_id WHERE a.environment_id=j.environment_id AND a.job_id=j.id AND a.provider_message_id IS NOT NULL AND a.provider_message_id<>''))),count(*),
+      (SELECT h.last_completed_at::text FROM public.novu_rust_twilio_projection_heartbeat h WHERE h.environment_id=p_environment),
+      coalesce((SELECT h.last_completed_at<statement_timestamp()-p_heartbeat*interval '1 second' FROM public.novu_rust_twilio_projection_heartbeat h WHERE h.environment_id=p_environment),true)
+      FROM public.novu_queue_jobs j WHERE j.environment_id=p_environment AND j.kind='experimental_twilio_sms' AND j.status<>'cancelled' AND j.available_at<=statement_timestamp()-p_grace*interval '1 second';
+  END IF;
+END; $$;
+REVOKE ALL ON FUNCTION public.novu_rust_provider_health(text,text,integer,integer) FROM PUBLIC;

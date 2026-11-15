@@ -24,10 +24,11 @@ async fn resend_passthrough_content_reaches_provider_with_layer_precedence() {
     let hash=format!("{:x}",Sha256::digest(b"resend-pass-key"));db.execute("INSERT INTO public.novu_rust_api_keys(key_hash,environment_id,user_id) VALUES($1,'resend-pass-env','resend-pass-user')",&[&hash]).await.unwrap();
     let (api,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(async move{driver.await.unwrap()});let router=novu_rust_api::router(Arc::new(api));
     let request=|txn:&str,overrides:Value| Request::builder().method("POST").uri("/v1/events/trigger").header("authorization","ApiKey resend-pass-key").header("content-type","application/json").body(Body::from(json!({"name":"resend-pass-workflow","to":{"subscriberId":txn,"email":"recipient@example.test"},"payload":{},"transactionId":txn,"overrides":overrides}).to_string())).unwrap();
-    for (i,bad) in [json!({"body":{"to":"other@example.test"}}),json!({"body":{"to":["bad\naddress"]}}),json!({"body":{"subject":5}}),json!({"headers":{},"body":{"subject":"x"}}),json!({"body":{"from":"bad\nfrom"}}),json!({"body":{"replyTo":["reply@example.test"]}}),json!({"body":{"headers":{"bad name":"x"}}}),json!({"body":{"headers":{"X-Test":"bad\nvalue"}}}),json!({"body":{"tags":[{"name":"swallow_dispatch","value":"x"}]}}),json!({"body":{"tags":[{"name":"bad name","value":"x"}]}}),json!({"body":{"tags":[{"name":"test","value":"x"},{"name":"TEST","value":"y"}]}})].into_iter().enumerate() {
+    for (i,bad) in [json!({"body":{"to":"other@example.test"}}),json!({"body":{"to":["bad\naddress"]}}),json!({"body":{"subject":5}}),json!({"headers":{},"body":{"subject":"x"}}),json!({"body":{"from":"bad\nfrom"}}),json!({"body":{"replyTo":["reply@example.test"]}}),json!({"body":{"headers":{"bad name":"x"}}}),json!({"body":{"headers":{"X-Test":"bad\nvalue"}}}),json!({"body":{"tags":[{"name":"swallow_dispatch","value":"x"}]}}),json!({"body":{"tags":[{"name":"bad name","value":"x"}]}}),json!({"body":{"tags":[{"name":"test","value":"x"},{"name":"TEST","value":"y"}]}}),json!({"body":{"scheduledAt":"tomorrow"}})].into_iter().enumerate() {
         assert_eq!(router.clone().oneshot(request(&format!("invalid-pass-{i}"),json!({"providers":{"resend":{"_passthrough":bad}}}))).await.unwrap().status(),StatusCode::NOT_IMPLEMENTED);
     }
-    let overrides=json!({"providers":{"resend":{"subject":"known global","from":"known@example.test","to":["known@example.test"],"cc":["known-cc@example.test"],"headers":{"X-Global":"known-global"},"_passthrough":{"body":{"subject":"pass global","text":"literal {{name}}","from":"Pass Sender <pass@example.test>","replyTo":"reply@example.test","to":["extra@example.test"],"bcc":["hidden@example.test"],"tags":[{"name":"global","value":"old"}],"headers":{"X-Pass":"global","X-Override":"global"}}}}},"steps":{"mail-step":{"providers":{"resend":{"subject":"known step","from":"step@example.test","headers":{"X-Base":"known-step"},"_passthrough":{"body":{"html":"","tags":[{"name":"campaign","value":"summer-1"}],"headers":{"X-Override":"step","X-Step":"step"}}}}}}}});
+    let scheduled=(chrono::Utc::now()+chrono::Duration::hours(1)).to_rfc3339();
+    let overrides=json!({"providers":{"resend":{"subject":"known global","from":"known@example.test","to":["known@example.test"],"cc":["known-cc@example.test"],"headers":{"X-Global":"known-global"},"_passthrough":{"body":{"subject":"pass global","text":"literal {{name}}","from":"Pass Sender <pass@example.test>","replyTo":"reply@example.test","to":["extra@example.test"],"bcc":["hidden@example.test"],"tags":[{"name":"global","value":"old"}],"headers":{"X-Pass":"global","X-Override":"global"}}}}},"steps":{"mail-step":{"providers":{"resend":{"subject":"known step","from":"step@example.test","headers":{"X-Base":"known-step"},"_passthrough":{"body":{"html":"","scheduledAt":scheduled,"tags":[{"name":"campaign","value":"summer-1"}],"headers":{"X-Override":"step","X-Step":"step"}}}}}}}});
     assert_eq!(router.oneshot(request("resend-pass-valid",overrides)).await.unwrap().status(),StatusCode::CREATED);
     assert!(novu_postgres_queue::in_app::process_one(&mut db).await.unwrap());
     let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let addr=listener.local_addr().unwrap();
@@ -38,30 +39,46 @@ async fn resend_passthrough_content_reaches_provider_with_layer_precedence() {
     assert_eq!(body["to"],json!(["recipient@example.test","known@example.test","known@example.test","extra@example.test"]));assert_eq!(body["cc"],json!(["known-cc@example.test","known-cc@example.test"]));assert_eq!(body["bcc"],json!(["hidden@example.test"]));
     assert_eq!(body["headers"],json!({"X-Base":"known-step","xBase":"known-step","xGlobal":"known-global","X-Pass":"global","X-Override":"step","X-Step":"step"}));
     assert_eq!(body["tags"][0],json!({"name":"campaign","value":"summer-1"}));assert_eq!(body["tags"][1]["name"],"swallow_dispatch");
+    assert_eq!(body["scheduled_at"],scheduled);
     let correlation=body["tags"][1]["value"].as_str().unwrap().parse::<uuid::Uuid>().unwrap();
     assert!(db.query_one("SELECT EXISTS(SELECT 1 FROM public.novu_rust_resend_attempts WHERE environment_id='resend-pass-env' AND correlation_id=$1)",&[&correlation]).await.unwrap().get::<_,bool>(0));
     let rows=db.query("SELECT recipient_kind,recipient_index,recipient_hash FROM public.novu_rust_resend_recipients WHERE environment_id='resend-pass-env' ORDER BY recipient_kind,recipient_index",&[]).await.unwrap();
     let expected=[("bcc",0,"hidden@example.test"),("cc",0,"known-cc@example.test"),("cc",1,"known-cc@example.test"),("to",0,"recipient@example.test"),("to",1,"known@example.test"),("to",2,"known@example.test"),("to",3,"extra@example.test")];
     assert_eq!(rows.len(),expected.len());for (row,(kind,index,address)) in rows.iter().zip(expected) {assert_eq!(row.get::<_,String>(0),kind);assert_eq!(row.get::<_,i32>(1),index);assert_eq!(row.get::<_,String>(2),novu_postgres_queue::resend_queue::recipient_hash(address));}
     let job:uuid::Uuid=db.query_one("SELECT id FROM public.novu_queue_jobs WHERE environment_id='resend-pass-env' AND kind='experimental_resend_email'",&[]).await.unwrap().get(0);
+    db.execute("UPDATE public.novu_queue_jobs SET available_at=clock_timestamp()-interval '10 minutes' WHERE id=$1",&[&job]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'resend-pass-env',rolname,'alert_view',oid FROM pg_roles WHERE rolname=session_user",&[]).await.unwrap();
+    let health=novu_postgres_queue::reconciliation::resend_health(&db,"resend-pass-env",60,60).await.unwrap();assert_eq!(health["eligibleJobs"],0);
+    let scoped=novu_postgres_queue::reconciliation::scoped_provider_health(&db,"resend-pass-env","resend",60,60).await.unwrap();assert_eq!(scoped["eligibleJobs"],0);
+    let uncertain=uuid::Uuid::new_v4();db.execute("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status,available_at,resend_scheduled_at) VALUES($1,'resend-pass-env','experimental_resend_email','{}','failed',clock_timestamp()-interval '10 minutes',clock_timestamp()+interval '1 hour')",&[&uncertain]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_resend_attempts(job_id,environment_id,state) VALUES($1,'resend-pass-env','unknown')",&[&uncertain]).await.unwrap();
+    let health=novu_postgres_queue::reconciliation::resend_health(&db,"resend-pass-env",60,60).await.unwrap();assert_eq!(health["eligibleJobs"],1);
+    let scoped=novu_postgres_queue::reconciliation::scoped_provider_health(&db,"resend-pass-env","resend",60,60).await.unwrap();assert_eq!(scoped["eligibleJobs"],1);
+    db.execute("DELETE FROM public.novu_rust_resend_attempts WHERE job_id=$1",&[&uncertain]).await.unwrap();db.execute("DELETE FROM public.novu_queue_jobs WHERE id=$1",&[&uncertain]).await.unwrap();
+    db.execute("UPDATE public.novu_queue_jobs SET resend_scheduled_at=clock_timestamp()-interval '5 minutes' WHERE id=$1",&[&job]).await.unwrap();
+    let health=novu_postgres_queue::reconciliation::resend_health(&db,"resend-pass-env",60,60).await.unwrap();assert_eq!(health["eligibleJobs"],1);assert_eq!(health["overdueUndelivered"],1);
+    let scoped=novu_postgres_queue::reconciliation::scoped_provider_health(&db,"resend-pass-env","resend",60,60).await.unwrap();assert_eq!(scoped["eligibleJobs"],1);
     let secret=b"test-only-resend-webhook-secret-123";let key=format!("whsec_{}",STANDARD.encode(secret));
     let webhook_config=novu_rust_api::resend_webhook::Config::new("resend-pass-env".into(),&key).unwrap().with_correlation_capture(true);
     let (webhook_db,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(async move{driver.await.unwrap()});
     let webhook=novu_rust_api::router_with_webhook_configs(Arc::new(webhook_db),None,HashMap::new(),None,Some(webhook_config));
-    let signed=|id:&str,address:&str,key:&[u8]| {
+    let signed=|id:&str,address:&str,kind:&str,key:&[u8]| {
         let timestamp=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string();
-        let data=json!({"type":"email.delivered","data":{"email_id":"fixture-id","to":[address],"tags":{"swallow_dispatch":correlation.to_string(),"campaign":"summer-1"}}}).to_string();
+        let data=json!({"type":kind,"data":{"email_id":"fixture-id","to":[address],"tags":{"swallow_dispatch":correlation.to_string(),"campaign":"summer-1"}}}).to_string();
         let mac=hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256,key),format!("{id}.{timestamp}.{data}").as_bytes());
         Request::builder().method("POST").uri("/webhooks/organizations/org/environments/resend-pass-env/email/resend").header("svix-id",id).header("svix-timestamp",timestamp).header("svix-signature",format!("v1,{}",STANDARD.encode(mac.as_ref()))).body(Body::from(data)).unwrap()
     };
-    assert_eq!(webhook.clone().oneshot(signed("forged","recipient@example.test",b"wrong-secret")).await.unwrap().status(),StatusCode::UNAUTHORIZED);
-    for (i,address) in ["recipient@example.test","known@example.test","known-cc@example.test","extra@example.test"].into_iter().enumerate() {
-        assert_eq!(webhook.clone().oneshot(signed(&format!("event-{i}"),address,secret)).await.unwrap().status(),StatusCode::NO_CONTENT);
-    }
-    let evidence=db.query_one("SELECT count(*),count(*) FILTER(WHERE correlation_id=$1) FROM public.novu_rust_resend_delivery_events WHERE environment_id='resend-pass-env'",&[&correlation]).await.unwrap();assert_eq!(evidence.get::<_,i64>(0),4);assert_eq!(evidence.get::<_,i64>(1),4);
+    assert_eq!(webhook.clone().oneshot(signed("forged","recipient@example.test","email.delivered",b"wrong-secret")).await.unwrap().status(),StatusCode::UNAUTHORIZED);
+    assert_eq!(webhook.clone().oneshot(signed("scheduled-event","recipient@example.test","email.scheduled",secret)).await.unwrap().status(),StatusCode::NO_CONTENT);
     assert!(novu_postgres_queue::resend_projection::project(&mut db,"resend-pass-env",job).await.unwrap());
     assert_eq!(db.query_one("SELECT resend_delivery_result FROM public.novu_queue_jobs WHERE id=$1",&[&job]).await.unwrap().get::<_,String>(0),"pending");
-    assert_eq!(webhook.oneshot(signed("hidden-event","hidden@example.test",secret)).await.unwrap().status(),StatusCode::NO_CONTENT);
+    for (i,address) in ["recipient@example.test","known@example.test","known-cc@example.test","extra@example.test"].into_iter().enumerate() {
+        assert_eq!(webhook.clone().oneshot(signed(&format!("event-{i}"),address,"email.delivered",secret)).await.unwrap().status(),StatusCode::NO_CONTENT);
+    }
+    let evidence=db.query_one("SELECT count(*),count(*) FILTER(WHERE correlation_id=$1) FROM public.novu_rust_resend_delivery_events WHERE environment_id='resend-pass-env'",&[&correlation]).await.unwrap();assert_eq!(evidence.get::<_,i64>(0),5);assert_eq!(evidence.get::<_,i64>(1),5);
+    assert!(novu_postgres_queue::resend_projection::project(&mut db,"resend-pass-env",job).await.unwrap());
+    assert_eq!(db.query_one("SELECT resend_delivery_result FROM public.novu_queue_jobs WHERE id=$1",&[&job]).await.unwrap().get::<_,String>(0),"pending");
+    assert_eq!(webhook.oneshot(signed("hidden-event","hidden@example.test","email.delivered",secret)).await.unwrap().status(),StatusCode::NO_CONTENT);
     assert!(novu_postgres_queue::resend_projection::project(&mut db,"resend-pass-env",job).await.unwrap());
     assert_eq!(db.query_one("SELECT resend_delivery_result FROM public.novu_queue_jobs WHERE id=$1",&[&job]).await.unwrap().get::<_,String>(0),"delivered");
 }

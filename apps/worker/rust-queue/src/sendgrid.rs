@@ -41,6 +41,7 @@ pub struct Email {
     pub custom_data: Map<String, Value>,
     pub tracking_settings: Map<String, Value>,
     pub resend_tags: Option<Vec<Value>>,
+    pub resend_scheduled_at: Option<String>,
     pub sandbox_mode: Option<bool>,
     pub message_id: Option<String>,
     pub transaction_id: Option<String>,

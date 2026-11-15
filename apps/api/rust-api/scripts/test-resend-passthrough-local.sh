@@ -17,3 +17,5 @@ cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-wo
 cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply api "$API/migrations"
 cargo test --locked --manifest-path "$API/Cargo.toml" --test workflow_email_attachments resend_passthrough_content_reaches_provider_with_layer_precedence -- --ignored
 cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test reference_resend_source original_resend_passthrough_content_precedence -- --ignored
+"$TEST_PG_BIN/createdb" -h 127.0.0.1 -p "$PORT" -U postgres resend_auto_webhook
+TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/resend_auto_webhook" cargo test --locked --manifest-path "$API/Cargo.toml" --test resend_webhook_auto_end_to_end signed_recipient_events_resolve_unknown_and_preserve_conflicts -- --ignored
