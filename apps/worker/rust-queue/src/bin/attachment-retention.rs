@@ -6,12 +6,12 @@ use uuid::Uuid;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let valid = matches!(args.as_slice(),[cmd,_,_,_] if cmd=="list" || cmd=="list-alternatives")
-        || matches!(args.as_slice(),[cmd,_,_,_,_] if cmd=="scrub" || cmd=="scrub-alternatives")
-        || matches!(args.as_slice(),[cmd,_] if cmd=="audit" || cmd=="audit-alternatives")
-        || matches!(args.as_slice(),[cmd,_,_] if cmd=="audit" || cmd=="audit-alternatives");
+    let valid = matches!(args.as_slice(),[cmd,_,_,_] if ["list","list-alternatives","list-tracking"].contains(&cmd.as_str()))
+        || matches!(args.as_slice(),[cmd,_,_,_,_] if ["scrub","scrub-alternatives","scrub-tracking"].contains(&cmd.as_str()))
+        || matches!(args.as_slice(),[cmd,_] if ["audit","audit-alternatives","audit-tracking"].contains(&cmd.as_str()))
+        || matches!(args.as_slice(),[cmd,_,_] if ["audit","audit-alternatives","audit-tracking"].contains(&cmd.as_str()));
     if !valid {
-        return Err("usage: attachment-retention list-alternatives ENV AGE LIMIT | scrub-alternatives ENV AGE LIMIT REASON | audit-alternatives ENV [AFTER_ID] | list ENV MIN_AGE_SECONDS LIMIT | scrub ENV MIN_AGE_SECONDS LIMIT REASON | audit ENV [AFTER_ID]".into());
+        return Err("usage: attachment-retention list[-alternatives|-tracking] ENV AGE LIMIT | scrub[-alternatives|-tracking] ENV AGE LIMIT REASON | audit[-alternatives|-tracking] ENV [AFTER_ID]".into());
     }
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let (db, driver) = tokio::time::timeout(Duration::from_secs(30), config.connect(tls)).await??;
@@ -19,9 +19,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let _ = driver.await;
     });
     match args[0].as_str() {
-        "list" | "scrub" | "list-alternatives" | "scrub-alternatives" => {
+        "list" | "scrub" | "list-alternatives" | "scrub-alternatives" | "list-tracking" | "scrub-tracking" => {
             let is_list = args[0].starts_with("list");
             let alternative = args[0].ends_with("alternatives");
+            let tracking = args[0].ends_with("tracking");
             let age: i32 = args[2].parse()?;
             let limit: i32 = args[3].parse()?;
             if !(0..=31_536_000).contains(&age) || !(1..=100).contains(&limit) {
@@ -31,7 +32,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 tokio::time::timeout(
                     Duration::from_secs(30),
                     db.query(
-                        if alternative { "SELECT * FROM public.novu_rust_list_alternative_retention($1,$2,$3)" } else { "SELECT * FROM public.novu_rust_list_attachment_retention($1,$2,$3)" },
+                        if tracking { "SELECT * FROM public.novu_rust_list_tracking_retention($1,$2,$3)" } else if alternative { "SELECT * FROM public.novu_rust_list_alternative_retention($1,$2,$3)" } else { "SELECT * FROM public.novu_rust_list_attachment_retention($1,$2,$3)" },
                         &[&args[1], &age, &limit],
                     ),
                 )
@@ -40,7 +41,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 tokio::time::timeout(
                     Duration::from_secs(30),
                     db.query(
-                        if alternative { "SELECT * FROM public.novu_rust_scrub_alternative_retention($1,$2,$3,$4)" } else { "SELECT * FROM public.novu_rust_scrub_attachment_retention($1,$2,$3,$4)" },
+                        if tracking { "SELECT * FROM public.novu_rust_scrub_tracking_retention($1,$2,$3,$4)" } else if alternative { "SELECT * FROM public.novu_rust_scrub_alternative_retention($1,$2,$3,$4)" } else { "SELECT * FROM public.novu_rust_scrub_attachment_retention($1,$2,$3,$4)" },
                         &[&args[1], &age, &limit, &args[4]],
                     ),
                 )
@@ -50,7 +51,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             let values:Vec<_>=rows.into_iter().map(|r|if is_list {json!({"jobId":r.get::<_,Uuid>(0).to_string(),"kind":r.get::<_,String>(1),"completedAt":r.get::<_,String>(2)})} else {json!({"jobId":r.get::<_,Uuid>(0).to_string(),"kind":r.get::<_,String>(1)})}).collect();
             println!("{}", serde_json::to_string(&values)?);
         }
-        "audit" | "audit-alternatives" => {
+        "audit" | "audit-alternatives" | "audit-tracking" => {
             let after = args
                 .get(2)
                 .map(|s| s.parse::<i64>())
@@ -59,7 +60,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             let rows = tokio::time::timeout(
                 Duration::from_secs(30),
                 db.query(
-                    if args[0] == "audit-alternatives" { "SELECT * FROM public.novu_rust_alternative_retention_audit($1,$2)" } else { "SELECT * FROM public.novu_rust_attachment_retention_audit($1,$2)" },
+                    if args[0] == "audit-tracking" { "SELECT * FROM public.novu_rust_tracking_retention_audit($1,$2)" } else if args[0] == "audit-alternatives" { "SELECT * FROM public.novu_rust_alternative_retention_audit($1,$2)" } else { "SELECT * FROM public.novu_rust_attachment_retention_audit($1,$2)" },
                     &[&args[1], &after],
                 ),
             )
