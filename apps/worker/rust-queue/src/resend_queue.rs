@@ -1042,6 +1042,103 @@ mod tests {
                 "completed"
             );
         }
+
+        // Provider rate-limits a real queue dispatch; an authorized retry then sends again.
+        let job = Uuid::new_v4();
+        enqueue(
+            &db,
+            job,
+            "env-a",
+            JOB_KIND,
+            &json!({"to":["to@example.test"],"subject":"rate","html":"test"}),
+        )
+        .await
+        .unwrap();
+        for response in [429, 200] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let provider = Resend::test_endpoint(
+                Config {
+                    api_key: "re_test".into(),
+                    from: "from@example.test".into(),
+                    sender_name: String::new(),
+                },
+                &format!("http://{}/emails", listener.local_addr().unwrap()),
+            )
+            .unwrap();
+            let mock = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0; 4096];
+                loop {
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&bytes[..pos]).to_ascii_lowercase();
+                        let len: usize = header
+                            .lines()
+                            .find_map(|v| {
+                                v.strip_prefix("content-length: ")
+                                    .and_then(|v| v.parse().ok())
+                            })
+                            .unwrap();
+                        if bytes.len() >= pos + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let body = if response == 200 {
+                    "{\"id\":\"retry-success\"}"
+                } else {
+                    "{}"
+                };
+                socket.write_all(format!("HTTP/1.1 {response} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            });
+            assert!(
+                process_one_with_retry_key(
+                    &mut db,
+                    "env-a",
+                    &provider,
+                    true,
+                    crate::email_step_policy::Policy::Snapshot,
+                    true,
+                    true,
+                    true
+                )
+                .await
+                .unwrap()
+            );
+            mock.await.unwrap();
+            if response == 429 {
+                let row = db
+                    .query_one(
+                        "SELECT state,http_status FROM novu_rust_resend_attempts WHERE job_id=$1",
+                        &[&job],
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(row.get::<_, String>(0), "rejected");
+                assert_eq!(row.get::<_, i32>(1), 429);
+                crate::reconciliation::resolve(
+                    &mut db,
+                    "env-a",
+                    job,
+                    None,
+                    "retry",
+                    "operator",
+                    "provider rate limit",
+                )
+                .await
+                .unwrap();
+            } else {
+                let row = db.query_one("SELECT j.status,a.state,a.provider_message_id,r.previous_http_status,r.retry_correlation_id FROM novu_queue_jobs j JOIN novu_rust_resend_attempts a ON a.job_id=j.id JOIN novu_rust_delivery_reconciliations r ON r.job_id=j.id WHERE j.id=$1", &[&job]).await.unwrap();
+                assert_eq!(row.get::<_, String>(0), "completed");
+                assert_eq!(row.get::<_, String>(1), "accepted");
+                assert_eq!(row.get::<_, String>(2), "retry-success");
+                assert_eq!(row.get::<_, i32>(3), 429);
+                assert!(row.get::<_, Option<Uuid>>(4).is_some());
+            }
+        }
     }
 
     #[tokio::test]

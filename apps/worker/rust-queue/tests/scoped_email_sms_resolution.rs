@@ -126,9 +126,11 @@ async fn scoped_email_sms_decisions_are_authorized_atomic_and_fenced() {
         );
     }
     let mut db = connect(&url).await;
-    db.batch_execute(include_str!("../migrations/0135_resend_correlation_retry.sql"))
-        .await
-        .unwrap();
+    db.batch_execute(include_str!(
+        "../migrations/0157_resend_retry_rate_limit.sql"
+    ))
+    .await
+    .unwrap();
     db.batch_execute("INSERT INTO novu_rust_environments VALUES ('a','org'),('b','org')")
         .await
         .unwrap();
@@ -399,6 +401,61 @@ async fn scoped_email_sms_decisions_are_authorized_atomic_and_fenced() {
         assert_eq!(row.get::<_, i64>(1), 0);
         assert_eq!(row.get::<_, Uuid>(2), tag);
     }
+    // Explicit retries of rejected 429 responses retain evidence checks and audit in both paths.
+    for scoped in [false, true] {
+        let job = create_job(&db, queue::resend_queue::JOB_KIND).await;
+        let tag = Uuid::new_v4();
+        db.execute("UPDATE novu_rust_resend_attempts SET state='rejected',http_status=429,correlation_id=$2 WHERE job_id=$1", &[&job,&tag]).await.unwrap();
+        let invoke = |decision: &'static str| resolve(&actor, "a", job, decision);
+        assert!(invoke("accepted").await.is_err());
+        db.execute("INSERT INTO novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type,correlation_id) VALUES ('a',$1,'rate-evidence','email.delivered',$2)", &[&format!("rate-{job}"),&tag]).await.unwrap();
+        let denied = if scoped {
+            invoke("retry").await.is_err()
+        } else {
+            queue::reconciliation::resolve(&mut db, "a", job, None, "retry", "operator", "ticket")
+                .await
+                .is_err()
+        };
+        assert!(denied);
+        assert_eq!(
+            db.query_one(
+                "SELECT state FROM novu_rust_resend_attempts WHERE job_id=$1",
+                &[&job]
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+            "rejected"
+        );
+        db.execute("DELETE FROM novu_rust_resend_delivery_events WHERE environment_id='a' AND correlation_id=$1", &[&tag]).await.unwrap();
+        if scoped {
+            invoke("retry").await.unwrap();
+        } else {
+            queue::reconciliation::resolve(&mut db, "a", job, None, "retry", "operator", "ticket")
+                .await
+                .unwrap();
+        }
+        let row = db.query_one("SELECT j.status,r.previous_http_status,r.retry_correlation_id,(SELECT count(*) FROM novu_rust_resend_attempts WHERE job_id=j.id) FROM novu_queue_jobs j JOIN novu_rust_delivery_reconciliations r ON r.job_id=j.id WHERE j.id=$1", &[&job]).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), "pending");
+        assert_eq!(row.get::<_, i32>(1), 429);
+        assert_eq!(row.get::<_, Uuid>(2), tag);
+        assert_eq!(row.get::<_, i64>(3), 0);
+        let other = create_job(&db, queue::resend_queue::JOB_KIND).await;
+        db.execute(
+            "UPDATE novu_rust_resend_attempts SET state='rejected',http_status=403 WHERE job_id=$1",
+            &[&other],
+        )
+        .await
+        .unwrap();
+        let denied = if scoped {
+            resolve(&actor, "a", other, "retry").await.is_err()
+        } else {
+            queue::reconciliation::resolve(&mut db, "a", other, None, "retry", "operator", "ticket")
+                .await
+                .is_err()
+        };
+        assert!(denied);
+    }
     // FCM target/group state is compared to the existing implementation.
     let no_function = fcm_job(
         &db,
@@ -632,6 +689,12 @@ async fn scoped_email_sms_decisions_are_authorized_atomic_and_fenced() {
     .unwrap();
     assert!(resolve(&actor, "a", fcm, "retry").await.is_err());
     let cli_job = create_job(&db, queue::resend_queue::JOB_KIND).await;
+    db.execute(
+        "UPDATE novu_rust_resend_attempts SET state='rejected',http_status=429 WHERE job_id=$1",
+        &[&cli_job],
+    )
+    .await
+    .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
         .args([
             "retry",
