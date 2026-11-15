@@ -86,6 +86,29 @@ impl Config {
             lock_correlation_jobs: false,
         })
     }
+    pub fn bundle_reload_enabled(&self) -> bool {
+        self.reload.is_some()
+    }
+    async fn reload_bundle(&self) -> Option<Vec<Vec<u8>>> {
+        let reload = self.reload.as_ref()?;
+        let permit = reload.permits.clone().try_acquire_owned().ok()?;
+        let path = reload.path.clone();
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                Self::read_bundle(&path)
+            }),
+        )
+        .await
+        {
+            Ok(Ok(Some(secrets))) => Some(secrets),
+            _ => None,
+        }
+    }
+    pub async fn bundle_healthy(&self) -> bool {
+        self.reload_bundle().await.is_some()
+    }
     pub fn with_retry_job_lock(mut self, enabled: bool) -> Self {
         self.lock_retry_jobs = enabled;
         self
@@ -216,22 +239,10 @@ pub async fn receive(
     if seconds > now.as_secs().saturating_add(300) || now.as_secs().saturating_sub(seconds) > 300 {
         return StatusCode::UNAUTHORIZED;
     }
-    let reloaded = if let Some(reload) = &config.reload {
-        let Ok(permit) = reload.permits.clone().try_acquire_owned() else {
-            return StatusCode::SERVICE_UNAVAILABLE;
-        };
-        let path = reload.path.clone();
-        match tokio::time::timeout(
-            Duration::from_secs(2),
-            tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                Config::read_bundle(&path)
-            }),
-        )
-        .await
-        {
-            Ok(Ok(Some(secrets))) => Some(secrets),
-            _ => return StatusCode::SERVICE_UNAVAILABLE,
+    let reloaded = if config.bundle_reload_enabled() {
+        match config.reload_bundle().await {
+            Some(secrets) => Some(secrets),
+            None => return StatusCode::SERVICE_UNAVAILABLE,
         }
     } else {
         None

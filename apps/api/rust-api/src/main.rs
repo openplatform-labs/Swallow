@@ -489,6 +489,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if ready_require_operator_keys && (!health_endpoints || runtime.operator_key_reload_healthy().is_none()) {
         return Err("operator key readiness requires health endpoints and key reload".into());
     }
+    let resend_bundle_health = match std::env::var("SWALLOW_API_RESEND_WEBHOOK_BUNDLE_HEALTH_ENABLED").as_deref() {
+        Ok("true") => true, Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid Resend webhook bundle health setting".into()),
+    };
+    if resend_bundle_health && (!health_endpoints || !runtime.resend_bundle_reload_enabled()) {
+        return Err("Resend webhook bundle health requires health endpoints and bundle reload".into());
+    }
     runtime.start_operator_key_reload();
     let cors = cors_from_env()?;
     let shared = ApiState {
@@ -586,6 +593,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 (if healthy { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE },
                  [(header::CACHE_CONTROL, "no-store")],
                  Json(serde_json::json!({"status": if healthy { "healthy" } else { "unhealthy" }})))
+            }
+        }));
+    }
+    if resend_bundle_health {
+        let runtime=runtime.clone();
+        app=app.route("/health/resend-webhook-bundle",axum::routing::get(move || {
+            let runtime=runtime.clone();
+            async move {
+                let healthy=runtime.resend_bundle_healthy().await;
+                (if healthy {StatusCode::OK}else{StatusCode::SERVICE_UNAVAILABLE},[(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"status":if healthy {"healthy"}else{"unhealthy"}})))
             }
         }));
     }

@@ -54,20 +54,19 @@ async fn run() -> Result<()> {
     if !(1..=60).contains(&seconds) {
         return Err("invalid database probe timeout".into());
     }
-    let key_probe = match std::env::var("SWALLOW_OPERATOR_KEY_PROBE_URL") {
-        Ok(raw) => {
-            if std::env::var_os("SWALLOW_DB_PROBE_URL").is_some() { return Err("select exactly one probe".into()); }
-            let url = reqwest::Url::parse(&raw).map_err(|_| "invalid operator key probe URL")?;
-            if !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some()
-                || url.path() != "/health/operator-keys"
-                || !(url.scheme() == "https" || (url.scheme() == "http" && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")))) {
-                return Err("invalid operator key probe URL".into());
-            }
-            Some(url)
-        }
-        Err(std::env::VarError::NotPresent) => None,
-        Err(_) => return Err("invalid operator key probe URL".into()),
-    };
+    let operator_url=std::env::var_os("SWALLOW_OPERATOR_KEY_PROBE_URL");
+    let resend_url=std::env::var_os("SWALLOW_RESEND_WEBHOOK_KEY_PROBE_URL");
+    if operator_url.is_some() && resend_url.is_some() {return Err("select exactly one probe".into());}
+    let is_resend_probe=resend_url.is_some();
+    let key_probe=if let Some(raw)=operator_url.or(resend_url) {
+        if std::env::var_os("SWALLOW_DB_PROBE_URL").is_some() {return Err("select exactly one probe".into());}
+        let raw=raw.into_string().map_err(|_|"invalid key probe URL")?;
+        let url=reqwest::Url::parse(&raw).map_err(|_|"invalid key probe URL")?;
+        let expected=if is_resend_probe {"/health/resend-webhook-bundle"} else {"/health/operator-keys"};
+        if !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() || url.path()!=expected
+           || !(url.scheme()=="https" || (url.scheme()=="http" && matches!(url.host_str(),Some("localhost" | "127.0.0.1" | "[::1]")))) {return Err("invalid key probe URL".into());}
+        Some(url)
+    } else {None};
     let probe_role = if key_probe.is_none() { Some(novu_postgres_queue::db_probe::Role::from_env()?) } else { None };
     let operation_seconds: u64 = std::env::var("SWALLOW_DB_ALERT_OPERATION_TIMEOUT_SECONDS")
         .unwrap_or_else(|_| "30".into())
@@ -148,11 +147,12 @@ async fn run() -> Result<()> {
         failed_jobs: None,
         failed_jobs_check_failed: false,
         database_probe: key_probe.is_none().then(|| (args[1].clone(), false)),
-        operator_key_probe: key_probe.as_ref().map(|_| (args[1].clone(), false)),
+        operator_key_probe: (key_probe.is_some() && !is_resend_probe).then(|| (args[1].clone(), false)),
+        resend_webhook_key_probe: is_resend_probe.then(|| (args[1].clone(), false)),
         alert_store_unavailable: false,
     };
     alert.text().map_err(|_| "invalid alert label")?;
-    let default_target = format!("{}-{}", if key_probe.is_some() { "key" } else { "db" }, args[1]);
+    let default_target = format!("{}-{}", if is_resend_probe { "resend-key" } else if key_probe.is_some() { "key" } else { "db" }, args[1]);
     let slack_id = std::env::var("SWALLOW_DB_ALERT_SLACK_TARGET_ID")
         .unwrap_or_else(|_| default_target.clone());
     let email_id = std::env::var("SWALLOW_DB_ALERT_EMAIL_TARGET_ID").unwrap_or(default_target);
@@ -189,6 +189,7 @@ async fn run() -> Result<()> {
     };
     if let Some((_, unhealthy)) = alert.database_probe.as_mut() { *unhealthy = probe_unhealthy; }
     if let Some((_, unhealthy)) = alert.operator_key_probe.as_mut() { *unhealthy = probe_unhealthy; }
+    if let Some((_, unhealthy)) = alert.resend_webhook_key_probe.as_mut() { *unhealthy = probe_unhealthy; }
     let mut delivery_config = (monitor_config.clone(), monitor_tls.clone());
     let monitor = tokio::time::timeout(
         Duration::from_secs(seconds),

@@ -13,6 +13,7 @@ fn server() -> Command {
         .env("LISTEN_ADDR", "127.0.0.1:0")
         .env_remove("INBOX_HMAC_KEYS_JSON")
         .env_remove("INBOX_HMAC_KEYS_JSON_FILE")
+        .env_remove("SWALLOW_API_RESEND_WEBHOOK_BUNDLE_HEALTH_ENABLED")
         .env_remove("SWALLOW_API_STRICT_SECURITY_CONFIG")
         .env_remove("SWALLOW_API_REQUIRED_SECURITY")
         .env_remove("JWT_SECRET")
@@ -59,6 +60,17 @@ fn strict_and_required_security_settings_control_startup() {
         assert!(!String::from_utf8_lossy(&output.stderr).contains("sensitive-test-token"));
     }
     check(&[("SWALLOW_API_STRICT_SECURITY_CONFIG", "true")], true);
+    check(
+        &[("SWALLOW_API_RESEND_WEBHOOK_BUNDLE_HEALTH_ENABLED", "true")],
+        false,
+    );
+    check(
+        &[(
+            "SWALLOW_API_RESEND_WEBHOOK_BUNDLE_HEALTH_ENABLED",
+            "invalid",
+        )],
+        false,
+    );
     check(
         &[
             ("SWALLOW_API_STRICT_SECURITY_CONFIG", "true"),
@@ -233,6 +245,7 @@ fn resend_bundle_requires_valid_exclusive_configuration() {
             .env("SWALLOW_API_STRICT_SECURITY_CONFIG", "true")
             .env("NOVU_RESEND_WEBHOOK_ENVIRONMENT_ID", "env")
             .env("NOVU_RESEND_WEBHOOK_SECRET_BUNDLE_FILE", &path)
+            .env("SWALLOW_API_RESEND_WEBHOOK_BUNDLE_HEALTH_ENABLED", "true")
             .stderr(Stdio::piped());
         if conflict {
             command.env(

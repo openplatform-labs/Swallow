@@ -19,3 +19,7 @@ cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-wo
 cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply worker "$WORKER/migrations"
 cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply api "$API/migrations"
 TEST_DATABASE_URL="$DATABASE_URL" cargo test --locked --manifest-path "$API/Cargo.toml" --test resend_webhook_bundle -- --ignored
+TEST_DATABASE_URL="$DATABASE_URL" cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test resend_webhook_key_probe_alert resend_bundle_probe_triggers_coordinated_alert_and_recovery -- --ignored
+cargo build --quiet --locked --manifest-path "$API/Cargo.toml" --bin novu-rust-api
+TEST_DATABASE_URL="$DATABASE_URL" TEST_API_BINARY="$API/target/debug/novu-rust-api" cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test resend_webhook_key_probe_alert real_resend_bundle_failure_triggers_alert_and_recovers -- --ignored
+TEST_DATABASE_URL="$DATABASE_URL" cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test operator_key_probe_alert key_probe_triggers_coordinated_alert_and_recovery -- --ignored

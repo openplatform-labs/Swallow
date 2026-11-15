@@ -651,6 +651,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         failed_jobs_check_failed,
         database_probe: None,
         operator_key_probe: None,
+        resend_webhook_key_probe: None,
         alert_store_unavailable: false,
     };
     alert.text().map_err(|_| "invalid alert environment")?;

@@ -367,6 +367,11 @@ impl RuntimeConfig {
         Some(state.lock().map(|value| key_reload_state_healthy(value.0, value.1, *interval)).unwrap_or(false))
     }
 
+    pub fn resend_bundle_reload_enabled(&self) -> bool { self.resend.as_ref().is_some_and(|c|c.bundle_reload_enabled()) }
+    pub async fn resend_bundle_healthy(&self) -> bool {
+        match &self.resend {Some(config)=>config.bundle_healthy().await,None=>false}
+    }
+
     pub fn router(&self, db: Arc<Client>) -> Router {
         let router = router_with_webhook_configs_and_jwt_policy(
             db,
