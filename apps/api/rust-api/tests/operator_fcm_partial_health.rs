@@ -74,7 +74,7 @@ async fn fcm_partial_health_requires_both_grants_and_is_environment_scoped() {
     .await
     .unwrap();
     db.execute("INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES('https://issuer.test','alice','console',$1),('https://issuer.test','alice','console',$2)",&[&env,&other]).await.unwrap();
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_fcm_partial_health(text,text,text,text,bigint,integer) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_fcm_partial_health(text,text,text,text,bigint,integer),public.novu_rust_operator_jwt_fcm_partial_jobs(text,text,text,text,bigint,integer,uuid) TO {role}")).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname::text=$1",&[&role]).await.unwrap();
     let api = connect(&url).await;
     api.batch_execute(&format!("SET SESSION AUTHORIZATION {role}"))
@@ -104,6 +104,68 @@ async fn fcm_partial_health_requires_both_grants_and_is_environment_scoped() {
     let (status, value) = response(app.clone(), &token, "GET", &path, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value, json!({"partialJobs":1}));
+    let list =
+        format!("/v1/experimental/operator/fcm-partial-jobs?environmentId={env}&windowSeconds=60");
+    assert_eq!(
+        response(app.clone(), &token, "GET", &list, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    db.execute("INSERT INTO public.novu_rust_operator_jwt_fcm_partial_jobs_grants VALUES('https://issuer.test','alice','console',$1)",&[&env]).await.unwrap();
+    db.execute("WITH added AS (INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) SELECT gen_random_uuid(),$1,'experimental_fcm_push',jsonb_build_object('token','private-secret'),'completed' FROM generate_series(1,20) RETURNING id,environment_id) INSERT INTO public.novu_rust_fcm_attempts(job_id,environment_id,target_index,state) SELECT id,environment_id,i,CASE WHEN i=0 THEN 'accepted' ELSE 'rejected' END FROM added CROSS JOIN generate_series(0,1) i",&[&env]).await.unwrap();
+    let (status, first) = response(app.clone(), &token, "GET", &list, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["data"].as_array().unwrap().len(), 20);
+    assert_eq!(first["hasMore"], true);
+    assert!(!first.to_string().contains("private-secret"));
+    let after = first["next"].as_str().unwrap();
+    let (status, second) = response(
+        app.clone(),
+        &token,
+        "GET",
+        &format!("{list}&after={after}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(second["data"].as_array().unwrap().len(), 1);
+    assert_eq!(second["hasMore"], false);
+    assert!(second["data"][0]["jobId"].as_str().unwrap() > after);
+    assert_eq!(
+        response(
+            app.clone(),
+            &token,
+            "GET",
+            &format!("{list}&after=invalid"),
+            None
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        response(
+            app.clone(),
+            &token,
+            "GET",
+            &format!(
+                "/v1/experimental/operator/fcm-partial-jobs?environmentId={other}&windowSeconds=60"
+            ),
+            None
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    db.execute(
+        "DELETE FROM public.novu_rust_operator_jwt_fcm_partial_jobs_grants WHERE environment_id=$1",
+        &[&env],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        response(app.clone(), &token, "GET", &list, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
     for invalid in ["0", "604801", "01"] {
         let url = format!(
             "/v1/experimental/operator/fcm-partial-health?environmentId={env}&windowSeconds={invalid}"
@@ -128,7 +190,12 @@ async fn fcm_partial_health_requires_both_grants_and_is_environment_scoped() {
         StatusCode::UNAUTHORIZED
     );
     db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,$2,'alert_view',oid FROM pg_roles WHERE rolname::text=$2",&[&env,&role]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_operator_jwt_fcm_partial_jobs_grants VALUES('https://issuer.test','alice','console',$1)",&[&env]).await.unwrap();
     db.execute("DELETE FROM public.novu_rust_operator_jwt_fcm_partial_health_grants WHERE environment_id=$1",&[&env]).await.unwrap();
+    assert_eq!(
+        response(app.clone(), &token, "GET", &list, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
     assert_eq!(
         response(app, &token, "GET", &path, None).await.0,
         StatusCode::UNAUTHORIZED

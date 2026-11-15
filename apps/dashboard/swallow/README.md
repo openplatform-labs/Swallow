@@ -1,5 +1,8 @@
 ## Slack 429 지연 재시도 화면
 
+The FCM partial-health panel can list matching completed jobs and select one for the existing FCM result lookup. List access needs the partial-health and separate partial-jobs JWT grants plus `alert_view`; details use the existing FCM result grant. Lists are UUID-ordered, page size 20, and change between requests; aging out is not acknowledgement. A local browser against the restricted DB/API fixture checked selection, details, and clearing after list-grant revocation.
+
+
 The FCM results panel can query recent partial failure health with an independently granted operator JWT and an environment `alert_view` DB permission. The window is 1–604800 seconds; the count excludes aged-out unreviewed work and is not an acknowledgement. Apply worker migration `0185` followed by API migration `0104`. A local browser test against a disposable PostgreSQL/API fixture checked the count and result clearing after JWT permission revocation; real identity providers and production deployment remain unverified.
 
 
