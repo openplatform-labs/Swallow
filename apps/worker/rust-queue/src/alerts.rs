@@ -1460,6 +1460,180 @@ mod tests {
         (endpoint, task)
     }
 
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL and mock loopback servers"]
+    async fn fcm_health_alert_reaches_both_destinations_and_recurs_after_recovery() {
+        let url = std::env::var("TEST_DATABASE_URL").unwrap();
+        let (mut db, driver) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = driver.await;
+        });
+        db.batch_execute("CREATE TABLE public.novu_rust_environments(id text PRIMARY KEY, organization_id text NOT NULL); INSERT INTO public.novu_rust_environments VALUES ('env-a','org')").await.unwrap();
+        for sql in [
+            crate::MIGRATION,
+            crate::reconciliation::MIGRATION,
+            crate::reconciliation::OPERATOR_GRANTS_MIGRATION,
+            crate::reconciliation::OPERATOR_GRANT_LOCK_MIGRATION,
+            MIGRATION,
+            include_str!("../migrations/0072_operator_grant_management.sql"),
+            include_str!("../migrations/0073_operator_role_identity.sql"),
+            include_str!("../migrations/0087_alert_view_permission.sql"),
+            include_str!("../migrations/0085_alert_condition_cooldown.sql"),
+            include_str!("../migrations/0088_scoped_alert_dispatch.sql"),
+            include_str!("../migrations/0089_scoped_delivery_health.sql"),
+            include_str!("../migrations/0093_alert_condition_recovery.sql"),
+            include_str!("../migrations/0095_fcm_routing_guard.sql"),
+            include_str!("../migrations/0124_push_workflow_worker_policy.sql"),
+            include_str!("../migrations/0142_fcm_credential_health.sql"),
+            include_str!("../migrations/0143_alert_signed_condition_masks.sql"),
+        ] {
+            db.batch_execute(sql).await.unwrap();
+        }
+        db.execute("INSERT INTO public.novu_rust_delivery_operator_grants SELECT 'env-a',session_user,v,(SELECT oid FROM pg_roles WHERE rolname=session_user) FROM unnest(ARRAY['alert_view','alert_send']) v", &[]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_fcm_routing_workers SELECT 'env-a',rolname,oid FROM pg_roles WHERE rolname=session_user", &[]).await.unwrap();
+        let instance = Uuid::new_v4();
+        db.query_one(
+            "SELECT public.novu_rust_fcm_credential_heartbeat('env-a',$1,'unhealthy')",
+            &[&instance],
+        )
+        .await
+        .unwrap();
+        let row = db.query_one("SELECT healthy,unhealthy,stale FROM public.novu_rust_fcm_credential_health_check('env-a',60)", &[]).await.unwrap();
+        let mut value = alert();
+        value.resend_enabled = false;
+        value.fcm_credentials = Some(Ok((
+            row.get::<_, i64>(0) as u64,
+            row.get::<_, i64>(1) as u64,
+            row.get::<_, i64>(2) as u64,
+            1,
+        )));
+        assert_eq!(value.condition_mask(), i32::MIN);
+        let (url, slack_request) = mock_server("200 OK", "ok").await;
+        let slack = SlackWebhook::with_endpoint(url).unwrap();
+        assert_eq!(
+            dispatch_slack_with_options(&mut db, "fcm", 60, &value, &slack, true, true)
+                .await
+                .unwrap(),
+            Dispatch::Accepted
+        );
+        assert!(slack_request.await.unwrap().contains(
+            "FCM credential workers: 0 healthy, 1 unhealthy, 0 stale; minimum healthy: 1"
+        ));
+        let (url, email_request) = mock_server("200 OK", r#"{"id":"mock-fcm"}"#).await;
+        let email = Resend::test_endpoint(
+            crate::resend::Config {
+                api_key: "fixture-key".into(),
+                from: "from@example.test".into(),
+                sender_name: String::new(),
+            },
+            url.as_str(),
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch_email_with_conditions(
+                &mut db,
+                "fcm",
+                60,
+                &value,
+                &email,
+                "ops@example.test",
+                true
+            )
+            .await
+            .unwrap(),
+            Dispatch::Accepted
+        );
+        assert!(email_request.await.unwrap().contains(
+            "FCM credential workers: 0 healthy, 1 unhealthy, 0 stale; minimum healthy: 1"
+        ));
+        assert_eq!(
+            dispatch_slack_with_options(&mut db, "fcm", 60, &value, &slack, true, true)
+                .await
+                .unwrap(),
+            Dispatch::CoolingDown
+        );
+        db.query_one(
+            "SELECT public.novu_rust_fcm_credential_heartbeat('env-a',$1,'healthy')",
+            &[&instance],
+        )
+        .await
+        .unwrap();
+        let row = db.query_one("SELECT healthy,unhealthy,stale FROM public.novu_rust_fcm_credential_health_check('env-a',60)", &[]).await.unwrap();
+        assert_eq!(
+            (
+                row.get::<_, i64>(0),
+                row.get::<_, i64>(1),
+                row.get::<_, i64>(2)
+            ),
+            (1, 0, 0)
+        );
+        value.fcm_credentials = Some(Ok((1, 0, 0, 1)));
+        for channel in ["slack", "email"] {
+            observe_conditions(
+                &db,
+                "env-a",
+                channel,
+                "fcm",
+                value.condition_mask(),
+                value.observed_condition_mask(),
+            )
+            .await
+            .unwrap();
+        }
+        db.query_one(
+            "SELECT public.novu_rust_fcm_credential_heartbeat('env-a',$1,'unhealthy')",
+            &[&instance],
+        )
+        .await
+        .unwrap();
+        let row = db.query_one("SELECT healthy,unhealthy,stale FROM public.novu_rust_fcm_credential_health_check('env-a',60)", &[]).await.unwrap();
+        assert_eq!(
+            (
+                row.get::<_, i64>(0),
+                row.get::<_, i64>(1),
+                row.get::<_, i64>(2)
+            ),
+            (0, 1, 0)
+        );
+        value.fcm_credentials = Some(Ok((0, 1, 0, 1)));
+        let (url, slack_request) = mock_server("200 OK", "ok").await;
+        let slack = SlackWebhook::with_endpoint(url).unwrap();
+        assert_eq!(
+            dispatch_slack_with_options(&mut db, "fcm", 60, &value, &slack, true, true)
+                .await
+                .unwrap(),
+            Dispatch::Accepted
+        );
+        slack_request.await.unwrap();
+        let (url, email_request) = mock_server("200 OK", r#"{"id":"mock-fcm-again"}"#).await;
+        let email = Resend::test_endpoint(
+            crate::resend::Config {
+                api_key: "fixture-key".into(),
+                from: "from@example.test".into(),
+                sender_name: String::new(),
+            },
+            url.as_str(),
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch_email_with_conditions(
+                &mut db,
+                "fcm",
+                60,
+                &value,
+                &email,
+                "ops@example.test",
+                true
+            )
+            .await
+            .unwrap(),
+            Dispatch::Accepted
+        );
+        email_request.await.unwrap();
+    }
+
     #[test]
     fn rejects_untrusted_webhook_destinations_and_injection() {
         for url in [
