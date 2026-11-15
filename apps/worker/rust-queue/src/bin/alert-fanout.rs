@@ -7,6 +7,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::Stdio,
+    time::Duration,
 };
 use tokio::process::Command;
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
@@ -208,6 +209,18 @@ async fn run(stop: novu_postgres_queue::shutdown::Stop) -> Result<()> {
     if !(1..=8).contains(&concurrency) {
         return Err("invalid fanout concurrency".into());
     }
+    let target_timeout = match std::env::var("SWALLOW_ALERT_FANOUT_TARGET_TIMEOUT_SECONDS") {
+        Err(std::env::VarError::NotPresent) => None,
+        Ok(value) if value == "0" => None,
+        Ok(value) => Some(Duration::from_secs(
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|value| (1..=3600).contains(value))
+                .ok_or("invalid fanout target timeout")?,
+        )),
+        Err(_) => return Err("invalid fanout target timeout".into()),
+    };
     let config = read_config(file)?;
     let binary = child_path(name)?;
     let command_args: Vec<String> = command_args.into_iter().cloned().collect();
@@ -230,23 +243,46 @@ async fn run(stop: novu_postgres_queue::shutdown::Stop) -> Result<()> {
             let (channel, id) = target.key();
             let (channel, id) = (channel.to_owned(), id.to_owned());
             active.spawn(async move {
-                (
-                    channel,
-                    id,
-                    command.status().await.ok().and_then(|status| status.code()),
-                )
+                let (status, timed_out) = match command.spawn() {
+                    Ok(mut child) => {
+                        if let Some(limit) = target_timeout {
+                            match tokio::time::timeout(limit, child.wait()).await {
+                                Ok(result) => (result.ok().and_then(|status| status.code()), false),
+                                Err(_) => {
+                                    // The outcome may already have been committed or sent.
+                                    // Bound cleanup as well; kill_on_drop remains enabled.
+                                    let _ =
+                                        tokio::time::timeout(Duration::from_secs(2), child.kill())
+                                            .await;
+                                    (None, true)
+                                }
+                            }
+                        } else {
+                            (
+                                child.wait().await.ok().and_then(|status| status.code()),
+                                false,
+                            )
+                        }
+                    }
+                    Err(_) => (None, false),
+                };
+                (channel, id, status, timed_out)
             });
         }
         if active.is_empty() {
             break;
         }
         match active.join_next().await {
-            Some(Ok((channel, id, Some(0)))) => println!("{channel} {id}: completed"),
-            Some(Ok((channel, id, Some(2)))) => {
+            Some(Ok((channel, id, Some(0), false))) => println!("{channel} {id}: completed"),
+            Some(Ok((channel, id, Some(2), false))) => {
                 review = true;
                 println!("{channel} {id}: attention");
             }
-            Some(Ok((channel, id, _))) => {
+            Some(Ok((channel, id, _, true))) => {
+                failed = true;
+                eprintln!("{channel} {id}: timed out; outcome unknown");
+            }
+            Some(Ok((channel, id, _, false))) => {
                 failed = true;
                 eprintln!("{channel} {id}: failed");
             }

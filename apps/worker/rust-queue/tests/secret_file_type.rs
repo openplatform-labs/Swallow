@@ -205,3 +205,51 @@ fn alert_regular_file_policy_accepts_symlink_and_rejects_bad_policy_or_conflicti
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn fanout_timeout_isolates_actual_alert_command_blocked_on_fifo() {
+    let dir = std::env::temp_dir().join(format!("swallow-alert-fanout-fifo-{}", Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let fifo = dir.join("fifo");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let config = dir.join("targets.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({"targets":[
+            {"channel":"slack","id":"blocked","webhook_file":fifo},
+            {"channel":"slack","id":"missing","webhook_file":dir.join("missing")}
+        ]}))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_alert-fanout"))
+        .args(["delivery", "env", "300", "120", "60"])
+        .arg(&config)
+        .env_clear()
+        .env("SWALLOW_ALERT_FANOUT_TARGET_TIMEOUT_SECONDS", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("fanout did not continue");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("slack blocked: timed out; outcome unknown"));
+    assert!(stderr.contains("slack missing: failed"));
+    std::fs::remove_dir_all(dir).unwrap();
+}

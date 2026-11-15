@@ -285,3 +285,84 @@ fn shutdown_waits_for_active_targets_and_does_not_start_pending_targets() {
     assert!(!dir.join("c").exists());
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn target_timeout_kills_stalled_child_and_continues_other_destinations() {
+    use std::time::{Duration, Instant};
+    let dir = std::env::temp_dir().join(format!("swallow-fanout-timeout-{}", Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let fanout = dir.join("alert-fanout");
+    std::fs::copy(env!("CARGO_BIN_EXE_alert-fanout"), &fanout).unwrap();
+    let script = "#!/bin/sh\nprintf '%s\\n' \"$SWALLOW_ALERT_SLACK_TARGET_ID\" >> \"$FANOUT_TEST_DIR/log\"\nif [ \"$SWALLOW_ALERT_SLACK_TARGET_ID\" = stalled ]; then printf '%s' $$ > \"$FANOUT_TEST_DIR/pid\"; exec sleep 30; fi\nexit 0\n";
+    for name in ["send-delivery-alert", "send-database-alert"] {
+        let child = dir.join(name);
+        std::fs::write(&child, script).unwrap();
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let config = dir.join("targets.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({"targets":[
+            {"channel":"slack","id":"stalled","webhook_file":dir.join("secret")},
+            {"channel":"slack","id":"next","webhook_file":dir.join("secret")}
+        ]}))
+        .unwrap(),
+    )
+    .unwrap();
+    for mode in ["delivery", "database"] {
+        std::fs::write(dir.join("log"), "").unwrap();
+        let mut cmd = Command::new(&fanout);
+        if mode == "delivery" {
+            cmd.args(["delivery", "env", "300", "120", "60"]);
+        } else {
+            cmd.args(["database", "env", "db", "60"]);
+        }
+        let output = cmd
+            .arg(&config)
+            .env("FANOUT_TEST_DIR", &dir)
+            .env("SWALLOW_ALERT_FANOUT_TARGET_TIMEOUT_SECONDS", "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("log")).unwrap(),
+            "stalled\nnext\n"
+        );
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("slack stalled: timed out; outcome unknown")
+        );
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("slack next: completed")
+        );
+        let pid = std::fs::read_to_string(dir.join("pid")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Command::new("kill")
+            .args(["-0", &pid])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+        {
+            assert!(Instant::now() < deadline, "timed out child remains running");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    for value in ["bad", "3601", "-1"] {
+        std::fs::write(dir.join("log"), "").unwrap();
+        let output = Command::new(&fanout)
+            .args(["delivery", "env", "300", "120", "60"])
+            .arg(&config)
+            .env("FANOUT_TEST_DIR", &dir)
+            .env("SWALLOW_ALERT_FANOUT_TARGET_TIMEOUT_SECONDS", value)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(std::fs::read_to_string(dir.join("log")).unwrap(), "");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
