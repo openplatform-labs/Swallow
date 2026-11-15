@@ -28,6 +28,8 @@ async fn worker_pauses_for_invalid_password_and_uses_atomic_rotation() {
     )
     .await
     .unwrap();
+    db.execute("INSERT INTO public.novu_rust_smtp_credential_workers SELECT $1,rolname,oid FROM pg_roles WHERE rolname=current_user",&[&env]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_delivery_operator_grants SELECT $1,rolname,'alert_view',oid FROM pg_roles WHERE rolname=current_user",&[&env]).await.unwrap();
     let dir = std::env::temp_dir().join(format!("swallow-smtp-rotation-{}", Uuid::new_v4()));
     std::fs::create_dir(&dir).unwrap();
     let cert = dir.join("cert");
@@ -104,6 +106,7 @@ async fn worker_pauses_for_invalid_password_and_uses_atomic_rotation() {
             .env("SWALLOW_SMTP_PASSWORD_FILE", &password)
             .env("SWALLOW_SMTP_CA_FILE", &cert)
             .env("NOVU_SMTP_RELOAD_PASSWORD", "true")
+            .env("NOVU_SMTP_CREDENTIAL_HEALTH_ENABLED", "true")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -127,8 +130,24 @@ async fn worker_pauses_for_invalid_password_and_uses_atomic_rotation() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(dir.join("accepted-1").exists());
+    let row = db
+        .query_one(
+            "SELECT * FROM public.novu_rust_smtp_credential_health_check($1,60)",
+            &[&env],
+        )
+        .await
+        .unwrap();
+    assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1)), (1, 0));
     std::fs::write(&password, "invalid\npassword").unwrap();
     tokio::time::sleep(Duration::from_secs(3)).await;
+    let row = db
+        .query_one(
+            "SELECT * FROM public.novu_rust_smtp_credential_health_check($1,60)",
+            &[&env],
+        )
+        .await
+        .unwrap();
+    assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1)), (0, 1));
     let second = Uuid::new_v4();
     queue::enqueue(
         &db,
@@ -159,6 +178,14 @@ async fn worker_pauses_for_invalid_password_and_uses_atomic_rotation() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(dir.join("accepted-2").exists());
+    let row = db
+        .query_one(
+            "SELECT * FROM public.novu_rust_smtp_credential_health_check($1,60)",
+            &[&env],
+        )
+        .await
+        .unwrap();
+    assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1)), (1, 0));
     let mut done = false;
     for _ in 0..100 {
         done=db.query_opt("SELECT 1 FROM public.novu_queue_jobs j JOIN public.novu_rust_smtp_attempts a ON a.job_id=j.id WHERE j.id=$1 AND j.status='completed' AND a.state='accepted'",&[&second]).await.unwrap().is_some();
@@ -185,6 +212,7 @@ async fn worker_pauses_for_invalid_password_and_uses_atomic_rotation() {
             .env("SWALLOW_SMTP_PASSWORD_FILE", &password)
             .env("SWALLOW_SMTP_CA_FILE", &cert)
             .env("NOVU_SMTP_RELOAD_PASSWORD", "true")
+            .env("NOVU_SMTP_CREDENTIAL_HEALTH_ENABLED", "true")
             .env("NOVU_SMTP_RELOAD_FAILURE_POLICY", "exit")
             .stdout(Stdio::null())
             .stderr(Stdio::null())

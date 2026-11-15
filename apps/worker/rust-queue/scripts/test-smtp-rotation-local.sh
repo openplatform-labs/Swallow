@@ -14,3 +14,4 @@ cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-wo
 cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply worker "$WORKER/migrations"
 cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test smtp_password_rotation -- --ignored
 cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test smtp_queue -- --ignored
+cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test smtp_credential_health -- --ignored

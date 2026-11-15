@@ -30,6 +30,14 @@ async fn run(
         Ok("exit") if reload_path.is_some() => true,
         _ => return Err("invalid SMTP reload failure policy".into()),
     };
+    let credential_health = match std::env::var("NOVU_SMTP_CREDENTIAL_HEALTH_ENABLED").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid SMTP credential health setting".into()),
+    };
+    if credential_health && reload_path.is_none() {
+        return Err("SMTP credential health requires password reload".into());
+    }
     let mut provider = SmtpAlert::from_env_with_password_file(reload_path.as_deref())
         .map_err(|_| "invalid SMTP configuration")?;
     let policy = email_step_policy::Policy::from_env()?;
@@ -103,6 +111,9 @@ async fn run(
                     }
                 }
                 let mut recovery = tokio::time::Instant::now();
+                let health_instance = uuid::Uuid::new_v4();
+                let mut health_previous: Option<bool> = None;
+                let mut health_next = tokio::time::Instant::now();
                 loop {
                     if stop.requested() {
                         break;
@@ -120,9 +131,31 @@ async fn run(
                         }
                         recovery = tokio::time::Instant::now() + Duration::from_secs(5);
                     }
-                    if let Some(path) = &reload_path
-                        && provider.reload_password_file(path).is_err()
+                    let reload_failed = reload_path
+                        .as_ref()
+                        .is_some_and(|path| provider.reload_password_file(path).is_err());
+                    let healthy = !reload_failed;
+                    if credential_health
+                        && (health_previous != Some(healthy)
+                            || tokio::time::Instant::now() >= health_next)
                     {
+                        let state = if healthy { "healthy" } else { "unhealthy" };
+                        let result = tokio::time::timeout(
+                            timeout,
+                            db.query_one(
+                                "SELECT public.novu_rust_smtp_credential_heartbeat($1,$2,$3)",
+                                &[&environment, &health_instance, &state],
+                            ),
+                        )
+                        .await;
+                        if !matches!(result,Ok(Ok(row)) if row.get::<_,bool>(0)) {
+                            eprintln!("SMTP credential health observation failed; reconnecting");
+                            break;
+                        }
+                        health_previous = Some(healthy);
+                        health_next = tokio::time::Instant::now() + Duration::from_secs(10);
+                    }
+                    if reload_failed {
                         eprintln!("SMTP password reload failed; dispatch paused");
                         if exit_on_reload_failure {
                             task.abort();
