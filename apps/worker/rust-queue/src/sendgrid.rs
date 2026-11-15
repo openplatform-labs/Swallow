@@ -230,7 +230,10 @@ pub fn request_body(config: &Config, message: &Email) -> Result<Value, SendError
         body["headers"] = json!(message.headers);
     }
     if !message.tracking_settings.is_empty() {
-        body["tracking_settings"] = novu_rust_contracts::sendgrid_tracking::wire(&Value::Object(message.tracking_settings.clone())).map_err(|_| SendError::InvalidMessage)?;
+        body["tracking_settings"] = novu_rust_contracts::sendgrid_tracking::wire(&Value::Object(
+            message.tracking_settings.clone(),
+        ))
+        .map_err(|_| SendError::InvalidMessage)?;
     }
     Ok(body)
 }
@@ -327,13 +330,37 @@ impl Sendgrid {
     /// Send once; ambiguous network failures are never automatically retried.
     pub async fn send(&self, message: &Email) -> Result<Receipt, SendError> {
         let body = self.prepare(message)?;
-        self.send_prepared(body, message.message_id.as_deref()).await
+        self.send_prepared(body, message.message_id.as_deref())
+            .await
+    }
+    /// Validate a request with SendGrid without creating a delivery attempt.
+    /// Only the documented sandbox success status is treated as validation.
+    pub async fn validate_sandbox(&self, message: &Email) -> Result<(), SendError> {
+        let mut body = self.prepare(message)?;
+        body["mail_settings"] = json!({"sandbox_mode":{"enable":true}});
+        let response = self
+            .http
+            .post(&self.endpoint)
+            .bearer_auth(&self.config.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| SendError::Transport)?;
+        let status = response.status().as_u16();
+        if status != 200 {
+            return Err(SendError::Provider(status));
+        }
+        Ok(())
     }
     /// Validate and construct the request before a queue reservation commits.
     pub(crate) fn prepare(&self, message: &Email) -> Result<Value, SendError> {
         request_body_with_default_pool(&self.config, message, self.default_ip_pool.as_deref())
     }
-    pub(crate) async fn send_prepared(&self, body: Value, message_id: Option<&str>) -> Result<Receipt, SendError> {
+    pub(crate) async fn send_prepared(
+        &self,
+        body: Value,
+        message_id: Option<&str>,
+    ) -> Result<Receipt, SendError> {
         let response = self
             .http
             .post(&self.endpoint)
@@ -388,13 +415,82 @@ mod tests {
             ..Email::default()
         }
     }
+    #[tokio::test]
+    async fn sandbox_requires_documented_success_and_never_calls_normal_send() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v3/mail/send", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for status in [200, 202, 400] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0; 4096];
+                loop {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buf[..n]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..pos]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")?
+                                    .parse::<usize>()
+                                    .ok()
+                            })
+                            .unwrap();
+                        if bytes.len() >= pos + 4 + length {
+                            let body: Value =
+                                serde_json::from_slice(&bytes[pos + 4..pos + 4 + length]).unwrap();
+                            assert_eq!(
+                                body["mail_settings"],
+                                json!({"sandbox_mode":{"enable":true}})
+                            );
+                            assert_eq!(
+                                body["personalizations"][0]["to"][0]["email"],
+                                "a@example.test"
+                            );
+                            assert_eq!(body["ip_pool_name"], "default-pool");
+                            break;
+                        }
+                    }
+                }
+                socket.write_all(format!("HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            }
+        });
+        let provider = Sendgrid::with_endpoint(config(), &endpoint)
+            .unwrap()
+            .with_default_ip_pool("default-pool".into());
+        assert_eq!(provider.validate_sandbox(&message()).await, Ok(()));
+        assert_eq!(
+            provider.validate_sandbox(&message()).await,
+            Err(SendError::Provider(202))
+        );
+        assert_eq!(
+            provider.validate_sandbox(&message()).await,
+            Err(SendError::Provider(400))
+        );
+        server.await.unwrap();
+    }
     #[test]
     fn tracking_validation_rejects_invalid_persisted_messages_before_send() {
-        let mut email=message();
-        assert!(request_body(&config(),&email).unwrap().get("tracking_settings").is_none());
-        for invalid in [json!({"clickTracking":{"enable":"true"}}),json!({"openTracking":{"unsupported":true}}),json!({"ganalytics":{"utmSource":"x".repeat(4097)}})] {
-            email.tracking_settings=invalid.as_object().unwrap().clone();
-            assert!(matches!(request_body(&config(),&email),Err(SendError::InvalidMessage)));
+        let mut email = message();
+        assert!(
+            request_body(&config(), &email)
+                .unwrap()
+                .get("tracking_settings")
+                .is_none()
+        );
+        for invalid in [
+            json!({"clickTracking":{"enable":"true"}}),
+            json!({"openTracking":{"unsupported":true}}),
+            json!({"ganalytics":{"utmSource":"x".repeat(4097)}}),
+        ] {
+            email.tracking_settings = invalid.as_object().unwrap().clone();
+            assert!(matches!(
+                request_body(&config(), &email),
+                Err(SendError::InvalidMessage)
+            ));
         }
     }
     #[tokio::test]
