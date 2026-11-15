@@ -1,3 +1,9 @@
+## 경보 이메일 발송 설정 바인딩 선택
+
+`SWALLOW_ALERT_EMAIL_BINDING_PROFILE=configuration`을 선택하고 기존 바인딩 키를 설정하면 경보 이메일 대상 ID에 수신자·공급자뿐 아니라 발신 주소·표시 이름·공급자 API endpoint·API 키 및 SendGrid IP 풀을 HMAC으로 묶는다. 기본 `destination`은 기존 수신자 중심 동작이다. 강화 모드에서 바인딩 키가 없거나 같은 대상 ID의 설정이 다르면 발송을 차단한다. 원문 자격증명은 바인딩 테이블에 저장하지 않는다. 키나 풀을 변경할 때는 새로운 대상 ID 및 모든 발송기의 배포 조정이 필요하다. DB 접근과 바인딩 키를 보호하고 구형·바인딩 미사용 발송기를 중지해야 한다. Slack 대상의 바인딩 규칙은 변경하지 않는다.
+
+임시 PostgreSQL과 실제 fanout·두 경보 명령으로 Resend·SendGrid의 일치 설정과 발신·수신·키 변경 거절, SendGrid 지역·풀 변경 거절, 기존 방식과의 충돌 및 키 누락을 확인했다. 대상은 테스트용으로 차단해 외부 발송은 하지 않았으며 실제 공급자·운영 HA는 미검증이다. 자세한 전환 절차는 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
 ## SendGrid 경보 이메일 IP 풀
 
 직접 실행하는 경보 이메일 명령에서 SendGrid를 선택한 경우 `NOVU_SENDGRID_IP_POOL_NAME`으로 IP 풀을 지정할 수 있다. `alert-fanout`은 SendGrid 이메일 대상별 `ip_pool_name`을 선택적으로 받아 각 자식에 전달한다. fanout은 부모 환경의 풀 값을 지우므로 지정하지 않은 대상은 부모 설정이나 다른 대상의 풀을 상속하지 않는다. Resend 대상에 이 필드를 넣으면 설정 오류다. 빈 값은 풀을 지정하지 않는다. SendGrid의 실제 풀 검증은 공급자에 맡긴다.

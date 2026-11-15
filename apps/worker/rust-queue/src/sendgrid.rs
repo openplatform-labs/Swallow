@@ -254,6 +254,15 @@ pub struct Sendgrid {
     default_ip_pool: Option<String>,
 }
 impl Sendgrid {
+    pub(crate) fn binding_parts(&self) -> [&str; 5] {
+        [
+            &self.config.from,
+            &self.config.sender_name,
+            &self.endpoint,
+            &self.config.api_key,
+            self.default_ip_pool.as_deref().unwrap_or(""),
+        ]
+    }
     pub fn new(config: Config) -> Result<Self, SendError> {
         let endpoint = match config.region {
             Region::Global => "https://api.sendgrid.com/v3/mail/send",

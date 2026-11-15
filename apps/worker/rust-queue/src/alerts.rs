@@ -677,6 +677,22 @@ pub fn binding_key_from_env() -> DbResult<Option<ring::hmac::Key>> {
         None => Ok(None),
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmailBindingProfile {
+    Destination,
+    Configuration,
+}
+
+pub fn email_binding_profile_from_env(key_present: bool) -> DbResult<EmailBindingProfile> {
+    match std::env::var("SWALLOW_ALERT_EMAIL_BINDING_PROFILE").as_deref() {
+        Ok("destination") | Err(std::env::VarError::NotPresent) => {
+            Ok(EmailBindingProfile::Destination)
+        }
+        Ok("configuration") if key_present => Ok(EmailBindingProfile::Configuration),
+        Ok("configuration") => Err("email configuration binding requires a binding key".into()),
+        _ => Err("invalid email binding profile".into()),
+    }
+}
 fn destination_fingerprint(
     key: &ring::hmac::Key,
     channel: &str,
@@ -718,6 +734,7 @@ pub async fn bind_email_destination(
     key: &ring::hmac::Key,
     provider: &AlertEmailProvider,
     recipient: &str,
+    profile: EmailBindingProfile,
 ) -> DbResult<bool> {
     if recipient.is_empty()
         || recipient.len() > 320
@@ -730,12 +747,34 @@ pub async fn bind_email_destination(
         AlertEmailProvider::Resend(_) => "resend",
         AlertEmailProvider::Sendgrid(_) => "sendgrid",
     };
+    let fingerprint = match profile {
+        EmailBindingProfile::Destination => destination_fingerprint(key, "email", name, recipient),
+        EmailBindingProfile::Configuration => {
+            let mut hmac = ring::hmac::Context::with_key(key);
+            let mut add = |value: &str| {
+                hmac.update(&(value.len() as u64).to_be_bytes());
+                hmac.update(value.as_bytes());
+            };
+            for value in ["swallow-alert-email-configuration-v2", name, recipient] {
+                add(value);
+            }
+            match provider {
+                AlertEmailProvider::Resend(provider) => {
+                    for part in provider.binding_parts() { add(part); }
+                }
+                AlertEmailProvider::Sendgrid(provider) => {
+                    for part in provider.binding_parts() { add(part); }
+                }
+            }
+            hmac.sign().as_ref().iter().map(|b| format!("{b:02x}")).collect()
+        }
+    };
     bind_destination(
         db,
         environment,
         "email",
         target,
-        &destination_fingerprint(key, "email", name, recipient),
+        &fingerprint,
     )
     .await
 }

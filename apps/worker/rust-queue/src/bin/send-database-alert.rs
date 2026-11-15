@@ -101,6 +101,7 @@ async fn run() -> Result<()> {
         return Err("no usable alert destination configured".into());
     }
     let binding_key = alerts::binding_key_from_env()?;
+    let email_binding_profile = alerts::email_binding_profile_from_env(binding_key.is_some())?;
     let mut alert = Alert {
         environment: args[0].clone(),
         overdue_undelivered: 0,
@@ -232,7 +233,13 @@ async fn run() -> Result<()> {
                 tokio::time::timeout(
                     operation_timeout,
                     alerts::bind_email_destination(
-                        &db, &args[0], &email_id, key, provider, recipient
+                        &db,
+                        &args[0],
+                        &email_id,
+                        key,
+                        provider,
+                        recipient,
+                        email_binding_profile
                     )
                 )
                 .await,

@@ -238,3 +238,116 @@ async fn provider_failures_are_recorded_per_destination() {
     assert!(!output.contains("one@example.test"));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires fully migrated disposable PostgreSQL"]
+async fn configuration_binding_rejects_divergent_email_sender_settings() {
+    let url = std::env::var("TEST_DATABASE_URL").unwrap();
+    let (db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move { driver.await.unwrap() });
+    db.batch_execute("INSERT INTO novu_rust_environments VALUES ('binding-env','org'); INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'binding-env',rolname,'alert_send',oid FROM pg_roles WHERE rolname=session_user; INSERT INTO novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES ('binding-env','email','mail-sendgrid','rejected'),('binding-env','email','mail-resend','rejected')").await.unwrap();
+    let job = Uuid::new_v4();
+    novu_postgres_queue::enqueue(&db, job, "binding-env", "fixture", &serde_json::json!({}))
+        .await
+        .unwrap();
+    db.execute("UPDATE public.novu_queue_jobs SET available_at=clock_timestamp()-interval '5 minutes' WHERE id=$1",&[&job]).await.unwrap();
+    let dir = std::env::temp_dir().join(format!("swallow-binding-{}", Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let key = dir.join("email-key");
+    let binding = dir.join("binding-key");
+    let config = dir.join("targets.json");
+    std::fs::write(&key, "fixture-secret-original").unwrap();
+    std::fs::write(&binding, "binding-key-0123456789abcdef0123456789").unwrap();
+    let run = |target: serde_json::Value, mode: &str, profile: &str, key_present: bool| {
+        std::fs::write(
+            &config,
+            serde_json::to_vec(&serde_json::json!({"targets":[target]})).unwrap(),
+        )
+        .unwrap();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_alert-fanout"));
+        if mode == "delivery" {
+            cmd.args(["delivery", "binding-env", "300", "120", "60"]);
+        } else {
+            cmd.args(["database", "binding-env", "probe", "60"]);
+        }
+        cmd.arg(&config)
+            .env("DATABASE_URL", &url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("SWALLOW_ALERT_EMAIL_BINDING_PROFILE", profile)
+            .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
+            .env("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS", "60")
+            .env(
+                "SWALLOW_DB_PROBE_URL",
+                "postgres://postgres@127.0.0.1:1/postgres",
+            )
+            .env("SWALLOW_DB_PROBE_TIMEOUT_SECONDS", "1")
+            .env_remove("SWALLOW_ALERT_BINDING_KEY");
+        if key_present {
+            cmd.env("SWALLOW_ALERT_BINDING_KEY_FILE", &binding);
+        } else {
+            cmd.env_remove("SWALLOW_ALERT_BINDING_KEY_FILE");
+        }
+        cmd.output().unwrap()
+    };
+    for provider in ["sendgrid", "resend"] {
+        let mut target = serde_json::json!({"channel":"email","id":format!("mail-{provider}"),"provider":provider,"to":"ops@example.test","from":"sender@example.test","sender_name":"Ops","api_key_file":key});
+        if provider == "sendgrid" {
+            target["region"] = "global".into();
+            target["ip_pool_name"] = "pool-a".into();
+        }
+        for mode in ["delivery", "database"] {
+            let out = run(target.clone(), mode, "configuration", true);
+            assert_eq!(
+                out.status.code(),
+                Some(2),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        for field in ["from", "sender_name", "to"] {
+            let mut changed = target.clone();
+            changed[field] = "different@example.test".into();
+            let out = run(changed, "delivery", "configuration", true);
+            assert_eq!(out.status.code(), Some(1));
+        }
+        if provider == "sendgrid" {
+            for (field, value) in [("region", "eu"), ("ip_pool_name", "pool-b")] {
+                let mut changed = target.clone();
+                changed[field] = value.into();
+                assert_eq!(
+                    run(changed, "delivery", "configuration", true)
+                        .status
+                        .code(),
+                    Some(1)
+                );
+            }
+        }
+        std::fs::write(&key, "fixture-secret-rotated").unwrap();
+        let out = run(target.clone(), "delivery", "configuration", true);
+        assert_eq!(out.status.code(), Some(1));
+        let text = String::from_utf8_lossy(&out.stderr);
+        assert!(!text.contains("fixture-secret"));
+        assert!(!text.contains("ops@example.test"));
+        std::fs::write(&key, "fixture-secret-original").unwrap();
+        assert_eq!(
+            run(target.clone(), "delivery", "destination", true)
+                .status
+                .code(),
+            Some(1)
+        );
+        assert_eq!(
+            run(target, "delivery", "configuration", false)
+                .status
+                .code(),
+            Some(1)
+        );
+    }
+    let fingerprints:Vec<String>=db.query("SELECT fingerprint FROM public.novu_rust_alert_destination_bindings WHERE environment_id='binding-env'",&[]).await.unwrap().into_iter().map(|row|row.get(0)).collect();
+    assert_eq!(fingerprints.len(), 2);
+    assert!(
+        fingerprints
+            .iter()
+            .all(|s| s.len() == 64 && !s.contains("fixture-secret"))
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

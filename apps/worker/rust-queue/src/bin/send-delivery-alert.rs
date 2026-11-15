@@ -68,6 +68,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         return Err("no usable alert destination configured".into());
     }
     let binding_key = alerts::binding_key_from_env()?;
+    let email_binding_profile = alerts::email_binding_profile_from_env(binding_key.is_some())?;
     let slack_id =
         std::env::var("SWALLOW_ALERT_SLACK_TARGET_ID").unwrap_or_else(|_| "default".into());
     let email_id =
@@ -109,7 +110,13 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                 tokio::time::timeout(
                     operation_timeout,
                     alerts::bind_email_destination(
-                        &db, &args[0], &email_id, key, provider, recipient
+                        &db,
+                        &args[0],
+                        &email_id,
+                        key,
+                        provider,
+                        recipient,
+                        email_binding_profile
                     )
                 )
                 .await,

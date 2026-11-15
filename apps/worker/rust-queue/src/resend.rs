@@ -126,6 +126,14 @@ pub struct Resend {
     config: Config,
 }
 impl Resend {
+    pub(crate) fn binding_parts(&self) -> [&str; 4] {
+        [
+            &self.config.from,
+            &self.config.sender_name,
+            &self.endpoint,
+            &self.config.api_key,
+        ]
+    }
     pub fn new(config: Config) -> Result<Self, SendError> {
         Self::with_endpoint(config, "https://api.resend.com/emails")
     }
