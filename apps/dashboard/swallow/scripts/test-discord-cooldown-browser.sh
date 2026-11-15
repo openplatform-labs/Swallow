@@ -39,6 +39,7 @@ CREATE ROLE ui_fixture_api LOGIN;
 GRANT USAGE ON SCHEMA public TO ui_fixture_api;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_discord_cooldown_read(text,text,text,text,bigint,text),public.novu_rust_operator_jwt_discord_cooldown_change(text,text,text,text,bigint,text,uuid,bigint,boolean,text),public.novu_rust_operator_jwt_discord_cooldown_request(text,text,text,text,bigint,text,uuid),public.novu_rust_operator_jwt_discord_cooldown_audit_read(text,text,text,text,bigint,text,uuid) TO ui_fixture_api;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_discord_cooldown_health(text,text,text,text,bigint,integer) TO ui_fixture_api;
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_smtp_credential_health(text,text,text,text,bigint,integer,integer) TO ui_fixture_api;
 INSERT INTO public.novu_rust_environments VALUES('fixture-env','fixture-org'),('other-env','fixture-org');
 INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES('https://issuer.test','admin','console','fixture-env'),('https://issuer.test','target','console','fixture-env'),('https://issuer.test','admin','console','other-env');
 INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname='ui_fixture_api';
@@ -46,6 +47,8 @@ INSERT INTO public.novu_rust_discord_destinations(environment_id,destination_id,
 INSERT INTO public.novu_rust_discord_cooldown_admins(environment_id,destination_id,database_principal,principal_oid,can_read,can_write,can_audit) SELECT 'fixture-env','ops',rolname,oid,true,true,true FROM pg_roles WHERE rolname='ui_fixture_api';
 INSERT INTO public.novu_rust_operator_jwt_discord_cooldown_grants VALUES('https://issuer.test','admin','console','fixture-env','ops',true,true,true),('https://issuer.test','target','console','fixture-env','ops',false,false,false);
 INSERT INTO public.novu_rust_operator_jwt_discord_cooldown_health_grants VALUES('https://issuer.test','admin','console','fixture-env',true);
+INSERT INTO public.novu_rust_operator_jwt_smtp_credential_health_grants VALUES('https://issuer.test','admin','console','fixture-env',true);
+INSERT INTO public.novu_rust_smtp_credential_health(environment_id,instance_id,database_principal,backend_pid,backend_started_at,state) SELECT 'fixture-env','11111111-1111-4111-8111-000000000032',session_user,pg_backend_pid(),backend_start,'unhealthy' FROM pg_stat_activity WHERE pid=pg_backend_pid();
 INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'fixture-env',rolname,'alert_view',oid FROM pg_roles WHERE rolname='ui_fixture_api';
 INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,last_error,available_at) VALUES('11111111-1111-4111-8111-000000000031','fixture-env','experimental_discord_webhook','{}','Discord shared cooldown active',clock_timestamp()-interval '10 minutes');
 SQL
@@ -118,8 +121,10 @@ await fill('input[name="permissionKey"]',admin);await fill('input[name="permissi
 await page.waitForFunction(()=>document.querySelector('app-discord-cooldown')?.innerText.includes('정책을 조회하지 못했습니다.'));
 await page.click('nav.sidenav button >> nth=5');await page.selectOption('select[name="alertAuthMode"]','jwt');await fill('input[name="alertEnvironment"]','fixture-env');await fill('input[name="alertKey"]',admin);
 await page.click('app-discord-cooldown-health button:has-text("공유 대기 조회")');await page.waitForFunction(()=>document.querySelector('app-discord-cooldown-health')?.innerText.includes('제한 중인 대상 0개 · 연기 1건 · 지연 1건'));
+await fill('input[name="smtpCredentialAge"]','300');await page.click('app-smtp-credential-health button:has-text("암호 갱신 상태 조회")');await page.waitForFunction(()=>document.querySelector('app-smtp-credential-health')?.innerText.includes('확인 필요 · 정상 0개 · 실패 1개'));
 await fill('input[name="alertKey"]',target);await page.click('app-discord-cooldown-health button:has-text("공유 대기 조회")');await page.waitForFunction(()=>document.querySelector('app-discord-cooldown-health')?.innerText.includes('현황을 조회하지 못했습니다.'));
-await fs.writeFile(ROOT+'/request-id',req);console.log('Discord cooldown: real browser read, change, request, audit and access isolation passed');
+await page.click('app-smtp-credential-health button:has-text("암호 갱신 상태 조회")');await page.waitForFunction(()=>document.querySelector('app-smtp-credential-health')?.innerText.includes('상태를 조회하지 못했습니다.'));
+await fs.writeFile(ROOT+'/request-id',req);console.log('Discord cooldown and SMTP credential health: real browser, API and access isolation passed');
 '''
 with open(root+'/browser.mjs','w') as f:f.write('const API='+json.dumps(api)+'; const UI='+json.dumps(ui)+'; const ROOT='+json.dumps(root)+'; const SPACE='+json.dumps(int(space) if space else None)+';\n'+script)
 PY

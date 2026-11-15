@@ -28,6 +28,7 @@ enum Lookup {
     SlackCooldownHealth,
     ResendCooldownHealth,
     FcmCooldownHealth,
+    SmtpCredentialHealth,
     DiscordCooldownHealth,
     DiscordRetryHealth,
     DiscordRetryList,
@@ -427,6 +428,9 @@ pub(super) async fn slack_cooldown_health(
     query(db, headers, uri, verifier, Lookup::SlackCooldownHealth).await
 }
 
+pub(super) async fn smtp_credential_health(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
+    query(db,headers,uri,verifier,Lookup::SmtpCredentialHealth).await
+}
 pub(super) async fn discord_cooldown_health(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
     query(db,headers,uri,verifier,Lookup::DiscordCooldownHealth).await
 }
@@ -2407,6 +2411,7 @@ async fn query(
         | Lookup::SlackResult
         | Lookup::SendgridResult => &["environmentId", "jobId"],
         Lookup::ResendAutoHealth | Lookup::SlackCooldownHealth | Lookup::ResendCooldownHealth | Lookup::FcmCooldownHealth | Lookup::TwilioDelayedHealth => &["environmentId", "graceSeconds"],
+        Lookup::SmtpCredentialHealth => &["environmentId", "maxAgeSeconds", "minimumHealthy"],
         Lookup::DiscordCooldownHealth => &["environmentId", "graceSeconds"],
         Lookup::DiscordRetryHealth => &["environmentId", "graceSeconds"],
         Lookup::DiscordRetryList => &["environmentId", "graceSeconds", "filter", "after"],
@@ -2595,6 +2600,11 @@ async fn query(
                 ],
             )
             .await
+        }
+        Lookup::SmtpCredentialHealth => {
+            let Some(age)=params.get("maxAgeSeconds").and_then(|v|v.parse::<i32>().ok().filter(|n|(1..=86400).contains(n)&&n.to_string()==*v)) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};
+            let Some(minimum)=params.get("minimumHealthy").and_then(|v|v.parse::<i32>().ok().filter(|n|(1..=1000).contains(n)&&n.to_string()==*v)) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};
+            guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_smtp_credential_health($1,$2,$3,$4,$5,$6,$7)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&age,&minimum]).await
         }
         Lookup::DiscordCooldownHealth => {
             let Some(grace)=params.get("graceSeconds").and_then(|v|v.parse::<i32>().ok().filter(|n|(1..=86400).contains(n)&&n.to_string()==*v)) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};

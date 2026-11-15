@@ -1,12 +1,13 @@
 import { Component, EventEmitter, Input, OnChanges, OnDestroy, Output, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
+import { SmtpCredentialHealth } from './smtp-credential-health';
 
 type SmtpRow = {jobId:string;status:string;attemptState:string|null;attemptRevision:string|null;failureRevision:string;attempts:number};
 type HistoryOperator = {issuer:string;subject:string;clientId:string;requestId:string};
 type HistoryRow = {operator:HistoryOperator|null;actor:string;actorOid:string;requestId:string;jobId:string;attemptRevision:string|null;failureRevision:string;decision:'accepted'|'retry';reason:string;createdAt:string};
 type HistoryCursor = {actorOid:string;requestId:string};
 type Review = {requestId:string;jobId:string;attemptRevision:string|null;failureRevision:string;reason:string;decision?:'accepted'|'retry'};
-@Component({selector:'app-smtp-reviews',imports:[FormsModule],templateUrl:'./smtp-reviews.html'})
+@Component({selector:'app-smtp-reviews',imports:[FormsModule,SmtpCredentialHealth],templateUrl:'./smtp-reviews.html'})
 export class SmtpReviews implements OnChanges,OnDestroy {
   @Input() apiOrigin=''; @Input() environment=''; @Input() token=''; @Output() busyChange=new EventEmitter<boolean>();
   readonly rows=signal<SmtpRow[]>([]); readonly next=signal<string|null>(null); readonly listStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');

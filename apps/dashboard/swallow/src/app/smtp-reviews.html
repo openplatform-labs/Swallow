@@ -36,3 +36,5 @@
     <button type="button" class="btn btn-sm btn-outline" (click)="loadHistory(true)" [disabled]="!historyNext()">다음 이력</button><p>동시에 기록된 판정은 앞 페이지에 나타날 수 있으므로 첫 페이지를 다시 조회하세요.</p>
   }
 </div></section>
+
+<app-smtp-credential-health [apiOrigin]="apiOrigin" [environment]="environment" [token]="token"></app-smtp-credential-health>

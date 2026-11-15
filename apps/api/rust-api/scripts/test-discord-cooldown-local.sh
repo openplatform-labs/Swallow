@@ -14,3 +14,6 @@ cargo test --locked --manifest-path "$API/Cargo.toml" --test operator_discord_co
 "$TEST_PG_BIN/createdb" -h 127.0.0.1 -p "$PORT" -U postgres discord_cooldown_grants
 export TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/discord_cooldown_grants"
 cargo test --locked --manifest-path "$API/Cargo.toml" --test operator_discord_retry_grants -- --ignored
+"$TEST_PG_BIN/createdb" -h 127.0.0.1 -p "$PORT" -U postgres smtp_credential_health_api
+export TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/smtp_credential_health_api"
+cargo test --locked --manifest-path "$API/Cargo.toml" --test operator_smtp_credential_health -- --ignored
