@@ -37,6 +37,7 @@ struct VerifierConfig {
     issuer: String,
     audience: String,
     keys: Vec<VerifierKey>,
+    max_token_lifetime_seconds: Option<u64>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -53,6 +54,7 @@ pub struct AccessTokenVerifier {
     issuer: String,
     validation: Validation,
     keys: HashMap<String, DecodingKey>,
+    max_token_lifetime_seconds: Option<u64>,
 }
 
 impl AccessTokenVerifier {
@@ -67,7 +69,15 @@ impl AccessTokenVerifier {
             .iter()
             .map(|key| (key.kid.as_str(), key.pem.as_bytes()))
             .collect();
-        Self::new(&config.issuer, &config.audience, &keys)
+        if config
+            .max_token_lifetime_seconds
+            .is_some_and(|v| !(1..=31_536_000).contains(&v))
+        {
+            return Err("invalid verifier configuration");
+        }
+        let mut verifier = Self::new(&config.issuer, &config.audience, &keys)?;
+        verifier.max_token_lifetime_seconds = config.max_token_lifetime_seconds;
+        Ok(verifier)
     }
     /// Key material is trusted configuration; each entry is a unique key ID and RSA public PEM.
     pub fn new(issuer: &str, audience: &str, keys: &[(&str, &[u8])]) -> Result<Self, &'static str> {
@@ -109,6 +119,7 @@ impl AccessTokenVerifier {
             issuer: issuer.to_owned(),
             validation,
             keys: decoding_keys,
+            max_token_lifetime_seconds: None,
         })
     }
 
@@ -140,6 +151,12 @@ impl AccessTokenVerifier {
         if claims.iss != self.issuer
             || claims.iat > now
             || claims.exp <= now
+            || self.max_token_lifetime_seconds.is_some_and(|max| {
+                claims
+                    .exp
+                    .checked_sub(claims.iat)
+                    .is_none_or(|duration| duration > max)
+            })
             || claims.nbf.is_some_and(|nbf| nbf > now)
             || [&claims.sub, &claims.client_id, &claims.jti]
                 .iter()

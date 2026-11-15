@@ -118,3 +118,39 @@ fn rejects_invalid_or_duplicate_configuration() {
     );
     assert!(AccessTokenVerifier::new("issuer", "aud", &[("one", b"invalid")]).is_err());
 }
+
+#[test]
+fn optional_maximum_lifetime_uses_signed_iat_and_exp() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut config = json!({"issuer":"https://issuer.test","audience":"swallow-api","keys":[{"kid":"one","pem":std::str::from_utf8(PUBLIC).unwrap()}],"max_token_lifetime_seconds":60});
+    let bounded = AccessTokenVerifier::from_json(&config.to_string()).unwrap();
+    let mut claims = json!({"iss":"https://issuer.test","sub":"person-1","aud":"swallow-api","iat":now-1,"exp":now+59,"jti":"one","client_id":"console"});
+    assert!(bounded.verify(&token(&claims, |_| {})).is_some());
+    claims["exp"] = json!(now + 60);
+    assert!(bounded.verify(&token(&claims, |_| {})).is_none());
+    config
+        .as_object_mut()
+        .unwrap()
+        .remove("max_token_lifetime_seconds");
+    assert!(
+        AccessTokenVerifier::from_json(&config.to_string())
+            .unwrap()
+            .verify(&token(&claims, |_| {}))
+            .is_some()
+    );
+    for invalid in [
+        json!(0),
+        json!(31_536_001),
+        json!(-1),
+        json!("60"),
+        json!(1.5),
+    ] {
+        config["max_token_lifetime_seconds"] = invalid;
+        assert!(AccessTokenVerifier::from_json(&config.to_string()).is_err());
+    }
+    config["max_token_lifetime_seconds"] = json!(31_536_000);
+    assert!(AccessTokenVerifier::from_json(&config.to_string()).is_ok());
+}

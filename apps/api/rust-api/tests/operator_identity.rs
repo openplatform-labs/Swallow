@@ -84,6 +84,28 @@ async fn verifies_token_mapping_scope_revocation_and_expiry() {
         .unwrap()
         .as_secs();
     let good = token("user-1", "console", now + 120);
+    let bounded_config = json!({"issuer":"https://issuer.test","audience":"swallow","keys":[{"kid":"key","pem":std::str::from_utf8(PUBLIC).unwrap()}],"max_token_lifetime_seconds":60});
+    let bounded = novu_rust_api::router(Arc::new(connect(&actor_url).await)).layer(Extension(
+        Arc::new(AccessTokenVerifier::from_json(&bounded_config.to_string()).unwrap()),
+    ));
+    assert_eq!(
+        bounded
+            .clone()
+            .oneshot(request(&good, "environmentId=jwt-a"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let short = token("user-1", "console", now + 30);
+    assert_eq!(
+        bounded
+            .oneshot(request(&short, "environmentId=jwt-a"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
     assert_eq!(
         bare.oneshot(request(&good, "environmentId=jwt-a"))
             .await
