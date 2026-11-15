@@ -169,6 +169,7 @@ async fn run(
     let step_policy = novu_postgres_queue::push_step_policy::Policy::from_env()?;
     let preference_policy = novu_postgres_queue::push_step_policy::PreferencePolicy::from_env()?;
     let target_policy = novu_postgres_queue::push_step_policy::TargetPolicy::from_env()?;
+    let rate_limit_policy = fcm_queue::RateLimitPolicy::from_env()?;
     let invalid_token_policy = InvalidTokenPolicy::from_env()?;
     let cleanup_guard = TokenCleanupGuard::from_env()?;
     let environment = std::env::var("NOVU_FCM_ENVIRONMENT_ID")?;
@@ -592,7 +593,7 @@ async fn run(
                         continue;
                     }
                     let dispatch = async {
-                        fcm_queue::process_one_with_target_policy(
+                        fcm_queue::process_one_with_rate_limit_policy(
                             &mut db,
                             &environment,
                             provider.as_ref(),
@@ -601,6 +602,7 @@ async fn run(
                             step_policy,
                             preference_policy,
                             target_policy,
+                            rate_limit_policy,
                         )
                         .await
                     };

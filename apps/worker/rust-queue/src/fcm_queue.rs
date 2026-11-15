@@ -11,6 +11,28 @@ use uuid::Uuid;
 pub const JOB_KIND: &str = "experimental_fcm_push";
 pub const MIGRATION: &str = include_str!("../migrations/0045_experimental_fcm_attempts.sql");
 pub const RETRY_AFTER_MIGRATION: &str = include_str!("../migrations/0184_fcm_retry_after.sql");
+/// Delay only the remaining, not-yet-attempted targets in this job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RateLimitPolicy {
+    Continue,
+    DelayKnown,
+}
+impl RateLimitPolicy {
+    pub fn from_env() -> Result<Self, &'static str> {
+        match std::env::var("SWALLOW_FCM_MULTICAST_429_POLICY").as_deref() {
+            Ok("continue") | Err(std::env::VarError::NotPresent) => Ok(Self::Continue),
+            Ok("delay-known") => Ok(Self::DelayKnown),
+            _ => Err("invalid FCM multicast 429 policy"),
+        }
+    }
+}
+
+fn continuation_delay(policy: RateLimitPolicy, retry_after: Option<i32>) -> i32 {
+    match policy {
+        RateLimitPolicy::Continue => 0,
+        RateLimitPolicy::DelayKnown => retry_after.map(|seconds| seconds.max(60)).unwrap_or(0),
+    }
+}
 
 async fn claim(client: &Client, environment: &str) -> Result<Option<ClaimedJob>, Error> {
     let token = Uuid::new_v4();
@@ -121,6 +143,7 @@ pub async fn process_one(
         crate::push_step_policy::Policy::Snapshot,
         crate::push_step_policy::PreferencePolicy::Snapshot,
         crate::push_step_policy::TargetPolicy::Reference,
+        RateLimitPolicy::Continue,
     )
     .await
 }
@@ -140,6 +163,7 @@ pub async fn process_one_with_shared_provider(
         crate::push_step_policy::Policy::Snapshot,
         crate::push_step_policy::PreferencePolicy::Snapshot,
         crate::push_step_policy::TargetPolicy::Reference,
+        RateLimitPolicy::Continue,
     )
     .await
 }
@@ -160,6 +184,7 @@ pub async fn process_one_with_integrations(
         crate::push_step_policy::Policy::Snapshot,
         crate::push_step_policy::PreferencePolicy::Snapshot,
         crate::push_step_policy::TargetPolicy::Reference,
+        RateLimitPolicy::Continue,
     )
     .await
 }
@@ -181,6 +206,7 @@ pub async fn process_one_with_policy(
         policy,
         crate::push_step_policy::PreferencePolicy::Snapshot,
         crate::push_step_policy::TargetPolicy::Reference,
+        RateLimitPolicy::Continue,
     )
     .await
 }
@@ -203,6 +229,7 @@ pub async fn process_one_with_policies(
         policy,
         preference,
         crate::push_step_policy::TargetPolicy::Reference,
+        RateLimitPolicy::Continue,
     )
     .await
 }
@@ -227,6 +254,33 @@ pub async fn process_one_with_target_policy(
         policy,
         preference,
         target,
+        RateLimitPolicy::Continue,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn process_one_with_rate_limit_policy(
+    client: &mut Client,
+    environment: &str,
+    provider: Option<&Fcm>,
+    providers: Option<&HashMap<String, Fcm>>,
+    shared: bool,
+    policy: crate::push_step_policy::Policy,
+    preference: crate::push_step_policy::PreferencePolicy,
+    target: crate::push_step_policy::TargetPolicy,
+    rate_limit: RateLimitPolicy,
+) -> Result<bool, Error> {
+    process_one_inner(
+        client,
+        environment,
+        provider,
+        providers,
+        shared,
+        policy,
+        preference,
+        target,
+        rate_limit,
     )
     .await
 }
@@ -241,6 +295,7 @@ async fn process_one_inner(
     policy: crate::push_step_policy::Policy,
     preference_policy: crate::push_step_policy::PreferencePolicy,
     target_policy: crate::push_step_policy::TargetPolicy,
+    rate_limit_policy: RateLimitPolicy,
 ) -> Result<bool, Error> {
     let Some(job) = claim(client, environment).await? else {
         return Ok(false);
@@ -919,7 +974,8 @@ async fn process_one_inner(
             refresh_group(&tx, environment, job.id, history_index, group_size).await?;
         }
         if attempted.len() + 1 < messages.len() {
-            tx.execute("UPDATE novu_queue_jobs SET status='pending',available_at=clock_timestamp(),lease_token=NULL,lease_until=NULL WHERE id=$1 AND lease_token=$2",&[&job.id,&job.lease_token]).await?;
+            let delay = continuation_delay(rate_limit_policy, retry_after);
+            tx.execute("UPDATE novu_queue_jobs SET status='pending',available_at=clock_timestamp()+make_interval(secs=>$3::integer::double precision),lease_token=NULL,lease_until=NULL WHERE id=$1 AND lease_token=$2",&[&job.id,&job.lease_token,&delay]).await?;
         } else {
             finish(&tx, &job).await?;
         }
@@ -944,6 +1000,17 @@ pub async fn recover_expired(client: &mut Client, environment: &str) -> Result<u
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn continuation_respects_selected_policy_and_known_advice() {
+        use super::{RateLimitPolicy, continuation_delay};
+        assert_eq!(continuation_delay(RateLimitPolicy::Continue, Some(120)), 0);
+        assert_eq!(continuation_delay(RateLimitPolicy::DelayKnown, Some(0)), 60);
+        assert_eq!(
+            continuation_delay(RateLimitPolicy::DelayKnown, Some(120)),
+            120
+        );
+        assert_eq!(continuation_delay(RateLimitPolicy::DelayKnown, None), 0);
+    }
     use super::*;
     use serde_json::json;
     use tokio::{
@@ -1932,6 +1999,52 @@ mod tests {
             .await
             .unwrap();
         db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision) VALUES ('test',session_user,'retry'),('test',session_user,'accepted') ON CONFLICT DO NOTHING", &[]).await.unwrap();
+        // A 429 delays only unattempted targets, even when another worker claims the job.
+        let delayed = Uuid::new_v4();
+        let delayed_payload = json!({"title":"Hi","content":"Hello","targets":["a","b"]});
+        crate::enqueue(&db, delayed, "delay-test", JOB_KIND, &delayed_payload)
+            .await
+            .unwrap();
+        let (delayed_provider, delayed_server) = mock(vec![429, 200]).await;
+        assert!(
+            process_one_with_rate_limit_policy(
+                &mut db,
+                "delay-test",
+                Some(&delayed_provider),
+                None,
+                false,
+                crate::push_step_policy::Policy::Snapshot,
+                crate::push_step_policy::PreferencePolicy::Snapshot,
+                crate::push_step_policy::TargetPolicy::Reference,
+                RateLimitPolicy::DelayKnown
+            )
+            .await
+            .unwrap()
+        );
+        let row = db.query_one("SELECT status,available_at>clock_timestamp()+interval '100 seconds' FROM public.novu_queue_jobs WHERE id=$1", &[&delayed]).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), "pending");
+        assert!(row.get::<_, bool>(1));
+        assert!(
+            !process_one(&mut other_db, "delay-test", &delayed_provider)
+                .await
+                .unwrap()
+        );
+        db.execute("UPDATE public.novu_queue_jobs SET available_at=clock_timestamp()-interval '1 second' WHERE id=$1", &[&delayed]).await.unwrap();
+        assert!(
+            process_one(&mut other_db, "delay-test", &delayed_provider)
+                .await
+                .unwrap()
+        );
+        assert_eq!(delayed_server.await.unwrap(), ["a", "b"]);
+        let attempts = db.query("SELECT state FROM public.novu_rust_fcm_attempts WHERE job_id=$1 ORDER BY target_index", &[&delayed]).await.unwrap();
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|r| r.get::<_, String>(0))
+                .collect::<Vec<_>>(),
+            ["rejected", "accepted"]
+        );
+
         let payload = json!({"title":"Hi","content":"Hello","targets":["a","b","c"]});
         let other = Uuid::new_v4();
         let id = Uuid::new_v4();
