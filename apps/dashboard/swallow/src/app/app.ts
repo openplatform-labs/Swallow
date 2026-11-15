@@ -109,6 +109,9 @@ export class App implements OnDestroy {
   readonly alertSlots = signal<AlertSlot[]>([]);
   readonly alertStatus = signal<'idle' | 'loading' | 'loaded' | 'error'>('idle');
   readonly alertError = signal('');
+  readonly alertRefreshSeconds = signal(0);
+  private alertRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  private alertRefreshGeneration = 0;
   resendJobId = '';
   readonly resendStatus = signal<'idle'|'loading'|'loaded'|'error'>('idle');
   readonly resendError = signal('');
@@ -289,6 +292,8 @@ export class App implements OnDestroy {
   private grantRequestAbort:AbortController|null=null;
 
   ngOnDestroy(): void {
+    this.stopAlertRefresh();
+    this.alertRequestId++; this.alertAbort?.abort(); this.alertAbort=null;
     this.clearWorkflow(true);
     this.forgetWorkflowRequest();
     this.oidcSequence++;
@@ -311,6 +316,7 @@ export class App implements OnDestroy {
     // Preserve decision outcome and request ID, including an in-flight or uncertain decision.
     if (this.apiKey===session.token) { this.apiKey=''; this.clearSubscribers(); this.resetSubscriberEdit(); this.clearSubscriberProfileLookup(); this.clearSubscriberCreateLookup(); this.clearSubscriberDeleteLookup(); }
     if (this.alertKey===session.token) {
+      this.stopAlertRefresh();
       this.alertKey=''; this.clearResend(); this.clearResendJobs();
       this.alertRequestId++; this.alertAbort?.abort(); this.alertAbort=null;
       this.alertSlots.set([]); this.alertStatus.set('idle'); this.alertError.set('');
@@ -975,6 +981,7 @@ export class App implements OnDestroy {
 
   clearAlerts(): void {
     if (this.decisionStatus() === 'sending') return;
+    this.stopAlertRefresh();
     this.alertRequestId++;
     this.alertAbort?.abort();
     this.alertAbort = null;
@@ -1304,6 +1311,36 @@ export class App implements OnDestroy {
     this.clearRequestLookup(true);
   }
 
+  stopAlertRefresh(): void {
+    this.alertRefreshGeneration++;
+    if (this.alertRefreshTimer !== null) clearTimeout(this.alertRefreshTimer);
+    this.alertRefreshTimer = null;
+    this.alertRefreshSeconds.set(0);
+  }
+
+  setAlertRefresh(value: string): void {
+    this.stopAlertRefresh();
+    const seconds = Number(value);
+    if (![15, 30, 60].includes(seconds) || this.section() !== 'alerts') return;
+    this.alertRefreshSeconds.set(seconds);
+    const generation = this.alertRefreshGeneration;
+    const schedule = () => {
+      if (generation !== this.alertRefreshGeneration) return;
+      this.alertRefreshTimer = setTimeout(async () => {
+        this.alertRefreshTimer = null;
+        if (generation !== this.alertRefreshGeneration) return;
+        if (this.section() === 'alerts' && this.alertStatus() === 'loaded' && this.alertPage() === 1
+          && this.decisionStatus() === 'idle' && this.selectedAlert() === null) {
+          await this.loadAlerts();
+          if (generation !== this.alertRefreshGeneration) return;
+          if (this.alertStatus() === 'error') { this.stopAlertRefresh(); return; }
+        }
+        schedule();
+      }, seconds * 1000);
+    };
+    schedule();
+  }
+
   async loadAlerts(direction?: 'next' | 'previous'): Promise<void> {
     if (this.decisionStatus() === 'sending') return;
     this.expireOidcIfNeeded();
@@ -1355,6 +1392,7 @@ export class App implements OnDestroy {
     } catch (error: unknown) {
       this.expireOidcIfNeeded();
       if (id !== this.alertRequestId) return;
+      this.stopAlertRefresh();
       this.alertStatus.set('error');
       this.alertError.set(error instanceof Error && ['주소', '원격', '인증', '경보', 'API '].some(prefix => error.message.startsWith(prefix)) ? error.message : '서버에 연결할 수 없습니다.');
     } finally {

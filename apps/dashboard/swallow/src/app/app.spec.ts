@@ -6,6 +6,51 @@ import { OperatorOidc } from './operator-oidc';
 describe('Swallow console', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
+  it('polls alert first page only when no decision is being reviewed', async () => {
+    vi.useFakeTimers();
+    const row={channel:'slack',targetId:'ops',state:'unknown',lastStartedAt:null,attemptId:'1889f88e-c0a3-4ab5-b861-2fdc1f26f254'};
+    const mock=vi.spyOn(globalThis,'fetch').mockImplementation(async()=>new Response(JSON.stringify({data:[row],hasMore:false,next:null})));
+    const app=TestBed.createComponent(App).componentInstance;
+    app.setSection('alerts');app.alertKey='a'.repeat(64);await app.loadAlerts();
+    app.setAlertRefresh('15');await vi.advanceTimersByTimeAsync(15000);expect(mock).toHaveBeenCalledTimes(2);
+    app.selectAlert(app.alertSlots()[0]);app.decisionReason='investigation';
+    await vi.advanceTimersByTimeAsync(30000);expect(mock).toHaveBeenCalledTimes(2);expect(app.decisionReason).toBe('investigation');
+    app.clearDecision();app.alertPage.set(2);await vi.advanceTimersByTimeAsync(15000);expect(mock).toHaveBeenCalledTimes(2);
+    app.alertPage.set(1);await vi.advanceTimersByTimeAsync(15000);expect(mock).toHaveBeenCalledTimes(3);
+    app.setSection('overview');expect(app.alertRefreshSeconds()).toBe(0);await vi.advanceTimersByTimeAsync(30000);expect(mock).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not overlap alert polling and discards a response after credentials are cleared', async () => {
+    vi.useFakeTimers();
+    let finish!:(response:Response)=>void;
+    const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[],hasMore:false,next:null}))).mockReturnValueOnce(new Promise(resolve=>{finish=resolve;}));
+    const app=TestBed.createComponent(App).componentInstance;
+    app.setSection('alerts');app.alertKey='a'.repeat(64);await app.loadAlerts();app.setAlertRefresh('15');
+    await vi.advanceTimersByTimeAsync(15000);expect(mock).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(60000);expect(mock).toHaveBeenCalledTimes(2);
+    app.forgetAlertKey();finish(new Response(JSON.stringify({data:[{channel:'slack',targetId:'old',state:'unknown',lastStartedAt:null}],hasMore:false,next:null})));
+    await vi.advanceTimersByTimeAsync(0);expect(app.alertSlots()).toEqual([]);expect(app.alertRefreshSeconds()).toBe(0);
+  });
+
+  it('stops automatic alert polling on a failed refresh', async () => {
+    vi.useFakeTimers();
+    const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[],hasMore:false,next:null}))).mockResolvedValueOnce(new Response('',{status:403}));
+    const app=TestBed.createComponent(App).componentInstance;
+    app.setSection('alerts');app.alertKey='a'.repeat(64);await app.loadAlerts();app.setAlertRefresh('30');
+    await vi.advanceTimersByTimeAsync(30000);expect(app.alertStatus()).toBe('error');expect(app.alertRefreshSeconds()).toBe(0);
+    await vi.advanceTimersByTimeAsync(60000);expect(mock).toHaveBeenCalledTimes(2);
+  });
+
+  it('lets the operator select and stop automatic refresh in the view', () => {
+    vi.useFakeTimers();
+    const fixture=TestBed.createComponent(App);const app=fixture.componentInstance;
+    app.setSection('alerts');fixture.detectChanges();
+    const select=fixture.nativeElement.querySelector('#alert-refresh') as HTMLSelectElement;
+    expect(select.value).toBe('0');select.value='30';select.dispatchEvent(new Event('change'));fixture.detectChanges();
+    expect(app.alertRefreshSeconds()).toBe(30);
+    fixture.destroy();expect(app.alertRefreshSeconds()).toBe(0);
+  });
+
   it('requires scoped JWT delete reason and recovers a lost deletion result', async () => {
     const generation='11111111-1111-1111-1111-111111111111';const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({found:true,subscriberId:'person',generation,revision:'2',profile:{firstName:'Alice'}}))).mockRejectedValueOnce(new TypeError('lost'));
     const app=TestBed.createComponent(App).componentInstance;app.setSection('subscribers');app.credentialMode='jwt';app.apiKey='aaa.bbb.ccc';app.subscriberEnvironment='env-a';app.subscriberEditId='person';await app.loadSubscriberEdit();app.subscriberDeleteConfirmation='person';await app.changeSubscriberEdit(true);expect(mock).toHaveBeenCalledTimes(1);app.subscriberDeleteReason='ticket';await app.changeSubscriberEdit(true);expect(app.subscriberEditStatus()).toBe('unknown');expect(app.subscriberDeleteRetryStatus()).toBe('unknown');const snapshot=app.subscriberDeleteRetry()!;const original=mock.mock.calls[1][1]?.body;expect(JSON.parse(original as string)).toEqual({requestId:expect.any(String),subscriberId:'person',generation,revision:'2',reason:'ticket'});
