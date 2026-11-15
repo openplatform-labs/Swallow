@@ -630,6 +630,7 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/console/alerts/request", get(console_alerts::request_status))
         .route("/v1/experimental/console/alerts/decisions", get(console_alerts::history))
         .route("/v1/events/trigger", post(trigger))
+        .route("/v1/experimental/workflow-trigger-result", get(workflow_trigger_result))
         .route("/v1/experimental/fcm-integrations", get(fcm_integrations::list).post(fcm_integrations::create))
         .route("/v1/experimental/fcm-integration-audit", get(fcm_integrations::audit))
         .route("/v1/experimental/sendgrid-webhook-keys", get(sendgrid_key_management::list).post(sendgrid_key_management::create))
@@ -3664,6 +3665,27 @@ async fn patch_subscriber(
             &path,
         ),
     }
+}
+
+async fn workflow_trigger_result(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    Query(params): Query<Vec<(String,String)>>,
+) -> Response {
+    let path="/v1/experimental/workflow-trigger-result";
+    let environment = match authenticate(&db,&headers,path).await {Ok(value)=>value,Err(response)=>return response.into_response()};
+    let transaction = match params.as_slice() {
+        [(key,value)] if key=="transactionId" && !value.is_empty() && value.len()<=512 && !value.chars().any(char::is_control) => value,
+        _ => return error_at(StatusCode::BAD_REQUEST,"Invalid transaction ID","Bad Request",path).into_response(),
+    };
+    let row=match db.query_one("SELECT EXISTS(SELECT 1 FROM public.novu_rust_trigger_transactions t WHERE t.environment_id=$1 AND t.transaction_id=$2),COALESCE((SELECT jsonb_agg(jsonb_build_object('jobId',x.id,'jobStatus',x.status)) FROM (SELECT id,status FROM public.novu_queue_jobs WHERE environment_id=$1 AND kind IN ('experimental_static_in_app','experimental_static_in_app_attachments_v1') AND md5(payload->>'transactionId')=md5($2) AND payload->>'transactionId'=$2 ORDER BY id LIMIT 2) x),'[]'::jsonb)",&[&environment,&transaction]).await {
+        Ok(row)=>row,
+        Err(_)=>return error_at(StatusCode::INTERNAL_SERVER_ERROR,"Internal server error","Internal Server Error",path).into_response(),
+    };
+    let jobs:Value=row.get(1);
+    let items=jobs.as_array().expect("query returns array");
+    let single=if items.len()==1 {items.first().cloned()} else {None};
+    (StatusCode::OK,[(axum::http::header::CACHE_CONTROL,"no-store")],Json(json!({"data":{"transactionId":transaction,"recorded":row.get::<_,bool>(0),"jobCount":items.len(),"job":single}}))).into_response()
 }
 
 async fn trigger(

@@ -49,4 +49,15 @@ describe('workflow trigger',()=>{
   it('allows memory-only use when session storage cannot be read',async()=>{
     const getter=vi.spyOn(Storage.prototype,'getItem').mockImplementation(()=>{throw Error('denied')});vi.spyOn(globalThis,'fetch').mockRejectedValue(new Error('offline'));const {fixture,c}=setup();fixture.detectChanges();expect(c.status()).toBe('idle');expect(c.storageError()).toBe(true);await c.submit();expect(c.status()).toBe('unknown');c.reset();expect(c.status()).toBe('idle');getter.mockRestore();fixture.destroy();
   });
+  it('looks up the current transaction with its original API origin and environment key',async()=>{
+    const id='66666666-6666-4666-8666-666666666666';vi.spyOn(crypto,'randomUUID').mockReturnValue(id);
+    const fetcher=vi.spyOn(globalThis,'fetch').mockRejectedValueOnce(new Error('offline')).mockResolvedValueOnce(new Response(JSON.stringify({data:{transactionId:id,recorded:true,jobCount:1,job:{jobId:id,jobStatus:'completed'}}})));
+    const {fixture,c}=setup();await c.submit();await c.lookup();expect(fetcher.mock.calls[1][0]).toBe(`https://api.example.test/v1/experimental/workflow-trigger-result?transactionId=${id}`);expect(fetcher.mock.calls[1][1]).toMatchObject({headers:{Authorization:'ApiKey test-key'},credentials:'omit',redirect:'error'});expect(c.lookupResult()).toEqual({recorded:true,jobCount:1,job:{jobId:id,jobStatus:'completed'}});fixture.detectChanges();expect(fixture.nativeElement.textContent).toContain('부모 작업 상태는 개별 채널 전달 결과가 아닙니다');
+    c.apiOrigin='https://other.example.test';await c.lookup();expect(c.lookupStatus()).toBe('error');expect(fetcher).toHaveBeenCalledTimes(2);fixture.destroy();
+  });
+  it('rejects inconsistent or stale transaction lookup results',async()=>{
+    const id='77777777-7777-4777-8777-777777777777';vi.spyOn(crypto,'randomUUID').mockReturnValue(id);
+    let finish!:(response:Response)=>void;const fetcher=vi.spyOn(globalThis,'fetch').mockRejectedValueOnce(new Error('offline')).mockResolvedValueOnce(new Response(JSON.stringify({data:{transactionId:id,recorded:false,jobCount:0,job:{jobId:id,jobStatus:'completed'}}}))).mockImplementationOnce(()=>new Promise(resolve=>finish=resolve));
+    const {fixture,c}=setup();await c.submit();await c.lookup();expect(c.lookupStatus()).toBe('error');expect(c.lookupResult()).toBeNull();const pending=c.lookup();c.apiKey='other-key';c.clearLookup();finish(new Response(JSON.stringify({data:{transactionId:id,recorded:true,jobCount:1,job:{jobId:id,jobStatus:'completed'}}})));await pending;expect(c.lookupStatus()).toBe('idle');expect(c.lookupResult()).toBeNull();expect(fetcher).toHaveBeenCalledTimes(3);fixture.destroy();
+  });
 });
