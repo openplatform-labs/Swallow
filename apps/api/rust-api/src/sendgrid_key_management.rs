@@ -168,7 +168,7 @@ pub async fn audit(
         .take(100)
         .map(|row| {
             json!({
-                "id":row.get::<_,Uuid>(0),"identifier":row.get::<_,String>(1),
+                "id":row.get::<_,Uuid>(0).to_string(),"identifier":row.get::<_,String>(1),
                 "action":row.get::<_,String>(2),"userId":row.get::<_,String>(3),
                 "recordedAt":row.get::<_,String>(4)
             })
