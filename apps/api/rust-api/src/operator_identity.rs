@@ -33,6 +33,7 @@ enum Lookup {
     FcmResult,
     FcmJobs,
     SlackDecisionRequest,
+    TwilioRetryRequest,
     Resend429Request,
     Resend429Audit,
     SlackResult,
@@ -319,6 +320,10 @@ pub(super) async fn resend_429_audit(
     State(db): State<Arc<Client>>, headers: HeaderMap, OriginalUri(uri): OriginalUri,
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
 ) -> Response { query(db, headers, uri, verifier, Lookup::Resend429Audit).await }
+
+pub(super) async fn twilio_retry_request(State(db): State<Arc<Client>>, headers: HeaderMap, OriginalUri(uri): OriginalUri, verifier: Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
+    query(db, headers, uri, verifier, Lookup::TwilioRetryRequest).await
+}
 
 pub(super) async fn slack_decision_request(
     State(db): State<Arc<Client>>,
@@ -1514,7 +1519,7 @@ async fn query(
     let allowed: &[&str] = match lookup {
         Lookup::Subscribers => &["environmentId", "name", "after", "before", "limit"],
         Lookup::Alerts => &["environmentId", "afterChannel", "afterTarget"],
-        Lookup::DecisionRequest | Lookup::SlackDecisionRequest | Lookup::Resend429Request => &["environmentId", "requestId"],
+        Lookup::DecisionRequest | Lookup::SlackDecisionRequest | Lookup::Resend429Request | Lookup::TwilioRetryRequest => &["environmentId", "requestId"],
         Lookup::Identity | Lookup::ResendAutoPolicyRead => &["environmentId"],
         Lookup::PermissionIdentity => &["environmentId", "issuer", "subject", "clientId"],
         Lookup::PermissionAudit => &["environmentId", "before"],
@@ -2409,6 +2414,28 @@ async fn query(
             )
             .await
         }
+        Lookup::TwilioRetryRequest => {
+            let Some(request) = params
+                .get("requestId")
+                .and_then(|id| Uuid::parse_str(id).ok())
+            else {
+                return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+            };
+            guarded_query(
+                &db,
+                &identity,
+                "SELECT public.novu_rust_operator_jwt_twilio_retry_request($1,$2,$3,$4,$5,$6)",
+                &[
+                    &identity.issuer,
+                    &identity.subject,
+                    &identity.client_id,
+                    &env,
+                    &exp,
+                    &request,
+                ],
+            )
+            .await
+        }
         Lookup::DecisionRequest => {
             let Some(request) = params
                 .get("requestId")
@@ -2615,6 +2642,92 @@ pub(super) async fn slack_retry_after(
         &db,
         &identity,
         "SELECT public.novu_rust_operator_jwt_slack_retry_after($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+        &[
+            &identity.issuer,
+            &identity.subject,
+            &identity.client_id,
+            &env,
+            &exp,
+            &request,
+            &job,
+            &attempt,
+            &input.decision,
+            &input.reason,
+        ],
+    )
+    .await
+    {
+        Ok(row) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(row.get::<_,serde_json::Value>(0)),
+        )
+            .into_response(),
+        Err(e) if e.code().is_some_and(|c| c.code() == "42501") => {
+            failure(StatusCode::UNAUTHORIZED, uri.path())
+        }
+        Err(e) if e.code().is_some_and(|c| c.code() == "22023") => {
+            failure(StatusCode::BAD_REQUEST, uri.path())
+        }
+        Err(e) if e.code().is_some_and(|c| c.code() == "P4090") => {
+            let mut response = error_at(
+                StatusCode::CONFLICT,
+                "Request ID conflict",
+                "Conflict",
+                uri.path(),
+            )
+            .into_response();
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("no-store"),
+            );
+            response
+        }
+        Err(_) => failure(StatusCode::INTERNAL_SERVER_ERROR, uri.path()),
+    }
+}
+
+pub(super) async fn twilio_retry_after(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+    body: Bytes,
+) -> Response {
+    let identity = match authenticate(&db, &headers, verifier).await {
+        Ok(identity) => identity,
+        Err(status) => return failure(status, uri.path()),
+    };
+    let params: Vec<_> = form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).collect();
+    if params.len() != 1
+        || params[0].0 != "environmentId"
+        || params[0].1.is_empty()
+        || params[0].1.len() > 512
+        || params[0].1.contains('\0')
+    {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    }
+    let Some(input) = (body.len() <= 4096)
+        .then(|| serde_json::from_slice::<SlackDecisionBody>(&body).ok())
+        .flatten()
+    else {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    };
+    if input.reason.contains('\0') || input.decision.contains('\0') {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    }
+    let (Ok(request), Ok(job), Ok(attempt), Ok(exp)) = (
+        Uuid::parse_str(&input.request_id),
+        Uuid::parse_str(&input.job_id),
+        Uuid::parse_str(&input.attempt_id),
+        i64::try_from(identity.expires_at),
+    ) else {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    };
+    let env = params[0].1.as_ref();
+    match guarded_query(
+        &db,
+        &identity,
+        "SELECT public.novu_rust_operator_jwt_twilio_retry_after($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
         &[
             &identity.issuer,
             &identity.subject,

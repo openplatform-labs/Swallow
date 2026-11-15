@@ -365,6 +365,8 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/operator/resend-429-decision/request", get(operator_identity::resend_429_request))
         .route("/v1/experimental/operator/resend-429-decision/audit", get(operator_identity::resend_429_audit))
         .route("/v1/experimental/operator/slack-retry-after", post(operator_identity::slack_retry_after))
+        .route("/v1/experimental/operator/twilio-retry-after", post(operator_identity::twilio_retry_after))
+        .route("/v1/experimental/operator/twilio-retry-request", get(operator_identity::twilio_retry_request))
         .route("/v1/experimental/operator/slack-decision", post(operator_identity::slack_resolve))
         .route("/v1/experimental/operator/slack-decision-request", get(operator_identity::slack_decision_request))
         .route("/v1/experimental/operator/slack-result", get(operator_identity::slack_result))
