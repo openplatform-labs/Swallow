@@ -1,4 +1,4 @@
-실제 브라우저 회귀 시험은 `TEST_PG_BIN=/path/to/postgresql/bin scripts/test-resend-cooldown-grants-browser.sh`로 실행한다. 테스트 JWT와 임시 PostgreSQL에서 정책 조회·변경·감사 권한을 위임하고 대상 운영자가 기본 대기를 30초에서 45초로 변경해 이력과 DB 값을 확인한다. 정책 권한 회수 후 화면 동작과 외부 IdP·운영 HA는 이 시나리오에서 검증하지 않는다.
+실제 브라우저 회귀 시험은 `TEST_PG_BIN=/path/to/postgresql/bin scripts/test-resend-cooldown-grants-browser.sh`로 실행한다. 테스트 JWT와 임시 PostgreSQL에서 정책 조회·변경·감사 권한을 위임하고 대상 운영자가 기본 대기를 30초에서 45초로 변경해 이력과 DB 값을 확인한다. 쓰기 권한 회수 후 변경이 반영되지 않고 읽기는 유지되며, 읽기 권한 회수 후 조회가 거절돼도 감사 조회는 유지됨을 확인했다. 거절된 변경은 화면에서 결과 불명으로 표시된다. 외부 IdP·운영 HA는 검증하지 않는다.
 
 설정의 Resend 429 위임 권한에서 공유 대기 정책의 조회·변경·감사 권한을 각각 관리할 수 있다. API 0114를 적용하면 기존 Resend 429 관리자의 권한 범위가 넓어지므로 사전에 해당 관리자와 `can_read`·`can_write`를 검토해야 한다. 워커 정책에 대한 API DB 로그인 권한은 별도로 부여하며 초기 위임 관리자는 DBA가 등록한다. 제한 DB 로그인·임시 PostgreSQL에서 실제 정책 접근과 개별 권한 회수를 확인했고 Angular 테스트를 통과했다. 실제 브라우저·제한 API DB 로그인·임시 PostgreSQL에서 세 권한 위임 후 대상 운영자의 정책 변경과 감사 조회를 확인했다. 외부 IdP와 운영 HA는 미검증이다.
 

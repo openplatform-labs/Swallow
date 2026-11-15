@@ -145,7 +145,39 @@ await page.waitForFunction(()=>[...document.querySelectorAll('table')].some(t=>t
 await page.click('loc=role:button[name="정책 요청 정보 지우기"]');
 await page.click('app-resend-cooldown-policy section:first-child button');
 await page.waitForFunction(()=>document.body.innerText.includes('기본 대기: 45초'));
-console.log('Real API browser test: grant, audit, health, revoke and delegated policy change passed');
+// Remove only the write grant; the target must still be able to read and audit.
+await page.click('nav.sidenav button >> nth=5');
+await settings();
+await page.selectOption('select[name="grantKind"]','resend-429:policy-write');
+await page.click('loc=role:button[name="선택 권한 조회"]');
+await page.waitForFunction(()=>document.body.innerText.includes('resend-429:policy-write 현재 상태: 허용'));
+await submit('browser revoke policy-write');
+await page.fill('input[name="permissionKey"]',target);
+await page.click('app-resend-cooldown-policy section:first-child button');
+await page.waitForFunction(()=>document.body.innerText.includes('기본 대기: 45초'));
+await page.evaluate(()=>document.querySelector('input[name="resendCooldownFallback"]')?.scrollIntoView({block:'center'}));
+await page.fill('input[name="resendCooldownFallback"]','60');
+await page.evaluate(()=>document.querySelector('textarea[name="resendCooldownReason"]')?.scrollIntoView({block:'center'}));
+await page.fill('textarea[name="resendCooldownReason"]','revoked write must fail');
+await page.click('input[name="resendCooldownConfirm"]');
+await page.click('loc=role:button[name="정책 변경 요청 준비"]');
+await page.waitForSelector('input[name="resendCooldownSubmitConfirm"]');
+await page.click('input[name="resendCooldownSubmitConfirm"]');
+await page.click('loc=role:button[name="정책 변경 제출"]');
+await page.waitForFunction(()=>document.body.innerText.includes('결과가 불명확합니다. 요청 ID로 확인하세요.'));
+// Navigate away to clear the unresolved request, then revoke read separately.
+await page.click('nav.sidenav button >> nth=5');
+await settings();
+await page.selectOption('select[name="grantKind"]','resend-429:policy-read');
+await page.click('loc=role:button[name="선택 권한 조회"]');
+await page.waitForFunction(()=>document.body.innerText.includes('resend-429:policy-read 현재 상태: 허용'));
+await submit('browser revoke policy-read');
+await page.fill('input[name="permissionKey"]',target);
+await page.click('app-resend-cooldown-policy section:first-child button');
+await page.waitForFunction(()=>document.body.innerText.includes('정책을 조회하지 못했습니다. 인증과 정책 조회 권한을 확인하세요.'));
+await page.click('app-resend-cooldown-policy section:last-child button >> nth=0');
+await page.waitForFunction(()=>[...document.querySelectorAll('table')].some(t=>t.innerText.includes('browser policy change') && t.innerText.includes('45초')));
+console.log('Real API browser test: delegated policy grant, change, audit and independent revocation passed');
 '''
 with open(root+'/browser.mjs','w') as f:f.write('const API='+json.dumps(api)+'; const UI='+json.dumps(ui)+'; const ROOT='+json.dumps(root)+'; const SPACE='+json.dumps(int(space) if space else None)+';\n'+script)
 PY
