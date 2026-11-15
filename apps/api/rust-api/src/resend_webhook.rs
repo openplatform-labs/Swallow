@@ -8,8 +8,9 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use ring::{digest, hmac};
 use serde_json::Value;
 use std::{
+    path::{Path as FsPath, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio_postgres::Client;
 
@@ -17,10 +18,22 @@ use tokio_postgres::Client;
 pub struct Config {
     environment: String,
     secrets: Vec<Vec<u8>>,
+    reload: Option<Arc<Reload>>,
     lock_retry_jobs: bool,
     capture_correlation: bool,
     lock_correlation_jobs: bool,
 }
+struct Reload {
+    path: PathBuf,
+    permits: Arc<tokio::sync::Semaphore>,
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecretBundle {
+    current: String,
+    previous: Option<String>,
+}
+
 impl Config {
     pub fn new(environment: String, secret: &str) -> Option<Self> {
         Self::new_with_secrets(environment, &[secret])
@@ -40,6 +53,34 @@ impl Config {
         Some(Self {
             environment,
             secrets: decoded,
+            reload: None,
+            lock_retry_jobs: false,
+            capture_correlation: false,
+            lock_correlation_jobs: false,
+        })
+    }
+    fn read_bundle(path: &FsPath) -> Option<Vec<Vec<u8>>> {
+        let raw = novu_rust_contracts::secret::read_regular_file(path).ok()?;
+        let bundle: SecretBundle = serde_json::from_str(&raw).ok()?;
+        let mut secrets = vec![bundle.current.as_str()];
+        if let Some(previous) = bundle.previous.as_deref() {
+            secrets.push(previous);
+        }
+        Some(Self::new_with_secrets("fixture".into(), &secrets)?.secrets)
+    }
+    /// Reload an atomic JSON bundle before signature verification; failures are closed.
+    pub fn new_reloading(environment: String, path: PathBuf) -> Option<Self> {
+        if environment.trim().is_empty() || path.as_os_str().is_empty() {
+            return None;
+        }
+        Self::read_bundle(&path)?;
+        Some(Self {
+            environment,
+            secrets: Vec::new(),
+            reload: Some(Arc::new(Reload {
+                path,
+                permits: Arc::new(tokio::sync::Semaphore::new(16)),
+            })),
             lock_retry_jobs: false,
             capture_correlation: false,
             lock_correlation_jobs: false,
@@ -79,29 +120,42 @@ impl Config {
         if lock_correlation_jobs && (!lock_retry_jobs || !capture_correlation) {
             return None;
         }
-        let current = novu_rust_contracts::secret::from_env(
-            "NOVU_RESEND_WEBHOOK_SECRET",
-            "NOVU_RESEND_WEBHOOK_SECRET_FILE",
-        )
-        .ok()??;
-        let previous = novu_rust_contracts::secret::from_env(
-            "NOVU_RESEND_WEBHOOK_PREVIOUS_SECRET",
-            "NOVU_RESEND_WEBHOOK_PREVIOUS_SECRET_FILE",
-        )
-        .ok()?;
-        let mut secrets = vec![current.as_str()];
-        if let Some(previous) = &previous {
-            secrets.push(previous.as_str());
-        }
-        Some(
-            Self::new_with_secrets(
-                std::env::var("NOVU_RESEND_WEBHOOK_ENVIRONMENT_ID").ok()?,
-                &secrets,
-            )?
-            .with_retry_job_lock(lock_retry_jobs)
-            .with_correlation_capture(capture_correlation)
-            .with_correlation_job_lock(lock_correlation_jobs),
-        )
+        let environment = std::env::var("NOVU_RESEND_WEBHOOK_ENVIRONMENT_ID").ok()?;
+        let mut config =
+            if let Some(path) = std::env::var_os("NOVU_RESEND_WEBHOOK_SECRET_BUNDLE_FILE") {
+                if [
+                    "NOVU_RESEND_WEBHOOK_SECRET",
+                    "NOVU_RESEND_WEBHOOK_SECRET_FILE",
+                    "NOVU_RESEND_WEBHOOK_PREVIOUS_SECRET",
+                    "NOVU_RESEND_WEBHOOK_PREVIOUS_SECRET_FILE",
+                ]
+                .iter()
+                .any(|name| std::env::var_os(name).is_some())
+                {
+                    return None;
+                }
+                Self::new_reloading(environment, PathBuf::from(path))?
+            } else {
+                let current = novu_rust_contracts::secret::from_env(
+                    "NOVU_RESEND_WEBHOOK_SECRET",
+                    "NOVU_RESEND_WEBHOOK_SECRET_FILE",
+                )
+                .ok()??;
+                let previous = novu_rust_contracts::secret::from_env(
+                    "NOVU_RESEND_WEBHOOK_PREVIOUS_SECRET",
+                    "NOVU_RESEND_WEBHOOK_PREVIOUS_SECRET_FILE",
+                )
+                .ok()?;
+                let mut secrets = vec![current.as_str()];
+                if let Some(previous) = &previous {
+                    secrets.push(previous);
+                }
+                Self::new_with_secrets(environment, &secrets)?
+            };
+        config.lock_retry_jobs = lock_retry_jobs;
+        config.capture_correlation = capture_correlation;
+        config.lock_correlation_jobs = lock_correlation_jobs;
+        Some(config)
     }
 }
 
@@ -162,8 +216,28 @@ pub async fn receive(
     if seconds > now.as_secs().saturating_add(300) || now.as_secs().saturating_sub(seconds) > 300 {
         return StatusCode::UNAUTHORIZED;
     }
+    let reloaded = if let Some(reload) = &config.reload {
+        let Ok(permit) = reload.permits.clone().try_acquire_owned() else {
+            return StatusCode::SERVICE_UNAVAILABLE;
+        };
+        let path = reload.path.clone();
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                Config::read_bundle(&path)
+            }),
+        )
+        .await
+        {
+            Ok(Ok(Some(secrets))) => Some(secrets),
+            _ => return StatusCode::SERVICE_UNAVAILABLE,
+        }
+    } else {
+        None
+    };
     let mut valid = false;
-    for secret in &config.secrets {
+    for secret in reloaded.as_deref().unwrap_or(&config.secrets) {
         valid |= verify(secret, id, timestamp, &raw, signatures);
     }
     if !valid {
