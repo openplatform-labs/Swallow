@@ -7,11 +7,15 @@
   <label for="trigger-subscriber">구독자 ID</label><input id="trigger-subscriber" name="triggerSubscriber" [(ngModel)]="subscriber" [disabled]="status()==='sending'" required>
   <label for="trigger-payload">페이로드 JSON 객체</label><textarea id="trigger-payload" name="triggerPayload" [(ngModel)]="payload" [disabled]="status()==='sending'"></textarea>
   <label for="trigger-mode">SendGrid 이메일 방식</label><select id="trigger-mode" name="triggerMode" [(ngModel)]="mode" [disabled]="status()==='sending'"><option value="sandbox">시험 검증 (이메일 전달 없음)</option><option value="normal">일반 발송</option></select>
+  <label class="decision-confirm"><input type="checkbox" name="triggerRemember" [(ngModel)]="rememberTransaction" [disabled]="status()==='sending'||status()==='accepted'||status()==='unknown'"> 거래 ID와 API 주소를 이 브라우저 탭에 보관</label>
+  <p class="subscriber-hint">선택하면 화면 이탈이나 새로고침 후 결과를 불명으로 복원합니다. API 키와 구독자·페이로드는 저장하지 않습니다. 탭을 닫으면 기록이 사라질 수 있습니다.</p>
   <button class="btn btn-primary" type="submit" [disabled]="status()==='sending'||status()==='accepted'||status()==='unknown'">워크플로 실행</button>
   <button class="btn btn-outline" type="button" (click)="reset()" [disabled]="status()==='sending'">새 요청 준비</button>
 </form>
 @if(status()==='invalid'){<p role="alert">입력값과 API 주소, JSON 객체를 확인하세요.</p>}
+@if(storageError()){<p role="alert">탭 저장소를 사용할 수 없거나 저장된 기록이 올바르지 않습니다. 저장소를 확인한 후 새 요청을 준비하세요.</p>}
 @if(status()==='sending'){<p role="status">요청 중입니다. 거래 ID: {{transaction()}}</p>}
 @if(status()==='accepted'){<p role="status">접수 상태: {{outcome()}} · 거래 ID: {{transaction()}}. 실제 채널 처리 결과는 발송 이력에서 확인하세요.</p>}
-@if(status()==='unknown'){<p role="alert">요청 결과가 불명입니다. 거래 ID {{transaction()}}로 이력을 확인한 뒤 새 요청을 준비하세요. 새 요청은 다른 거래 ID를 사용합니다.</p>}
+@if(status()==='unknown'){<p role="alert">요청 결과가 불명입니다. 거래 ID {{transaction()}}를 기록해 운영 기록을 확인하세요. 현재 화면은 거래 ID 검색을 지원하지 않습니다. 새 요청은 다른 거래 ID를 사용합니다.</p>}
+@if(savedOrigin()){<p>기록된 API 주소: {{savedOrigin()}}</p>}
 </div></section>

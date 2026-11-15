@@ -1,20 +1,36 @@
-import { Component, Input, OnDestroy, signal } from '@angular/core';
+import { Component, Input, OnDestroy, OnInit, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 
 @Component({selector:'app-workflow-trigger',imports:[FormsModule],templateUrl:'./workflow-trigger.html'})
-export class WorkflowTrigger implements OnDestroy {
+export class WorkflowTrigger implements OnInit, OnDestroy {
   @Input() apiOrigin='';
   apiKey=''; workflow=''; subscriber=''; payload='{}'; mode:'sandbox'|'normal'='sandbox';
+  rememberTransaction=false;
   readonly status=signal<'idle'|'sending'|'accepted'|'unknown'|'invalid'>('idle');
   readonly transaction=signal(''); readonly outcome=signal('');
+  readonly savedOrigin=signal(''); readonly storageError=signal(false);
+  private readonly storageKey='swallow.workflow-trigger.transaction.v1';
   private abort:AbortController|null=null;
+  ngOnInit():void {
+    let raw:string|null;
+    try {raw=sessionStorage.getItem(this.storageKey);} catch {this.storageError.set(true);return;}
+    if(!raw)return;
+    this.rememberTransaction=true;
+    try {
+      const record:unknown=JSON.parse(raw);
+      if(!record||typeof record!=='object')throw new Error('invalid stored record');
+      const value=record as Record<string,unknown>;
+      if(value['version']!==1||typeof value['transactionId']!=='string'||!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value['transactionId'])||typeof value['origin']!=='string'||value['origin'].length>2048)throw new Error('invalid stored record');
+      this.transaction.set(value['transactionId']);this.savedOrigin.set(value['origin']);this.rememberTransaction=true;this.status.set('unknown');
+    } catch {this.storageError.set(true);this.status.set('unknown');}
+  }
   ngOnDestroy():void {this.abort?.abort();this.apiKey='';}
   private origin():string {
     const url=new URL(this.apiOrigin.trim());
     if(!['http:','https:'].includes(url.protocol)||url.username||url.password||url.pathname!=='/'||url.search||url.hash||(url.protocol==='http:'&&!['localhost','127.0.0.1','[::1]'].includes(url.hostname)))throw new Error('origin');
     return url.origin;
   }
-  reset():void {if(this.status()==='sending')return;this.transaction.set('');this.outcome.set('');this.status.set('idle');}
+  reset():void {if(this.status()==='sending')return;if(this.rememberTransaction){try{sessionStorage.removeItem(this.storageKey);}catch{this.storageError.set(true);return;}}this.storageError.set(false);this.transaction.set('');this.savedOrigin.set('');this.outcome.set('');this.status.set('idle');}
   async submit():Promise<void> {
     if(this.status()!=='idle'&&this.status()!=='invalid')return;
     let body:Record<string,unknown>, origin:string, key:string;
@@ -25,6 +41,11 @@ export class WorkflowTrigger implements OnDestroy {
       const transactionId=crypto.randomUUID();
       body={name:workflow,to:subscriber,payload,transactionId};
       if(this.mode==='sandbox')body['overrides']={providers:{sendgrid:{mailSettings:{sandboxMode:{enable:true}}}}};
+      if(this.rememberTransaction) {
+        try {if(sessionStorage.getItem(this.storageKey)!==null)throw new Error('record already exists');sessionStorage.setItem(this.storageKey,JSON.stringify({version:1,transactionId,origin}));}
+        catch {this.storageError.set(true);throw new Error('storage unavailable');}
+        this.savedOrigin.set(origin);
+      }
       this.transaction.set(transactionId);this.outcome.set('');
     } catch {this.status.set('invalid');return;}
     const controller=new AbortController();this.abort=controller;this.status.set('sending');

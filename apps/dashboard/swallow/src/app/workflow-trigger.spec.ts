@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WorkflowTrigger } from './workflow-trigger';
 
 describe('workflow trigger',()=>{
-  afterEach(()=>{vi.useRealTimers();vi.restoreAllMocks();});
+  afterEach(()=>{vi.useRealTimers();vi.restoreAllMocks();sessionStorage.clear();});
   function setup(){const fixture=TestBed.createComponent(WorkflowTrigger);const c=fixture.componentInstance;c.apiOrigin='https://api.example.test';c.apiKey='test-key';c.workflow='welcome';c.subscriber='person';return {fixture,c};}
   it('sends a sandbox override and displays the trigger acknowledgement',async()=>{
     const id='11111111-1111-4111-8111-111111111111';vi.spyOn(crypto,'randomUUID').mockReturnValue(id);
@@ -30,5 +30,23 @@ describe('workflow trigger',()=>{
     vi.useFakeTimers();const id='44444444-4444-4444-8444-444444444444';vi.spyOn(crypto,'randomUUID').mockReturnValue(id);
     vi.spyOn(globalThis,'fetch').mockImplementation((_url,options)=>new Promise((_resolve,reject)=>options!.signal!.addEventListener('abort',()=>reject(new Error('aborted')))));
     const {fixture,c}=setup();const pending=c.submit();expect(c.status()).toBe('sending');await vi.advanceTimersByTimeAsync(30000);await pending;expect(c.status()).toBe('unknown');expect(c.transaction()).toBe(id);fixture.destroy();
+  });
+  it('optionally restores only transaction ID and origin as unknown after reopening',async()=>{
+    const id='55555555-5555-4555-8555-555555555555';vi.spyOn(crypto,'randomUUID').mockReturnValue(id);
+    const fetcher=vi.spyOn(globalThis,'fetch').mockRejectedValue(new Error('offline'));const first=setup();first.fixture.detectChanges();first.c.rememberTransaction=true;first.c.payload='{"private":"secret"}';await first.c.submit();
+    expect(JSON.parse(sessionStorage.getItem('swallow.workflow-trigger.transaction.v1')!)).toEqual({version:1,transactionId:id,origin:'https://api.example.test'});first.fixture.destroy();
+    const second=setup();second.fixture.detectChanges();expect(second.c.status()).toBe('unknown');expect(second.c.transaction()).toBe(id);expect(second.c.savedOrigin()).toBe('https://api.example.test');await second.c.submit();expect(fetcher).toHaveBeenCalledTimes(1);
+    second.c.reset();expect(second.c.status()).toBe('idle');expect(sessionStorage.getItem('swallow.workflow-trigger.transaction.v1')).toBeNull();second.fixture.destroy();
+  });
+  it('does not submit when requested storage is unavailable or contains a prior record',async()=>{
+    const fetcher=vi.spyOn(globalThis,'fetch');const {fixture,c}=setup();fixture.detectChanges();c.rememberTransaction=true;
+    const setter=vi.spyOn(Storage.prototype,'setItem').mockImplementation(()=>{throw Error('denied')});await c.submit();expect(c.status()).toBe('invalid');expect(c.storageError()).toBe(true);expect(fetcher).not.toHaveBeenCalled();setter.mockRestore();
+    sessionStorage.setItem('swallow.workflow-trigger.transaction.v1','existing');await c.submit();expect(c.status()).toBe('invalid');expect(sessionStorage.getItem('swallow.workflow-trigger.transaction.v1')).toBe('existing');expect(fetcher).not.toHaveBeenCalled();fixture.destroy();
+  });
+  it('blocks on malformed stored records but allows clearing them',()=>{
+    sessionStorage.setItem('swallow.workflow-trigger.transaction.v1','invalid');const {fixture,c}=setup();fixture.detectChanges();expect(c.status()).toBe('unknown');expect(c.storageError()).toBe(true);c.reset();expect(c.status()).toBe('idle');expect(sessionStorage.getItem('swallow.workflow-trigger.transaction.v1')).toBeNull();fixture.destroy();
+  });
+  it('allows memory-only use when session storage cannot be read',async()=>{
+    const getter=vi.spyOn(Storage.prototype,'getItem').mockImplementation(()=>{throw Error('denied')});vi.spyOn(globalThis,'fetch').mockRejectedValue(new Error('offline'));const {fixture,c}=setup();fixture.detectChanges();expect(c.status()).toBe('idle');expect(c.storageError()).toBe(true);await c.submit();expect(c.status()).toBe('unknown');c.reset();expect(c.status()).toBe('idle');getter.mockRestore();fixture.destroy();
   });
 });
