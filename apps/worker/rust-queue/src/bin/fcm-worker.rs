@@ -234,6 +234,18 @@ async fn run(
         Ok("false") | Err(std::env::VarError::NotPresent) => None,
         _ => return Err("invalid FCM service account reload setting".into()),
     };
+    let exit_on_reload_failure = match std::env::var("NOVU_FCM_RELOAD_FAILURE_POLICY").as_deref() {
+        Ok("exit") => true,
+        Ok("pause") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid FCM reload failure policy".into()),
+    };
+    if exit_on_reload_failure
+        && reload_access_token.is_none()
+        && reload_integrations.is_none()
+        && reload_service_account.is_none()
+    {
+        return Err("FCM reload failure policy requires a reload mode".into());
+    }
     let integrations_raw = if let Some(path) = &reload_integrations {
         Some(novu_rust_contracts::secret::read_regular_multiline_file(
             path, 1_048_576,
@@ -468,6 +480,11 @@ async fn run(
                             .reload_access_token_file(path)
                             .is_err()
                     {
+                        if exit_on_reload_failure {
+                            task.abort();
+                            let _ = task.await;
+                            return Err("FCM access token reload failed".into());
+                        }
                         eprintln!("FCM access token reload failed; dispatch paused");
                         stop.wait(Duration::from_secs(2)).await;
                         continue;
@@ -487,6 +504,11 @@ async fn run(
                             }
                             Ok(None) => {}
                             Err(()) => {
+                                if exit_on_reload_failure {
+                                    task.abort();
+                                    let _ = task.await;
+                                    return Err("FCM integration credential reload failed".into());
+                                }
                                 eprintln!(
                                     "FCM integration credential reload failed; dispatch paused"
                                 );
@@ -511,6 +533,11 @@ async fn run(
                             }
                             Ok(None) => {}
                             Err(()) => {
+                                if exit_on_reload_failure {
+                                    task.abort();
+                                    let _ = task.await;
+                                    return Err("FCM service account key reload failed".into());
+                                }
                                 eprintln!("FCM service account key reload failed; dispatch paused");
                                 stop.wait(Duration::from_secs(2)).await;
                                 continue;

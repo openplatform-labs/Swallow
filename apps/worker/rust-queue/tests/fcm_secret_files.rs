@@ -77,6 +77,7 @@ async fn worker_supports_token_pem_and_integration_files() {
         .env_remove("NOVU_FCM_RELOAD_ACCESS_TOKEN")
         .env_remove("NOVU_FCM_RELOAD_INTEGRATIONS")
         .env_remove("NOVU_FCM_RELOAD_SERVICE_ACCOUNT")
+        .env_remove("NOVU_FCM_RELOAD_FAILURE_POLICY")
         .env_remove("NOVU_FCM_CLIENT_EMAIL")
         .env_remove("NOVU_FCM_PRIVATE_KEY")
         .env_remove("NOVU_FCM_PRIVATE_KEY_FILE")
@@ -463,6 +464,83 @@ async fn worker_supports_token_pem_and_integration_files() {
         "single service account worker should resume after key rotation"
     );
     drop(service_worker);
+    for policy in ["invalid", "EXIT", ""] {
+        let out = command()
+            .env("NOVU_FCM_RELOAD_FAILURE_POLICY", policy)
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+    }
+    let out = command()
+        .env("NOVU_FCM_ACCESS_TOKEN_FILE", &token)
+        .env("NOVU_FCM_RELOAD_FAILURE_POLICY", "exit")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    for mode in ["token", "map", "service"] {
+        let path = match mode {
+            "token" => &token,
+            "map" => &integrations,
+            _ => &key,
+        };
+        let valid = fs::read(path).unwrap();
+        let application = format!("fcm_exit_{mode}");
+        let mut c = command();
+        c.env(
+            "DATABASE_URL",
+            format!("{url}?application_name={application}"),
+        )
+        .env("NOVU_FCM_RELOAD_FAILURE_POLICY", "exit");
+        match mode {
+            "token" => {
+                c.env("NOVU_FCM_RELOAD_ACCESS_TOKEN", "true")
+                    .env("NOVU_FCM_ACCESS_TOKEN_FILE", path);
+            }
+            "map" => {
+                c.env("NOVU_FCM_RELOAD_INTEGRATIONS", "true")
+                    .env("NOVU_FCM_INTEGRATIONS_FILE", path);
+            }
+            _ => {
+                c.env("NOVU_FCM_RELOAD_SERVICE_ACCOUNT", "true")
+                    .env("NOVU_FCM_PRIVATE_KEY_FILE", path)
+                    .env("NOVU_FCM_CLIENT_EMAIL", "fixture@example.test");
+            }
+        }
+        let mut process = Worker(c.spawn().unwrap());
+        let mut connected = false;
+        for _ in 0..100 {
+            connected = db
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name=$1)",
+                    &[&application],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if connected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(connected, "worker must start before invalidating file");
+        fs::write(path, "broken\nsecret").unwrap();
+        let mut exit = None;
+        for _ in 0..100 {
+            exit = process.0.try_wait().unwrap();
+            if exit.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            exit.is_some_and(|status| !status.success()),
+            "{mode} worker should exit on invalid credentials"
+        );
+        let mut stderr = String::new();
+        std::io::Read::read_to_string(process.0.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+        assert!(!stderr.contains("broken") && !stderr.contains(path.to_str().unwrap()));
+        fs::write(path, valid).unwrap();
+    }
     let result = command()
         .env("NOVU_FCM_ACCESS_TOKEN_FILE", &token)
         .env("SWALLOW_FCM_ENFORCE_ROUTING_CONFIG", "invalid")
