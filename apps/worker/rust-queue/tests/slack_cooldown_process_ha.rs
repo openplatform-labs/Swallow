@@ -105,6 +105,45 @@ async fn surviving_worker_defers_jobs_after_peer_loss() {
     workers.0[0].wait().unwrap();
     enqueue_and_wait(&db, &environment, 10).await;
     assert!(workers.0[1].try_wait().unwrap().is_none());
+    // Break the surviving worker's current database connection, not the test's
+    // connection. Its process must reconnect before it can defer more jobs.
+    let pid: i32 = db
+        .query_one(
+            "SELECT pid FROM pg_stat_activity WHERE application_name=$1",
+            &[&names[1]],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let terminated: bool = db
+        .query_one("SELECT pg_terminate_backend($1)", &[&pid])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(terminated);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let row = db
+            .query_opt(
+                "SELECT pid FROM pg_stat_activity WHERE application_name=$1 AND pid<>$2",
+                &[&names[1], &pid],
+            )
+            .await
+            .unwrap();
+        if row.is_some() {
+            break;
+        }
+        assert!(
+            workers.0[1].try_wait().unwrap().is_none(),
+            "surviving worker exited during reconnect"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "worker did not reconnect"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    enqueue_and_wait(&db, &environment, 10).await;
     let count: i64 = db
         .query_one(
             "SELECT count(*) FROM public.novu_rust_slack_attempts WHERE environment_id=$1",
