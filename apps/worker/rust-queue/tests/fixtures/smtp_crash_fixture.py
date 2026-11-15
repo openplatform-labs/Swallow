@@ -1,6 +1,7 @@
 import socket, ssl, sys
 from pathlib import Path
-cert, key, directory = sys.argv[1:]
+cert, key, directory = sys.argv[1:4]
+plain = len(sys.argv) > 4 and sys.argv[4] == "plain"
 root = Path(directory)
 listener = socket.socket()
 listener.bind(('127.0.0.1', 0))
@@ -15,14 +16,17 @@ for count in (1, 2):
     reader = conn.makefile('rb')
     conn.sendall(b'220 localhost ESMTP\r\n')
     assert reader.readline().upper().startswith(b'EHLO')
-    conn.sendall(b'250-localhost\r\n250 STARTTLS\r\n')
-    assert reader.readline().upper().startswith(b'STARTTLS')
-    conn.sendall(b'220 Ready\r\n')
-    reader.close()
-    conn = context.wrap_socket(conn, server_side=True)
-    reader = conn.makefile('rb')
-    assert reader.readline().upper().startswith(b'EHLO')
-    conn.sendall(b'250 localhost\r\n')
+    if plain:
+        conn.sendall(b'250 localhost\r\n')
+    else:
+        conn.sendall(b'250-localhost\r\n250 STARTTLS\r\n')
+        assert reader.readline().upper().startswith(b'STARTTLS')
+        conn.sendall(b'220 Ready\r\n')
+        reader.close()
+        conn = context.wrap_socket(conn, server_side=True)
+        reader = conn.makefile('rb')
+        assert reader.readline().upper().startswith(b'EHLO')
+        conn.sendall(b'250 localhost\r\n')
     assert reader.readline().upper().startswith(b'MAIL FROM')
     conn.sendall(b'250 OK\r\n')
     assert reader.readline().upper().startswith(b'RCPT TO')

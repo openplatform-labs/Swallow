@@ -34,6 +34,7 @@ async fn smtp_uncertain_dispatch_survives_synchronous_promotion() {
     .await
     .unwrap();
     let scoped = std::env::var("TEST_SMTP_FAILOVER_RLS").as_deref() == Ok("true");
+    let plain = std::env::var("TEST_SMTP_FAILOVER_PLAIN").as_deref() == Ok("true");
     let foreign = Uuid::new_v4();
     let other = format!("smtp-other-{}", Uuid::new_v4().simple());
     db.execute(
@@ -134,6 +135,7 @@ async fn smtp_uncertain_dispatch_survives_synchronous_promotion() {
             .arg(&cert)
             .arg(&key)
             .arg(&dir)
+            .arg(if plain { "plain" } else { "starttls" })
             .stdout(Stdio::piped())
             .spawn()
             .unwrap(),
@@ -143,8 +145,8 @@ async fn smtp_uncertain_dispatch_survives_synchronous_promotion() {
         .read_line(&mut port)
         .unwrap();
     let worker = |db_url: &str| {
-        Process(
-            Command::new(env!("CARGO_BIN_EXE_smtp-worker"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_smtp-worker"));
+        command
                 .env_clear()
                 .env("DATABASE_URL", db_url)
                 .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
@@ -156,12 +158,11 @@ async fn smtp_uncertain_dispatch_survives_synchronous_promotion() {
                 .env("SWALLOW_SMTP_HOST", "localhost")
                 .env("SWALLOW_SMTP_PORT", port.trim())
                 .env("SWALLOW_SMTP_FROM", "sender@example.test")
-                .env("SWALLOW_SMTP_CA_FILE", &cert)
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap(),
-        )
+                .stderr(Stdio::null());
+        if plain { command.env("SWALLOW_SMTP_TLS", "none"); }
+        else { command.env("SWALLOW_SMTP_CA_FILE", &cert); }
+        Process(command.spawn().unwrap())
     };
     let first = Uuid::new_v4();
     queue::enqueue(
