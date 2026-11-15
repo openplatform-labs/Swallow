@@ -21,6 +21,9 @@ fn port() -> u16 {
         .port()
 }
 fn start(url: &str, port: u16, strict: bool, connections: &str) -> Server {
+    start_policy(url, port, strict, connections, "any")
+}
+fn start_policy(url: &str, port: u16, strict: bool, connections: &str, policy: &str) -> Server {
     Server(
         Command::new(env!("CARGO_BIN_EXE_novu-rust-api"))
             .env("DATABASE_URL", url)
@@ -28,6 +31,7 @@ fn start(url: &str, port: u16, strict: bool, connections: &str) -> Server {
             .env("LISTEN_ADDR", format!("127.0.0.1:{port}"))
             .env("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED", "true")
             .env("SWALLOW_API_DB_CONNECTIONS", connections)
+            .env("SWALLOW_API_READY_CONNECTION_POLICY", policy)
             .env("SWALLOW_API_MAX_INFLIGHT_PER_CONNECTION", "1")
             .env(
                 "SWALLOW_API_READY_REQUIRE_CAPACITY",
@@ -153,4 +157,13 @@ async fn readiness_can_follow_saturated_request_capacity() {
     wait_status(pool_port, "/health/ready", 200).await;
     assert_eq!(status(pool_port, "/unmatched"), Some(404));
     drop(second);
+
+    let all_port = port();
+    let _all = start_policy(&url, all_port, true, "2", "all");
+    wait_status(all_port, "/health/ready", 200).await;
+    let pending = pending_request(all_port);
+    wait_status(all_port, "/health/ready", 503).await;
+    assert_eq!(status(all_port, "/health/live"), Some(200));
+    drop(pending);
+    wait_status(all_port, "/health/ready", 200).await;
 }

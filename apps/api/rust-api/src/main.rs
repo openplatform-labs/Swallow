@@ -54,6 +54,7 @@ struct ApiState {
     max_inflight_per_connection: usize,
     ready_require_capacity: bool,
     ready_require_writable: bool,
+    ready_require_all: bool,
     timeout: Duration,
     request_timeout: Option<Duration>,
     draining: Arc<AtomicBool>,
@@ -169,6 +170,7 @@ async fn live() -> Response {
 
 async fn ready(State(shared): State<ApiState>) -> Response {
     let mut probes = tokio::task::JoinSet::new();
+    let mut eligible = 0usize;
     if !shared.draining.load(Ordering::Acquire) {
         for (index, slot) in shared.connections.iter().enumerate() {
             if shared.ready_require_capacity
@@ -183,6 +185,7 @@ async fn ready(State(shared): State<ApiState>) -> Response {
                 .and_then(|guard| guard.clone())
                 .filter(|c| !c.db.is_closed());
             if let Some(current) = current {
+                eligible += 1;
                 let slot = slot.clone();
                 let timeout = shared.timeout;
                 let inflight = shared.inflight.clone();
@@ -213,9 +216,14 @@ async fn ready(State(shared): State<ApiState>) -> Response {
             }
         }
     }
-    let mut ready = false;
+    let mut ready = shared.ready_require_all && eligible == shared.connections.len();
     while let Some(result) = probes.join_next().await {
-        if matches!(result, Ok(true)) {
+        if shared.ready_require_all {
+            if !matches!(result, Ok(true)) {
+                ready = false;
+                break;
+            }
+        } else if matches!(result, Ok(true)) {
             ready = true;
             break;
         }
@@ -407,6 +415,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             Ok("false") | Err(std::env::VarError::NotPresent) => false,
             _ => return Err("invalid API readiness writable setting".into()),
         };
+    let ready_require_all = match std::env::var("SWALLOW_API_READY_CONNECTION_POLICY").as_deref() {
+        Ok("all") => true,
+        Ok("any") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid API readiness connection policy".into()),
+    };
     let health_endpoints = match std::env::var("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED").as_deref() {
         Ok("true") => true,
         Ok("false") | Err(std::env::VarError::NotPresent) => false,
@@ -427,6 +440,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         max_inflight_per_connection,
         ready_require_capacity,
         ready_require_writable,
+        ready_require_all,
         timeout,
         request_timeout,
         draining: Arc::new(AtomicBool::new(false)),
