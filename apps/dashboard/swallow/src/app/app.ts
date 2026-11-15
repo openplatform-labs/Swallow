@@ -303,12 +303,13 @@ export class App implements OnDestroy {
   grantDesired=false;
   grantReason='';
   grantConfirmed=false;
+  grantSubmitConfirmed=false;
   grantRetryConfirmed=false;
   readonly grantStatus=signal<'idle'|'loading'|'loaded'|'missing'|'error'>('idle');
   readonly grantValue=signal<boolean|null>(null);
   private grantSequence=0;
   private grantAbort:AbortController|null=null;
-  readonly grantChangeStatus=signal<'idle'|'sending'|'recorded'|'rejected'|'unknown'|'unavailable'>('idle');
+  readonly grantChangeStatus=signal<'idle'|'prepared'|'sending'|'recorded'|'rejected'|'unknown'|'unavailable'>('idle');
   readonly grantChange=signal<GrantSnapshot|null>(null);
   readonly grantChanged=signal<boolean|null>(null);
   readonly grantMessage=signal('');
@@ -672,7 +673,7 @@ export class App implements OnDestroy {
   clearGrantChange():void {
     if(this.grantChangeStatus()==='sending')return;
     this.grantChange.set(null);this.grantChangeStatus.set('idle');this.grantChanged.set(null);this.grantMessage.set('');
-    this.grantReason='';this.grantConfirmed=false;this.grantRetryConfirmed=false;
+    this.grantReason='';this.grantConfirmed=false;this.grantSubmitConfirmed=false;this.grantRetryConfirmed=false;
   }
   private grantSelection():[string,string] {
     if(!/^(email|sms|push|slack|email-provider):(read|write)$/.test(this.grantKind) && !/^subscriber:(read|write|create|delete)$/.test(this.grantKind) && !/^(sendgrid|resend|twilio|fcm|slack):(result|jobs)$/.test(this.grantKind) && !/^slack:(retry|accepted)$/.test(this.grantKind) && this.grantKind!=='audit:read')throw new Error('invalid grant');
@@ -717,9 +718,21 @@ export class App implements OnDestroy {
       let keyHash:string;try{keyHash=await this.credentialFingerprint(key);}catch{this.grantChangeStatus.set('unavailable');return;}
       this.expireOidcIfNeeded();if(this.permissionKey.trim()!==key||this.permissionEnvironment.trim()!==environment||this.validatedOrigin()!==origin){this.grantChangeStatus.set('unavailable');return;}
       this.grantChange.set({origin,environment,keyHash,body});
-      await this.sendGrant(key,{origin,environment,keyHash,body});
-    }catch{this.grantChangeStatus.set('unknown');}
+      this.grantChangeStatus.set('prepared');
+    }catch{this.grantChangeStatus.set('unavailable');}
     finally{this.grantReason='';this.grantConfirmed=false;this.clearGrantRead();}
+  }
+  async submitGrant():Promise<void> {
+    this.expireOidcIfNeeded();const snapshot=this.grantChange(),key=this.permissionKey.trim();
+    if(!snapshot||this.grantChangeStatus()!=='prepared'||!this.grantSubmitConfirmed||!this.validJwt(key))return;
+    this.grantChangeStatus.set('sending');this.grantMessage.set('');
+    let sent=false;
+    try {
+      const keyHash=await this.credentialFingerprint(key);this.expireOidcIfNeeded();
+      if(this.permissionKey.trim()!==key||keyHash!==snapshot.keyHash||this.permissionEnvironment.trim()!==snapshot.environment||this.validatedOrigin()!==snapshot.origin){this.grantMessage.set('준비할 때와 같은 토큰, 환경 및 API 주소가 필요합니다.');return;}
+      sent=true;await this.sendGrant(key,snapshot);
+    }catch{this.grantMessage.set(sent?'결과가 불명확합니다. 요청 ID로 조회하세요.':'요청을 준비하지 못해 전송하지 않았습니다.');if(sent)this.grantChangeStatus.set('unknown');}
+    finally{this.grantSubmitConfirmed=false;if(this.grantChangeStatus()==='sending')this.grantChangeStatus.set(sent?'unknown':'prepared');}
   }
   private async sendGrant(key:string,snapshot:GrantSnapshot,retry=false):Promise<void> {
     const params=new URLSearchParams({environmentId:snapshot.environment});

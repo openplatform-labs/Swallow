@@ -438,7 +438,7 @@
                 <label class="decision-confirm"><input type="checkbox" name="grantDesired" [(ngModel)]="grantDesired"> 이 권한 허용</label>
                 <label for="grant-reason">변경 사유</label><textarea id="grant-reason" name="grantReason" [(ngModel)]="grantReason" maxlength="1000" required></textarea><small>비밀을 제외하고 1000바이트 이내로 입력하세요. 이전 상태가 달라지면 요청이 거절됩니다.</small>
                 <label class="decision-confirm"><input type="checkbox" name="grantConfirmed" [(ngModel)]="grantConfirmed"> 대상과 권한을 확인했습니다.</label>
-                <button type="submit" class="btn btn-primary" [disabled]="!canChangeGrant()">선택 권한 변경</button>
+                <button type="submit" class="btn btn-primary" [disabled]="!canChangeGrant()">변경 요청 준비</button>
               </form>
             }
           }
@@ -446,7 +446,12 @@
         @if(grantChange(); as change){
           <section class="card decision-card"><div class="card-block"><h2>위임 권한 변경 요청</h2>
             <p>요청 ID: {{ change.body.requestId }}<br>대상: {{ change.environment }} · {{ change.body.targetIssuer }} · {{ change.body.targetSubject }} · {{ change.body.targetClientId }}<br>{{ change.body.resource || 'subscriber' }} / {{ change.body.permission }}: {{ change.body.expected ? '허용' : '없음' }} → {{ change.body.desired ? '허용' : '없음' }}<br>사유: {{ change.body.reason }}</p>
-            @if(grantChangeStatus() === 'sending'){<p role="status">요청을 처리 중입니다.</p>}
+            @if(grantChangeStatus() === 'prepared'){
+              <p role="status">아직 전송하지 않았습니다. 요청 ID와 내용을 안전한 곳에 기록하세요. 화면을 떠나거나 새로고침하면 준비된 요청은 사라집니다.</p>
+              <label class="decision-confirm"><input type="checkbox" name="grantSubmitConfirmed" [(ngModel)]="grantSubmitConfirmed"> 요청 ID와 내용을 확인하고 이 요청을 제출합니다.</label>
+              <button type="button" class="btn btn-primary" [disabled]="!grantSubmitConfirmed" (click)="submitGrant()">변경 요청 제출</button>
+            }
+            @else if(grantChangeStatus() === 'sending'){<p role="status">요청을 처리 중입니다.</p>}
             @else if(grantChangeStatus() === 'recorded'){<p role="status">요청이 기록됐습니다. {{ grantChanged() ? '권한이 변경됐습니다.' : '변경은 없었습니다.' }}</p>}
             @else if(grantChangeStatus() === 'rejected'){<p class="subscriber-error" role="alert">요청이 거절됐습니다. 권한과 최신 상태를 확인하세요.</p>}
             @else if(grantChangeStatus() === 'unknown'){
