@@ -74,7 +74,7 @@ await page.goto('http://127.0.0.1:'+UI+'/');
 async function fill(selector,value) {await page.evaluate(s=>document.querySelector(s)?.scrollIntoView({block:'center'}),selector);await page.fill(selector,value);}
 await fill('input[name="apiOrigin"]',api);await page.click('nav.sidenav button >> nth=3');
 await fill('input[name="discordEndpointKey"]','fixture-api-key');
-await fill('input[name="discordEndpointId"]','browser-binding');await fill('input[name="discordEndpointSubscriber"]','alice');await fill('input[name="discordEndpointDestination"]','first');await fill('textarea[name="discordEndpointContext"]','{"tenant":"acme"}');
+await fill('input[name="discordEndpointId"]','browser-binding');await fill('input[name="discordEndpointSubscriber"]','alice');await page.click('app-discord-endpoints button:has-text("등록된 대상 조회")');await page.waitForSelector('select[name="discordEndpointDestinationChoice"]');await page.selectOption('select[name="discordEndpointDestinationChoice"]','first');await fill('textarea[name="discordEndpointContext"]','{"tenant":"acme"}');
 await page.click('input[name="discordEndpointConfirm"]');await page.click('app-discord-endpoints button:has-text("연결 작업 실행")');
 await page.waitForFunction(()=>document.querySelector('app-discord-endpoints')?.innerText.includes('변경 응답을 확인했습니다.'));
 await page.click('app-discord-endpoints button:has-text("연결 목록 조회")');await page.waitForFunction(()=>document.querySelector('app-discord-endpoints table')?.innerText.includes('tenant:acme'));

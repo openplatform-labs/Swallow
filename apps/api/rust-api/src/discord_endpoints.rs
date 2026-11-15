@@ -223,6 +223,35 @@ pub(super) async fn list(
     }
 }
 
+pub(super) async fn destinations(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+) -> ApiError {
+    let path = uri.to_string();
+    let (env, hash) = match access(&db, &headers, &path, "read").await {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let mut after: Option<String> = None;
+    for (name, value) in form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()) {
+        if name != "after" || after.is_some() || !destination(&value) {
+            return fail(StatusCode::BAD_REQUEST, "Invalid cursor", &path);
+        }
+        after = Some(value.into_owned());
+    }
+    let rows = match db.query("WITH auth AS MATERIALIZED (SELECT public.novu_rust_lock_discord_endpoint_grant($1,$2,'read') AS ok) SELECT a.ok,d.destination_id FROM auth a LEFT JOIN LATERAL (SELECT destination_id FROM public.novu_rust_discord_destinations WHERE environment_id=$2 AND ($3::text IS NULL OR destination_id COLLATE \"C\">$3 COLLATE \"C\") ORDER BY destination_id COLLATE \"C\" LIMIT 101) d ON a.ok", &[&hash,&env,&after]).await {
+        Ok(v) => v,
+        Err(_) => return fail(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error", &path),
+    };
+    if rows.first().is_none_or(|row| !row.get::<_,bool>(0)) {return fail(StatusCode::FORBIDDEN,"Forbidden",&path);}
+    let all: Vec<String> = rows.iter().filter_map(|row|row.get::<_,Option<String>>(1)).collect();
+    let more=all.len()>100;
+    let data: Vec<String>=all.into_iter().take(100).collect();
+    let next=if more {data.last().cloned()} else {None};
+    (StatusCode::OK, Json(json!({"data":data,"next":next})))
+}
+
 pub(super) async fn audit(
     State(db): State<Arc<Client>>,
     headers: HeaderMap,

@@ -74,6 +74,18 @@ async fn scoped_crud_revision_and_audit_are_atomic() {
         StatusCode::FORBIDDEN
     );
     db.execute("INSERT INTO novu_rust_discord_endpoint_permissions VALUES($1,'read'),($1,'write'),($2,'read')", &[&a,&b]).await.unwrap();
+    let destinations = "/v1/experimental/discord-destinations";
+    let (status, available) = request(app.clone(), "GET", destinations, "discord-key-a", Value::Null).await;
+    assert_eq!(status,StatusCode::OK);assert_eq!(available, json!({"data":["one","two"],"next":null}));
+    assert!(!available.to_string().contains("hash"));
+    assert_eq!(request(app.clone(),"GET",destinations,"discord-key-b",Value::Null).await.1,json!({"data":["one"],"next":null}));
+    assert_eq!(request(app.clone(),"GET",&format!("{destinations}?after=bad%2Fpath"),"discord-key-a",Value::Null).await.0,StatusCode::BAD_REQUEST);
+    db.batch_execute("INSERT INTO public.novu_rust_discord_destinations SELECT 'a','extra-'||lpad(i::text,3,'0'),'secret-hash' FROM generate_series(1,101) i").await.unwrap();
+    let first=request(app.clone(),"GET",destinations,"discord-key-a",Value::Null).await.1;
+    assert_eq!(first["data"].as_array().unwrap().len(),100);
+    let after=first["next"].as_str().unwrap();
+    let rest=request(app.clone(),"GET",&format!("{destinations}?after={after}"),"discord-key-a",Value::Null).await.1;
+    assert_eq!(rest["data"].as_array().unwrap().len(),3);assert!(rest["next"].is_null());
     let (status, created) =
         request(app.clone(), "POST", path, "discord-key-a", input.clone()).await;
     assert_eq!(status, StatusCode::CREATED);
@@ -188,6 +200,7 @@ async fn scoped_crud_revision_and_audit_are_atomic() {
     db.execute("DELETE FROM novu_rust_discord_endpoint_permissions WHERE key_hash=$1 AND permission='audit'", &[&a]).await.unwrap();
     assert_eq!(request(app.clone(), "GET", audit_path, "discord-key-a", Value::Null).await.0, StatusCode::FORBIDDEN);
     db.execute("DELETE FROM novu_rust_discord_endpoint_permissions WHERE key_hash=$1 AND permission='read'",&[&a]).await.unwrap();
+    assert_eq!(request(app.clone(), "GET", destinations, "discord-key-a", Value::Null).await.0, StatusCode::FORBIDDEN);
     assert_eq!(
         request(app.clone(), "GET", path, "discord-key-a", Value::Null)
             .await

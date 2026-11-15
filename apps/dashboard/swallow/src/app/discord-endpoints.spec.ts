@@ -28,4 +28,9 @@ describe('Discord endpoints',()=>{
   const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:first,nextCursor:first[99].id}))).mockResolvedValueOnce(new Response(JSON.stringify({data:[record(101)],nextCursor:null}))).mockResolvedValueOnce(new Response(JSON.stringify({data:[{...record(1),action:'other'}],nextCursor:null})));
   const {fixture,c}=setup();await c.audit();expect(c.audits().length).toBe(100);expect(JSON.stringify(c.audits())).not.toContain('not-retained');await c.audit(true);expect(c.audits().length).toBe(1);expect(new URL(mock.mock.calls[1][0] as string).searchParams.get('after')).toBe(first[99].id);c.key='another';c.clear();expect(c.audits()).toEqual([]);await c.audit();expect(c.auditStatus()).toBe('error');fixture.destroy();
  });
+ it('lists registered destinations without secret data and rejects malformed pages',async()=>{
+  const page=Array.from({length:100},(_,i)=>`target-${String(i).padStart(3,'0')}`);
+  const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:page,next:page[99],secret:'ignored'}))).mockResolvedValueOnce(new Response(JSON.stringify({data:['target-100'],next:null}))).mockResolvedValueOnce(new Response(JSON.stringify({data:['invalid/path'],next:null})));
+  const {fixture,c}=setup();await c.loadDestinations();expect(c.destinations().length).toBe(100);expect(JSON.stringify(c.destinations())).not.toContain('ignored');await c.loadDestinations(true);expect(c.destinations()).toEqual(['target-100']);expect(new URL(mock.mock.calls[1][0] as string).searchParams.get('after')).toBe(page[99]);await c.loadDestinations();expect(c.destinationStatus()).toBe('error');fixture.destroy();
+ });
 });
