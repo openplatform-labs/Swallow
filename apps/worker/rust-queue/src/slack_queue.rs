@@ -199,6 +199,15 @@ pub async fn process_one(
     environment: &str,
     provider: &Slack,
 ) -> Result<bool, Error> {
+    process_one_with_cooldown(db, environment, provider, false).await
+}
+
+pub async fn process_one_with_cooldown(
+    db: &mut Client,
+    environment: &str,
+    provider: &Slack,
+    cooldown: bool,
+) -> Result<bool, Error> {
     let Some(job) = claim(db, environment).await? else {
         return Ok(false);
     };
@@ -216,6 +225,10 @@ pub async fn process_one(
     let tx = db.transaction().await?;
     if !live(&tx, &job).await? {
         tx.rollback().await?;
+        return Ok(true);
+    }
+    if cooldown && crate::slack_cooldown::defer(&tx, &job).await? {
+        tx.commit().await?;
         return Ok(true);
     }
     let inserted=tx.execute("INSERT INTO novu_rust_slack_attempts(job_id,environment_id,state) VALUES ($1,$2,'dispatching') ON CONFLICT DO NOTHING", &[&job.id,&environment]).await?;
@@ -245,6 +258,7 @@ pub async fn process_one(
     }
     let updated=tx.execute("UPDATE novu_rust_slack_attempts SET state=$3,http_status=$4,provider_message_id=$5,retry_after_seconds=$6,retry_not_before=clock_timestamp()+make_interval(secs=>$6::integer::double precision),updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$2 AND state='dispatching'", &[&job.id,&environment,&state,&code,&id,&retry_after]).await?;
     if updated == 1 {
+        if cooldown && code == Some(429) { crate::slack_cooldown::record(&tx, environment, retry_after).await?; }
         let job_status = if state == "accepted" {
             "completed"
         } else {

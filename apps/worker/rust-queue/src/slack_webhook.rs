@@ -90,8 +90,8 @@ impl Webhook {
             .map_err(|_| SendError::Invalid)?;
         Ok(Self { client, endpoint })
     }
-    #[cfg(test)]
-    pub(crate) fn test_endpoint(url: &str) -> Result<Self, SendError> {
+    #[cfg(any(test, feature = "test-mocks"))]
+    pub fn test_endpoint(url: &str) -> Result<Self, SendError> {
         Self::with_endpoint(Url::parse(url).map_err(|_| SendError::Invalid)?)
     }
     pub async fn send(&self, message: &Message) -> Result<String, SendError> {

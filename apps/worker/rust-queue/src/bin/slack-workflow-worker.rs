@@ -17,6 +17,7 @@ async fn run(
     let step_policy = slack_workflow::StepPolicy::from_env()?;
     let endpoint_policy = slack_workflow::EndpointPolicy::from_env()?;
     let environment = std::env::var("NOVU_SLACK_ENVIRONMENT_ID")?;
+    let shared_cooldown = novu_postgres_queue::slack_cooldown::enabled_from_env()?;
     if environment.trim().is_empty() {
         return Err("Slack environment is required".into());
     }
@@ -119,12 +120,13 @@ async fn run(
                     }
                     let delivery = tokio::time::timeout(
                         timeout,
-                        slack_workflow::delivery_one_with_policies(
+                        slack_workflow::delivery_one_with_cooldown(
                             &mut db,
                             &environment,
                             &providers,
                             step_policy,
                             endpoint_policy,
+                            shared_cooldown,
                         ),
                     )
                     .await;

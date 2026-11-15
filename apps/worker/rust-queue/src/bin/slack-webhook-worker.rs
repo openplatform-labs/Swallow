@@ -14,6 +14,7 @@ async fn run(
     stop: novu_postgres_queue::shutdown::Stop,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let environment = std::env::var("NOVU_SLACK_ENVIRONMENT_ID")?;
+    let shared_cooldown = novu_postgres_queue::slack_cooldown::enabled_from_env()?;
     if environment.trim().is_empty() {
         return Err("Slack environment is required".into());
     }
@@ -94,11 +95,12 @@ async fn run(
                     }
                     match tokio::time::timeout(
                         timeout,
-                        slack_webhook_queue::process_one(
+                        slack_webhook_queue::process_one_with_cooldown(
                             &mut db,
                             &environment,
                             &destination,
                             &provider,
+                            shared_cooldown,
                         ),
                     )
                     .await
