@@ -49,6 +49,9 @@ SQL
 if [[ "${SWALLOW_UI_SLACK_429_FIXTURE:-false}" == true ]]; then
  "$pgbin/psql" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
 UPDATE public.novu_rust_slack_attempts SET state='rejected',http_status=429,retry_after_seconds=120,retry_not_before=clock_timestamp()+interval '120 seconds' WHERE job_id='11111111-1111-4111-8111-000000000001';
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_slack_retry_after(text,text,text,text,bigint,uuid,uuid,uuid,text,text),public.novu_rust_operator_jwt_slack_decision_request(text,text,text,text,bigint,uuid) TO ui_channel_results_fixture;
+INSERT INTO public.novu_rust_operator_jwt_slack_decision_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env','retry') ON CONFLICT DO NOTHING;
+INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'ui-fixture-env',rolname,'slack_retry',oid FROM pg_roles WHERE rolname='ui_channel_results_fixture' ON CONFLICT DO NOTHING;
 SQL
 fi
 if [[ "${SWALLOW_UI_RESEND_AUTO_HEALTH_FIXTURE:-false}" == true ]]; then
@@ -71,8 +74,8 @@ fi
 if [[ "${SWALLOW_UI_SLACK_DECISION_FIXTURE:-false}" == true ]]; then
  "$pgbin/psql" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_slack_resolve(text,text,text,text,bigint,uuid,uuid,uuid,text,text),public.novu_rust_operator_jwt_slack_decision_request(text,text,text,text,bigint,uuid) TO ui_channel_results_fixture;
-INSERT INTO public.novu_rust_operator_jwt_slack_decision_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env','retry');
-INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'ui-fixture-env',rolname,'slack_retry',oid FROM pg_roles WHERE rolname='ui_channel_results_fixture';
+INSERT INTO public.novu_rust_operator_jwt_slack_decision_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env','retry') ON CONFLICT DO NOTHING;
+INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'ui-fixture-env',rolname,'slack_retry',oid FROM pg_roles WHERE rolname='ui_channel_results_fixture' ON CONFLICT DO NOTHING;
 SQL
 fi
 if [[ "${SWALLOW_UI_RESEND_429_AUDIT_FIXTURE:-false}" == true ]]; then

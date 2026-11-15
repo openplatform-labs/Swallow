@@ -1,12 +1,18 @@
+## Slack 429 지연 재시도 화면
+
+운영 경보의 Slack 판정에서 즉시 재시도, 429 권장 시각 이후 재시도, 접수 판정을 선택한다. 지연 재시도는 실패한 현재 429 시도에 유효한 대기 안내가 있을 때만 준비할 수 있다. 요청 ID·시도·사유를 확인하고 제출하며, 결과 불명 시 같은 토큰·환경·API 주소에서 동일 요청을 재제출하거나 요청 ID로 조회할 수 있다. 즉시와 지연은 기존 Slack `retry` 권한을 공유한다.
+
+Angular 테스트 193개와 빌드, 임시 PostgreSQL 17·시험 JWT·제한 API DB 로그인·실제 로컬 브라우저에서 합성 429 요청의 준비 전 DB 상태, 지연 예약·감사 및 요청 조회를 확인했다. 응답 유실·인증 변경은 단위 테스트이며 실제 Slack 429·외부 IdP·운영 HA는 미검증이다. 최초 테스트 중 개발 서버와 동시에 실행할 때 임시 파일 오류가 있었고, 서버 종료 후 재실행은 통과했다. [화면 README](apps/dashboard/swallow/README.md)를 참고한다.
+
 ## Slack 지연 재시도 JWT API
 
-API 0097은 `POST /v1/experimental/operator/slack-retry-after`로 Slack 429의 권장 시각 이후 재시도를 요청한다. 기존 Slack JWT `retry`와 API DB `slack_retry` 권한을 사용하며 즉시·지연 권한을 별도로 나누지는 않는다. 동일 운영자·환경의 요청 ID 공간을 기존 즉시 판정과 공유해 다른 내용의 재사용을 거절하고, 동일 요청 재제출과 기존 판정 요청 조회에 예약 시각을 제공한다. 워커 0171의 시도 확인·감사·예약과 요청 기록이 원자적으로 처리된다. Angular 판정 화면은 아직 이 경로를 지원하지 않는다.
+API 0097은 `POST /v1/experimental/operator/slack-retry-after`로 Slack 429의 권장 시각 이후 재시도를 요청한다. 기존 Slack JWT `retry`와 API DB `slack_retry` 권한을 사용하며 즉시·지연 권한을 별도로 나누지는 않는다. 동일 운영자·환경의 요청 ID 공간을 기존 즉시 판정과 공유해 다른 내용의 재사용을 거절하고, 동일 요청 재제출과 기존 판정 요청 조회에 예약 시각을 제공한다. 워커 0171의 시도 확인·감사·예약과 요청 기록이 원자적으로 처리된다. Angular 판정 화면은 위 최신 항목을 참고한다.
 
 임시 PostgreSQL 17·제한 DB 로그인·시험 JWT에서 권한, 시도 ID, 재제출, 즉시 요청과 ID 충돌, 감사 실패 롤백 및 권한 회수와 기존 Slack 판정 회귀를 검증했다. 로컬 HTTP 서버에서도 지연 예약·재제출·조회가 통과했다. 실제 Slack 429·외부 IdP·운영 HA와 실제 네트워크 단절은 미검증이다. [API README](apps/api/rust-api/README.md)를 참고한다.
 
 ## Slack 429 선택형 지연 재시도
 
-워커 0171과 `delivery-reconcile slack-retry-after`는 운영자가 현재 Slack 429 시도 ID와 유효한 `Retry-After`를 확인한 뒤 권장 시각 이후 재시도를 예약하도록 한다. 앱·웹훅·워크플로 발송에 적용되며 기존 즉시 재시도도 유지한다. 환경별 `slack_retry`와 새 함수 EXECUTE가 필요하다. 시도·작업 잠금 아래 큐 상태와 원래 권장 시각을 감사에 함께 기록한다. JWT API 연결은 위 최신 항목을 참고하며 Angular 화면 연결은 남아 있다.
+워커 0171과 `delivery-reconcile slack-retry-after`는 운영자가 현재 Slack 429 시도 ID와 유효한 `Retry-After`를 확인한 뒤 권장 시각 이후 재시도를 예약하도록 한다. 앱·웹훅·워크플로 발송에 적용되며 기존 즉시 재시도도 유지한다. 환경별 `slack_retry`와 새 함수 EXECUTE가 필요하다. 시도·작업 잠금 아래 큐 상태와 원래 권장 시각을 감사에 함께 기록한다. JWT API와 Angular 화면 연결은 위 최신 항목을 참고한다.
 
 임시 PostgreSQL 17·제한 DB 계정·실제 CLI에서 시도 ID·권한·환경 격리, 안내 누락 거절, 감사 실패 롤백, 동시 판정 중 한 건만 성공, 세 작업 종류의 예약을 확인했다. 실제 큐 함수와 모의 Slack 앱에서 예약 시각 전 미처리와 시험상 시각을 앞당긴 뒤 발송을 확인했다. 실제 Slack 429·웹훅과 워크플로 발송의 예약 후 실행·원본 Novu 비교·운영 HA는 미검증이다. 기존 즉시 경로는 대기를 강제하지 않으며 늦은 증거와 재시도에 따른 중복 가능성이 있다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 

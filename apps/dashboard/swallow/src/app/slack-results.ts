@@ -1,21 +1,21 @@
 import { Component, EventEmitter, Input, OnChanges, OnDestroy, Output, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { validChannelPage } from './channel-page';
-type Decision={requestId:string;jobId:string;attemptId:string;decision:'retry'|'accepted';reason:string};
+type Decision={requestId:string;jobId:string;attemptId:string;decision:'retry'|'retry-after'|'accepted';reason:string};
 type Result={jobId:string;jobStatus:string;kind:string;attemptState:string|null;attemptId?:string|null;attemptHttpStatus?:number|null;retryAfterSeconds?:number|null;retryNotBefore?:string|null;providerIdKnown:boolean;hasResolutionHistory:boolean;failureCategory:string|null};
 @Component({selector:'app-slack-results',imports:[FormsModule],templateUrl:'./slack-results.html'})
 export class SlackResults implements OnChanges,OnDestroy {
   @Input() apiOrigin='';@Input() environment='';@Input() token='';@Output() busyChange=new EventEmitter<boolean>();
-  decisionChoice:'retry'|'accepted'='retry';decisionReason='';decisionConfirmed=false;resetConfirmed=false;lookupId='';
+  decisionChoice:'retry'|'retry-after'|'accepted'='retry';decisionReason='';decisionConfirmed=false;retryConfirmed=false;resetConfirmed=false;lookupId='';
   readonly decisionStatus=signal<'idle'|'prepared'|'sending'|'recorded'|'unknown'|'unavailable'>('idle');
-  readonly decisionSnapshot=signal<Decision|null>(null);readonly lookupStatus=signal<'idle'|'loading'|'found'|'not-found'|'error'>('idle');readonly lookupRecord=signal<Decision|null>(null);
-  private decisionToken:string|null=null;
+  readonly decisionSnapshot=signal<Decision|null>(null);readonly decisionAvailableAt=signal<string|null>(null);readonly decisionMessage=signal('');readonly lookupAvailableAt=signal<string|null>(null);readonly lookupStatus=signal<'idle'|'loading'|'found'|'not-found'|'error'>('idle');readonly lookupRecord=signal<Decision|null>(null);
+  private decisionToken:string|null=null;private decisionOrigin:string|null=null;private decisionEnvironment:string|null=null;
   private decisionAbort:AbortController|null=null;private decisionSequence=0;private lookupSequence=0;private lookupAbort:AbortController|null=null;
   jobId=''; readonly rows=signal<Result[]>([]); readonly result=signal<Result|null>(null); readonly next=signal<string|null>(null);
   readonly listStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');readonly resultStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');
   private listSequence=0;private resultSequence=0;private listAbort:AbortController|null=null;private resultAbort:AbortController|null=null;
   ngOnChanges():void {this.clear();} ngOnDestroy():void {this.clear();this.token='';}
-  clear():void {this.listSequence++;this.resultSequence++;this.listAbort?.abort();this.resultAbort?.abort();this.listAbort=null;this.resultAbort=null;this.rows.set([]);this.result.set(null);this.next.set(null);this.listStatus.set('idle');this.resultStatus.set('idle');this.jobId='';this.lookupSequence++;this.lookupAbort?.abort();this.lookupAbort=null;this.lookupStatus.set('idle');this.lookupRecord.set(null);this.decisionToken=null;if(this.decisionStatus()==='sending'){this.decisionSequence++;this.decisionAbort?.abort();this.decisionAbort=null;this.decisionStatus.set('unknown');this.busyChange.emit(false);}else if(this.decisionStatus()==='prepared'){this.decisionStatus.set('idle');this.decisionSnapshot.set(null);}this.decisionConfirmed=false;}
+  clear():void {this.listSequence++;this.resultSequence++;this.listAbort?.abort();this.resultAbort?.abort();this.listAbort=null;this.resultAbort=null;this.rows.set([]);this.result.set(null);this.next.set(null);this.listStatus.set('idle');this.resultStatus.set('idle');this.jobId='';this.lookupSequence++;this.lookupAbort?.abort();this.lookupAbort=null;this.lookupStatus.set('idle');this.lookupRecord.set(null);this.decisionToken=null;this.decisionOrigin=null;this.decisionEnvironment=null;this.retryConfirmed=false;this.decisionAvailableAt.set(null);this.lookupAvailableAt.set(null);if(this.decisionStatus()==='sending'){this.decisionSequence++;this.decisionAbort?.abort();this.decisionAbort=null;this.decisionStatus.set('unknown');this.busyChange.emit(false);}else if(['prepared','recorded','unavailable'].includes(this.decisionStatus())){this.decisionStatus.set('idle');this.decisionSnapshot.set(null);this.decisionReason='';this.lookupId='';}this.decisionConfirmed=false;this.resetConfirmed=false;}
   clearResult():void {this.resultSequence++;this.resultAbort?.abort();this.resultAbort=null;this.result.set(null);this.resultStatus.set('idle');}
   private validUuid(value:unknown):value is string {return typeof value==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);}
   private origin():string {const url=new URL(this.apiOrigin.trim());if(!['http:','https:'].includes(url.protocol)||url.username||url.password||url.pathname!=='/'||url.search||url.hash||(url.protocol==='http:'&&!['localhost','127.0.0.1','[::1]'].includes(url.hostname)))throw new Error('origin');return url.origin;}
@@ -34,33 +34,37 @@ export class SlackResults implements OnChanges,OnDestroy {
   }
   prepareDecision():void {
     const result=this.result(),reason=this.decisionReason.trim();
-    if(this.decisionStatus()!=='idle'||!result||result.jobStatus!=='failed'||!this.validUuid(result.attemptId)||!['unknown','rejected'].includes(result.attemptState || '')||!['retry','accepted'].includes(this.decisionChoice)||(this.decisionChoice==='accepted'&&result.attemptState!=='unknown')||!reason||new TextEncoder().encode(reason).length>512||/[\0]/.test(reason))return;
-    try {const requestId=crypto.randomUUID();this.decisionSnapshot.set({requestId,jobId:result.jobId,attemptId:result.attemptId,decision:this.decisionChoice,reason});this.clearLookup();this.lookupId=requestId;this.decisionConfirmed=false;this.decisionStatus.set('prepared');}
+    if(this.decisionStatus()!=='idle'||!result||result.jobStatus!=='failed'||!this.validUuid(result.attemptId)||!['unknown','rejected'].includes(result.attemptState || '')||!['retry','retry-after','accepted'].includes(this.decisionChoice)||(this.decisionChoice==='accepted'&&result.attemptState!=='unknown')||(this.decisionChoice==='retry-after'&&(result.attemptState!=='rejected'||result.attemptHttpStatus!==429||result.retryAfterSeconds==null||!result.retryNotBefore))||!reason||new TextEncoder().encode(reason).length>512||/[\0]/.test(reason))return;
+    try {const requestId=crypto.randomUUID();this.decisionSnapshot.set({requestId,jobId:result.jobId,attemptId:result.attemptId,decision:this.decisionChoice,reason});this.clearLookup();this.lookupId=requestId;this.decisionAvailableAt.set(null);this.decisionMessage.set('');this.decisionConfirmed=false;this.decisionStatus.set('prepared');}
     catch {this.decisionStatus.set('unavailable');}
   }
-  async submitDecision():Promise<void> {
-    const snapshot=this.decisionSnapshot();if(!snapshot||this.decisionStatus()!=='prepared'||!this.decisionConfirmed)return;
-    let url:string,params:URLSearchParams;try{url=this.origin();params=this.params();}catch{this.decisionStatus.set('unknown');return;}
-    const sequence=++this.decisionSequence,controller=new AbortController();this.decisionAbort=controller;this.decisionToken=this.token.trim();this.decisionStatus.set('sending');this.busyChange.emit(true);
+  async submitDecision(retry=false):Promise<void> {
+    const snapshot=this.decisionSnapshot();if(!snapshot||!(retry?this.decisionStatus()==='unknown'&&this.retryConfirmed:this.decisionStatus()==='prepared'&&this.decisionConfirmed))return;
+    let url:string,params:URLSearchParams;try{url=this.origin();params=this.params();}catch{this.decisionMessage.set('인증과 API 주소를 확인하세요.');return;}
+    const token=this.token.trim(),environment=this.environment.trim();
+    if(retry&&(this.decisionToken!==token||this.decisionOrigin!==url||this.decisionEnvironment!==environment)){this.decisionMessage.set('원래 요청과 같은 토큰, 환경 및 API 주소가 필요합니다.');return;}
+    const sequence=++this.decisionSequence,controller=new AbortController();this.decisionAbort=controller;this.decisionToken=token;this.decisionOrigin=url;this.decisionEnvironment=environment;this.decisionStatus.set('sending');this.decisionMessage.set('');this.busyChange.emit(true);
     try {
-      const response=await fetch(`${url}/v1/experimental/operator/slack-decision?${params}`,{method:'POST',headers:{Authorization:`Bearer ${this.token.trim()}`,'Content-Type':'application/json'},body:JSON.stringify(snapshot),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      const endpoint=snapshot.decision==='retry-after'?'slack-retry-after':'slack-decision';
+      const response=await fetch(`${url}/v1/experimental/operator/${endpoint}?${params}`,{method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify(snapshot),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
       if(!response.ok)throw new Error('uncertain');const value:unknown=await response.json();
-      if(!value||typeof value!=='object'||(value as Record<string,unknown>)['recorded']!==true||typeof (value as Record<string,unknown>)['replayed']!=='boolean')throw new Error('uncertain');
-      if(sequence!==this.decisionSequence)return;this.decisionStatus.set('recorded');this.clearResult();this.rows.set([]);this.next.set(null);this.listStatus.set('idle');
+      if(!value||typeof value!=='object')throw new Error('uncertain');const row=value as Record<string,unknown>;
+      if(row['recorded']!==true||typeof row['replayed']!=='boolean'||(snapshot.decision==='retry-after'&&(typeof row['availableAt']!=='string'||row['availableAt'].length===0||row['availableAt'].length>128)))throw new Error('uncertain');
+      if(sequence!==this.decisionSequence)return;this.decisionAvailableAt.set(snapshot.decision==='retry-after'?row['availableAt'] as string:null);this.decisionStatus.set('recorded');this.clearResult();this.rows.set([]);this.next.set(null);this.listStatus.set('idle');
     } catch {if(sequence===this.decisionSequence)this.decisionStatus.set('unknown');}
-    finally {if(sequence===this.decisionSequence){this.decisionAbort=null;this.busyChange.emit(false);}}
+    finally {if(sequence===this.decisionSequence){this.decisionAbort=null;this.retryConfirmed=false;this.busyChange.emit(false);}}
   }
-  resetDecision():void {if(this.decisionStatus()==='sending'||(this.decisionStatus()==='unknown'&&!this.resetConfirmed))return;this.decisionSnapshot.set(null);this.decisionStatus.set('idle');this.decisionToken=null;this.decisionConfirmed=false;this.resetConfirmed=false;this.decisionReason='';this.clearLookup();this.lookupId='';}
-  clearLookup():void {this.lookupSequence++;this.lookupAbort?.abort();this.lookupAbort=null;this.lookupRecord.set(null);this.lookupStatus.set('idle');}
+  resetDecision():void {if(this.decisionStatus()==='sending'||(this.decisionStatus()==='unknown'&&!this.resetConfirmed))return;this.decisionSnapshot.set(null);this.decisionStatus.set('idle');this.decisionToken=null;this.decisionOrigin=null;this.decisionEnvironment=null;this.decisionAvailableAt.set(null);this.decisionMessage.set('');this.decisionConfirmed=false;this.retryConfirmed=false;this.resetConfirmed=false;this.decisionReason='';this.clearLookup();this.lookupId='';}
+  clearLookup():void {this.lookupSequence++;this.lookupAbort?.abort();this.lookupAbort=null;this.lookupRecord.set(null);this.lookupAvailableAt.set(null);this.lookupStatus.set('idle');}
   async lookupDecision():Promise<void> {
     const requestId=this.lookupId.trim().toLowerCase();if(!this.validUuid(requestId)||this.decisionStatus()==='sending')return;
-    const sequence=++this.lookupSequence;this.lookupAbort?.abort();const controller=new AbortController();this.lookupAbort=controller;this.lookupRecord.set(null);this.lookupStatus.set('loading');
+    const sequence=++this.lookupSequence;this.lookupAbort?.abort();const controller=new AbortController();this.lookupAbort=controller;this.lookupRecord.set(null);this.lookupAvailableAt.set(null);this.lookupStatus.set('loading');
     try {const params=this.params();params.set('requestId',requestId);const response=await fetch(`${this.origin()}/v1/experimental/operator/slack-decision-request?${params}`,{headers:{Authorization:`Bearer ${this.token.trim()}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
       if(!response.ok)throw new Error('request');const value:unknown=await response.json();if(!value||typeof value!=='object')throw new Error('response');const row=value as Record<string,unknown>;
       if(row['found']===false){if(sequence===this.lookupSequence)this.lookupStatus.set('not-found');return;}
-      if(row['found']!==true||row['requestId']!==requestId||!this.validUuid(row['jobId'])||!this.validUuid(row['attemptId'])||!['retry','accepted'].includes(row['decision'] as string)||typeof row['reason']!=='string'||typeof row['createdAt']!=='string')throw new Error('response');
+      if(row['found']!==true||row['requestId']!==requestId||!this.validUuid(row['jobId'])||!this.validUuid(row['attemptId'])||!['retry','retry-after','accepted'].includes(row['decision'] as string)||typeof row['reason']!=='string'||typeof row['createdAt']!=='string'||(row['decision']==='retry-after'&&(typeof row['availableAt']!=='string'||row['availableAt'].length===0||row['availableAt'].length>128)))throw new Error('response');
       const snap=this.decisionSnapshot();if(snap&&snap.requestId===requestId&&(snap.jobId!==row['jobId']||snap.attemptId!==row['attemptId']||snap.decision!==row['decision']||snap.reason!==row['reason']))throw new Error('response');
-      if(sequence!==this.lookupSequence)return;this.lookupRecord.set({requestId,jobId:row['jobId'] as string,attemptId:row['attemptId'] as string,decision:row['decision'] as 'retry'|'accepted',reason:row['reason'] as string});this.lookupStatus.set('found');if(snap&&snap.requestId===requestId&&this.decisionToken!==null&&this.decisionToken===this.token.trim()) {this.decisionStatus.set('recorded');this.clearResult();this.rows.set([]);this.next.set(null);this.listStatus.set('idle');}
+      if(sequence!==this.lookupSequence)return;this.lookupRecord.set({requestId,jobId:row['jobId'] as string,attemptId:row['attemptId'] as string,decision:row['decision'] as 'retry'|'retry-after'|'accepted',reason:row['reason'] as string});this.lookupAvailableAt.set(row['decision']==='retry-after'?row['availableAt'] as string:null);this.lookupStatus.set('found');if(snap&&snap.requestId===requestId&&this.decisionToken!==null&&this.decisionToken===this.token.trim()&&this.decisionOrigin===this.origin()&&this.decisionEnvironment===this.environment.trim()) {this.decisionAvailableAt.set(row['decision']==='retry-after'?row['availableAt'] as string:null);this.decisionStatus.set('recorded');this.clearResult();this.rows.set([]);this.next.set(null);this.listStatus.set('idle');}
     }catch{if(sequence===this.lookupSequence)this.lookupStatus.set('error');}finally{if(sequence===this.lookupSequence)this.lookupAbort=null;}
   }
 
