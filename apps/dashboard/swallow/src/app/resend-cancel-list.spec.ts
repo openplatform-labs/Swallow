@@ -15,4 +15,10 @@ describe('Resend cancellation list',()=>{
     let done!:(r:Response)=>void;vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response('',{status:403})).mockResolvedValueOnce(new Response(JSON.stringify({data:[row(2),row(1)],next:null}))).mockReturnValueOnce(new Promise(resolve=>done=resolve));
     const {fixture,c}=setup();await c.list();expect(c.status()).toBe('error');expect(c.rows()).toEqual([]);await c.list();expect(c.status()).toBe('error');const pending=c.list();c.environment='other';c.ngOnChanges();done(new Response(JSON.stringify({data:[row(1)],next:null})));await pending;expect(c.status()).toBe('idle');expect(c.rows()).toEqual([]);fixture.destroy();
   });
+  it('requires independent detail access and distinguishes manual resolution',async()=>{
+    const request={requestId:id(1),jobId:id(101),providerId:'provider-1',databasePrincipal:'service',reason:'investigation',state:'confirmed',httpStatus:null,createdAt:'today',updatedAt:'today'};
+    const resolution={resolutionId:id(2),decision:'confirmed',databasePrincipal:'resolver',reason:'reviewed',recordedAt:'today'};
+    vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({request,resolution}))).mockResolvedValueOnce(new Response('',{status:403}));
+    const {fixture,c}=setup();await c.loadDetail(id(1));expect(c.detail()?.resolution?.decision).toBe('confirmed');fixture.detectChanges();expect(fixture.nativeElement.textContent).toContain('운영자 판정');await c.loadDetail(id(1));expect(c.detailStatus()).toBe('error');expect(c.detail()).toBeNull();fixture.destroy();
+  });
 });

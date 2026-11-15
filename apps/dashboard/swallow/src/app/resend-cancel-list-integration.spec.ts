@@ -7,6 +7,7 @@ describe.skipIf(!origin||!token)('Resend cancellation list with local API',()=>{
   it('shows both pages from the restricted JWT API',async()=>{
     const fixture=TestBed.createComponent(ResendCancelList),c=fixture.componentInstance;c.apiOrigin=origin!;c.environment='cancel-api-env';c.token=token!;c.grace=60;
     await c.list();expect(c.status()).toBe('loaded');expect(c.rows()).toHaveLength(50);fixture.detectChanges();expect(fixture.nativeElement.textContent).toContain('취소 결과 불명 요청');
+    await c.loadDetail(c.rows()[0].requestId);expect(c.detailStatus()).toBe('loaded');expect(c.detail()?.state).toBe('unknown');fixture.detectChanges();expect(fixture.nativeElement.textContent).toContain('private-provider');
     await c.list('next');expect(c.status()).toBe('loaded');expect(c.rows()).toHaveLength(5);expect(c.next()).toBeNull();fixture.destroy();
   });
 });

@@ -1,11 +1,15 @@
 <section class="card decision-card"><div class="card-block"><div class="card-eyebrow">RESEND CANCELLATION</div><h2>취소 결과 불명 요청</h2>
-<p>진행 중인 요청도 포함될 수 있습니다. 각 페이지는 서로 다른 시점이며 UUID 순서입니다. 조사와 판정은 별도 권한의 CLI에서 수행합니다.</p>
+<p>진행 중인 요청도 포함될 수 있습니다. 각 페이지는 서로 다른 시점이며 UUID 순서입니다. 상세 조회에는 별도 권한이 필요하며 판정은 CLI에서 수행합니다.</p>
 <form class="decision-form" (ngSubmit)="list()"><label for="cancel-grace">유예 시간 (초)</label><input id="cancel-grace" name="cancelGrace" type="number" min="1" max="86400" step="1" [(ngModel)]="grace" (ngModelChange)="clear()" required><button type="submit" class="btn btn-outline" [disabled]="status()==='loading'">미해결 요청 조회</button></form>
 @if(status()==='error'){<p role="alert">조회하지 못했습니다. 환경과 조회 권한을 확인하세요.</p>}
 @if(status()==='loading'){<p role="status">조회 중입니다.</p>}
 @if(status()==='loaded'){
   @if(!rows().length){<p>결과 불명 요청이 없습니다.</p>}
-  @else{<div class="table-wrap"><table class="table"><thead><tr><th>요청 ID</th><th>작업 ID</th><th>요청 시각</th><th>유예 시간</th></tr></thead><tbody>@for(row of rows();track row.requestId){<tr><td>{{row.requestId}}</td><td>{{row.jobId}}</td><td>{{row.createdAt}}</td><td>{{row.overdue?'초과':'대기 중'}}</td></tr>}</tbody></table></div>}
+  @else{<div class="table-wrap"><table class="table"><thead><tr><th>요청 ID</th><th>작업 ID</th><th>요청 시각</th><th>유예 시간</th><th>상세</th></tr></thead><tbody>@for(row of rows();track row.requestId){<tr><td>{{row.requestId}}</td><td>{{row.jobId}}</td><td>{{row.createdAt}}</td><td>{{row.overdue?'초과':'대기 중'}}</td><td><button type="button" class="btn btn-sm btn-outline" (click)="loadDetail(row.requestId)">상세 보기</button></td></tr>}</tbody></table></div>}
   <div class="pagination"><span>{{page()}}페이지</span><button type="button" class="btn btn-sm btn-outline" [disabled]="page()===1" (click)="list('previous')">이전</button><button type="button" class="btn btn-sm btn-outline" [disabled]="!next()" (click)="list('next')">다음</button></div>
 }
+<h3>취소 요청 상세</h3><form class="decision-form" (ngSubmit)="loadDetail()"><label for="cancel-request-id">요청 ID</label><input id="cancel-request-id" name="cancelRequestId" [(ngModel)]="requestId" (ngModelChange)="clearDetail()" autocomplete="off" required><button type="submit" class="btn btn-outline" [disabled]="detailStatus()==='loading'">상세 조회</button></form>
+@if(detailStatus()==='error'){<p role="alert">상세를 조회하지 못했습니다. 별도의 상세 조회 권한과 요청 ID를 확인하세요.</p>}
+@if(detailStatus()==='missing'){<p>요청을 찾을 수 없습니다.</p>}
+@if(detail();as item){<p role="status">상태: {{item.state}} · 요청: {{item.requestId}} · 작업: {{item.jobId}}<br>공급자 ID: {{item.providerId}} · DB 계정: {{item.databasePrincipal}} · HTTP 상태: {{item.httpStatus ?? '—'}}<br>요청 사유: {{item.reason}} · 요청 시각: {{item.createdAt}} · 갱신 시각: {{item.updatedAt}}</p>@if(item.resolution;as decision){<p>운영자 판정: {{decision.decision}} · 판정 ID: {{decision.resolutionId}} · DB 계정: {{decision.databasePrincipal}} · 사유: {{decision.reason}} · 시각: {{decision.recordedAt}}</p>}<p>기록은 공급자나 메일함의 현재 상태를 증명하지 않습니다. 판정 전 발송 프로세스를 중지하고 공급자 증거를 확인하세요.</p>}
 </div></section>

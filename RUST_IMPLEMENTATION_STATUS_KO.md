@@ -1,3 +1,5 @@
+Resend 취소 요청 상세 API·화면: API 0172의 별도 JWT 상세 권한으로 요청 및 수동 판정 기록을 조회한다. 목록 권한과 독립적이며 DB 로그인 조회 권한도 필요하다. 제한 로그인·시험 JWT·실제 로컬 API와 jsdom에서 상세 및 권한 회수를 검증했다. 상세 정보는 민감하고 실제 공급자 상태를 증명하지 않는다. 취소·판정 UI와 권한 관리 UI, 실제 브라우저·IdP·Resend 및 운영 HA는 미구현 또는 미검증이다. [API README](apps/api/rust-api/README.md)를 참고한다.
+
 Resend 취소 미해결 목록 API·화면: API 0171은 별도 JWT 권한과 API DB 로그인 조회 권한으로 요청을 제공하고 Angular 운영 경보 화면에 페이지를 표시한다. 제한 계정·시험 JWT·실제 로컬 API와 jsdom에서 55건 조회 및 권한 회수를 시험했다. 운영자 권한 관리 UI, 취소 상세·판정 UI와 실제 브라우저·IdP·Resend·운영 HA는 미구현 또는 미검증이다. [API README](apps/api/rust-api/README.md)를 참고한다.
 
 Resend 취소 미해결 목록: 워커 0261과 CLI에서 별도 조회 권한으로 환경별 결과 불명 요청을 UUID순 50건씩 찾고 상세 요청 ID를 확인한다. 수신자·제공자 ID·사유는 목록에서 제외한다. 제한 계정·격리 PostgreSQL에서 56건 페이지와 권한 격리를 시험했으며 페이지는 동일 시점 스냅샷이 아니다. HTTP API·UI, 실제 Resend 및 운영 HA는 미구현 또는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
