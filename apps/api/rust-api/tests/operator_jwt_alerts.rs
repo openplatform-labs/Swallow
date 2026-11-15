@@ -2521,6 +2521,9 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     let value: Value =
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(value["jobId"], job.to_string());
+    let attempt_id = Uuid::parse_str(value["attemptId"].as_str().unwrap()).unwrap();
+    let stored_attempt: Uuid = db.query_one("SELECT attempt_id FROM public.novu_rust_resend_attempts WHERE job_id=$1", &[&job]).await.unwrap().get(0);
+    assert_eq!(attempt_id, stored_attempt);
     assert_eq!(value["result"], "delivered");
     assert_eq!(value["autoCorrelated"], true);
     assert_eq!(value["autoCorrelationConflict"], false);
@@ -2540,6 +2543,24 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     let value: Value =
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(value["attemptHttpStatus"], 429);
+    assert_eq!(value["attemptId"], attempt_id.to_string());
+    // A removed and recreated attempt must not reuse the previous attempt identity.
+    let fresh_job = Uuid::new_v4();
+    novu_postgres_queue::enqueue(&db, fresh_job, "jwt-alert-a", novu_postgres_queue::resend_queue::JOB_KIND, &json!({})).await.unwrap();
+    let fresh_query = format!("environmentId=jwt-alert-a&jobId={fresh_job}");
+    let response = app.clone().oneshot(result_request(&token, &fresh_query)).await.unwrap();
+    let empty: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert!(empty["attemptId"].is_null());
+    db.execute("INSERT INTO public.novu_rust_resend_attempts(job_id,environment_id,state) VALUES ($1,'jwt-alert-a','rejected')", &[&fresh_job]).await.unwrap();
+    let first: Uuid = db.query_one("SELECT attempt_id FROM public.novu_rust_resend_attempts WHERE job_id=$1", &[&fresh_job]).await.unwrap().get(0);
+    db.execute("DELETE FROM public.novu_rust_resend_attempts WHERE job_id=$1", &[&fresh_job]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_resend_attempts(job_id,environment_id,state) VALUES ($1,'jwt-alert-a','rejected')", &[&fresh_job]).await.unwrap();
+    let second: Uuid = db.query_one("SELECT attempt_id FROM public.novu_rust_resend_attempts WHERE job_id=$1", &[&fresh_job]).await.unwrap().get(0);
+    assert_ne!(first, second);
+    let response = app.clone().oneshot(result_request(&token, &fresh_query)).await.unwrap();
+    let recreated: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(recreated["attemptId"], second.to_string());
+    db.execute("DELETE FROM public.novu_queue_jobs WHERE id=$1", &[&fresh_job]).await.unwrap();
     db.execute(
         "UPDATE public.novu_rust_resend_attempts SET http_status=NULL WHERE job_id=$1",
         &[&job],
