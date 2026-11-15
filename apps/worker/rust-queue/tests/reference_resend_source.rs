@@ -95,5 +95,5 @@ fn original_resend_passthrough_content_precedence() {
     let output=Command::new("node").arg("tests/reference_resend_passthrough.cjs").output().unwrap();
     assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
     let original:Value=serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(original,serde_json::json!({"subject":"pass global","html":"","text":"literal {{name}}","from":"Pass Sender <pass@example.test>","replyTo":"reply@example.test","to":["recipient@example.test","known@example.test","known@example.test","extra@example.test"],"cc":["known-cc@example.test","known-cc@example.test"],"bcc":["hidden@example.test"],"headers":{"X-Base":"known-step","xBase":"known-step","xGlobal":"known-global","X-Pass":"global","X-Override":"step","X-Step":"step"}}));
+    assert_eq!(original,serde_json::json!({"subject":"pass global","html":"","text":"literal {{name}}","from":"Pass Sender <pass@example.test>","replyTo":"reply@example.test","to":["recipient@example.test","known@example.test","known@example.test","extra@example.test"],"cc":["known-cc@example.test","known-cc@example.test"],"bcc":["hidden@example.test"],"headers":{"X-Base":"known-step","xBase":"known-step","xGlobal":"known-global","X-Pass":"global","X-Override":"step","X-Step":"step"},"tags":[{"name":"campaign","value":"summer-1"}]}));
 }

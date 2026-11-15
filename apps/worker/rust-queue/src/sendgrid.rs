@@ -40,6 +40,7 @@ pub struct Email {
     pub headers: Map<String, Value>,
     pub custom_data: Map<String, Value>,
     pub tracking_settings: Map<String, Value>,
+    pub resend_tags: Option<Vec<Value>>,
     pub sandbox_mode: Option<bool>,
     pub message_id: Option<String>,
     pub transaction_id: Option<String>,

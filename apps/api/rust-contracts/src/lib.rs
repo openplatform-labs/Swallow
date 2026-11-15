@@ -5,6 +5,7 @@ pub mod message;
 pub mod postgres;
 pub mod preference;
 pub mod recipients;
+pub mod resend_tags;
 pub mod secret;
 pub mod sendgrid_tracking;
 pub mod sendgrid_sandbox;

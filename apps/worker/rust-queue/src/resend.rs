@@ -44,6 +44,7 @@ pub fn request_body(config: &Config, email: &Email) -> Result<Value, SendError> 
         || !email.alternatives.is_empty()
         || !email.custom_data.is_empty()
         || (email.provider_from_without_name && email.from.as_deref().is_none_or(str::is_empty))
+        || email.resend_tags.as_ref().is_some_and(|tags| !novu_rust_contracts::resend_tags::valid(&json!(tags)))
     {
         return Err(SendError::InvalidMessage);
     }
@@ -91,6 +92,7 @@ pub fn request_body(config: &Config, email: &Email) -> Result<Value, SendError> 
     if !email.headers.is_empty() || email.workflow_wire_defaults {
         body["headers"] = json!(email.headers);
     }
+    if let Some(tags)=email.resend_tags.as_ref() {body["tags"]=json!(tags);}
     // Use an intentionally conservative limit below Resend's encoded 40 MB
     // limit. Explicit dispositions are representable only when they agree with CID.
     let mut size = 0usize;
@@ -201,7 +203,8 @@ impl Resend {
         correlation: Option<uuid::Uuid>,
     ) -> Result<String, SendError> {
         if let Some(correlation) = correlation {
-            body["tags"] = json!([{"name":"swallow_dispatch","value":correlation.to_string()}]);
+            if body.get("tags").is_none() {body["tags"]=json!([]);}
+            body["tags"].as_array_mut().ok_or(SendError::InvalidMessage)?.push(json!({"name":"swallow_dispatch","value":correlation.to_string()}));
         }
         if idempotency_key.is_some_and(|key| {
             key.is_empty() || key.len() > 256 || !key.bytes().all(|v| (0x21..=0x7e).contains(&v))
@@ -299,6 +302,9 @@ mod tests {
         );
         email.to=vec!["x".into()];email.cc=vec!["cc".into();1000];
         assert_eq!(request_body(&config(),&email),Err(SendError::InvalidMessage));
+        email.cc.clear();email.resend_tags=Some(vec![json!({"name":"Swallow_Dispatch","value":"bad"})]);
+        assert_eq!(request_body(&config(),&email),Err(SendError::InvalidMessage));
+        email.resend_tags=Some(vec![]);assert_eq!(request_body(&config(),&email).unwrap()["tags"],json!([]));
     }
     #[test]
     fn attachments_and_headers_are_encoded() {
