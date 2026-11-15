@@ -155,6 +155,10 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
         _ => return Err("invalid FCM credential alert thresholds".into()),
     };
+    let resend_auto_grace = env_optional_i32("SWALLOW_ALERT_RESEND_AUTO_GRACE_SECONDS")?;
+    if resend_auto_grace.is_some_and(|v| !(1..=86_400).contains(&v)) {
+        return Err("invalid Resend automatic retry grace".into());
+    }
     let twilio_grace = env_optional_i32("SWALLOW_ALERT_TWILIO_GRACE_SECONDS")?;
     let twilio_heartbeat = env_optional_i32("SWALLOW_ALERT_TWILIO_HEARTBEAT_MAX_SECONDS")?;
     let twilio_thresholds = match (twilio_grace, twilio_heartbeat) {
@@ -183,6 +187,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         && !sms_policy_enabled
         && !push_policy_enabled
         && !failed_jobs_enabled
+        && resend_auto_grace.is_none()
         && queue_wait.is_none()
         && twilio_thresholds.is_none()
         && sendgrid_thresholds.is_none()
@@ -450,6 +455,30 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     } else {
         None
     };
+    let resend_auto = if let Some(grace) = resend_auto_grace {
+        let result = tokio::time::timeout(
+            operation_timeout,
+            reconciliation::resend_auto_health(&db, &args[0], grace),
+        )
+        .await;
+        let values = result.ok().and_then(Result::ok).and_then(|v| {
+            Some((
+                v["rateLimited"].as_u64()?,
+                v["exhausted"].as_u64()?,
+                v["guardDeferred"].as_u64()?,
+                v["overdueAuto"].as_u64()?,
+            ))
+        });
+        Some(match values {
+            Some(value) => Ok(value),
+            None => {
+                eprintln!("Resend automatic retry health check failed");
+                Err(())
+            }
+        })
+    } else {
+        None
+    };
     let unhealthy = fcm_credentials.is_some_and(|value| match value {
         Ok((healthy, failed, _, minimum)) => healthy < minimum || failed > 0,
         Err(()) => true,
@@ -461,6 +490,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         || sendgrid_check_failed
         || sendgrid.is_some_and(|(overdue, stale)| overdue > 0 || stale)
         || failed_jobs_check_failed
+        || resend_auto.is_some_and(|v| !matches!(v, Ok((0, 0, 0, 0))))
         || failed_jobs.is_some_and(|n| n > 0)
         || failed_checks.iter().any(|failed| *failed)
         || resend.is_some_and(|(overdue, stale)| overdue > 0 || stale)
@@ -495,6 +525,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         push_policy_cancelled,
         channel_policy_check_failed,
         failed_checks,
+        resend_auto,
         failed_jobs,
         failed_jobs_check_failed,
         database_probe: None,
@@ -542,6 +573,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         || fcm_credentials.is_some_and(|v| v.is_err())
         || sendgrid_check_failed
         || failed_jobs_check_failed
+        || resend_auto.is_some_and(|value| value.is_err())
         || channel_policy_check_failed
         || failed_checks.iter().any(|failed| *failed);
     let mut needs_review = false;

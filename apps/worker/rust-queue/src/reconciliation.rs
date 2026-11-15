@@ -348,6 +348,18 @@ pub async fn sendgrid_health(
 }
 
 /// Alert on overdue non-delivered Resend jobs and an absent or stale projector.
+/// Environment-scoped aggregate for automatic retry and 429 operator attention.
+pub async fn resend_auto_health(
+    client: &Client,
+    environment: &str,
+    grace: i32,
+) -> Result<serde_json::Value> {
+    let row=client.query_one("SELECT rate_limited,exhausted,guard_deferred,overdue_auto FROM public.novu_rust_resend_auto_retry_health($1,$2)", &[&environment,&grace]).await?;
+    Ok(
+        serde_json::json!({"rateLimited":row.get::<_,i64>(0),"exhausted":row.get::<_,i64>(1),"guardDeferred":row.get::<_,i64>(2),"overdueAuto":row.get::<_,i64>(3)}),
+    )
+}
+
 pub async fn resend_health(
     client: &Client,
     environment: &str,

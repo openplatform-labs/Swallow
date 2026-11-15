@@ -319,6 +319,7 @@ pub struct Alert {
     pub push_policy_cancelled: Option<u64>,
     pub channel_policy_check_failed: bool,
     pub failed_checks: [bool; 5], // resend, queue, attempts, twilio, Slack chat
+    pub resend_auto: Option<Result<(u64, u64, u64, u64), ()>>,
     pub failed_jobs: Option<u64>,
     pub failed_jobs_check_failed: bool,
     pub database_probe: Option<(String, bool)>,
@@ -350,10 +351,14 @@ impl Alert {
             }
         }
         // Preserve existing bit numbers used by persisted cooldown masks.
-        if self.failed_jobs.is_some_and(|count| count > 0) {
+        if self.failed_jobs.is_some_and(|count| count > 0)
+            || self
+                .resend_auto
+                .is_some_and(|value| matches!(value,Ok((a,b,c,d)) if a>0||b>0||c>0||d>0))
+        {
             mask |= 1 << 18;
         }
-        if self.failed_jobs_check_failed {
+        if self.failed_jobs_check_failed || self.resend_auto.is_some_and(|value| value.is_err()) {
             mask |= 1 << 19;
         }
         if self
@@ -440,10 +445,16 @@ impl Alert {
                 known |= 1 << (13 + i);
             }
         }
-        if self.failed_jobs.is_some() {
+        // Both checks share the existing failed-job cooldown category. Do
+        // not mark it observed healthy if either enabled check failed.
+        if (self.failed_jobs.is_some() || self.resend_auto.is_some())
+            && !self.failed_jobs_check_failed
+            && !self.resend_auto.is_some_and(|value| value.is_err())
+        {
             known |= 1 << 18;
         }
-        if self.failed_jobs.is_some() || self.failed_jobs_check_failed {
+        if self.failed_jobs.is_some() || self.failed_jobs_check_failed || self.resend_auto.is_some()
+        {
             known |= 1 << 19;
         }
         if self.database_probe.is_some() {
@@ -568,6 +579,9 @@ impl Alert {
             if *failed {
                 details.push(format!("{name} check failed"));
             }
+        }
+        if let Some(result) = self.resend_auto {
+            match result {Ok((rate,exhausted,deferred,overdue))=>details.push(format!("Resend 429 aged: {rate}; retries exhausted: {exhausted}; guard deferred: {deferred}; automatic retries overdue: {overdue}")),Err(())=>details.push("Resend automatic retry check failed".into())}
         }
         if let Some(count) = self.failed_jobs {
             details.push(format!("unacknowledged failed jobs: {count}"));
@@ -1318,10 +1332,69 @@ mod tests {
             push_policy_cancelled: None,
             channel_policy_check_failed: false,
             failed_checks: [false; 5],
+            resend_auto: None,
             failed_jobs: None,
             failed_jobs_check_failed: false,
             database_probe: None,
             alert_store_unavailable: false,
+        }
+    }
+
+    #[test]
+    fn resend_automatic_retry_health_shares_failed_job_cooldown_safely() {
+        let mut a = alert();
+        a.resend_enabled = false;
+        a.resend_auto = Some(Ok((0, 0, 0, 0)));
+        assert_eq!(a.condition_mask() & (1 << 18), 0);
+        assert_ne!(a.observed_condition_mask() & (1 << 18), 0);
+        a.resend_auto = Some(Ok((0, 0, 1, 0)));
+        assert_ne!(a.condition_mask() & (1 << 18), 0);
+        assert!(a.text().unwrap().contains("guard deferred: 1"));
+        a.failed_jobs = Some(0);
+        a.resend_auto = Some(Err(()));
+        assert_ne!(a.condition_mask() & (1 << 19), 0);
+        assert_eq!(a.observed_condition_mask() & (1 << 18), 0);
+        a.resend_auto = Some(Ok((0, 0, 0, 0)));
+        a.failed_jobs_check_failed = true;
+        assert_eq!(a.observed_condition_mask() & (1 << 18), 0);
+    }
+
+    #[tokio::test]
+    async fn resend_automatic_retry_health_reaches_slack_payload() {
+        let mut a = alert();
+        a.resend_enabled = false;
+        a.resend_auto = Some(Ok((2, 1, 3, 4)));
+        let (url, server) = mock_server("200 OK", "ok").await;
+        let slack = SlackWebhook::with_endpoint(url).unwrap();
+        let (email_url, email_server) = mock_server("200 OK", r#"{"id":"mock-email"}"#).await;
+        let email = AlertEmailProvider::Resend(
+            crate::resend::Resend::test_endpoint(
+                crate::resend::Config {
+                    api_key: "re_test".into(),
+                    from: "sender@example.test".into(),
+                    sender_name: String::new(),
+                },
+                email_url.as_str(),
+            )
+            .unwrap(),
+        );
+        let result = send_uncoordinated_selected(
+            &a,
+            Some(&slack),
+            Some((&email, "ops@example.test")),
+            Duration::from_secs(2),
+            false,
+        )
+        .await;
+        assert_eq!(result.0, Some(Ok(())));
+        assert_eq!(result.1, Some(Ok(())));
+        let request = server.await.unwrap();
+        let email_request = email_server.await.unwrap();
+        for payload in [request, email_request] {
+            assert!(payload.contains("Resend 429 aged: 2"));
+            assert!(payload.contains("retries exhausted: 1"));
+            assert!(payload.contains("guard deferred: 3"));
+            assert!(payload.contains("automatic retries overdue: 4"));
         }
     }
 
@@ -2122,6 +2195,7 @@ mod tests {
             push_policy_cancelled: None,
             channel_policy_check_failed: false,
             failed_checks: [false; 5],
+            resend_auto: None,
             failed_jobs: None,
             failed_jobs_check_failed: false,
             database_probe: None,

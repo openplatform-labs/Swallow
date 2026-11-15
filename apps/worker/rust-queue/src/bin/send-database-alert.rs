@@ -121,6 +121,7 @@ async fn run() -> Result<()> {
         push_policy_cancelled: None,
         channel_policy_check_failed: false,
         failed_checks: [false; 5],
+        resend_auto: None,
         failed_jobs: None,
         failed_jobs_check_failed: false,
         database_probe: Some((args[1].clone(), false)),

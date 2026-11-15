@@ -42,7 +42,7 @@ async fn resend_evidence_for_cli(
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if ![2, 3, 4, 5, 6, 7, 8].contains(&args.len()) {
-        return Err("usage: delivery-reconcile check-fcm-credentials ENV MAX_AGE_SECONDS MIN_HEALTHY | check-channel-policy ENV email|sms|push|all | list-channel-policy ENV email|sms|push|all [AFTER_JOB] | ack-channel-policy ENV JOB REVISION OPERATOR REASON | push-policy-evidence ENV JOB REVISION | list-skipped-fcm ENV JOB [AFTER_TARGET] | list-cancelled-push-resolutions ENV JOB REVISION [AFTER_TARGET] | resolve-cancelled-push ENV JOB REVISION TARGET accepted|not_accepted OPERATOR REASON | check-failed-jobs ENV | list-failed-jobs ENV [AFTER_JOB] | ack-failed-job ENV JOB OPERATOR REASON | list-failed-jobs-v2 ENV [AFTER_JOB] | ack-failed-job-v2 ENV JOB REVISION OPERATOR REASON | list-slack ENV [AFTER_JOB] | slack-ack ENV JOB OPERATOR REASON | operator-scope ENV | operator-scope-set ENV DB_LOGIN GRANT_JSON REVOKE_JSON REASON | operator-scope-audit ENV [AFTER_ID] | operator-grants ENV [AFTER_LOGIN AFTER_PERMISSION] | operator-grant-audit ENV [AFTER_ID] | operator-grant|operator-revoke ENV DB_LOGIN PERMISSION REASON | check|check-slack ENV | slack-resolve ENV JOB retry|accepted OPERATOR REASON | list-slack-v2 ENV [AFTER_JOB] | slack-resolve-v2 ENV JOB ATTEMPT_ID retry|accepted OPERATOR REASON | check-alert-delivery ENV | alert-status ENV | alert-resolve ENV CHANNEL TARGET DECISION OPERATOR REASON | alert-resolve-v2 ENV CHANNEL TARGET ATTEMPT_ID DECISION OPERATOR REASON | check-queue ENV MAX_WAIT_SECONDS | check-resend|check-resend-metrics|check-twilio|check-twilio-metrics|check-sendgrid|check-sendgrid-metrics ENV GRACE_SECONDS HEARTBEAT_MAX_SECONDS | list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | email-dispatch-evidence|sendgrid-result ENV EMAIL_JOB | resend-evidence|resend-check|resend-result ENV EMAIL_JOB | sms-evidence|sms-delivery|twilio-result ENV SMS_JOB | resend-auto-policy-read ENV | resend-auto-policy-set ENV EXPECTED enabled|disabled MAX now|preserve REASON | resend-auto-policy-set-v2 ENV REQUEST_ID EXPECTED enabled|disabled MAX now|preserve REASON | resend-auto-policy-request ENV REQUEST_ID | resend-auto-policy-audit ENV [BEFORE] | resend-retry-after ENV JOB OPERATOR REASON | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
+        return Err("usage: delivery-reconcile check-fcm-credentials ENV MAX_AGE_SECONDS MIN_HEALTHY | check-channel-policy ENV email|sms|push|all | list-channel-policy ENV email|sms|push|all [AFTER_JOB] | ack-channel-policy ENV JOB REVISION OPERATOR REASON | push-policy-evidence ENV JOB REVISION | list-skipped-fcm ENV JOB [AFTER_TARGET] | list-cancelled-push-resolutions ENV JOB REVISION [AFTER_TARGET] | resolve-cancelled-push ENV JOB REVISION TARGET accepted|not_accepted OPERATOR REASON | check-failed-jobs ENV | list-failed-jobs ENV [AFTER_JOB] | ack-failed-job ENV JOB OPERATOR REASON | list-failed-jobs-v2 ENV [AFTER_JOB] | ack-failed-job-v2 ENV JOB REVISION OPERATOR REASON | list-slack ENV [AFTER_JOB] | slack-ack ENV JOB OPERATOR REASON | operator-scope ENV | operator-scope-set ENV DB_LOGIN GRANT_JSON REVOKE_JSON REASON | operator-scope-audit ENV [AFTER_ID] | operator-grants ENV [AFTER_LOGIN AFTER_PERMISSION] | operator-grant-audit ENV [AFTER_ID] | operator-grant|operator-revoke ENV DB_LOGIN PERMISSION REASON | check|check-slack ENV | slack-resolve ENV JOB retry|accepted OPERATOR REASON | list-slack-v2 ENV [AFTER_JOB] | slack-resolve-v2 ENV JOB ATTEMPT_ID retry|accepted OPERATOR REASON | check-alert-delivery ENV | alert-status ENV | alert-resolve ENV CHANNEL TARGET DECISION OPERATOR REASON | alert-resolve-v2 ENV CHANNEL TARGET ATTEMPT_ID DECISION OPERATOR REASON | check-queue ENV MAX_WAIT_SECONDS | check-resend-auto ENV GRACE_SECONDS | check-resend|check-resend-metrics|check-twilio|check-twilio-metrics|check-sendgrid|check-sendgrid-metrics ENV GRACE_SECONDS HEARTBEAT_MAX_SECONDS | list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | email-dispatch-evidence|sendgrid-result ENV EMAIL_JOB | resend-evidence|resend-check|resend-result ENV EMAIL_JOB | sms-evidence|sms-delivery|twilio-result ENV SMS_JOB | resend-auto-policy-read ENV | resend-auto-policy-set ENV EXPECTED enabled|disabled MAX now|preserve REASON | resend-auto-policy-set-v2 ENV REQUEST_ID EXPECTED enabled|disabled MAX now|preserve REASON | resend-auto-policy-request ENV REQUEST_ID | resend-auto-policy-audit ENV [BEFORE] | resend-retry-after ENV JOB OPERATOR REASON | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
     }
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let (mut db, connection) = config.connect(tls).await?;
@@ -51,7 +51,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             eprintln!("database connection failed");
         }
     });
-    if args.len() == 4 && args[0] == "check-fcm-credentials" {
+    if args.len() == 3 && args[0] == "check-resend-auto" {
+        let grace = args[2].parse::<i32>()?;
+        let health =
+            novu_postgres_queue::reconciliation::resend_auto_health(&db, &args[1], grace).await?;
+        println!("{}", health);
+        if ["rateLimited", "exhausted", "guardDeferred", "overdueAuto"]
+            .iter()
+            .any(|key| health[*key].as_i64().is_none_or(|v| v != 0))
+        {
+            std::process::exit(2);
+        }
+    } else if args.len() == 4 && args[0] == "check-fcm-credentials" {
         let age: i32 = args[2].parse()?;
         let minimum: i64 = args[3].parse()?;
         if !(1..=86_400).contains(&age) || !(1..=1000).contains(&minimum) {

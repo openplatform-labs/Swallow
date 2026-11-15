@@ -1,3 +1,9 @@
+## Resend 자동 재시도 상태 경보
+
+워커 0165와 `delivery-reconcile check-resend-auto`는 오래된 429, 현재 정책의 재시도 횟수 소진, 보호 설정 불일치로 연기된 작업 및 기한이 지난 자동 재시도 작업을 환경별로 집계한다. 별도 설정 `SWALLOW_ALERT_RESEND_AUTO_GRACE_SECONDS`을 켜면 기존 Slack·이메일 경보에 포함된다. 제한 DB 계정에는 환경별 `alert_view`와 집계 함수 EXECUTE가 필요하다. 일부 집계는 서로 겹치며, `new-condition`에서는 기존 미확인 실패 작업과 같은 쿨다운 범주를 사용한다.
+
+임시 PostgreSQL 17·제한 DB 로그인·실제 CLI에서 집계, 환경 격리, 권한 회수와 차단된 경보 예약을 검증하고 로컬 모의 Slack·Resend 어댑터로 내용 전달을 확인했다. 실제 외부 수신·운영 스케줄러·HA 및 대규모 DB 부하는 미검증이다. 조건과 제한은 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
 ## Resend 자동 재시도 정책 관리 화면
 
 Angular 설정 화면에서 API 0090을 사용해 자동 재시도 정책을 조회하고 활성화·최대 횟수·대상 시작 시각을 선택할 수 있다. 요청 ID·예상 revision·내용을 먼저 확인한 뒤 제출하며, 결과 불명 시 동일 요청 재제출과 별도 요청 조회를 제공한다. 감사는 별도 권한으로 JWT 경로만 조회한다. 사용자는 요청 ID를 화면 이탈 전에 보관하고 대기 중인 발송과 워커 설정·중복 위험을 별도로 확인해야 한다.

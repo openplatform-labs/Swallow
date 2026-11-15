@@ -1,3 +1,9 @@
+워커 0165는 환경별 Resend 429·자동 재시도 주의 상태를 집계한다. `delivery-reconcile check-resend-auto ENV GRACE_SECONDS`는 JSON의 `rateLimited`(기준 시간 이상 실패한 429), `exhausted`(그중 활성 정책의 횟수를 소진한 건), `guardDeferred`(보호 설정 불일치로 보류된 pending 건), `overdueAuto`(예약 시각과 기준 시간이 지난 자동 재시도 pending 건)를 반환한다. `exhausted`는 `rateLimited`의 부분집합이며 다른 항목도 겹칠 수 있다. GRACE_SECONDS는 1~86,400초다. 정상은 종료 0, 하나라도 양수면 2, 권한·DB·설정 오류는 1이다. 조회 DB 로그인에는 해당 환경의 `alert_view`와 `GRANT EXECUTE ON FUNCTION public.novu_rust_resend_auto_retry_health(text,integer)`가 필요하다.
+
+선택적으로 `SWALLOW_ALERT_RESEND_AUTO_GRACE_SECONDS=300`을 설정하면 기존 `send-delivery-alert`가 이 집계를 Slack·이메일 대상에 포함한다. 생략하면 비활성화되며 기존 Resend 전달 상태 검사와 독립적으로 켜거나 끌 수 있다. 검사 자체의 실패도 경보를 시도하고 오류로 종료한다. 모니터링 로그인에 위 조회 권한과 기존 발송 경로의 권한을 부여하고, 누락 실행·DB 장애·경보 전송 결과는 별도로 감시한다. `new-condition` 쿨다운에서는 기존 미확인 실패 작업과 같은 조건 범주를 공유하므로 이미 그 범주가 활성 상태인 동안 다른 항목이 추가되어도 별도 즉시 경보가 보장되지 않는다. 한 검사가 실패하면 공유 범주를 정상으로 지우지 않는다.
+
+집계는 조회 시점의 DB 상태이며 발송·수신이나 모든 워커의 정상 동작을 보장하지 않는다. `rateLimited`는 실패 작업의 별도 확인 여부를 반영하지 않아 상태가 바뀌기 전까지 계속 집계된다. `exhausted`는 현재 활성 정책과 cutoff 기준이고 정책 비활성화 시 0이 될 수 있다. `guardDeferred`는 특정 오류 문자열과 pending 상태를 사용하며 직접 DB 수정·구버전 워커·다른 실패 유형은 탐지하지 못한다. 향후 예약 시각이 아직 지나지 않은 작업은 overdue가 아니다. 환경의 pending·failed Resend 작업과 관련 이력 집계가 추가되므로 실제 규모에서 실행 계획·부하를 확인한다. 제한 DB 계정·실제 CLI·임시 PostgreSQL에서 집계·환경 격리·권한 회수 및 차단된 경보 예약을 검증했고, 로컬 모의 Slack·Resend 어댑터에서 경보 내용 전달을 확인했다. 실제 외부 수신·스케줄러·운영 HA는 미검증이다. 재현: `TEST_DATABASE_URL=... cargo test --test resend_auto_health -- --ignored` (전체 마이그레이션을 적용한 폐기 가능한 DB와 역할 생성 권한 필요).
+
 워커 0164는 Resend 자동 정책에 요청 ID 기반 변경과 결과 조회를 추가한다. 기존 정책 쓰기 권한 `can_write`와 다음 두 함수에 대한 별도 EXECUTE 권한이 필요하다. 요청 ID는 운영자가 전송 전에 생성·보관한다.
 
 ```sql
