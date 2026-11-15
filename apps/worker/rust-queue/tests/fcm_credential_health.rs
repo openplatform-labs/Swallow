@@ -73,6 +73,7 @@ async fn credential_health_tracks_individual_workers_and_permissions() {
         include_str!("../migrations/0124_push_workflow_worker_policy.sql"),
         include_str!("../migrations/0142_fcm_credential_health.sql"),
         include_str!("../migrations/0143_alert_signed_condition_masks.sql"),
+        include_str!("../migrations/0144_fcm_heartbeat_session_identity.sql"),
     ] {
         db.batch_execute(sql).await.unwrap();
     }
@@ -102,6 +103,49 @@ async fn credential_health_tracks_individual_workers_and_permissions() {
             .is_err()
     );
     db.execute("INSERT INTO public.novu_rust_fcm_routing_workers SELECT 'env-b',rolname,oid FROM pg_roles WHERE rolname='fcm_health_writer'",&[]).await.unwrap();
+    assert!(
+        writer
+            .query_one(
+                "SELECT public.novu_rust_fcm_credential_heartbeat('env-b',$1,'healthy')",
+                &[&id]
+            )
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
+    // Reapplying the migration must preserve the explicitly granted EXECUTE.
+    db.batch_execute(include_str!(
+        "../migrations/0144_fcm_heartbeat_session_identity.sql"
+    ))
+    .await
+    .unwrap();
+    assert!(
+        writer
+            .query_one(
+                "SELECT public.novu_rust_fcm_credential_heartbeat('env-b',$1,'healthy')",
+                &[&id]
+            )
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
+    // Model PID reuse: retain the current PID and principal, but store the
+    // previous backend's start time. Its old observation must not be refreshed.
+    db.execute("UPDATE public.novu_rust_fcm_credential_health SET backend_started_at=backend_started_at-interval '1 second', observed_at=clock_timestamp()-interval '2 minutes' WHERE environment_id='env-b' AND instance_id=$1", &[&id]).await.unwrap();
+    assert!(
+        !writer
+            .query_one(
+                "SELECT public.novu_rust_fcm_credential_heartbeat('env-b',$1,'unhealthy')",
+                &[&id]
+            )
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
+    let unchanged = db.query_one("SELECT state,observed_at < clock_timestamp()-interval '1 minute' FROM public.novu_rust_fcm_credential_health WHERE environment_id='env-b' AND instance_id=$1", &[&id]).await.unwrap();
+    assert_eq!(unchanged.get::<_, String>(0), "healthy");
+    assert!(unchanged.get::<_, bool>(1));
+    db.execute("UPDATE public.novu_rust_fcm_credential_health SET backend_started_at=backend_started_at+interval '1 second' WHERE environment_id='env-b' AND instance_id=$1", &[&id]).await.unwrap();
     assert!(
         writer
             .query_one(
