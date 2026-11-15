@@ -138,10 +138,45 @@ async fn real_api_key_reload_failure_triggers_alert_and_recovers() {
     assert_eq!(run().output().await.unwrap().status.code(),Some(2));
     let row=db.query_one("SELECT state, (SELECT count(*) FROM novu_rust_alert_delivery_attempts a WHERE a.environment_id=s.environment_id AND a.target_id=s.target_id) FROM novu_rust_alert_delivery_slots s WHERE s.environment_id=$1 AND s.target_id='key-instance'", &[&env]).await.unwrap();
     assert_eq!(row.get::<_,String>(0),"unknown"); assert_eq!(row.get::<_,i64>(1),1);
-    fs::write(dir.0.join("new"),valid).unwrap(); fs::rename(dir.0.join("new"),&file).unwrap();
+    fs::write(dir.0.join("new"),&valid).unwrap(); fs::rename(dir.0.join("new"),&file).unwrap();
     wait_for(&client,&url,200).await;
     assert_eq!(run().output().await.unwrap().status.code(),Some(0));
     let state:String=db.query_one("SELECT state FROM novu_rust_alert_delivery_slots WHERE environment_id=$1 AND target_id='key-instance'", &[&env]).await.unwrap().get(0);
     assert_eq!(state,"unknown");
+    // Run the production scheduler and fanout against the same live API.
+    let hook=dir.0.join("slack-webhook"); fs::write(&hook,"https://hooks.slack.com/services/FAKE/FAKE/FAKE").unwrap();
+    let targets=dir.0.join("targets.json");
+    fs::write(&targets,serde_json::json!({"targets":[{"channel":"slack","id":"scheduled-instance","webhook_file":hook}]}).to_string()).unwrap();
+    let log=dir.0.join("scheduler.log");
+    let log_out=fs::File::create(&log).unwrap(); let log_err=log_out.try_clone().unwrap();
+    let mut scheduler=Child(Command::new(env!("CARGO_BIN_EXE_alert-scheduler")).env_clear()
+        .args(["1","database",&env,"instance","60",targets.to_str().unwrap()])
+        .env("DATABASE_URL",alert_url.as_str()).env("NOVU_POSTGRES_ALLOW_INSECURE","true")
+        .env("SWALLOW_OPERATOR_KEY_PROBE_URL",&url).env("HTTPS_PROXY","http://127.0.0.1:1")
+        .env("NO_PROXY","127.0.0.1,localhost").env("SWALLOW_ALERT_SCOPED_DELIVERY","true")
+        .env("SWALLOW_ALERT_COOLDOWN_POLICY","new-condition").env("SWALLOW_DB_ALERT_OPERATION_TIMEOUT_SECONDS","3")
+        .stdout(Stdio::from(log_out)).stderr(Stdio::from(log_err)).spawn().unwrap());
+    async fn wait_log(path:&std::path::Path, needle:&str, count:usize) {
+        let deadline=tokio::time::Instant::now()+Duration::from_secs(20);
+        loop {
+            if fs::read_to_string(path).unwrap_or_default().matches(needle).count() >= count { return; }
+            assert!(tokio::time::Instant::now()<deadline,"scheduler did not reach expected status");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    wait_log(&log,"alert scheduler: completed",1).await;
+    fs::write(dir.0.join("new"),"{").unwrap(); fs::rename(dir.0.join("new"),&file).unwrap();
+    wait_for(&client,&url,503).await;
+    wait_log(&log,"alert scheduler: attention required",2).await;
+    let row=db.query_one("SELECT state, (SELECT count(*) FROM novu_rust_alert_delivery_attempts a WHERE a.environment_id=s.environment_id AND a.target_id=s.target_id) FROM novu_rust_alert_delivery_slots s WHERE s.environment_id=$1 AND s.target_id='scheduled-instance'", &[&env]).await.unwrap();
+    assert_eq!(row.get::<_,String>(0),"unknown"); assert_eq!(row.get::<_,i64>(1),1);
+    fs::write(dir.0.join("new"),&valid).unwrap(); fs::rename(dir.0.join("new"),&file).unwrap();
+    wait_for(&client,&url,200).await;
+    wait_log(&log,"alert scheduler: completed",2).await;
+    let state:String=db.query_one("SELECT state FROM novu_rust_alert_delivery_slots WHERE environment_id=$1 AND target_id='scheduled-instance'", &[&env]).await.unwrap().get(0);
+    assert_eq!(state,"unknown");
+    #[cfg(unix)] { unsafe { libc::kill(scheduler.0.id().unwrap() as i32, libc::SIGTERM); } }
+    #[cfg(not(unix))] { scheduler.0.start_kill().unwrap(); }
+    tokio::time::timeout(Duration::from_secs(10),scheduler.0.wait()).await.unwrap().unwrap();
     api.0.kill().await.unwrap(); api.0.wait().await.unwrap();
 }
