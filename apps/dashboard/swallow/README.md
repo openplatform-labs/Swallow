@@ -349,6 +349,8 @@ The settings permission panel supports the Discord review list and review grants
 
 # Discord 재시도 대기 조사
 
-운영 경보 화면에서 JWT 인증을 선택하면 Discord 429 재시도 대기 집계와 전체 또는 지연 작업 목록을 별도로 조회할 수 있다. 유예 시간은 1–86400초이며 집계·목록은 독립 JWT 권한과 API DB 로그인 `alert_view` 권한이 필요하다. 최초 권한은 DBA가 설정하며 위임 UI는 아직 없다. 세부 권한과 API는 [API README](../../api/rust-api/README.md), 경보 구성은 [워커 README](../../worker/rust-queue/README.md)를 따른다. 목록과 집계는 별도 시점이고 UUID 순서이며 실제 발송 여부나 워커 중단의 증거가 아니다.
+운영 경보 화면에서 JWT 인증을 선택하면 Discord 429 재시도 대기 집계와 전체 또는 지연 작업 목록을 별도로 조회할 수 있다. 유예 시간은 1–86400초이며 집계·목록은 독립 JWT 권한과 API DB 로그인 `alert_view` 권한이 필요하다. 설정 화면에서 권한 위임·회수와 요청·감사 조회를 지원하며 최초 위임 관리자와 DB 로그인 권한은 DBA가 설정한다. 세부 권한과 API는 [API README](../../api/rust-api/README.md), 경보 구성은 [워커 README](../../worker/rust-queue/README.md)를 따른다. 목록과 집계는 별도 시점이고 UUID 순서이며 실제 발송 여부나 워커 중단의 증거가 아니다.
 
 Angular 테스트 253개와 빌드가 통과했다. `scripts/test-discord-retry-diagnostics-browser.sh`는 격리 Docker PostgreSQL, 제한 API 로그인과 테스트 JWT를 사용해 실제 브라우저에서 집계, 전체·지연 필터, payload 비노출과 권한 없는 사용자의 거절을 확인한다. 실제 외부 IdP, Discord 발송 및 운영 HA는 검증하지 않았다. 기존 번들·CSS 예산 경고가 남아 있다.
+
+권한 위임을 추가한 Angular 테스트 254개와 빌드가 통과했다. 제한 DB 로그인·테스트 JWT·Docker PostgreSQL API 테스트에서 두 권한의 독립 부여·회수와 감사 실패 롤백을 확인했다. `scripts/test-discord-retry-grants-browser.sh`의 기본 모드는 Docker PostgreSQL이며, 이번 브라우저–API 시험은 Docker Desktop 시작 불가로 `SWALLOW_TEST_POSTGRES_MODE=local`을 지정해 임시 로컬 PostgreSQL 17에서 실행했다. 두 권한 부여, 위임 감사, 대상의 진단 조회, 집계 권한 회수와 목록 권한 유지를 확인했다. 로컬 모드는 `initdb`, `pg_ctl`, `psql`이 필요하다. 외부 IdP와 운영 HA는 미검증이다.
