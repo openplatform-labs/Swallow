@@ -72,7 +72,15 @@ async fn synchronous_failover_during_fcm_dispatch_preserves_unknown() {
     let db = connect(&primary_url).await;
     db.batch_execute("INSERT INTO public.novu_rust_environments VALUES ('fcm-ha','org'); INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES ('fcm-ha','alice','subscriber','{}')").await.unwrap();
     let job = Uuid::new_v4();
-    let payload = json!({"prepared_messages":[{"message":{"token":"fixture-device","notification":{"title":"Hello","body":"Body"}}}],"prepared_context":{"subscriber_id":"alice","subscriber_internal_id":"subscriber","notification_internal_id":"notification","workflow_identifier":"workflow","transaction_id":job.to_string(),"title":"Hello","content":"Body","target_metadata":[{"message_id":"fixture-message","device_tokens":["fixture-device"]}]}});
+    let multiple = std::env::var("TEST_FCM_FAILOVER_MULTIPLE").as_deref() == Ok("true");
+    let mut payload = json!({"prepared_messages":[{"message":{"token":"fixture-device","notification":{"title":"Hello","body":"Body"}}}],"prepared_context":{"subscriber_id":"alice","subscriber_internal_id":"subscriber","notification_internal_id":"notification","workflow_identifier":"workflow","transaction_id":job.to_string(),"title":"Hello","content":"Body","target_metadata":[{"message_id":"fixture-message","device_tokens":["fixture-device"]}]}});
+    if multiple {
+        payload["prepared_messages"].as_array_mut().unwrap().push(json!({"message":{"token":"fixture-second","notification":{"title":"Hello","body":"Body"}}}));
+        payload["prepared_context"]["target_metadata"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"message_id":"fixture-message-2","device_tokens":["fixture-second"]}));
+    }
     enqueue(&db, job, "fcm-ha", fcm_queue::JOB_KIND, &payload)
         .await
         .unwrap();
@@ -190,7 +198,7 @@ async fn synchronous_failover_during_fcm_dispatch_preserves_unknown() {
     let mut second = worker(&cluster_url, "fcm_failover_2", &proxy_url);
     let mut recovered = false;
     for _ in 0..200 {
-        let row=promoted.query_one("SELECT j.status,a.state,m.delivery_state,(SELECT count(*) FROM pg_stat_activity WHERE application_name IN ('fcm_failover_1','fcm_failover_2')) FROM public.novu_queue_jobs j JOIN public.novu_rust_fcm_attempts a ON a.job_id=j.id JOIN public.novu_rust_push_messages m ON m.push_job_id=j.id WHERE j.id=$1", &[&job]).await.unwrap();
+        let row=promoted.query_one("SELECT j.status,a.state,m.delivery_state,(SELECT count(*) FROM pg_stat_activity WHERE application_name IN ('fcm_failover_1','fcm_failover_2')) FROM public.novu_queue_jobs j JOIN public.novu_rust_fcm_attempts a ON a.job_id=j.id AND a.target_index=0 JOIN public.novu_rust_push_messages m ON m.push_job_id=j.id AND m.target_index=0 WHERE j.id=$1", &[&job]).await.unwrap();
         recovered = row.get::<_, String>(0) == "failed"
             && row.get::<_, String>(1) == "unknown"
             && row.get::<_, String>(2) == "unknown"
@@ -207,19 +215,22 @@ async fn synchronous_failover_during_fcm_dispatch_preserves_unknown() {
         "workers failed to preserve the ambiguous attempt"
     );
     tokio::time::sleep(Duration::from_secs(6)).await;
-    let row = promoted
-        .query_one(
-            "SELECT count(*),min(state) FROM public.novu_rust_fcm_attempts WHERE job_id=$1",
-            &[&job],
-        )
-        .await
-        .unwrap();
-    assert_eq!(row.get::<_, i64>(0), 1);
-    assert_eq!(row.get::<_, Option<String>>(1).as_deref(), Some("unknown"));
+    let rows = promoted.query("SELECT target_index,state FROM public.novu_rust_fcm_attempts WHERE job_id=$1 ORDER BY target_index", &[&job]).await.unwrap();
+    assert_eq!(rows.len(), if multiple { 2 } else { 1 });
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(row.get::<_, i32>(0), i as i32);
+        assert_eq!(row.get::<_, String>(1), "unknown");
+    }
+    let messages = promoted.query("SELECT target_index,delivery_state FROM public.novu_rust_push_messages WHERE push_job_id=$1 ORDER BY target_index", &[&job]).await.unwrap();
+    assert_eq!(messages.len(), if multiple { 2 } else { 1 });
+    for (i, row) in messages.iter().enumerate() {
+        assert_eq!(row.get::<_, i32>(0), i as i32);
+        assert_eq!(row.get::<_, String>(1), "unknown");
+    }
     assert_eq!(
         count.load(Ordering::SeqCst),
-        0,
-        "workers must not retry the ambiguous target"
+        if multiple { 1 } else { 0 },
+        "workers must send only the unattempted target, never retry the ambiguous target"
     );
     proxy_task.abort();
 }
