@@ -12,6 +12,11 @@ async fn run(
     if environment.trim().is_empty() {
         return Err("environment is required".into());
     }
+    let scoped_rls = match std::env::var("SWALLOW_SMTP_SCOPED_RLS").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid SMTP scoped RLS setting".into()),
+    };
     let provider = SmtpAlert::from_env().map_err(|_| "invalid SMTP configuration")?;
     let policy = email_step_policy::Policy::from_env()?;
     let seconds = match std::env::var("NOVU_SMTP_DB_TIMEOUT_SECONDS") {
@@ -46,6 +51,25 @@ async fn run(
                 Ok(Ok(_))
             );
             if ready {
+                if scoped_rls
+                    && !matches!(
+                        tokio::time::timeout(
+                            timeout,
+                            db.query_one(
+                                "SELECT public.novu_rust_assert_smtp_scoped_login($1)",
+                                &[&environment]
+                            )
+                        )
+                        .await,
+                        Ok(Ok(_))
+                    )
+                {
+                    task.abort();
+                    let _ = task.await;
+                    eprintln!("SMTP scoped isolation unavailable; reconnecting");
+                    stop.wait(Duration::from_secs(2)).await;
+                    continue;
+                }
                 match tokio::time::timeout(
                     timeout,
                     email_step_policy::register(&db, &environment, policy),

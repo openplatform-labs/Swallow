@@ -5,11 +5,11 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../../../.." && pwd)
 API="$ROOT/apps/api/rust-api"; WORKER="$ROOT/apps/worker/rust-queue"; UI="$ROOT/apps/dashboard/swallow"
 TEST_DIR=$(mktemp -d "${TMPDIR:-/tmp}/swallow-smtp-attachment-http-browser.XXXXXX")
-API_PID= UI_PID= INAPP_PID= SMTP_PID= FIXTURE_PID=
+API_PID= UI_PID= INAPP_PID= SMTP_PID= FIXTURE_PID= WRONG_PID=
 CONTAINER="swallow-smtp-attachment-http-$$"
 cleanup() {
   if [[ -n "$API_PID" ]]; then kill "$API_PID" 2>/dev/null || true; wait "$API_PID" 2>/dev/null || true; fi
-  for pid in "$INAPP_PID" "$SMTP_PID" "$FIXTURE_PID"; do if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fi; done
+  for pid in "$INAPP_PID" "$SMTP_PID" "$FIXTURE_PID" "$WRONG_PID"; do if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fi; done
   if [[ -n "$UI_PID" ]]; then kill "$UI_PID" 2>/dev/null || true; wait "$UI_PID" 2>/dev/null || true; fi
   if [[ "${TEST_POSTGRES_MODE:-docker}" == local ]]; then
     if [[ -f "$TEST_DIR/pg/PG_VERSION" ]]; then pg_ctl -D "$TEST_DIR/pg" -m fast -w stop >/dev/null 2>&1 || { echo "Could not stop test database; retained $TEST_DIR" >&2; return; }; fi
@@ -37,6 +37,10 @@ cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-wo
 cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply api "$API/migrations"
 db_sql -q -v ON_ERROR_STOP=1 <<'SQL'
 CREATE ROLE smtp_fixture_worker LOGIN;
+CREATE ROLE smtp_fixture_switch NOLOGIN;
+CREATE ROLE smtp_fixture_plain LOGIN;
+GRANT smtp_fixture_switch TO smtp_fixture_worker;
+GRANT SELECT ON public.novu_queue_jobs TO smtp_fixture_switch,smtp_fixture_plain;
 GRANT USAGE ON SCHEMA public TO smtp_fixture_worker;
 GRANT SELECT,UPDATE ON public.novu_queue_jobs TO smtp_fixture_worker;
 GRANT SELECT,INSERT,UPDATE ON public.novu_rust_smtp_attempts,public.novu_rust_email_workflow_worker_config TO smtp_fixture_worker;
@@ -51,6 +55,14 @@ INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_step
 INSERT INTO public.novu_rust_api_keys(key_hash,environment_id,user_id) VALUES(encode(sha256(convert_to('fixture-api-key','UTF8')),'hex'),'attachment-env','attachment-user');
 REVOKE INSERT ON public.novu_rust_smtp_attempts FROM smtp_fixture_worker;
 SQL
+if [[ "${TEST_SMTP_RLS:-false}" == true ]]; then
+  db_sql -q -v ON_ERROR_STOP=1 <<'SQL'
+INSERT INTO public.novu_rust_smtp_scoped_logins(principal_oid,database_principal,environment_id) SELECT oid,rolname,'attachment-env' FROM pg_roles WHERE rolname='smtp_fixture_worker';
+SQL
+  if db_sql -q -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_worker; SELECT public.novu_rust_assert_smtp_scoped_login('attachment-env')" >/dev/null 2>&1; then echo 'uninstalled RLS was accepted' >&2; exit 1; fi
+  db_sql -q -v ON_ERROR_STOP=1 -c "SELECT public.novu_rust_install_smtp_scoped_rls()"
+  if db_sql -q -v ON_ERROR_STOP=1 -c "SELECT public.novu_rust_assert_smtp_scoped_login('attachment-env')" >/dev/null 2>&1; then echo 'superuser was accepted' >&2; exit 1; fi
+fi
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost -addext subjectAltName=DNS:localhost -addext basicConstraints=critical,CA:FALSE -keyout "$TEST_DIR/key" -out "$TEST_DIR/cert" >"$TEST_DIR/openssl.log" 2>&1
 printf '%s' fixture-password > "$TEST_DIR/password"
 cargo build --quiet --locked --manifest-path "$API/Cargo.toml" --bin novu-rust-api
@@ -58,9 +70,19 @@ cargo build --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin in-app-w
 python3 "$WORKER/tests/fixtures/smtp_starttls_fixture.py" "$TEST_DIR/cert" "$TEST_DIR/key" "$TEST_DIR/message" "$TEST_DIR/connected" > "$TEST_DIR/smtp-port" 2>"$TEST_DIR/smtp-fixture.log" & FIXTURE_PID=$!
 for _ in $(seq 1 100); do [[ -s "$TEST_DIR/smtp-port" ]] && break; kill -0 "$FIXTURE_PID"; sleep 0.1; done
 SMTP_PORT=$(cat "$TEST_DIR/smtp-port")
+if [[ "${TEST_SMTP_RLS:-false}" == true ]]; then
+  env -i PATH="$PATH" DATABASE_URL="postgres://smtp_fixture_worker@127.0.0.1:$DB_PORT/postgres" NOVU_POSTGRES_ALLOW_INSECURE=true NOVU_SMTP_ENVIRONMENT_ID=other-env SWALLOW_SMTP_SCOPED_RLS=true SWALLOW_SMTP_HOST=localhost SWALLOW_SMTP_PORT="$SMTP_PORT" SWALLOW_SMTP_FROM=sender@example.test SWALLOW_SMTP_CA_FILE="$TEST_DIR/cert" "$WORKER/target/debug/smtp-worker" >"$TEST_DIR/wrong-scope.log" 2>&1 & WRONG_PID=$!
+  for _ in $(seq 1 100); do
+    rg -q 'SMTP scoped isolation unavailable; reconnecting' "$TEST_DIR/wrong-scope.log" && break
+    kill -0 "$WRONG_PID"; sleep 0.1
+  done
+  rg -q 'SMTP scoped isolation unavailable; reconnecting' "$TEST_DIR/wrong-scope.log"
+  [[ ! -e "$TEST_DIR/connected" ]]
+  kill "$WRONG_PID"; wait "$WRONG_PID" || true; WRONG_PID=
+fi
 env -i PATH="$PATH" DATABASE_URL="$DATABASE_URL" NOVU_POSTGRES_ALLOW_INSECURE=true LISTEN_ADDR="127.0.0.1:$API_PORT" SWALLOW_API_HEALTH_ENDPOINTS_ENABLED=true "$API/target/debug/novu-rust-api" >"$TEST_DIR/api.log" 2>&1 & API_PID=$!
 env -i PATH="$PATH" DATABASE_URL="$DATABASE_URL" NOVU_POSTGRES_ALLOW_INSECURE=true "$WORKER/target/debug/in-app-worker" >"$TEST_DIR/in-app.log" 2>&1 & INAPP_PID=$!
-env -i PATH="$PATH" DATABASE_URL="postgres://smtp_fixture_worker@127.0.0.1:$DB_PORT/postgres" NOVU_POSTGRES_ALLOW_INSECURE=true NOVU_SMTP_ENVIRONMENT_ID=attachment-env SWALLOW_SMTP_HOST=localhost SWALLOW_SMTP_PORT="$SMTP_PORT" SWALLOW_SMTP_FROM=sender@example.test SWALLOW_SMTP_TLS=starttls SWALLOW_SMTP_USERNAME=fixture-user SWALLOW_SMTP_PASSWORD_FILE="$TEST_DIR/password" SWALLOW_SMTP_CA_FILE="$TEST_DIR/cert" "$WORKER/target/debug/smtp-worker" >"$TEST_DIR/smtp.log" 2>&1 & SMTP_PID=$!
+env -i PATH="$PATH" DATABASE_URL="postgres://smtp_fixture_worker@127.0.0.1:$DB_PORT/postgres" NOVU_POSTGRES_ALLOW_INSECURE=true NOVU_SMTP_ENVIRONMENT_ID=attachment-env SWALLOW_SMTP_SCOPED_RLS="${TEST_SMTP_RLS:-false}" SWALLOW_SMTP_HOST=localhost SWALLOW_SMTP_PORT="$SMTP_PORT" SWALLOW_SMTP_FROM=sender@example.test SWALLOW_SMTP_TLS=starttls SWALLOW_SMTP_USERNAME=fixture-user SWALLOW_SMTP_PASSWORD_FILE="$TEST_DIR/password" SWALLOW_SMTP_CA_FILE="$TEST_DIR/cert" "$WORKER/target/debug/smtp-worker" >"$TEST_DIR/smtp.log" 2>&1 & SMTP_PID=$!
 for _ in $(seq 1 100); do curl -fsS "http://127.0.0.1:$API_PORT/health/ready" >/dev/null 2>&1 && break; kill -0 "$API_PID"; sleep 0.1; done
 cat > "$TEST_DIR/request.json" <<'JSON'
 {"name":"smtp-attachment","to":{"subscriberId":"recipient","email":"recipient@example.test"},"transactionId":"smtp-attachment-http","overrides":{"email":{"headers":{"X-Swallow-Test":"fixture-value","List-Unsubscribe":"<https://example.test/unsubscribe>"}}},"payload":{"attachments":[{"file":"aGVsbG8=","name":"hello.txt","mime":"text/plain"},{"file":{"type":"Buffer","data":[0,1,255]},"name":"logo.png","mime":"image/png","cid":"logo","channels":["email"]}]}}
@@ -103,7 +125,25 @@ assert p['logo.png'].get('Content-ID')=='<logo>'
 PY2
 [[ $(db_sql -At -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM public.novu_queue_jobs WHERE environment_id='attachment-env' AND status='completed' AND attachment_completed_at IS NOT NULL AND ((kind='experimental_static_in_app_attachments_v1' AND payload ? 'emailAttachments') OR (kind='experimental_smtp_email' AND payload ? 'attachments'))") == 2 ]]
 [[ $(db_sql -At -v ON_ERROR_STOP=1 -c "SELECT status='pending' AND NOT EXISTS(SELECT 1 FROM public.novu_rust_smtp_attempts WHERE job_id='11111111-1111-4111-8111-000000000099') FROM public.novu_queue_jobs WHERE id='11111111-1111-4111-8111-000000000099'") == t ]]
-# Table grants are intentionally broad: prove the remaining cross-environment risk.
-[[ $(db_sql -qAt -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_worker; SELECT count(*) FROM public.novu_queue_jobs WHERE environment_id='other-env'") == 1 ]]
+if [[ "${TEST_SMTP_RLS:-false}" == true ]]; then
+  [[ $(db_sql -qAt -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_worker; SELECT count(*) FROM public.novu_queue_jobs WHERE environment_id='other-env'") == 0 ]]
+  [[ $(db_sql -qAt -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_worker; SELECT public.novu_rust_smtp_rls_allows(NULL)") == f ]]
+  if db_sql -q -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_worker; UPDATE public.novu_queue_jobs SET environment_id='other-env' WHERE environment_id='attachment-env'" >/dev/null 2>&1; then echo 'cross-environment move was allowed' >&2; exit 1; fi
+  if db_sql -q -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_worker; SELECT public.novu_rust_assert_smtp_scoped_login('other-env')" >/dev/null 2>&1; then echo 'wrong SMTP scope was accepted' >&2; exit 1; fi
+  [[ $(db_sql -qAt -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_worker; SET ROLE smtp_fixture_switch; SELECT count(*) FROM public.novu_queue_jobs WHERE environment_id='other-env'") == 0 ]]
+  [[ $(db_sql -qAt -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_plain; SELECT count(*) FROM public.novu_queue_jobs WHERE environment_id='other-env'") == 1 ]]
+  if db_sql -q -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_worker; SELECT public.novu_rust_install_smtp_scoped_rls()" >/dev/null 2>&1; then echo 'worker could install RLS' >&2; exit 1; fi
+  if db_sql -q -v ON_ERROR_STOP=1 -c "SELECT public.novu_rust_install_smtp_scoped_rls()" >/dev/null 2>&1; then echo 'existing policies unexpectedly replaced' >&2; exit 1; fi
+  [[ $(db_sql -qAt -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_worker; WITH changed AS (UPDATE public.novu_queue_jobs SET last_error='forbidden' WHERE environment_id='other-env' RETURNING 1) SELECT count(*) FROM changed") == 0 ]]
+  if db_sql -q -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_worker; INSERT INTO public.novu_rust_smtp_attempts(job_id,environment_id,state) VALUES('11111111-1111-4111-8111-000000000099','other-env','unknown')" >/dev/null 2>&1; then echo 'cross-environment insert was allowed' >&2; exit 1; fi
+  if db_sql -q -v ON_ERROR_STOP=1 -c "DELETE FROM public.novu_rust_smtp_scoped_logins WHERE database_principal='smtp_fixture_worker'" >/dev/null 2>&1; then echo 'scope registration was deleted' >&2; exit 1; fi
+  if db_sql -q -v ON_ERROR_STOP=1 -c "UPDATE public.novu_rust_smtp_scoped_logins SET database_principal='smtp_fixture_plain' WHERE database_principal='smtp_fixture_worker'" >/dev/null 2>&1; then echo 'scope identity was changed' >&2; exit 1; fi
+  db_sql -q -v ON_ERROR_STOP=1 -c "UPDATE public.novu_rust_smtp_scoped_logins SET enabled=false WHERE database_principal='smtp_fixture_worker'"
+  if db_sql -q -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_worker; SELECT public.novu_rust_assert_smtp_scoped_login('attachment-env')" >/dev/null 2>&1; then echo 'revoked SMTP scope was accepted' >&2; exit 1; fi
+  [[ $(db_sql -qAt -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_worker; SELECT count(*) FROM public.novu_queue_jobs WHERE environment_id='attachment-env'") == 0 ]]
+else
+  # Table grants are intentionally broad without the optional RLS installation.
+  [[ $(db_sql -qAt -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_worker; SELECT count(*) FROM public.novu_queue_jobs WHERE environment_id='other-env'") == 1 ]]
+fi
 [[ $(db_sql -qAt -v ON_ERROR_STOP=1 -c "SELECT has_table_privilege('smtp_fixture_worker','public.novu_rust_subscribers','DELETE')") == f ]]
 echo 'HTTP trigger, restricted SMTP worker, revoked attempt permission, recovery and environment filtering passed'
