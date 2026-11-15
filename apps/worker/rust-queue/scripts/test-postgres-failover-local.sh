@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$(cd ../../.. && pwd)
 scenario=${SWALLOW_LOCAL_FAILOVER_SCENARIO:-alert-binding}
-case "$scenario" in alert-binding|alert-scheduler|alert-v2|alert-v3|smtp|smtp-rls|smtp-resolution|discord-manual-retry|discord-cooldown|discord-inflight|in-app|resend|resend-cooldown|twilio|fcm|fcm-delay|fcm-exp|fcm-exp-repeat|fcm-review) ;; *) echo 'invalid local failover scenario' >&2; exit 2;; esac
+case "$scenario" in alert-binding|alert-scheduler|alert-v2|alert-v3|smtp|smtp-rls|smtp-resolution|discord-manual-retry|discord-cooldown|discord-inflight|in-app|resend|resend-cooldown|resend-invalid|twilio|fcm|fcm-delay|fcm-exp|fcm-exp-repeat|fcm-review) ;; *) echo 'invalid local failover scenario' >&2; exit 2;; esac
 pgbin=${SWALLOW_TEST_POSTGRES_BIN:-/opt/homebrew/opt/postgresql@17/bin}
 [[ -x "$pgbin/pg_ctl" && -x "$pgbin/pg_basebackup" ]] || { echo 'PostgreSQL 17 server binaries are required' >&2; exit 1; }
 testdir=$(mktemp -d /private/tmp/swallow-alert-ha.XXXXXX)
@@ -58,6 +58,11 @@ elif [[ "$scenario" == smtp || "$scenario" == smtp-rls ]]; then
   TEST_SMTP_FAILOVER_RLS=$([[ "$scenario" == smtp-rls ]] && printf true || printf false) cargo test --locked --test smtp_failover -- --ignored --nocapture
 elif [[ "$scenario" == in-app ]]; then
   cargo test --locked --test postgres_failover -- --ignored
+elif [[ "$scenario" == resend-invalid ]]; then
+  cargo build --quiet --locked --bin resend-worker
+  target_dir=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+  export TEST_RESEND_WORKER_BINARY="$target_dir/debug/resend-worker"
+  cargo test --locked --lib resend_failover_test::synchronous_failover_during_invalid_resend_preparation_rolls_back_attempt -- --ignored
 elif [[ "$scenario" == resend || "$scenario" == resend-cooldown ]]; then
   cargo build --quiet --locked --bin resend-worker
   target_dir=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')

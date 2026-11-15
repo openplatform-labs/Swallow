@@ -665,3 +665,51 @@ async fn synchronous_failover_preserves_resend_shared_cooldown() {
         "deferred worker opened provider connection"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires disposable synchronously replicated PostgreSQL; stops the primary"]
+async fn synchronous_failover_during_invalid_resend_preparation_rolls_back_attempt() {
+    let primary_url=std::env::var("TEST_PRIMARY_URL").unwrap();
+    let standby_url=std::env::var("TEST_STANDBY_URL").unwrap();
+    let cluster_url=std::env::var("TEST_FAILOVER_URL").unwrap();
+    let mut admin=connect(&primary_url).await;
+    admin.batch_execute("INSERT INTO public.novu_rust_environments VALUES('resend-ha','org'); INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,email_subject,email_html,email_provider,inbox_metadata) VALUES('resend-ha','invalid-resend',true,true,'Hello','<p>Fixture</p>','resend','{\"id\":\"64a000000000000000000051\",\"name\":\"Fixture\",\"critical\":false,\"tags\":[]}'); INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES('resend-ha','alice','64a000000000000000000054','{\"email\":\"receiver@example.test\"}')").await.unwrap();
+    let trigger=Uuid::new_v4();
+    enqueue(&admin,trigger,"resend-ha",in_app::JOB_KIND,&json!({"workflow":"invalid-resend","transactionId":"invalid-ha","content":"","payload":{},"recipients":[{"subscriberId":"alice"}],"recipientIdentitySnapshot":{"alice":"64a000000000000000000054"},"emailOverride":{"alternatives":[{"contentType":"text/calendar","content":"meeting"}]},"severityOverride":null})).await.unwrap();
+    assert!(in_app::process_one(&mut admin).await.unwrap());
+    let job:Uuid=admin.query_one("SELECT email_job_id FROM public.novu_rust_email_step_outcomes WHERE environment_id='resend-ha' AND transaction_id='invalid-ha'",&[]).await.unwrap().get(0);
+    admin.batch_execute("CREATE FUNCTION public.test_pause_resend_rejection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(789654321); RETURN NEW; END $$; CREATE TRIGGER test_pause_resend_rejection BEFORE UPDATE OF state ON public.novu_rust_resend_attempts FOR EACH ROW WHEN (NEW.state='rejected') EXECUTE FUNCTION public.test_pause_resend_rejection()").await.unwrap();
+    let controller=connect(&primary_url).await;controller.query_one("SELECT pg_advisory_lock(789654321)",&[]).await.unwrap();
+    let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();let proxy=format!("http://{}",listener.local_addr().unwrap());
+    let primary_connect=format!("{primary_url}?connect_timeout=2");
+    let mut original=worker(&primary_connect,"resend_invalid_primary",&proxy);
+    let deadline=tokio::time::Instant::now()+Duration::from_secs(8);
+    loop {
+        let waiting:bool=admin.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='resend_invalid_primary' AND wait_event='advisory')",&[]).await.unwrap().get(0);
+        if waiting {break;} assert!(original.0.try_wait().unwrap().is_none());assert!(tokio::time::Instant::now()<deadline,"worker did not reach uncommitted rejection");tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let standby=connect(&standby_url).await;
+    let deadline=tokio::time::Instant::now()+Duration::from_secs(8);
+    loop {
+        let row=standby.query_one("SELECT pg_is_in_recovery(),status,(SELECT count(*) FROM public.novu_rust_resend_attempts WHERE job_id=$1) FROM public.novu_queue_jobs WHERE id=$1",&[&job]).await.unwrap();
+        assert!(row.get::<_,bool>(0));
+        if row.get::<_,String>(1)=="running" && row.get::<_,i64>(2)==0 {break;}
+        assert!(tokio::time::Instant::now()<deadline,"claim was not replicated");tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let ctl=std::env::var("TEST_LOCAL_PG_CTL").unwrap();let primary=std::env::var("TEST_LOCAL_PRIMARY_DATA").unwrap();let standby_data=std::env::var("TEST_LOCAL_STANDBY_DATA").unwrap();
+    assert!(Command::new(&ctl).args(["-D",&primary,"-m","immediate","stop"]).stdout(Stdio::null()).status().unwrap().success());
+    drop(original);
+    assert!(Command::new(&ctl).args(["-D",&standby_data,"promote","-w"]).stdout(Stdio::null()).status().unwrap().success());
+    let promoted=connect(&standby_url).await;
+    assert_eq!(promoted.query_one("SELECT count(*) FROM public.novu_rust_resend_attempts WHERE job_id=$1",&[&job]).await.unwrap().get::<_,i64>(0),0);
+    promoted.execute("UPDATE public.novu_queue_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1",&[&job]).await.unwrap();
+    let mut replacement=worker(&cluster_url,"resend_invalid_promoted",&proxy);
+    let deadline=tokio::time::Instant::now()+Duration::from_secs(20);
+    loop {
+        let done:bool=promoted.query_one("SELECT EXISTS(SELECT 1 FROM public.novu_queue_jobs j JOIN public.novu_rust_resend_attempts a ON a.job_id=j.id JOIN public.novu_rust_email_messages m ON m.email_job_id=j.id AND m.environment_id=j.environment_id WHERE j.id=$1 AND j.status='failed' AND j.last_error='invalid Resend request' AND a.state='rejected' AND a.http_status IS NULL AND m.status='error' AND m.delivery_state='rejected')",&[&job]).await.unwrap().get(0);
+        if done {break;}assert!(replacement.0.try_wait().unwrap().is_none());assert!(tokio::time::Instant::now()<deadline,"promoted worker did not recover invalid request");tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(promoted.query_one("SELECT count(*) FROM public.novu_rust_resend_attempts WHERE job_id=$1",&[&job]).await.unwrap().get::<_,i64>(0),1);
+    assert!(tokio::time::timeout(Duration::from_millis(500),listener.accept()).await.is_err());
+    drop(replacement);
+}
