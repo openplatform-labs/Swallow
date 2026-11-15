@@ -44,7 +44,7 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     let db = connect(&url).await;
     db.batch_execute("INSERT INTO public.novu_rust_environments VALUES('jwt-alert-a','org'),('jwt-alert-b','org')").await.unwrap();
     let role = format!("jwt_alert_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_alerts(text,text,text,text,bigint,text,text),public.novu_rust_console_alerts_page(text,text,text),public.novu_rust_operator_jwt_resend_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_resend_jobs(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_twilio_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_twilio_jobs(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_jobs(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_slack_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_slack_jobs(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_alerts(text,text,text,text,bigint,text,text),public.novu_rust_console_alerts_page(text,text,text),public.novu_rust_operator_jwt_resend_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_resend_jobs(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_twilio_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_twilio_jobs(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_jobs(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_slack_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_slack_jobs(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_sendgrid_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_sendgrid_jobs(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_read(text,text,text,text,bigint,text,text) TO {role}")).await.unwrap();
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_write(text,text,text,text,bigint,text,text,jsonb,jsonb,text) TO {role}")).await.unwrap();
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_audit_read(text,text,text,text,bigint,text,text,uuid) TO {role}")).await.unwrap();
@@ -130,6 +130,16 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     );
     assert!(
         api.query("SELECT * FROM public.novu_rust_slack_resolutions", &[])
+            .await
+            .is_err()
+    );
+    assert!(
+        api.query("SELECT * FROM public.novu_rust_sendgrid_attempts", &[])
+            .await
+            .is_err()
+    );
+    assert!(
+        api.query("SELECT * FROM public.novu_rust_sendgrid_recipients", &[])
             .await
             .is_err()
     );
@@ -1833,6 +1843,164 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     let mut waiting = false;
     for _ in 0..100 {
         if db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%novu_rust_operator_jwt_workflow_audit_read%')",&[]).await.unwrap().get::<_,bool>(0){waiting=true;break;}
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(waiting && !pending.is_finished());
+    tx.commit().await.unwrap();
+    assert_eq!(pending.await.unwrap(), StatusCode::UNAUTHORIZED);
+    let mail_job = Uuid::new_v4();
+    let dispatch = Uuid::new_v4();
+    novu_postgres_queue::enqueue(
+        &db,
+        mail_job,
+        "jwt-alert-a",
+        novu_postgres_queue::sendgrid_queue::JOB_KIND,
+        &json!({"email":"private-recipient"}),
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO public.novu_rust_sendgrid_dispatch_ids(id,job_id,environment_id) VALUES ($1,$2,'jwt-alert-a')",&[&dispatch,&mail_job]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_sendgrid_attempts(job_id,environment_id,state,dispatch_id,provider_message_id) VALUES ($1,'jwt-alert-a','accepted',$2,'private-provider')",&[&mail_job,&dispatch]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_sendgrid_recipients(dispatch_id,environment_id,recipient_kind,recipient_index,recipient_hash,delivery_result) VALUES ($1,'jwt-alert-a','to',0,repeat('a',64),'delivered'),($1,'jwt-alert-a','cc',0,repeat('b',64),'pending')",&[&dispatch]).await.unwrap();
+    db.execute("UPDATE public.novu_queue_jobs SET status='completed',sendgrid_delivery_result='pending' WHERE id=$1",&[&mail_job]).await.unwrap();
+    let mail_request = |jwt: &str, path: &str| {
+        Request::builder()
+            .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let mail_path = format!(
+        "/v1/experimental/operator/sendgrid-result?environmentId=jwt-alert-a&jobId={mail_job}"
+    );
+    let mail_list = "/v1/experimental/operator/sendgrid-jobs?environmentId=jwt-alert-a";
+    assert_eq!(
+        app.clone()
+            .oneshot(mail_request(&token, &mail_path))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_sendgrid_result_grants VALUES('https://issuer.test','person','console','jwt-alert-a')").await.unwrap();
+    let response = app
+        .clone()
+        .oneshot(mail_request(&token, &mail_path))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let mail: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(mail["result"], "pending");
+    assert_eq!(mail["recipientCount"], 2);
+    assert_eq!(mail["deliveredCount"], 1);
+    assert_eq!(mail["pendingCount"], 1);
+    assert!(
+        !mail.to_string().contains("private-recipient")
+            && !mail.to_string().contains("private-provider")
+            && !mail.to_string().contains(&"a".repeat(64))
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(mail_request(&token, mail_list))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_sendgrid_jobs_grants VALUES('https://issuer.test','person','console','jwt-alert-a'); INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) SELECT gen_random_uuid(),'jwt-alert-a','experimental_sendgrid_email','{}' FROM generate_series(1,21); INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) VALUES(gen_random_uuid(),'jwt-alert-b','experimental_sendgrid_email','{}')").await.unwrap();
+    let response = app
+        .clone()
+        .oneshot(mail_request(&token, mail_list))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(page["data"].as_array().unwrap().len(), 20);
+    let next = page["next"].as_str().unwrap();
+    let response = app
+        .clone()
+        .oneshot(mail_request(&token, &format!("{mail_list}&after={next}")))
+        .await
+        .unwrap();
+    let page: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(page["data"].as_array().unwrap().len(), 2);
+    db.execute(
+        "UPDATE public.novu_rust_sendgrid_attempts SET state='unknown' WHERE job_id=$1",
+        &[&mail_job],
+    )
+    .await
+    .unwrap();
+    let response = app
+        .clone()
+        .oneshot(mail_request(&token, &mail_path))
+        .await
+        .unwrap();
+    let mail: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(mail["result"], "unknown");
+    db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES('https://issuer.test','person','console','jwt-alert-b'); INSERT INTO public.novu_rust_operator_jwt_sendgrid_result_grants VALUES('https://issuer.test','person','console','jwt-alert-b')").await.unwrap();
+    assert_eq!(app.clone().oneshot(mail_request(&token,&format!("/v1/experimental/operator/sendgrid-result?environmentId=jwt-alert-b&jobId={mail_job}"))).await.unwrap().status(),StatusCode::BAD_REQUEST);
+    db.execute("DELETE FROM public.novu_rust_operator_jwt_identities WHERE subject='person' AND environment_id='jwt-alert-b'",&[]).await.unwrap();
+    db.execute(
+        "DELETE FROM public.novu_rust_sendgrid_recipients WHERE dispatch_id=$1",
+        &[&dispatch],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE public.novu_rust_sendgrid_attempts SET state='accepted' WHERE job_id=$1",
+        &[&mail_job],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE public.novu_queue_jobs SET sendgrid_delivery_result='delivered' WHERE id=$1",
+        &[&mail_job],
+    )
+    .await
+    .unwrap();
+    let response = app
+        .clone()
+        .oneshot(mail_request(&token, &mail_path))
+        .await
+        .unwrap();
+    let mail: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(mail["result"], "unknown");
+    assert_eq!(mail["recipientCount"], 0);
+    db.execute("DELETE FROM public.novu_rust_operator_jwt_sendgrid_result_grants WHERE subject='person' AND environment_id='jwt-alert-a'",&[]).await.unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(mail_request(&token, &mail_path))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(mail_request(&token, mail_list))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_sendgrid_result_grants VALUES('https://issuer.test','person','console','jwt-alert-a')").await.unwrap();
+    let mut mail_revoker = connect(&url).await;
+    let tx = mail_revoker.transaction().await.unwrap();
+    tx.execute("DELETE FROM public.novu_rust_operator_jwt_sendgrid_result_grants WHERE subject='person' AND environment_id='jwt-alert-a'",&[]).await.unwrap();
+    let req = mail_request(&token, &mail_path);
+    let pending = tokio::spawn({
+        let app = app.clone();
+        async move { app.oneshot(req).await.unwrap().status() }
+    });
+    let mut waiting = false;
+    for _ in 0..100 {
+        if db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%novu_rust_operator_jwt_sendgrid_result%')",&[]).await.unwrap().get::<_,bool>(0){waiting=true;break;}
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert!(waiting && !pending.is_finished());

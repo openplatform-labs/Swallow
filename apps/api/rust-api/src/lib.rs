@@ -348,6 +348,8 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/operator/fcm-jobs", get(operator_identity::fcm_jobs))
         .route("/v1/experimental/operator/slack-result", get(operator_identity::slack_result))
         .route("/v1/experimental/operator/slack-jobs", get(operator_identity::slack_jobs))
+        .route("/v1/experimental/operator/sendgrid-result", get(operator_identity::sendgrid_result))
+        .route("/v1/experimental/operator/sendgrid-jobs", get(operator_identity::sendgrid_jobs))
         .route("/v1/experimental/operator/resend-jobs", get(operator_identity::resend_jobs))
         .route("/v1/experimental/operator/workflow", get(operator_identity::workflow_read).put(operator_identity::workflow_write))
         .route("/v1/experimental/operator/workflow-audit", get(operator_identity::workflow_audit))

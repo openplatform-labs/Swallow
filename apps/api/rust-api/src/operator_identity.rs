@@ -31,6 +31,8 @@ enum Lookup {
     FcmJobs,
     SlackResult,
     SlackJobs,
+    SendgridResult,
+    SendgridJobs,
     WorkflowRead,
     WorkflowAudit,
     WorkflowRequest,
@@ -335,6 +337,22 @@ pub(super) async fn slack_jobs(
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
 ) -> Response {
     query(db, headers, uri, verifier, Lookup::SlackJobs).await
+}
+pub(super) async fn sendgrid_result(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::SendgridResult).await
+}
+pub(super) async fn sendgrid_jobs(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::SendgridJobs).await
 }
 pub(super) async fn workflow_read(
     State(db): State<Arc<Client>>,
@@ -1060,12 +1078,16 @@ async fn query(
         Lookup::PermissionIdentity => &["environmentId", "issuer", "subject", "clientId"],
         Lookup::PermissionAudit => &["environmentId", "before"],
         Lookup::PermissionChangeRequest => &["environmentId", "requestId"],
-        Lookup::ResendResult | Lookup::TwilioResult | Lookup::FcmResult | Lookup::SlackResult => {
-            &["environmentId", "jobId"]
-        }
-        Lookup::ResendJobs | Lookup::TwilioJobs | Lookup::FcmJobs | Lookup::SlackJobs => {
-            &["environmentId", "after"]
-        }
+        Lookup::ResendResult
+        | Lookup::TwilioResult
+        | Lookup::FcmResult
+        | Lookup::SlackResult
+        | Lookup::SendgridResult => &["environmentId", "jobId"],
+        Lookup::ResendJobs
+        | Lookup::TwilioJobs
+        | Lookup::FcmJobs
+        | Lookup::SlackJobs
+        | Lookup::SendgridJobs => &["environmentId", "after"],
         Lookup::WorkflowRead => &["environmentId", "workflow", "resource"],
         Lookup::WorkflowAudit => &["environmentId", "workflow", "resource", "after"],
         Lookup::WorkflowRequest => &["environmentId", "resource", "requestId"],
@@ -1383,7 +1405,11 @@ async fn query(
             )
             .await
         }
-        Lookup::ResendJobs | Lookup::TwilioJobs | Lookup::FcmJobs | Lookup::SlackJobs => {
+        Lookup::ResendJobs
+        | Lookup::TwilioJobs
+        | Lookup::FcmJobs
+        | Lookup::SlackJobs
+        | Lookup::SendgridJobs => {
             let after = match params.get("after") {
                 None => None,
                 Some(value) => match Uuid::parse_str(value) {
@@ -1396,7 +1422,9 @@ async fn query(
             guarded_query(
                 &db,
                 &identity,
-                if matches!(lookup, Lookup::SlackJobs) {
+                if matches!(lookup, Lookup::SendgridJobs) {
+                    "SELECT public.novu_rust_operator_jwt_sendgrid_jobs($1,$2,$3,$4,$5,$6)"
+                } else if matches!(lookup, Lookup::SlackJobs) {
                     "SELECT public.novu_rust_operator_jwt_slack_jobs($1,$2,$3,$4,$5,$6)"
                 } else if matches!(lookup, Lookup::FcmJobs) {
                     "SELECT public.novu_rust_operator_jwt_fcm_jobs($1,$2,$3,$4,$5,$6)"
@@ -1416,14 +1444,20 @@ async fn query(
             )
             .await
         }
-        Lookup::ResendResult | Lookup::TwilioResult | Lookup::FcmResult | Lookup::SlackResult => {
+        Lookup::ResendResult
+        | Lookup::TwilioResult
+        | Lookup::FcmResult
+        | Lookup::SlackResult
+        | Lookup::SendgridResult => {
             let Some(job) = params.get("jobId").and_then(|id| Uuid::parse_str(id).ok()) else {
                 return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
             };
             guarded_query(
                 &db,
                 &identity,
-                if matches!(lookup, Lookup::SlackResult) {
+                if matches!(lookup, Lookup::SendgridResult) {
+                    "SELECT public.novu_rust_operator_jwt_sendgrid_result($1,$2,$3,$4,$5,$6)"
+                } else if matches!(lookup, Lookup::SlackResult) {
                     "SELECT public.novu_rust_operator_jwt_slack_result($1,$2,$3,$4,$5,$6)"
                 } else if matches!(lookup, Lookup::FcmResult) {
                     "SELECT public.novu_rust_operator_jwt_fcm_result($1,$2,$3,$4,$5,$6)"
