@@ -147,6 +147,14 @@ INSERT INTO public.novu_rust_operator_jwt_fcm_unreviewed_grants VALUES ('https:/
 INSERT INTO public.novu_rust_operator_jwt_fcm_review_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
 SQL
 fi
+if [[ "${SWALLOW_UI_FCM_GRANT_ADMIN_FIXTURE:-false}" == true ]]; then
+ "$pgbin/psql" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_fcm_review_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_fcm_review_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_fcm_review_grant_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_review_grant_audit_read(text,text,text,text,bigint,uuid) TO ui_channel_results_fixture;
+INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES ('https://issuer.test','ui-target','console','ui-fixture-env');
+INSERT INTO public.novu_rust_operator_jwt_fcm_review_grant_admins VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env',true,true);
+INSERT INTO public.novu_rust_operator_jwt_fcm_review_grant_audit_viewers VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
+SQL
+fi
 node --input-type=module - "$root" "$testdir" <<'JS'
 import {readFile,writeFile} from 'node:fs/promises';
 import {SignJWT,importPKCS8} from './node_modules/jose/dist/webapi/index.js';
