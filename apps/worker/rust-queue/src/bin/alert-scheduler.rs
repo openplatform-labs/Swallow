@@ -65,6 +65,18 @@ async fn run(stop: novu_postgres_queue::shutdown::Stop) -> Result<()> {
         Ok(mode) if mode == "exit" => true,
         _ => return Err("invalid scheduler failure mode".into()),
     };
+    let run_timeout = match std::env::var("SWALLOW_ALERT_SCHEDULER_RUN_TIMEOUT_SECONDS") {
+        Err(std::env::VarError::NotPresent) => None,
+        Ok(value) if value == "0" => None,
+        Ok(value) => Some(Duration::from_secs(
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|n| (1..=86400).contains(n))
+                .ok_or("invalid scheduler run timeout")?,
+        )),
+        Err(_) => return Err("invalid scheduler run timeout".into()),
+    };
     let mut binary = std::env::current_exe()?;
     binary.set_file_name(format!("alert-fanout{}", std::env::consts::EXE_SUFFIX));
     while !stop.requested() {
@@ -85,13 +97,30 @@ async fn run(stop: novu_postgres_queue::shutdown::Stop) -> Result<()> {
                     group,
                     finished: false,
                 };
-                child.wait().await
+                match run_timeout {
+                    Some(limit) => match tokio::time::timeout(limit, child.wait()).await {
+                        Ok(status) => (Some(status), false),
+                        Err(_) => {
+                            // Dropping this guard kills the private process group. The
+                            // provider may have accepted a request before termination.
+                            drop(child);
+                            (None, true)
+                        }
+                    },
+                    None => (Some(child.wait().await), false),
+                }
             }
-            Err(error) => Err(error),
+            Err(error) => (Some(Err(error)), false),
         };
         match status {
-            Ok(status) if status.success() => println!("alert scheduler: completed"),
-            Ok(status) if status.code() == Some(2) => {
+            (None, true) => {
+                eprintln!("alert scheduler: run timed out; delivery outcome unknown");
+                if exit_on_failure {
+                    return Err("alert scheduler run timed out".into());
+                }
+            }
+            (Some(Ok(status)), false) if status.success() => println!("alert scheduler: completed"),
+            (Some(Ok(status)), false) if status.code() == Some(2) => {
                 eprintln!("alert scheduler: attention required")
             }
             _ => {

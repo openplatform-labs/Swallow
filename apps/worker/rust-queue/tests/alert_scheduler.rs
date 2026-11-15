@@ -485,3 +485,205 @@ async fn forced_scheduler_shutdown_recovers_uncertain_send_without_resending() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn run_timeout_stops_fanout_tree_and_can_resume_or_exit() {
+    let dir = std::env::temp_dir().join(format!("swallow-scheduler-timeout-{}", Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let scheduler = dir.join("alert-scheduler");
+    std::fs::copy(env!("CARGO_BIN_EXE_alert-scheduler"), &scheduler).unwrap();
+    let fanout = dir.join("alert-fanout");
+    std::fs::write(&fanout,"#!/bin/sh\necho start >> \"$SCHEDULER_TEST_LOG\"\n(sleep 4; echo escaped >> \"$SCHEDULER_TEST_LOG\") &\nwait\n").unwrap();
+    std::fs::set_permissions(&fanout, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let log = dir.join("log");
+    let output = dir.join("output");
+    let mut child = Command::new(&scheduler)
+        .args(["1", "delivery", "env", "1", "2", "3", "config"])
+        .env("SCHEDULER_TEST_LOG", &log)
+        .env("SWALLOW_ALERT_SCHEDULER_RUN_TIMEOUT_SECONDS", "1")
+        .env("SWALLOW_ALERT_SCHEDULER_FAILURE_MODE", "continue")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(&output).unwrap()))
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .matches("start")
+        .count()
+        < 2
+    {
+        assert!(
+            Instant::now() < deadline,
+            "scheduler did not resume after timeout"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(child.wait().unwrap().success());
+    thread::sleep(Duration::from_secs(4));
+    assert!(
+        !std::fs::read_to_string(&log).unwrap().contains("escaped"),
+        "a fanout descendant survived"
+    );
+    assert!(
+        std::fs::read_to_string(&output)
+            .unwrap()
+            .contains("run timed out; delivery outcome unknown")
+    );
+    let exited = Command::new(&scheduler)
+        .args(["1", "delivery", "env", "1", "2", "3", "config"])
+        .env("SCHEDULER_TEST_LOG", &log)
+        .env("SWALLOW_ALERT_SCHEDULER_RUN_TIMEOUT_SECONDS", "1")
+        .env("SWALLOW_ALERT_SCHEDULER_FAILURE_MODE", "exit")
+        .output()
+        .unwrap();
+    assert!(!exited.status.success());
+    assert!(String::from_utf8_lossy(&exited.stderr).contains("run timed out"));
+    for invalid in ["-1", "86401", "invalid"] {
+        let result = Command::new(&scheduler)
+            .args(["1", "delivery", "env", "1", "2", "3", "config"])
+            .env("SWALLOW_ALERT_SCHEDULER_RUN_TIMEOUT_SECONDS", invalid)
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn timeout_bounds_actual_fanout_waiting_on_config_fifo() {
+    let dir = std::env::temp_dir().join(format!("swallow-scheduler-fifo-{}", Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let fifo = dir.join("targets.fifo");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let result = Command::new(env!("CARGO_BIN_EXE_alert-scheduler"))
+        .args(["1", "delivery", "env", "1", "2", "3"])
+        .arg(&fifo)
+        .env("SWALLOW_ALERT_FANOUT_CONFIG_REGULAR_ONLY", "false")
+        .env("SWALLOW_ALERT_SCHEDULER_RUN_TIMEOUT_SECONDS", "1")
+        .env("SWALLOW_ALERT_SCHEDULER_FAILURE_MODE", "exit")
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("run timed out; delivery outcome unknown")
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires fully migrated disposable PostgreSQL"]
+async fn scheduler_timeout_recovers_uncertain_send_without_resending() {
+    use std::net::TcpListener;
+    let url = std::env::var("TEST_DATABASE_URL").unwrap();
+    let (db, driver) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    let env = format!("sched-stop-{}", Uuid::new_v4().simple());
+    db.execute(
+        "INSERT INTO novu_rust_environments VALUES ($1,'org')",
+        &[&env],
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,rolname,'alert_send',oid FROM pg_roles WHERE rolname=session_user",&[&env]).await.unwrap();
+    let job = Uuid::new_v4();
+    novu_postgres_queue::enqueue(&db, job, &env, "fixture", &serde_json::json!({}))
+        .await
+        .unwrap();
+    db.execute("UPDATE novu_queue_jobs SET available_at=clock_timestamp()-interval '5 minutes' WHERE id=$1",&[&job]).await.unwrap();
+    let dir = std::env::temp_dir().join(format!("swallow-scheduler-stop-{}", Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let webhook = dir.join("webhook");
+    let config = dir.join("config.json");
+    std::fs::write(&webhook, "https://hooks.slack.com/services/A/B/C").unwrap();
+    std::fs::write(
+        &config,
+        serde_json::to_vec(
+            &serde_json::json!({"targets":[{"channel":"slack","id":"ops","webhook_file":webhook}]}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let proxy = format!("http://{}", listener.local_addr().unwrap());
+    let configure = |cmd: &mut Command| {
+        cmd.env("DATABASE_URL", &url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
+            .env("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS", "60")
+            .env("SWALLOW_ALERT_OPERATION_TIMEOUT_SECONDS", "30")
+            .env("HTTPS_PROXY", &proxy)
+            .env("https_proxy", &proxy)
+            .env("NO_PROXY", "")
+            .env("no_proxy", "")
+            .env_remove("SWALLOW_ALERT_CHECK_SCOPED_ACCESS")
+            .env_remove("SWALLOW_ALERT_SCOPED_DELIVERY")
+            .env_remove("SWALLOW_ALERT_COOLDOWN_POLICY")
+            .env_remove("SWALLOW_ALERT_BINDING_KEY")
+            .env_remove("SWALLOW_ALERT_BINDING_KEY_FILE");
+    };
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_alert-scheduler"));
+    cmd.args(["1", "delivery", &env, "300", "120", "60"])
+        .arg(&config)
+        .env("SWALLOW_ALERT_SCHEDULER_RUN_TIMEOUT_SECONDS", "3")
+        .env("SWALLOW_ALERT_SCHEDULER_FAILURE_MODE", "exit")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    configure(&mut cmd);
+    let mut scheduler = cmd.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let socket = loop {
+        match listener.accept() {
+            Ok((socket, _)) => break socket,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "alert did not connect");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => panic!("proxy {e}"),
+        }
+    };
+    let state:String=db.query_one("SELECT state FROM novu_rust_alert_delivery_slots WHERE environment_id=$1 AND channel='slack' AND target_id='ops'",&[&env]).await.unwrap().get(0);
+    assert_eq!(state, "dispatching");
+    // Timeout ends the scheduler after it has reserved the external send.
+    assert!(!scheduler.wait().unwrap().success());
+    drop(socket);
+    db.execute("UPDATE novu_rust_alert_delivery_slots SET lease_until=clock_timestamp()-interval '1 second' WHERE environment_id=$1 AND channel='slack' AND target_id='ops'",&[&env]).await.unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_alert-fanout"));
+    cmd.args(["delivery", &env, "300", "120", "60"])
+        .arg(&config);
+    configure(&mut cmd);
+    let out = cmd.output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let state:String=db.query_one("SELECT state FROM novu_rust_alert_delivery_slots WHERE environment_id=$1 AND channel='slack' AND target_id='ops'",&[&env]).await.unwrap().get(0);
+    assert_eq!(state, "unknown");
+    let attempts:i64=db.query_one("SELECT count(*) FROM novu_rust_alert_delivery_attempts WHERE environment_id=$1 AND channel='slack' AND target_id='ops'",&[&env]).await.unwrap().get(0);
+    assert_eq!(attempts, 1);
+    assert!(
+        matches!(listener.accept(),Err(e) if e.kind()==std::io::ErrorKind::WouldBlock),
+        "unexpected second connection"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
