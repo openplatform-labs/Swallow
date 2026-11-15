@@ -354,3 +354,10 @@ The settings permission panel supports the Discord review list and review grants
 Angular 테스트 253개와 빌드가 통과했다. `scripts/test-discord-retry-diagnostics-browser.sh`는 격리 Docker PostgreSQL, 제한 API 로그인과 테스트 JWT를 사용해 실제 브라우저에서 집계, 전체·지연 필터, payload 비노출과 권한 없는 사용자의 거절을 확인한다. 실제 외부 IdP, Discord 발송 및 운영 HA는 검증하지 않았다. 기존 번들·CSS 예산 경고가 남아 있다.
 
 권한 위임을 추가한 Angular 테스트 254개와 빌드가 통과했다. 제한 DB 로그인·테스트 JWT·Docker PostgreSQL API 테스트에서 두 권한의 독립 부여·회수와 감사 실패 롤백을 확인했다. `scripts/test-discord-retry-grants-browser.sh`의 기본 모드는 Docker PostgreSQL이며, 이번 브라우저–API 시험은 Docker Desktop 시작 불가로 `SWALLOW_TEST_POSTGRES_MODE=local`을 지정해 임시 로컬 PostgreSQL 17에서 실행했다. 두 권한 부여, 위임 감사, 대상의 진단 조회, 집계 권한 회수와 목록 권한 유지를 확인했다. 로컬 모드는 `initdb`, `pg_ctl`, `psql`이 필요하다. 외부 IdP와 운영 HA는 미검증이다.
+
+
+### Discord 429 재시도 정책
+
+설정 화면에서 대상 ID별 `off`, `known`, `fallback` 모드와 최대 횟수, 대체 대기 시간을 선택하고 조회·변경·요청 확인·JWT 변경 감사를 할 수 있다. API 0125와 워커 0211, 대상별 JWT 및 API DB 로그인 권한이 각각 필요하며 JWT 권한 위임 화면은 아직 없다. 변경 전 대상 워커를 중지하고 진행 중인 발송을 정리한 다음 변경하고 동일 설정으로 재시작한다. API는 워커 롤아웃을 조정하거나 이미 진행 중인 발송을 취소하지 않는다. `fallback`은 제공자의 준비 전에 재시도할 수 있다.
+
+변경은 먼저 요청을 준비하고 별도 확인 후 제출한다. 응답 불명 시 원래 토큰·환경·대상·주소로 동일 요청 ID를 재제출하거나 기록을 확인한다. 요청 정보는 메모리에만 보관된다. 변경 없는 요청도 감사되며 revision은 그대로다. 감사는 UUID 순서이고 단일 스냅샷이 아니다. Angular 테스트 258건과 빌드가 통과했고 브라우저에서 화면 표시를 확인했다. 이번 화면과 실제 API의 브라우저 종단 간 검증, 실제 Discord·외부 IdP·운영 HA는 미검증이다. 번들·CSS 크기 경고가 남아 있다. 자세한 권한과 배포 절차는 [API README](../../api/rust-api/README.md)와 [워커 README](../../worker/rust-queue/README.md)를 참고한다.
