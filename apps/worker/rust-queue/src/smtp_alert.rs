@@ -234,11 +234,28 @@ impl SmtpAlert {
             || email.subject.len() > 998
             || email.html.len() > 1_048_576
             || email.text.as_ref().is_some_and(|v| v.len() > 1_048_576)
-            || !email.alternatives.is_empty()
+            || email.alternatives.len() > 10
             || !email.custom_data.is_empty()
             || email.ip_pool_name.is_some()
         {
             return Err(());
+        }
+        let mut alternative_size = 0usize;
+        let mut alternatives = Vec::with_capacity(email.alternatives.len());
+        for alternative in &email.alternatives {
+            alternative_size = alternative_size.checked_add(alternative.content.len()).ok_or(())?;
+            if alternative_size > 1_048_576
+                || alternative.content_type.len() > 255
+                || alternative.content_type.chars().any(char::is_control)
+                || alternative.content_type.to_ascii_lowercase().starts_with("multipart/")
+                || alternative.content_type.to_ascii_lowercase().starts_with("message/")
+            {
+                return Err(());
+            }
+            let content_type = ContentType::parse(&alternative.content_type).map_err(|_| ())?;
+            alternatives.push(
+                SinglePart::builder().header(content_type).body(alternative.content.clone()),
+            );
         }
         let from = address(
             email
@@ -365,7 +382,7 @@ impl SmtpAlert {
                 _ => return Err(()),
             }
         }
-        if email.attachments.is_empty() {
+        if email.attachments.is_empty() && alternatives.is_empty() {
             return match &email.text {
                 Some(text) => builder
                     .multipart(
@@ -380,16 +397,31 @@ impl SmtpAlert {
                     .map_err(|_| ()),
             };
         }
+        if email.attachments.is_empty() {
+            let mut parts = MultiPart::alternative().build();
+            if let Some(text) = &email.text {
+                parts = parts.singlepart(SinglePart::plain(text.clone()));
+            }
+            parts = parts.singlepart(SinglePart::html(email.html.clone()));
+            for part in alternatives {
+                parts = parts.singlepart(part);
+            }
+            return builder.multipart(parts).map_err(|_| ());
+        }
         let mut related = MultiPart::related().singlepart(SinglePart::html(email.html.clone()));
         for part in inline {
             related = related.singlepart(part);
         }
-        let mut mixed = if let Some(text) = &email.text {
-            MultiPart::mixed().multipart(
-                MultiPart::alternative()
-                    .singlepart(SinglePart::plain(text.clone()))
-                    .multipart(related),
-            )
+        let mut mixed = if email.text.is_some() || !alternatives.is_empty() {
+            let mut parts = MultiPart::alternative().build();
+            if let Some(text) = &email.text {
+                parts = parts.singlepart(SinglePart::plain(text.clone()));
+            }
+            parts = parts.multipart(related);
+            for part in alternatives {
+                parts = parts.singlepart(part);
+            }
+            MultiPart::mixed().multipart(parts)
         } else {
             MultiPart::mixed().multipart(related)
         };
@@ -637,6 +669,17 @@ mod tests {
         );
         assert!(!wrong_host_server.wait().unwrap().success());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn workflow_alternatives_support_calendar_and_reject_invalid_parts() {
+        let provider = SmtpAlert::test_transport("127.0.0.1".into(), 25);
+        let mut email = crate::sendgrid::Email { to:vec!["to@example.test".into()], subject:"meeting".into(), html:"<p>meeting</p>".into(), text:Some("meeting".into()), ..Default::default() };
+        email.alternatives.push(crate::sendgrid::Alternative{content_type:"text/calendar; method=REQUEST; charset=utf-8".into(),content:"BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n".into()});
+        let wire=String::from_utf8(provider.prepare_workflow(&email).unwrap().formatted()).unwrap();
+        assert!(wire.contains("multipart/alternative"));assert!(wire.contains("text/calendar"));assert!(wire.contains("BEGIN:VCALENDAR"));
+        email.alternatives[0].content_type="multipart/mixed; boundary=x".into();assert!(provider.prepare_workflow(&email).is_err());
+        email.alternatives[0].content_type="text/plain\r\nBcc: victim".into();assert!(provider.prepare_workflow(&email).is_err());
+        email.alternatives[0].content_type="text/calendar".into();email.alternatives[0].content="x".repeat(1_048_577);assert!(provider.prepare_workflow(&email).is_err());
     }
     #[test]
     fn workflow_messages_keep_bcc_out_of_headers_and_reject_unsupported_fields() {

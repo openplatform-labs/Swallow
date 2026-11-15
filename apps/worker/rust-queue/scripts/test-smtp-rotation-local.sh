@@ -21,3 +21,4 @@ cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test smtp_ca_retentio
 cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test alert_conditions_v3 -- --ignored
 cargo test --locked --manifest-path "$WORKER/Cargo.toml" --lib v3_smtp_credentials_send_and_recur_after_observed_recovery -- --ignored
 cargo test --locked --manifest-path "$WORKER/Cargo.toml" --lib smtp_ca_health_reaches_slack_and_email
+cargo test --locked --manifest-path "$WORKER/Cargo.toml" --lib workflow_alternatives_support_calendar_and_reject_invalid_parts

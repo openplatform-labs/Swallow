@@ -85,6 +85,9 @@ async fn worker_sends_once_and_recovers_expired_attempts() {
     queue::enqueue(&db,trigger,&env,queue::in_app::JOB_KIND,&json!({"workflow":"smtp-fixture","transactionId":"smtp-fixture-tx","content":"","payload":{},"recipients":[{"subscriberId":"alice"}],"recipientIdentitySnapshot":{"alice":"64a000000000000000000054"},"emailAttachments":[{"file":[104,101,108,108,111],"name":"report.txt","mime":"text/plain"},{"file":[0,1,255],"name":"logo.png","mime":"image/png","cid":"logo"}],"severityOverride":null})).await.unwrap();
     assert!(queue::in_app::process_one(&mut db).await.unwrap());
     let job:Uuid=db.query_one("SELECT email_job_id FROM public.novu_rust_email_step_outcomes WHERE environment_id=$1 AND transaction_id='smtp-fixture-tx'",&[&env]).await.unwrap().get(0);
+    // The experimental trigger does not yet expose alternatives; inject the
+    // supported queue field to exercise the actual workflow delivery worker.
+    db.execute("UPDATE public.novu_queue_jobs SET payload=jsonb_set(payload,'{alternatives}',$2::jsonb,true) WHERE id=$1",&[&job,&json!([{"content_type":"text/calendar; method=REQUEST; charset=utf-8","content":"BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n"}])]).await.unwrap();
     assert_eq!(
         db.query_one(
             "SELECT kind FROM public.novu_queue_jobs WHERE id=$1",
@@ -151,7 +154,7 @@ async fn worker_sends_once_and_recovers_expired_attempts() {
     assert!(body.contains("workflow fixture"));
     assert!(body.contains("Hello SMTP"));
     assert!(!body.contains("fixture-password"));
-    let parsed = Command::new("python3").arg("-c").arg(r#"import sys,email; m=email.message_from_binary_file(open(sys.argv[1],"rb")); p=[x for x in m.walk() if x.get_filename()]; assert len(p)==2; assert p[0].get("Content-ID")=="<logo>" and p[0].get_payload(decode=True)==bytes([0,1,255]); assert p[1].get_filename()=="report.txt" and p[1].get_payload(decode=True)==b"hello""#).arg(&output).status().unwrap();
+    let parsed = Command::new("python3").arg("-c").arg(r#"import sys,email; m=email.message_from_binary_file(open(sys.argv[1],"rb")); p=[x for x in m.walk() if x.get_filename()]; assert len(p)==2; assert p[0].get("Content-ID")=="<logo>" and p[0].get_payload(decode=True)==bytes([0,1,255]); assert p[1].get_filename()=="report.txt" and p[1].get_payload(decode=True)==b"hello"; c=[x for x in m.walk() if x.get_content_type()=="text/calendar"]; assert len(c)==1 and c[0].get_param("method")=="REQUEST" and b"BEGIN:VCALENDAR" in c[0].get_payload(decode=True)"#).arg(&output).status().unwrap();
     assert!(parsed.success());
     let mut stale_failed = false;
     for _ in 0..100 {
