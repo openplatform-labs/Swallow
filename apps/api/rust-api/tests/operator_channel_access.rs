@@ -243,4 +243,89 @@ async fn delegated_channel_access_is_scoped_audited_and_idempotent() {
     assert!(blocked);
     tx.commit().await.unwrap();
     assert_eq!(pending.await.unwrap(), StatusCode::UNAUTHORIZED);
+    // A separately provisioned operator can administer only one provider.
+    db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES ('https://issuer.test','scoped','console','channel-a'); INSERT INTO public.novu_rust_operator_jwt_channel_access_grant_scopes VALUES ('https://issuer.test','scoped','console','channel-a','sendgrid',true,false)").await.unwrap();
+    let scoped = jwt("scoped");
+    assert_eq!(
+        response(app.clone(), &scoped, "GET", &list_path, None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let twilio_path = list_path.replace("resource=sendgrid", "resource=twilio");
+    assert_eq!(
+        response(app.clone(), &scoped, "GET", &twilio_path, None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let id = Uuid::new_v4();
+    let body = json!({"requestId":id,"targetIssuer":"https://issuer.test","targetSubject":"target","targetClientId":"console","resource":"sendgrid","permission":"result","expected":true,"desired":false,"reason":"scoped change"});
+    assert_eq!(
+        response(app.clone(), &scoped, "PUT", path, Some(body.clone()))
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    db.execute("UPDATE public.novu_rust_operator_jwt_channel_access_grant_scopes SET can_write=true WHERE subject='scoped' AND resource='sendgrid'",&[]).await.unwrap();
+    let forbidden = json!({"requestId":Uuid::new_v4(),"targetIssuer":"https://issuer.test","targetSubject":"target","targetClientId":"console","resource":"twilio","permission":"result","expected":true,"desired":false,"reason":"outside scope"});
+    assert_eq!(
+        response(app.clone(), &scoped, "PUT", path, Some(forbidden))
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        response(app.clone(), &scoped, "PUT", path, Some(body))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let receipt = format!(
+        "/v1/experimental/operator/channel-access-grants/request?environmentId=channel-a&requestId={id}"
+    );
+    assert_eq!(
+        response(app.clone(), &scoped, "GET", &receipt, None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        response(app.clone(), &scoped, "GET", audit, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    db.batch_execute("UPDATE public.novu_rust_operator_jwt_channel_access_grant_scopes SET can_write=false WHERE subject='scoped' AND resource='sendgrid'; INSERT INTO public.novu_rust_operator_jwt_channel_access_grant_scopes VALUES ('https://issuer.test','scoped','console','channel-a','slack',false,true)").await.unwrap();
+    assert_eq!(
+        response(app.clone(), &scoped, "GET", &receipt, None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let other_receipt = format!(
+        "/v1/experimental/operator/channel-access-grants/request?environmentId=channel-a&requestId={}",
+        Uuid::new_v4()
+    );
+    assert_eq!(
+        response(app.clone(), &scoped, "GET", &other_receipt, None)
+            .await
+            .1["found"],
+        false
+    );
+    let mut revoker = connect(&url).await;
+    let tx = revoker.transaction().await.unwrap();
+    tx.execute("DELETE FROM public.novu_rust_operator_jwt_channel_access_grant_scopes WHERE subject='scoped' AND resource='sendgrid'",&[]).await.unwrap();
+    let pending = tokio::spawn({
+        let app = app.clone();
+        let token = scoped.clone();
+        let path = list_path.clone();
+        async move { response(app, &token, "GET", &path, None).await.0 }
+    });
+    let mut blocked = false;
+    for _ in 0..100 {
+        if db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%novu_rust_operator_jwt_channel_access_grant_read%')",&[]).await.unwrap().get::<_,bool>(0){blocked=true;break;}
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(blocked);
+    tx.commit().await.unwrap();
+    assert_eq!(pending.await.unwrap(), StatusCode::UNAUTHORIZED);
 }

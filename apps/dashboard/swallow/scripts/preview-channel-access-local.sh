@@ -28,7 +28,7 @@ GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_channel_access_grant_rea
 INSERT INTO public.novu_rust_environments VALUES ('ui-fixture-env','org');
 INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_catalog.pg_roles WHERE rolname='ui_channel_fixture';
 INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env'),('https://issuer.test','target-fixture','console','ui-fixture-env');
-INSERT INTO public.novu_rust_operator_jwt_channel_access_grant_admins VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env',true,true);
+INSERT INTO public.novu_rust_operator_jwt_channel_access_grant_scopes VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env','sendgrid',true,true);
 INSERT INTO public.novu_rust_operator_jwt_channel_access_grant_audit_viewers VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
 SQL
 node --input-type=module - "$root" "$testdir" <<'JS'
