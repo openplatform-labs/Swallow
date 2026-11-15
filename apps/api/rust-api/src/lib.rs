@@ -92,6 +92,7 @@ pub struct RuntimeConfig {
     require_jwt_exp: bool,
     reassert_fcm_registration: bool,
     operator_verifier: Option<Arc<operator_access_token::AccessTokenVerifier>>,
+    operator_reload: Option<(std::path::PathBuf, std::time::Duration, bool)>,
 }
 impl RuntimeConfig {
     pub fn from_env() -> Self {
@@ -231,7 +232,27 @@ impl RuntimeConfig {
         {
             return Err(invalid());
         }
-        let operator_config = novu_rust_contracts::secret::from_env("SWALLOW_OPERATOR_JWT_CONFIG", "SWALLOW_OPERATOR_JWT_CONFIG_FILE").map_err(|_| invalid())?;
+        let reload_interval = match std::env::var("SWALLOW_OPERATOR_JWT_RELOAD_SECONDS") {
+            Ok(value) => Some(std::time::Duration::from_secs(value.parse::<u64>().ok().filter(|n| (1..=300).contains(n)).ok_or_else(invalid)?)),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(_) => return Err(invalid()),
+        };
+        let reload_reject = match std::env::var("SWALLOW_OPERATOR_JWT_RELOAD_FAILURE").as_deref() {
+            Ok("reject") if reload_interval.is_some() => true,
+            Ok("retain") if reload_interval.is_some() => false,
+            Err(std::env::VarError::NotPresent) => false,
+            _ => return Err(invalid()),
+        };
+        let operator_reload = if let Some(interval) = reload_interval {
+            if std::env::var_os("SWALLOW_OPERATOR_JWT_CONFIG").is_some() { return Err(invalid()); }
+            let path = std::env::var_os("SWALLOW_OPERATOR_JWT_CONFIG_FILE").ok_or_else(invalid)?;
+            Some((std::path::PathBuf::from(path), interval, reload_reject))
+        } else { None };
+        let operator_config = if let Some((path,_,_)) = &operator_reload {
+            Some(novu_rust_contracts::secret::read_regular_file(path).map_err(|_| invalid())?)
+        } else {
+            novu_rust_contracts::secret::from_env("SWALLOW_OPERATOR_JWT_CONFIG", "SWALLOW_OPERATOR_JWT_CONFIG_FILE").map_err(|_| invalid())?
+        };
         let introspection = operator_introspection::Introspection::from_env().map_err(|_| invalid())?;
         if introspection.is_some() && operator_config.is_none() { return Err(invalid()); }
         let operator_verifier = operator_config.map(|value| {
@@ -247,8 +268,27 @@ impl RuntimeConfig {
             require_jwt_exp,
             reassert_fcm_registration,
             operator_verifier,
+            operator_reload,
         })
     }
+    /// Start a single process-local key refresh loop; callers own process lifetime.
+    pub fn start_operator_key_reload(&self) {
+        let (Some(verifier), Some((path, interval, reject))) = (&self.operator_verifier, &self.operator_reload) else { return; };
+        let verifier=verifier.clone(); let path=path.clone(); let interval=*interval; let reject=*reject;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let source=path.clone();
+                let read=tokio::task::spawn_blocking(move || novu_rust_contracts::secret::read_regular_file(&source)).await;
+                let valid=match read { Ok(Ok(value)) => verifier.reload_keys(&value).is_ok(), _ => false };
+                if !valid {
+                    if reject { verifier.reject_until_reloaded(); }
+                    eprintln!("operator signing key reload failed");
+                }
+            }
+        });
+    }
+
     pub fn router(&self, db: Arc<Client>) -> Router {
         let router = router_with_webhook_configs_and_jwt_policy(
             db,

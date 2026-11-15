@@ -469,6 +469,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         _ => return Err("invalid health endpoint setting".into()),
     };
     let runtime = novu_rust_api::RuntimeConfig::try_from_env()?;
+    runtime.start_operator_key_reload();
     let cors = cors_from_env()?;
     let shared = ApiState {
         connections: Arc::new(

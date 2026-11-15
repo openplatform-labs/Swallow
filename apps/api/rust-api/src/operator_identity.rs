@@ -105,7 +105,13 @@ async fn authenticate(
         return Err(StatusCode::UNAUTHORIZED);
     }
     let token = token.ok_or(StatusCode::UNAUTHORIZED)?;
-    let mut identity = verifier.verify(token).ok_or(StatusCode::UNAUTHORIZED)?;
+    if !verifier.is_available() { return Err(StatusCode::SERVICE_UNAVAILABLE); }
+    let mut identity = match verifier.verify(token) {
+        Some(identity) => identity,
+        None if !verifier.is_available() => return Err(StatusCode::SERVICE_UNAVAILABLE),
+        None => return Err(StatusCode::UNAUTHORIZED),
+    };
+    if !verifier.is_available() { return Err(StatusCode::SERVICE_UNAVAILABLE); }
     if verifier.checks_token_revocation() {
         let hash = |s: &str| ring::digest::digest(&ring::digest::SHA256, s.as_bytes());
         let issuer = hash(&identity.issuer);

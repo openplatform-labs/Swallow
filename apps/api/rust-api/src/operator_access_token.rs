@@ -6,6 +6,7 @@ use rsa::{
 use serde::{Deserialize, Deserializer};
 use std::{
     collections::HashMap,
+    sync::{RwLock, atomic::{AtomicBool, Ordering}},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -55,7 +56,8 @@ fn optional_numeric<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option
 pub struct AccessTokenVerifier {
     issuer: String,
     validation: Validation,
-    keys: HashMap<String, DecodingKey>,
+    keys: RwLock<HashMap<String, DecodingKey>>,
+    accepting: AtomicBool,
     max_token_lifetime_seconds: Option<u64>,
     check_token_revocation: bool,
     audience: String,
@@ -124,13 +126,30 @@ impl AccessTokenVerifier {
         Ok(Self {
             issuer: issuer.to_owned(),
             validation,
-            keys: decoding_keys,
+            keys: RwLock::new(decoding_keys),
+            accepting: AtomicBool::new(true),
             max_token_lifetime_seconds: None,
             check_token_revocation: false,
             audience: audience.to_owned(),
             introspection: None,
         })
     }
+
+    /// Replace only signing keys; identity and authorization policy stay fixed.
+    pub fn reload_keys(&self, value: &str) -> Result<(), &'static str> {
+        let candidate = Self::from_json(value)?;
+        if candidate.issuer != self.issuer || candidate.audience != self.audience
+            || candidate.max_token_lifetime_seconds != self.max_token_lifetime_seconds
+            || candidate.check_token_revocation != self.check_token_revocation {
+            return Err("operator verifier policy changed");
+        }
+        let keys = candidate.keys.into_inner().map_err(|_| "operator key lock unavailable")?;
+        *self.keys.write().map_err(|_| "operator key lock unavailable")? = keys;
+        self.accepting.store(true, Ordering::Release);
+        Ok(())
+    }
+    pub fn reject_until_reloaded(&self) { self.accepting.store(false, Ordering::Release); }
+    pub fn is_available(&self) -> bool { self.accepting.load(Ordering::Acquire) }
 
     pub fn set_introspection(&mut self, config: crate::operator_introspection::Introspection) {
         self.introspection = Some(config);
@@ -151,7 +170,7 @@ impl AccessTokenVerifier {
     }
 
     pub fn verify(&self, token: &str) -> Option<VerifiedSubject> {
-        if token.len() > 16384 || token.is_empty() {
+        if !self.accepting.load(Ordering::Acquire) || token.len() > 16384 || token.is_empty() {
             return None;
         }
         let header = decode_header(token).ok()?;
@@ -170,8 +189,8 @@ impl AccessTokenVerifier {
         {
             return None;
         }
-        let key = self.keys.get(header.kid.as_deref()?)?;
-        let claims = decode::<AccessClaims>(token, key, &self.validation)
+        let key = self.keys.read().ok()?.get(header.kid.as_deref()?)?.clone();
+        let claims = decode::<AccessClaims>(token, &key, &self.validation)
             .ok()?
             .claims;
         let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
