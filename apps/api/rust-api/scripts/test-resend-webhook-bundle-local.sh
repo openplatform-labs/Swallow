@@ -25,3 +25,4 @@ cargo build --quiet --locked --manifest-path "$API/Cargo.toml" --bin novu-rust-a
 TEST_DATABASE_URL="$DATABASE_URL" TEST_API_BINARY="$API/target/debug/novu-rust-api" cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test resend_webhook_key_probe_alert real_resend_bundle_failure_triggers_alert_and_recovers -- --ignored
 TEST_DATABASE_URL="$DATABASE_URL" cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test operator_key_probe_alert key_probe_triggers_coordinated_alert_and_recovery -- --ignored
 TEST_DATABASE_URL="$DATABASE_URL" TEST_API_BINARY="$API/target/debug/novu-rust-api" cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test twilio_webhook_key_probe_alert -- --ignored
+TEST_DATABASE_URL="$DATABASE_URL" cargo test --locked --manifest-path "$API/Cargo.toml" --test webhook_bundle_readiness -- --ignored

@@ -1,3 +1,5 @@
+웹훅 키 파일 준비 상태 선택: Resend와 Twilio 묶음 파일을 각각 또는 함께 `/health/ready` 조건으로 선택할 수 있다. 임시 PostgreSQL과 실제 API 네 개에서 미선택·개별·동시 선택과 파일 오류·복구를 비교했고 시작 구성 오류 및 기존 웹훅·경보 회귀를 확인했다. 실패는 전체 인스턴스 준비 상태를 503으로 바꾸지만 라우팅을 직접 막지 않고 파일 검사는 웹훅 검증과 읽기 슬롯을 공유한다. 실제 로드밸런서·다중 호스트·운영 HA는 미검증이며 공급자 키 일치나 콜백 수신을 보장하지 않는다. [API README](apps/api/rust-api/README.md)를 참고한다.
+
 Twilio 웹훅 토큰 상태 감시·경보: 선택형 `/health/twilio-webhook-bundle`이 파일 상태만 반환하며 `SWALLOW_TWILIO_WEBHOOK_KEY_PROBE_URL`을 통해 Slack·메일 경보와 스케줄러에 연결한다. 검사 유형과 API 인스턴스별 고유 대상 ID가 필요하다. 실제 API·임시 PostgreSQL·제한 경보 계정·스케줄러에서 파일 오류·복구와 불명 경보의 중복 억제를 검증하고 모의 Slack·Resend 본문을 확인했다. 실제 Twilio·공급자 경보 수신 및 다중 호스트 HA는 미검증이다. 파일 상태는 공급자 토큰 일치나 이벤트 수신을 증명하지 않는다. [API README](apps/api/rust-api/README.md)와 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
 Twilio 웹훅 토큰 선택형 재읽기: `NOVU_TWILIO_WEBHOOK_TOKEN_BUNDLE_FILE`의 현재·이전 토큰을 요청 서명 확인 직전에 읽는다. 기존 토큰 소스와 혼용할 수 없고 누락·잘못된 값·포화·2초 초과는 503이다. 임시 PostgreSQL·합성 서명에서 토큰 중첩·폐기·오류·복구를 확인했고 시작 설정 시험 6건 및 기존 Resend 키·경보 회귀를 수행했다. 파일 읽기가 멈추면 타임아웃 이후에도 슬롯을 점유하고 실제 Twilio 회전·재전송·운영 HA는 미검증이다. 파일 상태 감시·경보는 위 최신 항목을 참고한다. [API README](apps/api/rust-api/README.md)를 참고한다.

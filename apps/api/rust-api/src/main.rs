@@ -56,6 +56,7 @@ struct ApiState {
     ready_require_writable: bool,
     ready_require_all: bool,
     ready_operator_keys: Option<novu_rust_api::RuntimeConfig>,
+    ready_webhook_bundles: Option<(novu_rust_api::RuntimeConfig,bool,bool)>,
     route_require_writable: bool,
     timeout: Duration,
     request_timeout: Option<Duration>,
@@ -271,6 +272,13 @@ async fn ready(State(shared): State<ApiState>) -> Response {
     if let Some(runtime) = &shared.ready_operator_keys {
         ready &= runtime.operator_key_reload_healthy() == Some(true);
     }
+    if ready {
+        if let Some((runtime,resend,twilio))=&shared.ready_webhook_bundles {
+            let (resend_ok,twilio_ok)=tokio::join!(async { !resend || runtime.resend_bundle_healthy().await }, async { !twilio || runtime.twilio_bundle_healthy().await });
+            ready &= resend_ok && twilio_ok;
+        }
+    }
+    ready &= !shared.draining.load(Ordering::Acquire);
     let status = if ready {
         StatusCode::OK
     } else {
@@ -500,6 +508,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok("true")=>true,Ok("false")|Err(std::env::VarError::NotPresent)=>false,_=>return Err("invalid Twilio webhook bundle health setting".into()),
     };
     if twilio_bundle_health && (!health_endpoints || !runtime.twilio_bundle_reload_enabled()) {return Err("Twilio webhook bundle health requires health endpoints and bundle reload".into());}
+    let ready_require_resend_bundle=match std::env::var("SWALLOW_API_READY_REQUIRE_RESEND_WEBHOOK_BUNDLE").as_deref() {
+        Ok("true")=>true,Ok("false")|Err(std::env::VarError::NotPresent)=>false,_=>return Err("invalid Resend webhook bundle readiness setting".into()),
+    };
+    let ready_require_twilio_bundle=match std::env::var("SWALLOW_API_READY_REQUIRE_TWILIO_WEBHOOK_BUNDLE").as_deref() {
+        Ok("true")=>true,Ok("false")|Err(std::env::VarError::NotPresent)=>false,_=>return Err("invalid Twilio webhook bundle readiness setting".into()),
+    };
+    if (ready_require_resend_bundle && (!health_endpoints || !runtime.resend_bundle_reload_enabled())) || (ready_require_twilio_bundle && (!health_endpoints || !runtime.twilio_bundle_reload_enabled())) {
+        return Err("webhook bundle readiness requires health endpoints and the selected bundle reload".into());
+    }
     runtime.start_operator_key_reload();
     let cors = cors_from_env()?;
     let shared = ApiState {
@@ -517,6 +534,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         ready_require_writable,
         ready_require_all,
         ready_operator_keys: ready_require_operator_keys.then(|| runtime.clone()),
+        ready_webhook_bundles: (ready_require_resend_bundle||ready_require_twilio_bundle).then(|| (runtime.clone(),ready_require_resend_bundle,ready_require_twilio_bundle)),
         route_require_writable,
         timeout,
         request_timeout,
