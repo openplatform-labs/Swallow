@@ -74,6 +74,7 @@ async fn credential_health_tracks_individual_workers_and_permissions() {
         include_str!("../migrations/0142_fcm_credential_health.sql"),
         include_str!("../migrations/0143_alert_signed_condition_masks.sql"),
         include_str!("../migrations/0144_fcm_heartbeat_session_identity.sql"),
+        include_str!("../migrations/0145_fcm_credential_health_retention.sql"),
     ] {
         db.batch_execute(sql).await.unwrap();
     }
@@ -184,6 +185,153 @@ async fn credential_health_tracks_individual_workers_and_permissions() {
             .query_one("SELECT * FROM public.novu_rust_fcm_credential_health", &[])
             .await
             .is_err()
+    );
+    db.batch_execute("CREATE ROLE fcm_health_retention LOGIN; GRANT USAGE ON SCHEMA public TO fcm_health_retention; GRANT EXECUTE ON FUNCTION public.novu_rust_prune_fcm_credential_health(text,integer,integer) TO fcm_health_retention; INSERT INTO public.novu_rust_fcm_health_retention_operators SELECT 'env-b',rolname,oid FROM pg_roles WHERE rolname='fcm_health_retention'").await.unwrap();
+    let retention_url = url.replace("postgres@", "fcm_health_retention@");
+    let (retention, retention_driver) = tokio_postgres::connect(&retention_url, NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = retention_driver.await;
+    });
+    db.batch_execute("CREATE ROLE fcm_retention_owner NOLOGIN; GRANT USAGE ON SCHEMA public TO fcm_retention_owner; GRANT SELECT,UPDATE ON public.novu_rust_fcm_health_retention_operators TO fcm_retention_owner; GRANT SELECT,UPDATE,DELETE ON public.novu_rust_fcm_credential_health TO fcm_retention_owner; ALTER FUNCTION public.novu_rust_prune_fcm_credential_health(text,integer,integer) OWNER TO fcm_retention_owner").await.unwrap();
+    assert!(
+        retention
+            .query_one(
+                "SELECT public.novu_rust_prune_fcm_credential_health('env-b',86401,1)",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    db.batch_execute("GRANT pg_read_all_stats TO fcm_retention_owner")
+        .await
+        .unwrap();
+    let old_one = uuid::Uuid::new_v4();
+    let old_two = uuid::Uuid::new_v4();
+    let recent = uuid::Uuid::new_v4();
+    let other_environment = uuid::Uuid::new_v4();
+    for (environment, instance, age) in [
+        ("env-b", old_one, 172800_i32),
+        ("env-b", old_two, 172800),
+        ("env-b", recent, 30),
+        ("env-a", other_environment, 172800),
+    ] {
+        db.execute("INSERT INTO public.novu_rust_fcm_credential_health VALUES ($1,$2,'fixture',-1,clock_timestamp()-interval '3 days','unhealthy',clock_timestamp()-($3::integer)*interval '1 second')", &[&environment,&instance,&age]).await.unwrap();
+    }
+    db.execute("UPDATE public.novu_rust_fcm_credential_health SET observed_at=clock_timestamp()-interval '2 days' WHERE environment_id='env-b' AND instance_id=$1", &[&id]).await.unwrap();
+    assert!(
+        retention
+            .query_one(
+                "SELECT public.novu_rust_prune_fcm_credential_health('env-a',86401,1)",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        retention
+            .query_one(
+                "SELECT public.novu_rust_prune_fcm_credential_health('env-b',86400,1)",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        retention
+            .query_one(
+                "SELECT public.novu_rust_prune_fcm_credential_health('env-b',86401,1001)",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        retention
+            .query_one("SELECT * FROM public.novu_rust_fcm_credential_health", &[])
+            .await
+            .is_err()
+    );
+    let (mut blocker, blocker_driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = blocker_driver.await;
+    });
+    let lock = blocker.transaction().await.unwrap();
+    lock.query_one("SELECT instance_id FROM public.novu_rust_fcm_credential_health WHERE environment_id='env-b' AND instance_id=$1 FOR UPDATE", &[&old_one]).await.unwrap();
+    assert_eq!(
+        retention
+            .query_one(
+                "SELECT public.novu_rust_prune_fcm_credential_health('env-b',86401,1)",
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1
+    );
+    assert_eq!(
+        retention
+            .query_one(
+                "SELECT public.novu_rust_prune_fcm_credential_health('env-b',86401,1)",
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    lock.commit().await.unwrap();
+    assert_eq!(
+        retention
+            .query_one(
+                "SELECT public.novu_rust_prune_fcm_credential_health('env-b',86401,1)",
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1
+    );
+    assert_eq!(
+        retention
+            .query_one(
+                "SELECT public.novu_rust_prune_fcm_credential_health('env-b',86401,1)",
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    for instance in [id, recent, other_environment] {
+        assert!(db.query_one("SELECT EXISTS(SELECT 1 FROM public.novu_rust_fcm_credential_health WHERE instance_id=$1)", &[&instance]).await.unwrap().get::<_, bool>(0));
+    }
+    db.execute("DELETE FROM public.novu_rust_fcm_health_retention_operators WHERE environment_id='env-b' AND database_principal='fcm_health_retention'", &[]).await.unwrap();
+    assert!(
+        retention
+            .query_one(
+                "SELECT public.novu_rust_prune_fcm_credential_health('env-b',86401,1)",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    db.execute(
+        "DELETE FROM public.novu_rust_fcm_credential_health WHERE instance_id IN ($1,$2)",
+        &[&recent, &other_environment],
+    )
+    .await
+    .unwrap();
+    assert!(
+        writer
+            .query_one(
+                "SELECT public.novu_rust_fcm_credential_heartbeat('env-b',$1,'healthy')",
+                &[&id]
+            )
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
     );
     let fixture =
         Fixture(std::env::temp_dir().join(format!("swallow-fcm-health-{}", uuid::Uuid::new_v4())));
