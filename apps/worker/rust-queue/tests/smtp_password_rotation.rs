@@ -29,6 +29,7 @@ async fn worker_pauses_for_invalid_password_and_uses_atomic_rotation() {
     .await
     .unwrap();
     db.execute("INSERT INTO public.novu_rust_smtp_credential_workers SELECT $1,rolname,oid FROM pg_roles WHERE rolname=current_user",&[&env]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_smtp_ca_workers SELECT $1,rolname,oid FROM pg_roles WHERE rolname=current_user",&[&env]).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_delivery_operator_grants SELECT $1,rolname,'alert_view',oid FROM pg_roles WHERE rolname=current_user",&[&env]).await.unwrap();
     let dir = std::env::temp_dir().join(format!("swallow-smtp-rotation-{}", Uuid::new_v4()));
     std::fs::create_dir(&dir).unwrap();
@@ -115,6 +116,7 @@ async fn worker_pauses_for_invalid_password_and_uses_atomic_rotation() {
             .env("SWALLOW_SMTP_CA_FILE", &ca)
             .env("NOVU_SMTP_RELOAD_PASSWORD", "true")
             .env("NOVU_SMTP_RELOAD_CA", "true")
+            .env("NOVU_SMTP_CA_HEALTH_ENABLED", "true")
             .env("NOVU_SMTP_CREDENTIAL_HEALTH_ENABLED", "true")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -199,6 +201,14 @@ async fn worker_pauses_for_invalid_password_and_uses_atomic_rotation() {
         .await
         .unwrap();
     assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1)), (1, 0));
+    let ca_row = db
+        .query_one(
+            "SELECT * FROM public.novu_rust_smtp_ca_health_check($1,60)",
+            &[&env],
+        )
+        .await
+        .unwrap();
+    assert_eq!((ca_row.get::<_, i64>(0), ca_row.get::<_, i64>(1)), (0, 1));
     let replacement = format!("{}\n", std::fs::read_to_string(&cert).unwrap());
     std::fs::write(dir.join("new-ca"), replacement).unwrap();
     std::fs::rename(dir.join("new-ca"), &ca).unwrap();
@@ -210,6 +220,14 @@ async fn worker_pauses_for_invalid_password_and_uses_atomic_rotation() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(dir.join("accepted-2").exists());
+    let ca_row = db
+        .query_one(
+            "SELECT * FROM public.novu_rust_smtp_ca_health_check($1,60)",
+            &[&env],
+        )
+        .await
+        .unwrap();
+    assert_eq!((ca_row.get::<_, i64>(0), ca_row.get::<_, i64>(1)), (1, 0));
     let row = db
         .query_one(
             "SELECT * FROM public.novu_rust_smtp_credential_health_check($1,60)",

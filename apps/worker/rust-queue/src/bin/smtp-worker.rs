@@ -42,6 +42,14 @@ async fn run(
         Ok("false") | Err(std::env::VarError::NotPresent) => false,
         _ => return Err("invalid SMTP credential health setting".into()),
     };
+    let ca_health = match std::env::var("NOVU_SMTP_CA_HEALTH_ENABLED").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid SMTP CA health setting".into()),
+    };
+    if ca_health && reload_ca_path.is_none() {
+        return Err("SMTP CA health requires CA reload".into());
+    }
     if credential_health && reload_path.is_none() {
         return Err("SMTP credential health requires password reload".into());
     }
@@ -121,6 +129,8 @@ async fn run(
                 let health_instance = uuid::Uuid::new_v4();
                 let mut health_previous: Option<bool> = None;
                 let mut health_next = tokio::time::Instant::now();
+                let mut ca_previous: Option<bool> = None;
+                let mut ca_next = tokio::time::Instant::now();
                 loop {
                     if stop.requested() {
                         break;
@@ -164,6 +174,20 @@ async fn run(
                         }
                         health_previous = Some(healthy);
                         health_next = tokio::time::Instant::now() + Duration::from_secs(10);
+                    }
+                    let ca_healthy = !ca_reload_failed;
+                    if ca_health && (ca_previous != Some(ca_healthy) || tokio::time::Instant::now() >= ca_next) {
+                        let state = if ca_healthy { "healthy" } else { "unhealthy" };
+                        let result = tokio::time::timeout(timeout, db.query_one(
+                            "SELECT public.novu_rust_smtp_ca_heartbeat($1,$2,$3)",
+                            &[&environment, &health_instance, &state],
+                        )).await;
+                        if !matches!(result, Ok(Ok(row)) if row.get::<_,bool>(0)) {
+                            eprintln!("SMTP CA health observation failed; reconnecting");
+                            break;
+                        }
+                        ca_previous = Some(ca_healthy);
+                        ca_next = tokio::time::Instant::now() + Duration::from_secs(10);
                     }
                     if reload_failed || ca_reload_failed {
                         eprintln!("SMTP credential or CA reload failed; dispatch paused");

@@ -1,3 +1,5 @@
+SMTP CA 상태 관측: 워커 0237과 선택형 `NOVU_SMTP_CA_HEALTH_ENABLED`는 암호와 독립적으로 CA 파일 검증 성공·실패를 DB에 기록한다. 별도 등록 워커와 환경별 조회 권한으로 `delivery-reconcile check-smtp-ca`를 제공하며 실제 워커의 오류·복구와 제한 로그인·CLI를 로컬 PostgreSQL에서 시험한다. 릴레이 연결이나 인증서 신뢰를 증명하지 않으며 Slack·이메일 경보, HTTP·UI, 상태 기록 보존 관리는 아직 미구현이다. 실제 CA·운영 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
 SMTP CA 교체: `NOVU_SMTP_RELOAD_CA=true`는 새 작업 선점 전에 CA 파일을 다시 읽고 검증한다. 잘못된 파일이면 기존 `pause` 또는 `exit` 정책을 따르며, 암호와 함께 사용할 때 둘 다 정상이어야 새 작업을 시작한다. 실제 SMTP 워커·로컬 PostgreSQL·모의 STARTTLS 릴레이에서 CA 오류 중 선점 방지, 원자적 교체 후 발송, 암호 상태의 독립성과 CA 전용 종료 정책을 검증한다. 기존 비밀번호 상태 경보는 CA 오류를 감지하지 않으며 별도 로그·프로세스·큐 감시가 필요하다. 실제 CA 교체·릴레이·다중 호스트 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
 SMTP 자격 증명 관측 정리: 워커 0236과 `delivery-reconcile prune-smtp-credentials`는 별도로 등록한 환경별 DB 로그인만 24시간보다 오래되고 연결이 종료된 관측을 최대 1000건씩 삭제하도록 한다. 현재 연결과 최근 관측을 보존하고 삭제 건수·사유·로그인 감사를 같은 트랜잭션에 저장한다. 로컬 PostgreSQL 제한 계정 시험으로 환경 격리, 유효 기간, 감사 실패 롤백, CLI와 권한 회수를 확인한다. 직접 특권 DB 접근은 우회 가능하고 감사의 외부 위변조 방지·운영 부하·다중 호스트 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
