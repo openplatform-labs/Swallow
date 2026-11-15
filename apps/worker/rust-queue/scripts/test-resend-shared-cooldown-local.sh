@@ -21,3 +21,5 @@ cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test resend_idempoten
 cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply api "$API/migrations"
 cargo test --locked --manifest-path "$WORKER/Cargo.toml" --lib shared_resend_cooldown_defers_other_jobs_and_fences_policy -- --ignored
 cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test resend_idempotency_policy workers_reject_conflicting_shared_cooldown_settings -- --ignored
+cargo test --locked --manifest-path "$WORKER/Cargo.toml" --lib resend_cooldown_has_distinct_v2_conditions_and_transports
+cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test resend_cooldown_health -- --ignored

@@ -137,6 +137,7 @@ async fn run() -> Result<()> {
         failed_checks: [false; 5],
         resend_auto: None,
         slack_cooldown: None,
+        resend_cooldown: None,
         twilio_delayed: None,
         fcm_partial: None,
         fcm_unreviewed: None,

@@ -41,3 +41,8 @@ pub async fn record(
     Ok(())
 }
 
+/// Aggregate status for a separately authorized monitoring login.
+pub async fn health(db: &tokio_postgres::Client, environment: &str, grace: i32) -> Result<serde_json::Value, Error> {
+    let row = db.query_one("SELECT active,not_before,fallback_seconds,deferred,overdue FROM public.novu_rust_resend_cooldown_health($1,$2)", &[&environment,&grace]).await?;
+    Ok(serde_json::json!({"active":row.get::<_,bool>(0),"notBefore":row.get::<_,Option<String>>(1),"fallbackSeconds":row.get::<_,i32>(2),"deferred":row.get::<_,i64>(3),"overdue":row.get::<_,i64>(4)}))
+}

@@ -188,6 +188,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     if fcm_partial_window.is_some_and(|v| !(1..=604_800).contains(&v)) || (fcm_partial_window.is_some() && on_new_condition && !conditions_v2) { return Err("FCM partial check requires a valid window and v2 conditions for new-condition policy".into()); }
     let twilio_delayed_grace=env_optional_i32("SWALLOW_ALERT_TWILIO_DELAYED_GRACE_SECONDS")?;
     if twilio_delayed_grace.is_some_and(|v| !(1..=86_400).contains(&v)) || (twilio_delayed_grace.is_some() && on_new_condition && !conditions_v2) { return Err("Twilio delayed retry check requires a valid threshold and v2 conditions for new-condition policy".into()); }
+    let resend_cooldown_grace = env_optional_i32("SWALLOW_ALERT_RESEND_COOLDOWN_GRACE_SECONDS")?;
+    if resend_cooldown_grace.is_some_and(|v| !(1..=86_400).contains(&v)) || (resend_cooldown_grace.is_some() && on_new_condition && !conditions_v2) { return Err("Resend cooldown check requires valid grace and v2 conditions for new-condition policy".into()); }
     let slack_cooldown_grace = env_optional_i32("SWALLOW_ALERT_SLACK_COOLDOWN_GRACE_SECONDS")?;
     if slack_cooldown_grace.is_some_and(|v| !(1..=86_400).contains(&v)) { return Err("invalid Slack cooldown grace".into()); }
     let resend_auto_grace = env_optional_i32("SWALLOW_ALERT_RESEND_AUTO_GRACE_SECONDS")?;
@@ -224,6 +226,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         && !failed_jobs_enabled
         && resend_auto_grace.is_none()
         && slack_cooldown_grace.is_none()
+        && resend_cooldown_grace.is_none()
         && twilio_delayed_grace.is_none()
         && fcm_partial_window.is_none()
         && !fcm_unreviewed_enabled
@@ -534,6 +537,11 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     } else {
         None
     };
+    let resend_cooldown = if let Some(grace)=resend_cooldown_grace {
+        let result=tokio::time::timeout(operation_timeout,novu_postgres_queue::resend_cooldown::health(&db,&args[0],grace)).await;
+        let values=result.ok().and_then(Result::ok).and_then(|v| Some((v["active"].as_bool()?,v["deferred"].as_u64()?,v["overdue"].as_u64()?)));
+        Some(match values {Some(value)=>Ok(value),None=>{eprintln!("Resend shared cooldown check failed");Err(())}})
+    } else {None};
     let slack_cooldown = if let Some(grace)=slack_cooldown_grace {
         let result=tokio::time::timeout(operation_timeout,novu_postgres_queue::slack_cooldown::health(&db,&args[0],grace)).await;
         let values=result.ok().and_then(Result::ok).and_then(|v| Some((v["active"].as_bool()?,v["deferred"].as_u64()?,v["overdue"].as_u64()?)));
@@ -581,6 +589,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         || failed_jobs_check_failed
         || resend_auto.is_some_and(|v| !matches!(v, Ok((0, 0, 0, 0))))
         || slack_cooldown.is_some_and(|v| !matches!(v, Ok((false,0,0))))
+        || resend_cooldown.is_some_and(|v| !matches!(v, Ok((false,0,0))))
         || twilio_delayed.is_some_and(|v| !matches!(v, Ok((0,0,0))))
         || fcm_partial.is_some_and(|v| !matches!(v, Ok(0)))
         || fcm_unreviewed.is_some_and(|v| !matches!(v, Ok(0)))
@@ -621,6 +630,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         failed_checks,
         resend_auto,
         slack_cooldown,
+        resend_cooldown,
         twilio_delayed,
         fcm_partial,
         fcm_unreviewed,
@@ -677,6 +687,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         || failed_jobs_check_failed
         || resend_auto.is_some_and(|value| value.is_err())
         || slack_cooldown.is_some_and(|value| value.is_err())
+        || resend_cooldown.is_some_and(|value| value.is_err())
         || twilio_delayed.is_some_and(|value| value.is_err())
         || fcm_partial.is_some_and(|value| value.is_err())
         || fcm_unreviewed.is_some_and(|value| value.is_err())
