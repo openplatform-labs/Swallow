@@ -182,7 +182,6 @@ impl SmtpAlert {
             || email.html.len() > 1_048_576
             || email.text.as_ref().is_some_and(|v| v.len() > 1_048_576)
             || !email.alternatives.is_empty()
-            || !email.headers.is_empty()
             || !email.custom_data.is_empty()
             || email.ip_pool_name.is_some()
         {
@@ -209,6 +208,53 @@ impl SmtpAlert {
         let mut builder = Message::builder()
             .from(Mailbox::new(name, from))
             .subject(email.subject.as_str());
+        // Keep transport, addressing and MIME fields controlled by the builder.
+        // Reject case-insensitive duplicates instead of silently overwriting one.
+        let mut header_names = std::collections::HashSet::new();
+        if email.headers.len() > 100 {
+            return Err(());
+        }
+        for (name, value) in &email.headers {
+            let lower = name.to_ascii_lowercase();
+            let reserved = matches!(
+                lower.as_str(),
+                "from"
+                    | "sender"
+                    | "reply-to"
+                    | "to"
+                    | "cc"
+                    | "bcc"
+                    | "subject"
+                    | "date"
+                    | "message-id"
+                    | "mime-version"
+                    | "received"
+                    | "return-path"
+                    | "delivered-to"
+                    | "authentication-results"
+                    | "dkim-signature"
+            ) || lower.starts_with("content-")
+                || lower.starts_with("resent-");
+            let Some(value) = value.as_str() else {
+                return Err(());
+            };
+            if reserved
+                || name.len() > 76
+                || name.is_empty()
+                || !name.bytes().all(|c| (33..=126).contains(&c) && c != b':')
+                || !header_names.insert(lower)
+                || value.len() > 4096
+                || value.chars().any(char::is_control)
+            {
+                return Err(());
+            }
+            let name = lettre::message::header::HeaderName::new_from_ascii(name.clone())
+                .map_err(|_| ())?;
+            builder = builder.raw_header(lettre::message::header::HeaderValue::new(
+                name,
+                value.to_owned(),
+            ));
+        }
         for value in &email.to {
             builder = builder.to(Mailbox::new(None, address(value)?));
         }
@@ -557,6 +603,33 @@ mod tests {
         assert_eq!(msg.envelope().to().len(), 3);
         assert!(encoded.contains("multipart/alternative"));
         email.headers.insert("X-Test".into(), "value".into());
+        let msg = provider.prepare_workflow(&email).unwrap();
+        assert!(
+            String::from_utf8(msg.formatted())
+                .unwrap()
+                .contains("X-Test: value")
+        );
+        email.headers.insert("x-test".into(), "duplicate".into());
+        assert!(provider.prepare_workflow(&email).is_err());
+        email.headers.remove("x-test");
+        for name in [
+            "Bcc",
+            "Content-Type",
+            "Resent-To",
+            "Return-Path",
+            "Bad\r\nHeader",
+        ] {
+            email.headers.insert(name.into(), "invalid".into());
+            assert!(provider.prepare_workflow(&email).is_err());
+            email.headers.remove(name);
+        }
+        email
+            .headers
+            .insert("X-Test".into(), "bad\r\nBcc: victim@example.test".into());
+        assert!(provider.prepare_workflow(&email).is_err());
+        email
+            .headers
+            .insert("X-Test".into(), serde_json::json!(123));
         assert!(provider.prepare_workflow(&email).is_err());
     }
     #[test]

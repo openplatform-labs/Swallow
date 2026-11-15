@@ -110,7 +110,7 @@ async fn worker_sends_once_and_recovers_expired_attempts() {
     .unwrap();
     db.execute("INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES($1,'bob','64a000000000000000000056','{\"email\":\"new@example.test\"}'::jsonb)",&[&env]).await.unwrap();
     let invalid = Uuid::new_v4();
-    queue::enqueue(&db,invalid,&env,queue::smtp_queue::JOB_KIND,&json!({"to":["ops@example.test"],"subject":"unsupported","html":"test","headers":{"X-Test":"not supported"}})).await.unwrap();
+    queue::enqueue(&db,invalid,&env,queue::smtp_queue::JOB_KIND,&json!({"to":["ops@example.test"],"subject":"unsupported","html":"test","headers":{"Bcc":"not supported"}})).await.unwrap();
     let expired = Uuid::new_v4();
     queue::enqueue(&db, expired, &env, queue::smtp_queue::JOB_KIND, &json!({}))
         .await
