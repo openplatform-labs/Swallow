@@ -75,6 +75,7 @@ async fn credential_health_tracks_individual_workers_and_permissions() {
         include_str!("../migrations/0143_alert_signed_condition_masks.sql"),
         include_str!("../migrations/0144_fcm_heartbeat_session_identity.sql"),
         include_str!("../migrations/0145_fcm_credential_health_retention.sql"),
+        include_str!("../migrations/0146_fcm_health_retention_audit.sql"),
     ] {
         db.batch_execute(sql).await.unwrap();
     }
@@ -186,7 +187,7 @@ async fn credential_health_tracks_individual_workers_and_permissions() {
             .await
             .is_err()
     );
-    db.batch_execute("CREATE ROLE fcm_health_retention LOGIN; GRANT USAGE ON SCHEMA public TO fcm_health_retention; GRANT EXECUTE ON FUNCTION public.novu_rust_prune_fcm_credential_health(text,integer,integer) TO fcm_health_retention; INSERT INTO public.novu_rust_fcm_health_retention_operators SELECT 'env-b',rolname,oid FROM pg_roles WHERE rolname='fcm_health_retention'").await.unwrap();
+    db.batch_execute("CREATE ROLE fcm_health_retention LOGIN; GRANT USAGE ON SCHEMA public TO fcm_health_retention; GRANT EXECUTE ON FUNCTION public.novu_rust_prune_fcm_credential_health(text,integer,integer), public.novu_rust_fcm_health_retention_audit_page(text,bigint,integer) TO fcm_health_retention; INSERT INTO public.novu_rust_fcm_health_retention_operators SELECT 'env-b',rolname,oid FROM pg_roles WHERE rolname='fcm_health_retention'").await.unwrap();
     let retention_url = url.replace("postgres@", "fcm_health_retention@");
     let (retention, retention_driver) = tokio_postgres::connect(&retention_url, NoTls)
         .await
@@ -220,6 +221,25 @@ async fn credential_health_tracks_individual_workers_and_permissions() {
         db.execute("INSERT INTO public.novu_rust_fcm_credential_health VALUES ($1,$2,'fixture',-1,clock_timestamp()-interval '3 days','unhealthy',clock_timestamp()-($3::integer)*interval '1 second')", &[&environment,&instance,&age]).await.unwrap();
     }
     db.execute("UPDATE public.novu_rust_fcm_credential_health SET observed_at=clock_timestamp()-interval '2 days' WHERE environment_id='env-b' AND instance_id=$1", &[&id]).await.unwrap();
+    retention
+        .query_one(
+            "SELECT set_config('swallow.fcm_health_retention_reason','Routine retention',false)",
+            &[],
+        )
+        .await
+        .unwrap();
+    // Missing audit privileges must roll back the otherwise eligible deletion.
+    assert!(
+        retention
+            .query_one(
+                "SELECT public.novu_rust_prune_fcm_credential_health('env-b',86401,1)",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_fcm_credential_health WHERE instance_id IN ($1,$2)", &[&old_one,&old_two]).await.unwrap().get::<_,i64>(0), 2);
+    db.batch_execute("GRANT INSERT ON public.novu_rust_fcm_health_retention_audit TO fcm_retention_owner; GRANT USAGE ON SEQUENCE public.novu_rust_fcm_health_retention_audit_id_seq TO fcm_retention_owner").await.unwrap();
     assert!(
         retention
             .query_one(
@@ -303,6 +323,33 @@ async fn credential_health_tracks_individual_workers_and_permissions() {
             .unwrap()
             .get::<_, i64>(0),
         0
+    );
+    let audits=retention.query("SELECT database_principal,deleted_count,reason FROM public.novu_rust_fcm_health_retention_audit_page('env-b',NULL,100)", &[]).await.unwrap();
+    assert_eq!(audits.len(), 4);
+    assert_eq!(audits.iter().map(|r| r.get::<_, i64>(1)).sum::<i64>(), 2);
+    assert!(
+        audits
+            .iter()
+            .all(|r| r.get::<_, String>(0) == "fcm_health_retention"
+                && r.get::<_, Option<String>>(2).as_deref() == Some("Routine retention"))
+    );
+    assert!(
+        retention
+            .query(
+                "SELECT * FROM public.novu_rust_fcm_health_retention_audit_page('env-a',NULL,100)",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        retention
+            .query(
+                "SELECT * FROM public.novu_rust_fcm_health_retention_audit",
+                &[]
+            )
+            .await
+            .is_err()
     );
     for instance in [id, recent, other_environment] {
         assert!(db.query_one("SELECT EXISTS(SELECT 1 FROM public.novu_rust_fcm_credential_health WHERE instance_id=$1)", &[&instance]).await.unwrap().get::<_, bool>(0));
