@@ -63,12 +63,38 @@ function sql(query) {
     const withData=await sdk.notifications.list({useCache:false});
     assert(!withData.error, String(withData.error));
     assert.deepEqual(withData.data.notifications[0].data,{explicit:true});
-    const update=await item.read();
-    assert.equal(update.error?.originalError?.status,501,'mutation without metadata must still be rejected');
-    assert.equal(sql("SELECT is_read FROM novu_rust_in_app_messages WHERE transaction_id='recovery-gap-1'"),'f');
+    for(const operation of [
+      ()=>item.read(), ()=>item.archive(), ()=>item.unarchive(), ()=>item.unread(),
+      ()=>item.snooze(new Date(Date.now()+300000).toISOString()), ()=>item.unsnooze(),
+    ]) {
+      const result=await operation();
+      assert(!result.error, String(result.error?.originalError ?? result.error));
+      assert.equal(result.data.workflow,undefined);
+    }
+    assert.equal(sql("SELECT is_read::text||','||is_archived::text||','||(snoozed_until IS NULL)::text FROM novu_rust_in_app_messages WHERE transaction_id='recovery-gap-1'"),'false,false,true');
+    sql("UPDATE novu_rust_in_app_messages SET cta=jsonb_build_object('action',jsonb_build_object('buttons',jsonb_build_array(jsonb_build_object('type','primary','content','Open')),'status','pending')) WHERE transaction_id='recovery-gap-1'");
+    const withAction=await sdk.notifications.list({useCache:false});
+    assert(!withAction.error, String(withAction.error));
+    const action=withAction.data.notifications[0];
+    assert(action.primaryAction);
+    const completed=await action.completePrimary();
+    assert(!completed.error, String(completed.error?.originalError ?? completed.error));
+    assert.equal(completed.data.primaryAction.isCompleted,true);
+    const reverted=await action.revertPrimary();
+    assert(!reverted.error, String(reverted.error?.originalError ?? reverted.error));
+    assert.equal(reverted.data.primaryAction.isCompleted,false);
     sql("UPDATE novu_rust_workflows SET inbox_metadata='{}'::jsonb WHERE environment_id='env-a' AND identifier='greeting'");
     const partial=await sdk.notifications.list({useCache:false});
     assert.equal(partial.error?.originalError?.status,501,'partial metadata should remain rejected');
+    const denied=await item.unread();
+    assert.equal(denied.error?.originalError?.status,501,'partial metadata must reject mutation');
+    assert.equal(sql("SELECT is_read FROM novu_rust_in_app_messages WHERE transaction_id='recovery-gap-1'"),'t');
+    const snoozeDenied=await item.snooze(new Date(Date.now()+300000).toISOString());
+    assert.equal(snoozeDenied.error?.originalError?.status,501);
+    assert.equal(sql("SELECT count(*) FROM novu_queue_jobs WHERE kind='experimental-in-app-unsnooze' AND status='pending'"),'0');
+    const actionDenied=await action.completePrimary();
+    assert.equal(actionDenied.error?.originalError?.status,501);
+    assert.equal(sql("SELECT cta#>>'{action,status}' FROM novu_rust_in_app_messages WHERE transaction_id='recovery-gap-1'"),'pending');
     sql("UPDATE novu_rust_workflows SET inbox_metadata=jsonb_build_object('id','64a000000000000000000004','identifier','greeting','name','Greeting','critical',false,'tags',jsonb_build_array(),'severity','none','payloadAsData',false) WHERE environment_id='env-a' AND identifier='greeting'");
     const restored=await sdk.notifications.list({useCache:false});
     assert(!restored.error, String(restored.error));

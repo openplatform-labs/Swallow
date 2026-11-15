@@ -4304,7 +4304,7 @@ async fn trigger_api_contract_inner() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    worker.execute("UPDATE novu_rust_workflows SET inbox_metadata=NULL WHERE environment_id='env-a' AND identifier='names'", &[]).await.unwrap();
+    worker.execute("UPDATE novu_rust_workflows SET inbox_metadata='{}'::jsonb WHERE environment_id='env-a' AND identifier='names'", &[]).await.unwrap();
     let (status, _) = mark_one(
         app.clone(),
         Some("ApiKey test-key"),
