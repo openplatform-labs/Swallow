@@ -1,12 +1,13 @@
 import { Component, EventEmitter, Input, OnChanges, OnDestroy, Output, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
+import { FcmClaimDiagnostics } from './fcm-claim-diagnostics';
 import { validChannelPage } from './channel-page';
 type FcmCooldown={active:boolean;notBefore:string|null;fallbackSeconds:number;deferred:number;overdue:number;deadlineSource:429|503|null;deadlineRecordedAt:string|null};
 type ReviewJob={jobId:string;acceptedCount:number;rejectedCount:number;revision:string};
 type ReviewRequest={requestId:string;jobId:string;revision:string;reason:string};
 type PartialJob={jobId:string;acceptedCount:number;rejectedCount:number};
 type Result={jobId:string;jobStatus:string;attemptCount:number;acceptedCount:number;rejectedCount:number;unknownCount:number;dispatchingCount:number;skippedCount:number;operatorAcceptedCount:number;operatorNotAcceptedCount:number;rateLimitedCount?:number;rateLimitAdviceCount?:number;rateLimitNotBefore?:string|null};
-@Component({selector:'app-fcm-results',imports:[FormsModule],templateUrl:'./fcm-results.html'})
+@Component({selector:'app-fcm-results',imports:[FormsModule,FcmClaimDiagnostics],templateUrl:'./fcm-results.html'})
 export class FcmResults implements OnChanges,OnDestroy {
   @Input() apiOrigin='';@Input() environment='';@Input() token='';@Output() busyChange=new EventEmitter<boolean>();
   readonly reviewRows=signal<ReviewJob[]>([]);readonly reviewNext=signal<string|null>(null);readonly reviewListStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');

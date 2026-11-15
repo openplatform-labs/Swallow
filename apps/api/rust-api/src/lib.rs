@@ -475,6 +475,8 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/operator/slack-cooldown-health", get(operator_identity::slack_cooldown_health))
         .route("/v1/experimental/operator/resend-cooldown-health", get(operator_identity::resend_cooldown_health))
         .route("/v1/experimental/operator/fcm-cooldown-health", get(operator_identity::fcm_cooldown_health))
+        .route("/v1/experimental/operator/fcm-unrecorded-claims-health", get(operator_identity::fcm_unrecorded_claim_health))
+        .route("/v1/experimental/operator/fcm-unrecorded-claims", get(operator_identity::fcm_unrecorded_claim_list))
         .route("/v1/experimental/operator/twilio-delayed-health", get(operator_identity::twilio_delayed_health))
         .route("/v1/experimental/operator/fcm-partial-health", get(operator_identity::fcm_partial_health))
         .route("/v1/experimental/operator/fcm-partial-jobs", get(operator_identity::fcm_partial_jobs))

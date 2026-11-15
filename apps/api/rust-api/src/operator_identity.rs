@@ -28,6 +28,8 @@ enum Lookup {
     SlackCooldownHealth,
     ResendCooldownHealth,
     FcmCooldownHealth,
+    FcmUnrecordedClaimHealth,
+    FcmUnrecordedClaimList,
     TwilioDelayedHealth,
     FcmPartialHealth,
     FcmPartialJobs,
@@ -387,6 +389,13 @@ pub(super) async fn slack_cooldown_health(
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
 ) -> Response {
     query(db, headers, uri, verifier, Lookup::SlackCooldownHealth).await
+}
+
+pub(super) async fn fcm_unrecorded_claim_health(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
+    query(db,headers,uri,verifier,Lookup::FcmUnrecordedClaimHealth).await
+}
+pub(super) async fn fcm_unrecorded_claim_list(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
+    query(db,headers,uri,verifier,Lookup::FcmUnrecordedClaimList).await
 }
 
 pub(super) async fn fcm_cooldown_health(
@@ -1775,6 +1784,8 @@ async fn query(
         | Lookup::SlackResult
         | Lookup::SendgridResult => &["environmentId", "jobId"],
         Lookup::ResendAutoHealth | Lookup::SlackCooldownHealth | Lookup::ResendCooldownHealth | Lookup::FcmCooldownHealth | Lookup::TwilioDelayedHealth => &["environmentId", "graceSeconds"],
+        Lookup::FcmUnrecordedClaimHealth => &["environmentId", "minGap", "graceSeconds"],
+        Lookup::FcmUnrecordedClaimList => &["environmentId", "minGap", "graceSeconds", "after"],
         Lookup::FcmPartialHealth => &["environmentId", "windowSeconds"],
         Lookup::FcmPartialJobs => &["environmentId", "windowSeconds", "after"],
         Lookup::FcmUnreviewed => &["environmentId", "after"],
@@ -1937,6 +1948,13 @@ async fn query(
                 ],
             )
             .await
+        }
+        Lookup::FcmUnrecordedClaimHealth | Lookup::FcmUnrecordedClaimList => {
+            let Some(gap)=params.get("minGap").and_then(|v|v.parse::<i32>().ok().filter(|n|(2..=100000).contains(n)&&n.to_string()==*v)) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};
+            let Some(grace)=params.get("graceSeconds").and_then(|v|v.parse::<i32>().ok().filter(|n|(1..=86400).contains(n)&&n.to_string()==*v)) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};
+            let after=match params.get("after") { Some(v)=>match Uuid::parse_str(v){Ok(v)=>Some(v),Err(_)=>return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request")},None=>None};
+            let list=matches!(lookup,Lookup::FcmUnrecordedClaimList);
+            guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_fcm_unrecorded_claims($1,$2,$3,$4,$5,$6,$7,$8,$9)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&gap,&grace,&list,&after]).await
         }
         Lookup::FcmCooldownHealth => {
             let Some(grace) = params.get("graceSeconds").and_then(|v| {

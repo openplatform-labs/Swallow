@@ -22,3 +22,5 @@ TEST_DATABASE_URL="$DATABASE_URL" cargo test --locked --manifest-path "$API/Carg
 TEST_DATABASE_URL="$DATABASE_URL" cargo test --locked --manifest-path "$API/Cargo.toml" --test operator_resend_429_grants -- --ignored
 
 TEST_DATABASE_URL="$DATABASE_URL" cargo test --locked --manifest-path "$API/Cargo.toml" --test operator_resend_cooldown_policy -- --ignored
+
+TEST_DATABASE_URL="$DATABASE_URL" cargo test --locked --manifest-path "$API/Cargo.toml" --test operator_fcm_unrecorded_claims -- --ignored
