@@ -204,7 +204,7 @@ pub async fn process_one(
     tx.query_opt("SELECT mode FROM public.novu_rust_discord_retry_policy WHERE environment_id=$1 AND destination_id=$2 FOR SHARE", &[&environment,&destination]).await?;
     let cooldown = tx.query_opt("SELECT not_before>clock_timestamp() FROM public.novu_rust_discord_shared_cooldown WHERE environment_id=$1 AND destination_id=$2 FOR UPDATE", &[&environment,&destination]).await?;
     if cooldown.is_some_and(|row| row.get::<_, bool>(0)) {
-        tx.execute("UPDATE public.novu_queue_jobs SET status='pending',attempts=attempts-1,available_at=GREATEST(available_at,(SELECT not_before FROM public.novu_rust_discord_shared_cooldown WHERE environment_id=$2 AND destination_id=$3)),lease_token=NULL,lease_until=NULL WHERE id=$1", &[&job.id,&environment,&destination]).await?;
+        tx.execute("UPDATE public.novu_queue_jobs SET status='pending',attempts=attempts-1,available_at=GREATEST(available_at,(SELECT not_before FROM public.novu_rust_discord_shared_cooldown WHERE environment_id=$2 AND destination_id=$3)),last_error='Discord shared cooldown active',lease_token=NULL,lease_until=NULL WHERE id=$1", &[&job.id,&environment,&destination]).await?;
         tx.commit().await?;
         return Ok(true);
     }

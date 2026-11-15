@@ -85,11 +85,12 @@ async fn cooldown_is_opt_in_shared_and_fences_legacy_workers() {
     let a = a.unwrap();
     let b = b.unwrap();
     assert!(a || b);
-    let r=db.query_one("SELECT status,attempts,available_at>clock_timestamp(),(SELECT count(*) FROM novu_rust_discord_attempts WHERE job_id=$1) FROM novu_queue_jobs WHERE id=$1",&[&next]).await.unwrap();
+    let r=db.query_one("SELECT status,attempts,available_at>clock_timestamp(),(SELECT count(*) FROM novu_rust_discord_attempts WHERE job_id=$1),last_error FROM novu_queue_jobs WHERE id=$1",&[&next]).await.unwrap();
     assert_eq!(r.get::<_, String>(0), "pending");
     assert_eq!(r.get::<_, i32>(1), 0);
     assert!(r.get::<_, bool>(2));
     assert_eq!(r.get::<_, i64>(3), 0);
+    assert_eq!(r.get::<_, String>(4), "Discord shared cooldown active");
     // An unrelated, non-opted-in destination remains usable.
     let other = Uuid::new_v4();
     queue::enqueue(
