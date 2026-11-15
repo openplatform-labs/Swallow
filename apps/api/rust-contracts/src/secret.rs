@@ -100,6 +100,25 @@ pub fn from_env(name: &str, file_name: &str) -> Result<Option<String>, io::Error
         }
     };
     let file = std::env::var_os(file_name);
+    let regular_only = match std::env::var("SWALLOW_SECRET_REGULAR_FILES_ONLY").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid secret file policy",
+            ));
+        }
+    };
+    if regular_only && file.is_some() {
+        if inline.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "multiple secret sources",
+            ));
+        }
+        return read_regular_file(Path::new(file.as_ref().unwrap())).map(Some);
+    }
     read(inline.as_deref(), file.as_deref().map(Path::new))
 }
 
