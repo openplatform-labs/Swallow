@@ -31,6 +31,10 @@ struct DeliveryChecks {
     sms_policy_cancelled: Option<bool>,
     push_policy_cancelled: Option<bool>,
     slack_policy_cancelled: Option<bool>,
+    sendgrid_webhook_keys: Option<bool>,
+    fcm_cooldown_source: Option<bool>,
+    fcm_cooldown_distinct_source: Option<bool>,
+    fcm_unreviewed: Option<bool>,
 }
 impl DeliveryChecks {
     fn apply(&self, cmd: &mut Command) {
@@ -46,9 +50,85 @@ impl DeliveryChecks {
             ("SWALLOW_ALERT_SMS_POLICY_CANCELLED_ENABLED", self.sms_policy_cancelled),
             ("SWALLOW_ALERT_PUSH_POLICY_CANCELLED_ENABLED", self.push_policy_cancelled),
             ("SWALLOW_ALERT_SLACK_POLICY_CANCELLED_ENABLED", self.slack_policy_cancelled),
+            ("SWALLOW_ALERT_SENDGRID_WEBHOOK_KEYS_ENABLED", self.sendgrid_webhook_keys),
+            ("SWALLOW_ALERT_FCM_COOLDOWN_SOURCE_ENABLED", self.fcm_cooldown_source),
+            ("SWALLOW_ALERT_FCM_COOLDOWN_DISTINCT_SOURCE", self.fcm_cooldown_distinct_source),
+            ("SWALLOW_ALERT_FCM_UNREVIEWED_ENABLED", self.fcm_unreviewed),
         ] {
             if let Some(enabled) = value {
                 cmd.env(key, if enabled { "true" } else { "false" });
+            }
+        }
+    }
+}
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Threshold { Value(u32), Disabled(Disabled) }
+#[derive(Deserialize)]
+enum Disabled { #[serde(rename = "disabled")] Disabled }
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct DeliveryThresholds {
+    discord_cooldown_grace_seconds: Option<Threshold>,
+    discord_retry_grace_seconds: Option<Threshold>,
+    smtp_credential_max_age_seconds: Option<Threshold>,
+    smtp_credential_min_healthy: Option<Threshold>,
+    smtp_ca_max_age_seconds: Option<Threshold>,
+    smtp_ca_min_healthy: Option<Threshold>,
+    fcm_credential_max_age_seconds: Option<Threshold>,
+    fcm_credential_min_healthy: Option<Threshold>,
+    fcm_unrecorded_claim_min_gap: Option<Threshold>,
+    fcm_unrecorded_claim_grace_seconds: Option<Threshold>,
+    fcm_cooldown_grace_seconds: Option<Threshold>,
+    fcm_partial_window_seconds: Option<Threshold>,
+    twilio_delayed_grace_seconds: Option<Threshold>,
+    resend_cooldown_grace_seconds: Option<Threshold>,
+    slack_cooldown_grace_seconds: Option<Threshold>,
+    resend_auto_grace_seconds: Option<Threshold>,
+    twilio_grace_seconds: Option<Threshold>,
+    twilio_heartbeat_max_seconds: Option<Threshold>,
+    sendgrid_grace_seconds: Option<Threshold>,
+    sendgrid_heartbeat_max_seconds: Option<Threshold>,
+    queue_max_wait_seconds: Option<Threshold>,
+}
+impl DeliveryThresholds {
+    fn values(&self) -> [(&'static str, &Option<Threshold>, u32, u32); 21] {
+        [
+            ("SWALLOW_ALERT_DISCORD_COOLDOWN_GRACE_SECONDS", &self.discord_cooldown_grace_seconds, 1, 86400),
+            ("SWALLOW_ALERT_DISCORD_RETRY_GRACE_SECONDS", &self.discord_retry_grace_seconds, 1, 86400),
+            ("SWALLOW_ALERT_SMTP_CREDENTIAL_MAX_AGE_SECONDS", &self.smtp_credential_max_age_seconds, 1, 86400),
+            ("SWALLOW_ALERT_SMTP_CREDENTIAL_MIN_HEALTHY", &self.smtp_credential_min_healthy, 1, 1000),
+            ("SWALLOW_ALERT_SMTP_CA_MAX_AGE_SECONDS", &self.smtp_ca_max_age_seconds, 1, 86400),
+            ("SWALLOW_ALERT_SMTP_CA_MIN_HEALTHY", &self.smtp_ca_min_healthy, 1, 1000),
+            ("SWALLOW_ALERT_FCM_CREDENTIAL_MAX_AGE_SECONDS", &self.fcm_credential_max_age_seconds, 1, 86400),
+            ("SWALLOW_ALERT_FCM_CREDENTIAL_MIN_HEALTHY", &self.fcm_credential_min_healthy, 1, 1000),
+            ("SWALLOW_ALERT_FCM_UNRECORDED_CLAIM_MIN_GAP", &self.fcm_unrecorded_claim_min_gap, 2, 100000),
+            ("SWALLOW_ALERT_FCM_UNRECORDED_CLAIM_GRACE_SECONDS", &self.fcm_unrecorded_claim_grace_seconds, 1, 86400),
+            ("SWALLOW_ALERT_FCM_COOLDOWN_GRACE_SECONDS", &self.fcm_cooldown_grace_seconds, 1, 86400),
+            ("SWALLOW_ALERT_FCM_PARTIAL_WINDOW_SECONDS", &self.fcm_partial_window_seconds, 1, 604800),
+            ("SWALLOW_ALERT_TWILIO_DELAYED_GRACE_SECONDS", &self.twilio_delayed_grace_seconds, 1, 86400),
+            ("SWALLOW_ALERT_RESEND_COOLDOWN_GRACE_SECONDS", &self.resend_cooldown_grace_seconds, 1, 86400),
+            ("SWALLOW_ALERT_SLACK_COOLDOWN_GRACE_SECONDS", &self.slack_cooldown_grace_seconds, 1, 86400),
+            ("SWALLOW_ALERT_RESEND_AUTO_GRACE_SECONDS", &self.resend_auto_grace_seconds, 1, 86400),
+            ("SWALLOW_ALERT_TWILIO_GRACE_SECONDS", &self.twilio_grace_seconds, 1, 86400),
+            ("SWALLOW_ALERT_TWILIO_HEARTBEAT_MAX_SECONDS", &self.twilio_heartbeat_max_seconds, 1, 86400),
+            ("SWALLOW_ALERT_SENDGRID_GRACE_SECONDS", &self.sendgrid_grace_seconds, 1, 86400),
+            ("SWALLOW_ALERT_SENDGRID_HEARTBEAT_MAX_SECONDS", &self.sendgrid_heartbeat_max_seconds, 1, 86400),
+            ("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS", &self.queue_max_wait_seconds, 1, 86400),
+        ]
+    }
+    fn valid(&self) -> bool {
+        self.values().iter().all(|(_, value, min, max)| match value {
+            Some(Threshold::Value(value)) => (*min..=*max).contains(value),
+            _ => true,
+        })
+    }
+    fn apply(&self, cmd: &mut Command) {
+        for (key, value, _, _) in self.values() {
+            match value {
+                Some(Threshold::Value(value)) => { cmd.env(key, value.to_string()); }
+                Some(Threshold::Disabled(_)) => { cmd.env_remove(key); }
+                None => {}
             }
         }
     }
@@ -60,6 +140,7 @@ enum Target {
         id: String,
         webhook_file: String,
         delivery_checks: Option<DeliveryChecks>,
+        delivery_thresholds: Option<DeliveryThresholds>,
     },
     Email {
         id: String,
@@ -77,6 +158,7 @@ enum Target {
         region: Option<String>,
         ip_pool_name: Option<String>,
         delivery_checks: Option<DeliveryChecks>,
+        delivery_thresholds: Option<DeliveryThresholds>,
     },
 }
 #[derive(Deserialize)]
@@ -112,7 +194,11 @@ impl Target {
                 && value.contains('@')
                 && !value.contains(['\r', '\n', '\0', '<', '>'])
         }
+        let thresholds = match self {
+            Self::Slack { delivery_thresholds, .. } | Self::Email { delivery_thresholds, .. } => delivery_thresholds,
+        };
         valid_id
+            && thresholds.as_ref().is_none_or(DeliveryThresholds::valid)
             && match self {
                 Self::Slack { webhook_file, .. } => path(webhook_file),
                 Self::Email {
@@ -297,6 +383,10 @@ impl Target {
             Self::Slack { delivery_checks, .. } | Self::Email { delivery_checks, .. } => delivery_checks,
         };
         if let Some(checks) = checks { checks.apply(cmd); }
+        let thresholds = match self {
+            Self::Slack { delivery_thresholds, .. } | Self::Email { delivery_thresholds, .. } => delivery_thresholds,
+        };
+        if let Some(thresholds) = thresholds { thresholds.apply(cmd); }
     }
 }
 fn read_config(path: &str) -> Result<Config> {

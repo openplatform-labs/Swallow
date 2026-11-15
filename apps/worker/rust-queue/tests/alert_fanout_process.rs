@@ -3,27 +3,53 @@
 use std::{os::unix::fs::PermissionsExt, process::Command};
 use uuid::Uuid;
 #[test]
+fn all_target_thresholds_are_forwarded_to_the_matching_child_variables() {
+    let names = ["discord_cooldown_grace_seconds","discord_retry_grace_seconds","smtp_credential_max_age_seconds","smtp_credential_min_healthy","smtp_ca_max_age_seconds","smtp_ca_min_healthy","fcm_credential_max_age_seconds","fcm_credential_min_healthy","fcm_unrecorded_claim_min_gap","fcm_unrecorded_claim_grace_seconds","fcm_cooldown_grace_seconds","fcm_partial_window_seconds","twilio_delayed_grace_seconds","resend_cooldown_grace_seconds","slack_cooldown_grace_seconds","resend_auto_grace_seconds","twilio_grace_seconds","twilio_heartbeat_max_seconds","sendgrid_grace_seconds","sendgrid_heartbeat_max_seconds","queue_max_wait_seconds"];
+    let dir=std::env::temp_dir().join(format!("swallow-alert-thresholds-{}",Uuid::new_v4()));std::fs::create_dir(&dir).unwrap();
+    let fanout=dir.join("alert-fanout");std::fs::copy(env!("CARGO_BIN_EXE_alert-fanout"),&fanout).unwrap();
+    let child=dir.join("send-delivery-alert");
+    let mut script=String::from("#!/bin/sh\n");
+    let mut thresholds=serde_json::Map::new();
+    let mut expected=String::new();
+    for (index,name) in names.iter().enumerate() {
+        let key=format!("SWALLOW_ALERT_{}",name.to_ascii_uppercase());
+        script.push_str(&format!("printf '%s\\n' \"${{{key}:-disabled}}\" >> \"$FANOUT_TEST_LOG\"\n"));
+        if index%2==0 { thresholds.insert((*name).into(),serde_json::json!(index+20));expected.push_str(&format!("{}\n",index+20)); }
+        else { thresholds.insert((*name).into(),serde_json::json!("disabled"));expected.push_str("disabled\n"); }
+    }
+    std::fs::write(&child,script).unwrap();std::fs::set_permissions(child,std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config=dir.join("config.json");let log=dir.join("log");
+    std::fs::write(&config,serde_json::to_vec(&serde_json::json!({"targets":[{"channel":"slack","id":"ops","webhook_file":dir.join("key"),"delivery_thresholds":thresholds}]})).unwrap()).unwrap();
+    let mut cmd=Command::new(&fanout);cmd.args(["delivery","env","300","120","60"]).arg(&config).env("FANOUT_TEST_LOG",&log);
+    for name in names {cmd.env(format!("SWALLOW_ALERT_{}",name.to_ascii_uppercase()),"999");}
+    assert!(cmd.output().unwrap().status.success());assert_eq!(std::fs::read_to_string(&log).unwrap(),expected);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[test]
 fn delivery_checks_are_selected_per_target_and_invalid_config_starts_no_children() {
     let dir = std::env::temp_dir().join(format!("swallow-alert-checks-{}", Uuid::new_v4()));
     std::fs::create_dir(&dir).unwrap();
     let fanout = dir.join("alert-fanout");
     std::fs::copy(env!("CARGO_BIN_EXE_alert-fanout"), &fanout).unwrap();
     let child = dir.join("send-delivery-alert");
-    std::fs::write(&child, "#!/bin/sh\nprintf '%s:%s:%s:%s\\n' \"$SWALLOW_ALERT_SLACK_TARGET_ID\" \"$SWALLOW_ALERT_RESEND_ENABLED\" \"$SWALLOW_ALERT_DISCORD_ENABLED\" \"$SWALLOW_ALERT_FAILED_JOBS_ENABLED\" >> \"$FANOUT_TEST_LOG\"\n").unwrap();
+    std::fs::write(&child, "#!/bin/sh\nprintf '%s:%s:%s:%s:%s\\n' \"$SWALLOW_ALERT_SLACK_TARGET_ID\" \"$SWALLOW_ALERT_RESEND_ENABLED\" \"$SWALLOW_ALERT_DISCORD_ENABLED\" \"$SWALLOW_ALERT_FAILED_JOBS_ENABLED\" \"${SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS:-disabled}\" >> \"$FANOUT_TEST_LOG\"\n").unwrap();
     std::fs::set_permissions(child, std::fs::Permissions::from_mode(0o700)).unwrap();
     let config=dir.join("targets.json"); let log=dir.join("log");
     let targets=serde_json::json!({"targets":[
-        {"channel":"slack","id":"a","webhook_file":dir.join("key"),"delivery_checks":{"resend":false,"discord":true}},
-        {"channel":"slack","id":"b","webhook_file":dir.join("key"),"delivery_checks":{"failed_jobs":true}},
+        {"channel":"slack","id":"a","webhook_file":dir.join("key"),"delivery_checks":{"resend":false,"discord":true},"delivery_thresholds":{"queue_max_wait_seconds":120}},
+        {"channel":"slack","id":"b","webhook_file":dir.join("key"),"delivery_checks":{"failed_jobs":true},"delivery_thresholds":{"queue_max_wait_seconds":"disabled"}},
         {"channel":"slack","id":"c","webhook_file":dir.join("key")}
     ]});
     std::fs::write(&config,serde_json::to_vec(&targets).unwrap()).unwrap();
-    let run=|| Command::new(&fanout).args(["delivery","env","300","120","60"]).arg(&config).env("FANOUT_TEST_LOG",&log).env("SWALLOW_ALERT_RESEND_ENABLED","true").env("SWALLOW_ALERT_DISCORD_ENABLED","false").env("SWALLOW_ALERT_FAILED_JOBS_ENABLED","false").output().unwrap();
+    let run=|| Command::new(&fanout).args(["delivery","env","300","120","60"]).arg(&config).env("FANOUT_TEST_LOG",&log).env("SWALLOW_ALERT_RESEND_ENABLED","true").env("SWALLOW_ALERT_DISCORD_ENABLED","false").env("SWALLOW_ALERT_FAILED_JOBS_ENABLED","false").env("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS","60").output().unwrap();
     assert!(run().status.success());
-    assert_eq!(std::fs::read_to_string(&log).unwrap(),"a:false:true:false\nb:true:false:true\nc:true:false:false\n");
+    assert_eq!(std::fs::read_to_string(&log).unwrap(),"a:false:true:false:120\nb:true:false:true:disabled\nc:true:false:false:60\n");
     for invalid in [
         serde_json::json!({"channel":"slack","id":"d","webhook_file":dir.join("key"),"delivery_checks":{"resned":true}}),
         serde_json::json!({"channel":"slack","id":"d","webhook_file":dir.join("key"),"delivery_checks":{"resend":"false"}}),
+        serde_json::json!({"channel":"slack","id":"d","webhook_file":dir.join("key"),"delivery_thresholds":{"queue_max_wait_seconds":0}}),
+        serde_json::json!({"channel":"slack","id":"d","webhook_file":dir.join("key"),"delivery_thresholds":{"queue_max_wait_seconds":"off"}}),
+        serde_json::json!({"channel":"slack","id":"d","webhook_file":dir.join("key"),"delivery_thresholds":{"queue_max_wait_second":60}}),
         serde_json::json!({"channel":"email","id":"d","provider":"resend","to":"a\u{0}@example.test","from":"sender@example.test","api_key_file":dir.join("key")}),
         serde_json::json!({"channel":"email","id":"d","provider":"resend","to":"a@example.test","from":"sender\u{0}@example.test","api_key_file":dir.join("key")}),
     ] {
