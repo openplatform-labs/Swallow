@@ -335,6 +335,6 @@ The settings permission panel supports the Discord review list and review grants
 
 # Discord 워크플로 정책
 
-설정 화면에서 환경별 Discord 발송 정책을 조회하고 활성·비활성을 선택할 수 있다. 변경은 조회한 revision과 새 요청 ID를 고정해 준비한 뒤 별도 확인을 받아 제출한다. 결과가 불명이면 요청 ID로 조회하거나 같은 토큰·환경·API 주소로 동일 요청을 재제출할 수 있다. 요청과 감사 조회는 각기 권한이 필요하며, JWT와 API DB 로그인에 모두 해당 권한이 있어야 한다. 정책별 권한 위임 UI는 아직 없어 DBA가 사전에 설정해야 한다. API와 워커 배포 순서는 [API README](../../api/rust-api/README.md)와 [워커 README](../../worker/rust-queue/README.md)를 따른다.
+설정 화면에서 환경별 Discord 발송 정책을 조회하고 활성·비활성을 선택할 수 있다. 변경은 조회한 revision과 새 요청 ID를 고정해 준비한 뒤 별도 확인을 받아 제출한다. 결과가 불명이면 요청 ID로 조회하거나 같은 토큰·환경·API 주소로 동일 요청을 재제출할 수 있다. 요청과 감사 조회는 각기 권한이 필요하며, JWT와 API DB 로그인에 모두 해당 권한이 있어야 한다. 정책별 권한 위임 UI는 아직 없어 DBA 또는 위임 API로 사전에 설정해야 한다. API와 워커 배포 순서는 [API README](../../api/rust-api/README.md)와 [워커 README](../../worker/rust-queue/README.md)를 따른다.
 
 요청 정보와 토큰은 화면 메모리에만 보관하므로 새로고침 전에 요청 ID와 내용을 기록한다. 감사 목록은 JWT 경로만 보여 주고 단일 스냅샷이나 전체 변경 이력을 보장하지 않는다. Angular 테스트 242개와 빌드가 통과했다. `scripts/test-discord-policy-browser.sh`는 격리 Docker PostgreSQL, 제한 API 로그인, 테스트 JWT 및 실제 브라우저에서 제출 전 미변경, 정책 변경, 요청·감사 조회 및 다른 사용자·환경의 거절을 검증한다. 외부 IdP, 실제 Discord 및 운영 HA는 검증하지 않았다. 빌드에 기존 번들·CSS 예산 경고가 남아 있다.
