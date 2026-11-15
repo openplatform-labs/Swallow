@@ -56,4 +56,10 @@ describe('Smtp operator reviews',()=>{
     const {fixture,c}=component();c.findJob=job;await c.findFailure();expect(c.listStatus()).toBe('error');expect(c.rows()).toEqual([]);fixture.destroy();
   });
 
+  it('prepares and looks up a retry for a pre-dispatch failure',async()=>{
+    const pre={...row,attemptState:null,attemptRevision:null};vi.spyOn(crypto,'randomUUID').mockReturnValue(requestId);
+    const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[pre],hasMore:false,next:null}))).mockResolvedValueOnce(new Response(JSON.stringify({recorded:true,replayed:false}))).mockResolvedValueOnce(new Response(JSON.stringify({found:true,requestId,jobId:job,attemptRevision:null,failureRevision:'7',decision:'retry',reason:'fixed',recorded:true,createdAt:'2026-11-15T00:00:00Z'})));
+    const {fixture,c}=component();await c.list();c.reason='fixed';c.prepare(c.rows()[0],'retry');expect(c.review()?.attemptRevision).toBeNull();c.confirmed=true;await c.submit();expect(JSON.parse(mock.mock.calls[1][1]?.body as string).attemptRevision).toBeNull();await c.lookup();expect(c.lookupStatus()).toBe('found');fixture.destroy();
+  });
+
 });

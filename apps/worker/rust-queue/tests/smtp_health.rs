@@ -172,7 +172,7 @@ async fn scoped_health_and_alert_selection() {
         );
         assert!(String::from_utf8_lossy(&result.stderr).contains("requires operator review"));
     }
-    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_smtp_attention(text,uuid),public.novu_rust_ack_smtp(text,uuid,uuid,bigint,text,text),public.novu_rust_smtp_failure_lookup(text,uuid) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_smtp_attention(text,uuid),public.novu_rust_ack_smtp(text,uuid,uuid,bigint,text,text),public.novu_rust_smtp_failure_lookup(text,uuid),public.novu_rust_resolve_smtp(text,uuid,uuid,uuid,bigint,text,text) TO {role}")).await.unwrap();
     assert!(reader.query("SELECT * FROM public.novu_rust_smtp_attention($1,NULL)",&[&other]).await.is_err());
     let listed=Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
         .env_clear().env("DATABASE_URL",role_url.as_str()).env("NOVU_POSTGRES_ALLOW_INSECURE","true")
@@ -217,6 +217,15 @@ async fn scoped_health_and_alert_selection() {
     assert_eq!(ack.status.code(),Some(0),"{}",String::from_utf8_lossy(&ack.stderr));
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&ack.stdout).unwrap(),json!({"recorded":true}));
     assert_eq!(reader.query_one("SELECT * FROM public.novu_rust_smtp_health($1)",&[&env]).await.unwrap().get::<_,i64>(2),0);
+    db.execute("INSERT INTO public.novu_rust_smtp_resolvers SELECT $1,rolname,oid,false,true FROM pg_roles WHERE rolname::text=$2",&[&env,&role]).await.unwrap();
+    let pre_request=Uuid::new_v4();
+    let retry=Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+        .env_clear().env("DATABASE_URL",role_url.as_str()).env("NOVU_POSTGRES_ALLOW_INSECURE","true")
+        .args(["resolve-smtp",&env,&pre_request.to_string(),&ids[3].to_string(),"-",&pre_revision.to_string(),"retry","configuration corrected"]).output().unwrap();
+    assert_eq!(retry.status.code(),Some(0),"{}",String::from_utf8_lossy(&retry.stderr));
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&retry.stdout).unwrap()["recorded"],true);
+    assert_eq!(db.query_one("SELECT status FROM public.novu_queue_jobs WHERE id=$1",&[&ids[3]]).await.unwrap().get::<_,String>(0),"pending");
+    assert!(db.query_one("SELECT attempt_revision FROM public.novu_rust_smtp_resolutions WHERE request_id=$1",&[&pre_request]).await.unwrap().get::<_,Option<Uuid>>(0).is_none());
     let unchanged=db.query_one("SELECT j.status,a.state FROM public.novu_queue_jobs j JOIN public.novu_rust_smtp_attempts a ON a.job_id=j.id WHERE j.id=$1", &[&ids[0]]).await.unwrap();
     assert_eq!((unchanged.get::<_,String>(0),unchanged.get::<_,String>(1)),("failed".into(),"unknown".into()));
     db.execute("UPDATE public.novu_rust_smtp_attempts SET state=state WHERE job_id=$1", &[&ids[0]]).await.unwrap();

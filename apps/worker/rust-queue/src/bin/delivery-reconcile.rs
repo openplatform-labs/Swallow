@@ -461,7 +461,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     } else if args.len()==8 && args[0]=="resolve-smtp" {
         let request=Uuid::parse_str(&args[2])?;
         let job=Uuid::parse_str(&args[3])?;
-        let attempt=Uuid::parse_str(&args[4])?;
+        let attempt=if args[4]=="-" {None} else {Some(Uuid::parse_str(&args[4])?)};
         let revision=args[5].parse::<i64>()?;
         let row=db.query_one("SELECT public.novu_rust_resolve_smtp($1,$2,$3,$4,$5,$6,$7)",&[&args[1],&request,&job,&attempt,&revision,&args[6],&args[7]]).await?;
         println!("{}",serde_json::json!({"recorded":row.get::<_,bool>(0)}));

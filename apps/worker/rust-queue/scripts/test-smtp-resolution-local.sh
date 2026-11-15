@@ -27,6 +27,7 @@ cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-wo
 cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply worker "$WORKER/migrations"
 cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply api "$ROOT/apps/api/rust-api/migrations"
 cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test smtp_resolution_worker -- --ignored
+cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test smtp_predispatch_retry -- --ignored
 
 "$TEST_PG_BIN/createdb" -h 127.0.0.1 -p "$PORT" -U postgres smtp_health_lookup_test
 export TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/smtp_health_lookup_test"

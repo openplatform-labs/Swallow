@@ -356,4 +356,86 @@ async fn smtp_resolution_requires_both_permissions_and_isolates_jwt_requests() {
             .0,
         StatusCode::OK
     );
+    let pre = Uuid::new_v4();
+    let pre_id = Uuid::new_v4();
+    db.execute("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES($1,$2,'experimental_smtp_email','{}','failed')",&[&pre,&env]).await.unwrap();
+    let failure: i64 = db
+        .query_one(
+            "SELECT failure_revision FROM public.novu_queue_jobs WHERE id=$1",
+            &[&pre],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let pre_input = json!({"requestId":pre_id,"jobId":pre,"attemptRevision":null,"failureRevision":failure.to_string(),"decision":"retry","reason":"configuration corrected"});
+    let mut invalid = pre_input.clone();
+    invalid["decision"] = json!("accepted");
+    assert_eq!(
+        response(app.clone(), &alice, "POST", &path, Some(invalid))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    let mut stale = pre_input.clone();
+    stale["failureRevision"] = json!((failure + 1).to_string());
+    assert_eq!(
+        response(app.clone(), &alice, "POST", &path, Some(stale))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        response(app.clone(), &alice, "POST", &path, Some(pre_input.clone()))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        response(app.clone(), &alice, "POST", &path, Some(pre_input))
+            .await
+            .1["replayed"],
+        true
+    );
+    assert_eq!(
+        db.query_one(
+            "SELECT status FROM public.novu_queue_jobs WHERE id=$1",
+            &[&pre]
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0),
+        "pending"
+    );
+    let history_pre = format!(
+        "/v1/experimental/operator/smtp-resolution-history?environmentId={env}&jobId={pre}"
+    );
+    let (_, history) = response(app.clone(), &alice, "GET", &history_pre, None).await;
+    assert!(history["data"][0]["attemptRevision"].is_null());
+    assert_eq!(
+        history["data"][0]["operator"]["requestId"],
+        pre_id.to_string()
+    );
+    let lookup_pre = format!(
+        "/v1/experimental/operator/smtp-resolution-request?environmentId={env}&requestId={pre_id}&decision=retry"
+    );
+    let (_, looked_up) = response(app.clone(), &alice, "GET", &lookup_pre, None).await;
+    assert!(looked_up["attemptRevision"].is_null());
+    let attempted = Uuid::new_v4();
+    db.execute("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES($1,$2,'experimental_smtp_email','{}','failed')",&[&attempted,&env]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_smtp_attempts(job_id,environment_id,state) VALUES($1,$2,'unknown')",&[&attempted,&env]).await.unwrap();
+    let attempt_failure: i64 = db
+        .query_one(
+            "SELECT failure_revision FROM public.novu_queue_jobs WHERE id=$1",
+            &[&attempted],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let invalid_attempt = json!({"requestId":Uuid::new_v4(),"jobId":attempted,"attemptRevision":null,"failureRevision":attempt_failure.to_string(),"decision":"retry","reason":"wrong observation"});
+    assert_eq!(
+        response(app.clone(), &alice, "POST", &path, Some(invalid_attempt))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
 }
