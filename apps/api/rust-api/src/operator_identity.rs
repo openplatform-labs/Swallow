@@ -71,6 +71,10 @@ enum Lookup {
     ResendAutoPolicyRead,
     ResendAutoPolicyRequest,
     ResendAutoPolicyAudit,
+    SmtpAutoPolicyRead,
+    SmtpAutoPolicyRequest,
+    SmtpAutoPolicyAudit,
+    SmtpAutoHistory,
     ResendCooldownPolicyRead,
     ResendCooldownPolicyRequest,
     ResendCooldownPolicyAudit,
@@ -686,6 +690,32 @@ pub(super) async fn resend_auto_policy_audit(
     query(db, headers, uri, verifier, Lookup::ResendAutoPolicyAudit).await
 }
 
+pub(super) async fn smtp_auto_policy_read(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::SmtpAutoPolicyRead).await
+}
+pub(super) async fn smtp_auto_policy_request(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::SmtpAutoPolicyRequest).await
+}
+pub(super) async fn smtp_auto_policy_audit(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::SmtpAutoPolicyAudit).await
+}
+
+pub(super) async fn smtp_auto_history(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response { query(db,headers,uri,verifier,Lookup::SmtpAutoHistory).await }
 pub(super) async fn resend_cooldown_policy_read(
     State(db): State<Arc<Client>>,
     headers: HeaderMap,
@@ -1592,6 +1622,71 @@ pub(super) async fn resend_auto_policy_change(
     }
     let env = params[0].1.as_ref();
     match guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_resend_auto_policy_change($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&expected,&input.enabled,&input.max_retries,&input.cutoff,&input.reason]).await {
+        Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
+        Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
+        Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
+        Err(e) if e.code().is_some_and(|c|c.code()=="P4090")=>failure(StatusCode::CONFLICT,uri.path()),
+        Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path()),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SmtpAutoPolicyChange {
+    request_id: String,
+    expected_revision: String,
+    enabled: bool,
+    max_retries: i32,
+    delay_seconds: i32,
+    cutoff: String,
+    reason: String,
+}
+pub(super) async fn smtp_auto_policy_change(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+    body: Bytes,
+) -> Response {
+    let identity = match authenticate(&db, &headers, verifier).await {
+        Ok(v) => v,
+        Err(status) => return failure(status, uri.path()),
+    };
+    let params: Vec<_> = form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).collect();
+    if params.len() != 1
+        || params[0].0 != "environmentId"
+        || params[0].1.is_empty()
+        || params[0].1.len() > 512
+        || params[0].1.contains('\0')
+    {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    }
+    let Some(input) = (body.len() <= 4096)
+        .then(|| serde_json::from_slice::<SmtpAutoPolicyChange>(&body).ok())
+        .flatten()
+    else {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    };
+    let (Ok(request), Ok(exp), Ok(expected)) = (
+        Uuid::parse_str(&input.request_id),
+        i64::try_from(identity.expires_at),
+        input.expected_revision.parse::<i64>(),
+    ) else {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    };
+    if expected < 0
+        || expected.to_string() != input.expected_revision
+        || !(1..=10).contains(&input.max_retries)
+        || !(10..=86400).contains(&input.delay_seconds)
+        || !["now", "preserve", "all"].contains(&input.cutoff.as_str())
+        || input.reason.trim().is_empty()
+        || input.reason.len() > 512
+        || input.reason.contains('\0')
+    {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    }
+    let env = params[0].1.as_ref();
+    match guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_smtp_auto_policy_change($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&expected,&input.enabled,&input.max_retries,&input.delay_seconds,&input.cutoff,&input.reason]).await {
         Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
         Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
         Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
@@ -2688,10 +2783,10 @@ async fn query(
         Lookup::DiscordRetryPolicyRead => &["environmentId","destinationId"],
         Lookup::DiscordRetryPolicyRequest => &["environmentId","destinationId","requestId"],
         Lookup::DiscordRetryPolicyAudit => &["environmentId","destinationId","after"],
-        Lookup::Identity | Lookup::ResendAutoPolicyRead | Lookup::ResendCooldownPolicyRead | Lookup::SmtpTransportPolicyRead | Lookup::DiscordPolicyRead => &["environmentId"],
+        Lookup::Identity | Lookup::SmtpAutoPolicyRead | Lookup::ResendAutoPolicyRead | Lookup::ResendCooldownPolicyRead | Lookup::SmtpTransportPolicyRead | Lookup::DiscordPolicyRead => &["environmentId"],
         Lookup::PermissionIdentity => &["environmentId", "issuer", "subject", "clientId"],
-        Lookup::PermissionAudit => &["environmentId", "before"],
-        Lookup::PermissionChangeRequest | Lookup::ResendAutoPolicyRequest | Lookup::ResendCooldownPolicyRequest | Lookup::SmtpTransportPolicyRequest | Lookup::DiscordPolicyRequest => {
+        Lookup::PermissionAudit | Lookup::SmtpAutoHistory => &["environmentId", "before"],
+        Lookup::PermissionChangeRequest | Lookup::SmtpAutoPolicyRequest | Lookup::ResendAutoPolicyRequest | Lookup::ResendCooldownPolicyRequest | Lookup::SmtpTransportPolicyRequest | Lookup::DiscordPolicyRequest => {
             &["environmentId", "requestId"]
         }
         Lookup::ResendResult
@@ -2763,7 +2858,7 @@ async fn query(
         | Lookup::DiscordPolicyGrantAudit
         | Lookup::SmtpTransportGrantAudit
         | Lookup::DiscordRetryGrantAudit
-        | Lookup::ResendAutoPolicyAudit | Lookup::ResendCooldownPolicyAudit | Lookup::SmtpTransportPolicyAudit | Lookup::DiscordPolicyAudit | Lookup::Resend429Audit => &["environmentId", "after"],
+        | Lookup::SmtpAutoPolicyAudit | Lookup::ResendAutoPolicyAudit | Lookup::ResendCooldownPolicyAudit | Lookup::SmtpTransportPolicyAudit | Lookup::DiscordPolicyAudit | Lookup::Resend429Audit => &["environmentId", "after"],
         Lookup::ChannelAccessGrantAudit => &["environmentId", "after", "resource"],
         Lookup::SubscriberProfileRead => &["environmentId", "subscriberId"],
         Lookup::SubscriberProfileRequest => &["environmentId", "requestId"],
@@ -3029,6 +3124,46 @@ async fn query(
                 None => None,
             };
             guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_resend_auto_policy_audit_read($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&after]).await
+        }
+        Lookup::SmtpAutoPolicyRead => {
+            guarded_query(
+                &db,
+                &identity,
+                "SELECT public.novu_rust_operator_jwt_smtp_auto_policy_read($1,$2,$3,$4,$5)",
+                &[
+                    &identity.issuer,
+                    &identity.subject,
+                    &identity.client_id,
+                    &env,
+                    &exp,
+                ],
+            )
+            .await
+        }
+        Lookup::SmtpAutoPolicyRequest => {
+            let Some(request) = params
+                .get("requestId")
+                .and_then(|s| Uuid::parse_str(s).ok())
+            else {
+                return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+            };
+            guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_smtp_auto_policy_request($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request]).await
+        }
+        Lookup::SmtpAutoPolicyAudit => {
+            let after = match params.get("after") {
+                Some(value) => match Uuid::parse_str(value) {
+                    Ok(v) => Some(v),
+                    Err(_) => {
+                        return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+                    }
+                },
+                None => None,
+            };
+            guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_smtp_auto_policy_audit_read($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&after]).await
+        }
+        Lookup::SmtpAutoHistory => {
+            let before=match params.get("before") {Some(value)=>match value.parse::<i64>() {Ok(v) if v>0 && v.to_string()==*value=>Some(v),_=>return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request")},None=>None};
+            guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_smtp_auto_history($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&before]).await
         }
         Lookup::ResendCooldownPolicyRead => {
             guarded_query(
