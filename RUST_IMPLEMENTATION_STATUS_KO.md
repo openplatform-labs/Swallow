@@ -1,3 +1,5 @@
+웹훅 준비 상태 기반 라우팅 시험: 두 실제 API 프로세스와 임시 PostgreSQL 앞에 테스트용 프록시를 두고 파일 오류 시 정상 인스턴스로 합성 Resend·Twilio 웹훅을 전달하고 복구 후 다시 선택하는 것을 확인했다. 양쪽 파일이 손상되면 503이며 DB 이벤트가 추가되지 않았다. 단일 호스트·관리자 계정·시험용 프록시이므로 실제 공급자, 운영 로드밸런서, 네트워크 분리 및 다중 호스트 HA는 미검증이다. [API README](apps/api/rust-api/README.md)에 재현 방법이 있다.
+
 웹훅 키 파일 준비 상태 선택: Resend와 Twilio 묶음 파일을 각각 또는 함께 `/health/ready` 조건으로 선택할 수 있다. 임시 PostgreSQL과 실제 API 네 개에서 미선택·개별·동시 선택과 파일 오류·복구를 비교했고 시작 구성 오류 및 기존 웹훅·경보 회귀를 확인했다. 실패는 전체 인스턴스 준비 상태를 503으로 바꾸지만 라우팅을 직접 막지 않고 파일 검사는 웹훅 검증과 읽기 슬롯을 공유한다. 실제 로드밸런서·다중 호스트·운영 HA는 미검증이며 공급자 키 일치나 콜백 수신을 보장하지 않는다. [API README](apps/api/rust-api/README.md)를 참고한다.
 
 Twilio 웹훅 토큰 상태 감시·경보: 선택형 `/health/twilio-webhook-bundle`이 파일 상태만 반환하며 `SWALLOW_TWILIO_WEBHOOK_KEY_PROBE_URL`을 통해 Slack·메일 경보와 스케줄러에 연결한다. 검사 유형과 API 인스턴스별 고유 대상 ID가 필요하다. 실제 API·임시 PostgreSQL·제한 경보 계정·스케줄러에서 파일 오류·복구와 불명 경보의 중복 억제를 검증하고 모의 Slack·Resend 본문을 확인했다. 실제 Twilio·공급자 경보 수신 및 다중 호스트 HA는 미검증이다. 파일 상태는 공급자 토큰 일치나 이벤트 수신을 증명하지 않는다. [API README](apps/api/rust-api/README.md)와 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
