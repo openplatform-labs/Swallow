@@ -1195,7 +1195,7 @@ The HTTP fixture provisions `smtp_fixture_worker` without superuser privileges a
 
 Worker migration 0217 adds an **opt-in** PostgreSQL RLS mechanism for the SMTP worker's 11 shared tables. Applying the migration alone does not enable RLS. In a reviewed deployment window, a trusted table owner/DBA can call `SELECT public.novu_rust_install_smtp_scoped_rls();` once. The installer refuses any covered table that already has RLS or a policy and installs all policies transactionally; it can take table locks and add query overhead. Existing unregistered logins retain their prior row access. Do not use this installer over a separate RLS implementation.
 
-For a dedicated non-owner LOGIN, bootstrap the login's scoped registration and needed table privileges transactionally before starting it. For example, substituting values as SQL parameters or safely quoted identifiers:
+For a dedicated non-owner LOGIN, bootstrap the login's scoped registration and needed table privileges before starting it. Migration 0220 also provides the delegated CLI path below. For example, substituting values as SQL parameters or safely quoted identifiers:
 
 ```sql
 INSERT INTO public.novu_rust_smtp_scoped_logins(principal_oid,database_principal,environment_id)
@@ -1227,3 +1227,21 @@ GRANT EXECUTE ON FUNCTION public.novu_rust_smtp_scope_audit_read(text,bigint) TO
 With that login, run `delivery-reconcile smtp-scope-audit ENV [AFTER_ID]`; the cursor is a nonnegative decimal audit ID and the query returns up to 100 records in ID order. A change between environments is visible to authorized viewers of either side, but the other environment identifier is redacted. ID order is not a guaranteed commit order; concurrent transactions can commit out of order, so poll with overlap or use an independent audit export when complete collection matters. Registration audit does not cover role grants, RLS installation, policy changes or attempts by unauthorized users. Viewer grants themselves require trusted DBA administration.
 
 The local SMTP HTTP fixture verifies registration and disable audit, no-op updates, audit-write rollback, environment redaction, viewer separation and revocation, plus the CLI cursor. The synchronous promotion regression also passed with a scoped worker. Actual external auditing, role-administration audit, HTTP/UI access to these records, production concurrency and multi-host HA are not implemented or verified.
+
+### SMTP scope administration
+
+Worker migration 0220 provides optional environment-scoped database-login administration of SMTP scope registrations. A trusted DBA installs the RLS policies first, provisions the worker's database privileges separately, and grants a dedicated administrator read and/or write access for the environment. Grant only the functions that login needs. For example:
+
+```sql
+INSERT INTO public.novu_rust_smtp_scope_admins(environment_id,database_principal,principal_oid,can_read,can_write)
+SELECT 'ENVIRONMENT_ID',rolname,oid,true,true FROM pg_catalog.pg_roles WHERE rolname='SCOPE_ADMIN_LOGIN';
+GRANT EXECUTE ON FUNCTION public.novu_rust_smtp_scope_admin_read(text,text),
+ public.novu_rust_smtp_scope_admin_set(text,uuid,text,text,boolean,text),
+ public.novu_rust_smtp_scope_admin_request(text,uuid) TO SCOPE_ADMIN_LOGIN;
+```
+
+With that login, `delivery-reconcile smtp-scope-read ENV LOGIN` reports `absent`, `enabled` or `disabled` for an available target; `smtp-scope-set ENV REQUEST_ID LOGIN absent|enabled|disabled enabled|disabled REASON` creates or changes the registration conditionally; `smtp-scope-request ENV REQUEST_ID` recovers the caller's recorded request and reason. Replaying the same request ID and body returns its recorded result, while a different body or stale state fails. The function refuses self-change and an already registered login in another environment. Both enable and disable require the installed policies; enabling additionally rejects a target with privileged-role membership or ownership of a covered table. It does not grant or revoke the target's SQL privileges, verify every callable SECURITY DEFINER function, or install RLS. Scope changes still trigger the separate registration audit described above; request records retain the reason but are not linked to that audit by a shared ID. DBAs can bypass this path and administrator grants are themselves DBA-managed.
+
+Stop and drain workers before changing their privileges, role memberships or scope. An already reserved external request cannot be recalled; authorization and role checks occur at operation/connection time and cannot prevent a trusted DBA changing them later. Existing registrations are not assigned historical request records. Request lookup requires the same DB LOGIN and current write grant; lost responses should be reconciled before issuing a different request. There is no HTTP API or UI for this DB administration path yet, and external IdP, production load and multi-host HA are unverified.
+
+The local SMTP HTTP fixture tests restricted admin permissions, install prerequisites, self/cross-environment denial, privileged targets, concurrent identical request replay, conflicting bodies, stale state, audit-failure rollback, request lookup, revocation and real SMTP workflow recovery. This uses one local PostgreSQL instance and a mock relay. The separate scoped worker promotion regression ran with migration 0220 applied; it does not exercise the admin operation across failover.
