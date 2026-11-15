@@ -325,6 +325,7 @@ pub struct Alert {
     pub fcm_partial: Option<Result<u64, ()>>,
     pub fcm_unreviewed: Option<Result<u64, ()>>,
     pub fcm_cooldown: Option<Result<(bool,u64,u64), ()>>,
+    pub fcm_cooldown_source: Option<Option<u16>>,
     pub failed_jobs: Option<u64>,
     pub failed_jobs_check_failed: bool,
     pub database_probe: Option<(String, bool)>,
@@ -642,7 +643,18 @@ impl Alert {
             match result { Ok((pending,expired,blocked))=>details.push(format!("Twilio delayed retries overdue: {pending}; expired leases: {expired}; callback blocked: {blocked}")),Err(())=>details.push("Twilio delayed retry check failed".into()) }
         }
         if let Some(result)=self.fcm_cooldown {
-            match result {Ok((active,deferred,overdue))=>details.push(format!("FCM shared cooldown active: {active}; deferred jobs: {deferred}; overdue deferred jobs: {overdue}")),Err(())=>details.push("FCM shared cooldown check failed".into())}
+            match result {
+                Ok((active,deferred,overdue)) => {
+                    let suffix = match self.fcm_cooldown_source {
+                        Some(Some(429)) => "; deadline extended by HTTP 429",
+                        Some(Some(503)) => "; deadline extended by HTTP 503",
+                        Some(_) if active => "; deadline source unknown",
+                        _ => "",
+                    };
+                    details.push(format!("FCM shared cooldown active: {active}; deferred jobs: {deferred}; overdue deferred jobs: {overdue}{suffix}"));
+                }
+                Err(()) => details.push("FCM shared cooldown check failed".into()),
+            }
         }
         if let Some(result) = self.fcm_unreviewed {
             match result { Ok(count) => details.push(format!("unreviewed FCM partial jobs: {count}")), Err(()) => details.push("FCM unreviewed check failed".into()) }
@@ -1433,6 +1445,7 @@ mod tests {
             fcm_partial: None,
             fcm_unreviewed: None,
             fcm_cooldown: None,
+            fcm_cooldown_source: None,
             failed_jobs: None,
             failed_jobs_check_failed: false,
             database_probe: None,
@@ -1558,14 +1571,17 @@ mod tests {
     }
     #[tokio::test]
     async fn fcm_cooldown_alert_has_independent_v2_bits_and_both_destinations() {
-        let mut a=alert();a.resend_enabled=false;a.fcm_cooldown=Some(Ok((true,2,1)));
+        let mut a=alert();a.resend_enabled=false;a.fcm_cooldown=Some(Ok((true,2,1)));a.fcm_cooldown_source=Some(Some(503));
         assert_eq!(a.condition_mask_v2(),1_i64<<42);assert_ne!(a.observed_condition_mask_v2()&(1_i64<<42),0);
+        a.fcm_cooldown_source=Some(None);assert!(a.text().unwrap().contains("deadline source unknown"));
+        a.fcm_cooldown_source=Some(Some(429));assert!(a.text().unwrap().contains("deadline extended by HTTP 429"));
+        a.fcm_cooldown_source=Some(Some(503));
         let (url,server)=mock_server("200 OK","ok").await;let slack=SlackWebhook::with_endpoint(url).unwrap();
         let (email_url,email_server)=mock_server("200 OK",r#"{"id":"mock-email"}"#).await;
         let email=AlertEmailProvider::Resend(crate::resend::Resend::test_endpoint(crate::resend::Config{api_key:"re_test".into(),from:"sender@example.test".into(),sender_name:String::new()},email_url.as_str()).unwrap());
         let sent=send_uncoordinated_selected(&a,Some(&slack),Some((&email,"ops@example.test")),Duration::from_secs(2),false).await;
         assert_eq!(sent.0,Some(Ok(())));assert_eq!(sent.1,Some(Ok(())));
-        for payload in [server.await.unwrap(),email_server.await.unwrap()] {assert!(payload.contains("FCM shared cooldown active: true; deferred jobs: 2; overdue deferred jobs: 1"));}
+        for payload in [server.await.unwrap(),email_server.await.unwrap()] {assert!(payload.contains("FCM shared cooldown active: true; deferred jobs: 2; overdue deferred jobs: 1; deadline extended by HTTP 503"));}
         a.fcm_cooldown=Some(Err(()));assert_eq!(a.observed_condition_mask_v2()&(1_i64<<42),0);assert_ne!(a.condition_mask_v2()&(1_i64<<43),0);
     }
     #[test]
@@ -2399,6 +2415,7 @@ mod tests {
             fcm_partial: None,
             fcm_unreviewed: None,
             fcm_cooldown: None,
+            fcm_cooldown_source: None,
             failed_jobs: None,
             failed_jobs_check_failed: false,
             database_probe: None,

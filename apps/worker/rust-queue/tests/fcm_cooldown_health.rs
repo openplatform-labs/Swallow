@@ -14,12 +14,16 @@ fn cli(url: &str, env: &str) -> std::process::Output {
         .unwrap()
 }
 fn alert(url: &str, env: &str) -> std::process::Output {
+    alert_with_source(url, env, false)
+}
+fn alert_with_source(url: &str, env: &str, source: bool) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"))
         .env_clear()
         .env("DATABASE_URL", url)
         .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
         .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
         .env("SWALLOW_ALERT_FCM_COOLDOWN_GRACE_SECONDS", "60")
+        .env("SWALLOW_ALERT_FCM_COOLDOWN_SOURCE_ENABLED", if source { "true" } else { "false" })
         .env("SWALLOW_ALERT_SCOPED_DELIVERY", "true")
         .env(
             "SWALLOW_ALERT_SLACK_WEBHOOK",
@@ -115,9 +119,31 @@ async fn scoped_fcm_cooldown_health_reaches_alerts() {
     );
     assert!(String::from_utf8_lossy(&result.stderr).contains("requires operator review"));
     assert_eq!(alert_v2(role_url.as_str(), &env).status.code(), Some(2));
+    // Detail access is independently granted; failures must not masquerade as health.
+    let missing = alert_with_source(role_url.as_str(), &env, true);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("FCM cooldown check failed"));
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_fcm_cooldown_health_detail(text,integer) TO {role}")).await.unwrap();
+    db.execute("UPDATE public.novu_rust_fcm_cooldown_policies SET deadline_source=503,deadline_recorded_at=clock_timestamp() WHERE environment_id=$1", &[&env]).await.unwrap();
+    let (reader, reader_driver) = tokio_postgres::connect(role_url.as_str(),NoTls).await.unwrap();
+    tokio::spawn(async move { let _ = reader_driver.await; });
+    let details = queue::fcm_queue::cooldown_health_detail(&reader,&env,60).await.unwrap();
+    assert_eq!(details["deadlineSource"],503);
+    assert_eq!(alert_with_source(role_url.as_str(), &env, true).status.code(), Some(2));
+    assert!(queue::fcm_queue::cooldown_health_detail(&reader,&other,60).await.is_err());
+
     db.execute("DELETE FROM public.novu_rust_delivery_operator_grants WHERE environment_id=$1 AND database_principal=$2 AND decision='alert_view'",&[&env,&role]).await.unwrap();
     assert_eq!(cli(role_url.as_str(), &env).status.code(), Some(1));
     let result = alert(role_url.as_str(), &env);
     assert_eq!(result.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&result.stderr).contains("FCM cooldown check failed"));
+    assert!(queue::fcm_queue::cooldown_health_detail(&reader,&env,60).await.is_err());
+    assert_eq!(alert_with_source(role_url.as_str(), &env, true).status.code(), Some(1));
+    let invalid = Command::new(env!("CARGO_BIN_EXE_send-delivery-alert")).env_clear()
+        .env("DATABASE_URL", role_url.as_str()).env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .env("SWALLOW_ALERT_FCM_COOLDOWN_SOURCE_ENABLED", "true")
+        .env("SWALLOW_ALERT_SLACK_WEBHOOK", "https://hooks.slack.com/services/A/B/C")
+        .args([&env, "300", "120", "60"]).output().unwrap();
+    assert_eq!(invalid.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("requires the cooldown check"));
 }

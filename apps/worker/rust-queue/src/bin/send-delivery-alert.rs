@@ -177,6 +177,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         _ => return Err("invalid FCM credential alert thresholds".into()),
     };
     let fcm_cooldown_grace=env_optional_i32("SWALLOW_ALERT_FCM_COOLDOWN_GRACE_SECONDS")?;
+    let fcm_cooldown_source_enabled=env_bool("SWALLOW_ALERT_FCM_COOLDOWN_SOURCE_ENABLED",false)?;
+    if fcm_cooldown_source_enabled && fcm_cooldown_grace.is_none() { return Err("FCM cooldown source requires the cooldown check".into()); }
     if fcm_cooldown_grace.is_some_and(|v|!(1..=86400).contains(&v)) || (fcm_cooldown_grace.is_some() && on_new_condition && !conditions_v2) {return Err("FCM cooldown check requires a valid threshold and v2 conditions for new-condition policy".into());}
     let fcm_unreviewed_enabled=env_bool("SWALLOW_ALERT_FCM_UNREVIEWED_ENABLED",false)?;
     if fcm_unreviewed_enabled && on_new_condition && !conditions_v2 {return Err("FCM unreviewed check requires v2 conditions for new-condition policy".into());}
@@ -548,9 +550,20 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         let result=tokio::time::timeout(operation_timeout,reconciliation::fcm_unreviewed_health(&db,&args[0])).await;
         Some(match result {Ok(Ok(n)) if n>=0=>Ok(n as u64),_=>{eprintln!("FCM unreviewed check failed");Err(())}})
     } else {None};
+    let mut fcm_cooldown_source=None;
     let fcm_cooldown=if let Some(grace)=fcm_cooldown_grace {
-        let result=tokio::time::timeout(operation_timeout,novu_postgres_queue::fcm_queue::cooldown_health(&db,&args[0],grace)).await;
-        let values=result.ok().and_then(Result::ok).and_then(|v|Some((v["active"].as_bool()?,v["deferred"].as_u64()?,v["overdue"].as_u64()?)));
+        let result = if fcm_cooldown_source_enabled {
+            tokio::time::timeout(operation_timeout,novu_postgres_queue::fcm_queue::cooldown_health_detail(&db,&args[0],grace)).await
+        } else {
+            tokio::time::timeout(operation_timeout,novu_postgres_queue::fcm_queue::cooldown_health(&db,&args[0],grace)).await
+        };
+        let values=result.ok().and_then(Result::ok).and_then(|v| {
+            if fcm_cooldown_source_enabled {
+                let source = match &v["deadlineSource"] { serde_json::Value::Null => None, serde_json::Value::Number(n) => match n.as_u64()? {429=>Some(429),503=>Some(503),_=>return None}, _=>return None };
+                fcm_cooldown_source=Some(source);
+            }
+            Some((v["active"].as_bool()?,v["deferred"].as_u64()?,v["overdue"].as_u64()?))
+        });
         Some(match values {Some(value)=>Ok(value),None=>{eprintln!("FCM cooldown check failed");Err(())}})
     } else {None};
     let unhealthy = fcm_credentials.is_some_and(|value| match value {
@@ -610,6 +623,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         fcm_partial,
         fcm_unreviewed,
         fcm_cooldown,
+        fcm_cooldown_source,
         failed_jobs,
         failed_jobs_check_failed,
         database_probe: None,
