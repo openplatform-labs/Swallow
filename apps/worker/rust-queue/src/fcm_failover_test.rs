@@ -67,8 +67,6 @@ async fn synchronous_failover_during_fcm_dispatch_preserves_unknown() {
     let primary_url = std::env::var("TEST_PRIMARY_URL").unwrap();
     let standby_url = std::env::var("TEST_STANDBY_URL").unwrap();
     let cluster_url = std::env::var("TEST_FAILOVER_URL").unwrap();
-    let primary = std::env::var("TEST_PRIMARY_CONTAINER").unwrap();
-    let standby = std::env::var("TEST_STANDBY_CONTAINER").unwrap();
     let db = connect(&primary_url).await;
     db.batch_execute("INSERT INTO public.novu_rust_environments VALUES ('fcm-ha','org'); INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES ('fcm-ha','alice','subscriber','{}')").await.unwrap();
     let job = Uuid::new_v4();
@@ -150,32 +148,55 @@ async fn synchronous_failover_during_fcm_dispatch_preserves_unknown() {
         replicated,
         "in-flight attempt must reach the synchronous replica"
     );
-    assert!(
-        Command::new("docker")
-            .args(["kill", &primary])
-            .stdout(Stdio::null())
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(
-        Command::new("docker")
-            .args([
-                "exec",
-                "-u",
-                "postgres",
-                &standby,
-                "pg_ctl",
-                "promote",
-                "-D",
-                "/var/lib/postgresql/data",
-                "-w"
-            ])
-            .stdout(Stdio::null())
-            .status()
-            .unwrap()
-            .success()
-    );
+    if let Ok(pgctl) = std::env::var("TEST_LOCAL_PG_CTL") {
+        let primary = std::env::var("TEST_LOCAL_PRIMARY_DATA").unwrap();
+        let standby = std::env::var("TEST_LOCAL_STANDBY_DATA").unwrap();
+        assert!(
+            Command::new(&pgctl)
+                .args(["-D", &primary, "-m", "immediate", "stop"])
+                .stdout(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new(&pgctl)
+                .args(["-D", &standby, "promote", "-w"])
+                .stdout(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+    } else {
+        let primary = std::env::var("TEST_PRIMARY_CONTAINER").unwrap();
+        let standby = std::env::var("TEST_STANDBY_CONTAINER").unwrap();
+        assert!(
+            Command::new("docker")
+                .args(["kill", &primary])
+                .stdout(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("docker")
+                .args([
+                    "exec",
+                    "-u",
+                    "postgres",
+                    &standby,
+                    "pg_ctl",
+                    "promote",
+                    "-D",
+                    "/var/lib/postgresql/data",
+                    "-w"
+                ])
+                .stdout(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
     let promoted = connect(&standby_url).await;
     release_tx.send(()).unwrap();
     server.await.unwrap();
