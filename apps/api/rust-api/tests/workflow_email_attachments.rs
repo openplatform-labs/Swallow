@@ -15,18 +15,35 @@ static QUEUE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 #[ignore = "requires fully migrated disposable PostgreSQL"]
 async fn trigger_lookup_is_environment_scoped_and_distinguishes_missing_jobs() {
     let _guard=QUEUE_TEST_LOCK.lock().await;let url=std::env::var("TEST_DATABASE_URL").unwrap();
-    let (db,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(async move{driver.await.unwrap()});
+    let (mut db,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(async move{driver.await.unwrap()});
     db.batch_execute("INSERT INTO public.novu_rust_users VALUES ('lookup-user'); INSERT INTO public.novu_rust_environments VALUES ('lookup-a','org'),('lookup-b','org'); INSERT INTO public.novu_rust_trigger_transactions(environment_id,transaction_id) VALUES ('lookup-a','fixture-txn'); INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) VALUES ('11111111-1111-4111-8111-111111111111','lookup-a','experimental_static_in_app','{\"transactionId\":\"fixture-txn\",\"secret\":\"hidden\"}')").await.unwrap();
     for (env,key) in [("lookup-a","key-a"),("lookup-b","key-b")] {let hash=format!("{:x}",Sha256::digest(key.as_bytes()));db.execute("INSERT INTO public.novu_rust_api_keys(key_hash,environment_id,user_id) VALUES($1,$2,'lookup-user')",&[&hash,&env]).await.unwrap();}
     db.execute("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) VALUES ('33333333-3333-4333-8333-333333333333','lookup-a','experimental_static_in_app',jsonb_build_object('transactionId',repeat('x',10000)))",&[]).await.unwrap();
     let (api,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(async move{driver.await.unwrap()});let router=novu_rust_api::router(Arc::new(api));
     let request=|key:&str,query:&str| Request::builder().uri(format!("/v1/experimental/workflow-trigger-result?{query}")).header("authorization",format!("ApiKey {key}")).body(Body::empty()).unwrap();
+    let role=format!("lookup_api_{}",uuid::Uuid::new_v4().simple());
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT SELECT ON public.novu_rust_api_keys,public.novu_rust_users TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_api_trigger_lookup(text,text,text) TO {role}")).await.unwrap();
+    let restricted_url=url.replacen("postgres://postgres@",&format!("postgres://{role}@"),1);let (restricted,driver)=tokio_postgres::connect(&restricted_url,NoTls).await.unwrap();tokio::spawn(async move{driver.await.unwrap()});
+    assert!(restricted.query("SELECT * FROM public.novu_queue_jobs",&[]).await.is_err());assert!(restricted.execute("UPDATE public.novu_rust_api_keys SET enabled=false",&[]).await.is_err());let restricted_router=novu_rust_api::router(Arc::new(restricted));
+    assert_eq!(restricted_router.clone().oneshot(request("key-a","transactionId=fixture-txn")).await.unwrap().status(),StatusCode::OK);
     let response=router.clone().oneshot(request("key-a","transactionId=fixture-txn")).await.unwrap();assert_eq!(response.status(),StatusCode::OK);assert_eq!(response.headers()["cache-control"],"no-store");let body:Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),1024*16).await.unwrap()).unwrap();assert_eq!(body,json!({"data":{"transactionId":"fixture-txn","recorded":true,"jobCount":1,"job":{"jobId":"11111111-1111-4111-8111-111111111111","jobStatus":"pending"}}}));
     let response=router.clone().oneshot(request("key-b","transactionId=fixture-txn")).await.unwrap();let body:Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),1024*16).await.unwrap()).unwrap();assert_eq!(body["data"],json!({"transactionId":"fixture-txn","recorded":false,"jobCount":0,"job":null}));
     db.execute("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) VALUES ('22222222-2222-4222-8222-222222222222','lookup-a','experimental_static_in_app','{\"transactionId\":\"fixture-txn\"}')",&[]).await.unwrap();
     let response=router.clone().oneshot(request("key-a","transactionId=fixture-txn")).await.unwrap();let body:Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),1024*16).await.unwrap()).unwrap();assert_eq!(body["data"],json!({"transactionId":"fixture-txn","recorded":true,"jobCount":2,"job":null}));
     assert_eq!(router.clone().oneshot(request("bad-key","transactionId=fixture-txn")).await.unwrap().status(),StatusCode::UNAUTHORIZED);
     assert_eq!(router.clone().oneshot(request("key-a","transactionId=fixture-txn&transactionId=fixture-txn")).await.unwrap().status(),StatusCode::BAD_REQUEST);
+    let (observer,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(async move{driver.await.unwrap()});
+    for commit in [false,true] {
+        let tx=db.transaction().await.unwrap();tx.execute("UPDATE public.novu_rust_api_keys SET enabled=false WHERE environment_id='lookup-a'",&[]).await.unwrap();
+        let pending=tokio::spawn(restricted_router.clone().oneshot(request("key-a","transactionId=fixture-txn")));
+        let mut waiting=false;for _ in 0..100 {waiting=observer.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%novu_rust_api_trigger_lookup%')",&[]).await.unwrap().get(0);if waiting {break}tokio::time::sleep(std::time::Duration::from_millis(20)).await;}assert!(waiting);
+        if commit {tx.commit().await.unwrap();assert_eq!(pending.await.unwrap().unwrap().status(),StatusCode::UNAUTHORIZED);} else {tx.rollback().await.unwrap();assert_eq!(pending.await.unwrap().unwrap().status(),StatusCode::OK);}
+    }
+    db.execute("UPDATE public.novu_rust_api_keys SET enabled=true WHERE environment_id='lookup-a'",&[]).await.unwrap();
+    let tx=db.transaction().await.unwrap();tx.execute("DELETE FROM public.novu_rust_users WHERE id='lookup-user'",&[]).await.unwrap();
+    let pending=tokio::spawn(restricted_router.clone().oneshot(request("key-a","transactionId=fixture-txn")));
+    let mut waiting=false;for _ in 0..100 {waiting=observer.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%novu_rust_api_trigger_lookup%')",&[]).await.unwrap().get(0);if waiting {break}tokio::time::sleep(std::time::Duration::from_millis(20)).await;}assert!(waiting);tx.commit().await.unwrap();assert_eq!(pending.await.unwrap().unwrap().status(),StatusCode::UNAUTHORIZED);
+    db.execute("INSERT INTO public.novu_rust_users VALUES('lookup-user')",&[]).await.unwrap();
     db.execute("DELETE FROM public.novu_queue_jobs WHERE environment_id='lookup-a'",&[]).await.unwrap();
     let response=router.clone().oneshot(request("key-a","transactionId=fixture-txn")).await.unwrap();let body:Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),1024*16).await.unwrap()).unwrap();assert_eq!(body["data"],json!({"transactionId":"fixture-txn","recorded":true,"jobCount":0,"job":null}));
     db.execute("DELETE FROM public.novu_rust_trigger_transactions WHERE environment_id='lookup-a'",&[]).await.unwrap();

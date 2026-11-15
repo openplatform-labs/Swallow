@@ -3682,14 +3682,17 @@ async fn workflow_trigger_result(
         [(key,value)] if key=="transactionId" && !value.is_empty() && value.len()<=512 && !value.chars().any(char::is_control) => value,
         _ => return error_at(StatusCode::BAD_REQUEST,"Invalid transaction ID","Bad Request",path).into_response(),
     };
-    let row=match db.query_one("SELECT EXISTS(SELECT 1 FROM public.novu_rust_trigger_transactions t WHERE t.environment_id=$1 AND t.transaction_id=$2),COALESCE((SELECT jsonb_agg(jsonb_build_object('jobId',x.id,'jobStatus',x.status)) FROM (SELECT id,status FROM public.novu_queue_jobs WHERE environment_id=$1 AND kind IN ('experimental_static_in_app','experimental_static_in_app_attachments_v1') AND md5(payload->>'transactionId')=md5($2) AND payload->>'transactionId'=$2 ORDER BY id LIMIT 2) x),'[]'::jsonb)",&[&environment,&transaction]).await {
+    // Recheck and lock the exact key and user in the same statement as the
+    // read, so a concurrent committed revocation cannot leak a later result.
+    let key=headers.get("authorization").and_then(|v|v.to_str().ok()).and_then(|v|v.strip_prefix("ApiKey ")).expect("authenticate validated key");
+    let hash=format!("{:x}",Sha256::digest(key.as_bytes()));
+    let row=match db.query_one("SELECT public.novu_rust_api_trigger_lookup($1,$2,$3)",&[&hash,&environment,&transaction]).await {
         Ok(row)=>row,
         Err(_)=>return error_at(StatusCode::INTERNAL_SERVER_ERROR,"Internal server error","Internal Server Error",path).into_response(),
     };
-    let jobs:Value=row.get(1);
-    let items=jobs.as_array().expect("query returns array");
-    let single=if items.len()==1 {items.first().cloned()} else {None};
-    (StatusCode::OK,[(axum::http::header::CACHE_CONTROL,"no-store")],Json(json!({"data":{"transactionId":transaction,"recorded":row.get::<_,bool>(0),"jobCount":items.len(),"job":single}}))).into_response()
+    let result:Option<Value>=row.get(0);
+    let Some(result)=result else {return error_at(StatusCode::UNAUTHORIZED,"Unauthorized","Unauthorized",path).into_response();};
+    (StatusCode::OK,[(axum::http::header::CACHE_CONTROL,"no-store")],Json(json!({"data":result}))).into_response()
 }
 
 async fn trigger(
