@@ -13,8 +13,9 @@ const privateKey=await importPKCS8(privatePem,'RS256');
 const jwk=await exportJWK(await importSPKI(publicPem,'RS256'));
 Object.assign(jwk,{kid:'key',use:'sig',alg:'RS256'});
 const codes=new Map(),refreshTokens=new Map(),accessTokens=new Set();
-let revokedCount=0,lastRevoked=null,revokedAccessCount=0,redirectLeaks=0,tokenAttempts=0;
-let redirectToken=process.env.SWALLOW_TEST_OIDC_TOKEN_REDIRECT==='true';
+let revokedCount=0,lastRevoked=null,revokedAccessCount=0,redirectLeaks=0,crossOriginLeaks=0,tokenAttempts=0;
+let redirectToken=process.env.SWALLOW_TEST_OIDC_TOKEN_REDIRECT==='true', redirectStatus=307;
+const crossOriginRedirect=process.env.SWALLOW_TEST_OIDC_CROSS_REDIRECT==='true';
 const refreshEnabled=process.env.SWALLOW_TEST_OIDC_REFRESH==='true';
 const lifetime=refreshEnabled ? Number(process.env.SWALLOW_TEST_OIDC_LIFETIME||9) : 600;
 if(!Number.isInteger(lifetime)||lifetime<3||lifetime>600)throw new Error('invalid test lifetime');
@@ -30,8 +31,9 @@ const server=createServer(async(req,res)=>{
     json({issuer,authorization_endpoint:`${issuer}/authorize`,token_endpoint:`${issuer}/token`,jwks_uri:`${issuer}/jwks`,...(refreshEnabled?{revocation_endpoint:`${issuer}/revoke`}:{}),response_types_supported:['code'],subject_types_supported:['public'],id_token_signing_alg_values_supported:['RS256'],code_challenge_methods_supported:['S256'],token_endpoint_auth_methods_supported:['none']});return;
   }
   if(req.method==='GET' && url.pathname==='/jwks'){json({keys:[jwk]});return;}
-  if(req.method==='POST' && url.pathname==='/fixture/token-redirect'){redirectToken=url.searchParams.get('enabled')==='true';json({enabled:redirectToken});return;}
-  if(req.method==='GET' && url.pathname==='/fixture/redirect-observations'){json({attempts:tokenAttempts,leaks:redirectLeaks});return;}
+  if(req.method==='POST' && url.pathname==='/fixture/token-redirect'){const status=url.searchParams.get('status')||'307';if(!['307','308'].includes(status)){json({error:'invalid_status'},400);return;}redirectStatus=Number(status);redirectToken=url.searchParams.get('enabled')==='true';json({enabled:redirectToken,status:redirectStatus});return;}
+  if(req.method==='POST' && url.pathname==='/fixture/reset-observations'){tokenAttempts=0;redirectLeaks=0;crossOriginLeaks=0;json({reset:true});return;}
+  if(req.method==='GET' && url.pathname==='/fixture/redirect-observations'){json({attempts:tokenAttempts,leaks:redirectLeaks,crossOriginLeaks});return;}
   if(req.method==='POST' && url.pathname==='/fixture/token-leak'){redirectLeaks++;json({error:'unexpected_redirect'},400);return;}
   if(req.method==='GET' && url.pathname==='/fixture/revocation-count'){json({count:revokedCount,accessCount:revokedAccessCount});return;}
   if(req.method==='GET' && url.pathname==='/fixture/replay-revoked'){
@@ -56,7 +58,7 @@ const server=createServer(async(req,res)=>{
   }
   if(req.method==='POST' && url.pathname==='/token'){
     tokenAttempts++;
-    if(redirectToken){res.writeHead(307,{Location:`${issuer}/fixture/token-leak`}).end();return;}
+    if(redirectToken){res.writeHead(redirectStatus,{Location:crossOriginRedirect?'http://127.0.0.1:4252/fixture/token-leak':`${issuer}/fixture/token-leak`}).end();return;}
     let raw='';for await(const chunk of req){raw+=chunk;if(raw.length>8192){json({error:'invalid_request'},400);return;}}
     const p=new URLSearchParams(raw);
     if(p.get('grant_type')==='refresh_token'){
@@ -78,3 +80,15 @@ const server=createServer(async(req,res)=>{
   json({error:'not_found'},404);
 });
 server.listen(4251,'127.0.0.1',()=>console.log('Test OIDC issuer listening on 127.0.0.1:4251'));
+
+// A separate loopback origin observes redirects without logging request bodies.
+if(crossOriginRedirect){
+  createServer((req,res)=>{
+    res.setHeader('Access-Control-Allow-Origin',origin);
+    res.setHeader('Access-Control-Allow-Methods','POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers','Content-Type');
+    if(req.method==='OPTIONS'){res.writeHead(204).end();return;}
+    if(req.method==='POST' && req.url==='/fixture/token-leak'){crossOriginLeaks++;req.resume();res.writeHead(400,{'Content-Type':'application/json'}).end('{"error":"unexpected_redirect"}');return;}
+    res.writeHead(404).end();
+  }).listen(4252,'127.0.0.1',()=>console.log('Cross-origin test receiver listening on 127.0.0.1:4252'));
+}
