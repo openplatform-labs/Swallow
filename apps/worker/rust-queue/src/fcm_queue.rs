@@ -1046,12 +1046,7 @@ async fn process_one_inner(
             return Ok(true);
         }
     }
-    if (policy != crate::push_step_policy::Policy::Snapshot
-        || preference_policy == crate::push_step_policy::PreferencePolicy::Recheck
-        || target_policy == crate::push_step_policy::TargetPolicy::Registered
-        || unavailable_policy == UnavailablePolicy::Exponential)
-        && !lock_live(&tx, &job).await?
-    {
+    if !lock_live(&tx, &job).await? {
         tx.rollback().await?;
         return Ok(true);
     }
@@ -1075,6 +1070,10 @@ async fn process_one_inner(
     tx.execute("INSERT INTO novu_rust_fcm_attempts(job_id,environment_id,target_index,state) VALUES ($1,$2,$3,'dispatching')",&[&job.id,&environment,&index_i32]).await?;
     if prepared_context.is_some() {
         tx.execute("UPDATE novu_rust_push_messages SET delivery_state=CASE WHEN delivery_state='unknown' THEN 'unknown' ELSE 'dispatching' END WHERE environment_id=$1 AND push_job_id=$2 AND target_index=$3", &[&environment,&job.id,&history_index]).await?;
+    }
+    if !lock_live(&tx, &job).await? {
+        tx.rollback().await?;
+        return Ok(true);
     }
     tx.commit().await?;
     let result = selected_provider.send_wire(&messages[index]).await;
@@ -1595,6 +1594,42 @@ mod tests {
             Fcm::with_origin("demo", "fixture".into(), &origin).unwrap(),
             server,
         )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires migrated disposable PostgreSQL and loopback"]
+    async fn expired_lease_during_preparation_does_not_reserve_or_send() {
+        let (mut db, driver) = tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(), NoTls).await.unwrap();
+        tokio::spawn(async move { driver.await.unwrap() });
+        let environment = format!("fcm-expired-{}", Uuid::new_v4());
+        db.execute("INSERT INTO novu_rust_environments VALUES ($1,'org')", &[&environment]).await.unwrap();
+        db.execute("INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id) VALUES ($1,'alice','alice-id')", &[&environment]).await.unwrap();
+        let job = Uuid::new_v4();
+        let metadata = json!({"message_id":"message-id","device_tokens":["target"],"history_index":0,"group_size":1});
+        let payload = json!({"prepared_messages":[{"message":{"token":"target","notification":{"title":"title","body":"content"}}}],"prepared_context":{"subscriber_id":"alice","subscriber_internal_id":"alice-id","notification_internal_id":"notification","workflow_identifier":"wf","transaction_id":"txn","title":"title","content":"content","target_metadata":[metadata]}});
+        crate::enqueue(&db, job, &environment, JOB_KIND, &payload).await.unwrap();
+        // Simulate expiration while the transaction is preparing a history row.
+        db.batch_execute("CREATE FUNCTION public.test_expire_fcm_lease() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN UPDATE public.novu_queue_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=NEW.push_job_id; RETURN NEW; END $$; CREATE TRIGGER test_expire_fcm_lease BEFORE INSERT ON public.novu_rust_push_messages FOR EACH ROW EXECUTE FUNCTION public.test_expire_fcm_lease() ").await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider = Fcm::with_origin("demo", "fixture".into(), &format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        assert!(process_one(&mut db, &environment, &provider).await.unwrap());
+        assert!(tokio::time::timeout(Duration::from_millis(200), listener.accept()).await.is_err());
+        let row = db.query_one("SELECT status,(SELECT count(*) FROM novu_rust_fcm_attempts WHERE job_id=$1),(SELECT count(*) FROM novu_rust_push_messages WHERE push_job_id=$1) FROM novu_queue_jobs WHERE id=$1", &[&job]).await.unwrap();
+        assert_eq!(row.get::<_,String>(0), "running");
+        assert_eq!(row.get::<_,i64>(1), 0);
+        assert_eq!(row.get::<_,i64>(2), 0);
+        db.batch_execute("DROP TRIGGER test_expire_fcm_lease ON public.novu_rust_push_messages; DROP FUNCTION public.test_expire_fcm_lease()").await.unwrap();
+        db.execute("UPDATE novu_queue_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1", &[&job]).await.unwrap();
+        assert_eq!(recover_expired(&mut db, &environment).await.unwrap(), 1);
+        assert_eq!(db.query_one("SELECT status FROM novu_queue_jobs WHERE id=$1", &[&job]).await.unwrap().get::<_,String>(0), "pending");
+        db.batch_execute("CREATE FUNCTION public.test_expire_fcm_attempt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN UPDATE public.novu_queue_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=NEW.job_id; RETURN NEW; END $$; CREATE TRIGGER test_expire_fcm_attempt BEFORE INSERT ON public.novu_rust_fcm_attempts FOR EACH ROW EXECUTE FUNCTION public.test_expire_fcm_attempt()").await.unwrap();
+        assert!(process_one(&mut db, &environment, &provider).await.unwrap());
+        assert!(tokio::time::timeout(Duration::from_millis(200), listener.accept()).await.is_err());
+        let row = db.query_one("SELECT status,(SELECT count(*) FROM novu_rust_fcm_attempts WHERE job_id=$1),(SELECT count(*) FROM novu_rust_push_messages WHERE push_job_id=$1) FROM novu_queue_jobs WHERE id=$1", &[&job]).await.unwrap();
+        assert_eq!(row.get::<_,String>(0), "running");
+        assert_eq!(row.get::<_,i64>(1), 0);
+        assert_eq!(row.get::<_,i64>(2), 0);
+        db.batch_execute("DROP TRIGGER test_expire_fcm_attempt ON public.novu_rust_fcm_attempts; DROP FUNCTION public.test_expire_fcm_attempt()").await.unwrap();
     }
 
     #[tokio::test]
