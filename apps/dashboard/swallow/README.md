@@ -460,4 +460,4 @@ The existing operator grant screen can delegate and revoke SMTP transport policy
 
 설정 화면에서 운영자는 SMTP의 결과 불명 발송에 대한 자동 재시도를 선택하고 횟수, 대기 시간 및 대상 시작 시각을 정할 수 있다. 기본 비활성 정책과 별도 권한이 필요하며, 과거 실패 전체를 선택하면 이전에 수락된 메일까지 다시 전송될 수 있다. 변경은 사유와 확인을 요구하고 요청 ID, 정책 감사 및 재시도 이력을 조회한다. 이력은 재시도 예약 기록이며 실제 전달 완료의 증거가 아니다. 권한과 데이터베이스 설정은 [API README](../../api/rust-api/README.md)를 참고한다.
 
-정책 화면의 기본 변경 확인, 이력 페이지 이동 및 권한 거절은 모의 API를 이용한 Angular 테스트로 확인한다. 격리 PostgreSQL, 제한된 API DB 로그인, 테스트 JWT 및 실제 Rust API를 사용하는 jsdom 통합 테스트에서 정책 조회·확인·변경·요청 조회·감사와 재시도 이력을 확인했다. `TEST_PG_BIN=/opt/homebrew/opt/postgresql@17/bin scripts/test-smtp-transport-component-local.sh`로 재현한다. 실제 브라우저 검사, 실제 SMTP 발송과 연계된 이력 확인, 외부 IdP 및 운영 HA 검증은 아직 수행하지 않았다. 권한 위임 UI는 미구현이다.
+정책 화면의 기본 변경 확인, 이력 페이지 이동 및 권한 거절은 모의 API를 이용한 Angular 테스트로 확인한다. 격리 PostgreSQL, 제한된 API DB 로그인, 테스트 JWT 및 실제 Rust API를 사용하는 jsdom 통합 테스트에서 정책 조회·확인·변경·요청 조회·감사와 재시도 이력을 확인했다. `TEST_PG_BIN=/opt/homebrew/opt/postgresql@17/bin scripts/test-smtp-transport-component-local.sh`로 재현한다. 실제 브라우저 검사, 실제 SMTP 발송과 연계된 이력 확인, 외부 IdP 및 운영 HA 검증은 아직 수행하지 않았다. 권한 위임 API는 별도 관리자 권한을 통해 제공되며, 권한 위임 UI는 미구현이다.
