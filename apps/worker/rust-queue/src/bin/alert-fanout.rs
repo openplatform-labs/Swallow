@@ -170,10 +170,35 @@ impl Target {
     }
 }
 fn read_config(path: &str) -> Result<Config> {
+    let regular_only = match std::env::var("SWALLOW_ALERT_FANOUT_CONFIG_REGULAR_ONLY").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid alert configuration file policy".into()),
+    };
+    let file = if regular_only {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let file = options
+            .open(path)
+            .map_err(|_| "alert configuration unavailable")?;
+        if !file
+            .metadata()
+            .map_err(|_| "alert configuration unavailable")?
+            .is_file()
+        {
+            return Err("invalid alert configuration file type".into());
+        }
+        file
+    } else {
+        File::open(path).map_err(|_| "alert configuration unavailable")?
+    };
     let mut raw = Vec::new();
-    File::open(path)
-        .map_err(|_| "alert configuration unavailable")?
-        .take(65_537)
+    file.take(65_537)
         .read_to_end(&mut raw)
         .map_err(|_| "alert configuration unavailable")?;
     if raw.len() > 65_536 {

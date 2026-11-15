@@ -1,5 +1,7 @@
 ## Slack 공유 대기 상태 조회와 경보
 
+- 경보 대상 설정 파일 보호: `SWALLOW_ALERT_FANOUT_CONFIG_REGULAR_ONLY=true`를 선택하면 Unix에서 FIFO 등을 읽기 전에 거절해 경보 스케줄러가 설정 입력을 기다리며 멈추는 상황을 줄인다. 실제 fanout 프로세스에서 FIFO·디렉터리 거절, 일반 파일 심볼릭 링크 및 기존 FIFO 입력 동작을 확인했다. 느린 일반 파일 시스템과 실제 외부 경보 수신은 이 시험의 범위 밖이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
 - API 전체 연결 준비 상태: `SWALLOW_API_READY_CONNECTION_POLICY=all`을 선택하면 설정된 모든 DB 연결이 준비 검사를 통과해야 한다. 쓰기 가능 검사와 함께 사용하면 읽기 전용 연결 하나만 있어도 503이며, 용량 검사와 함께 사용하면 연결 하나의 포화도 503이 된다. 임시 PostgreSQL의 실제 주 서버·대기 서버를 각각 연결하는 테스트 프록시, 누락 연결 및 포화 요청으로 확인했다. 최초 혼합 연결 시험은 동기식 테스트 요청이 프록시 실행을 막아 중단했고 비동기로 수정 후 통과했다. 이 정책은 요청 전달 자체나 분리된 주 서버를 차단하지 않으며 실제 운영 HA는 미검증이다. [API README](apps/api/rust-api/README.md)를 참고한다.
 
 - API 쓰기 가능 준비 상태: `SWALLOW_API_READY_REQUIRE_WRITABLE=true`를 선택하면 PostgreSQL 복제 중이거나 세션이 읽기 전용인 연결은 준비 상태에서 제외한다. 임시 PostgreSQL 17의 읽기 전용 세션과 실제 로컬 복제본 승격 전후를 시험했다. 처음 테스트 실행은 별도의 복제본 환경 변수가 필요한 시험까지 함께 실행해 실패했으며, 각 시험을 분리해 재실행했다. 판정은 순간 상태이며 쓰기 권한·스키마 검증, 분리된 주 서버 차단이나 모든 연결의 쓰기 가능성을 보장하지 않는다. 운영 로드밸런서·다중 호스트 HA는 미검증이다. 설정과 재현 조건은 [API README](apps/api/rust-api/README.md)를 참고한다.

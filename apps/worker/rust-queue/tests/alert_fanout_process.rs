@@ -377,3 +377,81 @@ fn target_timeout_kills_stalled_child_and_continues_other_destinations() {
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn configuration_file_policy_rejects_fifo_and_accepts_regular_symlinks() {
+    use std::{
+        io::Write,
+        os::unix::fs::symlink,
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+    let dir = std::env::temp_dir().join(format!("swallow-fanout-config-{}", Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let fanout = dir.join("alert-fanout");
+    std::fs::copy(env!("CARGO_BIN_EXE_alert-fanout"), &fanout).unwrap();
+    let child = dir.join("send-delivery-alert");
+    std::fs::write(
+        &child,
+        "#!/bin/sh\nprintf called >> \"$FANOUT_TEST_LOG\"\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(child, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let target = serde_json::json!({"targets":[{"channel":"slack","id":"ops","webhook_file":dir.join("fixture-key")}]});
+    let bytes = serde_json::to_vec(&target).unwrap();
+    let config = dir.join("targets.json");
+    std::fs::write(&config, &bytes).unwrap();
+    let link = dir.join("linked.json");
+    symlink(&config, &link).unwrap();
+    let fifo = dir.join("target-fifo");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let log = dir.join("invocations");
+    let run = |path: &std::path::Path, policy: &str| {
+        let mut child = Command::new(&fanout)
+            .args(["delivery", "env", "300", "120", "60"])
+            .arg(path)
+            .env("SWALLOW_ALERT_FANOUT_CONFIG_REGULAR_ONLY", policy)
+            .env("FANOUT_TEST_LOG", &log)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(result) = child.try_wait().unwrap() {
+                break result;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("fanout stalled reading configuration");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    assert!(!run(&fifo, "true").success());
+    assert!(!run(&dir, "true").success());
+    assert!(!run(&config, "invalid").success());
+    assert!(!log.exists());
+    assert!(run(&link, "true").success());
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "called");
+    let writer_path = fifo.clone();
+    let writer = std::thread::spawn(move || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(writer_path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+    });
+    assert!(run(&fifo, "false").success());
+    writer.join().unwrap();
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "calledcalled");
+    std::fs::remove_dir_all(dir).unwrap();
+}
