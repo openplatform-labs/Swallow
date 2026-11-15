@@ -1,6 +1,12 @@
+## Slack 지연 재시도 JWT API
+
+API 0097은 `POST /v1/experimental/operator/slack-retry-after`로 Slack 429의 권장 시각 이후 재시도를 요청한다. 기존 Slack JWT `retry`와 API DB `slack_retry` 권한을 사용하며 즉시·지연 권한을 별도로 나누지는 않는다. 동일 운영자·환경의 요청 ID 공간을 기존 즉시 판정과 공유해 다른 내용의 재사용을 거절하고, 동일 요청 재제출과 기존 판정 요청 조회에 예약 시각을 제공한다. 워커 0171의 시도 확인·감사·예약과 요청 기록이 원자적으로 처리된다. Angular 판정 화면은 아직 이 경로를 지원하지 않는다.
+
+임시 PostgreSQL 17·제한 DB 로그인·시험 JWT에서 권한, 시도 ID, 재제출, 즉시 요청과 ID 충돌, 감사 실패 롤백 및 권한 회수와 기존 Slack 판정 회귀를 검증했다. 로컬 HTTP 서버에서도 지연 예약·재제출·조회가 통과했다. 실제 Slack 429·외부 IdP·운영 HA와 실제 네트워크 단절은 미검증이다. [API README](apps/api/rust-api/README.md)를 참고한다.
+
 ## Slack 429 선택형 지연 재시도
 
-워커 0171과 `delivery-reconcile slack-retry-after`는 운영자가 현재 Slack 429 시도 ID와 유효한 `Retry-After`를 확인한 뒤 권장 시각 이후 재시도를 예약하도록 한다. 앱·웹훅·워크플로 발송에 적용되며 기존 즉시 재시도도 유지한다. 환경별 `slack_retry`와 새 함수 EXECUTE가 필요하다. 시도·작업 잠금 아래 큐 상태와 원래 권장 시각을 감사에 함께 기록한다. 이 경로는 현재 CLI 전용이고 JWT API·Angular 화면 연결은 남아 있다.
+워커 0171과 `delivery-reconcile slack-retry-after`는 운영자가 현재 Slack 429 시도 ID와 유효한 `Retry-After`를 확인한 뒤 권장 시각 이후 재시도를 예약하도록 한다. 앱·웹훅·워크플로 발송에 적용되며 기존 즉시 재시도도 유지한다. 환경별 `slack_retry`와 새 함수 EXECUTE가 필요하다. 시도·작업 잠금 아래 큐 상태와 원래 권장 시각을 감사에 함께 기록한다. JWT API 연결은 위 최신 항목을 참고하며 Angular 화면 연결은 남아 있다.
 
 임시 PostgreSQL 17·제한 DB 계정·실제 CLI에서 시도 ID·권한·환경 격리, 안내 누락 거절, 감사 실패 롤백, 동시 판정 중 한 건만 성공, 세 작업 종류의 예약을 확인했다. 실제 큐 함수와 모의 Slack 앱에서 예약 시각 전 미처리와 시험상 시각을 앞당긴 뒤 발송을 확인했다. 실제 Slack 429·웹훅과 워크플로 발송의 예약 후 실행·원본 Novu 비교·운영 HA는 미검증이다. 기존 즉시 경로는 대기를 강제하지 않으며 늦은 증거와 재시도에 따른 중복 가능성이 있다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
