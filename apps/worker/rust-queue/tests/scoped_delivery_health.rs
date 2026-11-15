@@ -585,11 +585,86 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
     )
     .await
     .unwrap();
+    let inconsistent = reconciliation::scoped_sendgrid_health(&actor, "a", 300, 120)
+        .await
+        .unwrap();
+    assert_eq!(inconsistent["overdueUndelivered"], 1);
+    assert_eq!(
+        inconsistent,
+        reconciliation::sendgrid_health(&db, "a", 300, 120)
+            .await
+            .unwrap()
+    );
+    let mut monitor_url = reqwest::Url::parse(&url).unwrap();
+    monitor_url.set_username(&role).unwrap();
+    monitor_url
+        .set_password(Some("scoped-fixture-password"))
+        .unwrap();
+    for (database_url, scoped) in [(url.as_str(), "false"), (monitor_url.as_str(), "true")] {
+        let output = Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+            .args(["check-sendgrid", "a", "300", "120"])
+            .env("DATABASE_URL", database_url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("SWALLOW_MONITOR_SCOPED_ACCESS", scoped)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    db.execute(
+        "UPDATE novu_rust_sendgrid_recipients SET delivery_result='delivered' WHERE dispatch_id=$1",
+        &[&dispatch],
+    )
+    .await
+    .unwrap();
     let healthy = reconciliation::scoped_sendgrid_health(&actor, "a", 300, 120)
         .await
         .unwrap();
     assert_eq!(healthy["overdueUndelivered"], 0);
     assert_eq!(healthy["projectorStale"], false);
+    db.execute(
+        "UPDATE novu_rust_sendgrid_attempts SET state='unknown' WHERE job_id=$1",
+        &[&sendgrid],
+    )
+    .await
+    .unwrap();
+    let uncertain = reconciliation::scoped_sendgrid_health(&actor, "a", 300, 120)
+        .await
+        .unwrap();
+    assert_eq!(uncertain["overdueUndelivered"], 1);
+    assert_eq!(
+        uncertain,
+        reconciliation::sendgrid_health(&db, "a", 300, 120)
+            .await
+            .unwrap()
+    );
+    db.execute(
+        "UPDATE novu_rust_sendgrid_attempts SET state='accepted' WHERE job_id=$1",
+        &[&sendgrid],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "DELETE FROM novu_rust_sendgrid_recipients WHERE dispatch_id=$1",
+        &[&dispatch],
+    )
+    .await
+    .unwrap();
+    let no_recipients = reconciliation::scoped_sendgrid_health(&actor, "a", 300, 120)
+        .await
+        .unwrap();
+    assert_eq!(no_recipients["overdueUndelivered"], 1);
+    assert_eq!(
+        no_recipients,
+        reconciliation::sendgrid_health(&db, "a", 300, 120)
+            .await
+            .unwrap()
+    );
+    db.execute("INSERT INTO novu_rust_sendgrid_recipients(dispatch_id,environment_id,recipient_kind,recipient_index,recipient_hash,delivery_result) VALUES ($1,'a','to',0,repeat('a',64),'delivered'),($1,'a','cc',0,repeat('b',64),'pending')", &[&dispatch]).await.unwrap();
     db.execute(
         "UPDATE novu_queue_jobs SET sendgrid_delivery_result='unknown' WHERE id=$1",
         &[&sendgrid],
