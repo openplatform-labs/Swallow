@@ -101,6 +101,29 @@ async fn run(
         Ok("false") | Err(std::env::VarError::NotPresent) => false,
         _ => return Err("invalid shared FCM provider setting".into()),
     };
+    let reload_access_token = match std::env::var("NOVU_FCM_RELOAD_ACCESS_TOKEN").as_deref() {
+        Ok("true") => {
+            if [
+                "NOVU_FCM_ACCESS_TOKEN",
+                "NOVU_FCM_INTEGRATIONS",
+                "NOVU_FCM_INTEGRATIONS_FILE",
+                "NOVU_FCM_CLIENT_EMAIL",
+                "NOVU_FCM_PRIVATE_KEY",
+                "NOVU_FCM_PRIVATE_KEY_FILE",
+            ]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some())
+            {
+                return Err("FCM token reload sources conflict".into());
+            }
+            Some(std::path::PathBuf::from(
+                std::env::var_os("NOVU_FCM_ACCESS_TOKEN_FILE")
+                    .ok_or("FCM token reload requires a token file")?,
+            ))
+        }
+        Ok("false") | Err(std::env::VarError::NotPresent) => None,
+        _ => return Err("invalid FCM token reload setting".into()),
+    };
     let (provider, integrations) = if let Some(raw) = multiline_secret(
         "NOVU_FCM_INTEGRATIONS",
         "NOVU_FCM_INTEGRATIONS_FILE",
@@ -109,7 +132,12 @@ async fn run(
         (None, Some(build_integrations(&raw)?))
     } else {
         let project = std::env::var("NOVU_FCM_PROJECT_ID")?;
-        let provider = if let Some(token) = novu_rust_contracts::secret::from_env(
+        let provider = if let Some(path) = &reload_access_token {
+            Fcm::new(
+                &project,
+                novu_rust_contracts::secret::read_regular_file(path)?,
+            )?
+        } else if let Some(token) = novu_rust_contracts::secret::from_env(
             "NOVU_FCM_ACCESS_TOKEN",
             "NOVU_FCM_ACCESS_TOKEN_FILE",
         )? {
@@ -124,7 +152,7 @@ async fn run(
         };
         (Some(provider), None)
     };
-    let provider = provider.map(|p| {
+    let mut provider = provider.map(|p| {
         p.with_invalid_token_policy(invalid_token_policy)
             .with_token_cleanup_guard(cleanup_guard)
     });
@@ -296,6 +324,17 @@ async fn run(
                     }
                     if stop.requested() {
                         break;
+                    }
+                    if let Some(path) = &reload_access_token
+                        && provider
+                            .as_mut()
+                            .expect("reload requires a single provider")
+                            .reload_access_token_file(path)
+                            .is_err()
+                    {
+                        eprintln!("FCM access token reload failed; dispatch paused");
+                        stop.wait(Duration::from_secs(2)).await;
+                        continue;
                     }
                     let dispatch = async {
                         fcm_queue::process_one_with_target_policy(

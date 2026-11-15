@@ -901,6 +901,21 @@ impl Fcm {
     pub fn new(project_id: &str, access_token: String) -> Result<Self, SendError> {
         Self::with_origin(project_id, access_token, "https://fcm.googleapis.com")
     }
+    /// Reload only a fixed bearer-token provider; service account auth is unchanged.
+    pub fn reload_access_token_file(&mut self, path: &std::path::Path) -> Result<(), SendError> {
+        let token = novu_rust_contracts::secret::read_regular_file(path)
+            .map_err(|_| SendError::InvalidConfiguration)?;
+        if token.is_empty() || header::HeaderValue::from_str(&format!("Bearer {token}")).is_err() {
+            return Err(SendError::InvalidConfiguration);
+        }
+        match &mut self.auth {
+            Auth::Bearer(current) => {
+                *current = token;
+                Ok(())
+            }
+            Auth::ServiceAccount(_) => Err(SendError::InvalidConfiguration),
+        }
+    }
     pub fn with_service_account(
         project_id: &str,
         email: String,
@@ -1015,6 +1030,54 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+    #[tokio::test]
+    async fn fixed_token_file_reload_updates_mock_requests() {
+        let dir = std::env::temp_dir().join(format!("swallow-fcm-reload-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("token");
+        std::fs::write(&path, "old-token\n").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for expected in ["old-token", "new-token"] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0; 4096];
+                while !bytes.windows(4).any(|v| v == b"\r\n\r\n") {
+                    let count = socket.read(&mut buf).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buf[..count]);
+                }
+                assert!(
+                    String::from_utf8_lossy(&bytes)
+                        .contains(&format!("authorization: Bearer {expected}\r\n"))
+                );
+                let body = r#"{"name":"projects/demo/messages/1"}"#;
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let mut provider = Fcm::with_origin("demo", "initial-token".into(), &origin).unwrap();
+        provider.reload_access_token_file(&path).unwrap();
+        assert!(
+            provider
+                .send_wire(&json!({"message":{"token":"target"}}))
+                .await
+                .is_ok()
+        );
+        std::fs::write(&path, "bad\ntoken").unwrap();
+        assert!(provider.reload_access_token_file(&path).is_err());
+        std::fs::write(dir.join("next"), "new-token").unwrap();
+        std::fs::rename(dir.join("next"), &path).unwrap();
+        provider.reload_access_token_file(&path).unwrap();
+        assert!(
+            provider
+                .send_wire(&json!({"message":{"token":"target"}}))
+                .await
+                .is_ok()
+        );
+        server.await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn structured_unregistered_is_narrowly_classified() {
         let valid = br#"{"error":{"details":[{"@type":"type.googleapis.com/google.firebase.fcm.v1.FcmError","errorCode":"UNREGISTERED"}]}}"#;

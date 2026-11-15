@@ -7,6 +7,13 @@ use std::{
 use tokio_postgres::NoTls;
 
 struct Fixture(std::path::PathBuf);
+struct Worker(std::process::Child);
+impl Drop for Worker {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
@@ -56,24 +63,28 @@ async fn worker_supports_token_pem_and_integration_files() {
     fs::write(&integrations, serde_json::to_string_pretty(&data).unwrap()).unwrap();
     let command = || {
         let mut c = Command::new(env!("CARGO_BIN_EXE_fcm-worker"));
-        c.env("DATABASE_URL", &url)
-            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
-            .env("NOVU_FCM_ENVIRONMENT_ID", "env")
-            .env("NOVU_FCM_PROJECT_ID", "project-a")
-            .env_remove("NOVU_FCM_INTEGRATIONS")
-            .env_remove("NOVU_FCM_INTEGRATIONS_FILE")
-            .env_remove("NOVU_FCM_ACCESS_TOKEN")
-            .env_remove("NOVU_FCM_ACCESS_TOKEN_FILE")
-            .env_remove("NOVU_FCM_CLIENT_EMAIL")
-            .env_remove("NOVU_FCM_PRIVATE_KEY")
-            .env_remove("NOVU_FCM_PRIVATE_KEY_FILE")
-            .env_remove("SWALLOW_FCM_ALLOW_SHARED_PROVIDER")
-            .env_remove("SWALLOW_FCM_ENFORCE_ROUTING_CONFIG")
-            .env_remove("SWALLOW_PUSH_WORKFLOW_STEP_POLICY")
-            .env_remove("SWALLOW_PUSH_PREFERENCE_POLICY")
-            .env_remove("SWALLOW_PUSH_TARGET_POLICY")
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
+        c.env(
+            "DATABASE_URL",
+            format!("{url}?application_name=fcm_secret_fixture"),
+        )
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .env("NOVU_FCM_ENVIRONMENT_ID", "env")
+        .env("NOVU_FCM_PROJECT_ID", "project-a")
+        .env_remove("NOVU_FCM_INTEGRATIONS")
+        .env_remove("NOVU_FCM_INTEGRATIONS_FILE")
+        .env_remove("NOVU_FCM_ACCESS_TOKEN")
+        .env_remove("NOVU_FCM_ACCESS_TOKEN_FILE")
+        .env_remove("NOVU_FCM_RELOAD_ACCESS_TOKEN")
+        .env_remove("NOVU_FCM_CLIENT_EMAIL")
+        .env_remove("NOVU_FCM_PRIVATE_KEY")
+        .env_remove("NOVU_FCM_PRIVATE_KEY_FILE")
+        .env_remove("SWALLOW_FCM_ALLOW_SHARED_PROVIDER")
+        .env_remove("SWALLOW_FCM_ENFORCE_ROUTING_CONFIG")
+        .env_remove("SWALLOW_PUSH_WORKFLOW_STEP_POLICY")
+        .env_remove("SWALLOW_PUSH_PREFERENCE_POLICY")
+        .env_remove("SWALLOW_PUSH_TARGET_POLICY")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
         c
     };
     for mode in 0..4 {
@@ -114,6 +125,95 @@ async fn worker_supports_token_pem_and_integration_files() {
             .unwrap();
         assert!(!result.status.success());
     }
+    for mode in 0..4 {
+        let mut c = command();
+        c.env("NOVU_FCM_RELOAD_ACCESS_TOKEN", "true");
+        match mode {
+            0 => {}
+            1 => {
+                c.env("NOVU_FCM_ACCESS_TOKEN_FILE", &token)
+                    .env("NOVU_FCM_ACCESS_TOKEN", "fixture-secret");
+            }
+            2 => {
+                c.env("NOVU_FCM_ACCESS_TOKEN_FILE", &token)
+                    .env("NOVU_FCM_INTEGRATIONS_FILE", &integrations);
+            }
+            _ => {
+                c.env("NOVU_FCM_ACCESS_TOKEN_FILE", &token)
+                    .env("NOVU_FCM_CLIENT_EMAIL", "fixture@example.test");
+            }
+        }
+        let out = c.output().unwrap();
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("fixture-secret") && !stderr.contains(fixture.0.to_str().unwrap())
+        );
+    }
+    let invalid_flag = command()
+        .env("NOVU_FCM_RELOAD_ACCESS_TOKEN", "yes")
+        .output()
+        .unwrap();
+    assert!(!invalid_flag.status.success());
+    let mut worker = Worker(
+        command()
+            .env("NOVU_FCM_ACCESS_TOKEN_FILE", &token)
+            .env("NOVU_FCM_RELOAD_ACCESS_TOKEN", "true")
+            .spawn()
+            .unwrap(),
+    );
+    let mut registered = false;
+    for _ in 0..100 {
+        registered=db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='fcm_secret_fixture')",&[]).await.unwrap().get(0);
+        if registered {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(registered);
+    assert!(worker.0.try_wait().unwrap().is_none());
+    fs::write(&token, "invalid\ntoken").unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let job = uuid::Uuid::new_v4();
+    novu_postgres_queue::enqueue(
+        &db,
+        job,
+        "env",
+        novu_postgres_queue::fcm_queue::JOB_KIND,
+        &serde_json::json!({"unrecognized":true}),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        db.query_one("SELECT status FROM novu_queue_jobs WHERE id=$1", &[&job])
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        "pending"
+    );
+    fs::write(fixture.0.join("next"), "rotated-token\n").unwrap();
+    fs::rename(fixture.0.join("next"), &token).unwrap();
+    let mut failed = false;
+    for _ in 0..100 {
+        failed = db
+            .query_one(
+                "SELECT status='failed' FROM novu_queue_jobs WHERE id=$1",
+                &[&job],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if failed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        failed,
+        "worker should resume and reject the invalid job without sending"
+    );
+    drop(worker);
     let result = command()
         .env("NOVU_FCM_ACCESS_TOKEN_FILE", &token)
         .env("SWALLOW_FCM_ENFORCE_ROUTING_CONFIG", "invalid")
