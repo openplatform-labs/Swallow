@@ -572,8 +572,24 @@ Reproduce the IP pool provider comparison with the dashboard dependencies instal
 
 ### Projection heartbeat policy agreement
 
-Apply worker migration `0151` before deploying the three projection workers and grant each projection worker DB login `SELECT, INSERT, UPDATE` on `public.novu_rust_projection_worker_policy`. The first new worker registers its `REQUIRE_FULL_SCAN` value for its environment and provider; subsequent workers accept only the same value and exit on mismatch. The default remains `false`; setting the existing provider-specific variable to `true` remains a user choice. Environment and provider registrations are independent. Connection failures and missing permissions cause reconnect retries; a mismatched policy terminates the worker. Monitor process exits and connection errors separately. Protect the registry from untrusted writes.
+Apply worker migration `0151` before deploying the three projection workers and either grant each projection worker DB login `SELECT, INSERT, UPDATE` on `public.novu_rust_projection_worker_policy`, or choose the restricted function mode described below. The first new worker registers its `REQUIRE_FULL_SCAN` value for its environment and provider; subsequent workers accept only the same value and exit on mismatch. The default remains `false`; setting the existing provider-specific variable to `true` remains a user choice. Environment and provider registrations are independent. Connection failures and missing permissions cause reconnect retries; a mismatched policy terminates the worker. Monitor process exits and connection errors separately. Protect the registry from untrusted writes.
 
 To change policy, stop **all** projection workers for that provider and environment, have a trusted administrator delete only its registration row and its corresponding provider heartbeat row, then start all workers with the desired setting. Clearing the prior heartbeat avoids treating a relaxed scan as evidence of a strict scan. Older workers do not register or check this policy and must be stopped before relying on it. Manual registry edits while workers are running, database restore, asynchronous replication loss and split brain are outside this protection. The agreement concerns full-scan policy only, not scan intervals, provider configuration or a consistent snapshot of all jobs. A new worker registers on each database connection; its ongoing connection does not continuously recheck the row.
 
 Local PostgreSQL 17 tests exercised actual workers for all three providers: a locked job, suppressed strict heartbeat, rejection of a conflicting process, recovery after unlocking, plus interruption and restart. The test DB login was an administrator. Docker storage was read-only; production permissions, sustained load, real provider traffic and multi-host HA remain unverified.
+
+### Restricted projection-policy registration
+
+Apply worker migration `0152` and set `SWALLOW_PROJECTION_SCOPED_POLICY=true` on each updated projection worker to use the restricted registration function. Omit the setting or set `false` for the existing direct-table mode. Invalid values fail startup. A trusted DBA must provision a row for each allowed environment, provider and actual login, and separately grant that login `EXECUTE` on `public.novu_rust_register_projection_policy(text,text,boolean)`. For example, with deployment-specific identifiers substituted by a trusted administrator:
+
+```sql
+INSERT INTO public.novu_rust_projection_policy_logins(environment_id,provider,database_principal,principal_oid)
+SELECT 'ENVIRONMENT', 'sendgrid', rolname, oid FROM pg_catalog.pg_roles
+WHERE rolname='WORKER_LOGIN' AND rolcanlogin;
+GRANT EXECUTE ON FUNCTION public.novu_rust_register_projection_policy(text,text,boolean) TO WORKER_LOGIN;
+REVOKE ALL ON public.novu_rust_projection_worker_policy FROM WORKER_LOGIN;
+```
+
+Provision Resend and Twilio independently when needed. The login is checked by `session_user` and role OID, and its grant row is share-locked during registration so a committed revocation wins over a waiting registration. The security-definer owner needs SELECT and row-lock privileges on the login registry and SELECT/INSERT/UPDATE on the policy table. Protect both tables, function ownership, the schema and the trusted DBA role. Revoke any direct policy table privileges or inherited grants when enforcing this boundary. The worker still needs separately provisioned permissions for its projection data and heartbeat; those permissions may expose other environments unless separately constrained.
+
+Registration happens at connection time: revoking access does not stop an already running worker or interrupt a scan. Stop or disconnect that worker separately. Shared logins are not individual identities; elevated roles, inherited rights, legacy direct-mode workers and older binaries can bypass this boundary. Local PostgreSQL 17 tests used a restricted login with actual workers for all three providers and checked cross-environment denial, direct-table denial, OID mismatch and revocation racing a waiting registration. Production DB roles, live providers and HA remain unverified.

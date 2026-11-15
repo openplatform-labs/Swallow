@@ -29,6 +29,7 @@ async fn run(
             Ok("false") | Err(std::env::VarError::NotPresent) => false,
             _ => return Err("invalid full scan policy".into()),
         };
+    let scoped_policy = novu_postgres_queue::projection_policy::scoped_from_env()?;
     let scan_seconds: u64 = match std::env::var("NOVU_SENDGRID_PROJECTION_SCAN_INTERVAL_SECONDS") {
         Ok(value) => value.parse()?,
         Err(std::env::VarError::NotPresent) => 30,
@@ -91,17 +92,26 @@ async fn run(
                 continue;
             }
         }
-        match tokio::time::timeout(
-            timeout,
-            novu_postgres_queue::projection_policy::register(
-                &db,
-                &environment,
-                "sendgrid",
-                require_full_scan,
-            ),
-        )
-        .await
-        {
+        let registration = async {
+            if scoped_policy {
+                novu_postgres_queue::projection_policy::register_scoped(
+                    &db,
+                    &environment,
+                    "sendgrid",
+                    require_full_scan,
+                )
+                .await
+            } else {
+                novu_postgres_queue::projection_policy::register(
+                    &db,
+                    &environment,
+                    "sendgrid",
+                    require_full_scan,
+                )
+                .await
+            }
+        };
+        match tokio::time::timeout(timeout, registration).await {
             Ok(Ok(true)) => {}
             Ok(Ok(false)) => {
                 driver.abort();
