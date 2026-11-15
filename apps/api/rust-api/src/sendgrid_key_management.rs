@@ -137,6 +137,50 @@ pub async fn list(
     };
     (StatusCode::OK, Json(json!({"data":data,"nextCursor":next})))
 }
+
+pub async fn audit(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+) -> ApiError {
+    let path = uri.to_string();
+    let (env, hash) = match identity(&db, &headers, &path).await {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let mut after: Option<Uuid> = None;
+    for (name, value) in form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()) {
+        if name != "after" || after.is_some() {
+            return fail(StatusCode::BAD_REQUEST, &path);
+        }
+        after = match Uuid::parse_str(&value) {
+            Ok(value) => Some(value),
+            Err(_) => return fail(StatusCode::BAD_REQUEST, &path),
+        };
+    }
+    let rows = match db.query("SELECT id,key_id,action,user_id,recorded_at FROM public.novu_rust_sendgrid_key_audit_list($1,$2,$3)", &[&hash,&env,&after]).await {
+        Ok(rows) => rows,
+        Err(error) => return db_error(error, &path),
+    };
+    let more = rows.len() > 100;
+    let data: Vec<Value> = rows
+        .iter()
+        .take(100)
+        .map(|row| {
+            json!({
+                "id":row.get::<_,Uuid>(0),"identifier":row.get::<_,String>(1),
+                "action":row.get::<_,String>(2),"userId":row.get::<_,String>(3),
+                "recordedAt":row.get::<_,String>(4)
+            })
+        })
+        .collect();
+    let next = if more {
+        data.last().and_then(|value| value["id"].as_str())
+    } else {
+        None
+    };
+    (StatusCode::OK, Json(json!({"data":data,"nextCursor":next})))
+}
 async fn change(
     db: &Client,
     headers: &HeaderMap,

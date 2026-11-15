@@ -93,6 +93,7 @@ async fn scoped_key_rotation_and_concurrent_limit() {
         novu_rust_api::MIGRATION,
         include_str!("../migrations/0004_sendgrid_webhooks.sql"),
         include_str!("../migrations/0064_sendgrid_key_management.sql"),
+        include_str!("../migrations/0065_sendgrid_key_audit_access.sql"),
     ] {
         db.batch_execute(sql).await.unwrap();
     }
@@ -260,7 +261,7 @@ async fn scoped_key_rotation_and_concurrent_limit() {
         StatusCode::INTERNAL_SERVER_ERROR
     );
     assert_eq!(db.query_one("SELECT count(*) FROM novu_rust_sendgrid_webhook_keys WHERE environment_id='a' AND key_id='rollback'",&[]).await.unwrap().get::<_,i64>(0),0);
-    db.batch_execute("DROP TRIGGER reject_key_audit ON public.novu_rust_sendgrid_key_audit; CREATE ROLE sendgrid_key_api LOGIN; GRANT USAGE ON SCHEMA public TO sendgrid_key_api; GRANT SELECT ON public.novu_rust_api_keys,public.novu_rust_users TO sendgrid_key_api; GRANT EXECUTE ON FUNCTION public.novu_rust_sendgrid_keys_list(text,text,text),public.novu_rust_sendgrid_key_change(text,text,text,text,text,uuid) TO sendgrid_key_api").await.unwrap();
+    db.batch_execute("DROP TRIGGER reject_key_audit ON public.novu_rust_sendgrid_key_audit; CREATE ROLE sendgrid_key_api LOGIN; GRANT USAGE ON SCHEMA public TO sendgrid_key_api; GRANT SELECT ON public.novu_rust_api_keys,public.novu_rust_users TO sendgrid_key_api; GRANT EXECUTE ON FUNCTION public.novu_rust_sendgrid_keys_list(text,text,text),public.novu_rust_sendgrid_key_change(text,text,text,text,text,uuid),public.novu_rust_sendgrid_key_audit_list(text,text,uuid) TO sendgrid_key_api").await.unwrap();
     let (limited, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move {
         driver.await.unwrap();
@@ -299,7 +300,7 @@ async fn scoped_key_rotation_and_concurrent_limit() {
     );
     assert_eq!(
         call(
-            limited_app,
+            limited_app.clone(),
             "DELETE",
             &format!("{base}/limited"),
             "a-key",
@@ -309,12 +310,75 @@ async fn scoped_key_rotation_and_concurrent_limit() {
         .0,
         StatusCode::OK
     );
+    let audit_path = "/v1/experimental/sendgrid-webhook-key-audit".to_string();
+    assert_eq!(
+        call(
+            limited_app.clone(),
+            "GET",
+            &audit_path,
+            "read-key",
+            json!({})
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    db.execute(
+        "INSERT INTO novu_rust_sendgrid_key_permissions VALUES ($1,'audit')",
+        &[&r],
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO public.novu_rust_sendgrid_key_audit SELECT gen_random_uuid(),'a','fixture','create',$1,'u',clock_timestamp() FROM generate_series(1,105)", &[&a]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_sendgrid_key_audit VALUES (gen_random_uuid(),'b','other','create',$1,'u',clock_timestamp())", &[&b]).await.unwrap();
+    let page = call(
+        limited_app.clone(),
+        "GET",
+        &audit_path,
+        "read-key",
+        json!({}),
+    )
+    .await;
+    assert_eq!(page.0, StatusCode::OK);
+    assert_eq!(page.1["data"].as_array().unwrap().len(), 100);
+    assert!(!page.1.to_string().contains(&a));
+    assert!(!page.1.to_string().contains("other"));
+    let next = page.1["nextCursor"].as_str().unwrap();
+    let second = call(
+        limited_app.clone(),
+        "GET",
+        &format!("{audit_path}?after={next}"),
+        "read-key",
+        json!({}),
+    )
+    .await;
+    assert_eq!(second.0, StatusCode::OK);
+    assert!(!second.1["data"].as_array().unwrap().is_empty());
+    assert!(second.1["nextCursor"].is_null());
+    assert_eq!(
+        call(
+            limited_app.clone(),
+            "GET",
+            &format!("{audit_path}?after=invalid"),
+            "read-key",
+            json!({})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
     db.execute(
         "DELETE FROM novu_rust_sendgrid_key_permissions WHERE key_hash=$1",
         &[&r],
     )
     .await
     .unwrap();
+    assert_eq!(
+        call(limited_app, "GET", &audit_path, "read-key", json!({}))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
     assert_eq!(
         call(app, "GET", base, "read-key", json!({})).await.0,
         StatusCode::FORBIDDEN
