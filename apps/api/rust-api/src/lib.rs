@@ -353,6 +353,8 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/operator/twilio-jobs", get(operator_identity::twilio_jobs))
         .route("/v1/experimental/operator/fcm-result", get(operator_identity::fcm_result))
         .route("/v1/experimental/operator/fcm-jobs", get(operator_identity::fcm_jobs))
+        .route("/v1/experimental/operator/slack-decision", post(operator_identity::slack_resolve))
+        .route("/v1/experimental/operator/slack-decision-request", get(operator_identity::slack_decision_request))
         .route("/v1/experimental/operator/slack-result", get(operator_identity::slack_result))
         .route("/v1/experimental/operator/slack-jobs", get(operator_identity::slack_jobs))
         .route("/v1/experimental/operator/sendgrid-result", get(operator_identity::sendgrid_result))
