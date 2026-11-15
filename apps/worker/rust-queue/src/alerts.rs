@@ -1346,7 +1346,8 @@ pub async fn dispatch_pair_v3(db: &mut PgClient, other: Option<&mut PgClient>, c
     async fn dispatch_v3<F, Fut>(db: &mut PgClient, cfg: &DispatchPair<'_>, channel: &str, target: &str, send: F) -> DbResult<Dispatch>
     where F: FnOnce(Uuid) -> Fut, Fut: std::future::Future<Output=Result<(), AlertError>> {
         let (low,high) = cfg.alert.condition_mask_v3();
-        let row = db.query_one("SELECT result,attempt_id FROM public.novu_rust_reserve_alert_v3($1,$2,$3,$4,$5,$6)", &[&cfg.alert.environment,&channel,&target,&cfg.cooldown,&low,&high]).await?;
+        let (known_low,known_high) = cfg.alert.observed_condition_mask_v3();
+        let row = db.query_one("SELECT result,attempt_id FROM public.novu_rust_reserve_alert_v3($1,$2,$3,$4,$5,$6,$7,$8)", &[&cfg.alert.environment,&channel,&target,&cfg.cooldown,&low,&known_low,&high,&known_high]).await?;
         let result: String = row.get(0); let id: Option<Uuid> = row.get(1);
         match (result.as_str(), id) {
             ("cooldown",None) => Ok(Dispatch::CoolingDown), ("inflight",None) => Ok(Dispatch::InFlight),

@@ -166,7 +166,7 @@ async fn scoped_credential_health_prevents_spoofing_and_detects_failure() {
     assert_eq!(invalid.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("requires v3 conditions"));
     db.execute("INSERT INTO public.novu_rust_alert_v2_targets(environment_id,channel,target_id) VALUES($1,'slack','blocked')",&[&env]).await.unwrap();
-    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_reserve_alert_v3(text,text,text,integer,bigint,bigint),public.novu_rust_observe_alert_conditions_v3(text,text,text,bigint,bigint,bigint,bigint) TO {monitor}")).await.unwrap();
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_reserve_alert_v3(text,text,text,integer,bigint,bigint,bigint,bigint),public.novu_rust_observe_alert_conditions_v3(text,text,text,bigint,bigint,bigint,bigint) TO {monitor}")).await.unwrap();
     let alert_v3 = std::process::Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"))
         .env_clear()
         .env("DATABASE_URL", login(&monitor))
