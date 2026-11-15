@@ -547,6 +547,7 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/operator/trigger-grants/request", get(operator_identity::trigger_grant_request))
         .route("/v1/experimental/operator/trigger-grants/audit", get(operator_identity::trigger_grant_audit))
         .route("/v1/experimental/operator/execution-audit", get(operator_identity::execution_audit))
+        .route("/v1/experimental/operator/execution-grants", get(operator_identity::execution_grant_read).put(operator_identity::execution_grant_change))
         .route("/v1/experimental/operator/sendgrid-jobs", get(operator_identity::sendgrid_jobs))
         .route("/v1/experimental/operator/resend-jobs", get(operator_identity::resend_jobs))
         .route("/v1/experimental/operator/workflow", get(operator_identity::workflow_read).put(operator_identity::workflow_write))
