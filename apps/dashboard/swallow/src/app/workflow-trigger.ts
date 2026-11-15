@@ -5,6 +5,7 @@ import { FormsModule } from '@angular/forms';
 export class WorkflowTrigger implements OnInit, OnDestroy {
   @Input() apiOrigin='';
   apiKey=''; workflow=''; subscriber=''; payload='{}'; mode:'sandbox'|'normal'='sandbox';
+  lookupAuth:'api-key'|'jwt'='api-key'; lookupToken=''; lookupEnvironment='';
   rememberTransaction=false;
   readonly status=signal<'idle'|'sending'|'accepted'|'unknown'|'invalid'>('idle');
   readonly transaction=signal(''); readonly outcome=signal('');
@@ -27,7 +28,7 @@ export class WorkflowTrigger implements OnInit, OnDestroy {
       this.transaction.set(value['transactionId']);this.savedOrigin.set(value['origin']);this.rememberTransaction=true;this.status.set('unknown');
     } catch {this.storageError.set(true);this.status.set('unknown');}
   }
-  ngOnDestroy():void {this.abort?.abort();this.clearLookup();this.apiKey='';}
+  ngOnDestroy():void {this.abort?.abort();this.clearLookup();this.apiKey='';this.lookupToken='';}
   private origin():string {
     const url=new URL(this.apiOrigin.trim());
     if(!['http:','https:'].includes(url.protocol)||url.username||url.password||url.pathname!=='/'||url.search||url.hash||(url.protocol==='http:'&&!['localhost','127.0.0.1','[::1]'].includes(url.hostname)))throw new Error('origin');
@@ -37,20 +38,21 @@ export class WorkflowTrigger implements OnInit, OnDestroy {
   reset():void {if(this.status()==='sending')return;if(this.rememberTransaction){try{sessionStorage.removeItem(this.storageKey);}catch{this.storageError.set(true);return;}}this.clearLookup();this.storageError.set(false);this.transaction.set('');this.savedOrigin.set('');this.outcome.set('');this.status.set('idle');}
   async lookup():Promise<void> {
     this.clearLookup();const seq=this.lookupSequence,controller=new AbortController();this.lookupAbort=controller;
-    let origin:string,key:string,id:string;
-    try {origin=this.origin();key=this.apiKey.trim();id=this.transaction();if(origin!==this.savedOrigin()||!key||key.length>4096||/[\r\n\0]/.test(key)||!id)throw new Error('input');}
+    let origin:string,key:string,id:string,auth:'api-key'|'jwt',environment:string;
+    try {origin=this.origin();auth=this.lookupAuth;key=(auth==='jwt'?this.lookupToken:this.apiKey).trim();environment=this.lookupEnvironment.trim();id=this.transaction();if(origin!==this.savedOrigin()||!key||/[\r\n\0]/.test(key)||!id||(auth==='api-key'&&key.length>4096)||(auth==='jwt'&&(key.length>16384||!/^[-_A-Za-z0-9]+\.[-_A-Za-z0-9]+\.[-_A-Za-z0-9]+$/.test(key)||!environment||new TextEncoder().encode(environment).length>512||/[\r\n\0]/.test(environment)))||!['api-key','jwt'].includes(auth))throw new Error('input');}
     catch {this.lookupStatus.set('error');return;}
     this.lookupStatus.set('loading');const timeout=setTimeout(()=>controller.abort(),30000);
     try {
-      const params=new URLSearchParams({transactionId:id});
-      const response=await fetch(`${origin}/v1/experimental/workflow-trigger-result?${params}`,{headers:{Authorization:`ApiKey ${key}`},credentials:'omit',cache:'no-store',redirect:'error',signal:controller.signal});
+      const params=new URLSearchParams({transactionId:id});if(auth==='jwt')params.set('environmentId',environment);
+      const endpoint=auth==='jwt'?'/v1/experimental/operator/workflow-trigger-result':'/v1/experimental/workflow-trigger-result';
+      const response=await fetch(`${origin}${endpoint}?${params}`,{headers:{Authorization:`${auth==='jwt'?'Bearer':'ApiKey'} ${key}`},credentials:'omit',cache:'no-store',redirect:'error',signal:controller.signal});
       if(!response.ok)throw new Error('request');const value:unknown=await response.json();
-      if(!value||typeof value!=='object')throw new Error('response');const data=(value as Record<string,unknown>)['data'];if(!data||typeof data!=='object')throw new Error('response');const d=data as Record<string,unknown>;
+      if(!value||typeof value!=='object')throw new Error('response');const data=auth==='jwt'?value:(value as Record<string,unknown>)['data'];if(!data||typeof data!=='object')throw new Error('response');const d=data as Record<string,unknown>;
       if(d['transactionId']!==id||typeof d['recorded']!=='boolean'||![0,1,2].includes(d['jobCount'] as number))throw new Error('response');
       let job:{jobId:string;jobStatus:string}|null=null;
       if(d['jobCount']===1){const j=d['job'];if(!j||typeof j!=='object')throw new Error('response');const v=j as Record<string,unknown>;if(typeof v['jobId']!=='string'||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v['jobId'])||typeof v['jobStatus']!=='string'||!['pending','running','completed','failed','cancelled'].includes(v['jobStatus']))throw new Error('response');job={jobId:v['jobId'],jobStatus:v['jobStatus']};}else if(d['job']!==null)throw new Error('response');
       if(seq!==this.lookupSequence)return;
-      if(origin!==this.origin()||key!==this.apiKey.trim()||id!==this.transaction()){this.clearLookup();return;}
+      if(origin!==this.origin()||auth!==this.lookupAuth||key!==(auth==='jwt'?this.lookupToken:this.apiKey).trim()||environment!==this.lookupEnvironment.trim()||id!==this.transaction()){this.clearLookup();return;}
       this.lookupResult.set({recorded:d['recorded'] as boolean,jobCount:d['jobCount'] as number,job});this.lookupStatus.set('loaded');
     } catch {if(seq===this.lookupSequence){this.lookupResult.set(null);this.lookupStatus.set('error');}}
     finally {clearTimeout(timeout);if(seq===this.lookupSequence)this.lookupAbort=null;}

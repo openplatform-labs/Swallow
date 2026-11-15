@@ -54,6 +54,7 @@ enum Lookup {
     SlackJobs,
     SendgridResult,
     SendgridJobs,
+    TriggerResult,
     WorkflowRead,
     WorkflowAudit,
     WorkflowRequest,
@@ -562,6 +563,10 @@ pub(super) async fn sendgrid_result(
 ) -> Response {
     query(db, headers, uri, verifier, Lookup::SendgridResult).await
 }
+pub(super) async fn workflow_trigger_result(
+    State(db): State<Arc<Client>>, headers: HeaderMap, OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {query(db,headers,uri,verifier,Lookup::TriggerResult).await}
 pub(super) async fn sendgrid_jobs(
     State(db): State<Arc<Client>>,
     headers: HeaderMap,
@@ -2430,6 +2435,7 @@ async fn query(
             &["environmentId", "after"]
         }
         Lookup::WorkflowRead => &["environmentId", "workflow", "resource"],
+        Lookup::TriggerResult => &["environmentId","transactionId"],
         Lookup::WorkflowAudit => &["environmentId", "workflow", "resource", "after"],
         Lookup::WorkflowRequest => &["environmentId", "resource", "requestId"],
         Lookup::WorkflowGrantRead
@@ -2506,6 +2512,10 @@ async fn query(
         return failure(StatusCode::UNAUTHORIZED, "Unauthorized", "Unauthorized");
     };
     let result = match lookup {
+        Lookup::TriggerResult => {
+            let Some(transaction)=params.get("transactionId").filter(|s|!s.is_empty()&&s.len()<=512&&!s.chars().any(char::is_control)) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};
+            guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_trigger_lookup($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&transaction]).await
+        }
         Lookup::ResendAutoHealthJobs => {
             let Some(grace) = params.get("graceSeconds").and_then(|v| {
                 v.parse::<i32>()

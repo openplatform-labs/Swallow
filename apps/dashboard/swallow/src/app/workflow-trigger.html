@@ -19,8 +19,13 @@
 @if(status()==='unknown'){<p role="alert">요청 결과가 불명입니다. 거래 ID {{transaction()}}를 기록해 운영 기록을 확인하세요. 새 요청은 다른 거래 ID를 사용합니다.</p>}
 @if(savedOrigin()){<p>요청 API 주소: {{savedOrigin()}}</p>}
 @if(transaction() && (status()==='unknown'||status()==='accepted')){
+  <label for="trigger-lookup-auth">조회 인증</label><select id="trigger-lookup-auth" name="triggerLookupAuth" [(ngModel)]="lookupAuth" (ngModelChange)="clearLookup()"><option value="api-key">환경 API 키</option><option value="jwt">운영자 JWT</option></select>
+  @if(lookupAuth==='jwt'){
+    <label for="trigger-lookup-env">조회 환경 ID</label><input id="trigger-lookup-env" name="triggerLookupEnvironment" [(ngModel)]="lookupEnvironment" (ngModelChange)="clearLookup()" autocomplete="off">
+    <label for="trigger-lookup-token">운영자 접근 토큰</label><input id="trigger-lookup-token" name="triggerLookupToken" type="password" [(ngModel)]="lookupToken" (ngModelChange)="clearLookup()" autocomplete="off" spellcheck="false">
+  }
   <button type="button" class="btn btn-outline" (click)="lookup()" [disabled]="lookupStatus()==='loading'">거래 ID 조회</button>
-  <p class="subscriber-hint">같은 API 주소와 환경의 API 키가 필요합니다. 기록이 없거나 작업이 삭제됐더라도 요청이 실행되지 않았다는 증거는 아닙니다.</p>
+  <p class="subscriber-hint">같은 API 주소와 환경의 API 키 또는 별도 조회 권한이 부여된 운영자 JWT가 필요합니다. 기록이 없거나 작업이 삭제됐더라도 요청이 실행되지 않았다는 증거는 아닙니다.</p>
   @if(lookupStatus()==='error'){<p role="alert">조회하지 못했습니다. API 주소와 환경 API 키를 확인하세요.</p>}
   @if(lookupResult();as result){<p role="status">접수 기록: {{result.recorded?'있음':'없음'}} · 부모 작업 수: {{result.jobCount===2?'2개 이상':result.jobCount}} @if(result.job){· 작업 {{result.job.jobId}} · 상태 {{result.job.jobStatus}}}<br>부모 작업 상태는 개별 채널 전달 결과가 아닙니다.</p>}
 }

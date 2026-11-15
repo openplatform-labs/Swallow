@@ -18,3 +18,4 @@ cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-wo
 cargo test --locked --manifest-path "$API/Cargo.toml" --test workflow_email_attachments sendgrid_tracking_reaches_mock_provider_with_layer_precedence -- --ignored
 cargo test --locked --manifest-path "$API/Cargo.toml" --test workflow_email_attachments sendgrid_sandbox_workflow_records_validation_without_delivery -- --ignored
 cargo test --locked --manifest-path "$API/Cargo.toml" --test workflow_email_attachments trigger_lookup_is_environment_scoped_and_distinguishes_missing_jobs -- --ignored
+cargo test --locked --manifest-path "$API/Cargo.toml" --test operator_trigger_lookup -- --ignored

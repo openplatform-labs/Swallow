@@ -60,4 +60,10 @@ describe('workflow trigger',()=>{
     let finish!:(response:Response)=>void;const fetcher=vi.spyOn(globalThis,'fetch').mockRejectedValueOnce(new Error('offline')).mockResolvedValueOnce(new Response(JSON.stringify({data:{transactionId:id,recorded:false,jobCount:0,job:{jobId:id,jobStatus:'completed'}}}))).mockImplementationOnce(()=>new Promise(resolve=>finish=resolve));
     const {fixture,c}=setup();await c.submit();await c.lookup();expect(c.lookupStatus()).toBe('error');expect(c.lookupResult()).toBeNull();const pending=c.lookup();c.apiKey='other-key';c.clearLookup();finish(new Response(JSON.stringify({data:{transactionId:id,recorded:true,jobCount:1,job:{jobId:id,jobStatus:'completed'}}})));await pending;expect(c.lookupStatus()).toBe('idle');expect(c.lookupResult()).toBeNull();expect(fetcher).toHaveBeenCalledTimes(3);fixture.destroy();
   });
+  it('uses an independent operator JWT and environment for lookup',async()=>{
+    const id='88888888-8888-4888-8888-888888888888';vi.spyOn(crypto,'randomUUID').mockReturnValue(id);
+    const fetcher=vi.spyOn(globalThis,'fetch').mockRejectedValueOnce(new Error('offline')).mockResolvedValueOnce(new Response(JSON.stringify({transactionId:id,recorded:true,jobCount:0,job:null})));
+    const {fixture,c}=setup();await c.submit();c.lookupAuth='jwt';c.lookupToken='aaa.bbb.ccc';c.lookupEnvironment='env-a';await c.lookup();
+    expect(fetcher.mock.calls[1][0]).toBe(`https://api.example.test/v1/experimental/operator/workflow-trigger-result?transactionId=${id}&environmentId=env-a`);expect(fetcher.mock.calls[1][1]).toMatchObject({headers:{Authorization:'Bearer aaa.bbb.ccc'}});expect(c.lookupResult()).toEqual({recorded:true,jobCount:0,job:null});fixture.destroy();expect(c.lookupToken).toBe('');
+  });
 });
