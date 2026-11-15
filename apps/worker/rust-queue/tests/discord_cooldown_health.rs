@@ -124,6 +124,75 @@ async fn cooldown_health_is_scoped_and_detects_overdue_work() {
         value,
         json!({"activeDestinations":1,"deferred":2,"overdue":1})
     );
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_reserve_alert_v2(text,text,text,integer,bigint),public.novu_rust_observe_alert_conditions_v2(text,text,text,bigint,bigint),public.novu_rust_finish_alert(text,text,text,uuid,text,integer) TO {role}")).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_delivery_operator_grants SELECT $1,rolname,'alert_send',oid FROM pg_roles WHERE rolname::text=$2", &[&env,&role]).await.unwrap();
+    // PostgreSQL bigint bit 63 is negative; test the real reservation and recovery protocol.
+    let first=reader.query_one("SELECT result,attempt_id FROM public.novu_rust_reserve_alert_v2($1,'slack','signed',60,$2)",&[&env,&(1_i64<<62)]).await.unwrap();
+    assert_eq!(first.get::<_, String>(0), "claimed");
+    let attempt: Uuid = first.get(1);
+    assert!(
+        reader
+            .query_one(
+                "SELECT public.novu_rust_finish_alert($1,'slack','signed',$2,'accepted',NULL)",
+                &[&env, &attempt]
+            )
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
+    let failure=reader.query_one("SELECT result,attempt_id FROM public.novu_rust_reserve_alert_v2($1,'slack','signed',60,$2)",&[&env,&i64::MIN]).await.unwrap();
+    assert_eq!(failure.get::<_, String>(0), "claimed");
+    let attempt: Uuid = failure.get(1);
+    assert!(
+        reader
+            .query_one(
+                "SELECT public.novu_rust_finish_alert($1,'slack','signed',$2,'accepted',NULL)",
+                &[&env, &attempt]
+            )
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
+    reader
+        .query_one(
+            "SELECT public.novu_rust_observe_alert_conditions_v2($1,'slack','signed',$2,$3)",
+            &[&env, &0_i64, &i64::MIN],
+        )
+        .await
+        .unwrap();
+    let repeat = reader
+        .query_one(
+            "SELECT result FROM public.novu_rust_reserve_alert_v2($1,'slack','signed',60,$2)",
+            &[&env, &i64::MIN],
+        )
+        .await
+        .unwrap();
+    assert_eq!(repeat.get::<_, String>(0), "claimed");
+    db.execute("INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES($1,'slack','blocked','rejected')", &[&env]).await.unwrap();
+    let alert = std::process::Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"))
+        .env_clear()
+        .env("DATABASE_URL", role_url.as_str())
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
+        .env("SWALLOW_ALERT_DISCORD_COOLDOWN_GRACE_SECONDS", "60")
+        .env("SWALLOW_ALERT_SCOPED_DELIVERY", "true")
+        .env("SWALLOW_ALERT_COOLDOWN_POLICY", "new-condition")
+        .env("SWALLOW_ALERT_CONDITIONS_V2", "true")
+        .env(
+            "SWALLOW_ALERT_SLACK_WEBHOOK",
+            "https://hooks.slack.com/services/A/B/C",
+        )
+        .env("SWALLOW_ALERT_SLACK_TARGET_ID", "blocked")
+        .args([&env, "300", "120", "60"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        alert.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&alert.stderr)
+    );
+    assert!(String::from_utf8_lossy(&alert.stderr).contains("requires operator review"));
     db.execute(
         "UPDATE public.novu_queue_jobs SET status='completed' WHERE id=ANY($1::uuid[])",
         &[&vec![pending, overdue]],
@@ -139,6 +208,28 @@ async fn cooldown_health_is_scoped_and_detects_overdue_work() {
         .output()
         .unwrap();
     assert!(output.status.success());
+    let healthy = std::process::Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"))
+        .env_clear()
+        .env("DATABASE_URL", role_url.as_str())
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
+        .env("SWALLOW_ALERT_DISCORD_COOLDOWN_GRACE_SECONDS", "60")
+        .env("SWALLOW_ALERT_SCOPED_DELIVERY", "true")
+        .env("SWALLOW_ALERT_COOLDOWN_POLICY", "new-condition")
+        .env("SWALLOW_ALERT_CONDITIONS_V2", "true")
+        .env(
+            "SWALLOW_ALERT_SLACK_WEBHOOK",
+            "https://hooks.slack.com/services/A/B/C",
+        )
+        .env("SWALLOW_ALERT_SLACK_TARGET_ID", "blocked")
+        .args([&env, "300", "120", "60"])
+        .output()
+        .unwrap();
+    assert!(
+        healthy.status.success(),
+        "{}",
+        String::from_utf8_lossy(&healthy.stderr)
+    );
     db.execute("DELETE FROM public.novu_rust_delivery_operator_grants WHERE environment_id=$1 AND database_principal::text=$2 AND decision='alert_view'",&[&env,&role]).await.unwrap();
     assert!(
         reader
@@ -148,5 +239,31 @@ async fn cooldown_health_is_scoped_and_detects_overdue_work() {
             )
             .await
             .is_err()
+    );
+    let denied = std::process::Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"))
+        .env_clear()
+        .env("DATABASE_URL", role_url.as_str())
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
+        .env("SWALLOW_ALERT_DISCORD_COOLDOWN_GRACE_SECONDS", "60")
+        .env("SWALLOW_ALERT_SCOPED_DELIVERY", "true")
+        .env("SWALLOW_ALERT_COOLDOWN_POLICY", "new-condition")
+        .env("SWALLOW_ALERT_CONDITIONS_V2", "true")
+        .env(
+            "SWALLOW_ALERT_SLACK_WEBHOOK",
+            "https://hooks.slack.com/services/A/B/C",
+        )
+        .env("SWALLOW_ALERT_SLACK_TARGET_ID", "blocked")
+        .args([&env, "300", "120", "60"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        denied.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&denied.stderr).contains("Discord cooldown health check failed")
     );
 }

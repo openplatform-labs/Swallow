@@ -133,6 +133,7 @@ async fn run() -> Result<()> {
         smtp_health: None,
         discord_health: None,
         discord_retry_health: None,
+        discord_cooldown_health: None,
         email_policy_cancelled: None,
         sms_policy_cancelled: None,
         push_policy_cancelled: None,
