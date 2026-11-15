@@ -310,7 +310,10 @@ async fn process_one_inner(
         tx.commit().await?;
         return Ok(true);
     }
-    if policy != crate::email_step_policy::Policy::Snapshot && !live(&tx, &job).await? {
+    let prepared = provider.prepare(&email);
+    // Preparation can be expensive (e.g. attachments). Do not reserve after
+    // the lease has expired, regardless of the workflow policy.
+    if !live(&tx, &job).await? {
         tx.rollback().await?;
         return Ok(true);
     }
@@ -342,6 +345,22 @@ async fn process_one_inner(
         }
     }
     tx.execute("INSERT INTO novu_rust_resend_recipients(job_id,environment_id,recipient_kind,recipient_index,recipient_hash) SELECT $1,$2,r.kind,r.idx,r.hash FROM jsonb_to_recordset($3::jsonb) AS r(kind text,idx integer,hash text)", &[&job.id,&environment,&serde_json::json!(recipients)]).await?;
+    let prepared = match prepared {
+        Ok(body) => body,
+        Err(_) => {
+            if !live(&tx, &job).await? {
+                tx.rollback().await?;
+                return Ok(true);
+            }
+            tx.execute("UPDATE novu_rust_resend_attempts SET state='rejected',updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$2 AND state='dispatching'", &[&job.id,&environment]).await?;
+            if email.message_id.is_some() {
+                tx.execute("UPDATE novu_rust_email_messages SET delivery_state='rejected',status='error',error_id='mail_unexpected_error',error_text='invalid Resend request' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
+            }
+            tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='invalid Resend request',lease_token=NULL,lease_until=NULL WHERE id=$1 AND environment_id=$2", &[&job.id,&environment]).await?;
+            tx.commit().await?;
+            return Ok(true);
+        }
+    };
     if email.message_id.is_some() {
         tx.execute("UPDATE novu_rust_email_messages SET delivery_state='dispatching' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
     }
@@ -350,13 +369,17 @@ async fn process_one_inner(
     } else {
         None
     };
+    if !live(&tx, &job).await? {
+        tx.rollback().await?;
+        return Ok(true);
+    }
     tx.commit().await?;
     let key = match retry_id {
         Some(id) => format!("swallow/{}/retry/{id}", job.id),
         None => format!("swallow/{}", job.id),
     };
     let (state, code, id, diagnostic, retry_after) = match provider
-        .send_with_correlation(&email, Some(&key), correlation)
+        .send_prepared_with_correlation(prepared, Some(&key), correlation)
         .await
     {
         Ok(id) => ("accepted", None, Some(id), None, None),
@@ -454,6 +477,43 @@ mod tests {
         net::TcpListener,
     };
     use tokio_postgres::NoTls;
+
+    #[tokio::test]
+    #[ignore = "requires fully migrated disposable PostgreSQL and loopback"]
+    async fn invalid_alternatives_are_rejected_before_dispatch_reservation() {
+        let (mut db, driver) = tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(), NoTls).await.unwrap();
+        tokio::spawn(driver);
+        let env = format!("resend-invalid-{}", Uuid::new_v4());
+        db.execute("INSERT INTO public.novu_rust_environments VALUES($1,'org')", &[&env]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,email_subject,email_html,email_provider,inbox_metadata) VALUES($1,'fixture',true,true,'hello','<p>hello</p>','resend','{\"id\":\"64a000000000000000000051\"}')", &[&env]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES($1,'alice','64a000000000000000000054','{\"email\":\"alice@example.test\"}')", &[&env]).await.unwrap();
+        let trigger=Uuid::new_v4();
+        enqueue(&db,trigger,&env,crate::in_app::JOB_KIND,&json!({"workflow":"fixture","transactionId":"invalid-alt","content":"","payload":{},"recipients":[{"subscriberId":"alice"}],"recipientIdentitySnapshot":{"alice":"64a000000000000000000054"},"emailOverride":{"alternatives":[{"contentType":"text/calendar","content":"meeting"}]},"severityOverride":null})).await.unwrap();
+        assert!(crate::in_app::process_one(&mut db).await.unwrap());
+        let job:Uuid=db.query_one("SELECT email_job_id FROM public.novu_rust_email_step_outcomes WHERE environment_id=$1 AND transaction_id='invalid-alt'",&[&env]).await.unwrap().get(0);
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider=Resend::test_endpoint(Config{api_key:"fixture".into(),from:"sender@example.test".into(),sender_name:String::new()},&format!("http://{}/emails",listener.local_addr().unwrap())).unwrap();
+        db.batch_execute("CREATE FUNCTION public.test_resend_invalid_fail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$; CREATE TRIGGER test_resend_invalid_fail BEFORE UPDATE OF delivery_state ON public.novu_rust_email_messages FOR EACH ROW WHEN (NEW.delivery_state='rejected') EXECUTE FUNCTION public.test_resend_invalid_fail()").await.unwrap();
+        assert!(process_one(&mut db,&env,&provider).await.is_err());
+        assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_resend_attempts WHERE job_id=$1",&[&job]).await.unwrap().get::<_,i64>(0),0);
+        db.batch_execute("DROP TRIGGER test_resend_invalid_fail ON public.novu_rust_email_messages; DROP FUNCTION public.test_resend_invalid_fail()").await.unwrap();
+        db.execute("UPDATE public.novu_queue_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1",&[&job]).await.unwrap();
+        assert_eq!(recover_expired(&mut db,&env).await.unwrap(),1);
+        assert!(process_one(&mut db,&env,&provider).await.unwrap());
+        assert!(tokio::time::timeout(Duration::from_millis(300),listener.accept()).await.is_err());
+        let row=db.query_one("SELECT j.status,j.last_error,a.state,a.http_status,m.status,m.delivery_state,m.error_text FROM public.novu_queue_jobs j JOIN public.novu_rust_resend_attempts a ON a.job_id=j.id JOIN public.novu_rust_email_messages m ON m.email_job_id=j.id AND m.environment_id=j.environment_id WHERE j.id=$1",&[&job]).await.unwrap();
+        assert_eq!(row.get::<_,String>(0),"failed");assert_eq!(row.get::<_,String>(1),"invalid Resend request");assert_eq!(row.get::<_,String>(2),"rejected");assert_eq!(row.get::<_,Option<i32>>(3),None);assert_eq!(row.get::<_,String>(4),"error");assert_eq!(row.get::<_,String>(5),"rejected");assert_eq!(row.get::<_,String>(6),"invalid Resend request");
+        assert!(!process_one(&mut db,&env,&provider).await.unwrap());
+        let valid=Uuid::new_v4();
+        enqueue(&db,valid,&env,JOB_KIND,&json!({"to":["alice@example.test"],"subject":"valid","html":"<p>ok</p>"})).await.unwrap();
+        let server=tokio::spawn(async move {
+            let (mut socket,_)=listener.accept().await.unwrap();let mut request=[0u8;4096];assert!(socket.read(&mut request).await.unwrap()>0);
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"id\":\"mock-id-1\"}").await.unwrap();
+        });
+        assert!(process_one(&mut db,&env,&provider).await.unwrap());server.await.unwrap();
+        let accepted=db.query_one("SELECT j.status,a.state,a.provider_message_id FROM public.novu_queue_jobs j JOIN public.novu_rust_resend_attempts a ON a.job_id=j.id WHERE j.id=$1",&[&valid]).await.unwrap();
+        assert_eq!(accepted.get::<_,String>(0),"completed");assert_eq!(accepted.get::<_,String>(1),"accepted");assert_eq!(accepted.get::<_,Option<String>>(2).as_deref(),Some("mock-id-1"));
+    }
 
     #[tokio::test]
     #[ignore = "requires migrated disposable PostgreSQL and loopback"]

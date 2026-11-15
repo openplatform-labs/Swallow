@@ -1,3 +1,5 @@
+Resend 발송 전 검증: 워크플로 본문을 발송 시도 확정 전에 구성·검증하여 지원하지 않는 본문을 외부 요청 없이 rejected 시도와 실패 작업·메시지로 원자 기록한다. 로컬 PostgreSQL에서 실패 기록 중 DB 오류를 강제로 발생시켜 롤백과 선점 만료 후 복구를 확인했고, 모의 HTTP로 유효 요청과 429 회귀를 검증한다. 본문 구성 중 DB 트랜잭션과 잠금이 유지되어 대용량 부하를 평가해야 한다. 유효 시도 기록 이후 전송 전 종료는 여전히 결과 불명이며 실제 Resend·원본 호환·운영 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
 Resend 추가 본문 정책: `SWALLOW_RESEND_ALTERNATIVES_POLICY=defer|reject`로 기존 지연 판정 또는 요청 단계 거절을 선택한다. `reject`는 현재 활성 이메일 단계가 Resend이고 최종 override가 비어 있지 않으면 트리거 전체를 422로 거절해 작업을 만들지 않는다. 로컬 PostgreSQL·실제 API 프로세스에서 정책과 우선순위·빈 배열 해제·비활성 단계·다른 제공자를 시험했다. 조회 시점 이후 워크플로 변경은 보장하지 않으며 구독자 선호도를 미리 평가하지 않아 다른 채널도 함께 거절된다. 실제 Resend·원본 서버·다중 호스트 HA는 미검증이다. [API README](apps/api/rust-api/README.md)를 참고한다.
 
 SendGrid 추가 본문 원본 비교: 체크아웃된 Novu 제공자 소스를 번들링하고 SendGrid SDK 요청을 가로채 Rust와 9가지 본문을 비교했다. 달력 본문, 텍스트 없는 다중 본문, 빈 본문이 포함되며 모두 일치했다. 원본 전체 서버·트리거·실제 SendGrid 전달 비교는 아니고 범위는 선정된 제공자 요청 본문에 한정된다. 재현 방법은 [워커 README](apps/worker/rust-queue/README.md)에 기록했다.

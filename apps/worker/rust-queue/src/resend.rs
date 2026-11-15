@@ -186,7 +186,19 @@ impl Resend {
         idempotency_key: Option<&str>,
         correlation: Option<uuid::Uuid>,
     ) -> Result<String, SendError> {
-        let mut body = request_body(&self.config, email)?;
+        let body = self.prepare(email)?;
+        self.send_prepared_with_correlation(body, idempotency_key, correlation).await
+    }
+    /// Prepare before a queue attempt is committed; no external request occurs.
+    pub(crate) fn prepare(&self, email: &Email) -> Result<Value, SendError> {
+        request_body(&self.config, email)
+    }
+    pub(crate) async fn send_prepared_with_correlation(
+        &self,
+        mut body: Value,
+        idempotency_key: Option<&str>,
+        correlation: Option<uuid::Uuid>,
+    ) -> Result<String, SendError> {
         if let Some(correlation) = correlation {
             body["tags"] = json!([{"name":"swallow_dispatch","value":correlation.to_string()}]);
         }
