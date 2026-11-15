@@ -37,4 +37,14 @@ describe('Smtp operator reviews',()=>{
     const {fixture,c}=component();await c.list();c.reason='evidence';c.prepare(c.rows()[0],'accepted');expect(c.review()).toBeNull();await c.list();c.prepare(c.rows()[0],'retry');c.confirmed=true;await c.submit();await c.lookup();expect(c.lookupStatus()).toBe('error');expect(c.reviewStatus()).toBe('unknown');fixture.destroy();
   });
 
+  it('reads history pages without losing large revisions',async()=>{
+    const items=Array.from({length:100},(_,i)=>({actor:'api_login',actorOid:'42',requestId:`00000000-0000-4000-8000-${i.toString().padStart(12,'0')}`,jobId:job,attemptRevision:revision,failureRevision:'9223372036854775807',decision:'retry',reason:'evidence',createdAt:'2026-11-15T00:00:00Z'}));
+    const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:items,next:{actorOid:'42',requestId:items[99].requestId}}))).mockResolvedValueOnce(new Response(JSON.stringify({data:[{...items[0],requestId:requestId}],next:null})));
+    const {fixture,c}=component();c.historyJob=job;await c.loadHistory();expect(c.history().length).toBe(100);expect(c.history()[0].failureRevision).toBe('9223372036854775807');fixture.detectChanges();expect(fixture.nativeElement.textContent).toContain('api_login');await c.loadHistory(true);expect(c.history().length).toBe(1);expect(mock.mock.calls[1][0]).toContain('beforeActorOid=42');expect(c.historyNext()).toBeNull();fixture.destroy();
+  });
+  it('clears history on context change and rejects a malformed cursor',async()=>{
+    let resolve!:(r:Response)=>void;vi.spyOn(globalThis,'fetch').mockImplementationOnce(()=>new Promise(r=>resolve=r)).mockResolvedValueOnce(new Response(JSON.stringify({data:[],next:{actorOid:'42',requestId}})));
+    const {fixture,c}=component();c.historyJob=job;const pending=c.loadHistory();c.environment='other';c.ngOnChanges();resolve(new Response(JSON.stringify({data:[],next:null})));await pending;expect(c.historyStatus()).toBe('idle');await c.loadHistory();expect(c.historyStatus()).toBe('error');fixture.destroy();
+  });
+
 });

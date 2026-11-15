@@ -2,6 +2,8 @@ import { Component, EventEmitter, Input, OnChanges, OnDestroy, Output, signal } 
 import { FormsModule } from '@angular/forms';
 
 type SmtpRow = {jobId:string;status:string;attemptState:string|null;attemptRevision:string|null;failureRevision:string;attempts:number};
+type HistoryRow = {actor:string;actorOid:string;requestId:string;jobId:string;attemptRevision:string;failureRevision:string;decision:'accepted'|'retry';reason:string;createdAt:string};
+type HistoryCursor = {actorOid:string;requestId:string};
 type Review = {requestId:string;jobId:string;attemptRevision:string|null;failureRevision:string;reason:string;decision?:'accepted'|'retry'};
 @Component({selector:'app-smtp-reviews',imports:[FormsModule],templateUrl:'./smtp-reviews.html'})
 export class SmtpReviews implements OnChanges,OnDestroy {
@@ -10,10 +12,12 @@ export class SmtpReviews implements OnChanges,OnDestroy {
   readonly review=signal<Review|null>(null); readonly reviewStatus=signal<'idle'|'prepared'|'sending'|'unknown'|'recorded'|'unavailable'>('idle'); readonly recorded=signal<boolean|null>(null);
   readonly lookupStatus=signal<'idle'|'loading'|'found'|'not-found'|'error'>('idle'); readonly lookupRecord=signal<(Review & {recorded:boolean})|null>(null);
   readonly message=signal(''); reason=''; confirmed=false; retryConfirmed=false; resetConfirmed=false; lookupId=''; lookupDecision:''|'accepted'|'retry'='';
+  historyJob=''; readonly history=signal<HistoryRow[]>([]); readonly historyNext=signal<HistoryCursor|null>(null); readonly historyStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');
+  private historySeq=0; private historyAbort:AbortController|null=null;
   private listSeq=0; private reviewSeq=0; private lookupSeq=0;
   private listAbort:AbortController|null=null; private reviewAbort:AbortController|null=null; private lookupAbort:AbortController|null=null;
   private sentToken:string|null=null; private sentOrigin:string|null=null; private sentEnvironment:string|null=null;
-  ngOnChanges():void { this.clearList(); this.clearLookup(); if(this.reviewStatus()==='sending'){this.reviewSeq++;this.reviewAbort?.abort();this.reviewAbort=null;this.reviewStatus.set('unknown');this.busyChange.emit(false);} if(['prepared','recorded','unavailable'].includes(this.reviewStatus()))this.resetReview(); this.sentToken=null;this.sentOrigin=null;this.sentEnvironment=null; }
+  ngOnChanges():void { this.clearList(); this.clearLookup(); this.clearHistory(); if(this.reviewStatus()==='sending'){this.reviewSeq++;this.reviewAbort?.abort();this.reviewAbort=null;this.reviewStatus.set('unknown');this.busyChange.emit(false);} if(['prepared','recorded','unavailable'].includes(this.reviewStatus()))this.resetReview(); this.sentToken=null;this.sentOrigin=null;this.sentEnvironment=null; }
   ngOnDestroy():void {this.ngOnChanges();this.token='';}
   private uuid(v:unknown):v is string {return typeof v==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);}
   private revision(v:unknown):v is string {return typeof v==='string'&&/^(0|[1-9][0-9]{0,18})$/.test(v)&&BigInt(v)<=9223372036854775807n;}
@@ -41,4 +45,20 @@ export class SmtpReviews implements OnChanges,OnDestroy {
     try{const params=this.params();params.set('requestId',id);const decision=this.lookupDecision;if(decision)params.set('decision',decision);const response=await fetch(`${this.origin()}/v1/experimental/operator/${decision?'smtp-resolution-request':'smtp-review-request'}?${params}`,{headers:{Authorization:`Bearer ${this.token.trim()}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([c.signal,AbortSignal.timeout(10000)])});if(!response.ok)throw new Error('request');const value:unknown=await response.json();if(!value||typeof value!=='object')throw new Error('response');const r=value as Record<string,unknown>;if(r['found']===false){if(seq===this.lookupSeq)this.lookupStatus.set('not-found');return;}if(r['found']!==true||r['requestId']!==id||!this.uuid(r['jobId'])||!(r['attemptRevision']===null||this.uuid(r['attemptRevision']))||!this.revision(r['failureRevision'])||typeof r['reason']!=='string'||typeof r['recorded']!=='boolean'||typeof r['createdAt']!=='string'||(decision?(r['decision']!==decision||!this.uuid(r['attemptRevision'])):r['decision']!==undefined))throw new Error('response');
       const record:Review & {recorded:boolean}={requestId:id,jobId:r['jobId'],attemptRevision:r['attemptRevision'] as string|null,failureRevision:r['failureRevision'],reason:r['reason'],recorded:r['recorded'],...(decision?{decision}:{})};const snap=this.review();if(snap&&snap.requestId===id&&(snap.jobId!==record.jobId||snap.attemptRevision!==record.attemptRevision||snap.failureRevision!==record.failureRevision||snap.reason!==record.reason||snap.decision!==record.decision))throw new Error('mismatch');if(seq!==this.lookupSeq)return;this.lookupRecord.set(record);this.lookupStatus.set('found');if(snap&&snap.requestId===id&&this.sentToken===this.token.trim()&&this.sentOrigin===this.origin()&&this.sentEnvironment===this.environment.trim()){this.recorded.set(record.recorded);this.reviewStatus.set('recorded');this.clearList();}
     }catch{if(seq===this.lookupSeq)this.lookupStatus.set('error');}finally{if(seq===this.lookupSeq)this.lookupAbort=null;}}
+  clearHistory():void {this.historySeq++;this.historyAbort?.abort();this.historyAbort=null;this.history.set([]);this.historyNext.set(null);this.historyStatus.set('idle');}
+  private oid(v:unknown):v is string {return typeof v==='string'&&/^(0|[1-9][0-9]{0,9})$/.test(v)&&Number(v)<=4294967295;}
+  async loadHistory(more=false):Promise<void> {
+    const job=this.historyJob.trim().toLowerCase(),cursor=more?this.historyNext():null;if(!this.uuid(job)||(more&&!cursor))return;
+    const seq=++this.historySeq;this.historyAbort?.abort();const c=new AbortController();this.historyAbort=c;this.history.set([]);this.historyNext.set(null);this.historyStatus.set('loading');
+    try {const params=this.params();params.set('jobId',job);if(cursor){params.set('beforeActorOid',cursor.actorOid);params.set('beforeRequestId',cursor.requestId);}
+      const response=await fetch(`${this.origin()}/v1/experimental/operator/smtp-resolution-history?${params}`,{headers:{Authorization:`Bearer ${this.token.trim()}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([c.signal,AbortSignal.timeout(10000)])});if(!response.ok)throw new Error('request');
+      const value:unknown=await response.json();if(!value||typeof value!=='object')throw new Error('page');const page=value as Record<string,unknown>;if(!Array.isArray(page['data'])||page['data'].length>100)throw new Error('page');
+      const rows:HistoryRow[]=page['data'].map((value:unknown)=>{if(!value||typeof value!=='object')throw new Error('row');const r=value as Record<string,unknown>;
+        if(typeof r['actor']!=='string'||!this.oid(r['actorOid'])||!this.uuid(r['requestId'])||!this.uuid(r['jobId'])||r['jobId'].toLowerCase()!==job||!this.uuid(r['attemptRevision'])||!this.revision(r['failureRevision'])||!['accepted','retry'].includes(r['decision'] as string)||typeof r['reason']!=='string'||typeof r['createdAt']!=='string')throw new Error('row');
+        return {actor:r['actor'],actorOid:r['actorOid'],requestId:r['requestId'],jobId:r['jobId'],attemptRevision:r['attemptRevision'],failureRevision:r['failureRevision'],decision:r['decision'] as 'accepted'|'retry',reason:r['reason'],createdAt:r['createdAt']};});
+      let next:HistoryCursor|null=null;if(page['next']!==null){if(!page['next']||typeof page['next']!=='object'||rows.length!==100)throw new Error('cursor');const n=page['next'] as Record<string,unknown>;if(!this.oid(n['actorOid'])||!this.uuid(n['requestId'])||n['actorOid']!==rows.at(-1)?.actorOid||n['requestId']!==rows.at(-1)?.requestId)throw new Error('cursor');next={actorOid:n['actorOid'],requestId:n['requestId']};}
+      if(seq!==this.historySeq)return;this.history.set(rows);this.historyNext.set(next);this.historyStatus.set('loaded');
+    }catch{if(seq===this.historySeq)this.historyStatus.set('error');}finally{if(seq===this.historySeq)this.historyAbort=null;}
+  }
+
 }
