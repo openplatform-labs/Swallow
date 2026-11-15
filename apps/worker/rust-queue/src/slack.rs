@@ -2,7 +2,7 @@
 use reqwest::{Client, Url, header};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{fmt, time::Duration};
+use std::{fmt, path::Path, time::Duration};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -75,6 +75,17 @@ pub struct Slack {
     endpoint: Url,
 }
 impl Slack {
+    /// Reload before claiming a new job. The caller must pause on failure.
+    pub fn reload_token_file(&mut self, path: &Path) -> Result<(), SendError> {
+        let token = novu_rust_contracts::secret::read(None, Some(path))
+            .map_err(|_| SendError::Invalid)?
+            .ok_or(SendError::Invalid)?;
+        if header::HeaderValue::from_str(&format!("Bearer {token}")).is_err() {
+            return Err(SendError::Invalid);
+        }
+        self.token = token;
+        Ok(())
+    }
     pub fn new(token: String) -> Result<Self, SendError> {
         Self::with_endpoint(
             token,
@@ -166,6 +177,51 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+    #[tokio::test]
+    async fn token_file_reload_changes_subsequent_mock_requests() {
+        let dir = std::env::temp_dir().join(format!("swallow-slack-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("token");
+        std::fs::write(&path, "fixture-old").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for expected in ["fixture-old", "fixture-new"] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buf = [0; 4096];
+                while !bytes.windows(4).any(|v| v == b"\r\n\r\n") {
+                    let count = socket.read(&mut buf).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buf[..count]);
+                }
+                assert!(
+                    String::from_utf8_lossy(&bytes)
+                        .contains(&format!("authorization: Bearer {expected}\r\n"))
+                );
+                let body = r#"{"ok":true,"channel":"C1","ts":"1"}"#;
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let mut provider = Slack::test_endpoint("fixture-old".into(), &url).unwrap();
+        let message = Message {
+            channel: "C1".into(),
+            text: "hello".into(),
+            blocks: None,
+            custom_data: None,
+        };
+        provider.reload_token_file(&path).unwrap();
+        assert!(provider.send(&message).await.is_ok());
+        std::fs::write(&path, "invalid\ntoken").unwrap();
+        assert_eq!(provider.reload_token_file(&path), Err(SendError::Invalid));
+        assert_eq!(provider.token, "fixture-old");
+        std::fs::write(dir.join("next"), "fixture-new").unwrap();
+        std::fs::rename(dir.join("next"), &path).unwrap();
+        provider.reload_token_file(&path).unwrap();
+        assert!(provider.send(&message).await.is_ok());
+        server.await.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     async fn mock(status: &str, body: &str) -> (String, tokio::task::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap());
