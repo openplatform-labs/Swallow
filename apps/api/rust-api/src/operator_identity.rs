@@ -1193,11 +1193,10 @@ async fn query(
         | Lookup::FcmResult
         | Lookup::SlackResult
         | Lookup::SendgridResult => &["environmentId", "jobId"],
-        Lookup::ResendJobs
-        | Lookup::TwilioJobs
-        | Lookup::FcmJobs
-        | Lookup::SlackJobs
-        | Lookup::SendgridJobs => &["environmentId", "after"],
+        Lookup::ResendJobs => &["environmentId", "after", "status"],
+        Lookup::TwilioJobs | Lookup::FcmJobs | Lookup::SlackJobs | Lookup::SendgridJobs => {
+            &["environmentId", "after"]
+        }
         Lookup::WorkflowRead => &["environmentId", "workflow", "resource"],
         Lookup::WorkflowAudit => &["environmentId", "workflow", "resource", "after"],
         Lookup::WorkflowRequest => &["environmentId", "resource", "requestId"],
@@ -1608,30 +1607,40 @@ async fn query(
                     }
                 },
             };
-            guarded_query(
-                &db,
-                &identity,
-                if matches!(lookup, Lookup::SendgridJobs) {
-                    "SELECT public.novu_rust_operator_jwt_sendgrid_jobs($1,$2,$3,$4,$5,$6)"
-                } else if matches!(lookup, Lookup::SlackJobs) {
-                    "SELECT public.novu_rust_operator_jwt_slack_jobs($1,$2,$3,$4,$5,$6)"
-                } else if matches!(lookup, Lookup::FcmJobs) {
-                    "SELECT public.novu_rust_operator_jwt_fcm_jobs($1,$2,$3,$4,$5,$6)"
-                } else if matches!(lookup, Lookup::TwilioJobs) {
-                    "SELECT public.novu_rust_operator_jwt_twilio_jobs($1,$2,$3,$4,$5,$6)"
-                } else {
-                    "SELECT public.novu_rust_operator_jwt_resend_jobs($1,$2,$3,$4,$5,$6)"
-                },
-                &[
-                    &identity.issuer,
-                    &identity.subject,
-                    &identity.client_id,
-                    &env,
-                    &exp,
-                    &after,
-                ],
-            )
-            .await
+            if matches!(lookup, Lookup::ResendJobs) && params.contains_key("status") {
+                let filter = params.get("status").unwrap();
+                if !["unknown", "rejected", "rate-limited"].contains(&filter.as_str()) {
+                    return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+                }
+                guarded_query(&db, &identity,
+                    "SELECT public.novu_rust_operator_jwt_resend_jobs_filtered($1,$2,$3,$4,$5,$6,$7)",
+                    &[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&after,&filter]).await
+            } else {
+                guarded_query(
+                    &db,
+                    &identity,
+                    if matches!(lookup, Lookup::SendgridJobs) {
+                        "SELECT public.novu_rust_operator_jwt_sendgrid_jobs($1,$2,$3,$4,$5,$6)"
+                    } else if matches!(lookup, Lookup::SlackJobs) {
+                        "SELECT public.novu_rust_operator_jwt_slack_jobs($1,$2,$3,$4,$5,$6)"
+                    } else if matches!(lookup, Lookup::FcmJobs) {
+                        "SELECT public.novu_rust_operator_jwt_fcm_jobs($1,$2,$3,$4,$5,$6)"
+                    } else if matches!(lookup, Lookup::TwilioJobs) {
+                        "SELECT public.novu_rust_operator_jwt_twilio_jobs($1,$2,$3,$4,$5,$6)"
+                    } else {
+                        "SELECT public.novu_rust_operator_jwt_resend_jobs($1,$2,$3,$4,$5,$6)"
+                    },
+                    &[
+                        &identity.issuer,
+                        &identity.subject,
+                        &identity.client_id,
+                        &env,
+                        &exp,
+                        &after,
+                    ],
+                )
+                .await
+            }
         }
         Lookup::ResendResult
         | Lookup::TwilioResult

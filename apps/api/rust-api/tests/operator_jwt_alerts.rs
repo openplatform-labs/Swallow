@@ -45,6 +45,7 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     db.batch_execute("INSERT INTO public.novu_rust_environments VALUES('jwt-alert-a','org'),('jwt-alert-b','org')").await.unwrap();
     let role = format!("jwt_alert_{}", Uuid::new_v4().simple());
     db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_alerts(text,text,text,text,bigint,text,text),public.novu_rust_console_alerts_page(text,text,text),public.novu_rust_operator_jwt_resend_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_resend_jobs(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_twilio_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_twilio_jobs(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_jobs(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_slack_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_slack_jobs(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_sendgrid_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_sendgrid_jobs(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_jobs_filtered(text,text,text,text,bigint,uuid,text) TO {role}")).await.unwrap();
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_read(text,text,text,text,bigint,text,text) TO {role}")).await.unwrap();
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_write(text,text,text,text,bigint,text,text,jsonb,jsonb,text) TO {role}")).await.unwrap();
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_audit_read(text,text,text,text,bigint,text,text,uuid) TO {role}")).await.unwrap();
@@ -2612,6 +2613,76 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
             && !value.to_string().contains("private-recipient-hash")
             && !value.to_string().contains("payload-secret")
             && !value.to_string().contains(&tag.to_string())
+    );
+    // Filtered pages expose only current matching attempts in the authorized environment.
+    db.batch_execute("WITH jobs AS (INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) SELECT gen_random_uuid(),'jwt-alert-a','experimental_resend_email','{}','failed' FROM generate_series(1,23) RETURNING id) INSERT INTO public.novu_rust_resend_attempts(job_id,environment_id,state,http_status) SELECT id,'jwt-alert-a','rejected',429 FROM jobs").await.unwrap();
+    let filtered_request = |query: &str| jobs_request(&token, query);
+    let page = app
+        .clone()
+        .oneshot(filtered_request(
+            "environmentId=jwt-alert-a&status=rate-limited",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let page: Value =
+        serde_json::from_slice(&page.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(page["data"].as_array().unwrap().len(), 20);
+    assert!(
+        page["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["attemptHttpStatus"] == 429 && row["attemptState"] == "rejected")
+    );
+    let next = page["next"].as_str().unwrap();
+    let next_page = app
+        .clone()
+        .oneshot(filtered_request(&format!(
+            "environmentId=jwt-alert-a&status=rate-limited&after={next}"
+        )))
+        .await
+        .unwrap();
+    let next_page: Value =
+        serde_json::from_slice(&next_page.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(next_page["data"].as_array().unwrap().len(), 3);
+    assert_eq!(next_page["hasMore"], false);
+    let unknown = app
+        .clone()
+        .oneshot(filtered_request("environmentId=jwt-alert-a&status=unknown"))
+        .await
+        .unwrap();
+    let unknown: Value =
+        serde_json::from_slice(&unknown.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(unknown["data"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        app.clone()
+            .oneshot(filtered_request("environmentId=jwt-alert-a&status=other"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(jobs_request(
+                &make("reader"),
+                "environmentId=jwt-alert-a&status=rate-limited"
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(filtered_request(
+                "environmentId=jwt-alert-b&status=rate-limited"
+            ))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
     );
     // The new grant is separate from the existing alert-read permission.
     assert_eq!(

@@ -431,6 +431,15 @@ describe('Swallow console', () => {
     app.setSection('overview');expect(app.resendJobs()).toEqual([]);expect(app.resendJobsStatus()).toBe('idle');
   });
 
+  it('filters Resend jobs and discards a response from the previous filter', async () => {
+    let finish!:(response:Response)=>void;
+    const fetchMock=vi.spyOn(globalThis,'fetch').mockReturnValueOnce(new Promise(done=>{finish=done;})).mockResolvedValueOnce(new Response(JSON.stringify({data:[],hasMore:false,next:null})));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('alerts');app.alertAuthMode='jwt';app.alertEnvironment='env-a';app.alertKey='aaa.bbb.ccc';
+    const old=app.loadResendJobs();app.resendJobsFilter='rate-limited';app.clearResendJobs();
+    finish(new Response(JSON.stringify({data:[],hasMore:false,next:null})));await old;expect(app.resendJobsStatus()).toBe('idle');
+    await app.loadResendJobs();expect(new URL(fetchMock.mock.calls[1][0] as string).searchParams.get('status')).toBe('rate-limited');expect(app.resendJobsPage()).toBe(1);expect(app.resendJobsStatus()).toBe('loaded');
+  });
+
   it('rejects unauthorized and malformed lists and ignores a late response after logout', async () => {
     let finish!:(response:Response)=>void;
     vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response('',{status:401})).mockResolvedValueOnce(new Response(JSON.stringify({data:[],hasMore:true,next:'bad'}))).mockReturnValueOnce(new Promise(done=>{finish=done;}));

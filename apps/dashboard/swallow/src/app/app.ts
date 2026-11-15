@@ -147,6 +147,7 @@ export class App implements OnDestroy {
   readonly resendResult = signal<ResendResult|null>(null);
   private resendSequence = 0;
   private resendAbort: AbortController|null = null;
+  resendJobsFilter: ''|'unknown'|'rejected'|'rate-limited' = '';
   readonly resendJobs = signal<ResendResult[]>([]);
   readonly resendJobsStatus = signal<'idle'|'loading'|'loaded'|'error'>('idle');
   readonly resendJobsError = signal('');
@@ -1312,7 +1313,7 @@ export class App implements OnDestroy {
     try {
       const origin=this.validatedOrigin(), key=this.alertKey.trim(), environment=this.alertEnvironment.trim();
       if (this.alertAuthMode!=='jwt' || !this.validJwt(key) || !this.validEnvironment(environment)) throw new Error('운영자 JWT와 환경 ID를 확인해 주세요.');
-      const params=new URLSearchParams({environmentId:environment}); if (cursor) params.set('after',cursor);
+      const params=new URLSearchParams({environmentId:environment}); if (cursor) params.set('after',cursor); if (this.resendJobsFilter) params.set('status',this.resendJobsFilter);
       const response=await fetch(`${origin}/v1/experimental/operator/resend-jobs?${params}`, {method:'GET',headers:{Authorization:`Bearer ${key}`},cache:'no-store',credentials:'omit',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
       if (response.status===401 || response.status===403) throw new Error('인증 값 또는 Resend 목록 및 결과 조회 권한을 확인해 주세요.');
       if (!response.ok) throw new Error('작업 목록을 가져오지 못했습니다.');

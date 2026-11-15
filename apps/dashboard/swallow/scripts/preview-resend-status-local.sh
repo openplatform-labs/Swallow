@@ -24,7 +24,7 @@ cargo run --quiet --locked --manifest-path "$worker/Cargo.toml" --bin migrate-wo
 "$pgbin/psql" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
 CREATE ROLE ui_resend_status_fixture LOGIN;
 GRANT USAGE ON SCHEMA public TO ui_resend_status_fixture;
-GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_resend_jobs(text,text,text,text,bigint,uuid) TO ui_resend_status_fixture;
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_resend_jobs(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_resend_jobs_filtered(text,text,text,text,bigint,uuid,text) TO ui_resend_status_fixture;
 INSERT INTO public.novu_rust_environments VALUES ('ui-fixture-env','org');
 INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_catalog.pg_roles WHERE rolname='ui_resend_status_fixture';
 INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
