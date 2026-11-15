@@ -33,6 +33,67 @@ async fn smtp_uncertain_dispatch_survives_synchronous_promotion() {
     )
     .await
     .unwrap();
+    let scoped = std::env::var("TEST_SMTP_FAILOVER_RLS").as_deref() == Ok("true");
+    let foreign = Uuid::new_v4();
+    let other = format!("smtp-other-{}", Uuid::new_v4().simple());
+    db.execute(
+        "INSERT INTO public.novu_rust_environments VALUES($1,'org')",
+        &[&other],
+    )
+    .await
+    .unwrap();
+    queue::enqueue(
+        &db,
+        foreign,
+        &other,
+        queue::smtp_queue::JOB_KIND,
+        &json!({"to":["other@example.test"],"subject":"other","html":"other"}),
+    )
+    .await
+    .unwrap();
+    if scoped {
+        db.batch_execute("CREATE ROLE smtp_failover_worker LOGIN; GRANT USAGE ON SCHEMA public TO smtp_failover_worker; GRANT SELECT,UPDATE ON public.novu_queue_jobs,public.novu_rust_email_messages TO smtp_failover_worker; GRANT SELECT,INSERT,UPDATE ON public.novu_rust_smtp_attempts,public.novu_rust_email_workflow_worker_config TO smtp_failover_worker;").await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_smtp_scoped_logins(principal_oid,database_principal,environment_id) SELECT oid,rolname,$1 FROM pg_roles WHERE rolname='smtp_failover_worker'", &[&env]).await.unwrap();
+        db.query_one("SELECT public.novu_rust_install_smtp_scoped_rls()", &[])
+            .await
+            .unwrap();
+        let scoped_url = url.replacen(
+            "postgres://postgres@",
+            "postgres://smtp_failover_worker@",
+            1,
+        );
+        let (reader, driver) = tokio_postgres::connect(&scoped_url, NoTls).await.unwrap();
+        tokio::spawn(driver);
+        assert_eq!(
+            reader
+                .query_one(
+                    "SELECT count(*) FROM public.novu_queue_jobs WHERE id=$1",
+                    &[&foreign]
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            0
+        );
+    }
+    let worker_primary = if scoped {
+        url.replacen(
+            "postgres://postgres@",
+            "postgres://smtp_failover_worker@",
+            1,
+        )
+    } else {
+        url.clone()
+    };
+    let worker_cluster = if scoped {
+        cluster_url.replacen(
+            "postgres://postgres@",
+            "postgres://smtp_failover_worker@",
+            1,
+        )
+    } else {
+        cluster_url.clone()
+    };
     let dir = std::env::temp_dir().join(format!("swallow-smtp-crash-{}", Uuid::new_v4()));
     std::fs::create_dir(&dir).unwrap();
     let cert = dir.join("cert");
@@ -88,6 +149,10 @@ async fn smtp_uncertain_dispatch_survives_synchronous_promotion() {
                 .env("DATABASE_URL", db_url)
                 .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
                 .env("NOVU_SMTP_ENVIRONMENT_ID", &env)
+                .env(
+                    "SWALLOW_SMTP_SCOPED_RLS",
+                    if scoped { "true" } else { "false" },
+                )
                 .env("SWALLOW_SMTP_HOST", "localhost")
                 .env("SWALLOW_SMTP_PORT", port.trim())
                 .env("SWALLOW_SMTP_FROM", "sender@example.test")
@@ -108,7 +173,7 @@ async fn smtp_uncertain_dispatch_survives_synchronous_promotion() {
     )
     .await
     .unwrap();
-    let mut first_worker = worker(&url);
+    let mut first_worker = worker(&worker_primary);
     for _ in 0..200 {
         if dir.join("message-1").exists() {
             break;
@@ -130,7 +195,7 @@ async fn smtp_uncertain_dispatch_survives_synchronous_promotion() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(replicated, "attempt not present on standby");
-    let survivor_url = format!("{cluster_url}&application_name=smtp-survivor");
+    let survivor_url = format!("{worker_cluster}&application_name=smtp-survivor");
     let mut second_worker = worker(&survivor_url);
     // Establish the survivor on the primary before it is stopped.
     let mut connected = false;
@@ -165,6 +230,33 @@ async fn smtp_uncertain_dispatch_survives_synchronous_promotion() {
             .unwrap()
             .get::<_, bool>(0)
     );
+    if scoped {
+        let scoped_url = standby_url.replacen(
+            "postgres://postgres@",
+            "postgres://smtp_failover_worker@",
+            1,
+        );
+        let (reader, driver) = tokio_postgres::connect(&scoped_url, NoTls).await.unwrap();
+        tokio::spawn(driver);
+        assert_eq!(
+            reader
+                .query_one(
+                    "SELECT count(*) FROM public.novu_queue_jobs WHERE id=$1",
+                    &[&foreign]
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            0
+        );
+        reader
+            .query_one(
+                "SELECT public.novu_rust_assert_smtp_scoped_login($1)",
+                &[&env],
+            )
+            .await
+            .unwrap();
+    }
     db.execute("UPDATE public.novu_queue_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id=$1",&[&first]).await.unwrap();
     let mut recovered = false;
     for _ in 0..200 {
@@ -219,6 +311,16 @@ async fn smtp_uncertain_dispatch_survives_synchronous_promotion() {
             row.get::<_, i64>(2)
         ),
         ("failed".into(), "unknown".into(), 1)
+    );
+    assert_eq!(
+        db.query_one(
+            "SELECT status FROM public.novu_queue_jobs WHERE id=$1",
+            &[&foreign]
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0),
+        "pending"
     );
     std::fs::remove_dir_all(dir).unwrap();
 }

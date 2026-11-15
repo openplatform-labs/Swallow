@@ -45,6 +45,7 @@ GRANT USAGE ON SCHEMA public TO smtp_fixture_worker;
 GRANT SELECT,UPDATE ON public.novu_queue_jobs TO smtp_fixture_worker;
 GRANT SELECT,INSERT,UPDATE ON public.novu_rust_smtp_attempts,public.novu_rust_email_workflow_worker_config TO smtp_fixture_worker;
 GRANT SELECT,UPDATE ON public.novu_rust_subscribers TO smtp_fixture_worker;
+GRANT UPDATE(email_subject) ON public.novu_rust_workflows TO smtp_fixture_worker;
 GRANT SELECT ON public.novu_rust_workflow_preferences,public.novu_rust_subscriber_preferences,public.novu_rust_subscriber_workflow_preferences,public.novu_rust_workflows,public.novu_rust_contexts TO smtp_fixture_worker;
 GRANT SELECT,INSERT,UPDATE,DELETE ON public.novu_rust_email_messages TO smtp_fixture_worker;
 GRANT SELECT,UPDATE ON public.novu_rust_email_step_outcomes TO smtp_fixture_worker;
@@ -82,7 +83,7 @@ if [[ "${TEST_SMTP_RLS:-false}" == true ]]; then
 fi
 env -i PATH="$PATH" DATABASE_URL="$DATABASE_URL" NOVU_POSTGRES_ALLOW_INSECURE=true LISTEN_ADDR="127.0.0.1:$API_PORT" SWALLOW_API_HEALTH_ENDPOINTS_ENABLED=true "$API/target/debug/novu-rust-api" >"$TEST_DIR/api.log" 2>&1 & API_PID=$!
 env -i PATH="$PATH" DATABASE_URL="$DATABASE_URL" NOVU_POSTGRES_ALLOW_INSECURE=true "$WORKER/target/debug/in-app-worker" >"$TEST_DIR/in-app.log" 2>&1 & INAPP_PID=$!
-env -i PATH="$PATH" DATABASE_URL="postgres://smtp_fixture_worker@127.0.0.1:$DB_PORT/postgres" NOVU_POSTGRES_ALLOW_INSECURE=true NOVU_SMTP_ENVIRONMENT_ID=attachment-env SWALLOW_SMTP_SCOPED_RLS="${TEST_SMTP_RLS:-false}" SWALLOW_SMTP_HOST=localhost SWALLOW_SMTP_PORT="$SMTP_PORT" SWALLOW_SMTP_FROM=sender@example.test SWALLOW_SMTP_TLS=starttls SWALLOW_SMTP_USERNAME=fixture-user SWALLOW_SMTP_PASSWORD_FILE="$TEST_DIR/password" SWALLOW_SMTP_CA_FILE="$TEST_DIR/cert" "$WORKER/target/debug/smtp-worker" >"$TEST_DIR/smtp.log" 2>&1 & SMTP_PID=$!
+env -i PATH="$PATH" DATABASE_URL="postgres://smtp_fixture_worker@127.0.0.1:$DB_PORT/postgres" NOVU_POSTGRES_ALLOW_INSECURE=true NOVU_SMTP_ENVIRONMENT_ID=attachment-env SWALLOW_SMTP_SCOPED_RLS="${TEST_SMTP_RLS:-false}" SWALLOW_EMAIL_WORKFLOW_STEP_POLICY="${TEST_EMAIL_POLICY:-snapshot}" SWALLOW_SMTP_HOST=localhost SWALLOW_SMTP_PORT="$SMTP_PORT" SWALLOW_SMTP_FROM=sender@example.test SWALLOW_SMTP_TLS=starttls SWALLOW_SMTP_USERNAME=fixture-user SWALLOW_SMTP_PASSWORD_FILE="$TEST_DIR/password" SWALLOW_SMTP_CA_FILE="$TEST_DIR/cert" "$WORKER/target/debug/smtp-worker" >"$TEST_DIR/smtp.log" 2>&1 & SMTP_PID=$!
 for _ in $(seq 1 100); do curl -fsS "http://127.0.0.1:$API_PORT/health/ready" >/dev/null 2>&1 && break; kill -0 "$API_PID"; sleep 0.1; done
 cat > "$TEST_DIR/request.json" <<'JSON'
 {"name":"smtp-attachment","to":{"subscriberId":"recipient","email":"recipient@example.test"},"transactionId":"smtp-attachment-http","overrides":{"email":{"headers":{"X-Swallow-Test":"fixture-value","List-Unsubscribe":"<https://example.test/unsubscribe>"}}},"payload":{"attachments":[{"file":"aGVsbG8=","name":"hello.txt","mime":"text/plain"},{"file":{"type":"Buffer","data":[0,1,255]},"name":"logo.png","mime":"image/png","cid":"logo","channels":["email"]}]}}
