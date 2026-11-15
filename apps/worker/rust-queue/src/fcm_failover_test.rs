@@ -46,6 +46,7 @@ fn worker(url: &str, name: &str, proxy: &str) -> Worker {
             .env("NOVU_FCM_PROJECT_ID", "fixture-project")
             .env("NOVU_FCM_ACCESS_TOKEN", "fixture-token")
             .env("NOVU_FCM_DB_TIMEOUT_SECONDS", "10")
+            .env("SWALLOW_FCM_MULTICAST_429_POLICY", "delay-known")
             .env("HTTPS_PROXY", proxy)
             .env("https_proxy", proxy)
             .env("HTTP_PROXY", proxy)
@@ -252,6 +253,182 @@ async fn synchronous_failover_during_fcm_dispatch_preserves_unknown() {
         count.load(Ordering::SeqCst),
         if multiple { 1 } else { 0 },
         "workers must send only the unattempted target, never retry the ambiguous target"
+    );
+    proxy_task.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires disposable synchronously replicated PostgreSQL; destroys the primary"]
+async fn synchronous_failover_preserves_fcm_delayed_continuation() {
+    let primary_url = std::env::var("TEST_PRIMARY_URL").unwrap();
+    let standby_url = std::env::var("TEST_STANDBY_URL").unwrap();
+    let cluster_url = std::env::var("TEST_FAILOVER_URL").unwrap();
+    let db = connect(&primary_url).await;
+    db.execute(
+        "INSERT INTO public.novu_rust_environments VALUES ('fcm-ha','org')",
+        &[],
+    )
+    .await
+    .unwrap();
+    let job = Uuid::new_v4();
+    enqueue(
+        &db,
+        job,
+        "fcm-ha",
+        fcm_queue::JOB_KIND,
+        &json!({"title":"Hi","content":"Body","targets":["first","second"]}),
+    )
+    .await
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = socket.read(&mut chunk).await.unwrap();
+            assert!(n > 0);
+            bytes.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&bytes[..pos]);
+                let len = headers
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|v| v.parse::<usize>().ok())
+                    })
+                    .unwrap();
+                if bytes.len() >= pos + 4 + len {
+                    let body: Value =
+                        serde_json::from_slice(&bytes[pos + 4..pos + 4 + len]).unwrap();
+                    assert_eq!(body["message"]["token"], "first");
+                    break;
+                }
+            }
+        }
+        socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+    });
+    let provider = Fcm::with_origin("fixture-project", "fixture-token".into(), &origin).unwrap();
+    let mut sender = connect(&primary_url).await;
+    assert!(
+        fcm_queue::process_one_with_rate_limit_policy(
+            &mut sender,
+            "fcm-ha",
+            Some(&provider),
+            None,
+            false,
+            crate::push_step_policy::Policy::Snapshot,
+            crate::push_step_policy::PreferencePolicy::Snapshot,
+            crate::push_step_policy::TargetPolicy::Reference,
+            fcm_queue::RateLimitPolicy::DelayKnown
+        )
+        .await
+        .unwrap()
+    );
+    server.await.unwrap();
+    let replica = connect(&standby_url).await;
+    let mut replayed = false;
+    for _ in 0..100 {
+        replayed=replica.query_opt("SELECT 1 FROM public.novu_queue_jobs j JOIN public.novu_rust_fcm_attempts a ON a.job_id=j.id WHERE j.id=$1 AND j.status='pending' AND j.available_at>clock_timestamp()+interval '90 seconds' AND a.target_index=0 AND a.state='rejected' AND a.retry_after_seconds=120",&[&job]).await.unwrap().is_some();
+        if replayed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        replayed,
+        "replica must replay both the 429 evidence and continuation schedule"
+    );
+    let pgctl = std::env::var("TEST_LOCAL_PG_CTL").unwrap();
+    let primary = std::env::var("TEST_LOCAL_PRIMARY_DATA").unwrap();
+    let standby = std::env::var("TEST_LOCAL_STANDBY_DATA").unwrap();
+    assert!(
+        Command::new(&pgctl)
+            .args(["-D", &primary, "-m", "immediate", "stop"])
+            .stdout(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new(&pgctl)
+            .args(["-D", &standby, "promote", "-w"])
+            .stdout(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let promoted = connect(&standby_url).await;
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+    let count = Arc::new(AtomicUsize::new(0));
+    let observed = count.clone();
+    let proxy_task = tokio::spawn(async move {
+        while let Ok((socket, _)) = proxy.accept().await {
+            observed.fetch_add(1, Ordering::SeqCst);
+            drop(socket);
+        }
+    });
+    let mut first = worker(&cluster_url, "fcm_delay_1", &proxy_url);
+    let mut second = worker(&cluster_url, "fcm_delay_2", &proxy_url);
+    let mut ready = false;
+    for _ in 0..100 {
+        ready=promoted.query_one("SELECT count(*) FROM pg_stat_activity WHERE application_name IN ('fcm_delay_1','fcm_delay_2')",&[]).await.unwrap().get::<_,i64>(0)==2;
+        if ready {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        ready && first.0.try_wait().unwrap().is_none() && second.0.try_wait().unwrap().is_none()
+    );
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        0,
+        "delayed continuation must not start early"
+    );
+    assert_eq!(
+        promoted
+            .query_one(
+                "SELECT count(*) FROM public.novu_rust_fcm_attempts WHERE job_id=$1",
+                &[&job]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1
+    );
+    // Advance the schedule for a short test; this is an administrative intervention.
+    promoted.execute("UPDATE public.novu_queue_jobs SET available_at=clock_timestamp()-interval '1 second' WHERE id=$1",&[&job]).await.unwrap();
+    let mut finished = false;
+    for _ in 0..100 {
+        finished=promoted.query_one("SELECT EXISTS(SELECT 1 FROM public.novu_rust_fcm_attempts WHERE job_id=$1 AND target_index=1 AND state='unknown')",&[&job]).await.unwrap().get(0);
+        if finished {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(finished, "remaining target must run after its schedule");
+    let rows = promoted
+        .query(
+            "SELECT state FROM public.novu_rust_fcm_attempts WHERE job_id=$1 ORDER BY target_index",
+            &[&job],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect::<Vec<_>>(),
+        ["rejected", "unknown"]
+    );
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "only the unattempted target may initiate a request"
     );
     proxy_task.abort();
 }
