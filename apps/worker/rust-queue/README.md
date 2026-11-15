@@ -1510,3 +1510,18 @@ Slack app, incoming webhook and workflow delivery, as well as Discord webhook de
 `TEST_PG_BIN=/opt/homebrew/opt/postgresql@17/bin scripts/test-chat-lease-local.sh` uses disposable local PostgreSQL and a loopback listener. Test-only database triggers simulate expiration while inserting attempts for the four queue paths; the test checks rollback and no connection, forcibly expires the claims and verifies their recovery to pending. A separate regression checks Slack 429 persistence with mock HTTP. The tests call queue functions, not separate production workers, and do not establish actual Slack or Discord delivery, commit-stall behavior, production contention or multi-host HA. Docker is not used.
 
 `TEST_PG_BIN=/opt/homebrew/opt/postgresql@17/bin scripts/test-discord-cooldown-local.sh` also passed the existing scoped queue, retry, rate-limit and shared-cooldown regression tests against local PostgreSQL and mock endpoints.
+
+### Per-target delivery alert checks
+
+Each `alert-fanout` target may optionally specify `delivery_checks` as an object of boolean overrides. For example:
+
+```json
+{"targets":[
+  {"channel":"slack","id":"delivery-ops","webhook_file":"/run/secrets/slack-ops","delivery_checks":{"resend":false,"failed_jobs":true}},
+  {"channel":"email","id":"email-ops","provider":"resend","to":"ops@example.test","from":"alerts@example.test","api_key_file":"/run/secrets/resend","delivery_checks":{"resend":true,"failed_jobs":false}}
+]}
+```
+
+Available fields are `resend`, `attempts`, `slack_jobs`, `smtp`, `discord`, `failed_jobs`, `slack_missing_endpoints`, `email_policy_cancelled`, `sms_policy_cancelled`, `push_policy_cancelled` and `slack_policy_cancelled`. Each overrides the corresponding `SWALLOW_ALERT_*_ENABLED` setting only for that target's child process; omitted or null fields inherit the parent setting and existing defaults. Unknown fields and non-booleans reject the entire configuration before starting any destination. `slack_missing_endpoints` only takes effect when `slack_jobs` is enabled. Other checks, thresholds, credentials, cooldown and condition-version policies remain inherited and independently configured; this is not a complete per-target configuration or a management UI. Database alert children ignore these delivery check settings. Turning off all effective checks causes the delivery child to fail rather than send; monitor fanout failures. A disabled check can hide an incident, so choose coverage deliberately. Distinct checks on senders sharing a destination ID can affect shared condition history and suppression; coordinate every sender and use stable separate target IDs as appropriate, especially when using `new-condition`. Existing destination binding protects destination identity, not the complete check selection. Older fanout binaries reject the new field and must be upgraded before using it. NUL in either configured email address is now rejected before any child starts.
+
+`TEST_PG_BIN=/opt/homebrew/opt/postgresql@17/bin scripts/test-alert-target-checks-local.sh` tests per-target overrides, inheritance and invalid-configuration atomicity using fixture child processes. It also runs the actual delivery alert children against disposable local PostgreSQL with one failed job and blocked Slack slots: the target monitoring failed jobs reports attention while the target monitoring only attempts completes normally. The first database test lacked the separate `alert_view` grant and passed after the fixture was corrected. Tests do not send external alerts, exercise a real IdP or prove production HA. Docker is not used.

@@ -17,12 +17,49 @@ type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 struct Config {
     targets: Vec<Target>,
 }
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct DeliveryChecks {
+    resend: Option<bool>,
+    attempts: Option<bool>,
+    slack_jobs: Option<bool>,
+    smtp: Option<bool>,
+    discord: Option<bool>,
+    failed_jobs: Option<bool>,
+    slack_missing_endpoints: Option<bool>,
+    email_policy_cancelled: Option<bool>,
+    sms_policy_cancelled: Option<bool>,
+    push_policy_cancelled: Option<bool>,
+    slack_policy_cancelled: Option<bool>,
+}
+impl DeliveryChecks {
+    fn apply(&self, cmd: &mut Command) {
+        for (key, value) in [
+            ("SWALLOW_ALERT_RESEND_ENABLED", self.resend),
+            ("SWALLOW_ALERT_ATTEMPTS_ENABLED", self.attempts),
+            ("SWALLOW_ALERT_SLACK_JOBS_ENABLED", self.slack_jobs),
+            ("SWALLOW_ALERT_SMTP_ENABLED", self.smtp),
+            ("SWALLOW_ALERT_DISCORD_ENABLED", self.discord),
+            ("SWALLOW_ALERT_FAILED_JOBS_ENABLED", self.failed_jobs),
+            ("SWALLOW_ALERT_SLACK_MISSING_ENDPOINTS_ENABLED", self.slack_missing_endpoints),
+            ("SWALLOW_ALERT_EMAIL_POLICY_CANCELLED_ENABLED", self.email_policy_cancelled),
+            ("SWALLOW_ALERT_SMS_POLICY_CANCELLED_ENABLED", self.sms_policy_cancelled),
+            ("SWALLOW_ALERT_PUSH_POLICY_CANCELLED_ENABLED", self.push_policy_cancelled),
+            ("SWALLOW_ALERT_SLACK_POLICY_CANCELLED_ENABLED", self.slack_policy_cancelled),
+        ] {
+            if let Some(enabled) = value {
+                cmd.env(key, if enabled { "true" } else { "false" });
+            }
+        }
+    }
+}
 #[derive(Deserialize)]
 #[serde(tag = "channel", rename_all = "lowercase", deny_unknown_fields)]
 enum Target {
     Slack {
         id: String,
         webhook_file: String,
+        delivery_checks: Option<DeliveryChecks>,
     },
     Email {
         id: String,
@@ -39,6 +76,7 @@ enum Target {
         sender_name: Option<String>,
         region: Option<String>,
         ip_pool_name: Option<String>,
+        delivery_checks: Option<DeliveryChecks>,
     },
 }
 #[derive(Deserialize)]
@@ -72,7 +110,7 @@ impl Target {
             !value.is_empty()
                 && value.len() <= 320
                 && value.contains('@')
-                && !value.contains(['\r', '\n', '<', '>'])
+                && !value.contains(['\r', '\n', '\0', '<', '>'])
         }
         valid_id
             && match self {
@@ -180,7 +218,7 @@ impl Target {
             cmd.env_remove(key);
         }
         match self {
-            Self::Slack { id, webhook_file } => {
+            Self::Slack { id, webhook_file, .. } => {
                 cmd.env("SWALLOW_ALERT_SLACK_TARGET_ID", id)
                     .env("SWALLOW_DB_ALERT_SLACK_TARGET_ID", id)
                     .env("SWALLOW_ALERT_SLACK_WEBHOOK_FILE", webhook_file);
@@ -200,6 +238,7 @@ impl Target {
                 sender_name,
                 region,
                 ip_pool_name,
+                ..
             } => {
                 cmd.env("SWALLOW_ALERT_EMAIL_TARGET_ID", id)
                     .env("SWALLOW_DB_ALERT_EMAIL_TARGET_ID", id)
@@ -254,6 +293,10 @@ impl Target {
                 }
             }
         }
+        let checks = match self {
+            Self::Slack { delivery_checks, .. } | Self::Email { delivery_checks, .. } => delivery_checks,
+        };
+        if let Some(checks) = checks { checks.apply(cmd); }
     }
 }
 fn read_config(path: &str) -> Result<Config> {

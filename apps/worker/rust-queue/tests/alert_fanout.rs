@@ -4,6 +4,33 @@ use tokio_postgres::NoTls;
 use uuid::Uuid;
 #[tokio::test]
 #[ignore = "requires fully migrated disposable PostgreSQL"]
+async fn per_target_delivery_checks_control_real_alert_children() {
+    let url=std::env::var("TEST_DATABASE_URL").unwrap();
+    let (db,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();
+    tokio::spawn(async move { let _=driver.await; });
+    let env="fanout-selected-checks";
+    db.execute("INSERT INTO novu_rust_environments VALUES ($1,'org')", &[&env]).await.unwrap();
+    db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,rolname,permission,oid FROM pg_roles CROSS JOIN unnest(ARRAY['alert_send','alert_view']) permission WHERE rolname=session_user", &[&env]).await.unwrap();
+    db.execute("INSERT INTO novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES ($1,'slack','failed','rejected'),($1,'slack','attempts','rejected')", &[&env]).await.unwrap();
+    let job=Uuid::new_v4();
+    novu_postgres_queue::enqueue(&db,job,env,"fixture",&serde_json::json!({})).await.unwrap();
+    db.execute("UPDATE novu_queue_jobs SET status='failed' WHERE id=$1", &[&job]).await.unwrap();
+    let dir=std::env::temp_dir().join(format!("swallow-alert-checks-db-{}",Uuid::new_v4()));std::fs::create_dir(&dir).unwrap();
+    let secret=dir.join("slack");std::fs::write(&secret,"https://hooks.slack.com/services/A/B/C").unwrap();
+    let config=dir.join("config.json");
+    std::fs::write(&config,serde_json::to_vec(&serde_json::json!({"targets":[
+      {"channel":"slack","id":"failed","webhook_file":secret,"delivery_checks":{"resend":false,"failed_jobs":true}},
+      {"channel":"slack","id":"attempts","webhook_file":secret,"delivery_checks":{"resend":false,"attempts":true}}
+    ]})).unwrap()).unwrap();
+    let output=Command::new(env!("CARGO_BIN_EXE_alert-fanout")).args(["delivery",env,"300","120","60"]).arg(&config).env("DATABASE_URL",&url).env("NOVU_POSTGRES_ALLOW_INSECURE","true").env_remove("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS").env_remove("SWALLOW_ALERT_BINDING_KEY").env_remove("SWALLOW_ALERT_BINDING_KEY_FILE").output().unwrap();
+    assert_eq!(output.status.code(),Some(2),"{}",String::from_utf8_lossy(&output.stderr));
+    let text=String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("slack failed: attention"),"{text}");
+    assert!(text.contains("slack attempts: completed"),"{text}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[tokio::test]
+#[ignore = "requires fully migrated disposable PostgreSQL"]
 async fn destinations_have_independent_slots_and_failures_do_not_suppress_others() {
     let url = std::env::var("TEST_DATABASE_URL").unwrap();
     let (db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();

@@ -3,6 +3,39 @@
 use std::{os::unix::fs::PermissionsExt, process::Command};
 use uuid::Uuid;
 #[test]
+fn delivery_checks_are_selected_per_target_and_invalid_config_starts_no_children() {
+    let dir = std::env::temp_dir().join(format!("swallow-alert-checks-{}", Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let fanout = dir.join("alert-fanout");
+    std::fs::copy(env!("CARGO_BIN_EXE_alert-fanout"), &fanout).unwrap();
+    let child = dir.join("send-delivery-alert");
+    std::fs::write(&child, "#!/bin/sh\nprintf '%s:%s:%s:%s\\n' \"$SWALLOW_ALERT_SLACK_TARGET_ID\" \"$SWALLOW_ALERT_RESEND_ENABLED\" \"$SWALLOW_ALERT_DISCORD_ENABLED\" \"$SWALLOW_ALERT_FAILED_JOBS_ENABLED\" >> \"$FANOUT_TEST_LOG\"\n").unwrap();
+    std::fs::set_permissions(child, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config=dir.join("targets.json"); let log=dir.join("log");
+    let targets=serde_json::json!({"targets":[
+        {"channel":"slack","id":"a","webhook_file":dir.join("key"),"delivery_checks":{"resend":false,"discord":true}},
+        {"channel":"slack","id":"b","webhook_file":dir.join("key"),"delivery_checks":{"failed_jobs":true}},
+        {"channel":"slack","id":"c","webhook_file":dir.join("key")}
+    ]});
+    std::fs::write(&config,serde_json::to_vec(&targets).unwrap()).unwrap();
+    let run=|| Command::new(&fanout).args(["delivery","env","300","120","60"]).arg(&config).env("FANOUT_TEST_LOG",&log).env("SWALLOW_ALERT_RESEND_ENABLED","true").env("SWALLOW_ALERT_DISCORD_ENABLED","false").env("SWALLOW_ALERT_FAILED_JOBS_ENABLED","false").output().unwrap();
+    assert!(run().status.success());
+    assert_eq!(std::fs::read_to_string(&log).unwrap(),"a:false:true:false\nb:true:false:true\nc:true:false:false\n");
+    for invalid in [
+        serde_json::json!({"channel":"slack","id":"d","webhook_file":dir.join("key"),"delivery_checks":{"resned":true}}),
+        serde_json::json!({"channel":"slack","id":"d","webhook_file":dir.join("key"),"delivery_checks":{"resend":"false"}}),
+        serde_json::json!({"channel":"email","id":"d","provider":"resend","to":"a\u{0}@example.test","from":"sender@example.test","api_key_file":dir.join("key")}),
+        serde_json::json!({"channel":"email","id":"d","provider":"resend","to":"a@example.test","from":"sender\u{0}@example.test","api_key_file":dir.join("key")}),
+    ] {
+        let mut bad=targets.clone();bad["targets"].as_array_mut().unwrap().push(invalid);
+        std::fs::write(&config,serde_json::to_vec(&bad).unwrap()).unwrap();
+        std::fs::write(&log, "").unwrap();
+        assert_eq!(run().status.code(),Some(1));
+        assert_eq!(std::fs::read_to_string(&log).unwrap(),"");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[test]
 fn routes_each_destination_and_continues_after_a_failure() {
     let dir = std::env::temp_dir().join(format!("swallow-fanout-process-{}", Uuid::new_v4()));
     std::fs::create_dir(&dir).unwrap();
