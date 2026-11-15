@@ -119,11 +119,12 @@ async fn run(
                     }
                     let delivery = tokio::time::timeout(
                         timeout,
-                        slack_workflow::delivery_one_with_policy(
+                        slack_workflow::delivery_one_with_policies(
                             &mut db,
                             &environment,
                             &providers,
                             step_policy,
+                            endpoint_policy,
                         ),
                     )
                     .await;

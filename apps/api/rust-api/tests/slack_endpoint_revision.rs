@@ -154,7 +154,7 @@ async fn snapshot_revisions_fence_changes_before_fanout_and_before_delivery() {
         0
     );
     // Pre-upgrade snapshot payloads lack a revision and retain their previous behavior.
-    trigger(app, "legacy-snapshot").await;
+    trigger(app.clone(), "legacy-snapshot").await;
     assert!(
         novu_postgres_queue::in_app::process_one_with_slack_snapshot(
             &mut db,
@@ -165,6 +165,14 @@ async fn snapshot_revisions_fence_changes_before_fanout_and_before_delivery() {
         .unwrap()
     );
     db.execute("UPDATE public.novu_queue_jobs SET payload=jsonb_set(payload,'{endpoint_snapshot}',(SELECT jsonb_agg(item - 'revision') FROM jsonb_array_elements(payload->'endpoint_snapshot') item)) WHERE kind=$1 AND status='pending'",&[&slack_workflow::FANOUT_KIND]).await.unwrap();
+    let legacy_parent: Value = db
+        .query_one(
+            "SELECT payload FROM public.novu_queue_jobs WHERE kind=$1 AND status='pending'",
+            &[&slack_workflow::FANOUT_KIND],
+        )
+        .await
+        .unwrap()
+        .get(0);
     change_and_restore(&db).await;
     assert!(
         slack_workflow::fanout_one_with_policies(
@@ -191,4 +199,106 @@ async fn snapshot_revisions_fence_changes_before_fanout_and_before_delivery() {
             .unwrap()
     );
     assert_eq!(db.query_one("SELECT last_error FROM public.novu_queue_jobs WHERE kind=$1 AND status='failed' AND last_error='Slack integration credentials not configured'",&[&slack_workflow::DELIVERY_KIND]).await.unwrap().get::<_,String>(0),"Slack integration credentials not configured");
+    let parent_id = uuid::Uuid::new_v4();
+    novu_postgres_queue::enqueue(
+        &db,
+        parent_id,
+        "a",
+        slack_workflow::FANOUT_KIND,
+        &legacy_parent,
+    )
+    .await
+    .unwrap();
+    assert!(
+        slack_workflow::fanout_one_with_policies(
+            &mut db,
+            "a",
+            StepPolicy::Snapshot,
+            EndpointPolicy::SnapshotRevision
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(
+        db.query_one(
+            "SELECT last_error FROM public.novu_queue_jobs WHERE id=$1",
+            &[&parent_id]
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0),
+        "Slack endpoint revision missing"
+    );
+    let child_id = uuid::Uuid::new_v4();
+    novu_postgres_queue::enqueue(&db, child_id, "a", slack_workflow::DELIVERY_KIND, &child)
+        .await
+        .unwrap();
+    assert!(
+        slack_workflow::delivery_one_with_policies(
+            &mut db,
+            "a",
+            &slack_workflow::Providers::new(),
+            StepPolicy::Snapshot,
+            EndpointPolicy::SnapshotRevision
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(
+        db.query_one(
+            "SELECT last_error FROM public.novu_queue_jobs WHERE id=$1",
+            &[&child_id]
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0),
+        "Slack endpoint revision missing"
+    );
+    trigger(app, "strict-snapshot").await;
+    assert!(
+        novu_postgres_queue::in_app::process_one_with_slack_snapshot(
+            &mut db,
+            Duration::from_secs(60),
+            true
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        slack_workflow::fanout_one_with_policies(
+            &mut db,
+            "a",
+            StepPolicy::Snapshot,
+            EndpointPolicy::SnapshotRevision
+        )
+        .await
+        .unwrap()
+    );
+    let new_child: Value = db
+        .query_one(
+            "SELECT payload FROM public.novu_queue_jobs WHERE kind=$1 AND status='pending'",
+            &[&slack_workflow::DELIVERY_KIND],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(new_child["endpoint_revision"].as_str().is_some());
+    assert!(
+        slack_workflow::delivery_one_with_policies(
+            &mut db,
+            "a",
+            &slack_workflow::Providers::new(),
+            StepPolicy::Snapshot,
+            EndpointPolicy::SnapshotRevision
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(
+        db.query_one("SELECT count(*) FROM public.novu_rust_slack_attempts", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
 }

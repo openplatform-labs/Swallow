@@ -1,3 +1,9 @@
+## Slack 스냅샷 버전 필수 정책
+
+`NOVU_SLACK_WORKFLOW_ENDPOINT_POLICY=snapshot-revision`을 선택하면 Slack 분기 작업의 모든 목적지 스냅샷과 발송 작업에 변경 버전이 있어야 한다. 버전 없는 이전 작업은 `Slack endpoint revision missing` 실패로 남기고 자동 재발송하지 않는다. 목적지가 없는 빈 스냅샷은 기존대로 취소된다. `current`와 `snapshot`은 기존 동작을 유지하며 `snapshot`은 버전 없는 과거 작업도 처리한다. 워커 `0147`·`0148`, 모든 in-app 생산자의 스냅샷 설정, 동일한 워커 정책 및 구버전 프로세스 중지가 필요하다. 실패는 기존 Slack 발송 전 실패 감시·확인 절차에서 다룬다. 단계별 배포와 제한은 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
+Docker PostgreSQL의 실제 Slack 워커 프로세스에서 버전 없는 분기·발송 작업이 실패하고 발송 시도 없이 감시에 표시됨을 확인했다. 독립 통합 테스트는 새 버전 스냅샷 허용과 기존 `snapshot` 정책 호환을 확인했고 실제 워커의 정책 등록·혼용 거절도 검증했다. 실제 Slack, 운영 HA, 외부 경보 수신 및 모든 배포 경합은 미검증이다.
+
 ## Slack 목적지 변경 버전과 스냅샷
 
 워커 `0147`은 Slack 목적지 행에 변경 UUID를 추가하고 행이 수정될 때마다 새 UUID를 부여한다. `NOVU_SLACK_SNAPSHOT_ENDPOINTS=true`로 새로 캡처한 스냅샷과 `NOVU_SLACK_WORKFLOW_ENDPOINT_POLICY=snapshot`을 함께 사용하면, 분기 전에 목적지가 변경됐다가 원래 값으로 복구돼도 버전 불일치로 감지한다. 만들어진 발송 작업도 그 버전을 보관해 발송 예약 전에 다시 확인한다. 기본 `current` 정책은 현재 목적지를 선택하며 이 버전 보호를 적용하지 않는다. 이전에 저장된 버전 없는 스냅샷과 발송 작업은 기존 비교 방식으로 처리되므로 변경 후 복구를 감지하지 못한다. 사용자 선택과 안전한 배포 순서는 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.

@@ -18,12 +18,14 @@ pub type Providers = HashMap<(String, String), Slack>;
 pub enum EndpointPolicy {
     Current,
     Snapshot,
+    SnapshotRevision,
 }
 impl EndpointPolicy {
     pub fn from_env() -> Result<Self, &'static str> {
         match std::env::var("NOVU_SLACK_WORKFLOW_ENDPOINT_POLICY").as_deref() {
             Ok("current") | Err(std::env::VarError::NotPresent) => Ok(Self::Current),
             Ok("snapshot") => Ok(Self::Snapshot),
+            Ok("snapshot-revision") => Ok(Self::SnapshotRevision),
             _ => Err("invalid Slack workflow endpoint policy"),
         }
     }
@@ -31,6 +33,7 @@ impl EndpointPolicy {
         match self {
             Self::Current => "current",
             Self::Snapshot => "snapshot",
+            Self::SnapshotRevision => "snapshot-revision",
         }
     }
 }
@@ -265,12 +268,19 @@ pub async fn fanout_one_with_policies(
     // A snapshot is needed only for the parent. Do not clone the full list
     // into each child, which would produce quadratic payload work.
     let captured_snapshot = ctx.endpoint_snapshot.take();
-    let captured = if endpoint_policy == EndpointPolicy::Snapshot {
+    let captured = if endpoint_policy != EndpointPolicy::Current {
         let Some(snapshot) = captured_snapshot.as_ref() else {
             terminal(&tx, &job, "failed", Some("Slack endpoint snapshot missing")).await?;
             tx.commit().await?;
             return Ok(true);
         };
+        if endpoint_policy == EndpointPolicy::SnapshotRevision
+            && snapshot.iter().any(|endpoint| endpoint.revision.is_none())
+        {
+            terminal(&tx, &job, "failed", Some("Slack endpoint revision missing")).await?;
+            tx.commit().await?;
+            return Ok(true);
+        }
         let map: HashMap<Uuid, &EndpointSnapshot> =
             snapshot.iter().map(|e| (e.endpoint_id, e)).collect();
         if snapshot.len() > 1000 || map.len() != snapshot.len() {
@@ -403,6 +413,15 @@ pub async fn delivery_one_with_policy(
     providers: &Providers,
     policy: StepPolicy,
 ) -> Result<bool, Error> {
+    delivery_one_with_policies(db, environment, providers, policy, EndpointPolicy::Current).await
+}
+pub async fn delivery_one_with_policies(
+    db: &mut Client,
+    environment: &str,
+    providers: &Providers,
+    policy: StepPolicy,
+    endpoint_policy: EndpointPolicy,
+) -> Result<bool, Error> {
     let Some(job) = claim(db, environment, DELIVERY_KIND).await? else {
         return Ok(false);
     };
@@ -421,6 +440,15 @@ pub async fn delivery_one_with_policy(
     };
     let ctx = &delivery.context;
     let tx = db.transaction().await?;
+    if endpoint_policy == EndpointPolicy::SnapshotRevision && delivery.endpoint_revision.is_none() {
+        if !live(&tx, &job).await? {
+            tx.rollback().await?;
+            return Ok(true);
+        }
+        terminal(&tx, &job, "failed", Some("Slack endpoint revision missing")).await?;
+        tx.commit().await?;
+        return Ok(true);
+    }
     let row = subscriber(&tx, &job, ctx).await?;
     if !live(&tx, &job).await? {
         tx.rollback().await?;
