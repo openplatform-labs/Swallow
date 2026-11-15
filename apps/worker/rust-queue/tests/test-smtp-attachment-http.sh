@@ -80,7 +80,7 @@ fi
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost -addext subjectAltName=DNS:localhost -addext basicConstraints=critical,CA:FALSE -keyout "$TEST_DIR/key" -out "$TEST_DIR/cert" >"$TEST_DIR/openssl.log" 2>&1
 printf '%s' fixture-password > "$TEST_DIR/password"
 cargo build --quiet --locked --manifest-path "$API/Cargo.toml" --bin novu-rust-api
-cargo build --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin in-app-worker --bin smtp-worker --bin delivery-reconcile
+cargo build --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin in-app-worker --bin smtp-worker --bin delivery-reconcile --bin attachment-retention
 python3 "$WORKER/tests/fixtures/smtp_starttls_fixture.py" "$TEST_DIR/cert" "$TEST_DIR/key" "$TEST_DIR/message" "$TEST_DIR/connected" > "$TEST_DIR/smtp-port" 2>"$TEST_DIR/smtp-fixture.log" & FIXTURE_PID=$!
 for _ in $(seq 1 100); do [[ -s "$TEST_DIR/smtp-port" ]] && break; kill -0 "$FIXTURE_PID"; sleep 0.1; done
 SMTP_PORT=$(cat "$TEST_DIR/smtp-port")
@@ -254,4 +254,17 @@ PY2
   db_sql -q -v ON_ERROR_STOP=1 -c "UPDATE public.novu_rust_smtp_scope_admins SET can_read=false WHERE database_principal='smtp_fixture_admin'"
   if admin_cli smtp-scope-read attachment-env smtp_fixture_target >/dev/null 2>&1; then echo 'revoked read access allowed' >&2; exit 1; fi
 fi
+db_sql -q -v ON_ERROR_STOP=1 <<'SQL'
+CREATE ROLE smtp_alt_retention LOGIN;
+GRANT USAGE ON SCHEMA public TO smtp_alt_retention;
+GRANT EXECUTE ON FUNCTION public.novu_rust_scrub_alternative_retention(text,integer,integer,text) TO smtp_alt_retention;
+INSERT INTO public.novu_rust_attachment_retention_grants SELECT 'attachment-env',rolname,oid,false,true FROM pg_roles WHERE rolname='smtp_alt_retention';
+SQL
+env -i PATH="$PATH" DATABASE_URL="postgres://smtp_alt_retention@127.0.0.1:$DB_PORT/postgres" NOVU_POSTGRES_ALLOW_INSECURE=true "$WORKER/target/debug/attachment-retention" scrub-alternatives attachment-env 0 100 fixture > "$TEST_DIR/alternative-retention.json"
+python3 - "$TEST_DIR/alternative-retention.json" <<'PY2'
+import json,sys
+assert len(json.load(open(sys.argv[1])))==2
+PY2
+[[ $(db_sql -At -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM public.novu_queue_jobs WHERE environment_id='attachment-env' AND alternative_scrubbed_at IS NOT NULL AND ((kind='experimental_static_in_app_attachments_v1' AND NOT (payload->'emailOverride' ? 'alternatives') AND payload ? 'emailAttachments') OR (kind='experimental_smtp_email' AND NOT (payload ? 'alternatives') AND NOT (payload#>'{workflow_context,overrides}' ? 'alternatives') AND payload ? 'attachments'))") == 2 ]]
+if db_sql -q -v ON_ERROR_STOP=1 -c "UPDATE public.novu_queue_jobs SET status='pending' WHERE environment_id='attachment-env' AND alternative_scrubbed_at IS NOT NULL" >/dev/null 2>&1; then echo 'scrubbed alternatives were requeued' >&2; exit 1; fi
 echo 'HTTP trigger, restricted SMTP worker, revoked attempt permission, recovery and environment filtering passed'

@@ -1,4 +1,6 @@
-SMTP 추가 본문 트리거 연결: `overrides.email.alternatives`의 `contentType`과 문자열 `content`를 제한적으로 검증하여 워크플로와 이메일 작업에 전달한다. 실제 Rust HTTP API·인앱 워커·제한 SMTP 워커·모의 STARTTLS 서버에서 달력 본문과 첨부파일 발송 및 잘못된 구조 거절을 검증한다. MIME 문법은 발송 전에 워커에서 검사하고, 템플릿 렌더링·제공자/단계 override·관리 UI는 미구현이다. 원본 Novu 비교·실제 메일 수신·운영 HA는 미검증이다. 본문은 큐에 남고 첨부파일 보존 정리 대상이 아니다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+추가 MIME 본문 보존 정리: 워커 0239는 완료된 부모·이메일 작업의 추가 본문을 별도 선택형 명령으로 삭제하고 감사하며 재실행을 차단한다. 기존 첨부파일 정리와 독립적으로 실행할 수 있고 어느 순서도 지원한다. 로컬 PostgreSQL에서 제한 권한·감사 실패 롤백·양쪽 정리 순서·이전 완료 작업 업그레이드를 검증했고 실제 HTTP·SMTP 워커 시험에서 부모와 자식 정리를 확인했다. 대기·실패·독립 이메일 작업은 제외되며 WAL·백업·공급자 복사본은 삭제하지 않는다. 실제 운영 부하·다중 호스트 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
+SMTP 추가 본문 트리거 연결: `overrides.email.alternatives`의 `contentType`과 문자열 `content`를 제한적으로 검증하여 워크플로와 이메일 작업에 전달한다. 실제 Rust HTTP API·인앱 워커·제한 SMTP 워커·모의 STARTTLS 서버에서 달력 본문과 첨부파일 발송 및 잘못된 구조 거절을 검증한다. MIME 문법은 발송 전에 워커에서 검사하고, 템플릿 렌더링·제공자/단계 override·관리 UI는 미구현이다. 원본 Novu 비교·실제 메일 수신·운영 HA는 미검증이다. 본문은 큐에 남으며 별도 보존 정리 기능은 위 최신 항목을 참고한다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
 SMTP 추가 MIME 본문: SMTP 워커가 큐 메시지의 `alternatives`를 제한적으로 지원해 달력 초대 등을 HTML·텍스트와 함께 보낼 수 있다. MIME 유형과 크기를 발송 예약 전 검증하고 인라인 이미지·일반 첨부파일과 함께 구성한다. 실제 워커·로컬 PostgreSQL·모의 STARTTLS 서버에서 MIME을 파싱해 확인한다. 트리거 연결은 위 최신 항목을 참고하며 관리 UI는 아직 없다. 실제 메일 클라이언트·원본 Novu 전체 호환·운영 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
