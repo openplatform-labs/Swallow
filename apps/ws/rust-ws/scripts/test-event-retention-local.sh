@@ -92,6 +92,9 @@ if "$binary" delete-v2 tenant-a 2024-01-01T00:00:00Z 1 "$failed_id" rollback-v2 
 [[ $("${psql[@]}" -Atc "SELECT count(*) FROM public.novu_rust_ws_events WHERE environment_id='tenant-a' AND created_at<'2024-01-01'") == 1 ]]
 "${psql[@]}" -c 'ALTER TABLE public.novu_rust_ws_retention_audit DROP CONSTRAINT test_reject_v2'
 "$binary" delete-v2 tenant-a 2024-01-01T00:00:00Z 1 "$failed_id" rollback-v2 > /dev/null
+# Drop the PostgreSQL response only after the autocommit has finished.
+"${psql[@]}" -c "INSERT INTO public.novu_rust_ws_events(environment_id,subscriber_internal_id,event,data,created_at) SELECT 'tenant-a','subscriber','lost-response','{}','2023-01-01'::timestamptz FROM generate_series(1,2)"
+RETENTION_PG_PORT="$port" RETENTION_BINARY="$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")" RETENTION_PSQL="$pgbin/psql" node tests/retention_ack_loss.cjs
 "${psql[@]}" -c "DELETE FROM public.novu_rust_ws_retention_grants WHERE database_principal='ws_retention_test'"
 if "$binary" preview tenant-a 2024-01-01T00:00:00Z 2 >/dev/null 2>&1; then echo 'revoked grant accepted' >&2; exit 1; fi
 if "$binary" request tenant-a "$request_id" >/dev/null 2>&1; then echo 'revoked request lookup accepted' >&2; exit 1; fi
