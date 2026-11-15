@@ -1,5 +1,7 @@
 ## Slack 공유 대기 상태 조회와 경보
 
+- FCM 날짜형 재시도 지시: 429의 `Retry-After` HTTP 날짜를 제공자 `Date` 또는 로컬 시계와 비교해 기존 대상별 저장·선택형 지연에 반영한다. 모의 FCM과 임시 PostgreSQL에서 120초 저장, 미발송 대상 지연과 거절된 대상의 중복 발송 방지를 확인했다. 실제 FCM 날짜 응답·503 지시·운영 HA는 미검증이며, 시계와 허용 범위의 제약은 [워커 README](apps/worker/rust-queue/README.md)에 정리했다.
+
 - 경보 대상 설정 파일 보호: `SWALLOW_ALERT_FANOUT_CONFIG_REGULAR_ONLY=true`를 선택하면 Unix에서 FIFO 등을 읽기 전에 거절해 경보 스케줄러가 설정 입력을 기다리며 멈추는 상황을 줄인다. 실제 fanout 프로세스에서 FIFO·디렉터리 거절, 일반 파일 심볼릭 링크 및 기존 FIFO 입력 동작을 확인했다. 느린 일반 파일 시스템과 실제 외부 경보 수신은 이 시험의 범위 밖이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
 - API 전체 연결 준비 상태: `SWALLOW_API_READY_CONNECTION_POLICY=all`을 선택하면 설정된 모든 DB 연결이 준비 검사를 통과해야 한다. 쓰기 가능 검사와 함께 사용하면 읽기 전용 연결 하나만 있어도 503이며, 용량 검사와 함께 사용하면 연결 하나의 포화도 503이 된다. 임시 PostgreSQL의 실제 주 서버·대기 서버를 각각 연결하는 테스트 프록시, 누락 연결 및 포화 요청으로 확인했다. 최초 혼합 연결 시험은 동기식 테스트 요청이 프록시 실행을 막아 중단했고 비동기로 수정 후 통과했다. 이 정책은 요청 전달 자체나 분리된 주 서버를 차단하지 않으며 실제 운영 HA는 미검증이다. [API README](apps/api/rust-api/README.md)를 참고한다.

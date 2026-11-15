@@ -1,7 +1,31 @@
 //! Experimental FCM provider message planning and limited workflow/queue delivery.
 use reqwest::{Client, header};
 use serde_json::{Map, Value, json};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+
+// FCM can return either seconds or an HTTP date. Use the server's Date when
+// available so differences between provider and worker clocks do not shorten
+// the wait. The elapsed response time is deliberately not subtracted.
+fn retry_after_seconds(headers: &header::HeaderMap, now: SystemTime) -> Option<u32> {
+    let mut values = headers.get_all(header::RETRY_AFTER).iter();
+    let value = match (values.next(), values.next()) {
+        (Some(value), None) => value.to_str().ok()?,
+        _ => return None,
+    };
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        return value.parse::<u32>().ok().filter(|seconds| *seconds <= 86_400);
+    }
+    let deadline = httpdate::parse_http_date(value).ok()?;
+    let mut dates = headers.get_all(header::DATE).iter();
+    let base = match (dates.next(), dates.next()) {
+        (None, None) => now,
+        (Some(value), None) => httpdate::parse_http_date(value.to_str().ok()?).ok()?,
+        _ => return None,
+    };
+    let duration = deadline.duration_since(base).unwrap_or(Duration::ZERO);
+    let seconds = duration.as_secs().checked_add(u64::from(duration.subsec_nanos() > 0))?;
+    u32::try_from(seconds).ok().filter(|seconds| *seconds <= 86_400)
+}
 
 #[derive(Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -991,7 +1015,7 @@ impl Fcm {
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let retry_after = (status == 429)
-                .then(|| crate::slack::retry_after_seconds(response.headers()))
+                .then(|| retry_after_seconds(response.headers(), SystemTime::now()))
                 .flatten();
             let retry_after_missing = status == 429
                 && !response
@@ -1079,6 +1103,33 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+    #[test]
+    fn retry_after_accepts_dates_without_shortening_for_clock_skew() {
+        let mut headers = header::HeaderMap::new();
+        let local = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        headers.insert(header::DATE, "Sun, 15 Nov 2026 00:00:00 GMT".parse().unwrap());
+        headers.insert(header::RETRY_AFTER, "Sun, 15 Nov 2026 00:02:00 GMT".parse().unwrap());
+        assert_eq!(retry_after_seconds(&headers, local), Some(120));
+        headers.insert(header::RETRY_AFTER, "Sun, 15 Nov 2026 00:00:00 GMT".parse().unwrap());
+        assert_eq!(retry_after_seconds(&headers, local), Some(0));
+        headers.insert(header::RETRY_AFTER, "Mon, 16 Nov 2026 00:00:01 GMT".parse().unwrap());
+        assert_eq!(retry_after_seconds(&headers, local), None);
+        headers.insert(header::RETRY_AFTER, "120".parse().unwrap());
+        headers.insert(header::DATE, "invalid".parse().unwrap());
+        assert_eq!(retry_after_seconds(&headers, local), Some(120));
+        headers.insert(header::RETRY_AFTER, "Sun, 15 Nov 2026 00:02:00 GMT".parse().unwrap());
+        assert_eq!(retry_after_seconds(&headers, local), None);
+        headers.remove(header::DATE);
+        headers.insert(header::RETRY_AFTER, "Thu, 01 Jan 1970 00:02:00 GMT".parse().unwrap());
+        assert_eq!(retry_after_seconds(&headers, local + Duration::from_millis(500)), Some(20));
+        headers.append(header::RETRY_AFTER, "120".parse().unwrap());
+        assert_eq!(retry_after_seconds(&headers, local), None);
+        headers.remove(header::RETRY_AFTER);
+        headers.insert(header::RETRY_AFTER, "Thu, 01 Jan 1970 00:02:00 GMT".parse().unwrap());
+        headers.append(header::DATE, "Thu, 01 Jan 1970 00:01:40 GMT".parse().unwrap());
+        headers.append(header::DATE, "Thu, 01 Jan 1970 00:01:41 GMT".parse().unwrap());
+        assert_eq!(retry_after_seconds(&headers, local), None);
+    }
     #[tokio::test]
     async fn fixed_token_file_reload_updates_mock_requests() {
         let dir = std::env::temp_dir().join(format!("swallow-fcm-reload-{}", uuid::Uuid::new_v4()));

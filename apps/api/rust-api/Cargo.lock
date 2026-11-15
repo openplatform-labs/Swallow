@@ -1150,6 +1150,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "css-inline",
+ "httpdate",
  "jsonlogic",
  "libc",
  "novu-rust-contracts",

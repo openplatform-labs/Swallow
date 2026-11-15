@@ -2199,6 +2199,19 @@ mod tests {
                 ["rejected", "accepted"]
             );
         }
+        // A date-form Retry-After uses the provider Date and delays only remaining targets.
+        let date_job = Uuid::new_v4();
+        crate::enqueue(&db, date_job, "date-header", JOB_KIND, &delayed_payload).await.unwrap();
+        let (provider, server) = mock_with_headers(vec![429, 200], "Date: Sun, 15 Nov 2026 00:00:00 GMT\r\nRetry-After: Sun, 15 Nov 2026 00:02:00 GMT\r\n").await;
+        assert!(process_one_with_rate_limit_policy(&mut db, "date-header", Some(&provider), None, false, crate::push_step_policy::Policy::Snapshot, crate::push_step_policy::PreferencePolicy::Snapshot, crate::push_step_policy::TargetPolicy::Reference, RateLimitPolicy::DelayKnown).await.unwrap());
+        let row = db.query_one("SELECT j.available_at>clock_timestamp()+interval '100 seconds',a.retry_after_seconds FROM public.novu_queue_jobs j JOIN public.novu_rust_fcm_attempts a ON a.job_id=j.id WHERE j.id=$1 AND a.target_index=0", &[&date_job]).await.unwrap();
+        assert!(row.get::<_,bool>(0));
+        assert_eq!(row.get::<_,Option<i32>>(1), Some(120));
+        assert!(!process_one(&mut other_db, "date-header", &provider).await.unwrap());
+        db.execute("UPDATE public.novu_queue_jobs SET available_at=clock_timestamp()-interval '1 second' WHERE id=$1", &[&date_job]).await.unwrap();
+        assert!(process_one(&mut other_db, "date-header", &provider).await.unwrap());
+        assert_eq!(server.await.unwrap(), ["a", "b"]);
+
         // Shared cooldown fences another job before its first provider request.
         db.batch_execute("CREATE TABLE IF NOT EXISTS public.novu_rust_environments(id text PRIMARY KEY); INSERT INTO public.novu_rust_environments(id) VALUES('shared-fcm');").await.unwrap();
         db.batch_execute(include_str!("../migrations/0188_fcm_shared_cooldown.sql"))
