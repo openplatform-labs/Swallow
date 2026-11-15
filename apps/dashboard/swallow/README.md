@@ -1,5 +1,8 @@
 ## Slack 429 지연 재시도 화면
 
+The FCM results panel supports durable unreviewed-job listing, review preparation with a reason, explicit confirmation, request lookup and same-request replay after an uncertain response. Apply worker migrations through `0187` and API migration `0106`; provision separate unreviewed-list and review JWT grants, plus the API DB login's `alert_view` and `queue_ack` permissions and the documented function EXECUTE grants. A request ID should be recorded before sending: the UI keeps it only in memory and loses it when leaving the page. A missing lookup record does not prove the request failed; same-request replay requires the original API origin, environment and token. Acknowledgement does not resend or establish delivery. The recent-window panel remains independent and does not exclude reviewed jobs. See the API and worker READMEs for replay, revision, retention and HA limitations. Angular tests cover identity changes, malformed responses and lost requests; a local browser with a restricted API and disposable PostgreSQL exercised preparation, confirmation, persisted audit, lookup and refreshed list. Real IdP and production HA remain unverified.
+
+
 The FCM partial-health panel can list matching completed jobs and select one for the existing FCM result lookup. List access needs the partial-health and separate partial-jobs JWT grants plus `alert_view`; details use the existing FCM result grant. Lists are UUID-ordered, page size 20, and change between requests; aging out is not acknowledgement. A local browser against the restricted DB/API fixture checked selection, details, and clearing after list-grant revocation.
 
 

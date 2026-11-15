@@ -139,6 +139,14 @@ INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES
 INSERT INTO public.novu_rust_fcm_attempts(job_id,environment_id,target_index,state) VALUES ('cccccccc-cccc-4ccc-8ccc-cccccccccccc','ui-fixture-env',0,'accepted'),('cccccccc-cccc-4ccc-8ccc-cccccccccccc','ui-fixture-env',1,'rejected');
 SQL
 fi
+if [[ "${SWALLOW_UI_FCM_REVIEW_FIXTURE:-false}" == true ]]; then
+ "$pgbin/psql" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_fcm_unreviewed(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_review(text,text,text,text,bigint,uuid,uuid,text,text),public.novu_rust_operator_jwt_fcm_review_request(text,text,text,text,bigint,uuid) TO ui_channel_results_fixture;
+INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'ui-fixture-env',rolname,p,oid FROM pg_roles CROSS JOIN unnest(ARRAY['alert_view','queue_ack']) p WHERE rolname='ui_channel_results_fixture' ON CONFLICT DO NOTHING;
+INSERT INTO public.novu_rust_operator_jwt_fcm_unreviewed_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
+INSERT INTO public.novu_rust_operator_jwt_fcm_review_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
+SQL
+fi
 node --input-type=module - "$root" "$testdir" <<'JS'
 import {readFile,writeFile} from 'node:fs/promises';
 import {SignJWT,importPKCS8} from './node_modules/jose/dist/webapi/index.js';

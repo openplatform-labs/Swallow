@@ -180,6 +180,7 @@ export class App implements OnDestroy {
   readonly selectedAlert = signal<AlertSlot | null>(null);
   slackDecisionBusy = false;
   twilioDecisionBusy = false;
+  fcmReviewBusy = false;
   readonly decisionStatus = signal<'idle' | 'sending' | 'recorded' | 'rejected' | 'unknown' | 'unavailable'>('idle');
   decisionProtocol: 'idempotent' | 'legacy' = 'idempotent';
   readonly decisionRequestId = signal<string | null>(null);
@@ -1141,7 +1142,7 @@ export class App implements OnDestroy {
     if(this.fcmBusy||this.slackBusy)return;
     if(this.oidcRevokeStatus()==='sending')return;
     if(this.sendgridWriteStatus()==='sending')return;
-    if (this.resendDecisionStatus()==='sending' || this.resendDecisionStatus()==='preparing' || this.slackDecisionBusy || this.twilioDecisionBusy || this.resendPolicyBusy || (this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying' || this.subscriberDeleteRetryStatus()==='retrying') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || (this.grantChangeStatus()==='sending'||this.resendPolicyBusy) || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
+    if (this.resendDecisionStatus()==='sending' || this.resendDecisionStatus()==='preparing' || this.slackDecisionBusy || this.twilioDecisionBusy || this.fcmReviewBusy || this.resendPolicyBusy || (this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying' || this.subscriberDeleteRetryStatus()==='retrying') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || (this.grantChangeStatus()==='sending'||this.resendPolicyBusy) || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     if (this.section()==='workflows' && next!=='workflows') {this.clearWorkflow(true);this.forgetWorkflowRequest();}
     if (this.section()==='channels' && next!=='channels') this.clearSendgrid(true);
     if (this.section() === 'subscribers' && next !== 'subscribers') this.forgetKey();
