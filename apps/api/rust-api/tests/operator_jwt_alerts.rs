@@ -2534,6 +2534,11 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     let attempt_id = Uuid::parse_str(value["attemptId"].as_str().unwrap()).unwrap();
     let stored_attempt: Uuid = db.query_one("SELECT attempt_id FROM public.novu_rust_resend_attempts WHERE job_id=$1", &[&job]).await.unwrap().get(0);
     assert_eq!(attempt_id, stored_attempt);
+    assert_eq!(value["sameRequestReplayReserved"], false);
+    db.execute("UPDATE public.novu_rust_resend_attempts SET same_request_replays=1 WHERE job_id=$1", &[&job]).await.unwrap();
+    let response = app.clone().oneshot(result_request(&token, &result_query)).await.unwrap();
+    let replay: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(replay["sameRequestReplayReserved"], true);
     assert_eq!(value["result"], "delivered");
     assert_eq!(value["autoCorrelated"], true);
     assert_eq!(value["autoCorrelationConflict"], false);
@@ -2561,6 +2566,7 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     let response = app.clone().oneshot(result_request(&token, &fresh_query)).await.unwrap();
     let empty: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert!(empty["attemptId"].is_null());
+    assert!(empty["sameRequestReplayReserved"].is_null());
     db.execute("INSERT INTO public.novu_rust_resend_attempts(job_id,environment_id,state) VALUES ($1,'jwt-alert-a','rejected')", &[&fresh_job]).await.unwrap();
     let first: Uuid = db.query_one("SELECT attempt_id FROM public.novu_rust_resend_attempts WHERE job_id=$1", &[&fresh_job]).await.unwrap().get(0);
     db.execute("DELETE FROM public.novu_rust_resend_attempts WHERE job_id=$1", &[&fresh_job]).await.unwrap();
@@ -2570,6 +2576,7 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     let response = app.clone().oneshot(result_request(&token, &fresh_query)).await.unwrap();
     let recreated: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(recreated["attemptId"], second.to_string());
+    assert_eq!(recreated["sameRequestReplayReserved"], false);
     db.execute("DELETE FROM public.novu_queue_jobs WHERE id=$1", &[&fresh_job]).await.unwrap();
     db.execute(
         "UPDATE public.novu_rust_resend_attempts SET http_status=NULL WHERE job_id=$1",

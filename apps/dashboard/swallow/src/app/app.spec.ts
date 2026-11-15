@@ -623,6 +623,17 @@ describe('Swallow console', () => {
     await app.loadResend();expect(app.resendStatus()).toBe('error');expect(app.resendResult()).toBeNull();
   });
 
+  it('distinguishes a replay reservation from proof of delivery and handles old APIs', async () => {
+    const job='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
+    const row={jobId:job,jobStatus:'failed',result:'unknown',attemptState:'unknown',providerIdKnown:false,providerIdAmbiguous:false,autoCorrelated:false,autoCorrelationConflict:false,autoCorrelatedAt:null,lastCompletedScanAt:null};
+    vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({...row,sameRequestReplayReserved:true}))).mockResolvedValueOnce(new Response(JSON.stringify({...row,sameRequestReplayReserved:false}))).mockResolvedValueOnce(new Response(JSON.stringify(row))).mockResolvedValueOnce(new Response(JSON.stringify({...row,sameRequestReplayReserved:null})));
+    const fixture=TestBed.createComponent(App),app=fixture.componentInstance;app.setSection('alerts');app.alertAuthMode='jwt';app.alertEnvironment='env-a';app.alertKey='aaa.bbb.ccc';app.resendJobId=job;
+    await app.loadResend();fixture.detectChanges();expect(app.resendResult()?.sameRequestReplayReserved).toBe(true);expect(fixture.nativeElement.textContent).toContain('두 번째 요청이 실제로 전송됐다는 증거가 아닙니다');
+    await app.loadResend();expect(app.resendResult()?.sameRequestReplayReserved).toBe(false);
+    await app.loadResend();expect(app.resendResult()?.sameRequestReplayReserved).toBeUndefined();
+    await app.loadResend();expect(app.resendStatus()).toBe('error');expect(app.resendResult()).toBeNull();fixture.destroy();
+  });
+
   it('rejects malformed Resend requests and results without retaining stale data', async () => {
     const job='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';
     const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response('',{status:401})).mockResolvedValueOnce(new Response(JSON.stringify({jobId:job,result:'delivered'}),{status:200})).mockResolvedValueOnce(new Response(JSON.stringify({jobId:job,jobStatus:'completed',result:'delivered',attemptState:'accepted',providerIdKnown:true,providerIdAmbiguous:false,autoCorrelated:true,autoCorrelationConflict:true,autoCorrelatedAt:'today',lastCompletedScanAt:null}),{status:200}));
