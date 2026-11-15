@@ -1,0 +1,54 @@
+<section class="card decision-card"><div class="card-block">
+  <div class="card-eyebrow">SMTP AUTO RETRY</div><h2>SMTP 자동 재시도 정책</h2>
+  <p>SMTP 결과가 불명인 발송을 다시 시도합니다. 릴레이가 이미 접수했다면 메일이 중복될 수 있습니다. 별도 운영자 권한과 복구 워커가 필요하며 이미 대기열에 들어간 작업은 비활성화로 취소되지 않습니다.</p>
+  <button type="button" class="btn btn-outline" [disabled]="readStatus() === 'loading' || changeStatus() === 'sending' || changeStatus() === 'preparing'" (click)="load()">정책 조회</button>
+  @if(readStatus()==='loading'){<p role="status">조회 중입니다.</p>}
+  @else if(readStatus()==='error'){<p class="subscriber-error" role="alert">정책을 조회하지 못했습니다. 인증과 정책 조회 권한을 확인하세요.</p>}
+  @else if(readStatus()==='loaded'){
+    @if(policy();as current){<p role="status">현재: {{ current.enabled ? '활성' : '비활성' }} · 최대 {{ current.maxRetries }}회 · 대기 {{ current.delaySeconds }}초 · 대상 시작 {{ current.eligibleSince || '미설정' }} · revision {{ current.revision }}</p>}
+    @else {<p role="status">등록된 정책이 없습니다.</p>}
+    @if(changeStatus()==='idle'){
+      <form class="decision-form" (ngSubmit)="prepare()">
+        <label class="decision-confirm"><input type="checkbox" name="smtpAutoEnabled" [(ngModel)]="enabled"> 자동 재시도 활성화</label>
+        <label for="smtp-auto-max">최대 재시도 횟수</label><input id="smtp-auto-max" name="smtpAutoMax" type="number" min="1" max="10" step="1" [(ngModel)]="maxRetries" required>
+        <label for="smtp-auto-delay">최소 대기 시간(초)</label><input id="smtp-auto-delay" name="smtpAutoDelay" type="number" min="10" max="86400" step="1" [(ngModel)]="delaySeconds" required>
+        <label for="smtp-auto-cutoff">대상 시작 시각</label><select id="smtp-auto-cutoff" name="smtpAutoCutoff" [(ngModel)]="cutoff"><option value="now">현재 시각부터</option>@if(policy()?.eligibleSince){<option value="preserve">기존 시각 유지</option>}<option value="all">이전 실패 전체 포함</option></select>
+        <p>이전 실패 전체를 선택하면 오래된 미확정 메일까지 재발송할 수 있습니다. 최대 횟수에는 자동 재시도만 포함됩니다.</p>
+        <label for="smtp-auto-reason">변경 사유</label><textarea id="smtp-auto-reason" name="smtpAutoReason" [(ngModel)]="reason" maxlength="512" required></textarea>
+        <label class="decision-confirm"><input type="checkbox" name="smtpAutoConfirm" [(ngModel)]="confirm"> 정책과 발송 중복 가능성을 확인했습니다.</label>
+        <button type="submit" class="btn btn-primary" [disabled]="!canPrepare()">정책 변경 요청 준비</button>
+      </form>
+    }
+  }
+</div></section>
+@if(snapshot();as request){<section class="card decision-card"><div class="card-block"><h2>정책 변경 요청</h2>
+  <p>요청 ID: {{ request.body.requestId }}<br>환경: {{ request.environment }} · 예상 revision: {{ request.body.expectedRevision }}<br>{{ request.body.enabled ? '활성' : '비활성' }} · 최대 {{ request.body.maxRetries }}회 · 대기 {{ request.body.delaySeconds }}초 · 시작 시각: {{ request.body.cutoff === 'now' ? '현재 시각부터' : request.body.cutoff === 'all' ? '이전 실패 전체' : '기존 시각 유지' }}<br>사유: {{ request.body.reason }}</p>
+  @if(changeStatus()==='prepared'){<p role="status">아직 전송하지 않았습니다. 요청 ID와 내용을 기록하세요. 화면을 떠나거나 새로고침하면 사라집니다.</p><label class="decision-confirm"><input type="checkbox" name="smtpAutoSubmitConfirm" [(ngModel)]="submitConfirm"> 요청 ID와 내용을 확인하고 제출합니다.</label><button type="button" class="btn btn-primary" [disabled]="blocked || !submitConfirm" (click)="submit()">정책 변경 제출</button>}
+  @else if(changeStatus()==='sending'){<p role="status">요청을 처리 중입니다.</p>}
+  @else if(changeStatus()==='recorded'){<p role="status">요청이 기록됐습니다. 현재 정책은 다시 조회하세요.</p>}
+  @else if(changeStatus()==='unknown'){<p role="alert" class="subscriber-error">결과가 불명확합니다. 요청 ID로 확인하세요. 화면을 떠나면 요청 정보가 사라집니다.</p><label class="decision-confirm"><input type="checkbox" name="smtpAutoRetryConfirm" [(ngModel)]="retryConfirm"> 동일한 요청을 다시 제출합니다.</label><button type="button" class="btn btn-outline" [disabled]="blocked || !retryConfirm" (click)="submit(true)">동일 정책 요청 재제출</button><p>재제출에는 원래 토큰, 환경과 API 주소가 필요합니다.</p>}
+  @if(message()){<p role="alert" class="subscriber-error">{{ message() }}</p>}
+  @if(changeStatus()==='unknown'){<label class="decision-confirm"><input type="checkbox" name="smtpAutoResetConfirm" [(ngModel)]="resetConfirm"> 결과와 기록을 확인했으며 이 요청 정보를 지웁니다.</label>}
+  <button type="button" class="btn btn-outline" [disabled]="changeStatus()==='sending' || changeStatus()==='preparing' || (changeStatus()==='unknown' && !resetConfirm)" (click)="reset()">정책 요청 정보 지우기</button>
+</div></section>}
+@if(changeStatus()==='unavailable'){<p role="alert" class="subscriber-error">요청을 준비하지 못해 전송하지 않았습니다.</p><button type="button" class="btn btn-outline" (click)="reset()">닫기</button>}
+<section class="card decision-card"><div class="card-block"><h2>정책 변경 요청 확인</h2><p>같은 운영자와 환경의 쓰기 권한이 필요합니다. 기록이 없어도 요청이 진행 중일 수 있습니다.</p>
+  <form class="decision-form" (ngSubmit)="lookup()"><label for="smtp-auto-request">요청 ID</label><input id="smtp-auto-request" name="smtpAutoRequest" [(ngModel)]="lookupId" (ngModelChange)="clearLookup()" required><button type="submit" class="btn btn-outline" [disabled]="lookupStatus()==='loading' || changeStatus()==='sending' || changeStatus()==='preparing'">정책 요청 조회</button></form>
+  @if(lookupStatus()==='missing'){<p>기록이 없습니다. 요청이 진행 중일 수 있습니다.</p>}
+  @else if(lookupStatus()==='error'){<p role="alert" class="subscriber-error">요청을 조회하지 못했습니다. 인증과 쓰기 권한을 확인하세요.</p>}
+  @else if(lookupRecord();as record){<p role="status">요청 {{ record.requestId }} · {{ record.createdAt }}<br>예상 revision {{ record.expectedRevision }} → 결과 {{ record.policy.revision }}<br>{{ record.enabled ? '활성' : '비활성' }} · 최대 {{ record.maxRetries }}회 · 대기 {{ record.delaySeconds }}초 · {{ record.cutoff }}<br>사유: {{ record.reason }}</p><p>보관한 원래 요청과 대조하세요. 결과는 현재 정책이 아닐 수 있습니다.</p>}
+</div></section>
+<section class="card decision-card"><div class="card-block"><h2>정책 변경 이력</h2><p>별도 감사 권한이 필요합니다. JWT API 변경만 표시하며 UUID 순서는 시간순이 아니고 페이지는 단일 스냅샷이 아닙니다.</p><button type="button" class="btn btn-outline" [disabled]="auditStatus()==='loading' || changeStatus()==='sending' || changeStatus()==='preparing'" (click)="audit()">정책 이력 조회</button>
+  @if(auditStatus()==='error'){<p role="alert" class="subscriber-error">이력을 조회하지 못했습니다. 인증과 감사 권한을 확인하세요.</p>}
+  @else if(auditStatus()==='loaded'){
+    @if(auditRows().length===0){<p>조회된 이력이 없습니다.</p>}
+    @else{<div class="table-wrap"><table class="table"><thead><tr><th>기록</th><th>변경자</th><th>정책</th><th>사유</th></tr></thead><tbody>@for(row of auditRows();track row.id){<tr><td>{{ row.recordedAt }}<br>요청: {{ row.requestId }}<br>기록: {{ row.id }}</td><td>{{ row.actorIssuer }}<br>{{ row.actorSubject }} · {{ row.actorClientId }}<br>DB: {{ row.databasePrincipal }}</td><td>{{ row.previous ? row.previous.revision : '없음' }} → {{ row.current.revision }}<br>{{ row.current.enabled ? '활성' : '비활성' }} · {{ row.current.maxRetries }}회<br>{{ row.current.eligibleSince || '미설정' }} · {{ row.current.delaySeconds }}초</td><td>{{ row.reason }}</td></tr>}</tbody></table></div>}
+    <p>{{ auditPage() }} 페이지</p><button type="button" class="btn btn-sm btn-outline" [disabled]="auditPage()<=1" (click)="audit('previous')">이전</button><button type="button" class="btn btn-sm btn-outline" [disabled]="!auditNext()" (click)="audit('next')">다음</button>
+  }
+</div></section>
+
+<section class="card decision-card"><div class="card-block"><h2>SMTP 자동 재시도 이력</h2><p>별도 이력 권한이 필요합니다. 예약 기록은 전달 완료를 뜻하지 않으며, 기록 순서는 커밋 순서와 다를 수 있습니다.</p><button type="button" class="btn btn-outline" [disabled]="historyStatus()==='loading' || changeStatus()==='sending' || changeStatus()==='preparing'" (click)="history()">재시도 이력 조회</button>
+@if(historyStatus()==='error'){<p role="alert" class="subscriber-error">이력을 조회하지 못했습니다. 인증과 이력 권한을 확인하세요.</p>}
+@else if(historyStatus()==='loaded'){@if(historyRows().length===0){<p>조회된 이력이 없습니다.</p>}@else{<div class="table-wrap"><table class="table"><thead><tr><th>시각과 작업</th><th>시도와 실패 revision</th><th>실행자와 제한</th></tr></thead><tbody>@for(row of historyRows();track row.id){<tr><td>{{ row.recordedAt }}<br>{{ row.jobId }}</td><td>{{ row.attemptRevision }}<br>{{ row.failureRevision }}</td><td>{{ row.databasePrincipal }}<br>최대 {{ row.maxRetries }}회 · {{ row.delaySeconds }}초</td></tr>}</tbody></table></div>}
+<p>{{ historyPage() }} 페이지</p><button type="button" class="btn btn-sm btn-outline" [disabled]="historyPage()<=1" (click)="history('previous')">이전</button><button type="button" class="btn btn-sm btn-outline" [disabled]="!historyNext()" (click)="history('next')">다음</button>}
+</div></section>

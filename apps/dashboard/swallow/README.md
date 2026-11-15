@@ -456,3 +456,8 @@ The Settings screen includes SMTP transport policy read, change preparation and 
 
 
 The existing operator grant screen can delegate and revoke SMTP transport policy `read`, `write` and `audit` permissions, look up a submitted request and page the grant audit. API migration 0166 requires a separately provisioned grant administrator and audit viewer, plus an independently authorized API DB login; the screen does not grant these bootstrap rights. Changes use the existing prepare/confirm and same-request recovery flow. `TEST_PG_BIN=/opt/homebrew/opt/postgresql@17/bin scripts/test-smtp-transport-component-local.sh` exercises grant and revoke, lookup and audit from the Angular component in jsdom against the actual local API, restricted DB login, synthetic JWT and disposable PostgreSQL. It does not verify an actual browser, external IdP, direct DB grant changes or production HA.
+# SMTP 자동 재시도 정책 화면
+
+설정 화면에서 운영자는 SMTP의 결과 불명 발송에 대한 자동 재시도를 선택하고 횟수, 대기 시간 및 대상 시작 시각을 정할 수 있다. 기본 비활성 정책과 별도 권한이 필요하며, 과거 실패 전체를 선택하면 이전에 수락된 메일까지 다시 전송될 수 있다. 변경은 사유와 확인을 요구하고 요청 ID, 정책 감사 및 재시도 이력을 조회한다. 이력은 재시도 예약 기록이며 실제 전달 완료의 증거가 아니다. 권한과 데이터베이스 설정은 [API README](../../api/rust-api/README.md)를 참고한다.
+
+정책 화면의 기본 변경 확인, 이력 페이지 이동 및 권한 거절은 모의 API를 이용한 Angular 테스트로 확인한다. 이 화면을 실제 Rust API 및 PostgreSQL과 연결한 종단 간 검증, 실제 브라우저 검사, 외부 IdP 및 운영 HA 검증은 아직 수행하지 않았다. 권한 위임 UI는 미구현이다.
