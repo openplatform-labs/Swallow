@@ -209,7 +209,54 @@ async fn verifies_token_mapping_scope_revocation_and_expiry() {
     assert_eq!(audits.len(), 1);
     assert_eq!(audits[0].get::<_, String>(0), "jwt_revoke_admin");
     assert_eq!(audits[0].get::<_, String>(1), "fixture");
-    db.batch_execute("UPDATE public.novu_rust_operator_token_revocation_admins SET can_revoke=false WHERE database_principal='jwt_revoke_admin'; UPDATE public.novu_rust_operator_token_revocation_admins SET can_read_audit=false WHERE database_principal='jwt_revoke_reader'").await.unwrap();
+    let second_admin =
+        connect(&url.replacen("postgres://postgres@", "postgres://jwt_revoke_admin@", 1)).await;
+    let (a, b) = tokio::join!(
+        admin.query_one(revoke_sql, &[&"concurrent", &"fixture"]),
+        second_admin.query_one(revoke_sql, &[&"concurrent", &"fixture"])
+    );
+    let (a, b) = (a.unwrap().get::<_, bool>(0), b.unwrap().get::<_, bool>(0));
+    assert_ne!(
+        a, b,
+        "concurrent identical revocations must insert exactly once"
+    );
+    let audit_count = reader
+        .query_one(
+            "SELECT count(*) FROM public.novu_rust_operator_token_revocation_audit_page(NULL,100)",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0);
+    assert_eq!(audit_count, 2);
+    let mut locking_admin =
+        connect(&url.replacen("postgres://postgres@", "postgres://jwt_revoke_admin@", 1)).await;
+    let tx = locking_admin.transaction().await.unwrap();
+    assert!(
+        tx.query_one(revoke_sql, &[&"lock-test", &"fixture"])
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
+    let grant_db = connect(&url).await;
+    let permission_change = tokio::spawn(async move {
+        grant_db.execute("UPDATE public.novu_rust_operator_token_revocation_admins SET can_revoke=false WHERE database_principal='jwt_revoke_admin'",&[]).await
+    });
+    let mut blocked = false;
+    for _ in 0..100 {
+        blocked=db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE 'UPDATE public.novu_rust_operator_token_revocation_admins SET can_revoke%')",&[]).await.unwrap().get(0);
+        if blocked {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        blocked,
+        "permission revocation must wait for the current operation"
+    );
+    tx.commit().await.unwrap();
+    assert_eq!(permission_change.await.unwrap().unwrap(), 1);
+    db.batch_execute("UPDATE public.novu_rust_operator_token_revocation_admins SET can_read_audit=false WHERE database_principal='jwt_revoke_reader'").await.unwrap();
     assert!(
         admin
             .query_one(revoke_sql, &[&"another", &"fixture"])
