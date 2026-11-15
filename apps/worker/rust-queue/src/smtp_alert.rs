@@ -167,6 +167,24 @@ impl SmtpAlert {
         *self = replacement;
         Ok(())
     }
+    /// Rebuild only after reading and validating the complete replacement CA.
+    pub fn reload_ca_file(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let pem = novu_rust_contracts::secret::read_regular_multiline_file(path, 65_536)?;
+        if self.ca_pem.as_deref() == Some(pem.as_str()) {
+            return Ok(());
+        }
+        let (username, password) = if self.username.is_empty() {
+            (None, None)
+        } else {
+            (Some(self.username.clone()), Some(self.password.clone()))
+        };
+        let replacement = Self::new(self.host.clone(), self.port.parse()?, self.tls.clone(), self.from.clone(), username, password, Some(pem))?;
+        *self = replacement;
+        Ok(())
+    }
     pub fn binding_parts(&self) -> Vec<&str> {
         let mut values = vec![
             self.host.as_str(),

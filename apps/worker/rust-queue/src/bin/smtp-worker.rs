@@ -25,9 +25,16 @@ async fn run(
         Ok("false") | Err(std::env::VarError::NotPresent) => None,
         _ => return Err("invalid SMTP password reload setting".into()),
     };
+    let reload_ca_path = match std::env::var("NOVU_SMTP_RELOAD_CA").as_deref() {
+        Ok("true") => Some(std::path::PathBuf::from(
+            std::env::var_os("SWALLOW_SMTP_CA_FILE").ok_or("SMTP CA reload requires a file")?,
+        )),
+        Ok("false") | Err(std::env::VarError::NotPresent) => None,
+        _ => return Err("invalid SMTP CA reload setting".into()),
+    };
     let exit_on_reload_failure = match std::env::var("NOVU_SMTP_RELOAD_FAILURE_POLICY").as_deref() {
         Ok("pause") | Err(std::env::VarError::NotPresent) => false,
-        Ok("exit") if reload_path.is_some() => true,
+        Ok("exit") if reload_path.is_some() || reload_ca_path.is_some() => true,
         _ => return Err("invalid SMTP reload failure policy".into()),
     };
     let credential_health = match std::env::var("NOVU_SMTP_CREDENTIAL_HEALTH_ENABLED").as_deref() {
@@ -134,6 +141,9 @@ async fn run(
                     let reload_failed = reload_path
                         .as_ref()
                         .is_some_and(|path| provider.reload_password_file(path).is_err());
+                    let ca_reload_failed = reload_ca_path
+                        .as_ref()
+                        .is_some_and(|path| provider.reload_ca_file(path).is_err());
                     let healthy = !reload_failed;
                     if credential_health
                         && (health_previous != Some(healthy)
@@ -155,12 +165,12 @@ async fn run(
                         health_previous = Some(healthy);
                         health_next = tokio::time::Instant::now() + Duration::from_secs(10);
                     }
-                    if reload_failed {
-                        eprintln!("SMTP password reload failed; dispatch paused");
+                    if reload_failed || ca_reload_failed {
+                        eprintln!("SMTP credential or CA reload failed; dispatch paused");
                         if exit_on_reload_failure {
                             task.abort();
                             let _ = task.await;
-                            return Err("SMTP password reload failed".into());
+                            return Err("SMTP credential or CA reload failed".into());
                         }
                         stop.wait(Duration::from_secs(2)).await;
                         continue;
