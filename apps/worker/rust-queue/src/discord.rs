@@ -4,6 +4,55 @@ use reqwest::{Client, Url};
 use serde_json::{Map, Value, json};
 use std::time::Duration;
 
+// Discord reports fractional seconds. Round up so that a stored whole-second
+// guidance never understates a valid provider value.
+fn fractional_seconds(value: f64) -> Option<u32> {
+    if !value.is_finite() || !(0.0..=86_400.0).contains(&value) {
+        return None;
+    }
+    Some(value.ceil() as u32)
+}
+fn discord_retry_header(headers: &reqwest::header::HeaderMap) -> Option<u32> {
+    if let Some(value) = crate::slack::retry_after_seconds(headers) {
+        return Some(value);
+    }
+    let mut values = headers.get_all(reqwest::header::RETRY_AFTER).iter();
+    let value = match (values.next(), values.next()) {
+        (Some(v), None) => v.to_str().ok()?,
+        _ => return None,
+    };
+    if value.is_empty()
+        || !value.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        || !value.contains('.')
+    {
+        return None;
+    }
+    fractional_seconds(value.parse().ok()?)
+}
+#[derive(serde::Deserialize)]
+struct DiscordRateLimitBody {
+    retry_after: Option<f64>,
+}
+fn discord_retry_body(bytes: &[u8]) -> Option<u32> {
+    let body: DiscordRateLimitBody = serde_json::from_slice(bytes).ok()?;
+    fractional_seconds(body.retry_after?)
+}
+async fn rate_limit_body(response: &mut reqwest::Response) -> Option<u32> {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.ok()? {
+            if bytes.len().checked_add(chunk.len())? > 64 * 1024 {
+                return None;
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        discord_retry_body(&bytes)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Provider body fields override trigger data, as in Novu's provider transform.
 /// This transport accepts already-transformed provider fields; casing conversion is
 /// the caller's responsibility.
@@ -127,9 +176,13 @@ impl Webhook {
             .map_err(|_| SendError::Unknown)?;
         let status = response.status().as_u16();
         if status == 429 {
-            return Err(SendError::RateLimited(crate::slack::retry_after_seconds(
-                response.headers(),
-            )));
+            let header = discord_retry_header(response.headers());
+            let body = rate_limit_body(&mut response).await;
+            return Err(SendError::RateLimited(match (header, body) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            }));
         }
         if (400..500).contains(&status) && ![408, 409].contains(&status) {
             return Err(SendError::Rejected(Some(status)));
@@ -208,6 +261,72 @@ mod tests {
             json!([{"title":"a"},{"title":"b"},{"title":"c"}])
         );
         assert!(request_body(&"x".repeat(131073), &Map::new(), &Map::new(), &Map::new()).is_err());
+    }
+
+    #[test]
+    fn rate_limit_guidance_rejects_invalid_and_rounds_fractional_values() {
+        assert_eq!(discord_retry_body(br#"{"retry_after":1.25}"#), Some(2));
+        assert_eq!(discord_retry_body(br#"{"retry_after":0}"#), Some(0));
+        for value in [
+            br#"{"retry_after":-1}"#.as_slice(),
+            br#"{"retry_after":86400.1}"#,
+            br#"{"retry_after":"5"}"#,
+            br#"{"retry_after":1,"retry_after":2}"#,
+            b"not json",
+        ] {
+            assert_eq!(discord_retry_body(value), None);
+        }
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "1.25".parse().unwrap());
+        assert_eq!(discord_retry_header(&headers), Some(2));
+        headers.append(reqwest::header::RETRY_AFTER, "3".parse().unwrap());
+        assert_eq!(discord_retry_header(&headers), None);
+    }
+    #[tokio::test]
+    async fn rate_limit_response_uses_larger_valid_body_or_header_without_retry() {
+        for (header, body, expected) in [
+            ("Retry-After: 1.2\r\n", r#"{"retry_after":3.25}"#, Some(4)),
+            ("Retry-After: 7\r\n", r#"{"retry_after":2.5}"#, Some(7)),
+            ("", r#"{"retry_after":0.25}"#, Some(1)),
+            ("", r#"{"retry_after":-1}"#, None),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/webhook", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await.unwrap();
+                socket.write_all(format!("HTTP/1.1 429 Too Many Requests\r\n{header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            });
+            assert_eq!(
+                Webhook::test_endpoint(&url)
+                    .unwrap()
+                    .send(&json!({"content":"test"}))
+                    .await,
+                Err(SendError::RateLimited(expected))
+            );
+            server.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn stalled_rate_limit_body_keeps_header_guidance() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/webhook", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await.unwrap();
+            socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 7\r\nContent-Length: 100\r\n\r\n").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        });
+        assert_eq!(
+            Webhook::test_endpoint(&url)
+                .unwrap()
+                .send(&json!({"content":"test"}))
+                .await,
+            Err(SendError::RateLimited(Some(7)))
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]
