@@ -103,6 +103,7 @@ impl Webhook {
             .await
             .map_err(|_| SendError::Unknown)?;
         let status = response.status().as_u16();
+        if status == 429 { return Err(SendError::RateLimited(crate::slack::retry_after_seconds(response.headers()))); }
         if (400..500).contains(&status) && ![408, 409].contains(&status) {
             return Err(SendError::Rejected(Some(status)));
         }
@@ -196,7 +197,7 @@ mod tests {
                 assert_eq!(result, Err(SendError::Unknown));
             }
             if status == 429 {
-                assert_eq!(result, Err(SendError::Rejected(Some(429))));
+                assert_eq!(result, Err(SendError::RateLimited(None)));
             }
             let req = server.await.unwrap();
             assert!(!req.to_ascii_lowercase().contains("authorization:"));

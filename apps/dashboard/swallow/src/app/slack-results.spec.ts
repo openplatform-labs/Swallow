@@ -35,6 +35,13 @@ describe('Slack operator results',()=>{
     const pending=c.submitDecision();c.token='ddd.eee.fff';c.ngOnChanges();finish(new Response(JSON.stringify({recorded:true,replayed:false})));await pending;expect(c.decisionStatus()).toBe('unknown');
     mock.mockResolvedValueOnce(new Response(JSON.stringify({found:true,...draft,createdAt:'2026-01-01'})));await c.lookupDecision();expect(c.lookupStatus()).toBe('found');expect(c.decisionStatus()).toBe('unknown');expect(c.lookupRecord()?.jobId).toBe(id);fixture.destroy();
   });
+  it('shows Slack 429 guidance and rejects inconsistent or invalid response data',async()=>{
+    const limited={...row,attemptState:'rejected',attemptHttpStatus:429,retryAfterSeconds:120,retryNotBefore:'2026-01-01 00:02:00+00'};
+    vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify(limited))).mockResolvedValueOnce(new Response(JSON.stringify({...limited,retryAfterSeconds:86401}))).mockResolvedValueOnce(new Response(JSON.stringify({...limited,retryNotBefore:null})));
+    const fixture=TestBed.createComponent(SlackResults),c=fixture.componentInstance;c.apiOrigin='http://127.0.0.1:3000';c.environment='env';c.token='aaa.bbb.ccc';c.jobId=id;
+    await c.load();fixture.detectChanges();expect(c.result()?.retryAfterSeconds).toBe(120);expect(fixture.nativeElement.textContent).toContain('120초');expect(fixture.nativeElement.textContent).toContain('대기를 강제하지 않습니다');
+    await c.load();expect(c.resultStatus()).toBe('error');expect(c.result()).toBeNull();await c.load();expect(c.resultStatus()).toBe('error');fixture.destroy();
+  });
   it('rejects an acceptance decision for a rejected attempt and records successful retry',async()=>{
     const attempt='22222222-2222-4222-8222-222222222222';const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({...row,attemptState:'rejected',attemptId:attempt}))).mockResolvedValueOnce(new Response(JSON.stringify({recorded:true,replayed:false})));
     const fixture=TestBed.createComponent(SlackResults);const c=fixture.componentInstance;c.apiOrigin='https://api.example.test';c.environment='env';c.token='aaa.bbb.ccc';c.jobId=id;await c.load();c.decisionReason='checked';c.decisionChoice='accepted';c.prepareDecision();expect(c.decisionStatus()).toBe('idle');c.decisionChoice='retry';c.prepareDecision();c.decisionConfirmed=true;await c.submitDecision();expect(c.decisionStatus()).toBe('recorded');expect(c.result()).toBeNull();expect(mock).toHaveBeenCalledTimes(2);fixture.destroy();

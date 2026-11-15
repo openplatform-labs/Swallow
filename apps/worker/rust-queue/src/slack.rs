@@ -19,13 +19,14 @@ pub struct Message {
 pub enum SendError {
     Invalid,
     Rejected(Option<u16>),
+    RateLimited(Option<u32>),
     Unknown,
 }
 impl fmt::Display for SendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Invalid => "invalid Slack message",
-            Self::Rejected(_) => "Slack rejected request",
+            Self::Rejected(_) | Self::RateLimited(_) => "Slack rejected request",
             Self::Unknown => "Slack outcome unknown",
         })
     }
@@ -67,6 +68,18 @@ pub fn request_body(message: &Message) -> Result<Value, SendError> {
         return Err(SendError::Invalid);
     }
     Ok(body)
+}
+
+/// Accept only a single bounded, unsigned number of seconds.
+pub(crate) fn retry_after_seconds(headers: &header::HeaderMap) -> Option<u32> {
+    let mut values = headers.get_all(header::RETRY_AFTER).iter();
+    match (values.next(), values.next()) {
+        (Some(value), None) => value.to_str().ok().and_then(|value| {
+            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) { return None; }
+            value.parse::<u32>().ok().filter(|seconds| *seconds <= 86_400)
+        }),
+        _ => None,
+    }
 }
 
 pub struct Slack {
@@ -121,6 +134,7 @@ impl Slack {
             .await
             .map_err(|_| SendError::Unknown)?;
         let status = response.status().as_u16();
+        if status == 429 { return Err(SendError::RateLimited(retry_after_seconds(response.headers()))); }
         if (400..500).contains(&status) && ![408, 409].contains(&status) {
             return Err(SendError::Rejected(Some(status)));
         }
@@ -255,6 +269,29 @@ mod tests {
         (url, task)
     }
     #[tokio::test]
+    async fn retry_after_headers_are_bounded_for_app_and_webhook() {
+        use crate::slack_webhook::{Message as WebhookMessage, Webhook};
+        for headers in [
+            ("Retry-After: 0\r\n", Some(0)),
+            ("Retry-After: 120\r\n", Some(120)),
+            ("Retry-After: 86400\r\n", Some(86400)),
+            ("Retry-After: 86401\r\n", None),
+            ("Retry-After: -1\r\n", None),
+            ("Retry-After: 30, 40\r\n", None),
+            ("Retry-After: 30\r\nRetry-After: 40\r\n", None),
+            ("", None),
+        ] {
+            for webhook in [false, true] {
+                let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url=format!("http://{}/",listener.local_addr().unwrap());
+                let wire=headers.0.to_owned();
+                let server=tokio::spawn(async move {let (mut socket,_)=listener.accept().await.unwrap();let mut buf=[0;4096];assert!(socket.read(&mut buf).await.unwrap()>0);socket.write_all(format!("HTTP/1.1 429 Too Many Requests\r\n{wire}Content-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();});
+                let result=if webhook {Webhook::test_endpoint(&url).unwrap().send(&WebhookMessage{destination:"ops".into(),text:"hello".into(),blocks:None,custom_data:None}).await} else {Slack::test_endpoint("test-token".into(),&url).unwrap().send(&Message{channel:"C1".into(),text:"hello".into(),blocks:None,custom_data:None}).await};
+                assert_eq!(result,Err(SendError::RateLimited(headers.1)));server.await.unwrap();
+            }
+        }
+    }
+    #[tokio::test]
     async fn verifies_slack_response_and_secret_redaction() {
         let message = Message {
             channel: "C123".into(),
@@ -282,7 +319,7 @@ mod tests {
             (
                 "429 Too Many Requests",
                 "limit",
-                Err(SendError::Rejected(Some(429))),
+                Err(SendError::RateLimited(None)),
             ),
             ("409 Conflict", "ambiguous", Err(SendError::Unknown)),
             (

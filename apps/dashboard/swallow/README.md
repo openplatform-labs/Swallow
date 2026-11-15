@@ -1,3 +1,9 @@
+## Slack 429 재시도 대기 안내
+
+운영 경보의 Slack 작업 상세에서 HTTP 429와 지원되는 대기 초·DB 기준 권장 시각을 보여준다. 워커 0170, API 0096과 기존 Slack 결과 조회 권한이 필요하며, 이전 API는 업데이트 필요로 표시한다. 이 값은 재시도를 예약하지 않고 기존 수동 재시도에도 대기 시각을 강제하지 않는다. [워커 README](../../worker/rust-queue/README.md)의 제한을 확인한다.
+
+Angular 테스트 190개와 빌드, 제한 API DB 로그인·시험 JWT·임시 PostgreSQL 및 실제 로컬 브라우저에서 합성 429 표시를 확인했다. 실제 Slack·원본 서버의 해당 오류·운영 HA는 미검증이며 CSS 예산 경고가 있다. 재현은 `SWALLOW_UI_SLACK_429_FIXTURE=true bash scripts/preview-channel-results-local.sh`와 별도 UI 서버를 사용한다.
+
 ## Resend 429 재시도 판정 이력
 
 운영 경보의 `429 재시도 판정 이력`에서 JWT API를 통해 기록된 즉시·지연 재시도 판정의 요청·작업·시도 ID, 운영자, DB 로그인, 예약 시각과 사유를 조회한다. 워커 0167 및 API 0093–0094, 환경별 `novu_rust_operator_jwt_resend_429_audit_grants`와 API DB 로그인에 `novu_rust_operator_jwt_resend_429_audit_read(text,text,text,text,bigint,uuid)` 함수 EXECUTE가 필요하다. 이 권한은 설정 화면에서 위임할 수 있다. 권한 위임의 변경 이력과 별도이며 CLI·DB 직접 변경 기록은 포함하지 않는다.

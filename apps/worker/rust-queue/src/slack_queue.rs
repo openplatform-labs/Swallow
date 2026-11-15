@@ -225,23 +225,25 @@ pub async fn process_one(
         return Ok(true);
     }
     tx.commit().await?;
-    let (state, code, id, diagnostic) = match provider.send(&message).await {
-        Ok(id) => ("accepted", None, Some(id), None),
+    let (state, code, id, diagnostic, retry_after) = match provider.send(&message).await {
+        Ok(id) => ("accepted", None, Some(id), None, None),
         Err(SendError::Rejected(code)) => (
             "rejected",
             code.map(i32::from),
             None,
             Some("Slack rejected request"),
+            None,
         ),
-        Err(SendError::Invalid) => ("rejected", None, None, Some("invalid Slack request")),
-        Err(SendError::Unknown) => ("unknown", None, None, Some("Slack outcome unknown")),
+        Err(SendError::RateLimited(seconds)) => ("rejected", Some(429), None, Some("Slack rejected request"), seconds.map(|v| v as i32)),
+        Err(SendError::Invalid) => ("rejected", None, None, Some("invalid Slack request"), None),
+        Err(SendError::Unknown) => ("unknown", None, None, Some("Slack outcome unknown"), None),
     };
     let tx = db.transaction().await?;
     if !live(&tx, &job).await? {
         tx.rollback().await?;
         return Ok(true);
     }
-    let updated=tx.execute("UPDATE novu_rust_slack_attempts SET state=$3,http_status=$4,provider_message_id=$5,updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$2 AND state='dispatching'", &[&job.id,&environment,&state,&code,&id]).await?;
+    let updated=tx.execute("UPDATE novu_rust_slack_attempts SET state=$3,http_status=$4,provider_message_id=$5,retry_after_seconds=$6,retry_not_before=clock_timestamp()+make_interval(secs=>$6::integer::double precision),updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$2 AND state='dispatching'", &[&job.id,&environment,&state,&code,&id,&retry_after]).await?;
     if updated == 1 {
         let job_status = if state == "accepted" {
             "completed"
@@ -352,6 +354,7 @@ mod tests {
         a.batch_execute("CREATE TABLE novu_rust_environments(id text PRIMARY KEY,organization_id text NOT NULL); INSERT INTO novu_rust_environments VALUES ('a','org'),('b','org')").await.unwrap();
         a.batch_execute(crate::MIGRATION).await.unwrap();
         a.batch_execute(MIGRATION).await.unwrap();
+        a.batch_execute(include_str!("../migrations/0170_slack_retry_after.sql")).await.unwrap();
         a.batch_execute(MIGRATION).await.unwrap();
         a.batch_execute(WORKFLOW_ATTENTION_MIGRATION).await.unwrap();
         a.batch_execute(ATTENTION_REVISION_MIGRATION).await.unwrap();

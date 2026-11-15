@@ -2110,6 +2110,12 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(with_attempt["attemptId"], attempt.to_string());
     assert_eq!(with_attempt["attemptState"], "unknown");
+    assert!(with_attempt["attemptHttpStatus"].is_null());
+    assert!(with_attempt["retryAfterSeconds"].is_null());
+    db.execute("UPDATE public.novu_rust_slack_attempts SET state='rejected',http_status=429,retry_after_seconds=120,retry_not_before=clock_timestamp()+interval '120 seconds' WHERE job_id=$1", &[&slack_job]).await.unwrap();
+    let response=app.clone().oneshot(slack_request(&token,&slack_path)).await.unwrap();
+    let limited:Value=serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(limited["attemptHttpStatus"],429);assert_eq!(limited["retryAfterSeconds"],120);assert!(limited["retryNotBefore"].is_string());
     db.execute(
         "DELETE FROM public.novu_rust_slack_attempts WHERE job_id=$1",
         &[&slack_job],

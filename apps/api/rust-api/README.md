@@ -1,3 +1,7 @@
+### Slack rate-limit result guidance
+
+Apply worker migration 0170 before API migration 0096. The existing authorized `GET /v1/experimental/operator/slack-result` adds `attemptHttpStatus`, `retryAfterSeconds` and `retryNotBefore` for the current attempt. Values can be null, including for old workers or unsupported headers. This does not provide a delayed retry or change the existing immediate operator decision. A restricted-login JWT integration test covers the returned fields; the provider response is tested separately against mocks. See the worker README for limits and deployment requirements.
+
 ### Resend 429 grant delegation
 
 API migration 0095 adds a separate grant administration API for `resource=resend-429` and permissions `immediate`, `after`, and `audit`. `GET /v1/experimental/operator/resend-429-grants` reads a target identity's current permission; `PUT` to the same path accepts `requestId`, `targetIssuer`, `targetSubject`, `targetClientId`, `resource`, `permission`, `expected`, `desired`, and `reason`. `GET .../request` retrieves the caller's request by ID; `GET .../audit` pages grant-change audit records. All require `environmentId`. A changed or missing target, stale expected value or conflicting request fails; an identical request ID and body replays its result. The caller cannot change the same issuer and subject, even through a different client. Only actual changes create audit records. Preserve request IDs and investigate ambiguous results before issuing a new request.

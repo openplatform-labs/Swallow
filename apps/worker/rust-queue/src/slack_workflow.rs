@@ -597,23 +597,25 @@ pub async fn delivery_one_with_policies(
         return Ok(true);
     }
     tx.commit().await?;
-    let (state, code, id, diagnostic) = match provider.send(&message).await {
-        Ok(id) => ("accepted", None, Some(id), None),
+    let (state, code, id, diagnostic, retry_after) = match provider.send(&message).await {
+        Ok(id) => ("accepted", None, Some(id), None, None),
         Err(SendError::Rejected(code)) => (
             "rejected",
             code.map(i32::from),
             None,
             Some("Slack rejected request"),
+            None,
         ),
-        Err(SendError::Invalid) => ("rejected", None, None, Some("invalid Slack request")),
-        Err(SendError::Unknown) => ("unknown", None, None, Some("Slack outcome unknown")),
+        Err(SendError::RateLimited(seconds)) => ("rejected", Some(429), None, Some("Slack rejected request"), seconds.map(|v| v as i32)),
+        Err(SendError::Invalid) => ("rejected", None, None, Some("invalid Slack request"), None),
+        Err(SendError::Unknown) => ("unknown", None, None, Some("Slack outcome unknown"), None),
     };
     let tx = db.transaction().await?;
     if !live(&tx, &job).await? {
         tx.rollback().await?;
         return Ok(true);
     }
-    let updated=tx.execute("UPDATE novu_rust_slack_attempts SET state=$3,http_status=$4,provider_message_id=$5,updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$2 AND state='dispatching'",&[&job.id,&environment,&state,&code,&id]).await?;
+    let updated=tx.execute("UPDATE novu_rust_slack_attempts SET state=$3,http_status=$4,provider_message_id=$5,retry_after_seconds=$6,retry_not_before=clock_timestamp()+make_interval(secs=>$6::integer::double precision),updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$2 AND state='dispatching'",&[&job.id,&environment,&state,&code,&id,&retry_after]).await?;
     if updated == 1 {
         terminal(
             &tx,
@@ -675,6 +677,7 @@ mod tests {
             crate::MIGRATION,
             crate::in_app::MIGRATION,
             crate::slack_queue::MIGRATION,
+            include_str!("../migrations/0170_slack_retry_after.sql"),
             include_str!("../migrations/0075_slack_channel_endpoints.sql"),
             include_str!("../migrations/0076_slack_endpoint_integrations.sql"),
             include_str!("../migrations/0147_slack_endpoint_revision.sql"),
@@ -936,6 +939,7 @@ mod tests {
             crate::MIGRATION,
             crate::in_app::MIGRATION,
             crate::slack_queue::MIGRATION,
+            include_str!("../migrations/0170_slack_retry_after.sql"),
             include_str!("../migrations/0075_slack_channel_endpoints.sql"),
             include_str!("../migrations/0076_slack_endpoint_integrations.sql"),
             include_str!("../migrations/0147_slack_endpoint_revision.sql"),
@@ -1299,6 +1303,7 @@ mod tests {
         db.batch_execute("CREATE TABLE novu_rust_environments(id text PRIMARY KEY, organization_id text NOT NULL); INSERT INTO novu_rust_environments VALUES ('env','org')").await.unwrap();
         for migration in [
             crate::slack_queue::MIGRATION,
+            include_str!("../migrations/0170_slack_retry_after.sql"),
             include_str!("../migrations/0075_slack_channel_endpoints.sql"),
             include_str!("../migrations/0076_slack_endpoint_integrations.sql"),
             include_str!("../migrations/0147_slack_endpoint_revision.sql"),
@@ -1367,4 +1372,26 @@ mod tests {
         assert_eq!(row.get::<_, String>(0), "completed");
         assert_eq!(row.get::<_, String>(1), "accepted");
     }
+    #[tokio::test]
+    #[ignore = "requires fully migrated disposable PostgreSQL and loopback HTTP"]
+    async fn slack_429_guidance_is_persisted_for_each_queue_kind() {
+        let (mut db, driver)=tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(), NoTls).await.unwrap();
+        tokio::spawn(async move { let _=driver.await; });
+        db.batch_execute("INSERT INTO public.novu_rust_environments VALUES('slack-429-test','org'); INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps) VALUES('slack-429-test','flow',true,true); INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES('slack-429-test','alice','alice-internal','{}'); INSERT INTO public.novu_rust_slack_endpoint_integrations VALUES('slack-429-test','main'); INSERT INTO public.novu_rust_slack_channel_endpoints(environment_id,identifier,subscriber_id,subscriber_internal_id,integration_identifier,endpoint_type,endpoint) VALUES('slack-429-test','one','alice','alice-internal','main','slack_channel','{\"channelId\":\"C1\"}')").await.unwrap();
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();let url=format!("http://{}/",listener.local_addr().unwrap());
+        let server=tokio::spawn(async move {for _ in 0..3 {let (mut socket,_)=listener.accept().await.unwrap();let mut buf=[0;4096];assert!(socket.read(&mut buf).await.unwrap()>0);socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();}});
+        let app=Slack::test_endpoint("test-token".into(),&url).unwrap();let hook=crate::slack_webhook::Webhook::test_endpoint(&url).unwrap();
+        let a=Uuid::new_v4();let b=Uuid::new_v4();
+        crate::enqueue(&db,a,"slack-429-test",crate::slack_queue::JOB_KIND,&json!({"channel":"C1","text":"hello"})).await.unwrap();
+        crate::enqueue(&db,b,"slack-429-test",crate::slack_webhook_queue::JOB_KIND,&json!({"destination":"ops","text":"hello"})).await.unwrap();
+        assert!(crate::slack_queue::process_one(&mut db,"slack-429-test",&app).await.unwrap());
+        assert!(crate::slack_webhook_queue::process_one(&mut db,"slack-429-test","ops",&hook).await.unwrap());
+        let ctx=Context {subscriber_id:"alice".into(),subscriber_internal_id:"alice-internal".into(),workflow_identifier:"flow".into(),workflow_internal_id:None,content_template:"hello".into(),payload:json!({}),context_keys:vec![],actor:None,actor_internal_id:None,endpoint_snapshot:None};
+        crate::enqueue(&db,Uuid::new_v4(),"slack-429-test",FANOUT_KIND,&serde_json::to_value(ctx).unwrap()).await.unwrap();assert!(fanout_one(&mut db,"slack-429-test").await.unwrap());
+        let mut providers=Providers::new();providers.insert(("main".into(),String::new()),app);
+        assert!(delivery_one(&mut db,"slack-429-test",&providers).await.unwrap());server.await.unwrap();
+        let rows=db.query("SELECT j.kind,j.status,a.state,a.http_status,a.retry_after_seconds,a.retry_not_before>clock_timestamp()+interval '100 seconds' FROM public.novu_queue_jobs j JOIN public.novu_rust_slack_attempts a ON a.job_id=j.id WHERE j.environment_id='slack-429-test' ORDER BY j.kind",&[]).await.unwrap();
+        assert_eq!(rows.len(),3);for row in rows {assert_eq!(row.get::<_,String>(1),"failed");assert_eq!(row.get::<_,String>(2),"rejected");assert_eq!(row.get::<_,i32>(3),429);assert_eq!(row.get::<_,i32>(4),120);assert!(row.get::<_,bool>(5));}
+    }
+
 }

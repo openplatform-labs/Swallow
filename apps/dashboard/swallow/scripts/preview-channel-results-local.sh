@@ -46,6 +46,11 @@ INSERT INTO public.novu_rust_operator_jwt_sendgrid_result_grants VALUES ('https:
 INSERT INTO public.novu_rust_operator_jwt_sendgrid_jobs_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
 INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) SELECT gen_random_uuid(),'ui-fixture-env','experimental_sendgrid_email','{}' FROM generate_series(1,21);
 SQL
+if [[ "${SWALLOW_UI_SLACK_429_FIXTURE:-false}" == true ]]; then
+ "$pgbin/psql" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
+UPDATE public.novu_rust_slack_attempts SET state='rejected',http_status=429,retry_after_seconds=120,retry_not_before=clock_timestamp()+interval '120 seconds' WHERE job_id='11111111-1111-4111-8111-000000000001';
+SQL
+fi
 if [[ "${SWALLOW_UI_RESEND_AUTO_HEALTH_FIXTURE:-false}" == true ]]; then
  "$pgbin/psql" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_auto_health(text,text,text,text,bigint,integer),public.novu_rust_operator_jwt_resend_auto_health_jobs(text,text,text,text,bigint,integer,text,uuid),public.novu_rust_operator_jwt_resend_result(text,text,text,text,bigint,uuid) TO ui_channel_results_fixture;
