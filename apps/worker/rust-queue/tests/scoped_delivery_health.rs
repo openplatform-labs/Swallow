@@ -600,6 +600,38 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
     monitor_url
         .set_password(Some("scoped-fixture-password"))
         .unwrap();
+    let result_command = || {
+        Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
+            .args(["sendgrid-result", "a", &sendgrid.to_string()])
+            .env("DATABASE_URL", monitor_url.as_str())
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .output()
+            .unwrap()
+    };
+    let output = result_command();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["result"], "unknown");
+    assert_eq!(result["recipients"].as_array().unwrap().len(), 2);
+    db.execute(
+        "UPDATE novu_queue_jobs SET sendgrid_delivery_result='failed' WHERE id=$1",
+        &[&sendgrid],
+    )
+    .await
+    .unwrap();
+    let output = result_command();
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["result"], "unknown");
+    db.execute(
+        "UPDATE novu_queue_jobs SET sendgrid_delivery_result='delivered' WHERE id=$1",
+        &[&sendgrid],
+    )
+    .await
+    .unwrap();
     for (database_url, scoped) in [(url.as_str(), "false"), (monitor_url.as_str(), "true")] {
         let output = Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
             .args(["check-sendgrid", "a", "300", "120"])
@@ -626,6 +658,9 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
         .unwrap();
     assert_eq!(healthy["overdueUndelivered"], 0);
     assert_eq!(healthy["projectorStale"], false);
+    let output = result_command();
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["result"], "delivered");
     db.execute(
         "UPDATE novu_rust_sendgrid_attempts SET state='unknown' WHERE job_id=$1",
         &[&sendgrid],
@@ -636,6 +671,9 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
         .await
         .unwrap();
     assert_eq!(uncertain["overdueUndelivered"], 1);
+    let output = result_command();
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["result"], "unknown");
     assert_eq!(
         uncertain,
         reconciliation::sendgrid_health(&db, "a", 300, 120)
@@ -658,6 +696,9 @@ async fn scoped_checks_match_legacy_and_isolate_database_login() {
         .await
         .unwrap();
     assert_eq!(no_recipients["overdueUndelivered"], 1);
+    let output = result_command();
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["result"], "unknown");
     assert_eq!(
         no_recipients,
         reconciliation::sendgrid_health(&db, "a", 300, 120)
