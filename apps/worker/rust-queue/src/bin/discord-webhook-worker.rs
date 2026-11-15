@@ -18,6 +18,32 @@ async fn run(
     if !valid_destination(&destination) {
         return Err("invalid Discord webhook destination ID".into());
     }
+    let retry_mode = match std::env::var("NOVU_DISCORD_429_RETRY_MODE") {
+        Ok(v) => v,
+        Err(std::env::VarError::NotPresent) => "off".to_owned(),
+        Err(_) => return Err("invalid Discord 429 retry mode".into()),
+    };
+    if !["off", "known", "fallback"].contains(&retry_mode.as_str()) {
+        return Err("invalid Discord 429 retry mode".into());
+    }
+    let retry_max = match std::env::var("NOVU_DISCORD_429_MAX_RETRIES") {
+        Ok(v) => v
+            .parse::<i32>()
+            .ok()
+            .filter(|v| (0..=10).contains(v))
+            .ok_or("invalid Discord 429 retry limit")?,
+        Err(std::env::VarError::NotPresent) => 3,
+        Err(_) => return Err("invalid Discord 429 retry limit".into()),
+    };
+    let retry_fallback = match std::env::var("NOVU_DISCORD_429_FALLBACK_SECONDS") {
+        Ok(v) => v
+            .parse::<i32>()
+            .ok()
+            .filter(|v| (1..=86400).contains(v))
+            .ok_or("invalid Discord 429 fallback")?,
+        Err(std::env::VarError::NotPresent) => 60,
+        Err(_) => return Err("invalid Discord 429 fallback".into()),
+    };
     let url = novu_rust_contracts::secret::from_env(
         "NOVU_DISCORD_WEBHOOK_URL",
         "NOVU_DISCORD_WEBHOOK_URL_FILE",
@@ -61,6 +87,13 @@ async fn run(
                     Ok(Ok(Some(_))) => {},
                     Ok(Ok(None)) => { task.abort(); return Err("Discord webhook destination already uses a different endpoint".into()); },
                     _ => { task.abort(); let _=task.await; eprintln!("Discord webhook destination registration failed; reconnecting"); stop.wait(Duration::from_secs(2)).await; continue; }
+                }
+            }
+            if configured {
+                match tokio::time::timeout(timeout, db.query_opt("INSERT INTO public.novu_rust_discord_retry_policy(environment_id,destination_id,mode,max_retries,fallback_seconds) VALUES($1,$2,$3,$4,$5) ON CONFLICT(environment_id,destination_id) DO UPDATE SET mode=EXCLUDED.mode WHERE (novu_rust_discord_retry_policy.mode,novu_rust_discord_retry_policy.max_retries,novu_rust_discord_retry_policy.fallback_seconds)=(EXCLUDED.mode,EXCLUDED.max_retries,EXCLUDED.fallback_seconds) RETURNING 1", &[&environment,&destination,&retry_mode,&retry_max,&retry_fallback])).await {
+                    Ok(Ok(Some(_))) => {},
+                    Ok(Ok(None)) => {task.abort();return Err("Discord 429 policy conflicts with registered policy".into());},
+                    _ => {task.abort();let _=task.await;eprintln!("Discord 429 policy registration failed; reconnecting");stop.wait(Duration::from_secs(2)).await;continue;}
                 }
             }
             let mut recovery = tokio::time::Instant::now();

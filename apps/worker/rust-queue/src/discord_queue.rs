@@ -12,6 +12,8 @@ use uuid::Uuid;
 pub const JOB_KIND: &str = "experimental_discord_webhook";
 pub const WORKFLOW_KIND: &str = "experimental_discord_workflow";
 pub const MIGRATION: &str = include_str!("../migrations/0202_discord_webhook_queue.sql");
+pub const RETRY_POLICY_MIGRATION: &str =
+    include_str!("../migrations/0208_discord_retry_policy.sql");
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -196,6 +198,14 @@ pub async fn process_one(
             return Ok(true);
         }
     };
+    // Serialize policy changes with reservation and fence old worker versions.
+    tx.query_opt("SELECT mode FROM public.novu_rust_discord_retry_policy WHERE environment_id=$1 AND destination_id=$2 FOR SHARE", &[&environment,&destination]).await?;
+    let marker = format!("{}:{}", job.id, job.lease_token);
+    tx.query_one(
+        "SELECT set_config('swallow.discord_retry_fence',$1,true)",
+        &[&marker],
+    )
+    .await?;
     let inserted = tx.execute("INSERT INTO novu_rust_discord_attempts(job_id,environment_id,state) VALUES ($1,$2,'dispatching') ON CONFLICT DO NOTHING", &[&job.id,&environment]).await?;
     if inserted != 1 {
         tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='Discord attempt requires review',lease_token=NULL,lease_until=NULL WHERE id=$1", &[&job.id]).await?;
@@ -252,12 +262,37 @@ pub async fn process_one(
     }
     let updated = tx.execute("UPDATE novu_rust_discord_attempts SET state=$3,http_status=$4,provider_message_id=$5,provider_timestamp=$6,retry_after_seconds=$7,updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$2 AND state='dispatching'", &[&job.id,&environment,&state,&code,&id,&timestamp,&retry_after]).await?;
     if updated == 1 {
-        let status = if state == "accepted" {
-            "completed"
+        let retry_policy = tx.query_opt("SELECT mode,max_retries,fallback_seconds FROM public.novu_rust_discord_retry_policy WHERE environment_id=$1 AND destination_id=$2 FOR SHARE", &[&environment,&destination]).await?;
+        let mut retry = None;
+        if code == Some(429) {
+            if let Some(policy) = retry_policy {
+                let mode: String = policy.get(0);
+                let max: i32 = policy.get(1);
+                let fallback: i32 = policy.get(2);
+                let count: i64 = tx.query_one("SELECT count(*) FROM public.novu_rust_discord_retry_history WHERE job_id=$1", &[&job.id]).await?.get(0);
+                if count < i64::from(max) {
+                    retry = match (mode.as_str(), retry_after) {
+                        ("known", Some(seconds)) | ("fallback", Some(seconds)) => {
+                            Some(seconds.max(1))
+                        }
+                        ("fallback", None) => Some(fallback),
+                        _ => None,
+                    };
+                }
+            }
+        }
+        if let Some(delay) = retry {
+            tx.execute("INSERT INTO public.novu_rust_discord_retry_history(job_id,environment_id,destination_id,retry_after_seconds,scheduled_delay_seconds) VALUES($1,$2,$3,$4,$5)",&[&job.id,&environment,&destination,&retry_after,&delay]).await?;
+            tx.execute("DELETE FROM public.novu_rust_discord_attempts WHERE job_id=$1 AND environment_id=$2 AND state='rejected' AND http_status=429",&[&job.id,&environment]).await?;
+            tx.execute("UPDATE public.novu_queue_jobs SET status='pending',available_at=clock_timestamp()+make_interval(secs=>$2::double precision),last_error='Discord rate limited; retry scheduled',lease_token=NULL,lease_until=NULL WHERE id=$1", &[&job.id,&(delay as f64)]).await?;
         } else {
-            "failed"
-        };
-        tx.execute("UPDATE novu_queue_jobs SET status=$2,last_error=$3,lease_token=NULL,lease_until=NULL WHERE id=$1", &[&job.id,&status,&diagnostic]).await?;
+            let status = if state == "accepted" {
+                "completed"
+            } else {
+                "failed"
+            };
+            tx.execute("UPDATE novu_queue_jobs SET status=$2,last_error=$3,lease_token=NULL,lease_until=NULL WHERE id=$1", &[&job.id,&status,&diagnostic]).await?;
+        }
     }
     tx.commit().await?;
     Ok(true)

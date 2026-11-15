@@ -18,6 +18,9 @@ async fn dispatch_and_recovery_are_scoped_and_fenced() {
     db.batch_execute("CREATE TABLE novu_rust_environments(id text PRIMARY KEY); INSERT INTO novu_rust_environments VALUES ('a'),('b')").await.unwrap();
     db.batch_execute(queue::MIGRATION).await.unwrap();
     db.batch_execute(discord_queue::MIGRATION).await.unwrap();
+    db.batch_execute(discord_queue::RETRY_POLICY_MIGRATION)
+        .await
+        .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!(
         "http://{}/api/webhooks/1/secret",
