@@ -34,6 +34,15 @@ impl fmt::Display for SendError {
 }
 impl std::error::Error for SendError {}
 
+/// Outcome of one cancellation request, not evidence about previous requests.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CancelOutcome {
+    Confirmed,
+    Rejected(u16),
+    /// The request may have taken effect; investigate before retrying.
+    Unknown,
+}
+
 pub fn request_body(config: &Config, email: &Email) -> Result<Value, SendError> {
     if email.to.is_empty()
         || email.to.len() > 50
@@ -176,6 +185,31 @@ impl Resend {
         self.config.api_key = key;
         Ok(())
     }
+    /// Call the provider once; this primitive does not update queue state or audit.
+    pub async fn cancel_scheduled(&self, id: &str) -> Result<CancelOutcome, SendError> {
+        // Reject paths and escaped separators rather than allowing an ID to alter the URL.
+        if id.is_empty() || id.len()>1024 || !id.bytes().all(|b|b.is_ascii_alphanumeric() || b==b'-' || b==b'_') {
+            return Err(SendError::InvalidMessage);
+        }
+        let url=format!("{}/{id}/cancel",self.endpoint.trim_end_matches('/'));
+        let mut response=match self.http.post(url).bearer_auth(&self.config.api_key).header(header::CONTENT_TYPE,"application/json").send().await {
+            Ok(response)=>response,
+            Err(_)=>return Ok(CancelOutcome::Unknown),
+        };
+        let status=response.status();
+        if status.is_client_error() {return Ok(CancelOutcome::Rejected(status.as_u16()));}
+        if !status.is_success() {return Ok(CancelOutcome::Unknown);}
+        let mut bytes=Vec::new();
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) if bytes.len().saturating_add(chunk.len())<=16_384 => bytes.extend_from_slice(&chunk),
+                Ok(None)=>break,
+                _=>return Ok(CancelOutcome::Unknown),
+            }
+        }
+        let valid=serde_json::from_slice::<Value>(&bytes).ok().is_some_and(|body|body.get("object").and_then(Value::as_str)==Some("email") && body.get("id").and_then(Value::as_str)==Some(id));
+        Ok(if valid {CancelOutcome::Confirmed} else {CancelOutcome::Unknown})
+    }
     /// Sends one request. A transport error or invalid success body is ambiguous.
     pub async fn send(
         &self,
@@ -268,6 +302,34 @@ mod tests {
             html: "<b>Hi</b>".into(),
             ..Default::default()
         }
+    }
+    #[tokio::test]
+    async fn cancellation_is_bounded_and_ambiguous_results_are_not_confirmed() {
+        for (status,body,expected) in [
+            (200,"{\"object\":\"email\",\"id\":\"abc-123\"}",CancelOutcome::Confirmed),
+            (200,"{\"object\":\"email\",\"id\":\"other\"}",CancelOutcome::Unknown),
+            (200,"{}",CancelOutcome::Unknown),
+            (400,"{}",CancelOutcome::Rejected(400)),
+            (429,"{}",CancelOutcome::Rejected(429)),
+            (500,"{}",CancelOutcome::Unknown),
+            (302,"{}",CancelOutcome::Unknown),
+        ] {
+            let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint=format!("http://{}/emails",listener.local_addr().unwrap());
+            let server=tokio::spawn(async move {
+                let (mut socket,_)=listener.accept().await.unwrap();let mut request=vec![0;4096];let n=socket.read(&mut request).await.unwrap();
+                let text=String::from_utf8_lossy(&request[..n]).to_ascii_lowercase();
+                assert!(text.starts_with("post /emails/abc-123/cancel http/1.1\r\n"));
+                assert!(text.contains("authorization: bearer re_test\r\n"));
+                let reply=format!("HTTP/1.1 {status} fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());socket.write_all(reply.as_bytes()).await.unwrap();
+            });
+            let provider=Resend::test_endpoint(config(),&endpoint).unwrap();
+            assert_eq!(provider.cancel_scheduled("../other").await,Err(SendError::InvalidMessage));
+            assert_eq!(provider.cancel_scheduled("abc-123").await.unwrap(),expected);
+            server.await.unwrap();
+        }
+        let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();let endpoint=format!("http://{}/emails",listener.local_addr().unwrap());drop(listener);
+        assert_eq!(Resend::test_endpoint(config(),&endpoint).unwrap().cancel_scheduled("abc-123").await.unwrap(),CancelOutcome::Unknown);
     }
     #[test]
     fn raw_provider_from_preserves_display_name_and_rejects_invalid_values() {

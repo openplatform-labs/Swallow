@@ -1,3 +1,5 @@
+Resend 예약 취소 어댑터: 공급자 취소 HTTP 호출과 정상·거절·결과 불명 분류만 추가했다. API·UI·운영 권한·감사·상태 동기화·장애 복구는 아직 연결되지 않아 운영자가 Swallow에서 예약 취소할 수 없다. 로컬 모의 HTTP만 시험했으며 실제 Resend와 운영 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
 Resend 예약 발송 경로 추가 검증: Angular jsdom 폼에서 실제 HTTP API·워크플로 워커·시험 전용 로컬 엔드포인트를 갖춘 실제 Resend 워커를 거쳐 모의 공급자 본문의 예약 시각·수신자와 DB 접수 기록을 확인했다. 실제 브라우저·외부 Resend 예약·수신, 제한 DB 로그인·JWT 및 운영 HA는 미검증이다. [대시보드 README](apps/dashboard/swallow/README.md)를 참고한다.
 
 Resend 예약 화면 통합 검증: Angular jsdom 폼 → 실제 로컬 HTTP API → PostgreSQL → 워크플로 워커 → Resend 큐 작업의 예약 시각 보존을 확인했다. 제한 DB 로그인·JWT·실제 브라우저·실제 예약 발송과 운영 HA는 이 시험에서 검증하지 않았다. 첫 시도에서 테스트 초기화 대기와 큐 필드 경로를 수정했다. [대시보드 README](apps/dashboard/swallow/README.md)를 참고한다.
