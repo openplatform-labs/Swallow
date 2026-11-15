@@ -63,6 +63,11 @@ SQL
   if db_sql -q -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_worker; SELECT public.novu_rust_assert_smtp_scoped_login('attachment-env')" >/dev/null 2>&1; then echo 'uninstalled RLS was accepted' >&2; exit 1; fi
   db_sql -q -v ON_ERROR_STOP=1 -c "SELECT public.novu_rust_install_smtp_scoped_rls()"
   if db_sql -q -v ON_ERROR_STOP=1 -c "SELECT public.novu_rust_assert_smtp_scoped_login('attachment-env')" >/dev/null 2>&1; then echo 'superuser was accepted' >&2; exit 1; fi
+  db_sql -q -v ON_ERROR_STOP=1 -c "CREATE ROLE smtp_fixture_bypass NOLOGIN BYPASSRLS; GRANT smtp_fixture_bypass TO smtp_fixture_worker"
+  if db_sql -q -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_worker; SELECT public.novu_rust_assert_smtp_scoped_login('attachment-env')" >/dev/null 2>&1; then echo 'BYPASSRLS membership was accepted' >&2; exit 1; fi
+  db_sql -q -v ON_ERROR_STOP=1 -c "REVOKE smtp_fixture_bypass FROM smtp_fixture_worker"
+  db_sql -q -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION smtp_fixture_worker; SELECT public.novu_rust_assert_smtp_scoped_login('attachment-env')" >/dev/null
+
 fi
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost -addext subjectAltName=DNS:localhost -addext basicConstraints=critical,CA:FALSE -keyout "$TEST_DIR/key" -out "$TEST_DIR/cert" >"$TEST_DIR/openssl.log" 2>&1
 printf '%s' fixture-password > "$TEST_DIR/password"
@@ -80,6 +85,16 @@ if [[ "${TEST_SMTP_RLS:-false}" == true ]]; then
   rg -q 'SMTP scoped isolation unavailable; reconnecting' "$TEST_DIR/wrong-scope.log"
   [[ ! -e "$TEST_DIR/connected" ]]
   kill "$WRONG_PID"; wait "$WRONG_PID" || true; WRONG_PID=
+  db_sql -q -v ON_ERROR_STOP=1 -c "GRANT smtp_fixture_bypass TO smtp_fixture_worker"
+  env -i PATH="$PATH" DATABASE_URL="postgres://smtp_fixture_worker@127.0.0.1:$DB_PORT/postgres" NOVU_POSTGRES_ALLOW_INSECURE=true NOVU_SMTP_ENVIRONMENT_ID=attachment-env SWALLOW_SMTP_SCOPED_RLS=true SWALLOW_SMTP_HOST=localhost SWALLOW_SMTP_PORT="$SMTP_PORT" SWALLOW_SMTP_FROM=sender@example.test SWALLOW_SMTP_CA_FILE="$TEST_DIR/cert" "$WORKER/target/debug/smtp-worker" >"$TEST_DIR/bypass-scope.log" 2>&1 & WRONG_PID=$!
+  for _ in $(seq 1 100); do
+    rg -q 'SMTP scoped isolation unavailable; reconnecting' "$TEST_DIR/bypass-scope.log" && break
+    kill -0 "$WRONG_PID"; sleep 0.1
+  done
+  rg -q 'SMTP scoped isolation unavailable; reconnecting' "$TEST_DIR/bypass-scope.log"
+  [[ ! -e "$TEST_DIR/connected" ]]
+  kill "$WRONG_PID"; wait "$WRONG_PID" || true; WRONG_PID=
+  db_sql -q -v ON_ERROR_STOP=1 -c "REVOKE smtp_fixture_bypass FROM smtp_fixture_worker"
 fi
 env -i PATH="$PATH" DATABASE_URL="$DATABASE_URL" NOVU_POSTGRES_ALLOW_INSECURE=true LISTEN_ADDR="127.0.0.1:$API_PORT" SWALLOW_API_HEALTH_ENDPOINTS_ENABLED=true "$API/target/debug/novu-rust-api" >"$TEST_DIR/api.log" 2>&1 & API_PID=$!
 env -i PATH="$PATH" DATABASE_URL="$DATABASE_URL" NOVU_POSTGRES_ALLOW_INSECURE=true "$WORKER/target/debug/in-app-worker" >"$TEST_DIR/in-app.log" 2>&1 & INAPP_PID=$!
