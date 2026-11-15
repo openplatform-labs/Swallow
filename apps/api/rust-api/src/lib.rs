@@ -204,6 +204,8 @@ impl RuntimeConfig {
                     "NOVU_TWILIO_WEBHOOK_URL",
                     "NOVU_TWILIO_WEBHOOK_AUTH_TOKEN",
                     "NOVU_TWILIO_WEBHOOK_AUTH_TOKEN_FILE",
+                    "NOVU_TWILIO_WEBHOOK_PREVIOUS_AUTH_TOKEN",
+                    "NOVU_TWILIO_WEBHOOK_PREVIOUS_AUTH_TOKEN_FILE",
                 ])))
             && twilio.is_none()
         {

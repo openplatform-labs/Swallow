@@ -108,6 +108,63 @@ async fn signed_status_events_are_scoped_deduplicated_and_private() {
         novu_rust_api::router_with_twilio_config(db.clone(), None, HashMap::new(), Some(config))
     };
     let form = "application/x-www-form-urlencoded";
+    let input = format!(
+        "{URL}AccountSidAC{}ExtraaExtrazMessageSidSM{}MessageStatusdeliveredTo+15555555555",
+        "1".repeat(32),
+        "2".repeat(32)
+    );
+    let rotated_signature = STANDARD.encode(
+        hmac::sign(
+            &hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, b"rotated-test-secret"),
+            input.as_bytes(),
+        )
+        .as_ref(),
+    );
+    let rotation = Config::new_with_tokens(
+        "env-a".into(),
+        format!("AC{}", "1".repeat(32)),
+        URL.into(),
+        vec![b"rotated-test-secret".to_vec(), b"test-secret".to_vec()],
+    )
+    .unwrap();
+    let rotated_router =
+        novu_rust_api::router_with_twilio_config(db.clone(), None, HashMap::new(), Some(rotation));
+    assert_eq!(
+        post(rotated_router.clone(), PATH, BODY, SIGNATURE, form).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        post(rotated_router.clone(), PATH, BODY, &rotated_signature, form).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        post(
+            rotated_router,
+            PATH,
+            &BODY.replace("delivered", "failed"),
+            &rotated_signature,
+            form
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+    let new_only = Config::new(
+        "env-a".into(),
+        format!("AC{}", "1".repeat(32)),
+        URL.into(),
+        b"rotated-test-secret".to_vec(),
+    )
+    .unwrap();
+    let new_router =
+        novu_rust_api::router_with_twilio_config(db.clone(), None, HashMap::new(), Some(new_only));
+    assert_eq!(
+        post(new_router.clone(), PATH, BODY, SIGNATURE, form).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        post(new_router, PATH, BODY, &rotated_signature, form).await,
+        StatusCode::NO_CONTENT
+    );
     assert_eq!(
         post(router.clone(), PATH, BODY, SIGNATURE, form).await,
         StatusCode::NO_CONTENT

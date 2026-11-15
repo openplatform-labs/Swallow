@@ -18,7 +18,7 @@ pub struct Config {
     account_sid: String,
     public_url: String,
     public_path: String,
-    auth_token: Vec<u8>,
+    auth_tokens: Vec<Vec<u8>>,
 }
 
 impl Config {
@@ -28,10 +28,25 @@ impl Config {
         public_url: String,
         auth_token: Vec<u8>,
     ) -> Option<Self> {
+        Self::new_with_tokens(environment, account_sid, public_url, vec![auth_token])
+    }
+
+    /// Accept at most two explicitly trusted tokens during a rotation window.
+    pub fn new_with_tokens(
+        environment: String,
+        account_sid: String,
+        public_url: String,
+        auth_tokens: Vec<Vec<u8>>,
+    ) -> Option<Self> {
         let uri: Uri = public_url.parse().ok()?;
         if environment.is_empty()
             || !valid_sid(&account_sid, "AC")
-            || auth_token.is_empty()
+            || auth_tokens.is_empty()
+            || auth_tokens.len() > 2
+            || auth_tokens
+                .iter()
+                .any(|token| token.is_empty() || token.len() > 16384)
+            || (auth_tokens.len() == 2 && auth_tokens[0] == auth_tokens[1])
             || uri.scheme_str() != Some("https")
             || uri.authority().is_none_or(|v| v.as_str().contains('@'))
             || uri.query().is_some()
@@ -45,20 +60,29 @@ impl Config {
             account_sid,
             public_url,
             public_path,
-            auth_token,
+            auth_tokens,
         })
     }
     pub fn from_env() -> Option<Self> {
-        Self::new(
+        let current = novu_rust_contracts::secret::from_env(
+            "NOVU_TWILIO_WEBHOOK_AUTH_TOKEN",
+            "NOVU_TWILIO_WEBHOOK_AUTH_TOKEN_FILE",
+        )
+        .ok()??;
+        let previous = novu_rust_contracts::secret::from_env(
+            "NOVU_TWILIO_WEBHOOK_PREVIOUS_AUTH_TOKEN",
+            "NOVU_TWILIO_WEBHOOK_PREVIOUS_AUTH_TOKEN_FILE",
+        )
+        .ok()?;
+        let mut tokens = vec![current.into_bytes()];
+        if let Some(previous) = previous {
+            tokens.push(previous.into_bytes());
+        }
+        Self::new_with_tokens(
             std::env::var("NOVU_TWILIO_WEBHOOK_ENVIRONMENT_ID").ok()?,
             std::env::var("NOVU_TWILIO_WEBHOOK_ACCOUNT_SID").ok()?,
             std::env::var("NOVU_TWILIO_WEBHOOK_URL").ok()?,
-            novu_rust_contracts::secret::from_env(
-                "NOVU_TWILIO_WEBHOOK_AUTH_TOKEN",
-                "NOVU_TWILIO_WEBHOOK_AUTH_TOKEN_FILE",
-            )
-            .ok()??
-            .into_bytes(),
+            tokens,
         )
     }
 }
@@ -226,8 +250,13 @@ async fn receive_inner(
     else {
         return StatusCode::UNAUTHORIZED;
     };
-    let key = hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, &config.auth_token);
-    if hmac::verify(&key, &signed_data(&expected_url, &fields), &signature).is_err() {
+    let signed = signed_data(&expected_url, &fields);
+    let mut valid = false;
+    for token in &config.auth_tokens {
+        let key = hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, token);
+        valid |= hmac::verify(&key, &signed, &signature).is_ok();
+    }
+    if !valid {
         return StatusCode::UNAUTHORIZED;
     }
     let one = |name: &str| -> Option<&str> {

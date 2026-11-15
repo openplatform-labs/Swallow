@@ -28,6 +28,8 @@ fn server() -> Command {
         .env_remove("NOVU_TWILIO_WEBHOOK_URL")
         .env_remove("NOVU_TWILIO_WEBHOOK_AUTH_TOKEN")
         .env_remove("NOVU_TWILIO_WEBHOOK_AUTH_TOKEN_FILE")
+        .env_remove("NOVU_TWILIO_WEBHOOK_PREVIOUS_AUTH_TOKEN")
+        .env_remove("NOVU_TWILIO_WEBHOOK_PREVIOUS_AUTH_TOKEN_FILE")
         .stdout(Stdio::null());
     command
 }
@@ -76,6 +78,37 @@ fn strict_and_required_security_settings_control_startup() {
         ],
         false,
     );
+    check(
+        &[
+            ("SWALLOW_API_STRICT_SECURITY_CONFIG", "true"),
+            (
+                "NOVU_TWILIO_WEBHOOK_PREVIOUS_AUTH_TOKEN",
+                "sensitive-test-token",
+            ),
+        ],
+        false,
+    );
+    let twilio = [
+        ("SWALLOW_API_STRICT_SECURITY_CONFIG", "true"),
+        ("NOVU_TWILIO_WEBHOOK_ENVIRONMENT_ID", "env"),
+        (
+            "NOVU_TWILIO_WEBHOOK_ACCOUNT_SID",
+            "AC11111111111111111111111111111111",
+        ),
+        ("NOVU_TWILIO_WEBHOOK_URL", "https://example.test/webhook"),
+        ("NOVU_TWILIO_WEBHOOK_AUTH_TOKEN", "sensitive-test-token"),
+        (
+            "NOVU_TWILIO_WEBHOOK_PREVIOUS_AUTH_TOKEN",
+            "older-test-token",
+        ),
+    ];
+    check(&twilio, true);
+    let mut duplicate = twilio;
+    duplicate[5].1 = "sensitive-test-token";
+    check(&duplicate, false);
+    let mut conflict = twilio.to_vec();
+    conflict.push(("NOVU_TWILIO_WEBHOOK_PREVIOUS_AUTH_TOKEN_FILE", "/missing"));
+    check(&conflict, false);
     check(
         &[(
             "SWALLOW_API_REQUIRED_SECURITY",
@@ -141,6 +174,36 @@ fn strict_and_required_security_settings_control_startup() {
         ],
         true,
     );
+}
+
+#[test]
+fn previous_twilio_token_file_supports_rotation_without_exposing_secrets() {
+    let path = std::env::temp_dir().join(format!("swallow-twilio-old-{}", uuid::Uuid::new_v4()));
+    fs::write(&path, "older-fixture-token\n").unwrap();
+    let mut child = server()
+        .env("SWALLOW_API_STRICT_SECURITY_CONFIG", "true")
+        .env("NOVU_TWILIO_WEBHOOK_ENVIRONMENT_ID", "env")
+        .env(
+            "NOVU_TWILIO_WEBHOOK_ACCOUNT_SID",
+            "AC11111111111111111111111111111111",
+        )
+        .env("NOVU_TWILIO_WEBHOOK_URL", "https://example.test/webhook")
+        .env("NOVU_TWILIO_WEBHOOK_AUTH_TOKEN", "current-fixture-token")
+        .env("NOVU_TWILIO_WEBHOOK_PREVIOUS_AUTH_TOKEN_FILE", &path)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let exited = child.try_wait().unwrap();
+    if exited.is_none() {
+        child.kill().unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(exited.is_none(), "valid rotation configuration failed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("fixture-token"));
+    assert!(!stderr.contains(path.to_str().unwrap()));
+    fs::remove_file(path).unwrap();
 }
 
 #[test]
