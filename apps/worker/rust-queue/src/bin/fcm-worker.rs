@@ -494,13 +494,15 @@ async fn run(
             if configured {
                 match tokio::time::timeout(
                     timeout,
-                    novu_postgres_queue::push_step_policy::register_with_cooldown(
+                    novu_postgres_queue::push_step_policy::register_with_multicast(
                         &db,
                         &environment,
                         step_policy,
                         preference_policy,
                         target_policy,
                         shared_cooldown,
+                        rate_limit_policy,
+                        unavailable_policy,
                     ),
                 )
                 .await
@@ -510,7 +512,7 @@ async fn run(
                         task.abort();
                         let _ = task.await;
                         return Err(
-                            "push workers have different workflow, preference or target policies, or shared cooldown setting"
+                            "push workers have different workflow, preference or target policies, or shared cooldown setting, or multicast 429/503 policies"
                                 .into(),
                         );
                     }

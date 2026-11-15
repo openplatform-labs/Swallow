@@ -38,6 +38,8 @@ async fn worker_supports_token_pem_and_integration_files() {
     .await
     .unwrap();
     db.batch_execute("ALTER TABLE public.novu_rust_push_workflow_worker_config ADD COLUMN preference_policy text DEFAULT 'snapshot', ADD COLUMN target_policy text DEFAULT 'reference'").await.unwrap();
+    db.batch_execute(include_str!("../migrations/0190_fcm_cooldown_registration.sql")).await.unwrap();
+    db.batch_execute(include_str!("../migrations/0191_fcm_multicast_policy_registration.sql")).await.unwrap();
     let fixture =
         Fixture(std::env::temp_dir().join(format!("swallow-fcm-{}", uuid::Uuid::new_v4())));
     fs::create_dir(&fixture.0).unwrap();

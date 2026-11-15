@@ -80,6 +80,8 @@ async fn credential_health_tracks_individual_workers_and_permissions() {
         db.batch_execute(sql).await.unwrap();
     }
     db.batch_execute("ALTER TABLE public.novu_rust_push_workflow_worker_config ADD COLUMN preference_policy text DEFAULT 'snapshot', ADD COLUMN target_policy text DEFAULT 'reference'; CREATE ROLE fcm_health_reader LOGIN; CREATE ROLE fcm_health_writer LOGIN; GRANT USAGE ON SCHEMA public TO fcm_health_reader,fcm_health_writer; GRANT EXECUTE ON FUNCTION public.novu_rust_fcm_credential_health_check(text,integer) TO fcm_health_reader; GRANT EXECUTE ON FUNCTION public.novu_rust_fcm_credential_heartbeat(text,uuid,text) TO fcm_health_writer").await.unwrap();
+    db.batch_execute(include_str!("../migrations/0190_fcm_cooldown_registration.sql")).await.unwrap();
+    db.batch_execute(include_str!("../migrations/0191_fcm_multicast_policy_registration.sql")).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_fcm_routing_workers SELECT 'env-a',rolname,oid FROM pg_roles WHERE rolname=session_user",&[]).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_delivery_operator_grants VALUES ('env-a',session_user,'alert_view',(SELECT oid FROM pg_roles WHERE rolname=session_user)),('env-a','fcm_health_reader','alert_view',(SELECT oid FROM pg_roles WHERE rolname='fcm_health_reader'))",&[]).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_delivery_operator_grants VALUES ('env-a',session_user,'alert_send',(SELECT oid FROM pg_roles WHERE rolname=session_user))",&[]).await.unwrap();

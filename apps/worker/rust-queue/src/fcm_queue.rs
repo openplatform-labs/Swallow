@@ -19,6 +19,9 @@ pub enum RateLimitPolicy {
     DelayDefault,
 }
 impl RateLimitPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Continue => "continue", Self::DelayKnown => "delay-known", Self::DelayDefault => "delay-default" }
+    }
     pub fn from_env() -> Result<Self, &'static str> {
         match std::env::var("SWALLOW_FCM_MULTICAST_429_POLICY").as_deref() {
             Ok("continue") | Err(std::env::VarError::NotPresent) => Ok(Self::Continue),
@@ -37,6 +40,9 @@ pub enum UnavailablePolicy {
     DelayMinimum,
 }
 impl UnavailablePolicy {
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Continue => "continue", Self::DelayKnown => "delay-known", Self::DelayMinimum => "delay-minimum" }
+    }
     pub fn from_env() -> Result<Self, &'static str> {
         match std::env::var("SWALLOW_FCM_MULTICAST_503_POLICY").as_deref() {
             Ok("continue") | Err(std::env::VarError::NotPresent) => Ok(Self::Continue),

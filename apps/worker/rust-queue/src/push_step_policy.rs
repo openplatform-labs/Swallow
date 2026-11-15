@@ -86,6 +86,16 @@ pub async fn register_with_cooldown(
     Ok(db.query_opt("INSERT INTO public.novu_rust_push_workflow_worker_config(environment_id,step_policy,preference_policy,target_policy,shared_cooldown) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(environment_id) DO UPDATE SET step_policy=EXCLUDED.step_policy,preference_policy=EXCLUDED.preference_policy,target_policy=EXCLUDED.target_policy,shared_cooldown=EXCLUDED.shared_cooldown WHERE (novu_rust_push_workflow_worker_config.step_policy IS NULL OR novu_rust_push_workflow_worker_config.step_policy=EXCLUDED.step_policy) AND (novu_rust_push_workflow_worker_config.preference_policy IS NULL OR novu_rust_push_workflow_worker_config.preference_policy=EXCLUDED.preference_policy) AND (novu_rust_push_workflow_worker_config.target_policy IS NULL OR novu_rust_push_workflow_worker_config.target_policy=EXCLUDED.target_policy) AND (novu_rust_push_workflow_worker_config.shared_cooldown IS NULL OR novu_rust_push_workflow_worker_config.shared_cooldown=EXCLUDED.shared_cooldown) RETURNING 1",&[&environment,&policy.as_str(),&preference.as_str(),&target.as_str(),&shared_cooldown]).await?.is_some())
 }
 
+/// Bind multicast policies along with the existing environment policy choices.
+#[allow(clippy::too_many_arguments)]
+pub async fn register_with_multicast(
+    db: &Client, environment: &str, policy: Policy, preference: PreferencePolicy, target: TargetPolicy,
+    shared_cooldown: bool, rate_limit: crate::fcm_queue::RateLimitPolicy,
+    unavailable: crate::fcm_queue::UnavailablePolicy,
+) -> Result<bool, Error> {
+    Ok(db.query_opt("INSERT INTO public.novu_rust_push_workflow_worker_config(environment_id,step_policy,preference_policy,target_policy,shared_cooldown,multicast_429_policy,multicast_503_policy) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(environment_id) DO UPDATE SET step_policy=EXCLUDED.step_policy,preference_policy=EXCLUDED.preference_policy,target_policy=EXCLUDED.target_policy,shared_cooldown=EXCLUDED.shared_cooldown,multicast_429_policy=EXCLUDED.multicast_429_policy,multicast_503_policy=EXCLUDED.multicast_503_policy WHERE (novu_rust_push_workflow_worker_config.step_policy IS NULL OR novu_rust_push_workflow_worker_config.step_policy=EXCLUDED.step_policy) AND (novu_rust_push_workflow_worker_config.preference_policy IS NULL OR novu_rust_push_workflow_worker_config.preference_policy=EXCLUDED.preference_policy) AND (novu_rust_push_workflow_worker_config.target_policy IS NULL OR novu_rust_push_workflow_worker_config.target_policy=EXCLUDED.target_policy) AND (novu_rust_push_workflow_worker_config.shared_cooldown IS NULL OR novu_rust_push_workflow_worker_config.shared_cooldown=EXCLUDED.shared_cooldown) AND (novu_rust_push_workflow_worker_config.multicast_429_policy IS NULL OR novu_rust_push_workflow_worker_config.multicast_429_policy=EXCLUDED.multicast_429_policy) AND (novu_rust_push_workflow_worker_config.multicast_503_policy IS NULL OR novu_rust_push_workflow_worker_config.multicast_503_policy=EXCLUDED.multicast_503_policy) RETURNING 1", &[&environment,&policy.as_str(),&preference.as_str(),&target.as_str(),&shared_cooldown,&rate_limit.as_str(),&unavailable.as_str()]).await?.is_some())
+}
+
 pub enum Check {
     Continue,
     Cancelled,

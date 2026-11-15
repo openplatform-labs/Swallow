@@ -39,7 +39,7 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
     }
     let (db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move { driver.await.unwrap() });
-    db.batch_execute("INSERT INTO novu_rust_environments VALUES ('guard-env','org'),('map-env','org'),('pref-env','org'),('cool-env','org'); INSERT INTO novu_rust_fcm_routing_workers SELECT e.id,r.rolname,r.oid FROM novu_rust_environments e CROSS JOIN pg_roles r WHERE r.rolname=session_user; INSERT INTO novu_rust_operator_grant_admins(environment_id,database_principal,principal_oid) SELECT 'guard-env',rolname,oid FROM pg_roles WHERE rolname=session_user").await.unwrap();
+    db.batch_execute("INSERT INTO novu_rust_environments VALUES ('guard-env','org'),('map-env','org'),('pref-env','org'),('cool-env','org'),('rate-env','org'),('race-env','org'); INSERT INTO novu_rust_fcm_routing_workers SELECT e.id,r.rolname,r.oid FROM novu_rust_environments e CROSS JOIN pg_roles r WHERE r.rolname=session_user; INSERT INTO novu_rust_operator_grant_admins(environment_id,database_principal,principal_oid) SELECT 'guard-env',rolname,oid FROM pg_roles WHERE rolname=session_user").await.unwrap();
     db.batch_execute("INSERT INTO public.novu_rust_fcm_cooldown_policies(environment_id,fallback_seconds) VALUES ('guard-env',60),('cool-env',60); INSERT INTO public.novu_rust_fcm_cooldown_workers SELECT e.id,r.rolname,r.oid FROM public.novu_rust_environments e CROSS JOIN pg_roles r WHERE e.id IN ('guard-env','cool-env') AND r.rolname=session_user").await.unwrap();
     let command = |env: &str, project: &str, token: &str| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_fcm-worker"));
@@ -53,6 +53,8 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
             .env_remove("NOVU_FCM_INTEGRATIONS")
             .env_remove("NOVU_FCM_INTEGRATIONS_FILE")
             .env_remove("SWALLOW_FCM_SHARED_COOLDOWN")
+            .env_remove("SWALLOW_FCM_MULTICAST_429_POLICY")
+            .env_remove("SWALLOW_FCM_MULTICAST_503_POLICY")
             .env_remove("SWALLOW_FCM_ALLOW_SHARED_PROVIDER")
             .env_remove("SWALLOW_FCM_INVALID_TOKEN_POLICY")
             .env_remove("SWALLOW_FCM_TOKEN_CLEANUP_GUARD")
@@ -115,6 +117,49 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
         .unwrap();
     assert!(!mismatch.status.success());
     assert!(String::from_utf8_lossy(&mismatch.stderr).contains("shared cooldown setting"));
+    // Both policies bind atomically and conflicting workers exit before claiming jobs.
+    for (variable, value) in [("SWALLOW_FCM_MULTICAST_429_POLICY", "delay-known"), ("SWALLOW_FCM_MULTICAST_503_POLICY", "delay-minimum")] {
+        let mismatch = command("guard-env", "project-a", "fixture-token").env(variable, value).output().unwrap();
+        assert!(!mismatch.status.success());
+        assert!(String::from_utf8_lossy(&mismatch.stderr).contains("multicast 429/503 policies"));
+    }
+    let mut nondefault = Worker(command("rate-env", "project-a", "fixture-token")
+        .env("SWALLOW_FCM_MULTICAST_429_POLICY", "delay-default")
+        .env("SWALLOW_FCM_MULTICAST_503_POLICY", "delay-minimum").spawn().unwrap());
+    let mut registered_rate = false;
+    for _ in 0..100 {
+        registered_rate = db.query_opt("SELECT multicast_429_policy='delay-default' AND multicast_503_policy='delay-minimum' FROM public.novu_rust_push_workflow_worker_config WHERE environment_id='rate-env'", &[]).await.unwrap().is_some_and(|r|r.get::<_,bool>(0));
+        if registered_rate { break; }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(registered_rate);
+    assert!(nondefault.0.try_wait().unwrap().is_none());
+    let mismatch = command("rate-env", "project-a", "fixture-token").output().unwrap();
+    assert!(!mismatch.status.success());
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("multicast 429/503 policies"));
+    let row = db.query_one("SELECT multicast_429_policy,multicast_503_policy FROM public.novu_rust_push_workflow_worker_config WHERE environment_id='rate-env'", &[]).await.unwrap();
+    assert_eq!(row.get::<_,String>(0), "delay-default");
+    assert_eq!(row.get::<_,String>(1), "delay-minimum");
+    // Competing first registrations cannot both claim different policy pairs.
+    let mut race_a = Worker(command("race-env", "project-a", "fixture-token")
+        .env("SWALLOW_FCM_MULTICAST_503_POLICY", "delay-known").spawn().unwrap());
+    let mut race_b = Worker(command("race-env", "project-a", "fixture-token")
+        .env("SWALLOW_FCM_MULTICAST_503_POLICY", "delay-minimum").spawn().unwrap());
+    let mut resolved = false;
+    for _ in 0..120 {
+        let a = race_a.0.try_wait().unwrap();
+        let b = race_b.0.try_wait().unwrap();
+        if a.is_some() || b.is_some() {
+            assert!(a.is_some() ^ b.is_some());
+            assert!(!a.or(b).unwrap().success());
+            resolved = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(resolved, "competing policies both remained active");
+    let registered: String = db.query_one("SELECT multicast_503_policy FROM public.novu_rust_push_workflow_worker_config WHERE environment_id='race-env'", &[]).await.unwrap().get(0);
+    assert!(["delay-known", "delay-minimum"].contains(&registered.as_str()));
     let mismatch_step = command("guard-env", "project-a", "fixture-token")
         .env("SWALLOW_PUSH_WORKFLOW_STEP_POLICY", "active")
         .output()
