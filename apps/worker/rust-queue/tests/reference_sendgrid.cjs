@@ -23,4 +23,9 @@ const cases=[
   {to:['a@example.test'],subject:'Hi',html:'<p>Hi</p>',text:'',alternatives:[{contentType:'text/calendar',content:''}]},
   {to:['a@example.test'],subject:'Hi',html:'<p>Hi</p>',attachments:[{file:Buffer.from('hello'),name:'a.txt',mime:'text/plain'},{file:Buffer.from([0,1,255]),name:'img.png',mime:'image/png',cid:'img'},{file:Buffer.from('hi'),name:'x.txt',mime:'text/plain',cid:'x',disposition:'attachment'}]},
 ];
-(async()=>{const SendgridEmailProvider=await loadProvider();let bodies=[];for(const options of cases){const provider=new SendgridEmailProvider(config);provider.client.request=async request=>{bodies.push(request.body);return [{headers:{}}]};await provider.sendMessage(options)}process.stdout.write(JSON.stringify(bodies))})().catch(error=>{console.error(error);process.exit(1)});
+const trackingCases=[
+  {trackingSettings:{clickTracking:{enable:true,enableText:false},openTracking:{enable:true,substitutionTag:'%open%'}}},
+  {trackingSettings:{subscriptionTracking:{enable:true,text:'unsubscribe',html:'<p>unsubscribe</p>',substitutionTag:'%unsub%'},ganalytics:{enable:true,utmSource:'source',utmMedium:'email',utmTerm:'term',utmContent:'content',utmCampaign:'campaign'}}},
+  {trackingSettings:{clickTracking:{enable:true,enableText:true},openTracking:{enable:true}},_passthrough:{body:{trackingSettings:{clickTracking:{enable:false},subscriptionTracking:{enable:true,text:'bye'}}}}},
+];
+(async()=>{const SendgridEmailProvider=await loadProvider();let bodies=[];for(const options of cases){const provider=new SendgridEmailProvider(config);provider.client.request=async request=>{bodies.push(request.body);return [{headers:{}}]};await provider.sendMessage(options)}for(const tracking of trackingCases){const provider=new SendgridEmailProvider(config);provider.client.request=async request=>{bodies.push(request.body);return [{headers:{}}]};await provider.sendMessage({to:['a@example.test'],subject:'Hi',html:'<p>Hi</p>'},tracking)}process.stdout.write(JSON.stringify(bodies))})().catch(error=>{console.error(error);process.exit(1)});

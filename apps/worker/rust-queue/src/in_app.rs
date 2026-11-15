@@ -641,6 +641,23 @@ async fn process_claimed(
         .and_then(|v| v.get(&email_provider));
     let mut raw_provider_headers = serde_json::Map::new();
     let mut provider_from_without_name = false;
+    let mut sendgrid_tracking = serde_json::json!({});
+    if email_provider == "sendgrid" {
+        // Bridge known values precede passthrough, even across workflow-step layers.
+        for layer in [provider_layer, step_layer].into_iter().flatten() {
+            if let Some(value) = layer.get("trackingSettings") {
+                merge_provider_layer(&mut sendgrid_tracking, value);
+            }
+        }
+        for layer in [provider_layer, step_layer].into_iter().flatten() {
+            if let Some(value) = layer.get("_passthrough").and_then(|v|v.get("body")).and_then(|v|v.get("trackingSettings")) {
+                merge_provider_layer(&mut sendgrid_tracking, value);
+            }
+        }
+        if !sendgrid_tracking.is_object() {
+            return Err(InvalidJob("invalid SendGrid tracking settings").into());
+        }
+    }
     let provider_pool_override = [
         data.get("emailFlatProviderOverride")
             .filter(|_| email_provider == "sendgrid"),
@@ -1027,6 +1044,9 @@ async fn process_claimed(
                 email_payload["alternatives"] = serde_json::Value::Array(parts.iter().map(|part| serde_json::json!({"content_type":part.get("contentType"),"content":part.get("content")})).collect());
             }
             if email_provider == "sendgrid" {
+                if sendgrid_tracking.as_object().is_some_and(|fields| !fields.is_empty()) {
+                    email_payload["tracking_settings"] = sendgrid_tracking.clone();
+                }
                 if provider_pool_override {
                     email_payload["ip_pool_name"] = merged_email_override
                         .get("ipPoolName")

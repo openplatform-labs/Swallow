@@ -3842,11 +3842,15 @@ async fn trigger(
     let overrides = object.get("overrides").and_then(Value::as_object);
     // Provider/step layers are bounded to understood fields. Unknown
     // passthrough shapes must not be silently accepted.
-    let valid_layer = |layer: &Value, allow_ip_pool: bool| {
+    let valid_layer = |layer: &Value, allow_ip_pool: bool, allow_sendgrid_tracking: bool| {
         layer.as_object().is_some_and(|fields| {
             fields.iter().all(|(key, value)| match key.as_str() {
                 "subject" | "html" | "senderName" => value.is_string(),
                 "ipPoolName" => allow_ip_pool && value.is_string(),
+                "trackingSettings" => allow_sendgrid_tracking && novu_rust_contracts::sendgrid_tracking::wire(value).is_ok(),
+                "_passthrough" => allow_sendgrid_tracking && value.as_object().is_some_and(|object| {
+                    object.len()==1 && object.get("body").and_then(Value::as_object).is_some_and(|body| body.iter().all(|(key,value)| key=="trackingSettings" && novu_rust_contracts::sendgrid_tracking::wire(value).is_ok()))
+                }),
                 "alternatives" => valid_email_alternatives(value),
                 "from" => value.as_str().is_some_and(|s| !s.is_empty()),
                 "to" | "cc" | "bcc" => value.as_array().is_some_and(|items| {
@@ -3956,8 +3960,8 @@ async fn trigger(
     let valid_providers = |value: &Value| {
         value.as_object().is_some_and(|entries| {
             entries.iter().all(|(key, layer)| match key.as_str() {
-                "sendgrid" => valid_layer(layer, true),
-                "resend" => valid_layer(layer, false),
+                "sendgrid" => valid_layer(layer, true, true),
+                "resend" => valid_layer(layer, false, false),
                 "smtp" => layer.as_object().is_some_and(|fields| fields.iter().all(|(key,value)| key == "alternatives" && valid_email_alternatives(value))),
                 "twilio" => valid_sms_layer(layer),
                 "fcm" => valid_fcm_layer(layer),
@@ -3965,7 +3969,7 @@ async fn trigger(
             })
         })
     };
-    if flat.is_some_and(|v| !valid_layer(v, true))
+    if flat.is_some_and(|v| !valid_layer(v, true, false))
         || sms_flat.is_some_and(|v| !valid_sms_layer(v))
         || fcm_flat.is_some_and(|v| {
             !v.as_object().is_some_and(|fields| {

@@ -39,6 +39,7 @@ pub struct Email {
     pub attachments: Vec<Attachment>,
     pub headers: Map<String, Value>,
     pub custom_data: Map<String, Value>,
+    pub tracking_settings: Map<String, Value>,
     pub message_id: Option<String>,
     pub transaction_id: Option<String>,
     pub workflow_identifier: Option<String>,
@@ -228,6 +229,9 @@ pub fn request_body(config: &Config, message: &Email) -> Result<Value, SendError
     if !message.headers.is_empty() {
         body["headers"] = json!(message.headers);
     }
+    if !message.tracking_settings.is_empty() {
+        body["tracking_settings"] = novu_rust_contracts::sendgrid_tracking::wire(&Value::Object(message.tracking_settings.clone())).map_err(|_| SendError::InvalidMessage)?;
+    }
     Ok(body)
 }
 
@@ -286,8 +290,8 @@ impl Sendgrid {
         self.dispatch_tracking
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_endpoint(config: Config, endpoint: &str) -> Result<Self, SendError> {
+    #[cfg(any(test, feature = "test-mocks"))]
+    pub fn test_endpoint(config: Config, endpoint: &str) -> Result<Self, SendError> {
         Self::with_endpoint(config, endpoint)
     }
 
@@ -382,6 +386,15 @@ mod tests {
             subject: "Hello".into(),
             html: "<p>Hello</p>".into(),
             ..Email::default()
+        }
+    }
+    #[test]
+    fn tracking_validation_rejects_invalid_persisted_messages_before_send() {
+        let mut email=message();
+        assert!(request_body(&config(),&email).unwrap().get("tracking_settings").is_none());
+        for invalid in [json!({"clickTracking":{"enable":"true"}}),json!({"openTracking":{"unsupported":true}}),json!({"ganalytics":{"utmSource":"x".repeat(4097)}})] {
+            email.tracking_settings=invalid.as_object().unwrap().clone();
+            assert!(matches!(request_body(&config(),&email),Err(SendError::InvalidMessage)));
         }
     }
     #[tokio::test]

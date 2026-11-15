@@ -127,6 +127,10 @@ fn original_sendgrid_wire_body() {
         ],
         ..Email::default()
     };
+    let tracking = |value: Value| Email {
+        to: vec!["a@example.test".into()], subject: "Hi".into(), html: "<p>Hi</p>".into(),
+        tracking_settings: value.as_object().unwrap().clone(), ..Email::default()
+    };
     assert_eq!(
         vec![
             request_body(&config, &plain).unwrap(),
@@ -137,7 +141,10 @@ fn original_sendgrid_wire_body() {
             request_body(&config, &alternative).unwrap(),
             request_body(&config, &multi_alternatives).unwrap(),
             request_body(&config, &empty_alternative).unwrap(),
-            request_body(&config, &attachment).unwrap()
+            request_body(&config, &attachment).unwrap(),
+            request_body(&config, &tracking(json!({"clickTracking":{"enable":true,"enableText":false},"openTracking":{"enable":true,"substitutionTag":"%open%"}}))).unwrap(),
+            request_body(&config, &tracking(json!({"subscriptionTracking":{"enable":true,"text":"unsubscribe","html":"<p>unsubscribe</p>","substitutionTag":"%unsub%"},"ganalytics":{"enable":true,"utmSource":"source","utmMedium":"email","utmTerm":"term","utmContent":"content","utmCampaign":"campaign"}}))).unwrap(),
+            request_body(&config, &tracking(json!({"clickTracking":{"enable":false,"enableText":true},"openTracking":{"enable":true},"subscriptionTracking":{"enable":true,"text":"bye"}}))).unwrap()
         ],
         original
     );
