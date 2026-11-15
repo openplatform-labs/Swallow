@@ -1,3 +1,5 @@
+Discord 권한 위임 API: API 0119는 Discord 전용 관리자의 목록·검토 권한 부여와 회수, 별도 감사 조회 및 요청 ID 재제출을 지원한다. 제한 DB 로그인과 테스트 JWT·Docker PostgreSQL에서 권한 분리, 자기 변경 거절, 권한별 회수와 감사 실패 롤백을 확인했다. 실제 IdP·운영 HA와 권한 위임 화면은 미검증 또는 미구현이다. [API README](apps/api/rust-api/README.md)를 참고한다.
+
 Discord 운영자 검토 화면: Angular 화면에서 미확인 작업과 revision을 조회하고 확인 요청을 제출하거나 결과 불명 요청을 조회·재제출할 수 있다. Angular 테스트 237건과 빌드가 통과했고 실제 브라우저에서 모의 API로 목록·검토 확인을 검증했다. 실제 API·외부 IdP를 연결한 브라우저 종단 간 시험과 권한 위임 화면은 미검증 또는 미구현이다. [대시보드 README](apps/dashboard/swallow/README.md)를 참고한다.
 
 Discord 운영자 JWT 확인 API: API 0118은 목록·확인 권한을 분리하고 요청 ID 재제출과 결과 조회를 지원한다. 서명된 테스트 JWT와 제한 DB 로그인·Docker PostgreSQL에서 권한·환경 격리, 오래된 revision, 재제출 및 권한 회수를 검증했다. 실제 IdP·Discord·운영 HA와 권한 위임 화면은 미검증 또는 미구현이다. [API README](apps/api/rust-api/README.md)를 참고한다.
