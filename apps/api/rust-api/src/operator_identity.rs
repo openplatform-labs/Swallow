@@ -125,7 +125,7 @@ enum Lookup {
     SubscriberActivityAudit,
 }
 
-struct Authenticated {
+pub(super) struct Authenticated {
     identity: VerifiedSubject,
     revocation_guard: bool,
 }
@@ -136,7 +136,7 @@ impl std::ops::Deref for Authenticated {
     }
 }
 
-async fn authenticate(
+pub(super) async fn authenticate(
     db: &Client,
     headers: &HeaderMap,
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
@@ -209,7 +209,7 @@ async fn authenticate(
 
 // All operator SQL here is a single SELECT of one security-definer function.
 // The materialized guard is evaluated in the same transaction as that call.
-async fn guarded_query(
+pub(super) async fn guarded_query(
     db: &Client,
     identity: &Authenticated,
     sql: &str,

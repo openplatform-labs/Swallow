@@ -66,4 +66,9 @@ describe('workflow trigger',()=>{
     const {fixture,c}=setup();await c.submit();c.lookupAuth='jwt';c.lookupToken='aaa.bbb.ccc';c.lookupEnvironment='env-a';await c.lookup();
     expect(fetcher.mock.calls[1][0]).toBe(`https://api.example.test/v1/experimental/operator/workflow-trigger-result?transactionId=${id}&environmentId=env-a`);expect(fetcher.mock.calls[1][1]).toMatchObject({headers:{Authorization:'Bearer aaa.bbb.ccc'}});expect(c.lookupResult()).toEqual({recorded:true,jobCount:0,job:null});fixture.destroy();expect(c.lookupToken).toBe('');
   });
+  it('can execute using a separately configured operator JWT',async()=>{
+    const id='99999999-9999-4999-8999-999999999999';vi.spyOn(crypto,'randomUUID').mockReturnValue(id);
+    const fetcher=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:{acknowledged:true,status:'processed',transactionId:id}}),{status:201}));const {fixture,c}=setup();c.executeAuth='jwt';c.executeToken='aaa.bbb.ccc';c.executeEnvironment='env-a';await c.submit();
+    expect(fetcher.mock.calls[0][0]).toBe('https://api.example.test/v1/experimental/operator/events/trigger?environmentId=env-a');expect(fetcher.mock.calls[0][1]).toMatchObject({headers:{Authorization:'Bearer aaa.bbb.ccc','Content-Type':'application/json'}});expect(JSON.parse(fetcher.mock.calls[0][1]!.body as string).overrides.providers.sendgrid.mailSettings.sandboxMode.enable).toBe(true);expect(c.status()).toBe('accepted');fixture.destroy();expect(c.executeToken).toBe('');
+  });
 });

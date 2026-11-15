@@ -634,6 +634,7 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/console/alerts/request", get(console_alerts::request_status))
         .route("/v1/experimental/console/alerts/decisions", get(console_alerts::history))
         .route("/v1/events/trigger", post(trigger))
+        .route("/v1/experimental/operator/events/trigger", post(operator_trigger))
         .route("/v1/experimental/workflow-trigger-result", get(workflow_trigger_result))
         .route("/v1/experimental/fcm-integrations", get(fcm_integrations::list).post(fcm_integrations::create))
         .route("/v1/experimental/fcm-integration-audit", get(fcm_integrations::audit))
@@ -3707,6 +3708,34 @@ async fn trigger(
     };
     let key=headers.get("authorization").and_then(|v|v.to_str().ok()).and_then(|v|v.strip_prefix("ApiKey ")).expect("authenticate validated key");
     let key_hash=format!("{:x}",Sha256::digest(key.as_bytes()));
+    trigger_inner(db,environment_id,TriggerAuth::ApiKey(key_hash),reject_resend,bytes).await
+}
+
+enum TriggerAuth { ApiKey(String), Operator(operator_identity::Authenticated) }
+
+async fn operator_trigger(
+    State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,
+    verifier:Option<Extension<Arc<operator_access_token::AccessTokenVerifier>>>,
+    reject_resend:Option<Extension<RejectResendAlternatives>>,bytes:Bytes,
+) -> Response {
+    let failure=|status:StatusCode,message:&str,label:&str|{let mut r=error_at(status,message,label,uri.path()).into_response();r.headers_mut().insert(axum::http::header::CACHE_CONTROL,axum::http::HeaderValue::from_static("no-store"));r};
+    let identity=match operator_identity::authenticate(&db,&headers,verifier).await {Ok(v)=>v,Err(status)=>return failure(status,"Operator authentication failed",if status==StatusCode::SERVICE_UNAVAILABLE {"Service Unavailable"} else {"Unauthorized"})};
+    let params:Vec<_>=form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).collect();
+    if params.len()!=1||params[0].0!="environmentId"||params[0].1.is_empty()||params[0].1.len()>512||params[0].1.chars().any(char::is_control) {return failure(StatusCode::BAD_REQUEST,"Invalid environment","Bad Request");}
+    let environment=params[0].1.to_string();
+    let workflow=serde_json::from_slice::<Value>(&bytes).ok().and_then(|v|v.get("name").and_then(Value::as_str).map(str::to_owned));
+    let Some(workflow)=workflow.filter(|v|!v.is_empty()&&v.len()<=512&&!v.chars().any(char::is_control)) else {return failure(StatusCode::BAD_REQUEST,"Invalid workflow","Bad Request");};
+    let Ok(exp)=i64::try_from(identity.expires_at) else {return failure(StatusCode::UNAUTHORIZED,"Unauthorized","Unauthorized");};
+    match operator_identity::guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_trigger_authorize($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&environment,&exp,&workflow]).await {
+        Ok(_)=>{},Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>return failure(StatusCode::UNAUTHORIZED,"Unauthorized","Unauthorized"),
+        Err(_)=>return failure(StatusCode::INTERNAL_SERVER_ERROR,"Internal server error","Internal Server Error"),
+    }
+    let (status,Json(mut body))=trigger_inner(db,environment,TriggerAuth::Operator(identity),reject_resend,bytes).await;
+    if body.get("path").is_some(){body["path"]=json!(uri.path());}
+    let mut response=(status,Json(body)).into_response();response.headers_mut().insert(axum::http::header::CACHE_CONTROL,axum::http::HeaderValue::from_static("no-store"));response
+}
+
+async fn trigger_inner(db:Arc<Client>,environment_id:String,auth:TriggerAuth,reject_resend:Option<Extension<RejectResendAlternatives>>,bytes:Bytes) -> ApiError {
     let body: Value = match serde_json::from_slice(&bytes) {
         Ok(body) => body,
         Err(_) => return error(StatusCode::BAD_REQUEST, "Invalid JSON", "Bad Request"),
@@ -4079,6 +4108,9 @@ async fn trigger(
             "Internal Server Error",
         );
     };
+    if matches!(&auth,TriggerAuth::Operator(_)) && (txn.len()>512||txn.chars().any(char::is_control)) {
+        return error(StatusCode::BAD_REQUEST,"Invalid transaction ID","Bad Request");
+    }
     let decision = evaluate(row.get(0), row.get(1), TenantState::NotSpecified);
     if decision == GateResult::Dispatch {
         if reject_resend.is_some_and(|Extension(policy)| policy.0)
@@ -4195,16 +4227,32 @@ async fn trigger(
         let data = json!({"organizationId": organization_id, "workflow": name, "transactionId": txn, "recipients": recipients, "topicKeys": topic_keys, "topicExclusions": topic_exclusions, "actor": actor, "content": content, "payload": payload, "emailAttachments":email_attachments, "tags": tags, "contextKeys": context_keys, "severity": severity, "severityOverride": override_severity, "emailOverride": email_override, "smsOverride": sms_override, "emailFlatProviderOverride":flat,"smsFlatProviderOverride":sms_flat,"pushFlatProviderOverride":fcm_flat,"emailProviderOverrides":providers,"emailStepOverrides":steps});
         // The ledger and queue entry are inserted atomically. This provisional deduplication
         // policy is not yet equivalent to Novu's tier-dependent retention behaviour.
-        let result = db.query_one("WITH auth AS MATERIALIZED (SELECT public.novu_rust_lock_trigger_api_key($7,$1) AS ok), accepted AS (INSERT INTO novu_rust_trigger_transactions (environment_id, transaction_id) SELECT $1,$2 FROM auth WHERE ok ON CONFLICT DO NOTHING RETURNING 1), contexts AS (INSERT INTO novu_rust_contexts (environment_id,context_key,data) SELECT $1, entry->>'key', COALESCE(NULLIF(entry->'data','null'::jsonb),'{}'::jsonb) FROM accepted CROSS JOIN jsonb_array_elements($6::jsonb) entry ON CONFLICT (environment_id,context_key) DO UPDATE SET data=CASE WHEN EXISTS (SELECT 1 FROM jsonb_array_elements($6::jsonb) element WHERE element->>'key'=EXCLUDED.context_key AND element->'data' <> 'null'::jsonb) THEN EXCLUDED.data ELSE novu_rust_contexts.data END, updated_at=CASE WHEN EXISTS (SELECT 1 FROM jsonb_array_elements($6::jsonb) element WHERE element->>'key'=EXCLUDED.context_key AND element->'data' <> 'null'::jsonb) AND novu_rust_contexts.data IS DISTINCT FROM EXCLUDED.data THEN now() ELSE novu_rust_contexts.updated_at END RETURNING 1) , enqueued AS (INSERT INTO novu_queue_jobs (id, environment_id, kind, payload) SELECT $3, $1, $4, $5::jsonb || jsonb_build_object('recipientIdentitySnapshot',(SELECT COALESCE(jsonb_object_agg(r->>'subscriberId',s.internal_id),'{}'::jsonb) FROM jsonb_array_elements($5::jsonb->'recipients') r LEFT JOIN novu_rust_subscribers s ON s.environment_id=$1 AND s.subscriber_id=r->>'subscriberId'),'actorIdentitySnapshot',(SELECT s.internal_id FROM novu_rust_subscribers s WHERE s.environment_id=$1 AND s.subscriber_id=$5::jsonb->'actor'->>'subscriberId'),'topicIdentitySnapshot',(SELECT COALESCE(jsonb_object_agg(t.subscriber_id,s.internal_id),'{}'::jsonb) FROM novu_rust_topic_subscribers t JOIN novu_rust_subscribers s ON s.environment_id=t.environment_id AND s.subscriber_id=t.subscriber_id WHERE t.environment_id=$1 AND t.topic_key IN (SELECT jsonb_array_elements_text($5::jsonb->'topicKeys')))) FROM accepted RETURNING 1) SELECT auth.ok,(SELECT count(*) FROM enqueued) FROM auth", &[&environment_id, &txn, &Uuid::new_v4(), &queue_kind, &data, &context_entries, &key_hash]).await;
+        let job_id=Uuid::new_v4();
+        let result=match &auth {
+            TriggerAuth::ApiKey(key_hash)=>db.query_one("WITH auth AS MATERIALIZED (SELECT public.novu_rust_lock_trigger_api_key($7,$1) AS ok), accepted AS (INSERT INTO novu_rust_trigger_transactions (environment_id, transaction_id) SELECT $1,$2 FROM auth WHERE ok ON CONFLICT DO NOTHING RETURNING 1), contexts AS (INSERT INTO novu_rust_contexts (environment_id,context_key,data) SELECT $1, entry->>'key', COALESCE(NULLIF(entry->'data','null'::jsonb),'{}'::jsonb) FROM accepted CROSS JOIN jsonb_array_elements($6::jsonb) entry ON CONFLICT (environment_id,context_key) DO UPDATE SET data=CASE WHEN EXISTS (SELECT 1 FROM jsonb_array_elements($6::jsonb) element WHERE element->>'key'=EXCLUDED.context_key AND element->'data' <> 'null'::jsonb) THEN EXCLUDED.data ELSE novu_rust_contexts.data END, updated_at=CASE WHEN EXISTS (SELECT 1 FROM jsonb_array_elements($6::jsonb) element WHERE element->>'key'=EXCLUDED.context_key AND element->'data' <> 'null'::jsonb) AND novu_rust_contexts.data IS DISTINCT FROM EXCLUDED.data THEN now() ELSE novu_rust_contexts.updated_at END RETURNING 1) , enqueued AS (INSERT INTO novu_queue_jobs (id, environment_id, kind, payload) SELECT $3, $1, $4, $5::jsonb || jsonb_build_object('recipientIdentitySnapshot',(SELECT COALESCE(jsonb_object_agg(r->>'subscriberId',s.internal_id),'{}'::jsonb) FROM jsonb_array_elements($5::jsonb->'recipients') r LEFT JOIN novu_rust_subscribers s ON s.environment_id=$1 AND s.subscriber_id=r->>'subscriberId'),'actorIdentitySnapshot',(SELECT s.internal_id FROM novu_rust_subscribers s WHERE s.environment_id=$1 AND s.subscriber_id=$5::jsonb->'actor'->>'subscriberId'),'topicIdentitySnapshot',(SELECT COALESCE(jsonb_object_agg(t.subscriber_id,s.internal_id),'{}'::jsonb) FROM novu_rust_topic_subscribers t JOIN novu_rust_subscribers s ON s.environment_id=t.environment_id AND s.subscriber_id=t.subscriber_id WHERE t.environment_id=$1 AND t.topic_key IN (SELECT jsonb_array_elements_text($5::jsonb->'topicKeys')))) FROM accepted RETURNING 1) SELECT auth.ok,(SELECT count(*) FROM enqueued) FROM auth", &[&environment_id, &txn, &job_id, &queue_kind, &data, &context_entries, key_hash]).await,
+            TriggerAuth::Operator(identity)=> {
+                let Ok(exp)=i64::try_from(identity.expires_at) else {return error(StatusCode::UNAUTHORIZED,"Unauthorized","Unauthorized");};
+                operator_identity::guarded_query(&db,identity,"SELECT public.novu_rust_operator_jwt_trigger_enqueue($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",&[&identity.issuer,&identity.subject,&identity.client_id,&environment_id,&exp,&name,&txn,&job_id,&queue_kind,&data,&context_entries]).await
+            }
+        };
         match result {
             Ok(row) if row.get::<_,bool>(0) => {},
             Ok(_) => return error(StatusCode::UNAUTHORIZED,"Unauthorized","Unauthorized"),
+            Err(e) if e.code().is_some_and(|c|c.code()=="42501") => return error(StatusCode::UNAUTHORIZED,"Unauthorized","Unauthorized"),
             Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR,"Internal server error","Internal Server Error"),
         }
     } else {
-        match db.query_one("SELECT public.novu_rust_lock_trigger_api_key($1,$2)",&[&key_hash,&environment_id]).await {
+        let result=match &auth {
+            TriggerAuth::ApiKey(key_hash)=>db.query_one("SELECT public.novu_rust_lock_trigger_api_key($1,$2)",&[key_hash,&environment_id]).await,
+            TriggerAuth::Operator(identity)=> {
+                let Ok(exp)=i64::try_from(identity.expires_at) else {return error(StatusCode::UNAUTHORIZED,"Unauthorized","Unauthorized");};
+                operator_identity::guarded_query(&db,identity,"SELECT public.novu_rust_operator_jwt_trigger_authorize($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&environment_id,&exp,&name]).await
+            }
+        };
+        match result {
             Ok(row) if row.get::<_,bool>(0) => {},
             Ok(_) => return error(StatusCode::UNAUTHORIZED,"Unauthorized","Unauthorized"),
+            Err(e) if e.code().is_some_and(|c|c.code()=="42501") => return error(StatusCode::UNAUTHORIZED,"Unauthorized","Unauthorized"),
             Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR,"Internal server error","Internal Server Error"),
         }
     }

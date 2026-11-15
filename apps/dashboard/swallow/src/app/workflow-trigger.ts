@@ -5,6 +5,7 @@ import { FormsModule } from '@angular/forms';
 export class WorkflowTrigger implements OnInit, OnDestroy {
   @Input() apiOrigin='';
   apiKey=''; workflow=''; subscriber=''; payload='{}'; mode:'sandbox'|'normal'='sandbox';
+  executeAuth:'api-key'|'jwt'='api-key'; executeToken=''; executeEnvironment='';
   lookupAuth:'api-key'|'jwt'='api-key'; lookupToken=''; lookupEnvironment='';
   rememberTransaction=false;
   readonly status=signal<'idle'|'sending'|'accepted'|'unknown'|'invalid'>('idle');
@@ -28,7 +29,7 @@ export class WorkflowTrigger implements OnInit, OnDestroy {
       this.transaction.set(value['transactionId']);this.savedOrigin.set(value['origin']);this.rememberTransaction=true;this.status.set('unknown');
     } catch {this.storageError.set(true);this.status.set('unknown');}
   }
-  ngOnDestroy():void {this.abort?.abort();this.clearLookup();this.apiKey='';this.lookupToken='';}
+  ngOnDestroy():void {this.abort?.abort();this.clearLookup();this.apiKey='';this.lookupToken='';this.executeToken='';}
   private origin():string {
     const url=new URL(this.apiOrigin.trim());
     if(!['http:','https:'].includes(url.protocol)||url.username||url.password||url.pathname!=='/'||url.search||url.hash||(url.protocol==='http:'&&!['localhost','127.0.0.1','[::1]'].includes(url.hostname)))throw new Error('origin');
@@ -59,10 +60,11 @@ export class WorkflowTrigger implements OnInit, OnDestroy {
   }
   async submit():Promise<void> {
     if(this.status()!=='idle'&&this.status()!=='invalid')return;
-    let body:Record<string,unknown>, origin:string, key:string;
+    let body:Record<string,unknown>, origin:string, key:string, endpoint:string, authorization:string;
     try {
-      origin=this.origin(); key=this.apiKey.trim();const workflow=this.workflow.trim(),subscriber=this.subscriber.trim();
-      if(!key||key.length>4096||/[\r\n\0]/.test(key)||!workflow||!subscriber||new TextEncoder().encode(workflow).length>512||new TextEncoder().encode(subscriber).length>512||/[\r\n\0]/.test(workflow+subscriber)||!['sandbox','normal'].includes(this.mode)||new TextEncoder().encode(this.payload).length>65536)throw new Error('input');
+      origin=this.origin();const auth=this.executeAuth,environment=this.executeEnvironment.trim();key=(auth==='jwt'?this.executeToken:this.apiKey).trim();const workflow=this.workflow.trim(),subscriber=this.subscriber.trim();
+      if(!key||/[\r\n\0]/.test(key)||!['api-key','jwt'].includes(auth)||(auth==='api-key'&&key.length>4096)||(auth==='jwt'&&(key.length>16384||!/^[-_A-Za-z0-9]+\.[-_A-Za-z0-9]+\.[-_A-Za-z0-9]+$/.test(key)||!environment||new TextEncoder().encode(environment).length>512||/[\r\n\0]/.test(environment)))||!workflow||!subscriber||new TextEncoder().encode(workflow).length>512||new TextEncoder().encode(subscriber).length>512||/[\r\n\0]/.test(workflow+subscriber)||!['sandbox','normal'].includes(this.mode)||new TextEncoder().encode(this.payload).length>65536)throw new Error('input');
+      endpoint=auth==='jwt'?`/v1/experimental/operator/events/trigger?${new URLSearchParams({environmentId:environment})}`:'/v1/events/trigger';authorization=`${auth==='jwt'?'Bearer':'ApiKey'} ${key}`;
       const payload:unknown=JSON.parse(this.payload);if(!payload||Array.isArray(payload)||typeof payload!=='object')throw new Error('payload');
       const transactionId=crypto.randomUUID();
       body={name:workflow,to:subscriber,payload,transactionId};
@@ -77,7 +79,7 @@ export class WorkflowTrigger implements OnInit, OnDestroy {
     const controller=new AbortController();this.abort=controller;this.status.set('sending');
     const timeout=setTimeout(()=>controller.abort(),30000);
     try {
-      const response=await fetch(`${origin}/v1/events/trigger`,{method:'POST',headers:{Authorization:`ApiKey ${key}`,'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'omit',cache:'no-store',redirect:'error',signal:controller.signal});
+      const response=await fetch(`${origin}${endpoint}`,{method:'POST',headers:{Authorization:authorization,'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'omit',cache:'no-store',redirect:'error',signal:controller.signal});
       if(response.status!==201)throw new Error('outcome');
       const result:unknown=await response.json();
       if(!result||typeof result!=='object')throw new Error('outcome');
