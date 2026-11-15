@@ -15,6 +15,32 @@ fn start(url: &str, writable: &str) -> (Server, u16) {
     start_config(url, writable, "any", "1")
 }
 fn start_config(url: &str, writable: &str, policy: &str, connections: &str) -> (Server, u16) {
+    start_routing(url, writable, policy, connections, "false")
+}
+fn start_routing(
+    url: &str,
+    writable: &str,
+    policy: &str,
+    connections: &str,
+    route_guard: &str,
+) -> (Server, u16) {
+    start_routing_policy(
+        url,
+        writable,
+        policy,
+        connections,
+        route_guard,
+        "round-robin",
+    )
+}
+fn start_routing_policy(
+    url: &str,
+    writable: &str,
+    policy: &str,
+    connections: &str,
+    route_guard: &str,
+    routing: &str,
+) -> (Server, u16) {
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -28,6 +54,8 @@ fn start_config(url: &str, writable: &str, policy: &str, connections: &str) -> (
         .env("SWALLOW_API_READY_REQUIRE_WRITABLE", writable)
         .env("SWALLOW_API_READY_CONNECTION_POLICY", policy)
         .env("SWALLOW_API_DB_CONNECTIONS", connections)
+        .env("SWALLOW_API_ROUTE_REQUIRE_WRITABLE", route_guard)
+        .env("SWALLOW_API_DB_ROUTING", routing)
         .env_remove("SWALLOW_API_STRICT_SECURITY_CONFIG")
         .env_remove("SWALLOW_API_REQUIRED_SECURITY")
         .stdout(Stdio::null())
@@ -270,5 +298,149 @@ async fn all_policy_rejects_missing_connection() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(probed, "readiness did not probe the connected primary");
+    task.abort();
+}
+
+async fn create_subscriber(port: u16, id: &str) -> u16 {
+    let body = serde_json::json!({"subscriberId":id,"firstName":"Fixture"}).to_string();
+    let output = tokio::process::Command::new("curl")
+        .args([
+            "-s",
+            "--max-time",
+            "5",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "-H",
+            "Authorization: ApiKey fixture-key",
+            "-H",
+            "Content-Type: application/json",
+            "--data",
+            &body,
+            &format!("http://127.0.0.1:{port}/v2/subscribers"),
+        ])
+        .output()
+        .await
+        .unwrap();
+    std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires migrated primary, standby and test API key"]
+async fn writable_routing_handles_mixed_and_read_only_connections() {
+    use std::sync::atomic::Ordering;
+    let primary = std::env::var("TEST_PRIMARY_ADDR").unwrap();
+    let standby = std::env::var("TEST_STANDBY_ADDR").unwrap();
+    let (proxy, count, task) = alternating_proxy(primary.clone(), standby.clone()).await;
+    let url =
+        format!("postgresql://postgres@127.0.0.1:{proxy}/postgres?application_name=route_guard");
+    let (_guard, port) = start_routing(&url, "false", "any", "2", "true");
+    for _ in 0..100 {
+        if count.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(count.load(Ordering::SeqCst) >= 2);
+    status(port, "/health/ready", "200").await;
+    let (observer, driver) = tokio_postgres::connect(
+        &format!("postgresql://postgres@{standby}/postgres"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    for i in 0..12 {
+        assert_eq!(create_subscriber(port, &format!("guarded-{i}")).await, 201);
+    }
+    assert!(observer.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='route_guard' AND query LIKE 'SELECT NOT pg_is_in_recovery()%')",&[]).await.unwrap().get::<_,bool>(0));
+    let (admin, driver) = tokio_postgres::connect(
+        &format!("postgresql://postgres@{primary}/postgres"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    assert_eq!(admin.query_one("SELECT count(*) FROM public.novu_rust_subscribers WHERE environment_id='routing-test' AND subscriber_id LIKE 'guarded-%'",&[]).await.unwrap().get::<_,i64>(0),12);
+    let (least_proxy, least_count, least_task) =
+        alternating_proxy(primary.clone(), standby.clone()).await;
+    let least_url = format!(
+        "postgresql://postgres@127.0.0.1:{least_proxy}/postgres?application_name=route_guard_least"
+    );
+    let (_least, least_port) =
+        start_routing_policy(&least_url, "false", "any", "2", "true", "least-inflight");
+    for _ in 0..100 {
+        if least_count.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(least_count.load(Ordering::SeqCst) >= 2);
+    status(least_port, "/health/ready", "200").await;
+    for i in 0..12 {
+        assert_eq!(
+            create_subscriber(least_port, &format!("least-{i}")).await,
+            201
+        );
+    }
+    assert_eq!(admin.query_one("SELECT count(*) FROM public.novu_rust_subscribers WHERE environment_id='routing-test' AND subscriber_id LIKE 'least-%'",&[]).await.unwrap().get::<_,i64>(0),12);
+    assert!(observer.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name='route_guard_least' AND query LIKE 'SELECT NOT pg_is_in_recovery()%')",&[]).await.unwrap().get::<_,bool>(0));
+    least_task.abort();
+    // The same mixed setup without the guard demonstrates why it is needed.
+    let (legacy_proxy, legacy_count, legacy_task) =
+        alternating_proxy(primary.clone(), standby.clone()).await;
+    let legacy_url = format!(
+        "postgresql://postgres@127.0.0.1:{legacy_proxy}/postgres?application_name=route_legacy"
+    );
+    let (_legacy, legacy_port) = start_routing(&legacy_url, "false", "any", "2", "false");
+    for _ in 0..100 {
+        if legacy_count.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(legacy_count.load(Ordering::SeqCst) >= 2);
+    status(legacy_port, "/health/ready", "200").await;
+    let mut legacy_results = Vec::new();
+    for i in 0..12 {
+        legacy_results.push(create_subscriber(legacy_port, &format!("legacy-{i}")).await);
+    }
+    assert!(
+        legacy_results.contains(&201) && legacy_results.contains(&500),
+        "legacy results: {legacy_results:?}"
+    );
+    legacy_task.abort();
+    let standby_url = format!("postgresql://postgres@{standby}/postgres");
+    let (_standby, standby_port) = start_routing(&standby_url, "false", "any", "1", "true");
+    status(standby_port, "/health/ready", "200").await;
+    assert_eq!(create_subscriber(standby_port, "must-not-write").await, 503);
+    let read_only_url = format!(
+        "postgresql://postgres@{primary}/postgres?options=-c%20default_transaction_read_only%3Don"
+    );
+    let (_read_only, read_only_port) = start_routing(&read_only_url, "false", "any", "1", "true");
+    status(read_only_port, "/health/ready", "200").await;
+    assert_eq!(
+        create_subscriber(read_only_port, "must-not-write-readonly").await,
+        503
+    );
+    let (mut bad, _) = start_routing(&standby_url, "false", "any", "1", "invalid");
+    let mut exited = false;
+    for _ in 0..100 {
+        if let Some(result) = bad.0.try_wait().unwrap() {
+            assert!(!result.success());
+            exited = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(exited, "invalid writable routing policy was accepted");
     task.abort();
 }

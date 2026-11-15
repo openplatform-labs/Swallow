@@ -55,6 +55,7 @@ struct ApiState {
     ready_require_capacity: bool,
     ready_require_writable: bool,
     ready_require_all: bool,
+    route_require_writable: bool,
     timeout: Duration,
     request_timeout: Option<Duration>,
     draining: Arc<AtomicBool>,
@@ -63,7 +64,7 @@ struct ApiState {
 impl ApiState {
     // Serialize selection and increments to avoid sending concurrent arrivals
     // to the same nominally idle connection. No lock is held across await.
-    fn select(&self) -> Selection {
+    fn select(&self, excluded: u16) -> Selection {
         let Ok(_selection) = self.selection.lock() else {
             return Selection::Unavailable;
         };
@@ -72,6 +73,9 @@ impl ApiState {
         let mut connected = false;
         let available = (0..len).filter_map(|offset| {
             let index = (start + offset) % len;
+            if excluded & (1u16 << index) != 0 {
+                return None;
+            }
             let current = self.connections[index]
                 .read()
                 .ok()
@@ -110,52 +114,85 @@ impl ApiState {
 }
 
 async fn forward(State(shared): State<ApiState>, request: Request) -> Response {
-    if shared.draining.load(Ordering::Acquire) {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [(header::CACHE_CONTROL, "no-store")],
-            Json(serde_json::json!({"message":"Server draining","statusCode":503})),
-        )
-            .into_response();
+    let work = forward_inner(&shared, request);
+    match shared.request_timeout {
+        Some(timeout) => match tokio::time::timeout(timeout, work).await {
+            Ok(response) => response,
+            Err(_) => (
+                StatusCode::GATEWAY_TIMEOUT,
+                [(header::CACHE_CONTROL, "no-store")],
+                Json(serde_json::json!({"message":"Request timed out","statusCode":504})),
+            )
+                .into_response(),
+        },
+        None => work.await,
     }
-    let current = shared.select();
-    match current {
-        Selection::Selected(current, _active) => {
-            let work = current.router.oneshot(request);
-            let response =
-                match shared.request_timeout {
-                    Some(timeout) => match tokio::time::timeout(timeout, work).await {
-                        Ok(response) => response,
-                        Err(_) => return (
-                            StatusCode::GATEWAY_TIMEOUT,
+}
+
+async fn forward_inner(shared: &ApiState, request: Request) -> Response {
+    let mut excluded = 0u16;
+    loop {
+        if shared.draining.load(Ordering::Acquire) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::CACHE_CONTROL, "no-store")],
+                Json(serde_json::json!({"message":"Server draining","statusCode":503})),
+            )
+                .into_response();
+        }
+        match shared.select(excluded) {
+            Selection::Selected(current, active) => {
+                if shared.route_require_writable {
+                    let writable = matches!(tokio::time::timeout(shared.timeout, current.db.query_one(
+                        "SELECT NOT pg_is_in_recovery() AND current_setting('transaction_read_only') = 'off'", &[],
+                    )).await, Ok(Ok(row)) if row.get::<_,bool>(0));
+                    let still_current = shared.connections[active.slot]
+                        .read()
+                        .ok()
+                        .and_then(|guard| {
+                            guard
+                                .as_ref()
+                                .map(|slot| Arc::ptr_eq(&slot.db, &current.db))
+                        })
+                        .unwrap_or(false);
+                    if !writable || !still_current {
+                        excluded |= 1u16 << active.slot;
+                        continue;
+                    }
+                    if shared.draining.load(Ordering::Acquire) {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
                             [(header::CACHE_CONTROL, "no-store")],
-                            Json(
-                                serde_json::json!({"message":"Request timed out","statusCode":504}),
-                            ),
+                            Json(serde_json::json!({"message":"Server draining","statusCode":503})),
                         )
-                            .into_response(),
-                    },
-                    None => work.await,
+                            .into_response();
+                    }
+                }
+                return match current.router.oneshot(request).await {
+                    Ok(response) => response,
+                    Err(never) => match never {},
                 };
-            match response {
-                Ok(response) => response,
-                Err(never) => match never {},
+            }
+            Selection::Busy => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [
+                        (header::CACHE_CONTROL, "no-store"),
+                        (header::RETRY_AFTER, "1"),
+                    ],
+                    Json(serde_json::json!({"message":"Server busy","statusCode":503})),
+                )
+                    .into_response();
+            }
+            Selection::Unavailable => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(header::CACHE_CONTROL, "no-store")],
+                    Json(serde_json::json!({"message":"Database unavailable","statusCode":503})),
+                )
+                    .into_response();
             }
         }
-        Selection::Busy => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [
-                (header::CACHE_CONTROL, "no-store"),
-                (header::RETRY_AFTER, "1"),
-            ],
-            Json(serde_json::json!({"message":"Server busy","statusCode":503})),
-        )
-            .into_response(),
-        Selection::Unavailable => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"message":"Database unavailable","statusCode":503})),
-        )
-            .into_response(),
     }
 }
 
@@ -420,6 +457,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Ok("any") | Err(std::env::VarError::NotPresent) => false,
         _ => return Err("invalid API readiness connection policy".into()),
     };
+    let route_require_writable =
+        match std::env::var("SWALLOW_API_ROUTE_REQUIRE_WRITABLE").as_deref() {
+            Ok("true") => true,
+            Ok("false") | Err(std::env::VarError::NotPresent) => false,
+            _ => return Err("invalid API writable routing setting".into()),
+        };
     let health_endpoints = match std::env::var("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED").as_deref() {
         Ok("true") => true,
         Ok("false") | Err(std::env::VarError::NotPresent) => false,
@@ -441,6 +484,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         ready_require_capacity,
         ready_require_writable,
         ready_require_all,
+        route_require_writable,
         timeout,
         request_timeout,
         draining: Arc::new(AtomicBool::new(false)),
