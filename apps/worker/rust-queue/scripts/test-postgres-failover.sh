@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$(cd ../../.. && pwd)
 scenario=${SWALLOW_FAILOVER_TEST_SCENARIO:-in-app}
-case "$scenario" in in-app|resend|fcm|operator-token) ;; *) echo 'invalid failover test scenario' >&2; exit 2;; esac
+case "$scenario" in in-app|resend|fcm|twilio|operator-token) ;; *) echo 'invalid failover test scenario' >&2; exit 2;; esac
 suffix="$$-$RANDOM"
 network="swallow-ha-net-$suffix"
 primary="swallow-ha-primary-$suffix"
@@ -49,7 +49,11 @@ export TEST_PRIMARY_CONTAINER="$primary" TEST_STANDBY_CONTAINER="$standby"
 export TEST_PRIMARY_URL="postgresql://postgres@127.0.0.1:$primary_port/postgres" TEST_STANDBY_URL="postgresql://postgres@127.0.0.1:$standby_port/postgres"
 export TEST_FAILOVER_URL="postgresql://postgres@127.0.0.1:$standby_port,127.0.0.1:$primary_port/postgres?target_session_attrs=read-write&connect_timeout=2"
 cargo test --locked --test postgres_probe_role -- --ignored
-if [[ "$scenario" == operator-token ]]; then
+if [[ "$scenario" == twilio ]]; then
+  cargo build --locked --bin twilio-worker >/dev/null
+  export TEST_TWILIO_WORKER_BINARY="$(cd "$CARGO_TARGET_DIR" && pwd)/debug/twilio-worker"
+  cargo test --locked --lib twilio_failover_test::synchronous_failover_during_twilio_dispatch_preserves_unknown -- --ignored
+elif [[ "$scenario" == operator-token ]]; then
   cargo test --locked --manifest-path "$root/apps/api/rust-api/Cargo.toml" --test operator_token_failover -- --ignored
 elif [[ "$scenario" == fcm ]]; then
   cargo build --locked --bin fcm-worker >/dev/null
