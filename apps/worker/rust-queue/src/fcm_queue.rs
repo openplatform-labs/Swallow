@@ -1034,7 +1034,8 @@ async fn process_one_inner(
     }
     if (policy != crate::push_step_policy::Policy::Snapshot
         || preference_policy == crate::push_step_policy::PreferencePolicy::Recheck
-        || target_policy == crate::push_step_policy::TargetPolicy::Registered)
+        || target_policy == crate::push_step_policy::TargetPolicy::Registered
+        || unavailable_policy == UnavailablePolicy::Exponential)
         && !lock_live(&tx, &job).await?
     {
         tx.rollback().await?;
@@ -1052,6 +1053,10 @@ async fn process_one_inner(
         }
         tx.commit().await?;
         return Ok(true);
+    }
+    if unavailable_policy == UnavailablePolicy::Exponential {
+        let fence = format!("{}:{}", job.id, job.lease_token);
+        tx.query_one("SELECT set_config('swallow.fcm_exponential_fence',$1,true)", &[&fence]).await?;
     }
     tx.execute("INSERT INTO novu_rust_fcm_attempts(job_id,environment_id,target_index,state) VALUES ($1,$2,$3,'dispatching')",&[&job.id,&environment,&index_i32]).await?;
     if prepared_context.is_some() {
@@ -2181,6 +2186,32 @@ mod tests {
             "push preference context missing"
         );
     }
+    #[tokio::test]
+    #[ignore = "requires fully migrated disposable PostgreSQL and loopback"]
+    async fn exponential_policy_fences_legacy_attempts_before_dispatch() {
+        let url=std::env::var("TEST_DATABASE_URL").unwrap();
+        let (mut db,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();
+        tokio::spawn(async move { let _=driver.await; });
+        db.execute("INSERT INTO public.novu_rust_environments VALUES ('fcm-exp-fence','org')", &[]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_push_workflow_worker_config(environment_id,multicast_503_policy) VALUES('fcm-exp-fence','exponential')", &[]).await.unwrap();
+        let job=Uuid::new_v4();
+        crate::enqueue(&db,job,"fcm-exp-fence",JOB_KIND,&json!({"title":"Hi","content":"Hello","targets":["a","b"]})).await.unwrap();
+        db.execute("UPDATE public.novu_queue_jobs SET status='running',lease_token=$2,lease_until=clock_timestamp()+interval '60 seconds' WHERE id=$1", &[&job,&Uuid::new_v4()]).await.unwrap();
+        db.batch_execute("CREATE ROLE fcm_legacy_fixture NOLOGIN; GRANT USAGE ON SCHEMA public TO fcm_legacy_fixture; GRANT INSERT ON public.novu_rust_fcm_attempts TO fcm_legacy_fixture; SET ROLE fcm_legacy_fixture").await.unwrap();
+        let failure=db.execute("INSERT INTO public.novu_rust_fcm_attempts(job_id,environment_id,target_index,state) VALUES($1,'fcm-exp-fence',0,'dispatching')", &[&job]).await.unwrap_err();
+        assert_eq!(failure.code().map(|v|v.code()),Some("55000"));
+        db.batch_execute("RESET ROLE").await.unwrap();
+        assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_fcm_attempts WHERE job_id=$1", &[&job]).await.unwrap().get::<_,i64>(0),0);
+        db.execute("UPDATE public.novu_queue_jobs SET status='pending',lease_token=NULL,lease_until=NULL WHERE id=$1", &[&job]).await.unwrap();
+        let (provider,server)=mock_with_headers(vec![503,200], "").await;
+        assert!(process_one_with_unavailable_policy(&mut db,"fcm-exp-fence",Some(&provider),None,false,crate::push_step_policy::Policy::Snapshot,crate::push_step_policy::PreferencePolicy::Snapshot,crate::push_step_policy::TargetPolicy::Reference,RateLimitPolicy::Continue,UnavailablePolicy::Exponential,false).await.unwrap());
+        let row=db.query_one("SELECT state,http_status FROM public.novu_rust_fcm_attempts WHERE job_id=$1 AND target_index=0", &[&job]).await.unwrap();
+        assert_eq!(row.get::<_,String>(0),"unknown");assert_eq!(row.get::<_,Option<i32>>(1),Some(503));
+        db.execute("UPDATE public.novu_queue_jobs SET available_at=clock_timestamp()-interval '1 second' WHERE id=$1", &[&job]).await.unwrap();
+        assert!(process_one_with_unavailable_policy(&mut db,"fcm-exp-fence",Some(&provider),None,false,crate::push_step_policy::Policy::Snapshot,crate::push_step_policy::PreferencePolicy::Snapshot,crate::push_step_policy::TargetPolicy::Reference,RateLimitPolicy::Continue,UnavailablePolicy::Exponential,false).await.unwrap());
+        assert_eq!(server.await.unwrap(),["a","b"]);
+    }
+
     #[tokio::test]
     #[ignore = "requires disposable PostgreSQL and loopback access"]
     async fn multicast_attempts_recovery_and_tenant_isolation() {

@@ -19,3 +19,9 @@ export DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/postgres" TEST_DATABASE
 "$TEST_PG_BIN/createdb" -h 127.0.0.1 -p "$PORT" -U postgres guard_test
 TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/queue_test" cargo test --locked --manifest-path "$WORKER/Cargo.toml" --lib multicast_attempts_recovery_and_tenant_isolation -- --ignored
 TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/guard_test" cargo test --locked --manifest-path "$WORKER/Cargo.toml" --test fcm_routing_guard -- --ignored
+"$TEST_PG_BIN/createdb" -h 127.0.0.1 -p "$PORT" -U postgres fence_test
+export DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/fence_test" TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/fence_test"
+cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply api "$API/migrations" --through 17
+cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply worker "$WORKER/migrations"
+cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply api "$API/migrations"
+cargo test --locked --manifest-path "$WORKER/Cargo.toml" --lib exponential_policy_fences_legacy_attempts_before_dispatch -- --ignored
