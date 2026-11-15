@@ -39,6 +39,7 @@ pub fn request_body(config: &Config, email: &Email) -> Result<Value, SendError> 
         || email.to.len() > 50
         || email.to.iter().any(String::is_empty)
         || email.cc.iter().chain(&email.bcc).any(String::is_empty)
+        || email.to.len().saturating_add(email.cc.len()).saturating_add(email.bcc.len()) > 1000
         || email.attachments.len() > 100
         || !email.alternatives.is_empty()
         || !email.custom_data.is_empty()
@@ -296,6 +297,8 @@ mod tests {
             request_body(&config(), &email),
             Err(SendError::InvalidMessage)
         );
+        email.to=vec!["x".into()];email.cc=vec!["cc".into();1000];
+        assert_eq!(request_body(&config(),&email),Err(SendError::InvalidMessage));
     }
     #[test]
     fn attachments_and_headers_are_encoded() {

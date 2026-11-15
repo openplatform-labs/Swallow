@@ -715,7 +715,14 @@ async fn process_claimed(
     }
     if email_provider == "resend" {
         let mut passthrough = serde_json::Map::new();
+        let mut known_recipients = serde_json::Map::new();
         for layer in [provider_layer,step_layer].into_iter().flatten() {
+            for key in ["to","cc","bcc"] {
+                if let Some(value)=layer.get(key) {
+                    if value.as_array().is_none_or(|items| items.iter().any(|v|v.as_str().is_none_or(str::is_empty))) {return Err(InvalidJob("invalid Resend recipients").into());}
+                    known_recipients.insert(key.into(),value.clone());
+                }
+            }
             if let Some(value)=layer.get("_passthrough") {
                 let object=value.as_object().ok_or(InvalidJob("invalid Resend passthrough"))?;
                 let body=object.get("body").and_then(serde_json::Value::as_object).ok_or(InvalidJob("invalid Resend passthrough"))?;
@@ -723,12 +730,14 @@ async fn process_claimed(
                     "subject"|"html"|"text" => !v.is_string(),
                     "from" => v.as_str().is_none_or(|s|s.is_empty()||s.contains(['\r','\n'])),
                     "replyTo" => v.as_str().is_none_or(|s|s.contains(['\r','\n'])),
+                    "to"|"cc"|"bcc" => v.as_array().is_none_or(|items| items.len()>50 || items.iter().any(|v|v.as_str().is_none_or(|s|s.is_empty()||s.contains(['\r','\n'])))),
                     _=>true,
                 }) {return Err(InvalidJob("invalid Resend passthrough").into());}
                 passthrough.extend(body.clone());
             }
         }
         if !passthrough.is_empty() {merged_email_override.insert("__resend_passthrough".into(),serde_json::Value::Object(passthrough));}
+        if !known_recipients.is_empty() {merged_email_override.insert("__resend_known_recipients".into(),serde_json::Value::Object(known_recipients));}
     }
     let email_override = Some(&merged_email_override);
     let severity = severity_override

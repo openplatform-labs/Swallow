@@ -4059,6 +4059,7 @@ async fn trigger_inner(db:Arc<Client>,environment_id:String,auth:TriggerAuth,rej
                             "subject" | "html" | "text" => value.is_string(),
                             "from" => value.as_str().is_some_and(|v| !v.is_empty() && !v.contains(['\r','\n'])),
                             "replyTo" => value.as_str().is_some_and(|v| !v.contains(['\r','\n'])),
+                            "to" | "cc" | "bcc" => value.as_array().is_some_and(|items| items.len()<=50 && items.iter().all(|v| v.as_str().is_some_and(|s| !s.is_empty() && !s.contains(['\r','\n'])))),
                             _ => false,
                         })))
                     } else {

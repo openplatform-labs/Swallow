@@ -257,12 +257,26 @@ pub(crate) async fn prepare_workflow_email(
             .or_else(|| option("text"))
             .unwrap_or(&html)
             .to_owned();
+        if let Some(value)=context.overrides.get("__resend_known_recipients") {
+            let fields=value.as_object();
+            if fields.is_none_or(|fields| fields.iter().any(|(key,value)| !["to","cc","bcc"].contains(&key.as_str()) || value.as_array().is_none_or(|items| items.iter().any(|v|v.as_str().is_none_or(str::is_empty))))) {
+                tx.execute("UPDATE novu_rust_email_messages SET status='error',error_id='mail_unexpected_error',error_text='invalid Resend recipients' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
+                tx.execute("UPDATE novu_rust_email_step_outcomes SET status='failed',email_job_id=NULL WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
+                tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='invalid Resend recipients',lease_token=NULL,lease_until=NULL WHERE id=$1", &[&job.id]).await?;
+                return Ok(false);
+            }
+            let fields=fields.expect("validated object");
+            for (key,target) in [("to",&mut email.to),("cc",&mut email.cc),("bcc",&mut email.bcc)] {
+                if let Some(items)=fields.get(key).and_then(serde_json::Value::as_array) {target.extend(items.iter().map(|v|v.as_str().expect("validated recipient").to_owned()));}
+            }
+        }
         if let Some(value)=context.overrides.get("__resend_passthrough") {
             let fields=value.as_object();
             if fields.is_none_or(|fields| fields.iter().any(|(key,value)| match key.as_str() {
                 "subject"|"html"|"text" => !value.is_string(),
                 "from" => value.as_str().is_none_or(|s|s.is_empty()||s.contains(['\r','\n'])),
                 "replyTo" => value.as_str().is_none_or(|s|s.contains(['\r','\n'])),
+                "to"|"cc"|"bcc" => value.as_array().is_none_or(|items|items.len()>50 || items.iter().any(|v|v.as_str().is_none_or(|s|s.is_empty()||s.contains(['\r','\n'])))),
                 _=>true,
             })) {
                 tx.execute("UPDATE novu_rust_email_messages SET status='error',error_id='mail_unexpected_error',error_text='invalid Resend passthrough' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
@@ -276,6 +290,9 @@ pub(crate) async fn prepare_workflow_email(
             if let Some(value)=fields.get("text").and_then(serde_json::Value::as_str) {email.text=Some(value.to_owned());}
             if let Some(value)=fields.get("from").and_then(serde_json::Value::as_str) {email.from=Some(value.to_owned());email.provider_from_without_name=true;}
             if let Some(value)=fields.get("replyTo").and_then(serde_json::Value::as_str) {email.reply_to=Some(value.to_owned());}
+            for (key,target) in [("to",&mut email.to),("cc",&mut email.cc),("bcc",&mut email.bcc)] {
+                if let Some(items)=fields.get(key).and_then(serde_json::Value::as_array) {target.extend(items.iter().map(|v|v.as_str().expect("validated recipient").to_owned()));}
+            }
         }
         tx.execute("UPDATE novu_rust_email_messages SET email=$3 WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id,&address]).await?;
     }
