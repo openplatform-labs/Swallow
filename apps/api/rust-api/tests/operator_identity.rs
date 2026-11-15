@@ -110,6 +110,7 @@ async fn verifies_token_mapping_scope_revocation_and_expiry() {
         StatusCode::OK
     );
     let revocation_config = json!({"issuer":"https://issuer.test","audience":"swallow","keys":[{"kid":"key","pem":std::str::from_utf8(PUBLIC).unwrap()}],"check_token_revocation":true});
+    db.batch_execute("CREATE ROLE jwt_token_guard_owner NOLOGIN; GRANT USAGE ON SCHEMA public TO jwt_token_guard_owner; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_token_revoked(bytea,bytea,bytea,bytea) TO jwt_token_guard_owner; ALTER FUNCTION public.novu_rust_operator_token_guard(bytea,bytea,bytea,bytea) OWNER TO jwt_token_guard_owner").await.unwrap();
     let guarded = novu_rust_api::router(Arc::new(connect(&actor_url).await)).layer(Extension(
         Arc::new(AccessTokenVerifier::from_json(&revocation_config.to_string()).unwrap()),
     ));
@@ -122,7 +123,14 @@ async fn verifies_token_mapping_scope_revocation_and_expiry() {
             .status(),
         StatusCode::SERVICE_UNAVAILABLE
     );
-    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_token_revoked(bytea,bytea,bytea,bytea) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_token_revoked(bytea,bytea,bytea,bytea),public.novu_rust_operator_token_guard(bytea,bytea,bytea,bytea) TO {role}")).await.unwrap();
+    let isolated = connect(&actor_url).await;
+    isolated
+        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .unwrap();
+    assert!(isolated.query_one("SELECT public.novu_rust_operator_token_guard(sha256('a'::bytea),sha256('b'::bytea),sha256('c'::bytea),sha256('d'::bytea))",&[]).await.is_err());
+    isolated.batch_execute("ROLLBACK").await.unwrap();
     assert_eq!(
         guarded
             .clone()
@@ -210,6 +218,36 @@ async fn verifies_token_mapping_scope_revocation_and_expiry() {
     assert_eq!(audits.len(), 1);
     assert_eq!(audits[0].get::<_, String>(0), "jwt_revoke_admin");
     assert_eq!(audits[0].get::<_, String>(1), "fixture");
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_subscriber_create(text,text,text,text,bigint,uuid,text,jsonb,text) TO {role}; INSERT INTO public.novu_rust_operator_jwt_subscriber_create_grants VALUES ('https://issuer.test','user-1','console','jwt-a')")).await.unwrap();
+    let write_token = token_with_id("user-1", "console", now + 120, "write-fixture");
+    let write_request = |subscriber: &str| {
+        Request::builder().method("POST").uri("/v1/experimental/operator/subscriber-create?environmentId=jwt-a").header(header::AUTHORIZATION,format!("Bearer {write_token}")).header(header::CONTENT_TYPE,"application/json").body(Body::from(json!({"requestId":Uuid::new_v4(),"subscriberId":subscriber,"profile":{},"reason":"fixture"}).to_string())).unwrap()
+    };
+    assert_eq!(
+        guarded
+            .clone()
+            .oneshot(write_request("guarded-create"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert!(
+        admin
+            .query_one(revoke_sql, &[&"write-fixture", &"fixture"])
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
+    assert_eq!(
+        guarded
+            .clone()
+            .oneshot(write_request("blocked-create"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
     let second_admin =
         connect(&url.replacen("postgres://postgres@", "postgres://jwt_revoke_admin@", 1)).await;
     let (a, b) = tokio::join!(
@@ -229,7 +267,7 @@ async fn verifies_token_mapping_scope_revocation_and_expiry() {
         .await
         .unwrap()
         .get::<_, i64>(0);
-    assert_eq!(audit_count, 2);
+    assert_eq!(audit_count, 3);
     #[cfg(unix)]
     {
         use std::io::Write;
@@ -345,11 +383,70 @@ async fn verifies_token_mapping_scope_revocation_and_expiry() {
                 .as_array()
                 .unwrap()
                 .len(),
-            3
+            4
         );
         assert!(!String::from_utf8_lossy(&audit.stdout).contains("cli-fixture"));
         std::fs::remove_file(path).unwrap();
     }
+    // Operation-first ordering: hold the identity row so the already guarded
+    // request is in progress, then verify revocation waits for that request.
+    let mut identity_blocker = connect(&url).await;
+    let identity_tx = identity_blocker.transaction().await.unwrap();
+    identity_tx.query_one("SELECT 1 FROM public.novu_rust_operator_jwt_identities WHERE environment_id='jwt-a' AND subject='user-1' FOR UPDATE",&[]).await.unwrap();
+    let first_token = token_with_id("user-1", "console", now + 120, "operation-first");
+    let ongoing = tokio::spawn({
+        let app = guarded.clone();
+        let token = first_token.clone();
+        async move {
+            app.oneshot(request(&token, "environmentId=jwt-a"))
+                .await
+                .unwrap()
+                .status()
+        }
+    });
+    let mut operation_locked = false;
+    for _ in 0..100 {
+        operation_locked=db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity a JOIN pg_locks l ON l.pid=a.pid WHERE a.query LIKE 'WITH swallow_token_gate%' AND a.wait_event_type='Lock' AND l.locktype='advisory' AND l.granted)",&[]).await.unwrap().get(0);
+        if operation_locked {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        operation_locked,
+        "guarded request must hold its token lock before identity access"
+    );
+    let revoker =
+        connect(&url.replacen("postgres://postgres@", "postgres://jwt_revoke_admin@", 1)).await;
+    let revoke_after = tokio::spawn(async move {
+        revoker
+            .query_one(revoke_sql, &[&"operation-first", &"fixture"])
+            .await
+    });
+    let mut revoke_waiting = false;
+    for _ in 0..100 {
+        revoke_waiting=db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity a JOIN pg_locks l ON l.pid=a.pid WHERE a.query LIKE 'SELECT public.novu_rust_admin_revoke_operator_token%' AND l.locktype='advisory' AND NOT l.granted)",&[]).await.unwrap().get(0);
+        if revoke_waiting {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        revoke_waiting,
+        "revocation must wait for the in-flight operation"
+    );
+    identity_tx.commit().await.unwrap();
+    assert_eq!(ongoing.await.unwrap(), StatusCode::OK);
+    assert!(revoke_after.await.unwrap().unwrap().get::<_, bool>(0));
+    assert_eq!(
+        guarded
+            .clone()
+            .oneshot(request(&first_token, "environmentId=jwt-a"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
     let mut locking_admin =
         connect(&url.replacen("postgres://postgres@", "postgres://jwt_revoke_admin@", 1)).await;
     let tx = locking_admin.transaction().await.unwrap();
@@ -368,14 +465,27 @@ async fn verifies_token_mapping_scope_revocation_and_expiry() {
             .get::<_, bool>(0)
     );
     let concurrent_token = token_with_id("user-1", "console", now + 120, "lock-test");
-    assert_eq!(
-        guarded
-            .clone()
-            .oneshot(request(&concurrent_token, "environmentId=jwt-a"))
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::OK
+    let pending_request = tokio::spawn({
+        let app = guarded.clone();
+        let token = concurrent_token.clone();
+        async move {
+            app.oneshot(request(&token, "environmentId=jwt-a"))
+                .await
+                .unwrap()
+                .status()
+        }
+    });
+    let mut guard_waiting = false;
+    for _ in 0..100 {
+        guard_waiting=db.query_one("SELECT EXISTS(SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid=l.pid WHERE l.locktype='advisory' AND NOT l.granted AND a.query LIKE 'WITH swallow_token_gate%')",&[]).await.unwrap().get(0);
+        if guard_waiting {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        guard_waiting,
+        "request must wait for the pending revocation"
     );
     let grant_db = connect(&url).await;
     let permission_change = tokio::spawn(async move {
@@ -395,6 +505,7 @@ async fn verifies_token_mapping_scope_revocation_and_expiry() {
     );
     tx.commit().await.unwrap();
     assert_eq!(permission_change.await.unwrap().unwrap(), 1);
+    assert_eq!(pending_request.await.unwrap(), StatusCode::UNAUTHORIZED);
     assert!(
         reader
             .query_one(inspect_sql, &[])

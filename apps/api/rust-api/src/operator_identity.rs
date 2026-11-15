@@ -41,11 +41,22 @@ enum Lookup {
     SubscriberActivityAudit,
 }
 
+struct Authenticated {
+    identity: VerifiedSubject,
+    revocation_guard: bool,
+}
+impl std::ops::Deref for Authenticated {
+    type Target = VerifiedSubject;
+    fn deref(&self) -> &Self::Target {
+        &self.identity
+    }
+}
+
 async fn authenticate(
     db: &Client,
     headers: &HeaderMap,
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
-) -> Result<VerifiedSubject, StatusCode> {
+) -> Result<Authenticated, StatusCode> {
     let Some(Extension(verifier)) = verifier else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
@@ -82,7 +93,48 @@ async fn authenticate(
             return Err(StatusCode::UNAUTHORIZED);
         }
     }
-    Ok(identity)
+    Ok(Authenticated {
+        identity,
+        revocation_guard: verifier.checks_token_revocation(),
+    })
+}
+
+// All operator SQL here is a single SELECT of one security-definer function.
+// The materialized guard is evaluated in the same transaction as that call.
+async fn guarded_query(
+    db: &Client,
+    identity: &Authenticated,
+    sql: &str,
+    params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+) -> Result<tokio_postgres::Row, tokio_postgres::Error> {
+    if !identity.revocation_guard {
+        return db.query_one(sql, params).await;
+    }
+    let hash = |s: &str| ring::digest::digest(&ring::digest::SHA256, s.as_bytes());
+    let issuer = hash(&identity.issuer);
+    let subject = hash(&identity.subject);
+    let client = hash(&identity.client_id);
+    let id = hash(&identity.token_id);
+    let issuer_bytes = issuer.as_ref();
+    let subject_bytes = subject.as_ref();
+    let client_bytes = client.as_ref();
+    let id_bytes = id.as_ref();
+    let mut bound: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params.to_vec();
+    bound.extend([
+        &issuer_bytes as &(dyn tokio_postgres::types::ToSql + Sync),
+        &subject_bytes,
+        &client_bytes,
+        &id_bytes,
+    ]);
+    let n = params.len();
+    let statement = format!(
+        "WITH swallow_token_gate AS MATERIALIZED (SELECT public.novu_rust_operator_token_guard(${},${},${},${}) AS allowed) {sql} FROM swallow_token_gate WHERE allowed",
+        n + 1,
+        n + 2,
+        n + 3,
+        n + 4
+    );
+    db.query_one(&statement, &bound).await
 }
 
 fn failure(status: StatusCode, path: &str) -> Response {
@@ -307,7 +359,7 @@ pub(super) async fn subscriber_grant_change(
         return failure(StatusCode::BAD_REQUEST, uri.path());
     }
     let env = params[0].1.as_ref();
-    match db.query_one("SELECT public.novu_rust_operator_jwt_subscriber_grant_change($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&input.target_issuer,&input.target_subject,&input.target_client_id,&input.permission,&input.expected,&input.desired,&input.reason]).await {
+    match guarded_query(&db, &identity, "SELECT public.novu_rust_operator_jwt_subscriber_grant_change($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&input.target_issuer,&input.target_subject,&input.target_client_id,&input.permission,&input.expected,&input.desired,&input.reason]).await {
         Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
         Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
         Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
@@ -375,12 +427,40 @@ pub(super) async fn subscriber_delete(
         return failure(StatusCode::BAD_REQUEST, uri.path());
     }
     let env = params[0].1.as_ref();
-    match db.query_one("SELECT public.novu_rust_operator_jwt_subscriber_delete($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&input.subscriber_id,&generation,&revision,&input.reason]).await {
-        Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
-        Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
-        Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
-        Err(e) if e.code().is_some_and(|c|c.code()=="P4090")=>failure(StatusCode::CONFLICT,uri.path()),
-        Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path()),
+    match guarded_query(
+        &db,
+        &identity,
+        "SELECT public.novu_rust_operator_jwt_subscriber_delete($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+        &[
+            &identity.issuer,
+            &identity.subject,
+            &identity.client_id,
+            &env,
+            &exp,
+            &request,
+            &input.subscriber_id,
+            &generation,
+            &revision,
+            &input.reason,
+        ],
+    )
+    .await
+    {
+        Ok(row) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(row.get::<_, serde_json::Value>(0)),
+        )
+            .into_response(),
+        Err(e) if e.code().is_some_and(|c| c.code() == "42501") => {
+            failure(StatusCode::UNAUTHORIZED, uri.path())
+        }
+        Err(e) if e.code().is_some_and(|c| c.code() == "22023") => {
+            failure(StatusCode::BAD_REQUEST, uri.path())
+        }
+        Err(e) if e.code().is_some_and(|c| c.code() == "P4090") => {
+            failure(StatusCode::CONFLICT, uri.path())
+        }
+        Err(_) => failure(StatusCode::INTERNAL_SERVER_ERROR, uri.path()),
     }
 }
 
@@ -450,22 +530,23 @@ pub(super) async fn subscriber_create(
         return failure(StatusCode::BAD_REQUEST, uri.path());
     }
     let env = params[0].1.as_ref();
-    match db
-        .query_one(
-            "SELECT public.novu_rust_operator_jwt_subscriber_create($1,$2,$3,$4,$5,$6,$7,$8,$9)",
-            &[
-                &identity.issuer,
-                &identity.subject,
-                &identity.client_id,
-                &env,
-                &exp,
-                &request,
-                &input.subscriber_id,
-                &input.profile,
-                &input.reason,
-            ],
-        )
-        .await
+    match guarded_query(
+        &db,
+        &identity,
+        "SELECT public.novu_rust_operator_jwt_subscriber_create($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+        &[
+            &identity.issuer,
+            &identity.subject,
+            &identity.client_id,
+            &env,
+            &exp,
+            &request,
+            &input.subscriber_id,
+            &input.profile,
+            &input.reason,
+        ],
+    )
+    .await
     {
         Ok(row) => (
             [(header::CACHE_CONTROL, "no-store")],
@@ -577,9 +658,9 @@ pub(super) async fn subscriber_profile_write(
         _ => return failure(StatusCode::BAD_REQUEST, uri.path()),
     };
     let result = if let Some(request) = request {
-        db.query_one("SELECT public.novu_rust_operator_jwt_subscriber_profile_write_v2($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&input.subscriber_id,&generation,&revision,&input.profile,&input.reason]).await
+        guarded_query(&db, &identity, "SELECT public.novu_rust_operator_jwt_subscriber_profile_write_v2($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&input.subscriber_id,&generation,&revision,&input.profile,&input.reason]).await
     } else {
-        db.query_one("SELECT public.novu_rust_operator_jwt_subscriber_profile_write($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&input.subscriber_id,&generation,&revision,&input.profile,&input.reason]).await
+        guarded_query(&db, &identity, "SELECT public.novu_rust_operator_jwt_subscriber_profile_write($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&input.subscriber_id,&generation,&revision,&input.profile,&input.reason]).await
     };
     match result {
         Ok(row) => (
@@ -669,7 +750,7 @@ pub(super) async fn workflow_grant_change(
         return failure(StatusCode::BAD_REQUEST, uri.path());
     };
     let env = params[0].1.as_ref();
-    match db.query_one("SELECT public.novu_rust_operator_jwt_workflow_grant_change($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&input.target_issuer,&input.target_subject,&input.target_client_id,&input.resource,&input.permission,&input.expected,&input.desired,&input.reason]).await{
+    match guarded_query(&db, &identity, "SELECT public.novu_rust_operator_jwt_workflow_grant_change($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&input.target_issuer,&input.target_subject,&input.target_client_id,&input.resource,&input.permission,&input.expected,&input.desired,&input.reason]).await{
         Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
         Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
         Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
@@ -751,7 +832,7 @@ pub(super) async fn workflow_write_v2(
         return failure(StatusCode::BAD_REQUEST, uri.path());
     };
     let env = params[0].1.as_ref();
-    match db.query_one("SELECT public.novu_rust_operator_jwt_workflow_write_v2($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&input.workflow,&input.resource,&input.expected,&input.desired,&input.reason]).await {
+    match guarded_query(&db, &identity, "SELECT public.novu_rust_operator_jwt_workflow_write_v2($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&input.workflow,&input.resource,&input.expected,&input.desired,&input.reason]).await {
         Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
         Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
         Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
@@ -798,23 +879,24 @@ pub(super) async fn workflow_write(
         return failure(StatusCode::UNAUTHORIZED, uri.path());
     };
     let env = params[0].1.as_ref();
-    match db
-        .query_one(
-            "SELECT public.novu_rust_operator_jwt_workflow_write($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
-            &[
-                &identity.issuer,
-                &identity.subject,
-                &identity.client_id,
-                &env,
-                &exp,
-                &input.workflow,
-                &input.resource,
-                &input.expected,
-                &input.desired,
-                &input.reason,
-            ],
-        )
-        .await
+    match guarded_query(
+        &db,
+        &identity,
+        "SELECT public.novu_rust_operator_jwt_workflow_write($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+        &[
+            &identity.issuer,
+            &identity.subject,
+            &identity.client_id,
+            &env,
+            &exp,
+            &input.workflow,
+            &input.resource,
+            &input.expected,
+            &input.desired,
+            &input.reason,
+        ],
+    )
+    .await
     {
         Ok(row) => (
             [(header::CACHE_CONTROL, "no-store")],
@@ -930,7 +1012,7 @@ async fn query(
                 },
                 None => None,
             };
-            db.query_one("SELECT public.novu_rust_operator_jwt_subscriber_activity_read($1,$2,$3,$4,$5,$6,$7)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&kind,&after]).await
+            guarded_query(&db, &identity, "SELECT public.novu_rust_operator_jwt_subscriber_activity_read($1,$2,$3,$4,$5,$6,$7)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&kind,&after]).await
         }
         Lookup::SubscriberGrantAudit => {
             let after = match params.get("after") {
@@ -942,7 +1024,7 @@ async fn query(
                 },
                 None => None,
             };
-            db.query_one("SELECT public.novu_rust_operator_jwt_subscriber_grant_audit_read($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&after]).await
+            guarded_query(&db, &identity, "SELECT public.novu_rust_operator_jwt_subscriber_grant_audit_read($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&after]).await
         }
         Lookup::SubscriberGrantRequest => {
             let Some(request) = params
@@ -951,7 +1033,9 @@ async fn query(
             else {
                 return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
             };
-            db.query_one(
+            guarded_query(
+                &db,
+                &identity,
                 "SELECT public.novu_rust_operator_jwt_subscriber_grant_request($1,$2,$3,$4,$5,$6)",
                 &[
                     &identity.issuer,
@@ -979,7 +1063,7 @@ async fn query(
             {
                 return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
             }
-            db.query_one("SELECT public.novu_rust_operator_jwt_subscriber_grant_read($1,$2,$3,$4,$5,$6,$7,$8,$9)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&issuer,&subject,&client,&permission]).await
+            guarded_query(&db, &identity, "SELECT public.novu_rust_operator_jwt_subscriber_grant_read($1,$2,$3,$4,$5,$6,$7,$8,$9)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&issuer,&subject,&client,&permission]).await
         }
         Lookup::SubscriberDeleteRequest => {
             let Some(request) = params
@@ -988,7 +1072,7 @@ async fn query(
             else {
                 return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
             };
-            db.query_one("SELECT public.novu_rust_operator_jwt_subscriber_delete_request_read($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request]).await
+            guarded_query(&db, &identity, "SELECT public.novu_rust_operator_jwt_subscriber_delete_request_read($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request]).await
         }
         Lookup::SubscriberCreateRequest => {
             let Some(request) = params
@@ -997,7 +1081,7 @@ async fn query(
             else {
                 return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
             };
-            db.query_one("SELECT public.novu_rust_operator_jwt_subscriber_create_request_read($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request]).await
+            guarded_query(&db, &identity, "SELECT public.novu_rust_operator_jwt_subscriber_create_request_read($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request]).await
         }
         Lookup::SubscriberProfileRequest => {
             let Some(request) = params
@@ -1006,13 +1090,15 @@ async fn query(
             else {
                 return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
             };
-            db.query_one("SELECT public.novu_rust_operator_jwt_subscriber_profile_request_read($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request]).await
+            guarded_query(&db, &identity, "SELECT public.novu_rust_operator_jwt_subscriber_profile_request_read($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request]).await
         }
         Lookup::SubscriberProfileRead => {
             let Some(subscriber) = params.get("subscriberId").filter(|s| !s.contains('\0')) else {
                 return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
             };
-            db.query_one(
+            guarded_query(
+                &db,
+                &identity,
                 "SELECT public.novu_rust_operator_jwt_subscriber_profile_read($1,$2,$3,$4,$5,$6)",
                 &[
                     &identity.issuer,
@@ -1035,7 +1121,9 @@ async fn query(
                 },
                 None => None,
             };
-            db.query_one(
+            guarded_query(
+                &db,
+                &identity,
                 "SELECT public.novu_rust_operator_jwt_workflow_grant_audit_read($1,$2,$3,$4,$5,$6)",
                 &[
                     &identity.issuer,
@@ -1064,7 +1152,7 @@ async fn query(
             {
                 return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
             }
-            db.query_one("SELECT public.novu_rust_operator_jwt_workflow_grant_read($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&issuer,&subject,&client,&resource,&permission]).await
+            guarded_query(&db, &identity, "SELECT public.novu_rust_operator_jwt_workflow_grant_read($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&issuer,&subject,&client,&resource,&permission]).await
         }
         Lookup::WorkflowGrantRequest => {
             let Some(request) = params
@@ -1073,7 +1161,9 @@ async fn query(
             else {
                 return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
             };
-            db.query_one(
+            guarded_query(
+                &db,
+                &identity,
                 "SELECT public.novu_rust_operator_jwt_workflow_grant_request($1,$2,$3,$4,$5,$6)",
                 &[
                     &identity.issuer,
@@ -1098,7 +1188,9 @@ async fn query(
             else {
                 return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
             };
-            db.query_one(
+            guarded_query(
+                &db,
+                &identity,
                 "SELECT public.novu_rust_operator_jwt_workflow_request_read($1,$2,$3,$4,$5,$6,$7)",
                 &[
                     &identity.issuer,
@@ -1133,7 +1225,9 @@ async fn query(
                     }
                 },
             };
-            db.query_one(
+            guarded_query(
+                &db,
+                &identity,
                 "SELECT public.novu_rust_operator_jwt_workflow_audit_read($1,$2,$3,$4,$5,$6,$7,$8)",
                 &[
                     &identity.issuer,
@@ -1160,7 +1254,9 @@ async fn query(
             {
                 return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
             }
-            db.query_one(
+            guarded_query(
+                &db,
+                &identity,
                 "SELECT public.novu_rust_operator_jwt_workflow_read($1,$2,$3,$4,$5,$6,$7)",
                 &[
                     &identity.issuer,
@@ -1184,7 +1280,9 @@ async fn query(
                     }
                 },
             };
-            db.query_one(
+            guarded_query(
+                &db,
+                &identity,
                 "SELECT public.novu_rust_operator_jwt_resend_jobs($1,$2,$3,$4,$5,$6)",
                 &[
                     &identity.issuer,
@@ -1201,7 +1299,9 @@ async fn query(
             let Some(job) = params.get("jobId").and_then(|id| Uuid::parse_str(id).ok()) else {
                 return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
             };
-            db.query_one(
+            guarded_query(
+                &db,
+                &identity,
                 "SELECT public.novu_rust_operator_jwt_resend_result($1,$2,$3,$4,$5,$6)",
                 &[
                     &identity.issuer,
@@ -1221,7 +1321,9 @@ async fn query(
             else {
                 return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
             };
-            db.query_one(
+            guarded_query(
+                &db,
+                &identity,
                 "SELECT public.novu_rust_operator_jwt_permission_change_request($1,$2,$3,$4,$5,$6)",
                 &[
                     &identity.issuer,
@@ -1242,7 +1344,9 @@ async fn query(
             ) else {
                 return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
             };
-            db.query_one(
+            guarded_query(
+                &db,
+                &identity,
                 "SELECT public.novu_rust_operator_jwt_review_identity($1,$2,$3,$4,$5,$6,$7,$8)",
                 &[
                     &identity.issuer,
@@ -1265,7 +1369,9 @@ async fn query(
                     _ => return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request"),
                 },
             };
-            db.query_one(
+            guarded_query(
+                &db,
+                &identity,
                 "SELECT public.novu_rust_operator_jwt_review_audit($1,$2,$3,$4,$5,$6)",
                 &[
                     &identity.issuer,
@@ -1282,7 +1388,9 @@ async fn query(
             let name = params.get("name").filter(|value| !value.is_empty());
             let after = params.get("after");
             let before = params.get("before");
-            db.query_one(
+            guarded_query(
+                &db,
+                &identity,
                 "SELECT public.novu_rust_operator_jwt_subscribers($1,$2,$3,$4,$5,$6,$7,$8)",
                 &[
                     &identity.issuer,
@@ -1300,7 +1408,9 @@ async fn query(
         Lookup::Alerts => {
             let channel = params.get("afterChannel");
             let target = params.get("afterTarget");
-            db.query_one(
+            guarded_query(
+                &db,
+                &identity,
                 "SELECT public.novu_rust_operator_jwt_alerts($1,$2,$3,$4,$5,$6,$7)",
                 &[
                     &identity.issuer,
@@ -1321,7 +1431,9 @@ async fn query(
             else {
                 return self::failure(StatusCode::BAD_REQUEST, uri.path());
             };
-            db.query_one(
+            guarded_query(
+                &db,
+                &identity,
                 "SELECT public.novu_rust_operator_jwt_decision_request($1,$2,$3,$4,$5,$6)",
                 &[
                     &identity.issuer,
@@ -1335,7 +1447,9 @@ async fn query(
             .await
         }
         Lookup::Identity => {
-            db.query_one(
+            guarded_query(
+                &db,
+                &identity,
                 "SELECT public.novu_rust_operator_jwt_self($1,$2,$3,$4,$5)",
                 &[
                     &identity.issuer,
@@ -1412,11 +1526,38 @@ pub(super) async fn resolve(
         return failure(StatusCode::BAD_REQUEST, uri.path());
     };
     let env = params[0].1.as_ref();
-    match db.query_one("SELECT public.novu_rust_operator_jwt_resolve_alert($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)", &[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&input.channel,&input.target_id,&attempt,&input.decision,&input.reason]).await {
-        Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"recorded":true,"replayed":row.get::<_,bool>(0)}))).into_response(),
-        Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
-        Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
-        Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path()),
+    match guarded_query(
+        &db,
+        &identity,
+        "SELECT public.novu_rust_operator_jwt_resolve_alert($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+        &[
+            &identity.issuer,
+            &identity.subject,
+            &identity.client_id,
+            &env,
+            &exp,
+            &request,
+            &input.channel,
+            &input.target_id,
+            &attempt,
+            &input.decision,
+            &input.reason,
+        ],
+    )
+    .await
+    {
+        Ok(row) => (
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(serde_json::json!({"recorded":true,"replayed":row.get::<_,bool>(0)})),
+        )
+            .into_response(),
+        Err(e) if e.code().is_some_and(|c| c.code() == "42501") => {
+            failure(StatusCode::UNAUTHORIZED, uri.path())
+        }
+        Err(e) if e.code().is_some_and(|c| c.code() == "22023") => {
+            failure(StatusCode::BAD_REQUEST, uri.path())
+        }
+        Err(_) => failure(StatusCode::INTERNAL_SERVER_ERROR, uri.path()),
     }
 }
 
@@ -1464,7 +1605,7 @@ pub(super) async fn change_permissions(
         return failure(StatusCode::BAD_REQUEST, uri.path());
     };
     let env = params[0].1.as_ref();
-    match db.query_one("SELECT public.novu_rust_operator_jwt_change_permissions($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&input.target_issuer,&input.target_subject,&input.target_client_id,&input.expected,&input.desired,&input.reason]).await {
+    match guarded_query(&db, &identity, "SELECT public.novu_rust_operator_jwt_change_permissions($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&input.target_issuer,&input.target_subject,&input.target_client_id,&input.expected,&input.desired,&input.reason]).await {
         Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
         Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
         Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
