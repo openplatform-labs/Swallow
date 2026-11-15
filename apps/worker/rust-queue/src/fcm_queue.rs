@@ -153,6 +153,7 @@ pub async fn process_one(
         crate::push_step_policy::PreferencePolicy::Snapshot,
         crate::push_step_policy::TargetPolicy::Reference,
         RateLimitPolicy::Continue,
+        false,
     )
     .await
 }
@@ -173,6 +174,7 @@ pub async fn process_one_with_shared_provider(
         crate::push_step_policy::PreferencePolicy::Snapshot,
         crate::push_step_policy::TargetPolicy::Reference,
         RateLimitPolicy::Continue,
+        false,
     )
     .await
 }
@@ -194,6 +196,7 @@ pub async fn process_one_with_integrations(
         crate::push_step_policy::PreferencePolicy::Snapshot,
         crate::push_step_policy::TargetPolicy::Reference,
         RateLimitPolicy::Continue,
+        false,
     )
     .await
 }
@@ -216,6 +219,7 @@ pub async fn process_one_with_policy(
         crate::push_step_policy::PreferencePolicy::Snapshot,
         crate::push_step_policy::TargetPolicy::Reference,
         RateLimitPolicy::Continue,
+        false,
     )
     .await
 }
@@ -239,6 +243,7 @@ pub async fn process_one_with_policies(
         preference,
         crate::push_step_policy::TargetPolicy::Reference,
         RateLimitPolicy::Continue,
+        false,
     )
     .await
 }
@@ -264,6 +269,7 @@ pub async fn process_one_with_target_policy(
         preference,
         target,
         RateLimitPolicy::Continue,
+        false,
     )
     .await
 }
@@ -290,6 +296,35 @@ pub async fn process_one_with_rate_limit_policy(
         preference,
         target,
         rate_limit,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn process_one_with_shared_cooldown(
+    client: &mut Client,
+    environment: &str,
+    provider: Option<&Fcm>,
+    providers: Option<&HashMap<String, Fcm>>,
+    shared: bool,
+    policy: crate::push_step_policy::Policy,
+    preference: crate::push_step_policy::PreferencePolicy,
+    target: crate::push_step_policy::TargetPolicy,
+    rate_limit: RateLimitPolicy,
+    cooldown: bool,
+) -> Result<bool, Error> {
+    process_one_inner(
+        client,
+        environment,
+        provider,
+        providers,
+        shared,
+        policy,
+        preference,
+        target,
+        rate_limit,
+        cooldown,
     )
     .await
 }
@@ -305,6 +340,7 @@ async fn process_one_inner(
     preference_policy: crate::push_step_policy::PreferencePolicy,
     target_policy: crate::push_step_policy::TargetPolicy,
     rate_limit_policy: RateLimitPolicy,
+    shared_cooldown: bool,
 ) -> Result<bool, Error> {
     let Some(job) = claim(client, environment).await? else {
         return Ok(false);
@@ -828,6 +864,20 @@ async fn process_one_inner(
     } else {
         None
     };
+    if shared_cooldown && skip_reason.is_none() {
+        let until: Option<String> = tx
+            .query_one(
+                "SELECT public.novu_rust_fcm_cooldown_check($1)",
+                &[&environment],
+            )
+            .await?
+            .get(0);
+        if let Some(until) = until {
+            tx.execute("UPDATE public.novu_queue_jobs SET status='pending',available_at=$3::text::timestamptz,last_error='FCM shared cooldown active',lease_token=NULL,lease_until=NULL WHERE id=$1 AND lease_token=$2",&[&job.id,&job.lease_token,&until]).await?;
+            tx.commit().await?;
+            return Ok(true);
+        }
+    }
     if let Some(context) = prepared_context.as_ref() {
         let string = |key: &str| context.get(key).and_then(serde_json::Value::as_str);
         let tokens = target_metadata
@@ -946,6 +996,13 @@ async fn process_one_inner(
     }
     let updated=tx.execute("UPDATE novu_rust_fcm_attempts SET state=$4,http_status=$5,provider_message_id=$6,updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$2 AND target_index=$3 AND state='dispatching'",&[&job.id,&environment,&index_i32,&state,&status,&id]).await?;
     if updated == 1 {
+        if shared_cooldown && status == Some(429) {
+            tx.query_one(
+                "SELECT public.novu_rust_fcm_cooldown_record($1,$2)",
+                &[&environment, &retry_after],
+            )
+            .await?;
+        }
         if let Some(seconds) = retry_after {
             tx.execute("UPDATE public.novu_rust_fcm_attempts SET retry_after_seconds=$4, retry_not_before=clock_timestamp()+make_interval(secs=>$4::integer::double precision) WHERE job_id=$1 AND environment_id=$2 AND target_index=$3", &[&job.id,&environment,&index_i32,&seconds]).await?;
         }
@@ -2136,6 +2193,79 @@ mod tests {
                 ["rejected", "accepted"]
             );
         }
+        // Shared cooldown fences another job before its first provider request.
+        db.batch_execute("CREATE TABLE IF NOT EXISTS public.novu_rust_environments(id text PRIMARY KEY); INSERT INTO public.novu_rust_environments(id) VALUES('shared-fcm');").await.unwrap();
+        db.batch_execute(include_str!("../migrations/0188_fcm_shared_cooldown.sql"))
+            .await
+            .unwrap();
+        db.execute("INSERT INTO public.novu_rust_fcm_cooldown_policies(environment_id,fallback_seconds) VALUES('shared-fcm',60)",&[]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_fcm_cooldown_workers SELECT 'shared-fcm',rolname,oid FROM pg_roles WHERE rolname=session_user",&[]).await.unwrap();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let shared_payload = json!({"title":"Hi","content":"Hello","targets":["a"]});
+        crate::enqueue(&db, first, "shared-fcm", JOB_KIND, &shared_payload)
+            .await
+            .unwrap();
+        let (shared_provider, shared_server) = mock(vec![429, 200]).await;
+        assert!(
+            process_one_with_shared_cooldown(
+                &mut db,
+                "shared-fcm",
+                Some(&shared_provider),
+                None,
+                false,
+                crate::push_step_policy::Policy::Snapshot,
+                crate::push_step_policy::PreferencePolicy::Snapshot,
+                crate::push_step_policy::TargetPolicy::Reference,
+                RateLimitPolicy::Continue,
+                true
+            )
+            .await
+            .unwrap()
+        );
+        crate::enqueue(&db, second, "shared-fcm", JOB_KIND, &shared_payload)
+            .await
+            .unwrap();
+        assert!(
+            process_one_with_shared_cooldown(
+                &mut other_db,
+                "shared-fcm",
+                Some(&shared_provider),
+                None,
+                false,
+                crate::push_step_policy::Policy::Snapshot,
+                crate::push_step_policy::PreferencePolicy::Snapshot,
+                crate::push_step_policy::TargetPolicy::Reference,
+                RateLimitPolicy::Continue,
+                true
+            )
+            .await
+            .unwrap()
+        );
+        let state=db.query_one("SELECT status,last_error,available_at>clock_timestamp()+interval '100 seconds',(SELECT count(*) FROM public.novu_rust_fcm_attempts WHERE job_id=$1) FROM public.novu_queue_jobs WHERE id=$1",&[&second]).await.unwrap();
+        assert_eq!(state.get::<_, String>(0), "pending");
+        assert_eq!(state.get::<_, String>(1), "FCM shared cooldown active");
+        assert!(state.get::<_, bool>(2));
+        assert_eq!(state.get::<_, i64>(3), 0);
+        db.execute("UPDATE public.novu_rust_fcm_cooldown_policies SET not_before=clock_timestamp()-interval '1 second' WHERE environment_id='shared-fcm'",&[]).await.unwrap();
+        db.execute("UPDATE public.novu_queue_jobs SET available_at=clock_timestamp()-interval '1 second' WHERE id=$1",&[&second]).await.unwrap();
+        assert!(
+            process_one_with_shared_cooldown(
+                &mut other_db,
+                "shared-fcm",
+                Some(&shared_provider),
+                None,
+                false,
+                crate::push_step_policy::Policy::Snapshot,
+                crate::push_step_policy::PreferencePolicy::Snapshot,
+                crate::push_step_policy::TargetPolicy::Reference,
+                RateLimitPolicy::Continue,
+                true
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(shared_server.await.unwrap(), ["a", "a"]);
         let payload = json!({"title":"Hi","content":"Hello","targets":["a","b","c"]});
         let other = Uuid::new_v4();
         let id = Uuid::new_v4();

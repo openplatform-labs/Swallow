@@ -170,6 +170,11 @@ async fn run(
     let preference_policy = novu_postgres_queue::push_step_policy::PreferencePolicy::from_env()?;
     let target_policy = novu_postgres_queue::push_step_policy::TargetPolicy::from_env()?;
     let rate_limit_policy = fcm_queue::RateLimitPolicy::from_env()?;
+    let shared_cooldown = match std::env::var("SWALLOW_FCM_SHARED_COOLDOWN").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid FCM shared cooldown setting".into()),
+    };
     let invalid_token_policy = InvalidTokenPolicy::from_env()?;
     let cleanup_guard = TokenCleanupGuard::from_env()?;
     let environment = std::env::var("NOVU_FCM_ENVIRONMENT_ID")?;
@@ -456,6 +461,31 @@ async fn run(
                     }
                 }
             }
+            if configured && shared_cooldown {
+                match tokio::time::timeout(
+                    timeout,
+                    db.query_one(
+                        "SELECT public.novu_rust_fcm_cooldown_check($1)",
+                        &[&environment],
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) if error.as_db_error().is_some() => {
+                        task.abort();
+                        let _ = task.await;
+                        return Err("FCM shared cooldown configuration denied".into());
+                    }
+                    _ => {
+                        task.abort();
+                        let _ = task.await;
+                        eprintln!("FCM shared cooldown connection failed; reconnecting");
+                        stop.wait(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                }
+            }
             let mut recovery = tokio::time::Instant::now();
             let health_instance = uuid::Uuid::new_v4();
             let mut health_previous: Option<bool> = None;
@@ -593,7 +623,7 @@ async fn run(
                         continue;
                     }
                     let dispatch = async {
-                        fcm_queue::process_one_with_rate_limit_policy(
+                        fcm_queue::process_one_with_shared_cooldown(
                             &mut db,
                             &environment,
                             provider.as_ref(),
@@ -603,6 +633,7 @@ async fn run(
                             preference_policy,
                             target_policy,
                             rate_limit_policy,
+                            shared_cooldown,
                         )
                         .await
                     };
