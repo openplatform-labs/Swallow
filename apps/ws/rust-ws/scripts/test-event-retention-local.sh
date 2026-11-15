@@ -14,10 +14,14 @@ role="postgres://ws_retention_test@127.0.0.1:$port/retention_test"
 psql=("$pgbin/psql" "$admin" -q -v ON_ERROR_STOP=1)
 "${psql[@]}" -f ../../worker/rust-queue/migrations/0030_experimental_ws_events.sql
 "${psql[@]}" -f ../../worker/rust-queue/migrations/0168_ws_event_retention.sql
+"${psql[@]}" -f ../../worker/rust-queue/migrations/0169_ws_retention_requests.sql
 "${psql[@]}" <<'SQL'
 CREATE ROLE ws_retention_test LOGIN;
-GRANT USAGE ON SCHEMA public TO ws_retention_test;
+CREATE ROLE ws_retention_other LOGIN;
+GRANT USAGE ON SCHEMA public TO ws_retention_test, ws_retention_other;
 GRANT EXECUTE ON FUNCTION public.novu_rust_ws_retention_batch(text,timestamptz,integer,boolean,text) TO ws_retention_test;
+GRANT EXECUTE ON FUNCTION public.novu_rust_ws_retention_delete_v2(text,timestamptz,integer,uuid,text),public.novu_rust_ws_retention_request(text,uuid) TO ws_retention_test,ws_retention_other;
+INSERT INTO public.novu_rust_ws_retention_grants SELECT 'tenant-a',rolname,oid,false,true FROM pg_roles WHERE rolname='ws_retention_other';
 INSERT INTO public.novu_rust_ws_retention_grants SELECT 'tenant-a',rolname,oid,true,false FROM pg_roles WHERE rolname='ws_retention_test';
 INSERT INTO public.novu_rust_ws_events(environment_id,subscriber_internal_id,event,data,created_at)
  SELECT 'tenant-a','subscriber','fixture','{}','2023-01-01'::timestamptz FROM generate_series(1,3);
@@ -57,6 +61,38 @@ python3 -c 'import json,sys; assert json.loads(sys.argv[1])["count"]==2' "$skipp
 wait "$lock_pid"
 remaining=$("$binary" delete tenant-a 2024-01-01T00:00:00Z 3 after-lock)
 python3 -c 'import json,sys; assert json.loads(sys.argv[1])["count"]==1' "$remaining"
+# Concurrent duplicate requests delete at most one batch; replay returns its original result.
+"${psql[@]}" -c "INSERT INTO public.novu_rust_ws_events(environment_id,subscriber_internal_id,event,data,created_at) SELECT 'tenant-a','subscriber','replay-fixture','{}','2023-01-01'::timestamptz FROM generate_series(1,2)"
+oversized_reason=$(python3 -c 'print("x"+" "*512)')
+if "$binary" delete-v2 tenant-a 2024-01-01T00:00:00Z 1 aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa "$oversized_reason" >/dev/null 2>&1; then echo 'oversized v2 reason accepted' >&2; exit 1; fi
+if "$binary" delete tenant-a 2024-01-01T00:00:00Z 1 "$oversized_reason" >/dev/null 2>&1; then echo 'oversized legacy reason accepted' >&2; exit 1; fi
+request_id=bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb
+"$binary" delete-v2 tenant-a 2024-01-01T00:00:00Z 1 "$request_id" ticket >"$testdir/first.json" & first_pid=$!
+"$binary" delete-v2 tenant-a 2024-01-01T00:00:00Z 1 "$request_id" ticket >"$testdir/second.json" & second_pid=$!
+wait "$first_pid"
+wait "$second_pid"
+python3 - "$testdir/first.json" "$testdir/second.json" <<'PYTEST'
+import json,sys
+with open(sys.argv[1]) as f: a=json.load(f)
+with open(sys.argv[2]) as f: b=json.load(f)
+assert sorted([a['replayed'],b['replayed']]) == [False,True]
+assert a['count']==b['count']==1 and a['requestId']==b['requestId']
+PYTEST
+[[ $("${psql[@]}" -Atc "SELECT count(*) FROM public.novu_rust_ws_events WHERE environment_id='tenant-a' AND created_at<'2024-01-01'") == 1 ]]
+[[ $("${psql[@]}" -Atc "SELECT count(*) FROM public.novu_rust_ws_retention_audit WHERE request_id='$request_id'") == 1 ]]
+lookup=$("$binary" request tenant-a "$request_id")
+python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert r["found"] and r["count"]==1 and r["reason"]=="ticket"' "$lookup"
+if "$binary" delete-v2 tenant-a 2024-01-01T00:00:00Z 1 "$request_id" different >/dev/null 2>&1; then echo 'conflicting request accepted' >&2; exit 1; fi
+other=$(DATABASE_URL="postgres://ws_retention_other@127.0.0.1:$port/retention_test" "$binary" request tenant-a "$request_id")
+python3 -c 'import json,sys; assert json.loads(sys.argv[1])["found"] is False' "$other"
+"${psql[@]}" -c "ALTER TABLE public.novu_rust_ws_retention_audit ADD CONSTRAINT test_reject_v2 CHECK (reason<>'rollback-v2')"
+failed_id=cccccccc-cccc-4ccc-8ccc-cccccccccccc
+if "$binary" delete-v2 tenant-a 2024-01-01T00:00:00Z 1 "$failed_id" rollback-v2 >/dev/null 2>&1; then echo 'v2 audit failure accepted' >&2; exit 1; fi
+[[ $("${psql[@]}" -Atc "SELECT count(*) FROM public.novu_rust_ws_retention_requests WHERE request_id='$failed_id'") == 0 ]]
+[[ $("${psql[@]}" -Atc "SELECT count(*) FROM public.novu_rust_ws_events WHERE environment_id='tenant-a' AND created_at<'2024-01-01'") == 1 ]]
+"${psql[@]}" -c 'ALTER TABLE public.novu_rust_ws_retention_audit DROP CONSTRAINT test_reject_v2'
+"$binary" delete-v2 tenant-a 2024-01-01T00:00:00Z 1 "$failed_id" rollback-v2 > /dev/null
 "${psql[@]}" -c "DELETE FROM public.novu_rust_ws_retention_grants WHERE database_principal='ws_retention_test'"
 if "$binary" preview tenant-a 2024-01-01T00:00:00Z 2 >/dev/null 2>&1; then echo 'revoked grant accepted' >&2; exit 1; fi
-printf '%s\n' 'WS retention role isolation, cutoff, batch, locked-row concurrency, audit rollback and revocation verified'
+if "$binary" request tenant-a "$request_id" >/dev/null 2>&1; then echo 'revoked request lookup accepted' >&2; exit 1; fi
+printf '%s\n' 'WS retention role isolation, cutoff, batch, concurrency, replay, audit rollback and revocation verified'
