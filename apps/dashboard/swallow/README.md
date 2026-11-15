@@ -358,6 +358,13 @@ Angular 테스트 253개와 빌드가 통과했다. `scripts/test-discord-retry-
 
 ### Discord 429 재시도 정책
 
-설정 화면에서 대상 ID별 `off`, `known`, `fallback` 모드와 최대 횟수, 대체 대기 시간을 선택하고 조회·변경·요청 확인·JWT 변경 감사를 할 수 있다. API 0125와 워커 0211, 대상별 JWT 및 API DB 로그인 권한이 각각 필요하며 JWT 권한 위임 화면은 아직 없다. 변경 전 대상 워커를 중지하고 진행 중인 발송을 정리한 다음 변경하고 동일 설정으로 재시작한다. API는 워커 롤아웃을 조정하거나 이미 진행 중인 발송을 취소하지 않는다. `fallback`은 제공자의 준비 전에 재시도할 수 있다.
+설정 화면에서 대상 ID별 `off`, `known`, `fallback` 모드와 최대 횟수, 대체 대기 시간을 선택하고 조회·변경·요청 확인·JWT 변경 감사를 할 수 있다. API 0125와 워커 0211, 대상별 JWT 및 API DB 로그인 권한이 각각 필요하다. 변경 전 대상 워커를 중지하고 진행 중인 발송을 정리한 다음 변경하고 동일 설정으로 재시작한다. API는 워커 롤아웃을 조정하거나 이미 진행 중인 발송을 취소하지 않는다. `fallback`은 제공자의 준비 전에 재시도할 수 있다.
 
 변경은 먼저 요청을 준비하고 별도 확인 후 제출한다. 응답 불명 시 원래 토큰·환경·대상·주소로 동일 요청 ID를 재제출하거나 기록을 확인한다. 요청 정보는 메모리에만 보관된다. 변경 없는 요청도 감사되며 revision은 그대로다. 감사는 UUID 순서이고 단일 스냅샷이 아니다. Angular 테스트 258건과 빌드가 통과했다. `scripts/test-discord-retry-policy-browser.sh`는 실제 브라우저·Rust API·제한 DB 로그인·테스트 JWT에서 정책 변경, 요청·감사 조회, 변경 없는 요청, 대상·사용자·환경 격리를 검증한다. 기본은 Docker PostgreSQL이며 `TEST_POSTGRES_MODE=local`은 테스트 전용 임시 로컬 PostgreSQL을 사용한다. Docker Desktop 시작 불가로 로컬 PostgreSQL 17에서 검증했다. 실제 Discord·외부 IdP·운영 HA는 미검증이다. 번들·CSS 크기 경고가 남아 있다. 자세한 권한과 배포 절차는 [API README](../../api/rust-api/README.md)와 [워커 README](../../worker/rust-queue/README.md)를 참고한다.
+
+
+### Discord 재시도 정책 권한 위임
+
+설정 화면에서 환경·대상·운영자별 정책 조회, 변경, 감사 JWT 권한을 조회하고 위임·회수할 수 있다. API 0126의 위임 관리자 권한과 API 로그인 함수 실행 권한은 DBA가 별도로 설정해야 한다. 위임된 JWT 권한은 정책 접근에 필요한 API DB 로그인 권한을 자동 부여하지 않는다. 자기 자신의 권한 변경은 거절된다. 요청은 확인 후 제출하며 응답이 불명확한 경우 원래 토큰·환경·대상·주소로 동일 요청을 재제출하거나 요청 ID를 조회한다. 요청 정보는 화면 메모리에만 보관되며 감사는 실제 변경만 표시하고 UUID 순서로 조회한다.
+
+Angular 테스트 262건과 빌드가 통과했다. `scripts/test-discord-retry-policy-grants-browser.sh`는 실제 브라우저, Rust API, 제한 DB 로그인과 테스트 JWT를 사용해 조회·부여·요청·감사·회수와 대상의 정책 접근 변경을 검증한다. 기본은 Docker PostgreSQL이며 `TEST_POSTGRES_MODE=local`은 임시 로컬 PostgreSQL을 사용한다. Docker Desktop 시작 불가로 로컬 PostgreSQL 17에서 검증했다. 외부 IdP·운영 HA는 미검증이며 빌드 크기 경고가 남아 있다. [API README](../../api/rust-api/README.md)에 권한과 함수 설정 절차가 있다.
