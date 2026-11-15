@@ -5,6 +5,7 @@ import { SlackIntegrations } from './slack-integrations';
 import { TwilioResults } from './twilio-results';
 import { FcmResults } from './fcm-results';
 import { DiscordReviews } from './discord-reviews';
+import { SmtpReviews } from './smtp-reviews';
 import { DiscordEndpoints } from './discord-endpoints';
 import { SlackResults } from './slack-results';
 import { ResendAutoPolicy } from './resend-auto-policy';
@@ -59,7 +60,7 @@ type SendgridKey = {identifier:string;active:boolean};
 type SendgridKeyAudit = {id:string;identifier:string;action:string;userId:string;recordedAt:string};
 
 @Component({
-  imports: [FormsModule, ClrAlertModule, FcmIntegrations, SlackIntegrations, TwilioResults, FcmResults, DiscordReviews, DiscordEndpoints, SlackResults, SendgridResults, ResendAutoPolicy, ResendCooldownPolicy, DiscordPolicy, DiscordRetryPolicy, DiscordRetryPolicyGrants, ResendAutoHealth],
+  imports: [FormsModule, ClrAlertModule, FcmIntegrations, SlackIntegrations, TwilioResults, FcmResults, DiscordReviews, SmtpReviews, DiscordEndpoints, SlackResults, SendgridResults, ResendAutoPolicy, ResendCooldownPolicy, DiscordPolicy, DiscordRetryPolicy, DiscordRetryPolicyGrants, ResendAutoHealth],
   selector: 'app-root',
   styleUrl: './app.css',
   templateUrl: './app.html',
@@ -196,6 +197,7 @@ export class App implements OnDestroy {
   twilioDecisionBusy = false;
   fcmReviewBusy = false;
   discordReviewBusy = false;
+  smtpReviewBusy = false;
   readonly decisionStatus = signal<'idle' | 'sending' | 'recorded' | 'rejected' | 'unknown' | 'unavailable'>('idle');
   decisionProtocol: 'idempotent' | 'legacy' = 'idempotent';
   readonly decisionRequestId = signal<string | null>(null);
@@ -1158,7 +1160,7 @@ export class App implements OnDestroy {
     if(this.fcmBusy||this.slackBusy||this.discordEndpointsBusy)return;
     if(this.oidcRevokeStatus()==='sending')return;
     if(this.sendgridWriteStatus()==='sending')return;
-    if (this.resendDecisionStatus()==='sending' || this.resendDecisionStatus()==='preparing' || this.slackDecisionBusy || this.twilioDecisionBusy || this.fcmReviewBusy || this.discordReviewBusy || this.policyBusy || (this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying' || this.subscriberDeleteRetryStatus()==='retrying') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || (this.grantChangeStatus()==='sending'||this.policyBusy) || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
+    if (this.resendDecisionStatus()==='sending' || this.resendDecisionStatus()==='preparing' || this.slackDecisionBusy || this.twilioDecisionBusy || this.fcmReviewBusy || this.discordReviewBusy || this.smtpReviewBusy || this.policyBusy || (this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying' || this.subscriberDeleteRetryStatus()==='retrying') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || (this.grantChangeStatus()==='sending'||this.policyBusy) || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;
     if (this.section()==='workflows' && next!=='workflows') {this.clearWorkflow(true);this.forgetWorkflowRequest();}
     if (this.section()==='channels' && next!=='channels') this.clearSendgrid(true);
     if (this.section() === 'subscribers' && next !== 'subscribers') this.forgetKey();

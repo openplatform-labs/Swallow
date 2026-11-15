@@ -4133,6 +4133,59 @@ pub(super) async fn discord_review(State(db):State<Arc<Client>>,headers:HeaderMa
     }
 }
 
+#[derive(Clone,Copy)]
+enum SmtpQuery { Attention, Request }
+pub(super) async fn smtp_attention(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
+    smtp_query(db,headers,uri,verifier,SmtpQuery::Attention).await
+}
+pub(super) async fn smtp_review_request(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
+    smtp_query(db,headers,uri,verifier,SmtpQuery::Request).await
+}
+async fn smtp_query(db:Arc<Client>,headers:HeaderMap,uri:Uri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>,kind:SmtpQuery) -> Response {
+    let identity=match authenticate(&db,&headers,verifier).await {Ok(v)=>v,Err(status)=>return failure(status,uri.path())};
+    let mut env=None;let mut cursor=None;
+    for (key,value) in form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()) {
+        match key.as_ref() {
+            "environmentId" if env.is_none() && !value.is_empty() && value.len()<=512 && !value.contains('\0') => env=Some(value.into_owned()),
+            "after" if matches!(kind,SmtpQuery::Attention) && cursor.is_none() => match Uuid::parse_str(&value) {Ok(v)=>cursor=Some(v),Err(_)=>return failure(StatusCode::BAD_REQUEST,uri.path())},
+            "requestId" if matches!(kind,SmtpQuery::Request) && cursor.is_none() => match Uuid::parse_str(&value) {Ok(v)=>cursor=Some(v),Err(_)=>return failure(StatusCode::BAD_REQUEST,uri.path())},
+            _=>return failure(StatusCode::BAD_REQUEST,uri.path()),
+        }
+    }
+    let Some(env)=env else{return failure(StatusCode::BAD_REQUEST,uri.path())};
+    if matches!(kind,SmtpQuery::Request) && cursor.is_none() {return failure(StatusCode::BAD_REQUEST,uri.path());}
+    let Ok(exp)=i64::try_from(identity.expires_at) else{return failure(StatusCode::BAD_REQUEST,uri.path())};
+    let sql=match kind {SmtpQuery::Attention=>"SELECT public.novu_rust_operator_jwt_smtp_attention($1,$2,$3,$4,$5,$6)",SmtpQuery::Request=>"SELECT public.novu_rust_operator_jwt_smtp_review_request($1,$2,$3,$4,$5,$6)"};
+    match guarded_query(&db,&identity,sql,&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&cursor]).await {
+        Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
+        Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
+        Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
+        Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path()),
+    }
+}
+#[derive(serde::Deserialize)]
+#[serde(rename_all="camelCase",deny_unknown_fields)]
+struct SmtpReviewBody {request_id:String,job_id:String,attempt_revision:Option<String>,failure_revision:String,reason:String}
+pub(super) async fn smtp_review(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>,body:Bytes) -> Response {
+    let identity=match authenticate(&db,&headers,verifier).await {Ok(v)=>v,Err(status)=>return failure(status,uri.path())};
+    let params:Vec<_>=form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).collect();
+    if params.len()!=1 || params[0].0!="environmentId" || params[0].1.is_empty() || params[0].1.len()>512 || params[0].1.contains('\0') {return failure(StatusCode::BAD_REQUEST,uri.path());}
+    let Some(input)=(body.len()<=4096).then(||serde_json::from_slice::<SmtpReviewBody>(&body).ok()).flatten() else{return failure(StatusCode::BAD_REQUEST,uri.path());};
+    if input.reason.trim().is_empty() || input.reason.len()>512 || input.reason.contains('\0') {return failure(StatusCode::BAD_REQUEST,uri.path());}
+    let (Ok(request),Ok(job),Ok(failure_revision),Ok(exp))=(Uuid::parse_str(&input.request_id),Uuid::parse_str(&input.job_id),input.failure_revision.parse::<i64>(),i64::try_from(identity.expires_at)) else{return failure(StatusCode::BAD_REQUEST,uri.path());};
+    if failure_revision<0 || failure_revision.to_string()!=input.failure_revision {return failure(StatusCode::BAD_REQUEST,uri.path());}
+    let attempt=match input.attempt_revision {Some(value)=>match Uuid::parse_str(&value){Ok(id)=>Some(id),Err(_)=>return failure(StatusCode::BAD_REQUEST,uri.path())},None=>None};
+    let env=params[0].1.as_ref();
+    match guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_smtp_review($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&job,&attempt,&failure_revision,&input.reason]).await {
+        Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
+        Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
+        Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
+        Err(e) if e.code().is_some_and(|c|matches!(c.code(),"P4090"|"40001"))=>{let mut response=error_at(StatusCode::CONFLICT,"Review conflict","Conflict",uri.path()).into_response();response.headers_mut().insert(header::CACHE_CONTROL,header::HeaderValue::from_static("no-store"));response},
+        Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path()),
+    }
+}
+
+
 pub(super) async fn discord_review_grant_read(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response { query(db,headers,uri,verifier,Lookup::DiscordReviewGrantRead).await }
 pub(super) async fn discord_review_grant_request(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response { query(db,headers,uri,verifier,Lookup::DiscordReviewGrantRequest).await }
 pub(super) async fn discord_review_grant_audit(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response { query(db,headers,uri,verifier,Lookup::DiscordReviewGrantAudit).await }

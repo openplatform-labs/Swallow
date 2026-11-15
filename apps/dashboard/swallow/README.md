@@ -372,3 +372,7 @@ Angular 테스트 262건과 빌드가 통과했다. `scripts/test-discord-retry-
 ### Experimental SMTP selection
 
 The workflow email-provider screen supports SMTP with the existing API-key and operator JWT authorization flows. Configure and start the SMTP worker separately and drain old generators and queued email jobs before switching; see the worker README. Selection alone does not verify delivery or provide SMTP outcome reconciliation. The SMTP browser fixture is `scripts/test-smtp-provider-browser.sh` (Docker PostgreSQL by default; `TEST_POSTGRES_MODE=local` uses a temporary local PostgreSQL installation). It exercises provider selection and audit through the API, not external email delivery. The browser test passed with a temporary local PostgreSQL instance; the Docker mode was not exercised in this run.
+
+### SMTP failure review
+
+In the alerts screen, use an operator JWT and environment to list and acknowledge SMTP failures. List and review permissions are independent and currently require administrator provisioning; see the API README. A review does not determine delivery or retry a message. The interface retains the request ID for lookup or exact replay after an uncertain response while the page remains open. `scripts/test-smtp-review-browser.sh` exercises the built UI, real API, synthetic JWT and restricted DB login (Docker PostgreSQL by default, or `TEST_POSTGRES_MODE=local`). The browser test passed with a temporary local PostgreSQL; external IdP and SMTP relay are not covered.
