@@ -88,16 +88,22 @@ if [[ "${SWALLOW_UI_SELF_REVOKE:-false}" == true ]]; then
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_self(text,text,text,text,bigint),public.novu_rust_operator_token_revoked(bytea,bytea,bytea,bytea),public.novu_rust_operator_token_guard(bytea,bytea,bytea,bytea),public.novu_rust_operator_jwt_self_revoke(text,text,text,text,bigint,bytea) TO ui_resend_fixture;
 SQL
 fi
-node --input-type=module - "$root" "$fixture_dir" "${SWALLOW_UI_SELF_REVOKE:-false}" <<'JS'
+if [[ "${SWALLOW_UI_TEST_OIDC:-false}" == true ]]; then
+  docker exec -i "$name" psql -q -v ON_ERROR_STOP=1 -U postgres -d ui_test <<'SQL'
+INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES ('http://127.0.0.1:4251','ui-fixture','console','ui-fixture-env');
+SQL
+fi
+node --input-type=module - "$root" "$fixture_dir" "${SWALLOW_UI_SELF_REVOKE:-false}" "${SWALLOW_UI_TEST_OIDC:-false}" <<'JS'
 import {readFile,writeFile} from 'node:fs/promises';
 import {SignJWT,importPKCS8} from './node_modules/jose/dist/webapi/index.js';
 const root=process.argv[2], dir=process.argv[3];
+const issuer=process.argv[5]==='true'?'http://127.0.0.1:4251':'https://issuer.test';
 const keyDir=`${root}/apps/api/rust-api/tests/fixtures/operator_jwt`;
 const [privatePem,publicPem]=await Promise.all([readFile(`${keyDir}/test-only-private.pem`,'utf8'),readFile(`${keyDir}/test-only-public.pem`,'utf8')]);
 const now=Math.floor(Date.now()/1000);
-const token=await new SignJWT({client_id:'console',jti:'ui-fixture'}).setProtectedHeader({alg:'RS256',typ:'at+jwt',kid:'key'}).setIssuer('https://issuer.test').setSubject('ui-fixture').setAudience('swallow').setIssuedAt(now).setExpirationTime(now+600).sign(await importPKCS8(privatePem,'RS256'));
+const token=await new SignJWT({client_id:'console',jti:'ui-fixture'}).setProtectedHeader({alg:'RS256',typ:'at+jwt',kid:'key'}).setIssuer(issuer).setSubject('ui-fixture').setAudience('swallow').setIssuedAt(now).setExpirationTime(now+600).sign(await importPKCS8(privatePem,'RS256'));
 await writeFile(`${dir}/token`,token,{mode:0o600});
-await writeFile(`${dir}/jwt-config`,JSON.stringify({issuer:'https://issuer.test',audience:'swallow',keys:[{kid:'key',pem:publicPem}],check_token_revocation:process.argv[4]==='true'}),{mode:0o600});
+await writeFile(`${dir}/jwt-config`,JSON.stringify({issuer,audience:'swallow',keys:[{kid:'key',pem:publicPem}],check_token_revocation:process.argv[4]==='true'}),{mode:0o600});
 JS
 api_port=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
 cargo build --quiet --locked --manifest-path "$api/Cargo.toml" --bin novu-rust-api
