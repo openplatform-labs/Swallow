@@ -144,7 +144,9 @@ fn original_sendgrid_wire_body() {
             request_body(&config, &attachment).unwrap(),
             request_body(&config, &tracking(json!({"clickTracking":{"enable":true,"enableText":false},"openTracking":{"enable":true,"substitutionTag":"%open%"}}))).unwrap(),
             request_body(&config, &tracking(json!({"subscriptionTracking":{"enable":true,"text":"unsubscribe","html":"<p>unsubscribe</p>","substitutionTag":"%unsub%"},"ganalytics":{"enable":true,"utmSource":"source","utmMedium":"email","utmTerm":"term","utmContent":"content","utmCampaign":"campaign"}}))).unwrap(),
-            request_body(&config, &tracking(json!({"clickTracking":{"enable":false,"enableText":true},"openTracking":{"enable":true},"subscriptionTracking":{"enable":true,"text":"bye"}}))).unwrap()
+            request_body(&config, &tracking(json!({"clickTracking":{"enable":false,"enableText":true},"openTracking":{"enable":true},"subscriptionTracking":{"enable":true,"text":"bye"}}))).unwrap(),
+            request_body(&config, &Email { to: vec!["a@example.test".into()], subject: "Hi".into(), html:"<p>Hi</p>".into(), sandbox_mode:Some(true), ..Email::default() }).unwrap(),
+            request_body(&config, &Email { to: vec!["a@example.test".into()], subject: "Hi".into(), html:"<p>Hi</p>".into(), sandbox_mode:Some(false), ..Email::default() }).unwrap()
         ],
         original
     );

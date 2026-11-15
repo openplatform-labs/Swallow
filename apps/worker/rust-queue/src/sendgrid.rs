@@ -40,6 +40,7 @@ pub struct Email {
     pub headers: Map<String, Value>,
     pub custom_data: Map<String, Value>,
     pub tracking_settings: Map<String, Value>,
+    pub sandbox_mode: Option<bool>,
     pub message_id: Option<String>,
     pub transaction_id: Option<String>,
     pub workflow_identifier: Option<String>,
@@ -235,6 +236,9 @@ pub fn request_body(config: &Config, message: &Email) -> Result<Value, SendError
         ))
         .map_err(|_| SendError::InvalidMessage)?;
     }
+    if let Some(enabled) = message.sandbox_mode {
+        body["mail_settings"] = json!({"sandbox_mode":{"enable":enabled}});
+    }
     Ok(body)
 }
 
@@ -343,6 +347,12 @@ impl Sendgrid {
         }
         let mut body = self.prepare(message)?;
         body["mail_settings"] = json!({"sandbox_mode":{"enable":true}});
+        self.validate_prepared_sandbox(body).await
+    }
+    pub(crate) async fn validate_prepared_sandbox(&self, body: Value) -> Result<(), SendError> {
+        if body.pointer("/mail_settings/sandbox_mode/enable") != Some(&json!(true)) {
+            return Err(SendError::InvalidMessage);
+        }
         let response = self
             .http
             .post(&self.endpoint)

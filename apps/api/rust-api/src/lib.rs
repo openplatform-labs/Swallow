@@ -3848,8 +3848,9 @@ async fn trigger(
                 "subject" | "html" | "senderName" => value.is_string(),
                 "ipPoolName" => allow_ip_pool && value.is_string(),
                 "trackingSettings" => allow_sendgrid_tracking && novu_rust_contracts::sendgrid_tracking::wire(value).is_ok(),
+                "mailSettings" => allow_sendgrid_tracking && novu_rust_contracts::sendgrid_sandbox::enabled(value).is_some(),
                 "_passthrough" => allow_sendgrid_tracking && value.as_object().is_some_and(|object| {
-                    object.len()==1 && object.get("body").and_then(Value::as_object).is_some_and(|body| body.iter().all(|(key,value)| key=="trackingSettings" && novu_rust_contracts::sendgrid_tracking::wire(value).is_ok()))
+                    object.len()==1 && object.get("body").and_then(Value::as_object).is_some_and(|body| body.iter().all(|(key,value)| match key.as_str() { "trackingSettings" => novu_rust_contracts::sendgrid_tracking::wire(value).is_ok(), "mailSettings" => novu_rust_contracts::sendgrid_sandbox::enabled(value).is_some(), _ => false }))
                 }),
                 "alternatives" => valid_email_alternatives(value),
                 "from" => value.as_str().is_some_and(|s| !s.is_empty()),

@@ -642,6 +642,7 @@ async fn process_claimed(
     let mut raw_provider_headers = serde_json::Map::new();
     let mut provider_from_without_name = false;
     let mut sendgrid_tracking = serde_json::json!({});
+    let mut sendgrid_sandbox = None;
     if email_provider == "sendgrid" {
         // Bridge known values precede passthrough, even across workflow-step layers.
         for layer in [provider_layer, step_layer].into_iter().flatten() {
@@ -656,6 +657,16 @@ async fn process_claimed(
         }
         if !sendgrid_tracking.is_object() {
             return Err(InvalidJob("invalid SendGrid tracking settings").into());
+        }
+        for layer in [provider_layer, step_layer].into_iter().flatten() {
+            if let Some(value) = layer.get("mailSettings") {
+                sendgrid_sandbox = Some(novu_rust_contracts::sendgrid_sandbox::enabled(value).ok_or(InvalidJob("invalid SendGrid mail settings"))?);
+            }
+        }
+        for layer in [provider_layer, step_layer].into_iter().flatten() {
+            if let Some(value) = layer.get("_passthrough").and_then(|v| v.get("body")).and_then(|v| v.get("mailSettings")) {
+                sendgrid_sandbox = Some(novu_rust_contracts::sendgrid_sandbox::enabled(value).ok_or(InvalidJob("invalid SendGrid mail settings"))?);
+            }
         }
     }
     let provider_pool_override = [
@@ -1044,6 +1055,9 @@ async fn process_claimed(
                 email_payload["alternatives"] = serde_json::Value::Array(parts.iter().map(|part| serde_json::json!({"content_type":part.get("contentType"),"content":part.get("content")})).collect());
             }
             if email_provider == "sendgrid" {
+                if let Some(enabled) = sendgrid_sandbox {
+                    email_payload["sandbox_mode"] = serde_json::json!(enabled);
+                }
                 if sendgrid_tracking.as_object().is_some_and(|fields| !fields.is_empty()) {
                     email_payload["tracking_settings"] = sendgrid_tracking.clone();
                 }

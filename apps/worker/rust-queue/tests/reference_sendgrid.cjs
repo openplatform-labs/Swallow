@@ -27,5 +27,7 @@ const trackingCases=[
   {trackingSettings:{clickTracking:{enable:true,enableText:false},openTracking:{enable:true,substitutionTag:'%open%'}}},
   {trackingSettings:{subscriptionTracking:{enable:true,text:'unsubscribe',html:'<p>unsubscribe</p>',substitutionTag:'%unsub%'},ganalytics:{enable:true,utmSource:'source',utmMedium:'email',utmTerm:'term',utmContent:'content',utmCampaign:'campaign'}}},
   {trackingSettings:{clickTracking:{enable:true,enableText:true},openTracking:{enable:true}},_passthrough:{body:{trackingSettings:{clickTracking:{enable:false},subscriptionTracking:{enable:true,text:'bye'}}}}},
+  {mailSettings:{sandboxMode:{enable:true}}},
+  {mailSettings:{sandboxMode:{enable:false}}},
 ];
 (async()=>{const SendgridEmailProvider=await loadProvider();let bodies=[];for(const options of cases){const provider=new SendgridEmailProvider(config);provider.client.request=async request=>{bodies.push(request.body);return [{headers:{}}]};await provider.sendMessage(options)}for(const tracking of trackingCases){const provider=new SendgridEmailProvider(config);provider.client.request=async request=>{bodies.push(request.body);return [{headers:{}}]};await provider.sendMessage({to:['a@example.test'],subject:'Hi',html:'<p>Hi</p>'},tracking)}process.stdout.write(JSON.stringify(bodies))})().catch(error=>{console.error(error);process.exit(1)});

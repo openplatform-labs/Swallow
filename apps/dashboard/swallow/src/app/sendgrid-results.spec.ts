@@ -7,6 +7,12 @@ const page=Array.from({length:20},(_,i)=>({...row,jobId:`11111111-1111-4111-8111
 const last=page[19].jobId;
 describe('SendGrid operator results',()=>{
   afterEach(()=>vi.restoreAllMocks());
+  it('shows validation without presenting it as delivery',async()=>{
+    const validated={...row,attemptState:'validated',dispatchTracked:false,result:'unknown',recipientCount:0,deliveredCount:0,pendingCount:0};
+    vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify(validated)));
+    const fixture=TestBed.createComponent(SendgridResults);const c=fixture.componentInstance;c.apiOrigin='https://api.example.test';c.environment='env';c.token='aaa.bbb.ccc';c.jobId=id;
+    await c.load();fixture.detectChanges();expect(c.result()).toEqual(validated);expect(fixture.nativeElement.textContent).toContain('시험 검증 완료 (메일 전달 없음)');fixture.destroy();
+  });
   it('lists and loads a selected result with bearer authorization',async()=>{
     const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:page.map(r=>({...r,unexpectedSecret:"fixture-sensitive"})),hasMore:true,next:last}))).mockResolvedValueOnce(new Response(JSON.stringify({data:[],hasMore:false,next:null}))).mockResolvedValueOnce(new Response(JSON.stringify({...row,unexpectedSecret:"fixture-sensitive"})));
     const fixture=TestBed.createComponent(SendgridResults);const c=fixture.componentInstance;c.apiOrigin='https://api.example.test';c.environment='env';c.token='aaa.bbb.ccc';await c.list();expect(c.rows()).toEqual(page);await c.list(true);expect(mock.mock.calls[1][0]).toContain(`after=${last}`);c.select(row);await c.load();expect(c.result()).toEqual(row);expect(mock.mock.calls[2][1]).toMatchObject({headers:{Authorization:'Bearer aaa.bbb.ccc'},credentials:'omit',cache:'no-store',redirect:'error'});fixture.destroy();

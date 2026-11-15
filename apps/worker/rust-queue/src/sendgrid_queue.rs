@@ -339,7 +339,8 @@ pub async fn process_one_with_step_policy(
         tx.rollback().await?;
         return Ok(true);
     }
-    let dispatch = provider.tracks_dispatches().then(Uuid::new_v4);
+    let sandbox = email.sandbox_mode == Some(true);
+    let dispatch = (provider.tracks_dispatches() && !sandbox).then(Uuid::new_v4);
     let inserted=tx.execute("INSERT INTO novu_rust_sendgrid_attempts(job_id,environment_id,state,dispatch_id) VALUES ($1,$2,'dispatching',$3) ON CONFLICT(job_id) DO NOTHING", &[&job.id,&job.environment_id,&dispatch]).await?;
     if inserted == 0 {
         tx.execute("UPDATE novu_queue_jobs SET status='failed',last_error='email attempt already exists',lease_token=NULL,lease_until=NULL WHERE id=$1", &[&job.id]).await?;
@@ -390,14 +391,20 @@ pub async fn process_one_with_step_policy(
             return Ok(true);
         }
     };
-    tx.execute("UPDATE novu_rust_email_messages SET delivery_state='dispatching' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
+    tx.execute("UPDATE novu_rust_email_messages SET delivery_state='dispatching',status=CASE WHEN $3 THEN 'warning' ELSE status END,error_text=CASE WHEN $3 THEN 'sandbox validation only; no email delivered' ELSE error_text END WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id,&sandbox]).await?;
     if !lock_live(&tx, &job).await? {
         tx.rollback().await?;
         return Ok(true);
     }
     tx.commit().await?;
-    let (state, status, provider_id, diagnostic) = match provider.send_prepared(prepared, email.message_id.as_deref()).await {
-        Ok(receipt) => (
+    let response = if sandbox {
+        provider.validate_prepared_sandbox(prepared).await.map(|_| None)
+    } else {
+        provider.send_prepared(prepared, email.message_id.as_deref()).await.map(Some)
+    };
+    let (state, status, provider_id, diagnostic) = match response {
+        Ok(None) => ("validated", Some(200), None, None),
+        Ok(Some(receipt)) => (
             "accepted",
             None,
             receipt.id.map(|v| v.chars().take(1024).collect::<String>()),
@@ -435,14 +442,16 @@ pub async fn process_one_with_step_policy(
     let updated=tx.execute("UPDATE novu_rust_sendgrid_attempts SET state=$2,http_status=$3,provider_message_id=$4,updated_at=clock_timestamp() WHERE job_id=$1 AND state='dispatching'", &[&job.id,&state,&status,&provider_id]).await?;
     if updated == 1 {
         tx.execute("UPDATE novu_rust_email_messages SET delivery_state=$3 WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id,&state]).await?;
-        if state == "accepted" {
+        if state == "validated" {
+            tx.execute("UPDATE novu_rust_email_messages SET status='warning',error_text='sandbox validation only; no email delivered' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
+        } else if state == "accepted" {
             tx.execute("UPDATE novu_rust_email_messages SET identifier=$3 WHERE environment_id=$1 AND email_job_id=$2", &[&job.environment_id,&job.id,&provider_id]).await?;
         } else {
             // Provider response text and headers may contain secrets or PII;
             // preserve a fixed diagnostic rather than persisting raw responses.
             tx.execute("UPDATE novu_rust_email_messages SET status='error',error_id='mail_unexpected_error',error_text=$3 WHERE environment_id=$1 AND email_job_id=$2", &[&job.environment_id,&job.id,&diagnostic]).await?;
         }
-        let job_status = if state == "accepted" {
+        let job_status = if state == "accepted" || state == "validated" {
             "completed"
         } else {
             "failed"

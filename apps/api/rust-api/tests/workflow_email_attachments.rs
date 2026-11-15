@@ -222,3 +222,36 @@ async fn sendgrid_tracking_reaches_mock_provider_with_layer_precedence() {
     let body=server.await.unwrap();assert_eq!(body["tracking_settings"],json!({"click_tracking":{"enable":false,"enable_text":true},"open_tracking":{"enable":true,"substitution_tag":"%open%"},"subscription_tracking":{"enable":true,"text":"bye"}}));
     let row=db.query_one("SELECT j.status,a.state FROM novu_queue_jobs j JOIN novu_rust_sendgrid_attempts a ON a.job_id=j.id WHERE j.environment_id='tracking-env'",&[]).await.unwrap();assert_eq!(row.get::<_,String>(0),"completed");assert_eq!(row.get::<_,String>(1),"accepted");
 }
+
+
+#[tokio::test]
+#[ignore = "requires fully migrated disposable PostgreSQL and loopback"]
+async fn sendgrid_sandbox_workflow_records_validation_without_delivery() {
+    use tokio::io::{AsyncReadExt,AsyncWriteExt};
+    let _guard=QUEUE_TEST_LOCK.lock().await;let url=std::env::var("TEST_DATABASE_URL").unwrap();
+    let (mut db,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(async move{driver.await.unwrap()});
+    db.batch_execute("INSERT INTO public.novu_rust_users VALUES ('sandbox-user'); INSERT INTO public.novu_rust_environments VALUES ('sandbox-env','org'); INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,in_app_content,email_subject,email_html,email_provider,email_step_id,inbox_metadata) VALUES ('sandbox-env','sandbox-workflow',true,true,'Hi','Hi','<p>Hi</p>','sendgrid','mail-step','{\"id\":\"sandbox-workflow-id\"}')").await.unwrap();
+    let hash=format!("{:x}",Sha256::digest(b"sandbox-key"));db.execute("INSERT INTO public.novu_rust_api_keys(key_hash,environment_id,user_id) VALUES($1,'sandbox-env','sandbox-user')",&[&hash]).await.unwrap();
+    let (api,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(async move{driver.await.unwrap()});let router=novu_rust_api::router(Arc::new(api));
+    let request=|txn:&str,overrides:Value| Request::builder().method("POST").uri("/v1/events/trigger").header("authorization","ApiKey sandbox-key").header("content-type","application/json").body(Body::from(json!({"name":"sandbox-workflow","to":{"subscriberId":txn,"email":"recipient@example.test"},"payload":{},"transactionId":txn,"overrides":overrides}).to_string())).unwrap();
+    for (i,invalid) in [json!({"providers":{"sendgrid":{"mailSettings":{"sandboxMode":{"enable":"yes"}}}}}),json!({"providers":{"resend":{"mailSettings":{"sandboxMode":{"enable":true}}}}})].into_iter().enumerate() {
+        assert_eq!(router.clone().oneshot(request(&format!("invalid-sandbox-{i}"),invalid)).await.unwrap().status(),StatusCode::NOT_IMPLEMENTED);
+    }
+    let overrides=json!({"providers":{"sendgrid":{"mailSettings":{"sandboxMode":{"enable":false}},"_passthrough":{"body":{"mailSettings":{"sandboxMode":{"enable":true}}}}}},"steps":{"mail-step":{"providers":{"sendgrid":{"mailSettings":{"sandboxMode":{"enable":false}}}}}}});
+    assert_eq!(router.oneshot(request("sandbox-valid",overrides)).await.unwrap().status(),StatusCode::CREATED);
+    assert!(novu_postgres_queue::in_app::process_one(&mut db).await.unwrap());
+    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let addr=listener.local_addr().unwrap();
+    let server=tokio::spawn(async move{let (mut socket,_)=listener.accept().await.unwrap();let mut raw=Vec::new();let mut chunk=[0;4096];loop{let n=socket.read(&mut chunk).await.unwrap();assert!(n>0);raw.extend_from_slice(&chunk[..n]);if let Some(pos)=raw.windows(4).position(|v|v==b"\r\n\r\n"){let header=String::from_utf8_lossy(&raw[..pos]);let len=header.lines().find_map(|l|l.to_ascii_lowercase().strip_prefix("content-length: ").and_then(|v|v.parse::<usize>().ok())).unwrap();if raw.len()>=pos+4+len{let body:Value=serde_json::from_slice(&raw[pos+4..pos+4+len]).unwrap();socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();return body;}}}});
+    let provider=novu_postgres_queue::sendgrid::Sendgrid::test_endpoint(novu_postgres_queue::sendgrid::Config{api_key:"fixture".into(),from:"sender@example.test".into(),sender_name:"Sender".into(),region:novu_postgres_queue::sendgrid::Region::Global},&format!("http://{addr}/send")).unwrap();
+    assert!(novu_postgres_queue::sendgrid_queue::process_one(&mut db,"sandbox-env",&provider).await.unwrap());
+    let body=server.await.unwrap();assert_eq!(body["mail_settings"],json!({"sandbox_mode":{"enable":true}}));
+    let row=db.query_one("SELECT j.id,j.status,a.state,a.dispatch_id,m.status,m.delivery_state FROM novu_queue_jobs j JOIN novu_rust_sendgrid_attempts a ON a.job_id=j.id JOIN novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.environment_id='sandbox-env'",&[]).await.unwrap();
+    assert_eq!(row.get::<_,String>(1),"completed");assert_eq!(row.get::<_,String>(2),"validated");assert_eq!(row.get::<_,Option<uuid::Uuid>>(3),None);assert_eq!(row.get::<_,String>(4),"warning");assert_eq!(row.get::<_,String>(5),"validated");
+    let job:uuid::Uuid=row.get(0);
+    assert!(db.execute("UPDATE novu_rust_sendgrid_attempts SET state='accepted' WHERE job_id=$1",&[&job]).await.is_err());
+    assert!(db.execute("UPDATE novu_queue_jobs SET payload=jsonb_set(payload,'{sandbox_mode}','false'::jsonb) WHERE id=$1",&[&job]).await.is_err());
+    assert!(novu_postgres_queue::sendgrid_projection::project(&mut db,"sandbox-env",job).await.unwrap());
+    let result=db.query_one("SELECT sendgrid_delivery_result FROM novu_queue_jobs WHERE id=$1",&[&job]).await.unwrap().get::<_,Option<String>>(0);assert_eq!(result.as_deref(),Some("unknown"));
+    db.execute("UPDATE novu_queue_jobs SET available_at=clock_timestamp()-interval '1 hour' WHERE id=$1",&[&job]).await.unwrap();
+    let health=novu_postgres_queue::reconciliation::sendgrid_health(&db,"sandbox-env",10,10).await.unwrap();assert_eq!(health["eligibleJobs"],0);
+}
