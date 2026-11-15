@@ -1,3 +1,5 @@
+Discord 연결 관리 화면: Angular 채널 화면에서 API 키로 수신자·대상 바인딩을 조회·등록·수정·삭제한다. 수정과 삭제는 조회한 revision을 사용하며 결과 불명 시 자동 재요청을 막는다. Angular 테스트 247건과 빌드가 통과했고 격리 Docker PostgreSQL·제한 API 로그인·실제 브라우저에서 등록, 목록, 변경, 삭제 및 DB 감사 기록을 확인했다. 화면은 웹훅 URL 등록과 서버 감사 이력 조회를 제공하지 않으며 실제 Discord 발송·원본 Novu와의 종단 간 비교·운영 HA는 미검증이다. [대시보드 README](apps/dashboard/swallow/README.md)를 참고한다.
+
 Discord 환경 정책 관리: 워커 0207과 CLI 및 API 0120은 환경별 활성화 정책의 조회·변경·요청 조회·감사를 제공한다. HTTP 경로는 운영자 JWT와 API DB 로그인에 각각 부여된 환경별 권한을 모두 확인한다. API 0121과 Angular 설정 화면은 정책별 JWT 권한 위임과 감사 조회를 지원한다. Docker PostgreSQL의 제한 로그인과 테스트 JWT로 권한 분리·회수, 환경 격리, 동시 중복 요청, revision 충돌, 감사 실패 롤백과 잠금 경합을 검증했다. 격리 Docker PostgreSQL·실제 API·브라우저로 정책 변경 및 요청·감사 조회와 권한 부여·회수에 따른 접근 변화를 검증했다. 외부 IdP, 실제 Discord, 운영 부하·HA는 미검증이다. [대시보드 README](apps/dashboard/swallow/README.md), [API README](apps/api/rust-api/README.md)와 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
 Discord 구버전 워커 시험: 실제 `75cd2ecc` 워커가 Docker PostgreSQL의 활성 정책에서 작업 완료를 거절당하고 알림·Discord 작업을 롤백하는 것을 확인했다. 구버전 종료 및 강제 임대 만료 후 현재 워커가 복구해 Discord 작업 하나를 생성했다. 단일 호스트·관리자 DB 계정 시험이며 실제 Discord 발송, 운영 부하·다중 호스트 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)에 재현 방법이 있다.

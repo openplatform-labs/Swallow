@@ -5,6 +5,7 @@ import { SlackIntegrations } from './slack-integrations';
 import { TwilioResults } from './twilio-results';
 import { FcmResults } from './fcm-results';
 import { DiscordReviews } from './discord-reviews';
+import { DiscordEndpoints } from './discord-endpoints';
 import { SlackResults } from './slack-results';
 import { ResendAutoPolicy } from './resend-auto-policy';
 import { ResendCooldownPolicy } from './resend-cooldown-policy';
@@ -56,7 +57,7 @@ type SendgridKey = {identifier:string;active:boolean};
 type SendgridKeyAudit = {id:string;identifier:string;action:string;userId:string;recordedAt:string};
 
 @Component({
-  imports: [FormsModule, ClrAlertModule, FcmIntegrations, SlackIntegrations, TwilioResults, FcmResults, DiscordReviews, SlackResults, SendgridResults, ResendAutoPolicy, ResendCooldownPolicy, DiscordPolicy, ResendAutoHealth],
+  imports: [FormsModule, ClrAlertModule, FcmIntegrations, SlackIntegrations, TwilioResults, FcmResults, DiscordReviews, DiscordEndpoints, SlackResults, SendgridResults, ResendAutoPolicy, ResendCooldownPolicy, DiscordPolicy, ResendAutoHealth],
   selector: 'app-root',
   styleUrl: './app.css',
   templateUrl: './app.html',
@@ -83,6 +84,7 @@ export class App implements OnDestroy {
   get policyBusy():boolean { return this.resendPolicyBusy || this.resendCooldownPolicyBusy || this.discordPolicyBusy; }
   fcmBusy=false;
   slackBusy=false;
+  discordEndpointsBusy=false;
   sendgridApiKey='';
   sendgridIdentifier='';
   sendgridPublicKey='';
@@ -1149,7 +1151,7 @@ export class App implements OnDestroy {
   }
 
   setSection(next: Section): void {
-    if(this.fcmBusy||this.slackBusy)return;
+    if(this.fcmBusy||this.slackBusy||this.discordEndpointsBusy)return;
     if(this.oidcRevokeStatus()==='sending')return;
     if(this.sendgridWriteStatus()==='sending')return;
     if (this.resendDecisionStatus()==='sending' || this.resendDecisionStatus()==='preparing' || this.slackDecisionBusy || this.twilioDecisionBusy || this.fcmReviewBusy || this.discordReviewBusy || this.policyBusy || (this.createStatus()==='sending' || this.subscriberEditStatus()==='saving' || this.subscriberProfileRetryStatus()==='retrying' || this.subscriberCreateRetryStatus()==='retrying' || this.subscriberDeleteRetryStatus()==='retrying') || this.decisionStatus() === 'sending' || this.permissionChangeStatus()==='sending' || (this.grantChangeStatus()==='sending'||this.policyBusy) || this.workflowStatus()==='saving' || this.providerStatus()==='saving' || this.workflowRetryStatus()==='retrying') return;

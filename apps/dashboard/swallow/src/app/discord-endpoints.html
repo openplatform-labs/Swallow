@@ -1,0 +1,21 @@
+<section class="card subscriber-card"><div class="card-block"><h2>Discord 수신자 연결</h2>
+<p>워커에 미리 등록된 대상 ID를 구독자에 연결합니다. 웹훅 주소는 이 화면과 API에 표시되지 않습니다. 환경 API 키에 Discord 연결 읽기·쓰기 권한이 각각 필요합니다.</p>
+<label for="discord-endpoint-key">환경 API 키</label><input id="discord-endpoint-key" type="password" name="discordEndpointKey" [(ngModel)]="key" (ngModelChange)="clear()" [disabled]="writeStatus()==='sending' || writeStatus()==='unknown'" autocomplete="off" spellcheck="false">
+<button type="button" class="btn btn-outline" (click)="list()" [disabled]="status()==='loading' || writeStatus()==='sending'">연결 목록 조회</button><button type="button" class="btn btn-outline" (click)="clear(true)" [disabled]="writeStatus()==='sending' || (writeStatus()==='unknown' && !ackUnknown)">인증 및 화면 지우기</button>
+@if(status()==='loading'){<p role="status">조회 중입니다.</p>} @else if(status()==='error'){<p role="alert">연결을 조회하지 못했습니다. 인증·권한과 식별자를 확인하세요.</p>}
+@else if(status()==='loaded') { @if(rows().length===0){<p>조회된 연결이 없습니다.</p>} @else {<div class="table-wrap"><table class="table"><thead><tr><th>연결 ID</th><th>구독자</th><th>대상 ID</th><th>컨텍스트</th><th>Revision</th></tr></thead><tbody>@for(row of rows();track row.identifier){<tr><td>{{row.identifier}}</td><td>{{row.subscriberId}}</td><td>{{row.destinationId}}</td><td>{{row.contextKeys.join(', ')}}</td><td>{{row.revision}}</td></tr>}</tbody></table></div>}<button type="button" class="btn btn-sm btn-outline" (click)="list(true)" [disabled]="!next() || writeStatus()==='sending'">다음</button> }
+<form class="decision-form" (ngSubmit)="save()">
+<label for="discord-endpoint-operation">작업</label><select id="discord-endpoint-operation" name="discordEndpointOperation" [(ngModel)]="operation" (ngModelChange)="forgetSelection()" [disabled]="writeStatus()==='sending' || writeStatus()==='unknown'"><option value="create">연결 등록</option><option value="update">연결 변경</option><option value="delete">연결 삭제</option></select>
+<label for="discord-endpoint-id">연결 ID</label><input id="discord-endpoint-id" name="discordEndpointId" [(ngModel)]="identifier" (ngModelChange)="forgetSelection()" [disabled]="writeStatus()==='sending' || writeStatus()==='unknown'" autocomplete="off" required>
+@if(operation!=='create'){<button type="button" class="btn btn-outline" (click)="review()" [disabled]="status()==='loading' || writeStatus()==='sending' || writeStatus()==='unknown'">변경 대상 조회</button>}
+@if(selected();as target){<p>조회한 대상: {{target.identifier}} · 구독자 {{target.subscriberId}} · 대상 {{target.destinationId}} · revision {{target.revision}}</p>}
+@if(operation!=='delete'){<label for="discord-endpoint-subscriber">구독자 ID</label><input id="discord-endpoint-subscriber" name="discordEndpointSubscriber" [(ngModel)]="subscriberId" [disabled]="operation==='update' || writeStatus()==='sending' || writeStatus()==='unknown'" autocomplete="off" required>
+<label for="discord-endpoint-destination">대상 ID</label><input id="discord-endpoint-destination" name="discordEndpointDestination" [(ngModel)]="destinationId" [disabled]="writeStatus()==='sending' || writeStatus()==='unknown'" autocomplete="off" required>
+<label for="discord-endpoint-context">컨텍스트 JSON (선택)</label><textarea id="discord-endpoint-context" name="discordEndpointContext" [(ngModel)]="contextText" [disabled]="writeStatus()==='sending' || writeStatus()==='unknown'" placeholder='{"tenant":"example"}'></textarea><p>종류와 ID의 문자열 객체를 입력하세요. 비우면 컨텍스트가 제거됩니다.</p>}
+<label><input type="checkbox" name="discordEndpointConfirm" [(ngModel)]="confirmed" [disabled]="writeStatus()==='sending' || writeStatus()==='unknown'"> 선택한 작업을 실행합니다</label>
+<button type="submit" class="btn btn-primary" [disabled]="!confirmed || (operation!=='create' && !selected()) || status()==='loading' || writeStatus()==='sending' || writeStatus()==='unknown'">연결 작업 실행</button>
+</form>
+@if(message()){<p role="status">{{message()}}</p>}
+@if(writeStatus()==='unknown'){<label><input type="checkbox" name="discordEndpointResolved" [(ngModel)]="ackUnknown"> 현재 목록과 서버 감사 기록을 확인하고 이 화면의 요청 상태를 지웁니다.</label><button type="button" class="btn btn-outline" [disabled]="!ackUnknown" (click)="clear()">결과 확인 후 계속</button>}
+<p>수정·삭제는 조회한 revision이 변경되면 거절됩니다. 결과가 불명인 경우 자동으로 재요청하지 말고 서버 기록을 확인하세요. 화면을 떠나거나 새로고침하면 요청 상태가 사라집니다. 이 API는 Novu 원본 연결 API가 아닌 Swallow 확장입니다.</p>
+</div></section>

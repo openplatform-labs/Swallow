@@ -340,3 +340,9 @@ The settings permission panel supports the Discord review list and review grants
 요청 정보와 토큰은 화면 메모리에만 보관하므로 새로고침 전에 요청 ID와 내용을 기록한다. 감사 목록은 JWT 경로만 보여 주고 단일 스냅샷이나 전체 변경 이력을 보장하지 않는다. Angular 테스트 242개와 빌드가 통과했다. `scripts/test-discord-policy-browser.sh`는 격리 Docker PostgreSQL, 제한 API 로그인, 테스트 JWT 및 실제 브라우저에서 제출 전 미변경, 정책 변경, 요청·감사 조회 및 다른 사용자·환경의 거절을 검증한다. 외부 IdP, 실제 Discord 및 운영 HA는 검증하지 않았다. 빌드에 기존 번들·CSS 예산 경고가 남아 있다.
 
 권한 위임 화면을 포함한 Angular 테스트 243개와 빌드가 통과했다. `scripts/test-discord-policy-grants-browser.sh`는 격리 PostgreSQL, 제한 API 로그인, 테스트 JWT 및 실제 브라우저에서 세 정책 권한 부여와 위임 감사 조회, 대상의 정책 조회·감사 접근, 조회 권한 회수와 다른 권한 유지를 확인한다. 외부 IdP와 운영 HA는 검증하지 않았다.
+
+# Discord 수신자 연결
+
+채널 화면에서 환경 API 키로 Discord 연결을 목록 조회하고 구독자와 미리 등록된 대상 ID를 연결·변경·삭제한다. 변경과 삭제는 현재 연결을 먼저 조회하고 revision을 보내며 다른 변경이 있으면 거절된다. 선택적 컨텍스트는 최대 5개의 종류·ID 문자열을 가진 JSON 객체다. 빈 값은 컨텍스트를 지우며 변경 시 기존 구독자는 바꿀 수 없다. `.`와 `..` 연결 ID는 브라우저 URL 경로 정규화 때문에 이 화면에서 변경할 수 없다. API와 권한·대상 등록은 [API README](../../api/rust-api/README.md)의 Discord 바인딩 설명을 따른다. 웹훅 URL 설정, 서버 감사 이력 조회 및 Discord 원본 API 호환 화면은 제공하지 않는다.
+
+응답이 불명확하면 자동 재전송하지 않는다. 현재 목록과 서버 감사 기록을 확인한 뒤 화면의 확인 절차로 요청 상태를 지워야 한다. 화면 이탈이나 새로고침 시 요청 상태와 키는 메모리에서 사라진다. Angular 테스트 247개와 빌드가 통과했다. `scripts/test-discord-endpoints-browser.sh`는 격리 Docker PostgreSQL, 제한 API 로그인, 시험용 환경 API 키 및 실제 브라우저로 등록·조회·변경·삭제와 DB 감사 기록을 검증한다. 실제 Discord 발송, 원본 Novu 서버 및 운영 HA는 검증하지 않았다. 빌드에는 번들·CSS 크기 경고가 남아 있다.

@@ -7,7 +7,7 @@
     <nav class="sidenav" aria-label="주 메뉴">
       <div class="nav-heading">WORKSPACE</div>
       @for (item of sections; track item.id) {
-        <button class="nav-entry" [class.active]="section() === item.id" [attr.aria-current]="section() === item.id ? 'page' : null" [disabled]="resendDecisionStatus() === 'sending' || resendDecisionStatus() === 'preparing' || slackDecisionBusy || twilioDecisionBusy || fcmReviewBusy || discordReviewBusy || policyBusy || sendgridWriteStatus() === 'sending' || createStatus() === 'sending' || subscriberEditStatus() === 'saving' || subscriberProfileRetryStatus() === 'retrying' || subscriberCreateRetryStatus() === 'retrying' || subscriberDeleteRetryStatus() === 'retrying' || decisionStatus() === 'sending' || (permissionChangeStatus() === 'sending' || (grantChangeStatus() === 'sending' || policyBusy)) || workflowStatus() === 'saving' || providerStatus() === 'saving' || workflowRetryStatus() === 'retrying'" (click)="setSection(item.id)">
+        <button class="nav-entry" [class.active]="section() === item.id" [attr.aria-current]="section() === item.id ? 'page' : null" [disabled]="discordEndpointsBusy || resendDecisionStatus() === 'sending' || resendDecisionStatus() === 'preparing' || slackDecisionBusy || twilioDecisionBusy || fcmReviewBusy || discordReviewBusy || policyBusy || sendgridWriteStatus() === 'sending' || createStatus() === 'sending' || subscriberEditStatus() === 'saving' || subscriberProfileRetryStatus() === 'retrying' || subscriberCreateRetryStatus() === 'retrying' || subscriberDeleteRetryStatus() === 'retrying' || decisionStatus() === 'sending' || (permissionChangeStatus() === 'sending' || (grantChangeStatus() === 'sending' || policyBusy)) || workflowStatus() === 'saving' || providerStatus() === 'saving' || workflowRetryStatus() === 'retrying'" (click)="setSection(item.id)">
           <span class="nav-icon" aria-hidden="true">{{ item.short }}</span><span>{{ item.label }}</span>
         </button>
       }
@@ -355,6 +355,7 @@
         <div class="page-heading"><div><div class="eyebrow">CHANNELS</div><h1>발송 채널</h1><p>FCM·Slack 통합과 SendGrid 웹훅 서명 공개키를 관리합니다.</p></div></div>
         <app-fcm-integrations [apiOrigin]="apiOrigin" (busy)="fcmBusy=$event"></app-fcm-integrations>
         <app-slack-integrations [apiOrigin]="apiOrigin" (busy)="slackBusy=$event"></app-slack-integrations>
+        <app-discord-endpoints [apiOrigin]="apiOrigin" (busy)="discordEndpointsBusy=$event"></app-discord-endpoints>
         <section class="card subscriber-card"><div class="card-block"><h2>SendGrid 웹훅 공개키</h2>
           <p>환경 API 키의 별도 읽기·쓰기 권한이 필요합니다. API 키는 이 화면에만 유지됩니다.</p>
           <label for="sg-api-key">환경 API 키</label><input id="sg-api-key" type="password" name="sendgridApiKey" [(ngModel)]="sendgridApiKey" (ngModelChange)="clearSendgrid()" [disabled]="sendgridWriteStatus()==='sending'" autocomplete="off" spellcheck="false">
