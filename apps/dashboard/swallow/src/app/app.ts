@@ -14,6 +14,7 @@ import { ResendCooldownPolicy } from './resend-cooldown-policy';
 import { DiscordPolicy } from './discord-policy';
 import { DiscordRetryPolicy } from './discord-retry-policy';
 import { DiscordCooldown } from './discord-cooldown';
+import { AlertTiming } from './alert-timing';
 import { DiscordRetryPolicyGrants } from './discord-retry-policy-grants';
 import { ResendAutoHealth } from './resend-auto-health';
 import { SendgridResults } from './sendgrid-results';
@@ -62,7 +63,7 @@ type SendgridKey = {identifier:string;active:boolean};
 type SendgridKeyAudit = {id:string;identifier:string;action:string;userId:string;recordedAt:string};
 
 @Component({
-  imports: [FormsModule, ClrAlertModule, FcmIntegrations, SlackIntegrations, TwilioResults, FcmResults, DiscordReviews, SmtpReviews, SmtpScope, DiscordEndpoints, SlackResults, SendgridResults, ResendAutoPolicy, ResendCooldownPolicy, DiscordPolicy, DiscordRetryPolicy, DiscordCooldown, DiscordRetryPolicyGrants, ResendAutoHealth],
+  imports: [FormsModule, ClrAlertModule, FcmIntegrations, SlackIntegrations, TwilioResults, FcmResults, DiscordReviews, SmtpReviews, SmtpScope, DiscordEndpoints, SlackResults, SendgridResults, ResendAutoPolicy, ResendCooldownPolicy, DiscordPolicy, DiscordRetryPolicy, DiscordCooldown, AlertTiming, DiscordRetryPolicyGrants, ResendAutoHealth],
   selector: 'app-root',
   styleUrl: './app.css',
   templateUrl: './app.html',
@@ -87,10 +88,11 @@ export class App implements OnDestroy {
   resendCooldownPolicyBusy=false;
   discordPolicyBusy=false;
   discordCooldownBusy=false;
+  alertTimingBusy=false;
   discordRetryPolicyBusy=false;
   discordRetryPolicyGrantsBusy=false;
   smtpScopeBusy = false;
-  get policyBusy():boolean { return this.smtpScopeBusy || this.resendPolicyBusy || this.resendCooldownPolicyBusy || this.discordPolicyBusy || this.discordRetryPolicyBusy || this.discordCooldownBusy || this.discordRetryPolicyGrantsBusy; }
+  get policyBusy():boolean { return this.alertTimingBusy || this.smtpScopeBusy || this.resendPolicyBusy || this.resendCooldownPolicyBusy || this.discordPolicyBusy || this.discordRetryPolicyBusy || this.discordCooldownBusy || this.discordRetryPolicyGrantsBusy; }
   fcmBusy=false;
   slackBusy=false;
   discordEndpointsBusy=false;
