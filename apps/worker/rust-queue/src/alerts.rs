@@ -893,6 +893,7 @@ pub async fn send_email(
         .map_err(|error| match error {
             crate::resend::SendError::InvalidConfiguration
             | crate::resend::SendError::InvalidMessage => AlertError::InvalidConfiguration,
+            crate::resend::SendError::RateLimited(_) => AlertError::Rejected(429),
             crate::resend::SendError::Provider(code)
                 if (400..500).contains(&code) && code != 408 && code != 409 =>
             {

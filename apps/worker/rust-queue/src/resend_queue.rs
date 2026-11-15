@@ -304,11 +304,18 @@ async fn process_one_inner(
         Some(id) => format!("swallow/{}/retry/{id}", job.id),
         None => format!("swallow/{}", job.id),
     };
-    let (state, code, id, diagnostic) = match provider
+    let (state, code, id, diagnostic, retry_after) = match provider
         .send_with_correlation(&email, Some(&key), correlation)
         .await
     {
-        Ok(id) => ("accepted", None, Some(id), None),
+        Ok(id) => ("accepted", None, Some(id), None, None),
+        Err(SendError::RateLimited(delay)) => (
+            "rejected",
+            Some(429),
+            None,
+            Some("Resend rejected request"),
+            delay,
+        ),
         Err(SendError::Provider(code))
             if !(400..500).contains(&code) || [408, 409].contains(&code) =>
         {
@@ -317,6 +324,7 @@ async fn process_one_inner(
                 Some(i32::from(code)),
                 None,
                 Some("Resend outcome unknown"),
+                None,
             )
         }
         Err(SendError::Provider(code)) => (
@@ -324,11 +332,12 @@ async fn process_one_inner(
             Some(i32::from(code)),
             None,
             Some("Resend rejected request"),
+            None,
         ),
         Err(SendError::Transport | SendError::InvalidResponse) => {
-            ("unknown", None, None, Some("Resend outcome unknown"))
+            ("unknown", None, None, Some("Resend outcome unknown"), None)
         }
-        Err(_) => ("rejected", None, None, Some("invalid Resend request")),
+        Err(_) => ("rejected", None, None, Some("invalid Resend request"), None),
     };
     let tx = client.transaction().await?;
     if !live(&tx, &job).await? {
@@ -337,6 +346,10 @@ async fn process_one_inner(
     }
     let updated=tx.execute("UPDATE novu_rust_resend_attempts SET state=$3,http_status=$4,provider_message_id=$5,updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$2 AND state='dispatching'", &[&job.id,&environment,&state,&code,&id]).await?;
     if updated == 1 {
+        if let Some(seconds) = retry_after {
+            let seconds = i32::try_from(seconds).expect("bounded retry-after");
+            tx.execute("UPDATE public.novu_rust_resend_attempts SET retry_after_seconds=$3, retry_not_before=clock_timestamp()+make_interval(secs => $3::integer::double precision) WHERE job_id=$1 AND environment_id=$2", &[&job.id,&environment,&seconds]).await?;
+        }
         if email.message_id.is_some() {
             tx.execute("UPDATE novu_rust_email_messages SET delivery_state=$3,identifier=CASE WHEN $3='accepted' THEN $4 ELSE identifier END,status=CASE WHEN $3='accepted' THEN 'sent' ELSE 'error' END,error_id=CASE WHEN $3='accepted' THEN NULL ELSE 'mail_unexpected_error' END,error_text=CASE WHEN $3='accepted' THEN NULL ELSE $5 END WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id,&state,&id,&diagnostic]).await?;
         }
@@ -386,6 +399,58 @@ mod tests {
         net::TcpListener,
     };
     use tokio_postgres::NoTls;
+
+    #[tokio::test]
+    #[ignore = "requires migrated disposable PostgreSQL and loopback"]
+    async fn rate_limit_header_is_recorded_on_the_attempt() {
+        let (mut db, driver) =
+            tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(), NoTls)
+                .await
+                .unwrap();
+        tokio::spawn(async move { driver.await.unwrap() });
+        let env = format!("rate-limit-{}", Uuid::new_v4());
+        db.execute(
+            "INSERT INTO public.novu_rust_environments VALUES ($1,'org')",
+            &[&env],
+        )
+        .await
+        .unwrap();
+        let job = Uuid::new_v4();
+        enqueue(
+            &db,
+            job,
+            &env,
+            JOB_KIND,
+            &json!({"to":["to@example.test"],"subject":"rate","html":"test"}),
+        )
+        .await
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let provider = Resend::test_endpoint(
+            Config {
+                api_key: "re_test".into(),
+                from: "from@example.test".into(),
+                sender_name: String::new(),
+            },
+            &format!("http://{}/emails", listener.local_addr().unwrap()),
+        )
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 4096];
+            assert!(socket.read(&mut buf).await.unwrap() > 0);
+            socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        });
+        assert!(process_one(&mut db, &env, &provider).await.unwrap());
+        server.await.unwrap();
+        let row=db.query_one("SELECT j.status,a.state,a.http_status,a.retry_after_seconds,a.retry_not_before > a.updated_at FROM public.novu_queue_jobs j JOIN public.novu_rust_resend_attempts a ON a.job_id=j.id WHERE j.id=$1 AND j.environment_id=$2", &[&job,&env]).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), "failed");
+        assert_eq!(row.get::<_, String>(1), "rejected");
+        assert_eq!(row.get::<_, Option<i32>>(2), Some(429));
+        assert_eq!(row.get::<_, Option<i32>>(3), Some(30));
+        assert!(row.get::<_, bool>(4));
+        assert!(!process_one(&mut db, &env, &provider).await.unwrap());
+    }
 
     #[tokio::test]
     #[ignore = "requires the workflow_email_attachments API fixture and loopback"]

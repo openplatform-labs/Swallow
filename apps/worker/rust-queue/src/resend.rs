@@ -18,6 +18,7 @@ pub enum SendError {
     Transport,
     InvalidResponse,
     Provider(u16),
+    RateLimited(Option<u32>),
 }
 impl fmt::Display for SendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -27,6 +28,7 @@ impl fmt::Display for SendError {
             Self::Transport => f.write_str("Resend transport failed"),
             Self::InvalidResponse => f.write_str("invalid Resend success response"),
             Self::Provider(code) => write!(f, "Resend returned HTTP {code}"),
+            Self::RateLimited(_) => f.write_str("Resend returned HTTP 429"),
         }
     }
 }
@@ -202,6 +204,21 @@ impl Resend {
             request = request.header("Idempotency-Key", key);
         }
         let mut response = request.send().await.map_err(|_| SendError::Transport)?;
+        if response.status().as_u16() == 429 {
+            // Resend documents a delay in seconds. Never shorten an invalid,
+            // repeated, or excessive header into a misleading delay.
+            let mut headers = response.headers().get_all(header::RETRY_AFTER).iter();
+            let retry_after = match (headers.next(), headers.next()) {
+                (Some(value), None) => value.to_str().ok().and_then(|s| {
+                    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+                        return None;
+                    }
+                    s.parse::<u32>().ok().filter(|seconds| *seconds <= 86_400)
+                }),
+                _ => None,
+            };
+            return Err(SendError::RateLimited(retry_after));
+        }
         if !response.status().is_success() {
             return Err(SendError::Provider(response.status().as_u16()));
         }
@@ -337,11 +354,43 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[tokio::test]
+    async fn rate_limit_retry_after_is_bounded_and_rejects_ambiguous_headers() {
+        for (headers, expected) in [
+            ("Retry-After: 30\r\n", Some(30)),
+            ("Retry-After: 0\r\n", Some(0)),
+            ("Retry-After: 86400\r\n", Some(86400)),
+            ("Retry-After: 86401\r\n", None),
+            ("Retry-After: 1.5\r\n", None),
+            ("Retry-After: -1\r\n", None),
+            ("Retry-After: 1\r\nRetry-After: 2\r\n", None),
+            ("Retry-After: Wed, 21 Oct 2015 07:28:00 GMT\r\n", None),
+            ("", None),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/emails", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0; 4096];
+                assert!(socket.read(&mut buf).await.unwrap() > 0);
+                let reply = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\n{headers}Content-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            });
+            let provider = Resend::test_endpoint(config(), &endpoint).unwrap();
+            assert_eq!(
+                provider.send(&message(), None).await,
+                Err(SendError::RateLimited(expected))
+            );
+            server.await.unwrap();
+        }
+    }
+    #[tokio::test]
     async fn requests_and_responses_are_bounded() {
         for (status, body, expected) in [
             (200, "{\"id\":\"provider-id\"}", Ok("provider-id")),
             (200, "{}", Err(SendError::InvalidResponse)),
-            (429, "{}", Err(SendError::Provider(429))),
+            (429, "{}", Err(SendError::RateLimited(None))),
             (500, "{}", Err(SendError::Provider(500))),
             (302, "{}", Err(SendError::Provider(302))),
         ] {
