@@ -500,6 +500,32 @@ fn child_path(name: &str) -> Result<PathBuf> {
     path.set_file_name(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     Ok(path)
 }
+async fn load_timing_settings(config: &mut Config, environment: &str) -> Result<()> {
+    let (pg, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
+    let (db, connection) = tokio::time::timeout(Duration::from_secs(10), pg.connect(tls)).await
+        .map_err(|_| "alert timing database connection timed out")??;
+    tokio::spawn(async move { let _ = connection.await; });
+    let rows = tokio::time::timeout(Duration::from_secs(10), db.query(
+        "SELECT channel,target_id,grace,heartbeat,cooldown FROM public.novu_rust_alert_timing_list($1)", &[&environment]
+    )).await.map_err(|_| "alert timing query timed out")??;
+    if rows.len() > 1024 { return Err("too many alert timing settings".into()); }
+    for row in rows {
+        let channel: String = row.get(0);
+        let id: String = row.get(1);
+        if let Some(target) = config.targets.iter_mut().find(|target| target.key() == (channel.as_str(), id.as_str())) {
+            let timing = AlertTiming {
+                resend_grace_seconds: row.get::<_, Option<i32>>(2).map(|v| v as u32),
+                resend_heartbeat_max_seconds: row.get::<_, Option<i32>>(3).map(|v| v as u32),
+                cooldown_seconds: row.get::<_, Option<i32>>(4).map(|v| v as u32),
+            };
+            if !timing.valid() { return Err("invalid stored alert timing".into()); }
+            match target {
+                Target::Slack { alert_timing, .. } | Target::Email { alert_timing, .. } => *alert_timing = Some(timing),
+            }
+        }
+    }
+    Ok(())
+}
 #[tokio::main]
 async fn main() -> Result<()> {
     novu_postgres_queue::shutdown::run_until_signal_with_setting(
@@ -535,7 +561,12 @@ async fn run(stop: novu_postgres_queue::shutdown::Stop) -> Result<()> {
         )),
         Err(_) => return Err("invalid fanout target timeout".into()),
     };
-    let config = read_config(file)?;
+    let mut config = read_config(file)?;
+    match std::env::var("SWALLOW_ALERT_TIMING_SOURCE").as_deref() {
+        Ok("postgres") => load_timing_settings(&mut config, command_args[0]).await?,
+        Ok("file") | Err(std::env::VarError::NotPresent) => {},
+        _ => return Err("invalid alert timing source".into()),
+    }
     let preflight = match std::env::var("SWALLOW_ALERT_FANOUT_PREFLIGHT_PAIRS").as_deref() {
         Ok("true") => true,
         Ok("false") | Err(std::env::VarError::NotPresent) => false,

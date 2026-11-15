@@ -13,3 +13,4 @@ cargo run --quiet --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.t
 cargo run --quiet --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --bin migrate-worker -- apply worker "$ROOT/apps/worker/rust-queue/migrations"
 cargo test --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --test alert_fanout_process
 cargo test --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --test alert_fanout per_target_delivery_checks_control_real_alert_children -- --ignored
+cargo test --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --test alert_timing_db -- --ignored
