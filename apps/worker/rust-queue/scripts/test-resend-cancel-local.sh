@@ -13,11 +13,12 @@ cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-wo
 cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply worker "$WORKER/migrations"
 cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply api "$API/migrations"
 "$TEST_PG_BIN/psql" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
-CREATE ROLE cancel_fixture LOGIN; CREATE ROLE cancel_unprivileged LOGIN;
-GRANT USAGE ON SCHEMA public TO cancel_fixture,cancel_unprivileged;
+CREATE ROLE cancel_fixture LOGIN; CREATE ROLE cancel_unprivileged LOGIN; CREATE ROLE cancel_resolver LOGIN;
+GRANT USAGE ON SCHEMA public TO cancel_fixture,cancel_unprivileged,cancel_resolver;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_reserve(text,uuid,uuid,text),public.novu_rust_resend_cancel_finish(text,uuid,text,integer),public.novu_rust_resend_cancel_get(text,uuid) TO cancel_fixture,cancel_unprivileged;
+GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_resolve(text,uuid,uuid,text,text),public.novu_rust_resend_cancel_resolution_get(text,uuid),public.novu_rust_resend_cancel_get(text,uuid) TO cancel_resolver,cancel_fixture;
 INSERT INTO public.novu_rust_environments VALUES ('cancel-env','org'),('cancel-other','org');
-INSERT INTO public.novu_rust_resend_cancel_operators SELECT 'cancel-env',rolname,oid,true,true FROM pg_roles WHERE rolname='cancel_fixture';
+INSERT INTO public.novu_rust_resend_cancel_operators(environment_id,database_principal,principal_oid,can_cancel,can_read,can_resolve) SELECT 'cancel-env',rolname,oid,rolname='cancel_fixture',true,rolname='cancel_resolver' FROM pg_roles WHERE rolname IN ('cancel_fixture','cancel_resolver');
 INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status,resend_scheduled_at) VALUES
  ('11111111-1111-4111-8111-111111111111','cancel-env','experimental_resend_email','{}','completed',clock_timestamp()+interval '1 hour'),
  ('22222222-2222-4222-8222-222222222222','cancel-env','experimental_resend_email','{}','completed',clock_timestamp()+interval '1 hour'),

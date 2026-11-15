@@ -6,8 +6,8 @@ use uuid::Uuid;
 #[tokio::main]
 async fn main() -> Result<(),Box<dyn Error+Send+Sync>> {
     let args:Vec<String>=std::env::args().skip(1).collect();
-    if !(args.len()==3 && args[0]=="get" || args.len()==5 && args[0]=="cancel") {
-        return Err("usage: resend-cancel get ENV REQUEST_UUID | cancel ENV REQUEST_UUID JOB_UUID REASON".into());
+    if !(args.len()==3 && (args[0]=="get" || args[0]=="resolution-get") || args.len()==5 && args[0]=="cancel" || args.len()==6 && args[0]=="resolve") {
+        return Err("usage: resend-cancel get ENV REQUEST_UUID | resolution-get ENV RESOLUTION_UUID | cancel ENV REQUEST_UUID JOB_UUID REASON | resolve ENV RESOLUTION_UUID REQUEST_UUID confirmed|not_cancelled REASON".into());
     }
     let request=Uuid::parse_str(&args[2])?;
     // Validate the provider configuration before committing an unknown marker.
@@ -31,9 +31,15 @@ async fn main() -> Result<(),Box<dyn Error+Send+Sync>> {
     let (config,tls)=novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let (db,connection)=config.connect(tls).await?;
     tokio::spawn(async move {if connection.await.is_err(){eprintln!("database connection failed");}});
-    if args[0]=="get" {
-        let row=db.query_one("SELECT public.novu_rust_resend_cancel_get($1,$2)",&[&args[1],&request]).await?;
+    if args[0]=="get" || args[0]=="resolution-get" {
+        let sql=if args[0]=="get" {"SELECT public.novu_rust_resend_cancel_get($1,$2)"} else {"SELECT public.novu_rust_resend_cancel_resolution_get($1,$2)"};
+        let row=db.query_one(sql,&[&args[1],&request]).await?;
         let result:Option<serde_json::Value>=row.get(0);println!("{}",serde_json::json!({"request":result}));return Ok(());
+    }
+    if args[0]=="resolve" {
+        let target=Uuid::parse_str(&args[3])?;
+        let row=db.query_one("SELECT public.novu_rust_resend_cancel_resolve($1,$2,$3,$4,$5)",&[&args[1],&request,&target,&args[4],&args[5]]).await?;
+        println!("{}",row.get::<_,serde_json::Value>(0));return Ok(());
     }
     let job=Uuid::parse_str(&args[3])?;
     let row=db.query_one("SELECT public.novu_rust_resend_cancel_reserve($1,$2,$3,$4)",&[&args[1],&request,&job,&args[4]]).await?;

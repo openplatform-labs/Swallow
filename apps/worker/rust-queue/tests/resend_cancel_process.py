@@ -42,5 +42,32 @@ try:
     recovered=run('cancel','cancel-env','dddddddd-dddd-4ddd-8ddd-dddddddddddd','33333333-3333-4333-8333-333333333333','concurrent')
     assert recovered.returncode==2 and json.loads(recovered.stdout)['fresh'] is False
     assert len(server.calls)==2
+    resolver=env.copy();resolver['DATABASE_URL']=resolver['DATABASE_URL'].replace('cancel_fixture@','cancel_resolver@')
+    rid='eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
+    assert run('resolve','cancel-env',rid,req2,'not_cancelled','checked',override=env).returncode!=0
+    # A failed audit insert must leave the request unknown.
+    admin=os.environ['DATABASE_URL'];psql=env['TEST_PSQL']
+    failure="CREATE FUNCTION public.fail_cancel_resolution() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$; CREATE TRIGGER fail_cancel_resolution BEFORE INSERT ON public.novu_rust_resend_cancel_resolutions FOR EACH ROW EXECUTE FUNCTION public.fail_cancel_resolution()"
+    subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',failure],check=True,capture_output=True)
+    assert run('resolve','cancel-env',rid,req2,'not_cancelled','checked',override=resolver).returncode!=0
+    assert json.loads(run('get','cancel-env',req2).stdout)['request']['state']=='unknown'
+    subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c','DROP TRIGGER fail_cancel_resolution ON public.novu_rust_resend_cancel_resolutions'],check=True,capture_output=True)
+    resolved=run('resolve','cancel-env',rid,req2,'not_cancelled','checked',override=resolver)
+    assert resolved.returncode==0,(resolved.stdout,resolved.stderr)
+    assert json.loads(resolved.stdout)['replayed'] is False
+    replay=run('resolve','cancel-env',rid,req2,'not_cancelled','checked',override=resolver)
+    assert replay.returncode==0 and json.loads(replay.stdout)['replayed'] is True
+    assert run('resolve','cancel-env',rid,req2,'confirmed','checked',override=resolver).returncode!=0
+    audit=run('resolution-get','cancel-env',rid,override=resolver);assert json.loads(audit.stdout)['request']['decision']=='not_cancelled'
+    late="SELECT public.novu_rust_resend_cancel_finish('cancel-env','%s','confirmed',NULL)"%req2
+    assert subprocess.run([env['TEST_PSQL'],env['DATABASE_URL'],'-qAt','-v','ON_ERROR_STOP=1','-c',late],capture_output=True).returncode!=0
+    # A fresh attempt is now an explicit operator choice, not an automatic retry.
+    retry=run('cancel','cancel-env','cccccccc-cccc-4ccc-8ccc-cccccccccccc',job2,'fixture');assert retry.returncode==2
+    assert server.calls==['/emails/fixture-one/cancel','/emails/fixture-two/cancel','/emails/fixture-two/cancel']
+    request3='dddddddd-dddd-4ddd-8ddd-dddddddddddd';resolution3='ffffffff-ffff-4fff-8fff-ffffffffffff'
+    assert run('resolve','cancel-env',resolution3,request3,'confirmed','provider evidence',override=resolver).returncode==0
+    assert json.loads(run('get','cancel-env',request3).stdout)['request']['state']=='confirmed'
+    assert run('cancel','cancel-env','99999999-9999-4999-8999-999999999999','33333333-3333-4333-8333-333333333333','new').returncode!=0
+    assert len(server.calls)==3
 finally:
     server.shutdown();server.server_close();thread.join()
