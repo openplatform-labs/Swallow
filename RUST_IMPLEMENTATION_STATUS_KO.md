@@ -1,8 +1,14 @@
+## Slack 공유 대기 상태 조회와 경보
+
+워커 0173과 `delivery-reconcile check-slack-cooldown ENV GRACE_SECONDS`는 환경별 공유 대기 활성 여부, 대체 초, 보류 작업 및 예약 시각이 기준 시간 이상 지난 작업 수를 조회한다. `SWALLOW_ALERT_SLACK_COOLDOWN_GRACE_SECONDS`를 설정하면 기존 Slack·메일 운영 경보에 이 상태를 포함한다. 별도 `alert_view` 및 함수 EXECUTE가 필요하며 정책 누락이나 조회 실패도 검사 실패로 처리한다. 경보는 선택형이며 스케줄러와 대체 경보 경로는 운영자가 구성해야 한다.
+
+임시 PostgreSQL 17·제한 DB 로그인·실제 CLI에서 상태·환경 격리·권한 회수와 차단된 경보 예약을 검증했고 모의 Slack·Resend 수신기로 본문을 확인했다. 실제 외부 수신·스케줄러·운영 HA는 미검증이다. `new-condition`에서 실패 작업·Resend 자동 재시도와 같은 조건 비트를 공유하므로 이미 문제가 활성화된 동안 별도 즉시 경보가 보장되지 않는다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
 ## Slack 선택형 환경 공유 대기
 
 워커 0172와 `NOVU_SLACK_SHARED_COOLDOWN=true`를 선택하면 Slack 앱·웹훅·워크플로 발송 워커가 환경별 PostgreSQL 대기 시각을 공유한다. 유효한 HTTP 429 `Retry-After`가 있으면 대기 시각을 연장하고, 안내가 없으면 운영자가 등록한 대체 초를 적용한다. 대기 중 새 작업은 발송 시도 기록 없이 해당 시각으로 연기된다. 이미 429로 실패한 작업의 재시도는 별도 운영자 판정이며 자동 예약되지 않는다. 기본은 꺼져 있고 DB 정책·역할별 함수 권한을 별도로 등록해야 한다.
 
-임시 PostgreSQL 17, 제한 DB 로그인, 모의 Slack과 실제 큐 함수에서 앱·웹훅·워크플로 보류, 대체 시간·기존 대기 시각 유지, 환경 격리·권한 회수·기본 비활성 경로와 정책 잠금 경합을 확인했다. 실제 Slack, 실행 바이너리의 운영 배포, 외부 경보 및 다중 호스트 HA는 미검증이다. 정책 등록·모든 워커의 설정 일치, 이미 시작된 요청과 DB 장애·만료 리스의 한계는 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+임시 PostgreSQL 17, 제한 DB 로그인, 모의 Slack과 실제 큐 함수에서 앱·웹훅·워크플로 보류, 대체 시간·기존 대기 시각 유지, 환경 격리·권한 회수·기본 비활성 경로와 정책 잠금 경합을 확인했다. 상태 조회와 모의 경보는 위 최신 항목을 참고한다. 실제 Slack, 실행 바이너리의 운영 배포, 외부 수신 및 다중 호스트 HA는 미검증이다. 정책 등록·모든 워커의 설정 일치, 이미 시작된 요청과 DB 장애·만료 리스의 한계는 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
 ## Slack 429 지연 재시도 화면
 

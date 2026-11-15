@@ -155,6 +155,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
         _ => return Err("invalid FCM credential alert thresholds".into()),
     };
+    let slack_cooldown_grace = env_optional_i32("SWALLOW_ALERT_SLACK_COOLDOWN_GRACE_SECONDS")?;
+    if slack_cooldown_grace.is_some_and(|v| !(1..=86_400).contains(&v)) { return Err("invalid Slack cooldown grace".into()); }
     let resend_auto_grace = env_optional_i32("SWALLOW_ALERT_RESEND_AUTO_GRACE_SECONDS")?;
     if resend_auto_grace.is_some_and(|v| !(1..=86_400).contains(&v)) {
         return Err("invalid Resend automatic retry grace".into());
@@ -188,6 +190,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         && !push_policy_enabled
         && !failed_jobs_enabled
         && resend_auto_grace.is_none()
+        && slack_cooldown_grace.is_none()
         && queue_wait.is_none()
         && twilio_thresholds.is_none()
         && sendgrid_thresholds.is_none()
@@ -479,6 +482,11 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     } else {
         None
     };
+    let slack_cooldown = if let Some(grace)=slack_cooldown_grace {
+        let result=tokio::time::timeout(operation_timeout,novu_postgres_queue::slack_cooldown::health(&db,&args[0],grace)).await;
+        let values=result.ok().and_then(Result::ok).and_then(|v| Some((v["active"].as_bool()?,v["deferred"].as_u64()?,v["overdue"].as_u64()?)));
+        Some(match values {Some(value)=>Ok(value),None=>{eprintln!("Slack shared cooldown check failed");Err(())}})
+    } else {None};
     let unhealthy = fcm_credentials.is_some_and(|value| match value {
         Ok((healthy, failed, _, minimum)) => healthy < minimum || failed > 0,
         Err(()) => true,
@@ -491,6 +499,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         || sendgrid.is_some_and(|(overdue, stale)| overdue > 0 || stale)
         || failed_jobs_check_failed
         || resend_auto.is_some_and(|v| !matches!(v, Ok((0, 0, 0, 0))))
+        || slack_cooldown.is_some_and(|v| !matches!(v, Ok((false,0,0))))
         || failed_jobs.is_some_and(|n| n > 0)
         || failed_checks.iter().any(|failed| *failed)
         || resend.is_some_and(|(overdue, stale)| overdue > 0 || stale)
@@ -526,6 +535,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         channel_policy_check_failed,
         failed_checks,
         resend_auto,
+        slack_cooldown,
         failed_jobs,
         failed_jobs_check_failed,
         database_probe: None,
@@ -574,6 +584,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         || sendgrid_check_failed
         || failed_jobs_check_failed
         || resend_auto.is_some_and(|value| value.is_err())
+        || slack_cooldown.is_some_and(|value| value.is_err())
         || channel_policy_check_failed
         || failed_checks.iter().any(|failed| *failed);
     let mut needs_review = false;

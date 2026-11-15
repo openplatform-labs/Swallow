@@ -320,6 +320,7 @@ pub struct Alert {
     pub channel_policy_check_failed: bool,
     pub failed_checks: [bool; 5], // resend, queue, attempts, twilio, Slack chat
     pub resend_auto: Option<Result<(u64, u64, u64, u64), ()>>,
+    pub slack_cooldown: Option<Result<(bool, u64, u64), ()>>,
     pub failed_jobs: Option<u64>,
     pub failed_jobs_check_failed: bool,
     pub database_probe: Option<(String, bool)>,
@@ -355,10 +356,11 @@ impl Alert {
             || self
                 .resend_auto
                 .is_some_and(|value| matches!(value,Ok((a,b,c,d)) if a>0||b>0||c>0||d>0))
+            || self.slack_cooldown.is_some_and(|value| matches!(value,Ok((active,deferred,overdue)) if active||deferred>0||overdue>0))
         {
             mask |= 1 << 18;
         }
-        if self.failed_jobs_check_failed || self.resend_auto.is_some_and(|value| value.is_err()) {
+        if self.failed_jobs_check_failed || self.resend_auto.is_some_and(|value| value.is_err()) || self.slack_cooldown.is_some_and(|value| value.is_err()) {
             mask |= 1 << 19;
         }
         if self
@@ -447,13 +449,14 @@ impl Alert {
         }
         // Both checks share the existing failed-job cooldown category. Do
         // not mark it observed healthy if either enabled check failed.
-        if (self.failed_jobs.is_some() || self.resend_auto.is_some())
+        if (self.failed_jobs.is_some() || self.resend_auto.is_some() || self.slack_cooldown.is_some())
             && !self.failed_jobs_check_failed
             && !self.resend_auto.is_some_and(|value| value.is_err())
+            && !self.slack_cooldown.is_some_and(|value| value.is_err())
         {
             known |= 1 << 18;
         }
-        if self.failed_jobs.is_some() || self.failed_jobs_check_failed || self.resend_auto.is_some()
+        if self.failed_jobs.is_some() || self.failed_jobs_check_failed || self.resend_auto.is_some() || self.slack_cooldown.is_some()
         {
             known |= 1 << 19;
         }
@@ -582,6 +585,9 @@ impl Alert {
         }
         if let Some(result) = self.resend_auto {
             match result {Ok((rate,exhausted,deferred,overdue))=>details.push(format!("Resend 429 aged: {rate}; retries exhausted: {exhausted}; guard deferred: {deferred}; automatic retries overdue: {overdue}")),Err(())=>details.push("Resend automatic retry check failed".into())}
+        }
+        if let Some(result) = self.slack_cooldown {
+            match result { Ok((active,deferred,overdue))=>details.push(format!("Slack shared cooldown active: {active}; deferred jobs: {deferred}; overdue deferred jobs: {overdue}")),Err(())=>details.push("Slack shared cooldown check failed".into()) }
         }
         if let Some(count) = self.failed_jobs {
             details.push(format!("unacknowledged failed jobs: {count}"));
@@ -1333,6 +1339,7 @@ mod tests {
             channel_policy_check_failed: false,
             failed_checks: [false; 5],
             resend_auto: None,
+            slack_cooldown: None,
             failed_jobs: None,
             failed_jobs_check_failed: false,
             database_probe: None,
@@ -1398,6 +1405,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn slack_cooldown_health_shares_failed_job_bits_without_clearing_failed_checks() {
+        let mut a=alert();a.resend_enabled=false;a.slack_cooldown=Some(Ok((false,0,0)));
+        assert_eq!(a.condition_mask()&(1<<18),0);assert_ne!(a.observed_condition_mask()&(1<<18),0);
+        a.slack_cooldown=Some(Ok((true,0,0)));assert_ne!(a.condition_mask()&(1<<18),0);
+        a.slack_cooldown=Some(Ok((false,2,1)));assert!(a.text().unwrap().contains("deferred jobs: 2; overdue deferred jobs: 1"));
+        a.failed_jobs=Some(0);a.slack_cooldown=Some(Err(()));assert_ne!(a.condition_mask()&(1<<19),0);assert_eq!(a.observed_condition_mask()&(1<<18),0);
+        a.slack_cooldown=Some(Ok((false,0,0)));a.resend_auto=Some(Err(()));assert_eq!(a.observed_condition_mask()&(1<<18),0);
+    }
+    #[tokio::test]
+    async fn slack_cooldown_reaches_slack_and_resend_alert_payloads() {
+        let mut a=alert();a.resend_enabled=false;a.slack_cooldown=Some(Ok((true,2,1)));
+        let (url,server)=mock_server("200 OK","ok").await;let slack=SlackWebhook::with_endpoint(url).unwrap();
+        let (email_url,email_server)=mock_server("200 OK",r#"{"id":"mock-email"}"#).await;
+        let email=AlertEmailProvider::Resend(crate::resend::Resend::test_endpoint(crate::resend::Config{api_key:"re_test".into(),from:"sender@example.test".into(),sender_name:String::new()},email_url.as_str()).unwrap());
+        let result=send_uncoordinated_selected(&a,Some(&slack),Some((&email,"ops@example.test")),Duration::from_secs(2),false).await;
+        assert_eq!(result.0,Some(Ok(())));assert_eq!(result.1,Some(Ok(())));
+        for payload in [server.await.unwrap(),email_server.await.unwrap()]{assert!(payload.contains("Slack shared cooldown active: true"));assert!(payload.contains("deferred jobs: 2"));assert!(payload.contains("overdue deferred jobs: 1"));}
+    }
     #[test]
     fn sendgrid_webhook_key_health_is_optional_and_independent() {
         let mut a = alert();
@@ -2196,6 +2222,7 @@ mod tests {
             channel_policy_check_failed: false,
             failed_checks: [false; 5],
             resend_auto: None,
+            slack_cooldown: None,
             failed_jobs: None,
             failed_jobs_check_failed: false,
             database_probe: None,
