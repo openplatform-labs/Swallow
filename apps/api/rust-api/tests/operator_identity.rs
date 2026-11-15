@@ -359,6 +359,24 @@ async fn verifies_token_mapping_scope_revocation_and_expiry() {
             .unwrap()
             .get::<_, bool>(0)
     );
+    let inspect_sql = "SELECT revoked FROM public.novu_rust_operator_token_revocation_inspect(sha256(convert_to('https://issuer.test','UTF8')),sha256(convert_to('user-1','UTF8')),sha256(convert_to('console','UTF8')),sha256(convert_to('lock-test','UTF8')))";
+    assert!(
+        !reader
+            .query_one(inspect_sql, &[])
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
+    let concurrent_token = token_with_id("user-1", "console", now + 120, "lock-test");
+    assert_eq!(
+        guarded
+            .clone()
+            .oneshot(request(&concurrent_token, "environmentId=jwt-a"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
     let grant_db = connect(&url).await;
     let permission_change = tokio::spawn(async move {
         grant_db.execute("UPDATE public.novu_rust_operator_token_revocation_admins SET can_revoke=false WHERE database_principal='jwt_revoke_admin'",&[]).await
@@ -377,6 +395,22 @@ async fn verifies_token_mapping_scope_revocation_and_expiry() {
     );
     tx.commit().await.unwrap();
     assert_eq!(permission_change.await.unwrap().unwrap(), 1);
+    assert!(
+        reader
+            .query_one(inspect_sql, &[])
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+    );
+    assert_eq!(
+        guarded
+            .clone()
+            .oneshot(request(&concurrent_token, "environmentId=jwt-a"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
     db.batch_execute("UPDATE public.novu_rust_operator_token_revocation_admins SET can_read_audit=false WHERE database_principal='jwt_revoke_reader'").await.unwrap();
     assert!(
         admin
