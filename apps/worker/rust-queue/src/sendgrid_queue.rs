@@ -277,6 +277,7 @@ pub(crate) async fn prepare_workflow_email(
                 "from" => value.as_str().is_none_or(|s|s.is_empty()||s.contains(['\r','\n'])),
                 "replyTo" => value.as_str().is_none_or(|s|s.contains(['\r','\n'])),
                 "to"|"cc"|"bcc" => value.as_array().is_none_or(|items|items.len()>50 || items.iter().any(|v|v.as_str().is_none_or(|s|s.is_empty()||s.contains(['\r','\n'])))),
+                "headers" => value.as_object().is_none_or(|items|items.len()>100 || items.iter().any(|(name,value)|reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() || value.as_str().is_none_or(|s|s.len()>4096 || reqwest::header::HeaderValue::from_str(s).is_err()))),
                 _=>true,
             })) {
                 tx.execute("UPDATE novu_rust_email_messages SET status='error',error_id='mail_unexpected_error',error_text='invalid Resend passthrough' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;
@@ -290,6 +291,7 @@ pub(crate) async fn prepare_workflow_email(
             if let Some(value)=fields.get("text").and_then(serde_json::Value::as_str) {email.text=Some(value.to_owned());}
             if let Some(value)=fields.get("from").and_then(serde_json::Value::as_str) {email.from=Some(value.to_owned());email.provider_from_without_name=true;}
             if let Some(value)=fields.get("replyTo").and_then(serde_json::Value::as_str) {email.reply_to=Some(value.to_owned());}
+            if let Some(headers)=fields.get("headers").and_then(serde_json::Value::as_object) {email.headers.extend(headers.clone());}
             for (key,target) in [("to",&mut email.to),("cc",&mut email.cc),("bcc",&mut email.bcc)] {
                 if let Some(items)=fields.get(key).and_then(serde_json::Value::as_array) {target.extend(items.iter().map(|v|v.as_str().expect("validated recipient").to_owned()));}
             }

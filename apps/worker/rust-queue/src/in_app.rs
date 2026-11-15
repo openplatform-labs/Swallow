@@ -731,9 +731,16 @@ async fn process_claimed(
                     "from" => v.as_str().is_none_or(|s|s.is_empty()||s.contains(['\r','\n'])),
                     "replyTo" => v.as_str().is_none_or(|s|s.contains(['\r','\n'])),
                     "to"|"cc"|"bcc" => v.as_array().is_none_or(|items| items.len()>50 || items.iter().any(|v|v.as_str().is_none_or(|s|s.is_empty()||s.contains(['\r','\n'])))),
+                    "headers" => v.as_object().is_none_or(|items|items.len()>100 || items.iter().any(|(name,value)|reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() || value.as_str().is_none_or(|s|s.len()>4096 || reqwest::header::HeaderValue::from_str(s).is_err()))),
                     _=>true,
                 }) {return Err(InvalidJob("invalid Resend passthrough").into());}
-                passthrough.extend(body.clone());
+                for (key,value) in body {
+                    if key=="headers" {
+                        let mut headers=passthrough.get("headers").and_then(serde_json::Value::as_object).cloned().unwrap_or_default();
+                        headers.extend(value.as_object().expect("validated headers").clone());
+                        passthrough.insert(key.clone(),serde_json::Value::Object(headers));
+                    } else {passthrough.insert(key.clone(),value.clone());}
+                }
             }
         }
         if !passthrough.is_empty() {merged_email_override.insert("__resend_passthrough".into(),serde_json::Value::Object(passthrough));}

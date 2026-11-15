@@ -4060,6 +4060,7 @@ async fn trigger_inner(db:Arc<Client>,environment_id:String,auth:TriggerAuth,rej
                             "from" => value.as_str().is_some_and(|v| !v.is_empty() && !v.contains(['\r','\n'])),
                             "replyTo" => value.as_str().is_some_and(|v| !v.contains(['\r','\n'])),
                             "to" | "cc" | "bcc" => value.as_array().is_some_and(|items| items.len()<=50 && items.iter().all(|v| v.as_str().is_some_and(|s| !s.is_empty() && !s.contains(['\r','\n'])))),
+                            "headers" => value.as_object().is_some_and(|items| items.len()<=100 && items.iter().all(|(name,value)| axum::http::header::HeaderName::from_bytes(name.as_bytes()).is_ok() && value.as_str().is_some_and(|s|s.len()<=4096 && axum::http::header::HeaderValue::from_str(s).is_ok()))),
                             _ => false,
                         })))
                     } else {
