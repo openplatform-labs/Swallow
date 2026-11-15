@@ -336,6 +336,11 @@ impl Sendgrid {
     /// Validate a request with SendGrid without creating a delivery attempt.
     /// Only the documented sandbox success status is treated as validation.
     pub async fn validate_sandbox(&self, message: &Email) -> Result<(), SendError> {
+        // Workflow contexts must be resolved under the subscriber and queue locks
+        // before building a provider request. This standalone path has neither.
+        if message.workflow_context.is_some() {
+            return Err(SendError::InvalidMessage);
+        }
         let mut body = self.prepare(message)?;
         body["mail_settings"] = json!({"sandbox_mode":{"enable":true}});
         let response = self
@@ -471,6 +476,20 @@ mod tests {
             Err(SendError::Provider(400))
         );
         server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn sandbox_rejects_unresolved_workflow_without_network_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v3/mail/send", listener.local_addr().unwrap());
+        let provider = Sendgrid::with_endpoint(config(), &endpoint).unwrap();
+        let mut email = message();
+        email.workflow_context = Some(serde_json::from_value(json!({
+            "subscriber_internal_id":"subscriber", "subject_template":"{{payload.subject}}",
+            "html_template":"{{payload.html}}", "payload":{}, "context":{},
+            "actor":null, "overrides":{}
+        })).unwrap());
+        assert_eq!(provider.validate_sandbox(&email).await, Err(SendError::InvalidMessage));
+        assert!(tokio::time::timeout(Duration::from_millis(100), listener.accept()).await.is_err());
     }
     #[test]
     fn tracking_validation_rejects_invalid_persisted_messages_before_send() {
