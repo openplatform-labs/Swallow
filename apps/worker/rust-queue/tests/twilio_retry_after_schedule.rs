@@ -113,6 +113,7 @@ async fn delayed_retry_is_fenced_audited_and_blocks_callback_evidence() {
     assert!(row.get::<_, bool>(1));
     assert_eq!(row.get::<_, i64>(2), 0);
     assert_eq!(row.get::<_, i64>(3), 1);
+    assert!(db.query_one("SELECT twilio_delayed_retry FROM public.novu_queue_jobs WHERE id=$1", &[&job]).await.unwrap().get::<_,bool>(0));
     db.execute("DELETE FROM public.novu_rust_delivery_operator_grants WHERE environment_id=$1 AND database_principal=$2 AND decision='retry'",&[&env,&role]).await.unwrap();
     let (revoked, id) = rejected(&db, &env, Some(120)).await;
     assert!(!cli(role_url, &env, revoked, id).status().unwrap().success());

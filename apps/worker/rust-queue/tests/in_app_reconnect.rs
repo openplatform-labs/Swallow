@@ -123,6 +123,7 @@ async fn workers_reconnect_and_process_in_app_once() {
         novu_postgres_queue::twilio_queue::DISPATCH_ID_MIGRATION,
         novu_postgres_queue::twilio_queue::DISPATCH_ACCOUNT_MIGRATION,
         novu_postgres_queue::twilio_queue::RETRY_AFTER_MIGRATION,
+        novu_postgres_queue::twilio_queue::DELAYED_FENCE_MIGRATION,
         novu_postgres_queue::fcm_queue::MIGRATION,
         in_app::DELIVERY_STATE_MIGRATION,
     ] {

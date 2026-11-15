@@ -13,6 +13,7 @@ pub const DISPATCH_ID_MIGRATION: &str =
     include_str!("../migrations/0055_twilio_attempt_identity.sql");
 pub const DISPATCH_ACCOUNT_MIGRATION: &str = include_str!("../migrations/0177_twilio_dispatch_account.sql");
 pub const RETRY_AFTER_MIGRATION: &str = include_str!("../migrations/0178_twilio_retry_after.sql");
+pub const DELAYED_FENCE_MIGRATION: &str = include_str!("../migrations/0180_twilio_delayed_retry_fence.sql");
 
 fn valid_phone(value: Option<&str>) -> Option<&str> {
     value.filter(|v| !v.trim().is_empty())
@@ -108,7 +109,12 @@ pub async fn process_one_with_step_policy(
     }
     // Serialize with callback inserts on the queue row. Legacy decisions and
     // job-only callbacks lack a dispatch ID and are handled conservatively.
-    if provider.tracks_status_callbacks() {
+    let protect_delayed = if provider.tracks_status_callbacks() {
+        true
+    } else {
+        tx.query_one("SELECT twilio_delayed_retry FROM public.novu_queue_jobs WHERE id=$1 AND environment_id=$2", &[&job.id,&environment]).await?.get::<_,bool>(0)
+    };
+    if protect_delayed {
         let evidence = tx.query_opt("SELECT r.retry_dispatch_id FROM (SELECT retry_dispatch_id FROM novu_rust_delivery_reconciliations WHERE environment_id=$1 AND job_id=$2 AND target_index IS NULL AND decision='retry' ORDER BY decision_order DESC LIMIT 1) r WHERE EXISTS(SELECT 1 FROM novu_rust_twilio_delivery_events e WHERE e.environment_id=$1 AND e.job_id=$2 AND (r.retry_dispatch_id IS NULL OR e.dispatch_id IS NULL OR e.dispatch_id=r.retry_dispatch_id))", &[&environment,&job.id]).await?;
         if let Some(evidence) = evidence {
             let dispatch: Option<Uuid> = evidence.get(0);
@@ -542,6 +548,7 @@ mod tests {
         db.batch_execute(DISPATCH_ID_MIGRATION).await.unwrap();
         db.batch_execute(DISPATCH_ACCOUNT_MIGRATION).await.unwrap();
         db.batch_execute(RETRY_AFTER_MIGRATION).await.unwrap();
+        db.batch_execute(DELAYED_FENCE_MIGRATION).await.unwrap();
         db.batch_execute(crate::reconciliation::MIGRATION)
             .await
             .unwrap();
@@ -872,6 +879,28 @@ mod tests {
         let server=tokio::spawn(async move {let (mut socket,_)=listener.accept().await.unwrap();let mut data=[0;8192];assert!(socket.read(&mut data).await.unwrap()>0);let body=r#"{"sid":"SM123","date_created":"Wed, 28 Oct 2026 10:00:00 +0000"}"#;socket.write_all(format!("HTTP/1.1 201 Created\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();});
         assert!(process_one(&mut db,&env,&provider).await.unwrap());server.await.unwrap();
         let row=db.query_one("SELECT j.status,a.state FROM public.novu_queue_jobs j JOIN public.novu_rust_twilio_attempts a ON a.job_id=j.id WHERE j.id=$1",&[&job]).await.unwrap();assert_eq!(row.get::<_,String>(0),"completed");assert_eq!(row.get::<_,String>(1),"accepted");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires fully migrated disposable PostgreSQL"]
+    async fn delayed_retry_blocks_late_evidence_without_callback_config() {
+        use super::*;
+        use crate::twilio::{Config,Region,Twilio};
+        let url=std::env::var("TEST_DATABASE_URL").unwrap();
+        let (mut db,driver)=tokio_postgres::connect(&url,tokio_postgres::NoTls).await.unwrap();tokio::spawn(async move {let _=driver.await;});
+        let env=format!("twilio-retry-evidence-{}",Uuid::new_v4());let job=Uuid::new_v4();let dispatch=Uuid::new_v4();
+        db.execute("INSERT INTO public.novu_rust_environments VALUES($1,'org')",&[&env]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,rolname,'retry',oid FROM pg_roles WHERE rolname=current_user",&[&env]).await.unwrap();
+        crate::enqueue(&db,job,&env,JOB_KIND,&serde_json::json!({"to":"+15550000002","content":"hello"})).await.unwrap();
+        db.execute("UPDATE public.novu_queue_jobs SET status='failed' WHERE id=$1",&[&job]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_twilio_dispatch_ids(id,job_id,environment_id) VALUES($1,$2,$3)",&[&dispatch,&job,&env]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_twilio_attempts(job_id,environment_id,state,http_status,dispatch_id,retry_after_seconds,retry_not_before) VALUES($1,$2,'rejected',429,$3,0,clock_timestamp()-interval '1 second')",&[&job,&env,&dispatch]).await.unwrap();
+        db.query_one("SELECT public.novu_rust_resolve_twilio_after($1,$2,$3,'operator','ticket')",&[&env,&job,&dispatch]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_twilio_delivery_events(environment_id,account_sid,message_sid,status,job_id,dispatch_id) VALUES($1,'ACfixture','SMfixture','delivered',$2,$3)",&[&env,&job,&dispatch]).await.unwrap();
+        let provider=Twilio::test_origin(Config{account_sid:"ACfixture".into(),auth_token:"fixture".into(),api_key_sid:None,api_key_secret:None,from:"+15550000001".into(),region:Region::Us},"http://127.0.0.1:1").unwrap();
+        assert!(process_one(&mut db,&env,&provider).await.unwrap());
+        let row=db.query_one("SELECT j.status,j.last_error,a.state,a.dispatch_id FROM public.novu_queue_jobs j JOIN public.novu_rust_twilio_attempts a ON a.job_id=j.id WHERE j.id=$1",&[&job]).await.unwrap();
+        assert_eq!(row.get::<_,String>(0),"failed");assert_eq!(row.get::<_,String>(1),"sms retry blocked by provider callback");assert_eq!(row.get::<_,String>(2),"unknown");assert_eq!(row.get::<_,Uuid>(3),dispatch);
     }
 
 }

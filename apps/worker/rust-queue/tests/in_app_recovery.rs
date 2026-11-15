@@ -79,6 +79,7 @@ async fn worker_recovers_expired_jobs_and_isolates_invalid_jobs() {
         novu_postgres_queue::twilio_queue::DISPATCH_ID_MIGRATION,
         novu_postgres_queue::twilio_queue::DISPATCH_ACCOUNT_MIGRATION,
         novu_postgres_queue::twilio_queue::RETRY_AFTER_MIGRATION,
+        novu_postgres_queue::twilio_queue::DELAYED_FENCE_MIGRATION,
         novu_postgres_queue::fcm_queue::MIGRATION,
         in_app::DELIVERY_STATE_MIGRATION,
     ] {
