@@ -6,6 +6,12 @@ import { OperatorOidc } from './operator-oidc';
 describe('Swallow console', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
+  it('requests provider refresh revocation only after confirmation and logs out on success or uncertainty',async()=>{
+    vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));vi.spyOn(OperatorOidc.prototype,'signIn').mockResolvedValue({token:'aaa.bbb.ccc',subject:'alice',environmentId:'env-a',expiresAt:Math.floor(Date.now()/1000)+600});vi.spyOn(OperatorOidc.prototype,'canRevokeRefresh').mockReturnValue(true);
+    let finish!:()=>void;const revoke=vi.spyOn(OperatorOidc.prototype,'revokeRefresh').mockReturnValueOnce(new Promise(done=>finish=done)).mockRejectedValueOnce(new Error('lost'));
+    const fixture=TestBed.createComponent(App),app=fixture.componentInstance;app.oidcAutoRenew=true;app.oidcIssuer='https://issuer.test';app.oidcClientId='console';app.oidcEnvironment='env-a';await app.prepareOidc();await app.signInOidc();await app.revokeIdpRefresh();expect(revoke).not.toHaveBeenCalled();app.oidcIdpRevokeConfirmed=true;const pending=app.revokeIdpRefresh();expect(app.oidcIdpRevokeStatus()).toBe('sending');app.resetOidc();expect(app.oidcStatus()).toBe('signed-in');finish();await pending;expect(app.oidcIdpRevokeStatus()).toBe('accepted');expect(app.oidcStatus()).toBe('idle');
+    await app.prepareOidc();await app.signInOidc();app.oidcIdpRevokeConfirmed=true;await app.revokeIdpRefresh();expect(app.oidcIdpRevokeStatus()).toBe('unknown');expect(app.oidcStatus()).toBe('idle');expect(revoke).toHaveBeenCalledTimes(2);fixture.destroy();
+  });
   it('revokes the signed-in token only after confirmation and clears local credentials', async () => {
     vi.spyOn(OperatorOidc.prototype,'prepare').mockImplementation(async settings=>({settings,metadata:{issuer:settings.issuer}}));
     vi.spyOn(OperatorOidc.prototype,'signIn').mockResolvedValue({token:'aaa.bbb.ccc',subject:'alice',environmentId:'env-a',expiresAt:Math.floor(Date.now()/1000)+600});

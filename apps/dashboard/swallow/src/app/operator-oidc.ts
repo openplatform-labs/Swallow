@@ -37,7 +37,9 @@ async function boundedText(response: Response, limit: number): Promise<string> {
 }
 
 export class OperatorOidc {
-  private active: {manager:UserManager; settings:OidcSettings; subject:string} | null=null;
+  private active: {manager:UserManager; settings:OidcSettings; subject:string; revocationEndpoint:string | null} | null=null;
+  private renewing=false;
+  private revoking=false;
   private generation=0;
   dispose(): void {
     this.generation++;
@@ -84,7 +86,11 @@ export class OperatorOidc {
       if(generation!==this.generation)throw new Error('login cancelled');
       if(settings.allowRefresh){
         if(!user.refresh_token || user.refresh_token.length>16384)throw new Error('refresh token unavailable');
-        this.active={manager,settings,subject:session.subject};
+        let revocationEndpoint:string|null=null;
+        if(typeof metadata.revocation_endpoint==='string') {
+          try { const endpoint=secureUrl(metadata.revocation_endpoint,true);if(endpoint.protocol==='http:' && new URL(settings.issuer).protocol!=='http:')throw new Error('insecure revocation endpoint');revocationEndpoint=endpoint.href; } catch { /* Optional unsupported endpoint. */ }
+        }
+        this.active={manager,settings,subject:session.subject,revocationEndpoint};
       }
       return session;
     } finally { if(this.active?.manager!==manager) await manager.removeUser(); }
@@ -106,7 +112,8 @@ export class OperatorOidc {
 
   async renew():Promise<VerifiedSession> {
     const active=this.active,generation=this.generation;
-    if(!active)throw new Error('refresh unavailable');
+    if(!active || this.renewing || this.revoking)throw new Error('refresh unavailable');
+    this.renewing=true;
     try {
       const user=await active.manager.signinSilent({silentRequestTimeoutInSeconds:10,resource:active.settings.resource || undefined});
       if(generation!==this.generation || this.active!==active)throw new Error('refresh cancelled');
@@ -118,7 +125,21 @@ export class OperatorOidc {
       if(this.active===active)this.dispose();
       else await active.manager.removeUser();
       throw error;
-    }
+    } finally {this.renewing=false;}
+  }
+
+  canRevokeRefresh():boolean {return !!this.active?.revocationEndpoint && !this.renewing && !this.revoking;}
+  async revokeRefresh():Promise<void> {
+    const active=this.active,generation=this.generation;
+    if(!active?.revocationEndpoint || this.renewing || this.revoking)throw new Error('refresh revocation unavailable');
+    this.revoking=true;
+    try {
+      const user=await active.manager.getUser();
+      if(generation!==this.generation || this.active!==active || !user?.refresh_token || user.refresh_token.length>16384)throw new Error('refresh revocation unavailable');
+      const body=new URLSearchParams({token:user.refresh_token,token_type_hint:'refresh_token',client_id:active.settings.clientId});
+      const response=await fetch(active.revocationEndpoint,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body,credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
+      if(response.status!==200)throw new Error('refresh revocation failed');
+    } finally {this.revoking=false;}
 
   }
 }
