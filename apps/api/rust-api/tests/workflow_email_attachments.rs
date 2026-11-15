@@ -14,6 +14,9 @@ static QUEUE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 #[tokio::test]
 #[ignore = "requires fully migrated disposable PostgreSQL and loopback"]
 async fn resend_passthrough_content_reaches_provider_with_layer_precedence() {
+    use base64::{Engine,engine::general_purpose::STANDARD};
+    use ring::hmac;
+    use std::{collections::HashMap,time::{SystemTime,UNIX_EPOCH}};
     use tokio::io::{AsyncReadExt,AsyncWriteExt};
     let _guard=QUEUE_TEST_LOCK.lock().await;let url=std::env::var("TEST_DATABASE_URL").unwrap();
     let (mut db,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(async move{driver.await.unwrap()});
@@ -41,13 +44,24 @@ async fn resend_passthrough_content_reaches_provider_with_layer_precedence() {
     let expected=[("bcc",0,"hidden@example.test"),("cc",0,"known-cc@example.test"),("cc",1,"known-cc@example.test"),("to",0,"recipient@example.test"),("to",1,"known@example.test"),("to",2,"known@example.test"),("to",3,"extra@example.test")];
     assert_eq!(rows.len(),expected.len());for (row,(kind,index,address)) in rows.iter().zip(expected) {assert_eq!(row.get::<_,String>(0),kind);assert_eq!(row.get::<_,i32>(1),index);assert_eq!(row.get::<_,String>(2),novu_postgres_queue::resend_queue::recipient_hash(address));}
     let job:uuid::Uuid=db.query_one("SELECT id FROM public.novu_queue_jobs WHERE environment_id='resend-pass-env' AND kind='experimental_resend_email'",&[]).await.unwrap().get(0);
+    let secret=b"test-only-resend-webhook-secret-123";let key=format!("whsec_{}",STANDARD.encode(secret));
+    let webhook_config=novu_rust_api::resend_webhook::Config::new("resend-pass-env".into(),&key).unwrap().with_correlation_capture(true);
+    let (webhook_db,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(async move{driver.await.unwrap()});
+    let webhook=novu_rust_api::router_with_webhook_configs(Arc::new(webhook_db),None,HashMap::new(),None,Some(webhook_config));
+    let signed=|id:&str,address:&str,key:&[u8]| {
+        let timestamp=SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string();
+        let data=json!({"type":"email.delivered","data":{"email_id":"fixture-id","to":[address],"tags":{"swallow_dispatch":correlation.to_string(),"campaign":"summer-1"}}}).to_string();
+        let mac=hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256,key),format!("{id}.{timestamp}.{data}").as_bytes());
+        Request::builder().method("POST").uri("/webhooks/organizations/org/environments/resend-pass-env/email/resend").header("svix-id",id).header("svix-timestamp",timestamp).header("svix-signature",format!("v1,{}",STANDARD.encode(mac.as_ref()))).body(Body::from(data)).unwrap()
+    };
+    assert_eq!(webhook.clone().oneshot(signed("forged","recipient@example.test",b"wrong-secret")).await.unwrap().status(),StatusCode::UNAUTHORIZED);
     for (i,address) in ["recipient@example.test","known@example.test","known-cc@example.test","extra@example.test"].into_iter().enumerate() {
-        let event=format!("event-{i}");let hash=novu_postgres_queue::resend_queue::recipient_hash(address);
-        db.execute("INSERT INTO public.novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type,recipient_hash) VALUES('resend-pass-env',$1,'fixture-id','email.delivered',$2)",&[&event,&hash]).await.unwrap();
+        assert_eq!(webhook.clone().oneshot(signed(&format!("event-{i}"),address,secret)).await.unwrap().status(),StatusCode::NO_CONTENT);
     }
+    let evidence=db.query_one("SELECT count(*),count(*) FILTER(WHERE correlation_id=$1) FROM public.novu_rust_resend_delivery_events WHERE environment_id='resend-pass-env'",&[&correlation]).await.unwrap();assert_eq!(evidence.get::<_,i64>(0),4);assert_eq!(evidence.get::<_,i64>(1),4);
     assert!(novu_postgres_queue::resend_projection::project(&mut db,"resend-pass-env",job).await.unwrap());
     assert_eq!(db.query_one("SELECT resend_delivery_result FROM public.novu_queue_jobs WHERE id=$1",&[&job]).await.unwrap().get::<_,String>(0),"pending");
-    let hidden=novu_postgres_queue::resend_queue::recipient_hash("hidden@example.test");db.execute("INSERT INTO public.novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type,recipient_hash) VALUES('resend-pass-env','hidden-event','fixture-id','email.delivered',$1)",&[&hidden]).await.unwrap();
+    assert_eq!(webhook.oneshot(signed("hidden-event","hidden@example.test",secret)).await.unwrap().status(),StatusCode::NO_CONTENT);
     assert!(novu_postgres_queue::resend_projection::project(&mut db,"resend-pass-env",job).await.unwrap());
     assert_eq!(db.query_one("SELECT resend_delivery_result FROM public.novu_queue_jobs WHERE id=$1",&[&job]).await.unwrap().get::<_,String>(0),"delivered");
 }
