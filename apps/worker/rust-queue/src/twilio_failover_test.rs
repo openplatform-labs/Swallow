@@ -162,7 +162,7 @@ async fn synchronous_failover_during_twilio_dispatch_preserves_unknown() {
     let replica = connect(&standby_url).await;
     let mut replicated = false;
     for _ in 0..100 {
-        replicated=replica.query_opt("SELECT 1 FROM public.novu_queue_jobs j JOIN public.novu_rust_twilio_attempts a ON a.job_id=j.id JOIN public.novu_rust_sms_messages m ON m.sms_job_id=j.id JOIN public.novu_rust_twilio_dispatch_ids d ON d.id=a.dispatch_id WHERE j.id=$1 AND j.status='running' AND a.state='dispatching' AND m.delivery_state='dispatching' AND a.dispatch_id=$2",&[&job,&dispatch]).await.unwrap().is_some();
+        replicated=replica.query_opt("SELECT 1 FROM public.novu_queue_jobs j JOIN public.novu_rust_twilio_attempts a ON a.job_id=j.id JOIN public.novu_rust_sms_messages m ON m.sms_job_id=j.id JOIN public.novu_rust_twilio_dispatch_ids d ON d.id=a.dispatch_id WHERE j.id=$1 AND j.status='running' AND a.state='dispatching' AND m.delivery_state='dispatching' AND a.dispatch_id=$2 AND d.account_sid='AC11111111111111111111111111111111'",&[&job,&dispatch]).await.unwrap().is_some();
         if replicated {
             break;
         }
@@ -291,6 +291,7 @@ async fn synchronous_failover_during_twilio_dispatch_preserves_unknown() {
             .env("LISTEN_ADDR", api_address.to_string())
             .env("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED", "true")
             .env("NOVU_TWILIO_WEBHOOK_ENVIRONMENT_ID", "sms-ha")
+            .env("NOVU_TWILIO_WEBHOOK_REQUIRE_DISPATCH_ACCOUNT", "true")
             .env("NOVU_TWILIO_WEBHOOK_ACCOUNT_SID", account)
             .env("NOVU_TWILIO_WEBHOOK_AUTH_TOKEN", "fixture")
             .env("NOVU_TWILIO_WEBHOOK_URL", base)
