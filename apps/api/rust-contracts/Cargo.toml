@@ -11,3 +11,6 @@ tokio-postgres-rustls = { version = "0.14", features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
 webpki-roots = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -271,9 +271,8 @@ impl Sendgrid {
     }
     /// Reload before claiming a new job. The caller must pause on failure.
     pub fn reload_api_key_file(&mut self, path: &Path) -> Result<(), SendError> {
-        let key = novu_rust_contracts::secret::read(None, Some(path))
-            .map_err(|_| SendError::InvalidConfiguration)?
-            .ok_or(SendError::InvalidConfiguration)?;
+        let key = novu_rust_contracts::secret::read_regular_file(path)
+            .map_err(|_| SendError::InvalidConfiguration)?;
         if header::HeaderValue::from_str(&format!("Bearer {key}")).is_err() {
             return Err(SendError::InvalidConfiguration);
         }

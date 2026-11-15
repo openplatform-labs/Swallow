@@ -77,9 +77,8 @@ pub struct Slack {
 impl Slack {
     /// Reload before claiming a new job. The caller must pause on failure.
     pub fn reload_token_file(&mut self, path: &Path) -> Result<(), SendError> {
-        let token = novu_rust_contracts::secret::read(None, Some(path))
-            .map_err(|_| SendError::Invalid)?
-            .ok_or(SendError::Invalid)?;
+        let token =
+            novu_rust_contracts::secret::read_regular_file(path).map_err(|_| SendError::Invalid)?;
         if header::HeaderValue::from_str(&format!("Bearer {token}")).is_err() {
             return Err(SendError::Invalid);
         }

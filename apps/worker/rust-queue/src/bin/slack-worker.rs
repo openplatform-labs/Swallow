@@ -13,10 +13,6 @@ async fn run(
     if environment.trim().is_empty() {
         return Err("Slack environment is required".into());
     }
-    let token =
-        novu_rust_contracts::secret::from_env("NOVU_SLACK_BOT_TOKEN", "NOVU_SLACK_BOT_TOKEN_FILE")?
-            .ok_or("Slack token is required")?;
-    let mut provider = Slack::new(token)?;
     let reload_token_file = match std::env::var("NOVU_SLACK_RELOAD_BOT_TOKEN").as_deref() {
         Ok("true") => Some(std::path::PathBuf::from(
             std::env::var_os("NOVU_SLACK_BOT_TOKEN_FILE")
@@ -25,6 +21,16 @@ async fn run(
         Ok("false") | Err(std::env::VarError::NotPresent) => None,
         _ => return Err("invalid Slack token reload setting".into()),
     };
+    let token = if let Some(path) = &reload_token_file {
+        if std::env::var_os("NOVU_SLACK_BOT_TOKEN").is_some() {
+            return Err("Slack token sources conflict".into());
+        }
+        novu_rust_contracts::secret::read_regular_file(path)?
+    } else {
+        novu_rust_contracts::secret::from_env("NOVU_SLACK_BOT_TOKEN", "NOVU_SLACK_BOT_TOKEN_FILE")?
+            .ok_or("Slack token is required")?
+    };
+    let mut provider = Slack::new(token)?;
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let timeout = match std::env::var("NOVU_SLACK_DB_TIMEOUT_SECONDS") {
         Ok(value) => value

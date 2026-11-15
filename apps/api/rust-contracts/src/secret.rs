@@ -15,7 +15,7 @@ pub fn read(inline: Option<&str>, file: Option<&Path>) -> Result<Option<String>,
             "multiple secret sources",
         ));
     }
-    let mut bytes = match (inline, file) {
+    let bytes = match (inline, file) {
         (Some(value), None) => value.as_bytes().to_vec(),
         (None, Some(path)) => {
             let mut value = Vec::new();
@@ -29,6 +29,10 @@ pub fn read(inline: Option<&str>, file: Option<&Path>) -> Result<Option<String>,
         (None, None) => return Ok(None),
         _ => unreachable!(),
     };
+    validate(bytes).map(Some)
+}
+
+fn validate(mut bytes: Vec<u8>) -> Result<String, io::Error> {
     if bytes.len() as u64 > MAX_SECRET_BYTES {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid secret"));
     }
@@ -43,7 +47,35 @@ pub fn read(inline: Option<&str>, file: Option<&Path>) -> Result<Option<String>,
     if value.is_empty() || value.contains(['\r', '\n', '\0']) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid secret"));
     }
-    Ok(Some(value))
+    Ok(value)
+}
+
+/// Read a regular file through its opened handle; on Unix, nonblocking open
+/// prevents a FIFO without a writer from hanging the worker. Symlinks to
+/// regular files are allowed for secret mounts and atomic replacement.
+pub fn read_regular_file(path: &Path) -> Result<String, io::Error> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| io::Error::other("secret file unavailable"))?;
+    if !file
+        .metadata()
+        .map_err(|_| io::Error::other("secret file unavailable"))?
+        .is_file()
+    {
+        return Err(io::Error::other("invalid secret file type"));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_SECRET_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| io::Error::other("secret file unavailable"))?;
+    validate(bytes)
 }
 
 pub fn from_env(name: &str, file_name: &str) -> Result<Option<String>, io::Error> {
@@ -84,5 +116,33 @@ mod tests {
         assert!(read(Some("bad\nsecret"), None).is_err());
         assert!(read(Some(""), None).is_err());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regular_file_reader_rejects_fifo_and_allows_symlink() {
+        let dir = std::env::temp_dir().join(format!("swallow-secret-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_regular_file(&fifo));
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+                .is_err()
+        );
+        std::fs::write(dir.join("key"), "fixture\n").unwrap();
+        std::os::unix::fs::symlink("key", dir.join("link")).unwrap();
+        assert_eq!(read_regular_file(&dir.join("link")).unwrap(), "fixture");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

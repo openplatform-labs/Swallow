@@ -23,16 +23,6 @@ async fn run(
         Ok("global") | Err(std::env::VarError::NotPresent) => Region::Global,
         _ => return Err("invalid NOVU_SENDGRID_REGION".into()),
     };
-    let mut provider = Sendgrid::new(Config {
-        api_key: novu_rust_contracts::secret::from_env(
-            "NOVU_SENDGRID_API_KEY",
-            "NOVU_SENDGRID_API_KEY_FILE",
-        )?
-        .ok_or("SendGrid API key is required")?,
-        from: std::env::var("NOVU_SENDGRID_FROM")?,
-        sender_name: std::env::var("NOVU_SENDGRID_SENDER_NAME")?,
-        region,
-    })?;
     let reload_key_file = match std::env::var("NOVU_SENDGRID_RELOAD_API_KEY").as_deref() {
         Ok("true") => Some(std::path::PathBuf::from(
             std::env::var_os("NOVU_SENDGRID_API_KEY_FILE")
@@ -41,6 +31,24 @@ async fn run(
         Ok("false") | Err(std::env::VarError::NotPresent) => None,
         _ => return Err("invalid SendGrid key reload setting".into()),
     };
+    let api_key = if let Some(path) = &reload_key_file {
+        if std::env::var_os("NOVU_SENDGRID_API_KEY").is_some() {
+            return Err("SendGrid key sources conflict".into());
+        }
+        novu_rust_contracts::secret::read_regular_file(path)?
+    } else {
+        novu_rust_contracts::secret::from_env(
+            "NOVU_SENDGRID_API_KEY",
+            "NOVU_SENDGRID_API_KEY_FILE",
+        )?
+        .ok_or("SendGrid API key is required")?
+    };
+    let mut provider = Sendgrid::new(Config {
+        api_key,
+        from: std::env::var("NOVU_SENDGRID_FROM")?,
+        sender_name: std::env::var("NOVU_SENDGRID_SENDER_NAME")?,
+        region,
+    })?;
     match std::env::var("NOVU_SENDGRID_DISPATCH_TRACKING").as_deref() {
         Ok("true") => provider = provider.with_dispatch_tracking(),
         Ok("false") | Err(std::env::VarError::NotPresent) => {}

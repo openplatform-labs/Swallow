@@ -18,15 +18,6 @@ async fn run(
     if environment.trim().is_empty() {
         return Err("environment is required".into());
     }
-    let mut provider = Resend::new(Config {
-        api_key: novu_rust_contracts::secret::from_env(
-            "NOVU_RESEND_API_KEY",
-            "NOVU_RESEND_API_KEY_FILE",
-        )?
-        .ok_or("Resend API key is required")?,
-        from: std::env::var("NOVU_RESEND_FROM")?,
-        sender_name: std::env::var("NOVU_RESEND_SENDER_NAME").unwrap_or_default(),
-    })?;
     let reload_key_file = match std::env::var("NOVU_RESEND_RELOAD_API_KEY").as_deref() {
         Ok("true") => Some(std::path::PathBuf::from(
             std::env::var_os("NOVU_RESEND_API_KEY_FILE")
@@ -35,6 +26,20 @@ async fn run(
         Ok("false") | Err(std::env::VarError::NotPresent) => None,
         _ => return Err("invalid Resend key reload setting".into()),
     };
+    let api_key = if let Some(path) = &reload_key_file {
+        if std::env::var_os("NOVU_RESEND_API_KEY").is_some() {
+            return Err("Resend key sources conflict".into());
+        }
+        novu_rust_contracts::secret::read_regular_file(path)?
+    } else {
+        novu_rust_contracts::secret::from_env("NOVU_RESEND_API_KEY", "NOVU_RESEND_API_KEY_FILE")?
+            .ok_or("Resend API key is required")?
+    };
+    let mut provider = Resend::new(Config {
+        api_key,
+        from: std::env::var("NOVU_RESEND_FROM")?,
+        sender_name: std::env::var("NOVU_RESEND_SENDER_NAME").unwrap_or_default(),
+    })?;
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let timeout = match std::env::var("NOVU_RESEND_DB_TIMEOUT_SECONDS") {
         Ok(value) => value

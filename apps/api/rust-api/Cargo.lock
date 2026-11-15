@@ -1196,6 +1196,7 @@ dependencies = [
 name = "novu-rust-contracts"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rustls",
  "rustls-pemfile",
  "serde_json",

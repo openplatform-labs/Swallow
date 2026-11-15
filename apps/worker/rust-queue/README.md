@@ -1,3 +1,7 @@
+# Reloadable credential file types
+
+Reloadable Resend, SendGrid, Twilio and standalone Slack credential files must resolve to a regular file. On Unix the worker opens them with nonblocking mode before checking the opened handle, so a FIFO without a writer is rejected instead of hanging; symlinks to regular files remain supported. This applies at startup and reload only when the reloadable source is selected. Legacy startup-only sources retain their previous behavior. Filesystem operations on a slow or unavailable filesystem may still block; nonblocking mode is not a filesystem timeout. Tests exercise FIFO startup for all four workers, a FIFO during a running Slack worker with Docker PostgreSQL, and symlink-to-regular-file reading. Non-Unix blocking behavior and production secret mounts are not tested.
+
 # Optional completed attachment cleanup
 
 Worker migration `0133` and `attachment-retention` provide an opt-in, environment-scoped cleanup of attachment bytes in completed workflow and workflow-generated Resend/SendGrid queue jobs. They do not run on a schedule. Pending, running, failed, cancelled and standalone email jobs are excluded. Completion means queue processing completed, not recipient delivery. Parent and child jobs have separate copies and eligibility; a pending child remains untouched. Existing completed jobs start their retention clock when the migration runs. Assess the migration's backfill, index creation and trigger overhead before deployment.

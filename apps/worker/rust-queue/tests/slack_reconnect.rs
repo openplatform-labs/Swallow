@@ -118,6 +118,12 @@ async fn key_reload_pauses_claims_until_file_is_valid() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    #[cfg(unix)]
+    {
+        std::fs::remove_file(&key).unwrap();
+        assert!(Command::new("mkfifo").arg(&key).status().unwrap().success());
+    }
+    #[cfg(not(unix))]
     std::fs::write(&key, "invalid\nfixture-key").unwrap();
     let mut paused = false;
     for _ in 0..100 {

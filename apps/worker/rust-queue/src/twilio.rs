@@ -28,9 +28,8 @@ enum FileCredentials {
 }
 
 fn file_credentials(path: &Path) -> Result<FileCredentials, SendError> {
-    let input = novu_rust_contracts::secret::read(None, Some(path))
-        .map_err(|_| SendError::InvalidConfiguration)?
-        .ok_or(SendError::InvalidConfiguration)?;
+    let input = novu_rust_contracts::secret::read_regular_file(path)
+        .map_err(|_| SendError::InvalidConfiguration)?;
     let credentials: FileCredentials =
         serde_json::from_str(&input).map_err(|_| SendError::InvalidConfiguration)?;
     let valid = |s: &str| !s.is_empty() && s.len() <= 16384 && !s.contains(['\r', '\n', '\0']);
