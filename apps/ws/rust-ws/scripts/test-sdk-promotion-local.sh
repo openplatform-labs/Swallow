@@ -8,6 +8,7 @@ pgbin=${SWALLOW_TEST_POSTGRES_BIN:-/opt/homebrew/opt/postgresql@17/bin}
 testdir=$(mktemp -d "${TMPDIR:-/tmp}/swallow-ws-promotion.XXXXXX")
 api_pid=; worker_pid=; ws1_pid=; ws2_pid=
 cleanup() {
+  for pid in "$ws1_pid" "$ws2_pid"; do [[ -z "$pid" ]] || kill -CONT "$pid" 2>/dev/null || true; done
   for pid in "$api_pid" "$worker_pid" "$ws1_pid" "$ws2_pid"; do [[ -z "$pid" ]] || kill "$pid" 2>/dev/null || true; done
   for pid in "$api_pid" "$worker_pid" "$ws1_pid" "$ws2_pid"; do [[ -z "$pid" ]] || wait "$pid" 2>/dev/null || true; done
   local running=0
@@ -48,4 +49,4 @@ LISTEN_ADDR="127.0.0.1:$api_port" SWALLOW_API_HEALTH_ENDPOINTS_ENABLED=true SWAL
 LISTEN_ADDR="127.0.0.1:$ws1_port" NOVU_WS_DISCONNECT_ON_EVENT_GAP=true NOVU_WS_EVENT_LOOKUP_RECOVERY=probe NOVU_WS_ENABLE_HEALTH_ENDPOINTS=true target/debug/novu-rust-ws >"$testdir/ws1.log" 2>&1 & ws1_pid=$!
 LISTEN_ADDR="127.0.0.1:$ws2_port" NOVU_WS_DISCONNECT_ON_EVENT_GAP=true NOVU_WS_EVENT_LOOKUP_RECOVERY=probe NOVU_WS_ENABLE_HEALTH_ENDPOINTS=true target/debug/novu-rust-ws >"$testdir/ws2.log" 2>&1 & ws2_pid=$!
 for ((i=0;i<100;i++)); do if curl -fsS "http://127.0.0.1:$api_port/health/ready" >/dev/null 2>&1 && curl -fsS "http://127.0.0.1:$ws1_port/health/ready" >/dev/null 2>&1 && curl -fsS "http://127.0.0.1:$ws2_port/health/ready" >/dev/null 2>&1; then break; fi; for pid in "$api_pid" "$worker_pid" "$ws1_pid" "$ws2_pid"; do kill -0 "$pid"; done; ((i<99)) || exit 1; sleep 0.1; done
-NOVU_RUST_URL="http://127.0.0.1:$api_port" RUST_WS_ONE="http://127.0.0.1:$ws1_port" RUST_WS_TWO="http://127.0.0.1:$ws2_port" TEST_PG_CTL="$pgbin/pg_ctl" TEST_PRIMARY_DATA="$testdir/primary" TEST_STANDBY_DATA="$testdir/standby" node tests/sdk_promotion_e2e.cjs
+NOVU_RUST_URL="http://127.0.0.1:$api_port" RUST_WS_ONE="http://127.0.0.1:$ws1_port" RUST_WS_TWO="http://127.0.0.1:$ws2_port" TEST_PG_CTL="$pgbin/pg_ctl" TEST_PRIMARY_DATA="$testdir/primary" TEST_STANDBY_DATA="$testdir/standby" TEST_PSQL="$pgbin/psql" TEST_STANDBY_URL="postgres://postgres@127.0.0.1:$standby_port/postgres" TEST_WS1_PID="$ws1_pid" TEST_WS2_PID="$ws2_pid" node tests/sdk_promotion_e2e.cjs

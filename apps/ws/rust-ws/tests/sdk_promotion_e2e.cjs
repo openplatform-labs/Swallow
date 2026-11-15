@@ -11,6 +11,10 @@ function pgctl(data, ...args) {
   const result=spawnSync(process.env.TEST_PG_CTL,['-D',data,...args,'-w'],{encoding:'utf8',timeout:20000});
   assert.equal(result.status,0,'PostgreSQL control failed');
 }
+function sql(query) {
+  const result=spawnSync(process.env.TEST_PSQL,[process.env.TEST_STANDBY_URL,'-q','-v','ON_ERROR_STOP=1','-At','-c',query],{encoding:'utf8',timeout:5000});
+  assert.equal(result.status,0,'PostgreSQL query failed');return result.stdout.trim();
+}
 async function trigger(id) {
   let response;
   await until(async()=>{
@@ -34,13 +38,22 @@ async function trigger(id) {
     }
     await trigger('ha-before');
     await until(()=>clients.every(c=>c.notifications.some(n=>n.transactionId==='ha-before')),'initial event did not reach both WS clients');
-    pgctl(process.env.TEST_PRIMARY_DATA,'-m','immediate','stop');
+    // Both WS listeners miss the event committed after promotion while paused.
+    const wsPids=[Number(process.env.TEST_WS1_PID),Number(process.env.TEST_WS2_PID)];
+    for(const pid of wsPids)process.kill(pid,'SIGSTOP');
+    try {
+      pgctl(process.env.TEST_PRIMARY_DATA,'-m','immediate','stop');
+      pgctl(process.env.TEST_STANDBY_DATA,'promote');
+      await trigger('ha-gap');
+      await until(()=>sql("SELECT count(*) FROM public.novu_rust_in_app_messages WHERE environment_id='ha-env' AND transaction_id='ha-gap'")==='1','in-app worker did not store gap message');
+      assert(clients.every(c=>!c.notifications.some(n=>n.transactionId==='ha-gap')));
+    } finally { for(const pid of wsPids)process.kill(pid,'SIGCONT'); }
     await until(()=>clients.every(c=>c.disconnects>=1),'listener loss did not disconnect both clients');
-    pgctl(process.env.TEST_STANDBY_DATA,'promote');
-    await until(()=>clients.every(c=>c.connects>=2&&c.refreshes>=1&&c.refreshed?.some(n=>n.transactionId==='ha-before')),'SDK clients did not reconnect and refresh after promotion');
+    await until(()=>clients.every(c=>c.connects>=2&&c.refreshes>=1&&c.refreshed?.some(n=>n.transactionId==='ha-before')&&c.refreshed?.some(n=>n.transactionId==='ha-gap')),'SDK clients did not reconnect and refresh after promotion');
+    assert(clients.every(c=>!c.notifications.some(n=>n.transactionId==='ha-gap')),'unexpected replay of missed event');
     await trigger('ha-after');
     await until(()=>clients.every(c=>c.notifications.some(n=>n.transactionId==='ha-after')),'post-promotion event did not reach both WS clients');
-    console.log('Two SDK clients reconnected, refreshed Inbox and received live events after synchronous PostgreSQL promotion.');
+    console.log('Two SDK clients recovered a missed event from Inbox and received live events after synchronous PostgreSQL promotion.');
   } finally {
     for(const c of clients){c.stop?.();await c.sdk.socket.disconnect();}
   }
