@@ -102,6 +102,15 @@ INSERT INTO public.novu_rust_operator_jwt_slack_decision_grant_admins VALUES ('h
 INSERT INTO public.novu_rust_operator_jwt_slack_decision_grant_audit_viewers VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
 SQL
 fi
+if [[ "${SWALLOW_UI_SLACK_COOLDOWN_HEALTH_FIXTURE:-false}" == true ]]; then
+ "$pgbin/psql" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_slack_cooldown_health(text,text,text,text,bigint,integer) TO ui_channel_results_fixture;
+INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'ui-fixture-env',rolname,'alert_view',oid FROM pg_roles WHERE rolname='ui_channel_results_fixture' ON CONFLICT DO NOTHING;
+INSERT INTO public.novu_rust_operator_jwt_slack_cooldown_health_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
+INSERT INTO public.novu_rust_slack_cooldown_policies(environment_id,fallback_seconds,not_before) VALUES ('ui-fixture-env',30,clock_timestamp()+interval '5 minutes');
+INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status,last_error,available_at) VALUES (gen_random_uuid(),'ui-fixture-env','experimental_slack_chat','{}','pending','Slack shared cooldown active',clock_timestamp()-interval '10 minutes'),(gen_random_uuid(),'ui-fixture-env','experimental_slack_webhook','{}','pending','Slack shared cooldown active',clock_timestamp());
+SQL
+fi
 node --input-type=module - "$root" "$testdir" <<'JS'
 import {readFile,writeFile} from 'node:fs/promises';
 import {SignJWT,importPKCS8} from './node_modules/jose/dist/webapi/index.js';

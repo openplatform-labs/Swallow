@@ -269,3 +269,5 @@ Angular 테스트 156개와 빌드가 통과했다. 실제 브라우저, 로컬 
 자동 갱신으로 로그인한 경우 접근 토큰 회수 화면에서 **공급자에 현재 갱신 토큰도 회수 요청**을 추가로 선택할 수 있다. 선택한 경우 공급자 갱신 토큰, Swallow 접근 토큰, 공급자 접근 토큰 순서로 요청하며, 선택하지 않은 항목은 건너뛴다. 요청 하나가 실패해도 다음 요청을 시도하고 결과를 각각 표시한다. HTTP 200은 공급자의 요청 수락이며 토큰이 유효했는지 또는 다른 토큰과 세션이 회수됐는지 증명하지 않는다. 세 요청은 원자적이지 않으며 중간 만료·네트워크 실패나 응답 유실 시 부분 성공 또는 불명 상태가 남을 수 있다. 화면은 마지막에 로그아웃하므로 공급자 및 Swallow 관리자 도구에서 불명 결과를 확인해야 한다.
 
 Angular 테스트 158개와 빌드가 통과했다. 실제 브라우저·로컬 테스트 OIDC 공급자·Rust API·임시 PostgreSQL에서 세 항목을 함께 요청해 각각 수락 또는 회수 기록을 확인하고 테스트 갱신 토큰 재사용이 거절되는 것을 확인했다. 실제 외부 IdP, 운영 HA 및 모든 실패 조합은 미검증이다.
+
+The JWT operations screen can query the optional Slack shared cooldown snapshot. Provision the separate API 0098 identity grant, API database `alert_view` and function EXECUTE, and a worker cooldown policy; see the Rust API README. The threshold affects this query only. A failed lookup clears the previous result. The snapshot does not show whether every worker has enabled the guard. The local preview fixture flag `SWALLOW_UI_SLACK_COOLDOWN_HEALTH_FIXTURE=true` seeds a policy and deferred jobs for browser testing; it does not contact Slack.

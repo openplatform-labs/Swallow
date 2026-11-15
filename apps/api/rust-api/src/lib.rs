@@ -350,6 +350,7 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/operator/alerts", get(operator_identity::alerts))
         .route("/v1/experimental/operator/resend-auto-health/jobs", get(operator_identity::resend_auto_health_jobs))
         .route("/v1/experimental/operator/resend-auto-health", get(operator_identity::resend_auto_health))
+        .route("/v1/experimental/operator/slack-cooldown-health", get(operator_identity::slack_cooldown_health))
         .route("/v1/experimental/operator/resend-result", get(operator_identity::resend_result))
         .route("/v1/experimental/operator/twilio-result", get(operator_identity::twilio_result))
         .route("/v1/experimental/operator/twilio-jobs", get(operator_identity::twilio_jobs))
