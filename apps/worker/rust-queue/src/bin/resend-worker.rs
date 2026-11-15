@@ -163,7 +163,7 @@ async fn run(
                     }
                     match tokio::time::timeout(
                         timeout,
-                        resend_queue::process_one_with_retry_key(
+                        resend_queue::process_one_with_registered_policy(
                             &mut db,
                             &environment,
                             &provider,

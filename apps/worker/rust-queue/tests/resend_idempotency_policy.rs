@@ -23,6 +23,7 @@ fn start(url: &str, environment: &str, scope: &str) -> Worker {
             .env("NOVU_RESEND_API_KEY", "re_test")
             .env("NOVU_RESEND_FROM", "test@example.test")
             .env("NOVU_RESEND_IDEMPOTENCY_SCOPE", scope)
+            .env("HTTPS_PROXY", "http://127.0.0.1:9")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -119,6 +120,120 @@ async fn workers_reject_conflicting_scopes_and_isolate_environments() {
         );
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
+
+    // Policy changes wait while the guarded dispatch transaction holds its lock.
+    drop(same);
+    let (mut guarded, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    let tx = guarded.transaction().await.unwrap();
+    tx.query_one(
+        "SELECT public.novu_rust_check_resend_idempotency_scope($1,'job')",
+        &[&a],
+    )
+    .await
+    .unwrap();
+    let (writer, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    let env_for_update = a.clone();
+    let update = tokio::spawn(async move {
+        writer.execute("UPDATE public.novu_rust_resend_idempotency_policy SET scope='retry' WHERE environment_id=$1", &[&env_for_update]).await.unwrap()
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !update.is_finished(),
+        "policy update did not wait for guarded transaction"
+    );
+    tx.commit().await.unwrap();
+    assert_eq!(update.await.unwrap(), 1);
+    assert_eq!(
+        db.query_one(
+            "SELECT public.novu_rust_check_resend_idempotency_scope($1,'job')",
+            &[&a]
+        )
+        .await
+        .unwrap_err()
+        .code()
+        .unwrap()
+        .code(),
+        "55000"
+    );
+
+    // A running worker with stale scope must not create an attempt or contact Resend.
+    let job = Uuid::new_v4();
+    novu_postgres_queue::enqueue(
+        &db,
+        job,
+        &a,
+        "experimental_resend_email",
+        &serde_json::json!({"to":["test@example.test"],"subject":"test","html":"test"}),
+    )
+    .await
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(exit) = original.0.try_wait().unwrap() {
+            assert!(!exit.success());
+            break;
+        }
+        assert!(Instant::now() < deadline, "stale worker did not stop");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert_eq!(
+        db.query_one(
+            "SELECT count(*) FROM public.novu_rust_resend_attempts WHERE job_id=$1",
+            &[&job]
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0),
+        0
+    );
+    assert_eq!(
+        db.query_one(
+            "SELECT status FROM public.novu_queue_jobs WHERE id=$1",
+            &[&job]
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0),
+        "running"
+    );
+    // The invoker needs explicit function and row-lock privileges.
+    let role = format!("resend_policy_{}", Uuid::new_v4().simple());
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT SELECT, UPDATE ON public.novu_rust_resend_idempotency_policy TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_check_resend_idempotency_scope(text,text) TO {role}")).await.unwrap();
+    let (restricted, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    restricted
+        .batch_execute(&format!("SET SESSION AUTHORIZATION {role}"))
+        .await
+        .unwrap();
+    restricted
+        .query_one(
+            "SELECT public.novu_rust_check_resend_idempotency_scope($1,'retry')",
+            &[&b],
+        )
+        .await
+        .unwrap();
+    db.batch_execute(&format!("REVOKE EXECUTE ON FUNCTION public.novu_rust_check_resend_idempotency_scope(text,text) FROM {role}")).await.unwrap();
+    assert_eq!(
+        restricted
+            .query_one(
+                "SELECT public.novu_rust_check_resend_idempotency_scope($1,'retry')",
+                &[&b]
+            )
+            .await
+            .unwrap_err()
+            .code()
+            .unwrap()
+            .code(),
+        "42501"
+    );
     assert_eq!(
         db.query_one(
             "SELECT scope FROM public.novu_rust_resend_idempotency_policy WHERE environment_id=$1",
@@ -127,6 +242,6 @@ async fn workers_reject_conflicting_scopes_and_isolate_environments() {
         .await
         .unwrap()
         .get::<_, String>(0),
-        "job"
+        "retry"
     );
 }

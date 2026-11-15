@@ -134,6 +134,56 @@ pub async fn process_one_with_retry_key(
     correlation_guard: bool,
     retry_key: bool,
 ) -> Result<bool, Error> {
+    process_one_inner(
+        client,
+        environment,
+        provider,
+        retry_guard,
+        policy,
+        correlation_enabled,
+        correlation_guard,
+        retry_key,
+        false,
+    )
+    .await
+}
+
+/// Worker entry point: fence the registered policy through attempt creation.
+pub async fn process_one_with_registered_policy(
+    client: &mut Client,
+    environment: &str,
+    provider: &Resend,
+    retry_guard: bool,
+    policy: crate::email_step_policy::Policy,
+    correlation_enabled: bool,
+    correlation_guard: bool,
+    retry_key: bool,
+) -> Result<bool, Error> {
+    process_one_inner(
+        client,
+        environment,
+        provider,
+        retry_guard,
+        policy,
+        correlation_enabled,
+        correlation_guard,
+        retry_key,
+        true,
+    )
+    .await
+}
+
+async fn process_one_inner(
+    client: &mut Client,
+    environment: &str,
+    provider: &Resend,
+    retry_guard: bool,
+    policy: crate::email_step_policy::Policy,
+    correlation_enabled: bool,
+    correlation_guard: bool,
+    retry_key: bool,
+    registered: bool,
+) -> Result<bool, Error> {
     let Some(job) = claim(client, environment).await? else {
         return Ok(false);
     };
@@ -145,6 +195,14 @@ pub async fn process_one_with_retry_key(
         }
     };
     let tx = client.transaction().await?;
+    if registered {
+        let scope = if retry_key { "retry" } else { "job" };
+        tx.query_one(
+            "SELECT public.novu_rust_check_resend_idempotency_scope($1,$2)",
+            &[&environment, &scope],
+        )
+        .await?;
+    }
     let subscriber =
         crate::sendgrid_queue::lock_workflow_subscriber(&tx, environment, &email).await?;
     if !live(&tx, &job).await? {
