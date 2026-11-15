@@ -195,6 +195,15 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         _=>return Err("invalid SMTP credential alert thresholds".into()),
     };
     if smtp_credentials_thresholds.is_some() && on_new_condition && !conditions_v3 {return Err("SMTP credential health new-condition requires v3 conditions".into());}
+    let smtp_auto_worker_thresholds = match (
+        env_optional_i32("SWALLOW_ALERT_SMTP_AUTO_WORKER_MAX_AGE_SECONDS")?,
+        env_optional_i32("SWALLOW_ALERT_SMTP_AUTO_WORKER_MIN_HEALTHY")?,
+    ) {
+        (None,None)=>None,
+        (Some(age),Some(minimum)) if (1..=86400).contains(&age) && (1..=1000).contains(&minimum)=>Some((age,minimum)),
+        _=>return Err("invalid SMTP auto worker alert thresholds".into()),
+    };
+    if smtp_auto_worker_thresholds.is_some() && on_new_condition && !conditions_v3 {return Err("SMTP auto worker health new-condition requires v3 conditions".into());}
     let smtp_ca_thresholds = match (
         env_optional_i32("SWALLOW_ALERT_SMTP_CA_MAX_AGE_SECONDS")?,
         env_optional_i32("SWALLOW_ALERT_SMTP_CA_MIN_HEALTHY")?,
@@ -287,6 +296,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         && fcm_credentials_thresholds.is_none()
         && smtp_credentials_thresholds.is_none()
         && smtp_ca_thresholds.is_none()
+        && smtp_auto_worker_thresholds.is_none()
     {
         return Err("no alert checks configured".into());
     }
@@ -466,6 +476,10 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     } else {
         None
     };
+    let smtp_auto_workers = if let Some((age,minimum))=smtp_auto_worker_thresholds {
+        let result=tokio::time::timeout(operation_timeout,db.query_one("SELECT * FROM public.novu_rust_smtp_auto_worker_health_check($1,$2)",&[&args[0],&age])).await;
+        Some(match result {Ok(Ok(row))=>match(u64::try_from(row.get::<_,i64>(0)),u64::try_from(row.get::<_,i64>(1))) {(Ok(healthy),Ok(stale))=>Ok((healthy,stale,minimum as u64)),_=>Err(())},_=>{eprintln!("SMTP auto worker health check failed");Err(())}})
+    } else {None};
     let smtp_ca = if let Some((age, minimum)) = smtp_ca_thresholds {
         let result=tokio::time::timeout(operation_timeout,db.query_one("SELECT healthy,unhealthy,stale FROM public.novu_rust_smtp_ca_health_check($1,$2)",&[&args[0],&age])).await;
         Some(match result {
@@ -715,7 +729,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         });
         Some(match values {Some(value)=>Ok(value),None=>{eprintln!("FCM cooldown check failed");Err(())}})
     } else {None};
-    let unhealthy = smtp_auto_health.is_some_and(|v| !matches!(v,Ok((_,_,0,0)))) || smtp_ca.is_some_and(|value| match value {Ok((healthy,unhealthy,_,minimum))=>healthy<minimum||unhealthy>0,Err(())=>true}) || smtp_credentials.is_some_and(|value| match value {Ok((healthy,unhealthy,_,minimum))=>healthy<minimum||unhealthy>0,Err(())=>true}) || discord_cooldown_health.is_some_and(|v| match v {Ok((active,deferred,overdue))=>overdue>0||(!discord_cooldown_overdue_only&&(active>0||deferred>0)),Err(())=>true}) || smtp_health.is_some_and(|v| !matches!(v,Ok((0,0,0)))) || discord_retry_health.is_some_and(|v| !matches!(v,Ok((_,0)))) || discord_health.is_some_and(|v| !matches!(v,Ok((0,0,0,0)))) || fcm_credentials.is_some_and(|value| match value {
+    let unhealthy = smtp_auto_workers.is_some_and(|v| match v {Ok((healthy,_,minimum))=>healthy<minimum,Err(())=>true}) || smtp_auto_health.is_some_and(|v| !matches!(v,Ok((_,_,0,0)))) || smtp_ca.is_some_and(|value| match value {Ok((healthy,unhealthy,_,minimum))=>healthy<minimum||unhealthy>0,Err(())=>true}) || smtp_credentials.is_some_and(|value| match value {Ok((healthy,unhealthy,_,minimum))=>healthy<minimum||unhealthy>0,Err(())=>true}) || discord_cooldown_health.is_some_and(|v| match v {Ok((active,deferred,overdue))=>overdue>0||(!discord_cooldown_overdue_only&&(active>0||deferred>0)),Err(())=>true}) || smtp_health.is_some_and(|v| !matches!(v,Ok((0,0,0)))) || discord_retry_health.is_some_and(|v| !matches!(v,Ok((_,0)))) || discord_health.is_some_and(|v| !matches!(v,Ok((0,0,0,0)))) || fcm_credentials.is_some_and(|value| match value {
         Ok((healthy, failed, _, minimum)) => healthy < minimum || failed > 0,
         Err(()) => true,
     }) || sendgrid_webhook_keys.is_some_and(|v| !matches!(v, Ok(1..=10)))
@@ -766,6 +780,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         slack_attempts,
         slack_policy_cancelled,
         smtp_health,
+        smtp_auto_workers,
         smtp_auto_health,
         discord_health,
         discord_retry_health,
@@ -833,7 +848,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         println!("{{\"status\":\"healthy\"}}");
         return Ok(());
     }
-    let mut error = smtp_auto_health.is_some_and(|v| v.is_err()) || discord_cooldown_health.is_some_and(|v| v.is_err()) || smtp_health.is_some_and(|v| v.is_err()) || discord_retry_health.is_some_and(|v| v.is_err()) || discord_health.is_some_and(|v| v.is_err()) || configuration_error
+    let mut error = smtp_auto_workers.is_some_and(|v| v.is_err()) || smtp_auto_health.is_some_and(|v| v.is_err()) || discord_cooldown_health.is_some_and(|v| v.is_err()) || smtp_health.is_some_and(|v| v.is_err()) || discord_retry_health.is_some_and(|v| v.is_err()) || discord_health.is_some_and(|v| v.is_err()) || configuration_error
         || observation_error
         || sendgrid_webhook_keys.is_some_and(|v| v.is_err())
         || fcm_credentials.is_some_and(|v| v.is_err())

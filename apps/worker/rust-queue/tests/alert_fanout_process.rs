@@ -9,7 +9,7 @@ fn optional_preflight_checks_effective_threshold_pairs_before_any_child() {
     for name in ["send-delivery-alert","send-database-alert"] {
         let child=dir.join(name);std::fs::write(&child,"#!/bin/sh\nprintf '%s\\n' \"$SWALLOW_ALERT_SLACK_TARGET_ID\" >> \"$FANOUT_TEST_LOG\"\n").unwrap();std::fs::set_permissions(child,std::fs::Permissions::from_mode(0o700)).unwrap();
     }
-    let pairs=[("smtp_credential_max_age_seconds","smtp_credential_min_healthy"),("smtp_ca_max_age_seconds","smtp_ca_min_healthy"),("fcm_credential_max_age_seconds","fcm_credential_min_healthy"),("fcm_unrecorded_claim_min_gap","fcm_unrecorded_claim_grace_seconds"),("twilio_grace_seconds","twilio_heartbeat_max_seconds"),("sendgrid_grace_seconds","sendgrid_heartbeat_max_seconds")];
+    let pairs=[("smtp_auto_worker_max_age_seconds","smtp_auto_worker_min_healthy"),("smtp_credential_max_age_seconds","smtp_credential_min_healthy"),("smtp_ca_max_age_seconds","smtp_ca_min_healthy"),("fcm_credential_max_age_seconds","fcm_credential_min_healthy"),("fcm_unrecorded_claim_min_gap","fcm_unrecorded_claim_grace_seconds"),("twilio_grace_seconds","twilio_heartbeat_max_seconds"),("sendgrid_grace_seconds","sendgrid_heartbeat_max_seconds")];
     let config=dir.join("config.json");let log=dir.join("log");
     for (left,right) in pairs {
         for (left_value,right_value,expected) in [(serde_json::json!(30),serde_json::Value::Null,false),(serde_json::json!(30),serde_json::json!(30),true),(serde_json::json!("disabled"),serde_json::json!("disabled"),true)] {
@@ -61,7 +61,7 @@ fn alert_timing_overrides_are_isolated_for_delivery_and_database() {
 }
 #[test]
 fn all_target_thresholds_are_forwarded_to_the_matching_child_variables() {
-    let names = ["discord_cooldown_grace_seconds","discord_retry_grace_seconds","smtp_credential_max_age_seconds","smtp_credential_min_healthy","smtp_ca_max_age_seconds","smtp_ca_min_healthy","fcm_credential_max_age_seconds","fcm_credential_min_healthy","fcm_unrecorded_claim_min_gap","fcm_unrecorded_claim_grace_seconds","fcm_cooldown_grace_seconds","fcm_partial_window_seconds","twilio_delayed_grace_seconds","resend_cooldown_grace_seconds","slack_cooldown_grace_seconds","resend_auto_grace_seconds","twilio_grace_seconds","twilio_heartbeat_max_seconds","sendgrid_grace_seconds","sendgrid_heartbeat_max_seconds","queue_max_wait_seconds","smtp_auto_grace_seconds"];
+    let names = ["discord_cooldown_grace_seconds","discord_retry_grace_seconds","smtp_credential_max_age_seconds","smtp_credential_min_healthy","smtp_ca_max_age_seconds","smtp_ca_min_healthy","fcm_credential_max_age_seconds","fcm_credential_min_healthy","fcm_unrecorded_claim_min_gap","fcm_unrecorded_claim_grace_seconds","fcm_cooldown_grace_seconds","fcm_partial_window_seconds","twilio_delayed_grace_seconds","resend_cooldown_grace_seconds","slack_cooldown_grace_seconds","resend_auto_grace_seconds","twilio_grace_seconds","twilio_heartbeat_max_seconds","sendgrid_grace_seconds","sendgrid_heartbeat_max_seconds","queue_max_wait_seconds","smtp_auto_grace_seconds","smtp_auto_worker_max_age_seconds","smtp_auto_worker_min_healthy"];
     let dir=std::env::temp_dir().join(format!("swallow-alert-thresholds-{}",Uuid::new_v4()));std::fs::create_dir(&dir).unwrap();
     let fanout=dir.join("alert-fanout");std::fs::copy(env!("CARGO_BIN_EXE_alert-fanout"),&fanout).unwrap();
     let child=dir.join("send-delivery-alert");

@@ -107,6 +107,12 @@ SELECT public.novu_rust_ack_smtp('smtp-auto-fixture','%s',a.revision,j.failure_r
     with lock:assert messages.count('successful')==2 and messages.count('repeated')==2, messages
     children[-1].terminate();children[-1].wait(timeout=10)
     status,counts=worker_health();assert status==2 and counts['healthy']==1 and counts['stale']>=1
+    worker_alert_env={k:v for k,v in alert_env.items() if k!='SWALLOW_ALERT_SMTP_AUTO_GRACE_SECONDS'}
+    worker_alert_env.update({'SWALLOW_ALERT_SMTP_AUTO_WORKER_MAX_AGE_SECONDS':'10','SWALLOW_ALERT_SMTP_AUTO_WORKER_MIN_HEALTHY':'2'})
+    alert=subprocess.run([str(pathlib.Path(work)/'send-delivery-alert'),env,'300','120','60'],env=worker_alert_env,capture_output=True,text=True,timeout=15)
+    assert alert.returncode==2 and 'requires operator review' in alert.stderr,alert.stderr
+    invalid={k:v for k,v in worker_alert_env.items() if k!='SWALLOW_ALERT_SMTP_AUTO_WORKER_MIN_HEALTHY'}
+    assert subprocess.run([str(pathlib.Path(work)/'send-delivery-alert'),env,'300','120','60'],env=invalid,capture_output=True,timeout=15).returncode==1
     sql("DELETE FROM public.novu_rust_smtp_auto_retry_workers WHERE environment_id='smtp-auto-fixture' AND database_principal='smtp_auto_fixture'")
     status,counts=worker_health();assert status==2 and counts['healthy']==0
     denied=subprocess.run([str(pathlib.Path(work)/'delivery-reconcile'),'check-smtp-auto-workers','smtp-auto-other','10','1'],env=runner,capture_output=True,timeout=10)

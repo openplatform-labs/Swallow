@@ -81,6 +81,8 @@ struct DeliveryThresholds {
     smtp_credential_max_age_seconds: Option<Threshold>,
     smtp_credential_min_healthy: Option<Threshold>,
     smtp_auto_grace_seconds: Option<Threshold>,
+    smtp_auto_worker_max_age_seconds: Option<Threshold>,
+    smtp_auto_worker_min_healthy: Option<Threshold>,
     smtp_ca_max_age_seconds: Option<Threshold>,
     smtp_ca_min_healthy: Option<Threshold>,
     fcm_credential_max_age_seconds: Option<Threshold>,
@@ -100,12 +102,14 @@ struct DeliveryThresholds {
     queue_max_wait_seconds: Option<Threshold>,
 }
 impl DeliveryThresholds {
-    fn values(&self) -> [(&'static str, &Option<Threshold>, u32, u32); 22] {
+    fn values(&self) -> [(&'static str, &Option<Threshold>, u32, u32); 24] {
         [
             ("SWALLOW_ALERT_DISCORD_COOLDOWN_GRACE_SECONDS", &self.discord_cooldown_grace_seconds, 1, 86400),
             ("SWALLOW_ALERT_DISCORD_RETRY_GRACE_SECONDS", &self.discord_retry_grace_seconds, 1, 86400),
             ("SWALLOW_ALERT_SMTP_CREDENTIAL_MAX_AGE_SECONDS", &self.smtp_credential_max_age_seconds, 1, 86400),
             ("SWALLOW_ALERT_SMTP_CREDENTIAL_MIN_HEALTHY", &self.smtp_credential_min_healthy, 1, 1000),
+            ("SWALLOW_ALERT_SMTP_AUTO_WORKER_MAX_AGE_SECONDS", &self.smtp_auto_worker_max_age_seconds, 1, 86400),
+            ("SWALLOW_ALERT_SMTP_AUTO_WORKER_MIN_HEALTHY", &self.smtp_auto_worker_min_healthy, 1, 1000),
             ("SWALLOW_ALERT_SMTP_AUTO_GRACE_SECONDS", &self.smtp_auto_grace_seconds, 1, 86400),
             ("SWALLOW_ALERT_SMTP_CA_MAX_AGE_SECONDS", &self.smtp_ca_max_age_seconds, 1, 86400),
             ("SWALLOW_ALERT_SMTP_CA_MIN_HEALTHY", &self.smtp_ca_min_healthy, 1, 1000),
@@ -313,6 +317,7 @@ impl Target {
         };
         let value = |f: fn(&DeliveryThresholds) -> &Option<Threshold>| thresholds.and_then(|t| f(t).as_ref());
         for (left_key, left, right_key, right) in [
+            ("SWALLOW_ALERT_SMTP_AUTO_WORKER_MAX_AGE_SECONDS", value(|t| &t.smtp_auto_worker_max_age_seconds), "SWALLOW_ALERT_SMTP_AUTO_WORKER_MIN_HEALTHY", value(|t| &t.smtp_auto_worker_min_healthy)),
             ("SWALLOW_ALERT_SMTP_CREDENTIAL_MAX_AGE_SECONDS", value(|t| &t.smtp_credential_max_age_seconds), "SWALLOW_ALERT_SMTP_CREDENTIAL_MIN_HEALTHY", value(|t| &t.smtp_credential_min_healthy)),
             ("SWALLOW_ALERT_SMTP_CA_MAX_AGE_SECONDS", value(|t| &t.smtp_ca_max_age_seconds), "SWALLOW_ALERT_SMTP_CA_MIN_HEALTHY", value(|t| &t.smtp_ca_min_healthy)),
             ("SWALLOW_ALERT_FCM_CREDENTIAL_MAX_AGE_SECONDS", value(|t| &t.fcm_credential_max_age_seconds), "SWALLOW_ALERT_FCM_CREDENTIAL_MIN_HEALTHY", value(|t| &t.fcm_credential_min_healthy)),
