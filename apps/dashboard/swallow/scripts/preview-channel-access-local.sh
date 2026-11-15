@@ -24,12 +24,12 @@ cargo run --quiet --locked --manifest-path "$worker/Cargo.toml" --bin migrate-wo
 "$pgbin/psql" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
 CREATE ROLE ui_channel_fixture LOGIN;
 GRANT USAGE ON SCHEMA public TO ui_channel_fixture;
-GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_channel_access_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_channel_access_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_channel_access_grant_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_channel_access_grant_audit_read(text,text,text,text,bigint,uuid) TO ui_channel_fixture;
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_channel_access_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_channel_access_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_channel_access_grant_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_channel_access_grant_audit_read(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_channel_access_grant_audit_filtered(text,text,text,text,bigint,text,uuid) TO ui_channel_fixture;
 INSERT INTO public.novu_rust_environments VALUES ('ui-fixture-env','org');
 INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_catalog.pg_roles WHERE rolname='ui_channel_fixture';
 INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env'),('https://issuer.test','target-fixture','console','ui-fixture-env');
 INSERT INTO public.novu_rust_operator_jwt_channel_access_grant_scopes VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env','sendgrid',true,true);
-INSERT INTO public.novu_rust_operator_jwt_channel_access_grant_audit_viewers VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
+INSERT INTO public.novu_rust_operator_jwt_channel_access_grant_audit_scopes VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env','sendgrid');
 SQL
 node --input-type=module - "$root" "$testdir" <<'JS'
 import {readFile,writeFile} from 'node:fs/promises';
