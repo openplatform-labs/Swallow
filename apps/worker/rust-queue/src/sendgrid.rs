@@ -322,8 +322,14 @@ impl Sendgrid {
     }
     /// Send once; ambiguous network failures are never automatically retried.
     pub async fn send(&self, message: &Email) -> Result<Receipt, SendError> {
-        let body =
-            request_body_with_default_pool(&self.config, message, self.default_ip_pool.as_deref())?;
+        let body = self.prepare(message)?;
+        self.send_prepared(body, message.message_id.as_deref()).await
+    }
+    /// Validate and construct the request before a queue reservation commits.
+    pub(crate) fn prepare(&self, message: &Email) -> Result<Value, SendError> {
+        request_body_with_default_pool(&self.config, message, self.default_ip_pool.as_deref())
+    }
+    pub(crate) async fn send_prepared(&self, body: Value, message_id: Option<&str>) -> Result<Receipt, SendError> {
         let response = self
             .http
             .post(&self.endpoint)
@@ -336,10 +342,9 @@ impl Sendgrid {
         if !status.is_success() {
             return Err(SendError::Provider(status.as_u16()));
         }
-        let id = message
-            .message_id
-            .clone()
+        let id = message_id
             .filter(|value| !value.is_empty())
+            .map(str::to_owned)
             .or_else(|| {
                 response
                     .headers()
