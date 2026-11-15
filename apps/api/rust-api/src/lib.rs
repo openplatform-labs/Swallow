@@ -87,8 +87,48 @@ fn key_reload_state_healthy(last: std::time::Instant, valid: bool, interval: std
     valid && last.elapsed() <= interval * 2 + std::time::Duration::from_secs(5)
 }
 
+type OperatorReloadHealth = std::sync::Mutex<(std::time::Instant, bool)>;
+
+async fn monitor_operator_key_reload(
+    health: Arc<OperatorReloadHealth>,
+    verifier: Arc<operator_access_token::AccessTokenVerifier>,
+    interval: std::time::Duration,
+) {
+    loop {
+        tokio::time::sleep(interval.min(std::time::Duration::from_secs(5))).await;
+        let check = health.lock();
+        let unhealthy = match &check {
+            Ok(state) => !key_reload_state_healthy(state.0, state.1, interval),
+            Err(_) => true,
+        };
+        if unhealthy && verifier.is_available() {
+            verifier.reject_until_reloaded();
+            eprintln!("operator signing key reload unavailable or stale");
+        }
+    }
+}
+
 #[cfg(test)]
 mod operator_key_health_tests {
+    #[tokio::test]
+    async fn stale_monitor_rejects_and_valid_reload_recovers() {
+        use std::{sync::{Arc, Mutex}, time::{Duration, Instant}};
+        let public = include_str!("../tests/fixtures/operator_jwt/test-only-public.pem");
+        let config = serde_json::json!({"issuer":"issuer","audience":"audience", "keys":[{"kid":"key","pem":public}]}).to_string();
+        let verifier = Arc::new(super::operator_access_token::AccessTokenVerifier::from_json(&config).unwrap());
+        let health = Arc::new(Mutex::new((Instant::now() - Duration::from_secs(8), true)));
+        let task = tokio::spawn(super::monitor_operator_key_reload(health.clone(), verifier.clone(), Duration::from_secs(1)));
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(!verifier.is_available());
+        {
+            let mut state = health.lock().unwrap();
+            verifier.reload_keys(&config).unwrap();
+            *state = (Instant::now(), true);
+        }
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(verifier.is_available());
+        task.abort();
+    }
     #[test]
     fn rejects_failed_or_stale_observations() {
         use std::time::{Duration, Instant};
@@ -294,17 +334,27 @@ impl RuntimeConfig {
         let (Some(verifier), Some((path, interval, reject))) = (&self.operator_verifier, &self.operator_reload) else { return; };
         let verifier=verifier.clone(); let path=path.clone(); let interval=*interval; let reject=*reject;
         let health = self.operator_reload_health.clone().expect("reload health initialized");
+        if reject {
+            tokio::spawn(monitor_operator_key_reload(health.clone(), verifier.clone(), interval));
+        }
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
                 let source=path.clone();
                 let read=tokio::task::spawn_blocking(move || novu_rust_contracts::secret::read_regular_file(&source)).await;
-                let valid=match read { Ok(Ok(value)) => verifier.reload_keys(&value).is_ok(), _ => false };
-                if let Ok(mut state) = health.lock() { *state = (std::time::Instant::now(), valid); }
-                if !valid {
-                    if reject { verifier.reject_until_reloaded(); }
-                    eprintln!("operator signing key reload failed");
-                }
+                let valid = match health.lock() {
+                    Ok(mut state) => {
+                        let valid = match read { Ok(Ok(value)) => verifier.reload_keys(&value).is_ok(), _ => false };
+                        *state = (std::time::Instant::now(), valid);
+                        if !valid && reject { verifier.reject_until_reloaded(); }
+                        valid
+                    }
+                    Err(_) => {
+                        if reject { verifier.reject_until_reloaded(); }
+                        false
+                    }
+                };
+                if !valid { eprintln!("operator signing key reload failed"); }
             }
         });
     }
