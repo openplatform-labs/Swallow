@@ -8,7 +8,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use novu_rust_api::operator_access_token::AccessTokenVerifier;
 use serde_json::json;
 use std::{
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -17,6 +17,39 @@ use tower::ServiceExt;
 
 const PRIVATE: &[u8] = include_bytes!("fixtures/operator_jwt/test-only-private.pem");
 const PUBLIC: &[u8] = include_bytes!("fixtures/operator_jwt/test-only-public.pem");
+
+struct ApiProcess(Child);
+impl Drop for ApiProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+async fn http_status(port: u16, path: &str, token: Option<&str>) -> Option<u16> {
+    let mut curl = tokio::process::Command::new("curl");
+    curl.args([
+        "--silent",
+        "--max-time",
+        "2",
+        "--output",
+        "/dev/null",
+        "--write-out",
+        "%{http_code}",
+    ]);
+    if let Some(token) = token {
+        curl.arg("--header")
+            .arg(format!("Authorization: Bearer {token}"));
+    }
+    let output = curl
+        .arg(format!("http://127.0.0.1:{port}{path}"))
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    std::str::from_utf8(&output.stdout).ok()?.parse().ok()
+}
 
 async fn connect(url: &str) -> Client {
     for _ in 0..100 {
@@ -68,6 +101,44 @@ async fn committed_operator_revocation_survives_synchronous_promotion() {
     let initial = app(connect(&api_url).await);
     let revoked = token("revoked-fixture");
     let other = token("other-fixture");
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    drop(socket);
+    let cluster_url = std::env::var("TEST_FAILOVER_URL").unwrap().replacen(
+        "postgresql://postgres@",
+        "postgresql://operator_ha_api@",
+        1,
+    );
+    let config=json!({"issuer":"https://issuer.test","audience":"swallow","keys":[{"kid":"fixture","pem":std::str::from_utf8(PUBLIC).unwrap()}],"check_token_revocation":true}).to_string();
+    let mut server = ApiProcess(
+        Command::new(env!("CARGO_BIN_EXE_novu-rust-api"))
+            .env_clear()
+            .env("DATABASE_URL", cluster_url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("LISTEN_ADDR", format!("127.0.0.1:{port}"))
+            .env("SWALLOW_OPERATOR_JWT_CONFIG", config)
+            .env("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED", "true")
+            .env("SWALLOW_API_DB_HEALTH_INTERVAL_SECONDS", "1")
+            .env("SWALLOW_API_DB_HEALTH_TIMEOUT_SECONDS", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let path = "/v1/experimental/operator/me?environmentId=operator-ha";
+    let mut started = false;
+    for _ in 0..100 {
+        if http_status(port, path, Some(&other)).await == Some(200) {
+            started = true;
+            break;
+        }
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "API exited during startup"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(started, "API did not start");
     assert_eq!(
         initial
             .clone()
@@ -82,6 +153,7 @@ async fn committed_operator_revocation_survives_synchronous_promotion() {
         initial.oneshot(request(&revoked)).await.unwrap().status(),
         StatusCode::UNAUTHORIZED
     );
+    assert_eq!(http_status(port, path, Some(&revoked)).await, Some(401));
     let replica = connect(&standby_url).await;
     let mut replicated = false;
     for _ in 0..100 {
@@ -103,6 +175,22 @@ async fn committed_operator_revocation_survives_synchronous_promotion() {
             .unwrap()
             .success()
     );
+    let mut unavailable = false;
+    for _ in 0..100 {
+        if http_status(port, "/health/ready", None).await == Some(503) {
+            unavailable = true;
+            break;
+        }
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "API exited after primary loss"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        unavailable,
+        "API did not report unavailable before promotion"
+    );
     assert!(
         Command::new("docker")
             .args([
@@ -121,6 +209,24 @@ async fn committed_operator_revocation_survives_synchronous_promotion() {
             .unwrap()
             .success()
     );
+    let mut reconnected = false;
+    for _ in 0..150 {
+        if http_status(port, path, Some(&other)).await == Some(200) {
+            reconnected = true;
+            break;
+        }
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "API exited during failover"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        reconnected,
+        "same API process did not reconnect to the promoted database"
+    );
+    assert_eq!(http_status(port, "/health/ready", None).await, Some(200));
+    assert_eq!(http_status(port, path, Some(&revoked)).await, Some(401));
     let promoted_url =
         standby_url.replacen("postgresql://postgres@", "postgresql://operator_ha_api@", 1);
     let promoted = app(connect(&promoted_url).await);
