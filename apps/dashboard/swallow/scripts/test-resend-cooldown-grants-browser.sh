@@ -164,7 +164,7 @@ await page.click('loc=role:button[name="정책 변경 요청 준비"]');
 await page.waitForSelector('input[name="resendCooldownSubmitConfirm"]');
 await page.click('input[name="resendCooldownSubmitConfirm"]');
 await page.click('loc=role:button[name="정책 변경 제출"]');
-await page.waitForFunction(()=>document.body.innerText.includes('결과가 불명확합니다. 요청 ID로 확인하세요.'));
+await page.waitForFunction(()=>document.body.innerText.includes('서버가 인증 또는 권한 오류를 반환했습니다. 이전 요청이 처리됐을 수 있으므로 요청 ID를 보관하고 확인하세요.'));
 // Navigate away to clear the unresolved request, then revoke read separately.
 await page.click('nav.sidenav button >> nth=5');
 await settings();
