@@ -47,7 +47,7 @@
         <div class="feature-grid">
           <button class="feature-card" (click)="setSection('workflows')"><span class="feature-icon">WF</span><strong>워크플로</strong><small>채널별 단일 단계 설정</small><span class="feature-status">설정하기 →</span></button>
           <button class="feature-card" (click)="setSection('subscribers')"><span class="feature-icon teal">SU</span><strong>구독자</strong><small>수신자와 알림 설정 관리</small><span class="feature-status">준비 중 →</span></button>
-          <button class="feature-card" (click)="setSection('channels')"><span class="feature-icon amber">CH</span><strong>발송 채널</strong><small>SendGrid 웹훅 서명 키 관리</small><span class="feature-status">키 관리 →</span></button>
+          <button class="feature-card" (click)="setSection('channels')"><span class="feature-icon amber">CH</span><strong>발송 채널</strong><small>FCM 통합 및 SendGrid 서명 키 관리</small><span class="feature-status">설정하기 →</span></button>
         </div>
       } @else if (section() === 'workflows') {
         <div class="page-heading"><div><div class="eyebrow">WORKFLOWS</div><h1>워크플로</h1><p>기존 워크플로의 채널별 단일 단계를 조회하고 설정합니다.</p></div></div>
@@ -316,7 +316,8 @@
           </div></section>
         }
       } @else if (section() === 'channels') {
-        <div class="page-heading"><div><div class="eyebrow">CHANNELS</div><h1>발송 채널</h1><p>SendGrid 웹훅 서명 공개키를 관리합니다.</p></div></div>
+        <div class="page-heading"><div><div class="eyebrow">CHANNELS</div><h1>발송 채널</h1><p>SendGrid 웹훅 서명 공개키와 FCM 통합을 관리합니다.</p></div></div>
+        <app-fcm-integrations [apiOrigin]="apiOrigin" (busy)="fcmBusy=$event"></app-fcm-integrations>
         <section class="card subscriber-card"><div class="card-block"><h2>SendGrid 웹훅 공개키</h2>
           <p>환경 API 키의 별도 읽기·쓰기 권한이 필요합니다. API 키는 이 화면에만 유지됩니다.</p>
           <label for="sg-api-key">환경 API 키</label><input id="sg-api-key" type="password" name="sendgridApiKey" [(ngModel)]="sendgridApiKey" (ngModelChange)="clearSendgrid()" [disabled]="sendgridWriteStatus()==='sending'" autocomplete="off" spellcheck="false">
