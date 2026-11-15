@@ -82,7 +82,7 @@ async fn worker_sends_once_and_recovers_expired_attempts() {
     db.execute("INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,email_subject,email_html,email_provider,inbox_metadata) VALUES($1,'smtp-fixture',true,true,'workflow fixture','<p>Hello SMTP</p>','smtp','{\"id\":\"64a000000000000000000051\",\"name\":\"Fixture\",\"critical\":false,\"tags\":[]}'::jsonb)",&[&env]).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES($1,'alice','64a000000000000000000054','{\"email\":\"ops@example.test\"}'::jsonb)",&[&env]).await.unwrap();
     let trigger = Uuid::new_v4();
-    queue::enqueue(&db,trigger,&env,queue::in_app::JOB_KIND,&json!({"workflow":"smtp-fixture","transactionId":"smtp-fixture-tx","content":"","payload":{},"recipients":[{"subscriberId":"alice"}],"recipientIdentitySnapshot":{"alice":"64a000000000000000000054"},"severityOverride":null})).await.unwrap();
+    queue::enqueue(&db,trigger,&env,queue::in_app::JOB_KIND,&json!({"workflow":"smtp-fixture","transactionId":"smtp-fixture-tx","content":"","payload":{},"recipients":[{"subscriberId":"alice"}],"recipientIdentitySnapshot":{"alice":"64a000000000000000000054"},"emailAttachments":[{"file":[104,101,108,108,111],"name":"report.txt","mime":"text/plain"},{"file":[0,1,255],"name":"logo.png","mime":"image/png","cid":"logo"}],"severityOverride":null})).await.unwrap();
     assert!(queue::in_app::process_one(&mut db).await.unwrap());
     let job:Uuid=db.query_one("SELECT email_job_id FROM public.novu_rust_email_step_outcomes WHERE environment_id=$1 AND transaction_id='smtp-fixture-tx'",&[&env]).await.unwrap().get(0);
     assert_eq!(
@@ -151,6 +151,8 @@ async fn worker_sends_once_and_recovers_expired_attempts() {
     assert!(body.contains("workflow fixture"));
     assert!(body.contains("Hello SMTP"));
     assert!(!body.contains("fixture-password"));
+    let parsed = Command::new("python3").arg("-c").arg(r#"import sys,email; m=email.message_from_binary_file(open(sys.argv[1],"rb")); p=[x for x in m.walk() if x.get_filename()]; assert len(p)==2; assert p[0].get("Content-ID")=="<logo>" and p[0].get_payload(decode=True)==bytes([0,1,255]); assert p[1].get_filename()=="report.txt" and p[1].get_payload(decode=True)==b"hello""#).arg(&output).status().unwrap();
+    assert!(parsed.success());
     let mut stale_failed = false;
     for _ in 0..100 {
         let row=db.query_one("SELECT status,last_error,(SELECT count(*) FROM public.novu_rust_smtp_attempts WHERE job_id=$1) FROM public.novu_queue_jobs WHERE id=$1",&[&stale]).await.unwrap();

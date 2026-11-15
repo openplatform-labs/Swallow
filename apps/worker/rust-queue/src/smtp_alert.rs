@@ -163,7 +163,7 @@ impl SmtpAlert {
     }
     /// Build the supported workflow subset before reserving a send.
     pub fn prepare_workflow(&self, email: &crate::sendgrid::Email) -> Result<Message, ()> {
-        use lettre::message::{Mailbox, MultiPart, SinglePart};
+        use lettre::message::{Attachment, Mailbox, MultiPart, SinglePart};
         fn address(value: &str) -> Result<lettre::Address, ()> {
             if value.len() > 320 || value.contains(['\r', '\n', '\0', '<', '>']) {
                 return Err(());
@@ -181,7 +181,6 @@ impl SmtpAlert {
             || email.subject.len() > 998
             || email.html.len() > 1_048_576
             || email.text.as_ref().is_some_and(|v| v.len() > 1_048_576)
-            || !email.attachments.is_empty()
             || !email.alternatives.is_empty()
             || !email.headers.is_empty()
             || !email.custom_data.is_empty()
@@ -222,19 +221,83 @@ impl SmtpAlert {
         if let Some(reply) = email.reply_to.as_ref().filter(|s| !s.is_empty()) {
             builder = builder.reply_to(Mailbox::new(None, address(reply)?));
         }
-        match &email.text {
-            Some(text) => builder
-                .multipart(
-                    MultiPart::alternative()
-                        .singlepart(SinglePart::plain(text.clone()))
-                        .singlepart(SinglePart::html(email.html.clone())),
-                )
-                .map_err(|_| ()),
-            None => builder
-                .header(ContentType::TEXT_HTML)
-                .body(email.html.clone())
-                .map_err(|_| ()),
+        // Validate before allocating MIME parts or reserving an external send.
+        let mut total = 0usize;
+        let mut inline = Vec::new();
+        let mut attached = Vec::new();
+        let mut content_ids = std::collections::HashSet::new();
+        if email.attachments.len() > 100 {
+            return Err(());
         }
+        for file in &email.attachments {
+            total = total.checked_add(file.file.len()).ok_or(())?;
+            if total > 20 * 1024 * 1024
+                || file.name.is_empty()
+                || file.name.len() > 255
+                || file.name.chars().any(char::is_control)
+                || file.mime.len() > 255
+            {
+                return Err(());
+            }
+            let mime = ContentType::parse(&file.mime).map_err(|_| ())?;
+            let cid = file.cid.as_deref().filter(|v| !v.is_empty());
+            if file.cid.is_some() && cid.is_none() {
+                return Err(());
+            }
+            if cid.is_some_and(|id| !content_ids.insert(id)) {
+                return Err(());
+            }
+            if cid.is_some_and(|v| {
+                v.len() > 255
+                    || !v
+                        .bytes()
+                        .all(|c| c.is_ascii_graphic() && !matches!(c, 34 | 60 | 62 | 92))
+            }) {
+                return Err(());
+            }
+            match (file.disposition.as_deref().filter(|v| !v.is_empty()), cid) {
+                (None | Some("inline"), Some(id)) => inline.push(
+                    Attachment::new_inline_with_name(id.to_owned(), file.name.clone())
+                        .body(file.file.clone(), mime),
+                ),
+                (None | Some("attachment"), None) => {
+                    attached.push(Attachment::new(file.name.clone()).body(file.file.clone(), mime))
+                }
+                _ => return Err(()),
+            }
+        }
+        if email.attachments.is_empty() {
+            return match &email.text {
+                Some(text) => builder
+                    .multipart(
+                        MultiPart::alternative()
+                            .singlepart(SinglePart::plain(text.clone()))
+                            .singlepart(SinglePart::html(email.html.clone())),
+                    )
+                    .map_err(|_| ()),
+                None => builder
+                    .header(ContentType::TEXT_HTML)
+                    .body(email.html.clone())
+                    .map_err(|_| ()),
+            };
+        }
+        let mut related = MultiPart::related().singlepart(SinglePart::html(email.html.clone()));
+        for part in inline {
+            related = related.singlepart(part);
+        }
+        let mut mixed = if let Some(text) = &email.text {
+            MultiPart::mixed().multipart(
+                MultiPart::alternative()
+                    .singlepart(SinglePart::plain(text.clone()))
+                    .multipart(related),
+            )
+        } else {
+            MultiPart::mixed().multipart(related)
+        };
+        for part in attached {
+            mixed = mixed.singlepart(part);
+        }
+        builder.multipart(mixed).map_err(|_| ())
     }
     pub async fn deliver_workflow(&self, message: Message) -> Result<(), ()> {
         self.transport
@@ -494,6 +557,77 @@ mod tests {
         assert_eq!(msg.envelope().to().len(), 3);
         assert!(encoded.contains("multipart/alternative"));
         email.headers.insert("X-Test".into(), "value".into());
+        assert!(provider.prepare_workflow(&email).is_err());
+    }
+    #[test]
+    fn workflow_attachments_validate_and_build_mime() {
+        let provider = SmtpAlert::test_transport("127.0.0.1".into(), 25);
+        let mut email = crate::sendgrid::Email {
+            to: vec!["to@example.test".into()],
+            subject: "test".into(),
+            html: "<img src=cid:logo>".into(),
+            text: Some("plain".into()),
+            ..Default::default()
+        };
+        email.attachments.push(crate::sendgrid::Attachment {
+            file: b"hello".to_vec(),
+            name: "report.txt".into(),
+            mime: "text/plain".into(),
+            cid: None,
+            disposition: None,
+        });
+        email.attachments.push(crate::sendgrid::Attachment {
+            file: vec![0, 1, 255],
+            name: "logo.png".into(),
+            mime: "image/png".into(),
+            cid: Some("logo".into()),
+            disposition: Some("inline".into()),
+        });
+        let wire =
+            String::from_utf8(provider.prepare_workflow(&email).unwrap().formatted()).unwrap();
+        for expected in [
+            "multipart/mixed",
+            "multipart/alternative",
+            "multipart/related",
+            "Content-ID: <logo>",
+            "report.txt",
+            "AAH/",
+        ] {
+            assert!(wire.contains(expected), "missing {expected}");
+        }
+        email.attachments[1].cid = Some("bad\r\nvalue".into());
+        assert!(provider.prepare_workflow(&email).is_err());
+        email.attachments[1].cid = Some("logo".into());
+        email.attachments[1].disposition = Some("attachment".into());
+        assert!(provider.prepare_workflow(&email).is_err());
+        email.attachments[1].disposition = Some("inline".into());
+        email.attachments[1].mime = "invalid".into();
+        assert!(provider.prepare_workflow(&email).is_err());
+        email.attachments[1].mime = "image/png".into();
+        email.attachments[1].name = "bad\nname".into();
+        assert!(provider.prepare_workflow(&email).is_err());
+        email.attachments[1].name = "logo.png".into();
+        email.attachments.push(crate::sendgrid::Attachment {
+            file: vec![],
+            name: "duplicate.png".into(),
+            mime: "image/png".into(),
+            cid: Some("logo".into()),
+            disposition: None,
+        });
+        assert!(provider.prepare_workflow(&email).is_err());
+        email.attachments.pop();
+        email.attachments[0].file = vec![0; 20 * 1024 * 1024 + 1];
+        assert!(provider.prepare_workflow(&email).is_err());
+        email.attachments[0].file.clear();
+        for i in 0..99 {
+            email.attachments.push(crate::sendgrid::Attachment {
+                file: vec![],
+                name: format!("{i}.txt"),
+                mime: "text/plain".into(),
+                cid: None,
+                disposition: None,
+            });
+        }
         assert!(provider.prepare_workflow(&email).is_err());
     }
     #[test]
