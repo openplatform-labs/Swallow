@@ -38,7 +38,7 @@ async fn retry_health_is_scoped_and_alerts_only_overdue_jobs() {
     )
     .await
     .unwrap();
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'test-only'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_discord_retry_health(text,integer),public.novu_rust_reserve_alert(text,text,text,integer,integer),public.novu_rust_reserve_alert_v2(text,text,text,integer,bigint),public.novu_rust_observe_alert_conditions_v2(text,text,text,bigint,bigint) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'test-only'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_discord_retry_health(text,integer),public.novu_rust_discord_retry_list(text,integer,boolean,uuid),public.novu_rust_reserve_alert(text,text,text,integer,integer),public.novu_rust_reserve_alert_v2(text,text,text,integer,bigint),public.novu_rust_observe_alert_conditions_v2(text,text,text,bigint,bigint) TO {role}")).await.unwrap();
     let mut role_url = reqwest::Url::parse(&url).unwrap();
     role_url.set_username(&role).unwrap();
     role_url.set_password(Some("test-only")).unwrap();
@@ -109,6 +109,27 @@ async fn retry_health_is_scoped_and_alerts_only_overdue_jobs() {
         .await
         .unwrap();
     assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1)), (2, 1));
+    let overdue = reader
+        .query(
+            "SELECT * FROM public.novu_rust_discord_retry_list($1,60,true,NULL)",
+            &[&env],
+        )
+        .await
+        .unwrap();
+    assert_eq!(overdue.len(), 1);
+    assert_eq!(overdue[0].get::<_, Uuid>(0), ids[1]);
+    assert_eq!(overdue[0].get::<_, i64>(5), 1);
+    assert!(overdue[0].get::<_, bool>(8));
+    assert!(
+        reader
+            .query(
+                "SELECT * FROM public.novu_rust_discord_retry_list($1,60,false,NULL)",
+                &[&other]
+            )
+            .await
+            .is_err()
+    );
+
     let report = Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"))
         .env_clear()
         .env("DATABASE_URL", role_url.as_str())
@@ -181,7 +202,65 @@ async fn retry_health_is_scoped_and_alerts_only_overdue_jobs() {
         .unwrap();
     assert_eq!(healthy.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&healthy.stdout).contains("healthy"));
+    db.execute("UPDATE public.novu_queue_jobs SET payload=jsonb_build_object('destination','payload-secret') WHERE id=$1",&[&ids[0]]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_discord_retry_history(job_id,environment_id,destination_id,retry_after_seconds,scheduled_delay_seconds) VALUES($1,$2,'private',9,11)",&[&ids[0],&env]).await.unwrap();
+    let row = reader
+        .query_one(
+            "SELECT * FROM public.novu_rust_discord_retry_list($1,60,false,NULL) WHERE job_id=$2",
+            &[&env, &ids[0]],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(2), "private");
+    assert_eq!(row.get::<_, i64>(5), 2);
+    assert_eq!(row.get::<_, i32>(6), 11);
+    assert_eq!(row.get::<_, Option<i32>>(7), Some(9));
+    for _ in 0..103 {
+        let id = Uuid::new_v4();
+        queue::enqueue(
+            &db,
+            id,
+            &env,
+            queue::discord_queue::JOB_KIND,
+            &json!({"destination":"safe-id","content":"secret-payload"}),
+        )
+        .await
+        .unwrap();
+        db.execute("INSERT INTO public.novu_rust_discord_retry_history(job_id,environment_id,destination_id,retry_after_seconds,scheduled_delay_seconds) VALUES($1,$2,'safe-id',5,5)",&[&id,&env]).await.unwrap();
+    }
+    let list = |after: Option<&str>| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_delivery-reconcile"));
+        cmd.env_clear()
+            .env("DATABASE_URL", role_url.as_str())
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .args(["list-discord-retry", &env, "60", "all"]);
+        if let Some(after) = after {
+            cmd.arg(after);
+        }
+        cmd.output().unwrap()
+    };
+    let first = list(None);
+    assert_eq!(first.status.code(), Some(0));
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["data"].as_array().unwrap().len(), 100);
+    let cursor = first["next"].as_str().unwrap();
+    assert!(!first.to_string().contains("secret-payload"));
+    assert!(!first.to_string().contains("payload-secret"));
+    let second = list(Some(cursor));
+    assert_eq!(second.status.code(), Some(0));
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(second["data"].as_array().unwrap().len(), 5);
+    assert!(second["next"].is_null());
     db.execute("DELETE FROM public.novu_rust_delivery_operator_grants WHERE environment_id=$1 AND database_principal::text=$2 AND decision='alert_view'",&[&env,&role]).await.unwrap();
+    assert!(
+        reader
+            .query(
+                "SELECT * FROM public.novu_rust_discord_retry_list($1,60,false,NULL)",
+                &[&env]
+            )
+            .await
+            .is_err()
+    );
     assert!(
         reader
             .query_one(
