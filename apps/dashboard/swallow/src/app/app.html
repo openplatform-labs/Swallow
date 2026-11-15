@@ -336,6 +336,18 @@
           @if(sendgridMessage()){<p role="status">{{ sendgridMessage() }}</p>}
           <p class="subscriber-hint">마지막 활성 키의 비활성화·삭제는 웹훅 수신을 중단할 수 있습니다. 결과가 불명이면 자동 재시도하지 말고 목록과 별도의 감사 이력을 확인하세요. 목록은 페이지별 조회이며 공급자의 설정이나 실제 수신 여부를 보증하지 않습니다.</p>
         </div></section>
+        <section class="card subscriber-card"><div class="card-block"><h2>공개키 변경 이력</h2>
+          <p>위 환경 API 키에 별도의 감사 조회 권한이 필요합니다. UUID 순서는 변경 시각이나 커밋 순서가 아니므로 새 기록이 이전 페이지에 나타날 수 있습니다.</p>
+          <button type="button" class="btn btn-outline" (click)="loadSendgridAudit()" [disabled]="sendgridAuditStatus()==='loading' || sendgridWriteStatus()==='sending'">변경 이력 조회</button>
+          @if(sendgridAuditStatus()==='loading'){<p role="status">변경 이력을 조회 중입니다.</p>}
+          @else if(sendgridAuditStatus()==='error'){<p class="subscriber-error" role="alert">변경 이력을 조회하지 못했습니다. 인증과 감사 조회 권한을 확인하세요.</p>}
+          @else if(sendgridAuditStatus()==='loaded'){
+            @if(sendgridAuditRows().length===0){<p>조회된 변경 이력이 없습니다.</p>}
+            @else {<div class="table-wrap"><table class="table"><thead><tr><th>기록</th><th>키 식별자</th><th>변경</th><th>사용자</th></tr></thead><tbody>@for(row of sendgridAuditRows();track row.id){<tr><td>{{ row.recordedAt }}<br>{{ row.id }}</td><td>{{ row.identifier }}</td><td>{{ row.action }}</td><td>{{ row.userId }}</td></tr>}</tbody></table></div>}
+            <p>{{ sendgridAuditPage() }} 페이지</p><button type="button" class="btn btn-sm btn-outline" (click)="loadSendgridAudit('previous')" [disabled]="sendgridAuditPage()<=1 || sendgridWriteStatus()==='sending'">이전</button><button type="button" class="btn btn-sm btn-outline" (click)="loadSendgridAudit('next')" [disabled]="!sendgridAuditNext() || sendgridWriteStatus()==='sending'">다음</button>
+          }
+          <p class="subscriber-hint">직접 DB 변경, 거절된 요청, 누락된 응답과 감사 변조 여부는 이 목록만으로 확인할 수 없습니다.</p>
+        </div></section>
       } @else if (section() === 'settings') {
         <div class="page-heading"><div><div class="eyebrow">ACCESS CONTROL</div><h1>운영자 권한 조회</h1><p>환경별 운영자 권한과 변경 이력을 확인합니다.</p></div></div>
         <clr-alert clrAlertType="info" [clrAlertClosable]="false"><clr-alert-item><span class="alert-text">조회·변경·감사에는 각각 별도로 부여된 권한이 필요합니다. 변경 전 현재 상태를 조회하세요.</span></clr-alert-item></clr-alert>

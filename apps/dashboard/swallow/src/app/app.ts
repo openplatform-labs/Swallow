@@ -39,6 +39,7 @@ type PermissionRequestRecord = {requestId:string; targetIssuer:string; targetSub
 type PermissionAudit = { id:string; recordedAt:string; issuer:string; subject:string; clientId:string; actor:string; jwtIssuer:string|null; jwtSubject:string|null; jwtClientId:string|null; requestId:string|null; reason:string; previous:string; current:string };
 type Section = 'overview' | 'workflows' | 'subscribers' | 'channels' | 'activity' | 'alerts' | 'settings';
 type SendgridKey = {identifier:string;active:boolean};
+type SendgridKeyAudit = {id:string;identifier:string;action:string;userId:string;recordedAt:string};
 
 @Component({
   imports: [FormsModule, ClrAlertModule],
@@ -72,6 +73,13 @@ export class App implements OnDestroy {
   readonly sendgridNext=signal<string|null>(null);
   private sendgridSequence=0;
   private sendgridAbort:AbortController|null=null;
+  readonly sendgridAuditRows=signal<SendgridKeyAudit[]>([]);
+  readonly sendgridAuditStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');
+  readonly sendgridAuditNext=signal<string|null>(null);
+  readonly sendgridAuditPage=signal(1);
+  private sendgridAuditHistory:(string|null)[]=[null];
+  private sendgridAuditSequence=0;
+  private sendgridAuditAbort:AbortController|null=null;
   workflowKey='';
   workflowAuthMode:'api-key'|'jwt'='api-key';
   workflowEnvironment='';
@@ -980,11 +988,41 @@ export class App implements OnDestroy {
 
   clearSendgrid(forgetKey=false):void {
     if(this.sendgridWriteStatus()==='sending')return;
+    this.clearSendgridAudit();
     this.sendgridSequence++;this.sendgridAbort?.abort();this.sendgridAbort=null;
     this.sendgridRows.set([]);this.sendgridNext.set(null);this.sendgridListStatus.set('idle');
     this.sendgridWriteStatus.set('idle');this.sendgridMessage.set('');this.sendgridConfirmed=false;
     this.sendgridPublicKey='';this.sendgridIdentifier='';
     if(forgetKey)this.sendgridApiKey='';
+  }
+  clearSendgridAudit():void {
+    this.sendgridAuditSequence++;this.sendgridAuditAbort?.abort();this.sendgridAuditAbort=null;
+    this.sendgridAuditRows.set([]);this.sendgridAuditNext.set(null);this.sendgridAuditStatus.set('idle');
+    this.sendgridAuditPage.set(1);this.sendgridAuditHistory=[null];
+  }
+  async loadSendgridAudit(direction?:'next'|'previous'):Promise<void> {
+    if(this.sendgridWriteStatus()==='sending')return;
+    if(direction==='previous'&&this.sendgridAuditPage()<=1)return;
+    const cursor=direction==='next'?this.sendgridAuditNext():direction==='previous'?this.sendgridAuditHistory[this.sendgridAuditPage()-2]:null;
+    if(direction==='next'&&!cursor)return;
+    const page=direction==='next'?this.sendgridAuditPage()+1:direction==='previous'?this.sendgridAuditPage()-1:1;
+    const sequence=++this.sendgridAuditSequence;this.sendgridAuditAbort?.abort();const controller=new AbortController();this.sendgridAuditAbort=controller;
+    this.sendgridAuditRows.set([]);this.sendgridAuditNext.set(null);this.sendgridAuditStatus.set('loading');
+    try {
+      const key=this.sendgridApiKey.trim();if(!key||/[^\x21-\x7e]/.test(key))throw new Error('invalid credentials');
+      const params=new URLSearchParams();if(cursor)params.set('after',cursor);
+      const response=await fetch(`${this.validatedOrigin()}/v1/experimental/sendgrid-webhook-key-audit${cursor?'?'+params:''}`,{headers:{Authorization:`ApiKey ${key}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      if(!response.ok)throw new Error('request failed');const result:unknown=await response.json();if(sequence!==this.sendgridAuditSequence)return;
+      const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      if(typeof result!=='object'||result===null||!('data' in result)||!Array.isArray(result.data)||result.data.length>100||!('nextCursor' in result)||!(result.nextCursor===null||(typeof result.nextCursor==='string'&&uuid.test(result.nextCursor))))throw new Error('invalid response');
+      const rows:SendgridKeyAudit[]=result.data.map((value:unknown)=>{
+        if(typeof value!=='object'||value===null)throw new Error('invalid row');const row=value as Record<string,unknown>;
+        if(typeof row['id']!=='string'||!uuid.test(row['id'])||typeof row['identifier']!=='string'||typeof row['userId']!=='string'||typeof row['recordedAt']!=='string'||typeof row['action']!=='string'||!['create','delete','activate','deactivate'].includes(row['action']))throw new Error('invalid row');
+        return {id:row['id'],identifier:row['identifier'],action:row['action'],userId:row['userId'],recordedAt:row['recordedAt']};
+      });
+      this.sendgridAuditRows.set(rows);this.sendgridAuditNext.set(result.nextCursor);this.sendgridAuditPage.set(page);this.sendgridAuditHistory=this.sendgridAuditHistory.slice(0,page-1);this.sendgridAuditHistory.push(cursor);this.sendgridAuditStatus.set('loaded');
+    }catch{if(sequence===this.sendgridAuditSequence)this.sendgridAuditStatus.set('error');}
+    finally{if(sequence===this.sendgridAuditSequence)this.sendgridAuditAbort=null;}
   }
   async loadSendgridKeys(next=false):Promise<void> {
     if(this.sendgridWriteStatus()==='sending')return;
@@ -1011,7 +1049,7 @@ export class App implements OnDestroy {
     const base=`${origin}/v1/experimental/sendgrid-webhook-keys`;
     const method=action==='create'?'POST':action==='delete'?'DELETE':'PATCH';
     const body=action==='create'?{identifier:id,publicKey}:action==='activate'?{active:true,publicKey}:action==='deactivate'?{active:false}:undefined;
-    this.sendgridSequence++;this.sendgridAbort?.abort();this.sendgridAbort=null;this.sendgridRows.set([]);this.sendgridNext.set(null);this.sendgridListStatus.set('idle');
+    this.clearSendgridAudit();this.sendgridSequence++;this.sendgridAbort?.abort();this.sendgridAbort=null;this.sendgridRows.set([]);this.sendgridNext.set(null);this.sendgridListStatus.set('idle');
     this.sendgridWriteStatus.set('sending');this.sendgridMessage.set('');
     try {
       const response=await fetch(action==='create'?base:`${base}/${encodeURIComponent(id)}`,{method,headers:{Authorization:`ApiKey ${key}`,...(body?{'Content-Type':'application/json'}:{})},...(body?{body:JSON.stringify(body)}:{}),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});

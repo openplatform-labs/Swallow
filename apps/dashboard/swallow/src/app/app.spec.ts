@@ -42,6 +42,25 @@ describe('Swallow console', () => {
     app.sendgridAction='delete';app.sendgridConfirmed=true;await app.changeSendgridKey();expect(mock.mock.calls[2][1]?.method).toBe('DELETE');expect(mock.mock.calls[2][1]?.body).toBeUndefined();
   });
 
+  it('loads SendGrid audit pages separately and clears history on authorization failure', async () => {
+    const id='11111111-1111-4111-8111-111111111111', other='22222222-2222-4222-8222-222222222222';
+    const mock=vi.spyOn(globalThis,'fetch')
+      .mockResolvedValueOnce(new Response(JSON.stringify({data:[{id,identifier:'k',action:'create',userId:'alice',recordedAt:'today',keyHash:'do-not-display'}],nextCursor:id})))
+      .mockResolvedValueOnce(new Response(JSON.stringify({data:[{id:other,identifier:'k',action:'deactivate',userId:'alice',recordedAt:'later'}],nextCursor:null})))
+      .mockResolvedValueOnce(new Response('',{status:403}));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('channels');app.sendgridApiKey='token';app.sendgridWriteStatus.set('unknown');
+    await app.loadSendgridAudit();expect(app.sendgridAuditRows()[0].action).toBe('create');expect(JSON.stringify(app.sendgridAuditRows())).not.toContain('do-not-display');expect(app.sendgridWriteStatus()).toBe('unknown');
+    await app.loadSendgridAudit('next');expect(mock.mock.calls[1][0]).toContain(`after=${id}`);expect(app.sendgridAuditPage()).toBe(2);expect(app.sendgridAuditRows()[0].action).toBe('deactivate');
+    await app.loadSendgridAudit('previous');expect(app.sendgridAuditStatus()).toBe('error');expect(app.sendgridAuditRows()).toEqual([]);
+  });
+
+  it('discards a late SendGrid audit response after credentials change', async () => {
+    let resolve!:(response:Response)=>void;vi.spyOn(globalThis,'fetch').mockImplementation(()=>new Promise<Response>(done=>resolve=done));
+    const app=TestBed.createComponent(App).componentInstance;app.setSection('channels');app.sendgridApiKey='old';const pending=app.loadSendgridAudit();app.sendgridApiKey='new';app.clearSendgrid();
+    resolve(new Response(JSON.stringify({data:[{id:'11111111-1111-4111-8111-111111111111',identifier:'k',action:'create',userId:'alice',recordedAt:'today'}],nextCursor:null})));await pending;
+    expect(app.sendgridAuditRows()).toEqual([]);expect(app.sendgridAuditStatus()).toBe('idle');
+  });
+
   it('polls alert first page only when no decision is being reviewed', async () => {
     vi.useFakeTimers();
     const row={channel:'slack',targetId:'ops',state:'unknown',lastStartedAt:null,attemptId:'1889f88e-c0a3-4ab5-b861-2fdc1f26f254'};
