@@ -38,10 +38,14 @@ try:
     env='smtp-auto-fixture';other='smtp-auto-other';first=str(uuid.uuid4());second=str(uuid.uuid4());old=str(uuid.uuid4());reviewed=str(uuid.uuid4())
     sql("""CREATE ROLE smtp_auto_fixture LOGIN; GRANT USAGE ON SCHEMA public TO smtp_auto_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_smtp_auto_retry_batch(text,integer),public.novu_rust_smtp_auto_history(text,bigint),public.novu_rust_smtp_auto_retry_health(text,integer) TO smtp_auto_fixture;
+GRANT EXECUTE ON FUNCTION public.novu_rust_reserve_alert_v3(text,text,text,integer,bigint,bigint,bigint,bigint),public.novu_rust_observe_alert_conditions_v3(text,text,text,bigint,bigint,bigint,bigint) TO smtp_auto_fixture;
 INSERT INTO public.novu_rust_environments VALUES('smtp-auto-fixture','org'),('smtp-auto-other','org');
 INSERT INTO public.novu_rust_smtp_auto_retry_workers SELECT 'smtp-auto-fixture',rolname,oid FROM pg_roles WHERE rolname='smtp_auto_fixture';
 INSERT INTO public.novu_rust_smtp_auto_admins SELECT 'smtp-auto-fixture',rolname,oid,false,false,true FROM pg_roles WHERE rolname='smtp_auto_fixture';
 INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'smtp-auto-fixture',rolname,'alert_view',oid FROM pg_roles WHERE rolname='smtp_auto_fixture';
+INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'smtp-auto-fixture',rolname,'alert_send',oid FROM pg_roles WHERE rolname='smtp_auto_fixture';
+INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES('smtp-auto-fixture','slack','blocked','rejected');
+INSERT INTO public.novu_rust_alert_v2_targets(environment_id,channel,target_id) VALUES('smtp-auto-fixture','slack','blocked');
 INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) VALUES ('%s','smtp-auto-fixture','experimental_smtp_email','{"to":["first@example.test"],"subject":"successful","html":"hello"}');"""%first)
     cfg={**os.environ,'NOVU_POSTGRES_ALLOW_INSECURE':'true','NOVU_SMTP_ENVIRONMENT_ID':env,'SWALLOW_SMTP_HOST':'127.0.0.1','SWALLOW_SMTP_PORT':str(server.server_address[1]),'SWALLOW_SMTP_TLS':'none','SWALLOW_SMTP_FROM':'sender@example.test'}
     for key in ('SWALLOW_SMTP_USERNAME','SWALLOW_SMTP_PASSWORD','SWALLOW_SMTP_PASSWORD_FILE','SWALLOW_SMTP_CA_FILE','SWALLOW_SMTP_TRANSPORT_GUARD'):cfg.pop(key,None)
@@ -72,6 +76,11 @@ SELECT public.novu_rust_ack_smtp('smtp-auto-fixture','%s',a.revision,j.failure_r
     assert sql("SELECT count(*) FROM public.novu_queue_jobs j JOIN public.novu_rust_smtp_attempts a ON a.job_id=j.id WHERE j.id='%s' AND j.status='failed' AND a.state='unknown'"%first)=='1'
     assert health()==(2,{'enabled':True,'eligible':1,'overdue':1,'exhausted':0})
     assert health('0')[0]==1
+    alert_env={**runner,'SWALLOW_ALERT_RESEND_ENABLED':'false','SWALLOW_ALERT_SMTP_AUTO_GRACE_SECONDS':'1','SWALLOW_ALERT_SCOPED_DELIVERY':'true','SWALLOW_ALERT_COOLDOWN_POLICY':'new-condition','SWALLOW_ALERT_CONDITIONS_V3':'true','SWALLOW_ALERT_SLACK_WEBHOOK':'https://hooks.slack.com/services/A/B/C','SWALLOW_ALERT_SLACK_TARGET_ID':'blocked'}
+    alert=subprocess.run([str(pathlib.Path(work)/'send-delivery-alert'),env,'300','120','60'],env=alert_env,capture_output=True,text=True,timeout=15)
+    assert alert.returncode==2 and 'requires operator review' in alert.stderr,alert.stderr
+    bad_env={**alert_env,'SWALLOW_ALERT_CONDITIONS_V3':'false'}
+    assert subprocess.run([str(pathlib.Path(work)/'send-delivery-alert'),env,'300','120','60'],env=bad_env,capture_output=True,timeout=15).returncode==1
     sql("DROP TRIGGER fixture_smtp_retry_audit_fail ON public.novu_rust_smtp_auto_retries; DROP FUNCTION public.fixture_smtp_retry_audit_fail()")
     until(lambda:sql("SELECT count(*) FROM public.novu_queue_jobs j JOIN public.novu_rust_smtp_attempts a ON a.job_id=j.id WHERE j.id='%s' AND j.status='completed' AND a.state='accepted'"%first)=='1','automatic replay did not reach relay')
     assert sql("SELECT count(*) FROM public.novu_rust_smtp_auto_retries WHERE job_id='%s'"%first)=='1'

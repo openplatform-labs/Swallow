@@ -133,6 +133,7 @@ async fn run() -> Result<()> {
         slack_attempts: None,
         slack_policy_cancelled: None,
         smtp_health: None,
+        smtp_auto_health: None,
         discord_health: None,
         discord_retry_health: None,
         discord_cooldown_health: None,
