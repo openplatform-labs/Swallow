@@ -5065,3 +5065,40 @@ pub(super) async fn alert_timing_read(State(db):State<Arc<Client>>,headers:Heade
 pub(super) async fn alert_timing_change(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>,body:Bytes)->Response {alert_timing_handle(db,headers,uri,verifier,Some(body),AlertTimingOperation::Change).await}
 pub(super) async fn alert_timing_request(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>)->Response {alert_timing_handle(db,headers,uri,verifier,None,AlertTimingOperation::Request).await}
 pub(super) async fn alert_timing_audit(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>)->Response {alert_timing_handle(db,headers,uri,verifier,None,AlertTimingOperation::Audit).await}
+
+async fn alert_timing_grants_handle(db: Arc<Client>, headers: HeaderMap, uri: Uri, verifier: Option<Extension<Arc<AccessTokenVerifier>>>, body: Option<Bytes>, op: AlertTimingOperation) -> Response {
+    let identity=match authenticate(&db,&headers,verifier).await {Ok(v)=>v,Err(status)=>return failure(status,uri.path())};
+    let params:Vec<_>=form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).collect();
+    let allowed:&[&str]=match op {AlertTimingOperation::Read=>&["environmentId","channel","targetId","targetIssuer","targetSubject","targetClientId","permission"],AlertTimingOperation::Request=>&["environmentId","channel","targetId","requestId"],AlertTimingOperation::Audit=>&["environmentId","channel","targetId","after"],AlertTimingOperation::Change=>&["environmentId","channel","targetId"]};
+    if params.iter().any(|(key,_)|!allowed.contains(&key.as_ref()))||allowed.iter().any(|key|params.iter().filter(|p|p.0==*key).count()>1)||["environmentId","channel","targetId"].iter().any(|key|params.iter().filter(|p|p.0==*key).count()!=1){return failure(StatusCode::BAD_REQUEST,uri.path());}
+    let get=|key:&str|params.iter().find(|p|p.0==key).map(|p|p.1.as_ref());
+    let env=get("environmentId").unwrap();let channel=get("channel").unwrap();let target=get("targetId").unwrap();
+    if env.is_empty()||env.len()>512||env.contains('\0')||!matches!(channel,"slack"|"email")||!valid_discord_retry_destination(target){return failure(StatusCode::BAD_REQUEST,uri.path());}
+    let Ok(exp)=i64::try_from(identity.expires_at) else {return failure(StatusCode::BAD_REQUEST,uri.path());};
+    let result=match op {
+        AlertTimingOperation::Read=>{
+            let (Some(issuer),Some(subject),Some(client),Some(permission))=(get("targetIssuer"),get("targetSubject"),get("targetClientId"),get("permission")) else {return failure(StatusCode::BAD_REQUEST,uri.path());};
+            if [issuer,subject,client,permission].iter().any(|v|v.contains('\0')) {return failure(StatusCode::BAD_REQUEST,uri.path());}
+            guarded_query(&db,&identity,"SELECT public.novu_rust_jwt_alert_timing_grant_read($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&channel,&target,&issuer,&subject,&client,&permission]).await
+        }
+        AlertTimingOperation::Change=>{
+            let Some(input)=body.as_ref().filter(|b|b.len()<=8192).and_then(|b|serde_json::from_slice::<DiscordRetryPolicyGrantChange>(b).ok()) else {return failure(StatusCode::BAD_REQUEST,uri.path());};
+            if [&input.target_issuer,&input.target_subject,&input.target_client_id,&input.permission,&input.reason].iter().any(|s|s.contains('\0')){return failure(StatusCode::BAD_REQUEST,uri.path());}
+            let Ok(request)=Uuid::parse_str(&input.request_id) else {return failure(StatusCode::BAD_REQUEST,uri.path());};
+            guarded_query(&db,&identity,"SELECT public.novu_rust_jwt_alert_timing_grant_change($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&channel,&target,&request,&input.target_issuer,&input.target_subject,&input.target_client_id,&input.permission,&input.expected,&input.desired,&input.reason]).await
+        }
+        AlertTimingOperation::Request=>{
+            let Some(id)=get("requestId").and_then(|v|Uuid::parse_str(v).ok()) else {return failure(StatusCode::BAD_REQUEST,uri.path());};
+            guarded_query(&db,&identity,"SELECT public.novu_rust_jwt_alert_timing_grant_request($1,$2,$3,$4,$5,$6,$7,$8)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&channel,&target,&id]).await
+        }
+        AlertTimingOperation::Audit=>{
+            let after=match get("after"){Some(v)=>match Uuid::parse_str(v){Ok(id)=>Some(id),Err(_)=>return failure(StatusCode::BAD_REQUEST,uri.path())},None=>None};
+            guarded_query(&db,&identity,"SELECT public.novu_rust_jwt_alert_timing_grant_audit_read($1,$2,$3,$4,$5,$6,$7,$8)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&channel,&target,&after]).await
+        }
+    };
+    match result {Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),Err(e) if e.code().is_some_and(|c|c.code()=="P4090")=>failure(StatusCode::CONFLICT,uri.path()),Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path())}
+}
+pub(super) async fn alert_timing_grant_read(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>)->Response {alert_timing_grants_handle(db,headers,uri,verifier,None,AlertTimingOperation::Read).await}
+pub(super) async fn alert_timing_grant_change(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>,body:Bytes)->Response {alert_timing_grants_handle(db,headers,uri,verifier,Some(body),AlertTimingOperation::Change).await}
+pub(super) async fn alert_timing_grant_request(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>)->Response {alert_timing_grants_handle(db,headers,uri,verifier,None,AlertTimingOperation::Request).await}
+pub(super) async fn alert_timing_grant_audit(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>)->Response {alert_timing_grants_handle(db,headers,uri,verifier,None,AlertTimingOperation::Audit).await}

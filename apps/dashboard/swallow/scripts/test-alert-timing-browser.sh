@@ -38,11 +38,13 @@ db_sql -q -v ON_ERROR_STOP=1 <<'SQL'
 CREATE ROLE ui_fixture_api LOGIN;
 GRANT USAGE ON SCHEMA public TO ui_fixture_api;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_alert_timing_read(text,text,text,text,bigint,text,text),public.novu_rust_operator_jwt_alert_timing_change(text,text,text,text,bigint,text,text,uuid,bigint,integer,integer,integer,text),public.novu_rust_operator_jwt_alert_timing_request(text,text,text,text,bigint,text,text,uuid),public.novu_rust_operator_jwt_alert_timing_audit(text,text,text,text,bigint,text,text,uuid) TO ui_fixture_api;
+GRANT EXECUTE ON FUNCTION public.novu_rust_jwt_alert_timing_grant_read(text,text,text,text,bigint,text,text,text,text,text,text),public.novu_rust_jwt_alert_timing_grant_change(text,text,text,text,bigint,text,text,uuid,text,text,text,text,boolean,boolean,text),public.novu_rust_jwt_alert_timing_grant_request(text,text,text,text,bigint,text,text,uuid),public.novu_rust_jwt_alert_timing_grant_audit_read(text,text,text,text,bigint,text,text,uuid) TO ui_fixture_api;
 INSERT INTO public.novu_rust_environments VALUES('fixture-env','fixture-org');
 INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES('https://issuer.test','admin','console','fixture-env'),('https://issuer.test','target','console','fixture-env');
 INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname='ui_fixture_api';
 INSERT INTO public.novu_rust_alert_timing_grants SELECT 'fixture-env',rolname,oid,true,true FROM pg_roles WHERE rolname='ui_fixture_api';
 INSERT INTO public.novu_rust_operator_jwt_alert_timing_grants VALUES('https://issuer.test','admin','console','fixture-env','slack','ops',true,true,true);
+INSERT INTO public.novu_rust_jwt_alert_timing_grant_admins VALUES('https://issuer.test','admin','console','fixture-env','slack','ops',true,true,true);
 
 SQL
 python3 - "$API/tests/fixtures/operator_jwt/test-only-public.pem" "$API/tests/fixtures/operator_jwt/test-only-private.pem" "$TEST_DIR" <<'PY'
@@ -93,6 +95,16 @@ await fill('input[name="alertTimingRequest"]',req);await page.click('app-alert-t
 await page.click('app-alert-timing button:has-text("시간 이력 조회")');await page.waitForFunction(()=>document.querySelector('app-alert-timing table')?.innerText.includes('browser timing test'));
 await page.click('app-alert-timing button:has-text("요청 정보 지우기")');await page.click('app-alert-timing button:has-text("시간 설정 조회")');await page.waitForFunction(()=>document.querySelector('app-alert-timing')?.innerText.includes('revision 1 · 유예 60초'));
 await fill('input[name="permissionKey"]',target);await page.click('app-alert-timing button:has-text("시간 설정 조회")');await page.waitForFunction(()=>document.querySelector('app-alert-timing')?.innerText.includes('조회하지 못했습니다.'));
+await fill('input[name="permissionKey"]',admin);
+await fill('input[name="alertTimingGrantDestination"]','ops');await fill('input[name="alertTimingGrantIssuer"]','https://issuer.test');await fill('input[name="alertTimingGrantSubject"]','target');await fill('input[name="alertTimingGrantClient"]','console');
+await page.click('app-alert-timing-grants button:has-text("위임 권한 조회")');await page.waitForFunction(()=>document.querySelector('app-alert-timing-grants')?.innerText.includes('현재 권한: 거부'));
+await page.selectOption('select[name="alertTimingGrantDesired"]',{label:'허용'});await fill('textarea[name="alertTimingGrantReason"]','browser grant');await page.click('input[name="alertTimingGrantConfirm"]');await page.click('app-alert-timing-grants button:has-text("위임 요청 준비")');
+await page.waitForSelector('input[name="alertTimingGrantSubmitConfirm"]');await page.click('input[name="alertTimingGrantSubmitConfirm"]');await page.click('app-alert-timing-grants button:has-text("위임 요청 제출")');await page.waitForFunction(()=>document.querySelector('app-alert-timing-grants')?.innerText.includes('권한이 변경됐습니다.'));
+await page.click('app-alert-timing-grants button:has-text("위임 이력 조회")');await page.waitForFunction(()=>document.querySelector('app-alert-timing-grants table')?.innerText.includes('browser grant'));
+await fill('input[name="permissionKey"]',target);await page.click('app-alert-timing button:has-text("시간 설정 조회")');await page.waitForFunction(()=>document.querySelector('app-alert-timing')?.innerText.includes('revision 1 · 유예 60초'));
+await fill('input[name="permissionKey"]',admin);await page.click('app-alert-timing-grants button:has-text("요청 정보 지우기")');await page.click('app-alert-timing-grants button:has-text("위임 권한 조회")');await page.waitForFunction(()=>document.querySelector('app-alert-timing-grants')?.innerText.includes('현재 권한: 허용'));
+await page.selectOption('select[name="alertTimingGrantDesired"]',{label:'거부'});await fill('textarea[name="alertTimingGrantReason"]','browser revoke');await page.click('input[name="alertTimingGrantConfirm"]');await page.click('app-alert-timing-grants button:has-text("위임 요청 준비")');await page.waitForSelector('input[name="alertTimingGrantSubmitConfirm"]');await page.click('input[name="alertTimingGrantSubmitConfirm"]');await page.click('app-alert-timing-grants button:has-text("위임 요청 제출")');await page.waitForFunction(()=>document.querySelector('app-alert-timing-grants')?.innerText.includes('권한이 변경됐습니다.'));
+await fill('input[name="permissionKey"]',target);await page.click('app-alert-timing button:has-text("시간 설정 조회")');await page.waitForFunction(()=>document.querySelector('app-alert-timing')?.innerText.includes('조회하지 못했습니다.'));
 await fs.writeFile(ROOT+'/request-id',req);console.log('Alert timing: real browser, restricted API and JWT access passed');
 
 '''
@@ -103,3 +115,4 @@ SPACE_ID=$(cat "$TEST_DIR/space-id")
 printf 'const task=await taskSpace(%s); await task.finish({keep:[]});\n' "$SPACE_ID" | ego-browser nodejs
 [[ $(db_sql -At -v ON_ERROR_STOP=1 -c "SELECT revision=1 AND grace=60 AND heartbeat IS NULL AND cooldown=300 FROM public.novu_rust_alert_timing_settings WHERE environment_id='fixture-env' AND channel='slack' AND target_id='ops'") == t ]]
 [[ $(db_sql -At -v ON_ERROR_STOP=1 -c "SELECT count(*)=1 FROM public.novu_rust_operator_jwt_alert_timing_audit WHERE environment_id='fixture-env' AND target_id='ops' AND reason='browser timing test'") == t ]]
+[[ $(db_sql -At -v ON_ERROR_STOP=1 -c "SELECT count(*)=2 FROM public.novu_rust_jwt_alert_timing_grant_audit WHERE environment_id='fixture-env' AND target_id='ops'") == t ]]
