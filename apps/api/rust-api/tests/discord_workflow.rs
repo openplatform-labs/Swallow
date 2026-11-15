@@ -68,8 +68,32 @@ async fn trigger_renders_and_guards_subscriber_endpoint_and_preferences() {
     )
     .await;
     migrate(&db, &root.join("migrations"), 18..=u32::MAX).await;
-    db.batch_execute("INSERT INTO public.novu_rust_users VALUES ('u'); INSERT INTO public.novu_rust_environments VALUES ('a','org'); INSERT INTO public.novu_rust_api_keys(key_hash,environment_id,user_id) VALUES (encode(sha256(convert_to('discord-key','UTF8')),'hex'),'a','u'); INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,in_app_step_active,chat_content,inbox_metadata) VALUES ('a','discord-workflow',true,true,false,'{{name}} {{subscriber.firstName}}','{\"id\":\"wf-id\"}'); INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES ('a','alice','old','{\"firstName\":\"Jane\"}'); INSERT INTO public.novu_rust_discord_destinations(environment_id,destination_id,endpoint_hash) VALUES('a','dest','fixture'); INSERT INTO public.novu_rust_discord_workflow_endpoints(environment_id,identifier,subscriber_id,subscriber_internal_id,destination_id) VALUES ('a','ep','alice','old','dest')").await.unwrap();
+    db.batch_execute("INSERT INTO public.novu_rust_users VALUES ('u'); INSERT INTO public.novu_rust_environments VALUES ('a','org'); INSERT INTO public.novu_rust_api_keys(key_hash,environment_id,user_id) VALUES (encode(sha256(convert_to('discord-key','UTF8')),'hex'),'a','u'); INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,in_app_step_active,chat_content,inbox_metadata) VALUES ('a','discord-workflow',true,true,false,'{{name}} {{subscriber.firstName}}','{\"id\":\"wf-id\"}'); INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES ('a','alice','old','{\"firstName\":\"Jane\"}'); INSERT INTO public.novu_rust_discord_destinations(environment_id,destination_id,endpoint_hash) VALUES('a','dest','fixture'); INSERT INTO public.novu_rust_discord_endpoint_permissions(key_hash,permission) VALUES (encode(sha256(convert_to('discord-key','UTF8')),'hex'),'write')").await.unwrap();
     let app = novu_rust_api::router_with_subscriber_secret(Arc::new(db), None);
+    let registration = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/experimental/discord-endpoints")
+                .header("authorization", "ApiKey discord-key")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"identifier":"ep","subscriberId":"alice","destinationId":"dest"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let registration_status = registration.status();
+    let registration_body = registration.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        registration_status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&registration_body)
+    );
     let (mut db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(driver);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
