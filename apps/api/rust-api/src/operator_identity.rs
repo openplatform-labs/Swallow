@@ -63,6 +63,9 @@ enum Lookup {
     ResendCooldownPolicyRead,
     ResendCooldownPolicyRequest,
     ResendCooldownPolicyAudit,
+    DiscordRetryPolicyRead,
+    DiscordRetryPolicyRequest,
+    DiscordRetryPolicyAudit,
     DiscordPolicyRead,
     DiscordPolicyRequest,
     DiscordPolicyAudit,
@@ -653,6 +656,9 @@ pub(super) async fn resend_cooldown_policy_audit(
     query(db, headers, uri, verifier, Lookup::ResendCooldownPolicyAudit).await
 }
 
+pub(super) async fn discord_retry_policy_read(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {query(db,headers,uri,verifier,Lookup::DiscordRetryPolicyRead).await}
+pub(super) async fn discord_retry_policy_request(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {query(db,headers,uri,verifier,Lookup::DiscordRetryPolicyRequest).await}
+pub(super) async fn discord_retry_policy_audit(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {query(db,headers,uri,verifier,Lookup::DiscordRetryPolicyAudit).await}
 pub(super) async fn discord_policy_read(
     State(db): State<Arc<Client>>,
     headers: HeaderMap,
@@ -1453,6 +1459,28 @@ pub(super) async fn resend_cooldown_policy_change(
 }
 
 #[derive(serde::Deserialize)]
+#[serde(rename_all="camelCase",deny_unknown_fields)]
+struct DiscordRetryPolicyChange {request_id:String,expected_revision:String,mode:String,max_retries:i32,fallback_seconds:i32,reason:String}
+pub(super) async fn discord_retry_policy_change(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>,body:Bytes)->Response {
+    let identity=match authenticate(&db,&headers,verifier).await {Ok(v)=>v,Err(status)=>return failure(status,uri.path())};
+    let params:Vec<_>=form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).collect();
+    if params.len()!=2 || params.iter().filter(|p|p.0=="environmentId").count()!=1 || params.iter().filter(|p|p.0=="destinationId").count()!=1 {return failure(StatusCode::BAD_REQUEST,uri.path());}
+    let env=params.iter().find(|p|p.0=="environmentId").unwrap().1.as_ref();let dest=params.iter().find(|p|p.0=="destinationId").unwrap().1.as_ref();
+    if env.is_empty()||env.len()>512||env.contains('\0')||!valid_discord_retry_destination(dest) {return failure(StatusCode::BAD_REQUEST,uri.path());}
+    let Some(input)=(body.len()<=4096).then(||serde_json::from_slice::<DiscordRetryPolicyChange>(&body).ok()).flatten() else {return failure(StatusCode::BAD_REQUEST,uri.path());};
+    let (Ok(request),Ok(exp),Ok(expected))=(Uuid::parse_str(&input.request_id),i64::try_from(identity.expires_at),input.expected_revision.parse::<i64>()) else {return failure(StatusCode::BAD_REQUEST,uri.path());};
+    if expected<0||expected.to_string()!=input.expected_revision||!matches!(input.mode.as_str(),"off"|"known"|"fallback")||!(0..=10).contains(&input.max_retries)||!(1..=86400).contains(&input.fallback_seconds)||input.reason.trim().is_empty()||input.reason.len()>512||input.reason.contains('\0') {return failure(StatusCode::BAD_REQUEST,uri.path());}
+    match guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_discord_retry_policy_change($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&dest,&request,&expected,&input.mode,&input.max_retries,&input.fallback_seconds,&input.reason]).await {
+        Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
+        Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
+        Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
+        Err(e) if e.code().is_some_and(|c|matches!(c.code(),"P4090"|"40001"))=>failure(StatusCode::CONFLICT,uri.path()),
+        Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path()),
+    }
+}
+fn valid_discord_retry_destination(v:&str)->bool {!v.is_empty()&&v.len()<=64&&v.bytes().all(|b|b.is_ascii_alphanumeric()||b"._-".contains(&b))}
+
+#[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DiscordPolicyChange {
     request_id: String,
@@ -2053,6 +2081,9 @@ async fn query(
         Lookup::Subscribers => &["environmentId", "name", "after", "before", "limit"],
         Lookup::Alerts => &["environmentId", "afterChannel", "afterTarget"],
         Lookup::DecisionRequest | Lookup::SlackDecisionRequest | Lookup::Resend429Request | Lookup::TwilioRetryRequest | Lookup::FcmReviewRequest => &["environmentId", "requestId"],
+        Lookup::DiscordRetryPolicyRead => &["environmentId","destinationId"],
+        Lookup::DiscordRetryPolicyRequest => &["environmentId","destinationId","requestId"],
+        Lookup::DiscordRetryPolicyAudit => &["environmentId","destinationId","after"],
         Lookup::Identity | Lookup::ResendAutoPolicyRead | Lookup::ResendCooldownPolicyRead | Lookup::DiscordPolicyRead => &["environmentId"],
         Lookup::PermissionIdentity => &["environmentId", "issuer", "subject", "clientId"],
         Lookup::PermissionAudit => &["environmentId", "before"],
@@ -2391,6 +2422,15 @@ async fn query(
                 None => None,
             };
             guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_resend_cooldown_policy_audit_read($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&after]).await
+        }
+        Lookup::DiscordRetryPolicyRead | Lookup::DiscordRetryPolicyRequest | Lookup::DiscordRetryPolicyAudit => {
+            let Some(dest)=params.get("destinationId").filter(|v|valid_discord_retry_destination(v)) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};
+            match lookup {
+                Lookup::DiscordRetryPolicyRead => guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_discord_retry_policy_read($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&dest]).await,
+                Lookup::DiscordRetryPolicyRequest => {let Some(request)=params.get("requestId").and_then(|v|Uuid::parse_str(v).ok()) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_discord_retry_policy_request($1,$2,$3,$4,$5,$6,$7)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&dest,&request]).await},
+                Lookup::DiscordRetryPolicyAudit => {let after=match params.get("after") {Some(v)=>match Uuid::parse_str(v){Ok(v)=>Some(v),Err(_)=>return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request")},None=>None};guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_discord_retry_policy_audit_read($1,$2,$3,$4,$5,$6,$7)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&dest,&after]).await},
+                _=>unreachable!(),
+            }
         }
         Lookup::DiscordPolicyRead => {
             guarded_query(
