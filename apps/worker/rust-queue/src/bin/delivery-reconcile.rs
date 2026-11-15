@@ -42,7 +42,7 @@ async fn resend_evidence_for_cli(
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if ![2, 3, 4, 5, 6, 7, 8].contains(&args.len()) {
-        return Err("usage: delivery-reconcile check-fcm-credentials ENV MAX_AGE_SECONDS MIN_HEALTHY | check-channel-policy ENV email|sms|push|all | list-channel-policy ENV email|sms|push|all [AFTER_JOB] | ack-channel-policy ENV JOB REVISION OPERATOR REASON | push-policy-evidence ENV JOB REVISION | list-skipped-fcm ENV JOB [AFTER_TARGET] | list-cancelled-push-resolutions ENV JOB REVISION [AFTER_TARGET] | resolve-cancelled-push ENV JOB REVISION TARGET accepted|not_accepted OPERATOR REASON | check-failed-jobs ENV | list-failed-jobs ENV [AFTER_JOB] | ack-failed-job ENV JOB OPERATOR REASON | list-failed-jobs-v2 ENV [AFTER_JOB] | ack-failed-job-v2 ENV JOB REVISION OPERATOR REASON | list-slack ENV [AFTER_JOB] | slack-ack ENV JOB OPERATOR REASON | operator-scope ENV | operator-scope-set ENV DB_LOGIN GRANT_JSON REVOKE_JSON REASON | operator-scope-audit ENV [AFTER_ID] | operator-grants ENV [AFTER_LOGIN AFTER_PERMISSION] | operator-grant-audit ENV [AFTER_ID] | operator-grant|operator-revoke ENV DB_LOGIN PERMISSION REASON | check|check-slack ENV | slack-resolve ENV JOB retry|accepted OPERATOR REASON | check-alert-delivery ENV | alert-status ENV | alert-resolve ENV CHANNEL TARGET DECISION OPERATOR REASON | alert-resolve-v2 ENV CHANNEL TARGET ATTEMPT_ID DECISION OPERATOR REASON | check-queue ENV MAX_WAIT_SECONDS | check-resend|check-resend-metrics|check-twilio|check-twilio-metrics|check-sendgrid|check-sendgrid-metrics ENV GRACE_SECONDS HEARTBEAT_MAX_SECONDS | list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | email-dispatch-evidence|sendgrid-result ENV EMAIL_JOB | resend-evidence|resend-check|resend-result ENV EMAIL_JOB | sms-evidence|sms-delivery|twilio-result ENV SMS_JOB | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
+        return Err("usage: delivery-reconcile check-fcm-credentials ENV MAX_AGE_SECONDS MIN_HEALTHY | check-channel-policy ENV email|sms|push|all | list-channel-policy ENV email|sms|push|all [AFTER_JOB] | ack-channel-policy ENV JOB REVISION OPERATOR REASON | push-policy-evidence ENV JOB REVISION | list-skipped-fcm ENV JOB [AFTER_TARGET] | list-cancelled-push-resolutions ENV JOB REVISION [AFTER_TARGET] | resolve-cancelled-push ENV JOB REVISION TARGET accepted|not_accepted OPERATOR REASON | check-failed-jobs ENV | list-failed-jobs ENV [AFTER_JOB] | ack-failed-job ENV JOB OPERATOR REASON | list-failed-jobs-v2 ENV [AFTER_JOB] | ack-failed-job-v2 ENV JOB REVISION OPERATOR REASON | list-slack ENV [AFTER_JOB] | slack-ack ENV JOB OPERATOR REASON | operator-scope ENV | operator-scope-set ENV DB_LOGIN GRANT_JSON REVOKE_JSON REASON | operator-scope-audit ENV [AFTER_ID] | operator-grants ENV [AFTER_LOGIN AFTER_PERMISSION] | operator-grant-audit ENV [AFTER_ID] | operator-grant|operator-revoke ENV DB_LOGIN PERMISSION REASON | check|check-slack ENV | slack-resolve ENV JOB retry|accepted OPERATOR REASON | list-slack-v2 ENV [AFTER_JOB] | slack-resolve-v2 ENV JOB ATTEMPT_ID retry|accepted OPERATOR REASON | check-alert-delivery ENV | alert-status ENV | alert-resolve ENV CHANNEL TARGET DECISION OPERATOR REASON | alert-resolve-v2 ENV CHANNEL TARGET ATTEMPT_ID DECISION OPERATOR REASON | check-queue ENV MAX_WAIT_SECONDS | check-resend|check-resend-metrics|check-twilio|check-twilio-metrics|check-sendgrid|check-sendgrid-metrics ENV GRACE_SECONDS HEARTBEAT_MAX_SECONDS | list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | email-dispatch-evidence|sendgrid-result ENV EMAIL_JOB | resend-evidence|resend-check|resend-result ENV EMAIL_JOB | sms-evidence|sms-delivery|twilio-result ENV SMS_JOB | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
     }
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let (mut db, connection) = config.connect(tls).await?;
@@ -210,6 +210,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let after = args.get(2).map(|s| Uuid::parse_str(s)).transpose()?;
         let rows = novu_postgres_queue::slack_queue::list_attention(&db, &args[1], after).await?;
         println!("{}", serde_json::to_string(&rows)?);
+    } else if (args.len() == 2 || args.len() == 3) && args[0] == "list-slack-v2" {
+        let after = args.get(2).map(|s| Uuid::parse_str(s)).transpose()?;
+        let rows =
+            novu_postgres_queue::slack_queue::list_attention_v2(&db, &args[1], after).await?;
+        println!("{}", serde_json::to_string(&rows)?);
     } else if args.len() == 5 && args[0] == "slack-ack" {
         let changed = novu_postgres_queue::slack_queue::acknowledge_workflow(
             &mut db,
@@ -375,6 +380,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             &args[3],
             &args[4],
             &args[5],
+        )
+        .await?;
+        println!("Slack resolution recorded");
+    } else if args.len() == 7 && args[0] == "slack-resolve-v2" {
+        novu_postgres_queue::slack_queue::resolve_v2(
+            &db,
+            &args[1],
+            Uuid::parse_str(&args[2])?,
+            Uuid::parse_str(&args[3])?,
+            &args[4],
+            &args[5],
+            &args[6],
         )
         .await?;
         println!("Slack resolution recorded");

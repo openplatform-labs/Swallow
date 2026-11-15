@@ -134,6 +134,40 @@ pub async fn list_attention(
         .collect())
 }
 
+/// List current attempt identities without exposing message contents.
+pub async fn list_attention_v2(
+    client: &Client,
+    environment: &str,
+    after: Option<Uuid>,
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+    let rows = client
+        .query(
+            "SELECT * FROM public.novu_rust_list_slack_attention_v2($1,$2)",
+            &[&environment, &after],
+        )
+        .await?;
+    Ok(rows.into_iter().map(|row| serde_json::json!({"jobId":row.get::<_,Uuid>(0),"kind":row.get::<_,String>(1),"jobStatus":row.get::<_,String>(2),"attempts":row.get::<_,i32>(3),"httpStatus":row.get::<_,Option<i32>>(4),"category":row.get::<_,String>(5),"attemptId":row.get::<_,Option<Uuid>>(6)})).collect())
+}
+
+/// Apply a decision only to the identified current attempt.
+pub async fn resolve_v2(
+    client: &Client,
+    environment: &str,
+    job: Uuid,
+    attempt: Uuid,
+    decision: &str,
+    operator: &str,
+    reason: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    client
+        .query_one(
+            "SELECT public.novu_rust_resolve_slack_v2($1,$2,$3,$4,$5,$6)",
+            &[&environment, &job, &attempt, &decision, &operator, &reason],
+        )
+        .await?;
+    Ok(())
+}
+
 async fn claim(client: &Client, environment: &str) -> Result<Option<ClaimedJob>, Error> {
     let token = Uuid::new_v4();
     let row=client.query_opt("WITH candidate AS (SELECT id FROM novu_queue_jobs WHERE environment_id=$1 AND kind=$2 AND status='pending' AND available_at<=now() ORDER BY available_at,created_at,id FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE novu_queue_jobs j SET status='running',attempts=j.attempts+1,lease_token=$3,lease_until=clock_timestamp()+interval '60 seconds' FROM candidate WHERE j.id=candidate.id RETURNING j.id,j.environment_id,j.kind,j.payload,j.attempts", &[&environment,&JOB_KIND,&token]).await?;
