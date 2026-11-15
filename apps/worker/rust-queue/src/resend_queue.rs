@@ -766,7 +766,11 @@ mod tests {
                 assert_eq!(body["attachments"][1]["content"], "AAH/");
                 if provider == "resend" {
                     assert_eq!(body["attachments"][1]["content_id"], "logo");
+                    assert!(body["attachments"][0].get("content_id").is_none());
+                    assert!(body["attachments"][0].get("disposition").is_none());
+                    assert!(body["attachments"][1].get("disposition").is_none());
                 } else {
+                    assert_eq!(body["attachments"][0]["disposition"], "attachment");
                     assert_eq!(body["attachments"][1]["disposition"], "inline");
                 }
                 let response = if provider == "resend" {

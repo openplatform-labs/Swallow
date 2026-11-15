@@ -49,7 +49,13 @@ fn original_resend_options_match_selected_cases() {
                 name: "image.png".into(),
                 mime: "image/png".into(),
                 cid: Some("logo".into()),
-                disposition: None,
+                disposition: Some("inline".into()),
+            }, Attachment {
+                file: b"hello".to_vec(),
+                name: "note.txt".into(),
+                mime: "text/plain".into(),
+                cid: None,
+                disposition: Some("attachment".into()),
             }],
             ..Email::default()
         },

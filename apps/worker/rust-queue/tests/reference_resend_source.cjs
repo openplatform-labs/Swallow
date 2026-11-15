@@ -14,7 +14,7 @@ const Original = new Function('isResendError',`${js}; return Original;`)(()=>fal
 const config = {apiKey:'fixture',from:'sender@example.test',senderName:'Sender'};
 const cases = [
   {to:['a@example.test'],subject:'Hello',html:'<p>Hello</p>',replyTo:'reply@example.test'},
-  {to:['a@example.test'],subject:'Attachment',html:'<img src="cid:logo">',replyTo:'reply@example.test',headers:{'X-Trace':'value'},attachments:[{file:Buffer.from([0,1,255]),name:'image.png',mime:'image/png',cid:'logo'}]},
+  {to:['a@example.test'],subject:'Attachment',html:'<img src="cid:logo">',replyTo:'reply@example.test',headers:{'X-Trace':'value'},attachments:[{file:Buffer.from([0,1,255]),name:'image.png',mime:'image/png',cid:'logo',disposition:'inline'},{file:Buffer.from('hello'),name:'note.txt',mime:'text/plain',disposition:'attachment'}]},
   {to:['a@example.test','b@example.test'],cc:['cc@example.test'],bcc:['bcc@example.test'],from:'alt@example.test',senderName:'Alias',subject:'Hi',html:'<b>Hi</b>',text:'Hi',replyTo:'reply@example.test'},
   {to:['a@example.test'],subject:'Plain',html:'Hi',replyTo:'reply@example.test',senderName:'No comma'},
 ];

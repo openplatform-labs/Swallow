@@ -64,7 +64,7 @@ async fn trigger_preserves_bounded_attachments_for_both_email_providers() {
     let (api, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move { driver.await.unwrap() });
     let router = novu_rust_api::router(Arc::new(api));
-    let payload = json!({"name":"Alice","attachments":[{"file":"aGVsbG8=","name":"hello.txt","mime":"text/plain"},{"file":{"type":"Buffer","data":[0,1,255]},"name":"logo.png","mime":"image/png","cid":"logo","channels":["email"]}]});
+    let payload = json!({"name":"Alice","attachments":[{"file":"aGVsbG8=","name":"hello.txt","mime":"text/plain","disposition":"attachment"},{"file":{"type":"Buffer","data":[0,1,255]},"name":"logo.png","mime":"image/png","cid":"logo","disposition":"inline","channels":["email"]}]});
     for provider in ["resend", "sendgrid"] {
         let body = json!({"name":format!("{provider}-attachment"),"to":{"subscriberId":format!("{provider}-person"),"email":"recipient@example.test"},"payload":payload,"transactionId":format!("attachment-{provider}")});
         let req = Request::builder()

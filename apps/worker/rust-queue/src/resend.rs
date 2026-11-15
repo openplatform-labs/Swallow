@@ -91,7 +91,7 @@ pub fn request_body(config: &Config, email: &Email) -> Result<Value, SendError> 
         body["headers"] = json!(email.headers);
     }
     // Use an intentionally conservative limit below Resend's encoded 40 MB
-    // limit. Reject unknown disposition rather than silently dropping it.
+    // limit. Explicit dispositions are representable only when they agree with CID.
     let mut size = 0usize;
     let mut attachments = Vec::with_capacity(email.attachments.len());
     for file in &email.attachments {
@@ -102,7 +102,12 @@ pub fn request_body(config: &Config, email: &Email) -> Result<Value, SendError> 
             || file.name.is_empty()
             || file.name.len() > 255
             || file.name.contains(['\r', '\n'])
-            || file.disposition.is_some()
+            || match file.disposition.as_deref() {
+                None => false,
+                Some("attachment") => file.cid.is_some(),
+                Some("inline") => file.cid.as_ref().is_none_or(|cid| cid.is_empty() || cid.len() >= 128),
+                Some(_) => true,
+            }
             || file
                 .cid
                 .as_ref()
@@ -309,11 +314,19 @@ mod tests {
             Err(SendError::InvalidMessage)
         );
         email.headers.clear();
+        email.attachments[0].disposition = Some("inline".into());
+        assert_eq!(request_body(&config(), &email).unwrap()["attachments"], body["attachments"]);
+        email.attachments[0].cid = None;
+        assert_eq!(request_body(&config(), &email), Err(SendError::InvalidMessage));
         email.attachments[0].disposition = Some("attachment".into());
-        assert_eq!(
-            request_body(&config(), &email),
-            Err(SendError::InvalidMessage)
-        );
+        assert_eq!(request_body(&config(), &email).unwrap()["attachments"], json!([{"filename":"image.png","content":"AAH/"}]));
+        email.attachments[0].cid = Some("logo".into());
+        assert_eq!(request_body(&config(), &email), Err(SendError::InvalidMessage));
+        email.attachments[0].disposition = Some("inline".into());
+        email.attachments[0].cid = Some("x".repeat(128));
+        assert_eq!(request_body(&config(), &email), Err(SendError::InvalidMessage));
+        email.attachments[0].disposition = Some("unknown".into());
+        assert_eq!(request_body(&config(), &email), Err(SendError::InvalidMessage));
     }
     #[tokio::test]
     async fn key_file_reload_updates_subsequent_requests_without_exposing_errors() {
