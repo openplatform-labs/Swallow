@@ -18,6 +18,25 @@ fn cli(url: &str, args: &[&str]) -> std::process::Output {
         .output()
         .unwrap()
 }
+fn alert(url: &str, env: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"))
+        .env_clear()
+        .env("DATABASE_URL", url)
+        .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+        .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
+        .env("SWALLOW_ALERT_FCM_UNREVIEWED_ENABLED", "true")
+        .env("SWALLOW_ALERT_SCOPED_DELIVERY", "true")
+        .env("SWALLOW_ALERT_COOLDOWN_POLICY", "new-condition")
+        .env("SWALLOW_ALERT_CONDITIONS_V2", "true")
+        .env(
+            "SWALLOW_ALERT_SLACK_WEBHOOK",
+            "https://hooks.slack.com/services/A/B/C",
+        )
+        .env("SWALLOW_ALERT_SLACK_TARGET_ID", "blocked")
+        .args([env, "300", "120", "60"])
+        .output()
+        .unwrap()
+}
 #[tokio::test]
 #[ignore = "requires fully migrated disposable PostgreSQL and role creation"]
 async fn reviews_are_scoped_persistent_and_revision_fenced() {
@@ -32,7 +51,7 @@ async fn reviews_are_scoped_persistent_and_revision_fenced() {
     )
     .await
     .unwrap();
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'test-only'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_fcm_partial_unreviewed(text,uuid),public.novu_rust_fcm_partial_ack(text,uuid,text,text,text) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN PASSWORD 'test-only'; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_fcm_partial_unreviewed(text,uuid),public.novu_rust_fcm_partial_ack(text,uuid,text,text,text),public.novu_rust_fcm_unreviewed_health(text),public.novu_rust_reserve_alert_v2(text,text,text,integer,bigint),public.novu_rust_observe_alert_conditions_v2(text,text,text,bigint,bigint) TO {role}")).await.unwrap();
     let mut role_url = reqwest::Url::parse(&url).unwrap();
     role_url.set_username(&role).unwrap();
     role_url.set_password(Some("test-only")).unwrap();
@@ -41,11 +60,25 @@ async fn reviews_are_scoped_persistent_and_revision_fenced() {
         cli(role_url, &["list-unreviewed-fcm", &env]).status.code(),
         Some(1)
     );
-    db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,rolname,p,oid FROM pg_roles CROSS JOIN unnest(ARRAY['alert_view','queue_ack']) p WHERE rolname::text=$2",&[&env,&role]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,rolname,p,oid FROM pg_roles CROSS JOIN unnest(ARRAY['alert_view','queue_ack','alert_send']) p WHERE rolname::text=$2",&[&env,&role]).await.unwrap();
     let job = Uuid::new_v4();
     let other_job = Uuid::new_v4();
     db.execute("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES($1,$3,'experimental_fcm_push','{}','completed'),($2,$4,'experimental_fcm_push','{}','completed')",&[&job,&other_job,&env,&other]).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_fcm_attempts(job_id,environment_id,target_index,state,updated_at) VALUES($1,$3,0,'accepted',now()-interval '2 days'),($1,$3,1,'rejected',now()-interval '2 days'),($2,$4,0,'accepted',now()),($2,$4,1,'rejected',now())",&[&job,&other_job,&env,&other]).await.unwrap();
+    let health = cli(role_url, &["check-unreviewed-fcm", &env]);
+    assert_eq!(health.status.code(), Some(2));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&health.stdout).unwrap(),
+        serde_json::json!({"unreviewedJobs":1})
+    );
+    assert_eq!(
+        cli(role_url, &["check-unreviewed-fcm", &other])
+            .status
+            .code(),
+        Some(1)
+    );
+    db.execute("INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES($1,'slack','blocked','rejected')",&[&env]).await.unwrap();
+    assert_eq!(alert(role_url, &env).status.code(), Some(2));
     let list = cli(role_url, &["list-unreviewed-fcm", &env]);
     assert_eq!(list.status.code(), Some(0));
     let v: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
@@ -154,6 +187,13 @@ async fn reviews_are_scoped_persistent_and_revision_fenced() {
         serde_json::from_slice::<serde_json::Value>(&repeat.stdout).unwrap(),
         serde_json::json!({"recorded":false})
     );
+    let health = cli(role_url, &["check-unreviewed-fcm", &env]);
+    assert_eq!(health.status.code(), Some(0));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&health.stdout).unwrap(),
+        serde_json::json!({"unreviewedJobs":0})
+    );
+    assert_eq!(alert(role_url, &env).status.code(), Some(0));
     let empty = cli(role_url, &["list-unreviewed-fcm", &env]);
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&empty.stdout).unwrap(),
@@ -164,6 +204,27 @@ async fn reviews_are_scoped_persistent_and_revision_fenced() {
     let v: serde_json::Value = serde_json::from_slice(&changed.stdout).unwrap();
     assert_eq!(v["data"].as_array().unwrap().len(), 1);
     assert_ne!(v["data"][0]["revision"], new_rev);
+    let health = cli(role_url, &["check-unreviewed-fcm", &env]);
+    assert_eq!(health.status.code(), Some(2));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&health.stdout).unwrap(),
+        serde_json::json!({"unreviewedJobs":1})
+    );
+    db.execute("WITH added AS (INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) SELECT gen_random_uuid(),$1,'experimental_fcm_push','{}','completed' FROM generate_series(1,101) RETURNING id,environment_id) INSERT INTO public.novu_rust_fcm_attempts(job_id,environment_id,target_index,state) SELECT id,environment_id,n,CASE WHEN n=0 THEN 'accepted' ELSE 'rejected' END FROM added CROSS JOIN generate_series(0,1) n",&[&env]).await.unwrap();
+    let health = cli(role_url, &["check-unreviewed-fcm", &env]);
+    assert_eq!(health.status.code(), Some(2));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&health.stdout).unwrap(),
+        serde_json::json!({"unreviewedJobs":102})
+    );
+    let page = cli(role_url, &["list-unreviewed-fcm", &env]);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&page.stdout).unwrap()["data"]
+            .as_array()
+            .unwrap()
+            .len(),
+        100
+    );
     db.execute("DELETE FROM public.novu_rust_delivery_operator_grants WHERE environment_id=$1 AND database_principal=$2 AND decision='queue_ack'",&[&env,&role]).await.unwrap();
     let next = v["data"][0]["revision"].as_str().unwrap();
     assert_eq!(

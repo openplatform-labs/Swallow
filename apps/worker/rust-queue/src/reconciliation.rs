@@ -664,6 +664,10 @@ pub async fn sms_evidence(client: &Client, environment: &str, job: Uuid) -> Resu
 /// Conflicting or unfamiliar evidence is intentionally never resolved.
 /// Aggregate monitoring of delayed Twilio retry jobs; no recipient or payload data.
 /// Count recent completed FCM jobs with both accepted and rejected targets.
+pub async fn fcm_unreviewed_health(client: &Client, environment: &str) -> Result<i64> {
+    Ok(client.query_one("SELECT public.novu_rust_fcm_unreviewed_health($1)", &[&environment]).await?.get(0))
+}
+
 pub async fn fcm_partial_health(client: &Client, environment: &str, window: i32) -> Result<i64> {
     Ok(client.query_one("SELECT public.novu_rust_fcm_partial_health($1,$2)", &[&environment,&window]).await?.get(0))
 }

@@ -176,6 +176,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
         _ => return Err("invalid FCM credential alert thresholds".into()),
     };
+    let fcm_unreviewed_enabled=env_bool("SWALLOW_ALERT_FCM_UNREVIEWED_ENABLED",false)?;
+    if fcm_unreviewed_enabled && on_new_condition && !conditions_v2 {return Err("FCM unreviewed check requires v2 conditions for new-condition policy".into());}
     let fcm_partial_window = env_optional_i32("SWALLOW_ALERT_FCM_PARTIAL_WINDOW_SECONDS")?;
     if fcm_partial_window.is_some_and(|v| !(1..=604_800).contains(&v)) || (fcm_partial_window.is_some() && on_new_condition && !conditions_v2) { return Err("FCM partial check requires a valid window and v2 conditions for new-condition policy".into()); }
     let twilio_delayed_grace=env_optional_i32("SWALLOW_ALERT_TWILIO_DELAYED_GRACE_SECONDS")?;
@@ -218,6 +220,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         && slack_cooldown_grace.is_none()
         && twilio_delayed_grace.is_none()
         && fcm_partial_window.is_none()
+        && !fcm_unreviewed_enabled
         && queue_wait.is_none()
         && twilio_thresholds.is_none()
         && sendgrid_thresholds.is_none()
@@ -538,6 +541,10 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         let result = tokio::time::timeout(operation_timeout,reconciliation::fcm_partial_health(&db,&args[0],window)).await;
         Some(match result { Ok(Ok(n)) if n >= 0 => Ok(n as u64), _ => { eprintln!("FCM partial failure check failed"); Err(()) } })
     } else { None };
+    let fcm_unreviewed = if fcm_unreviewed_enabled {
+        let result=tokio::time::timeout(operation_timeout,reconciliation::fcm_unreviewed_health(&db,&args[0])).await;
+        Some(match result {Ok(Ok(n)) if n>=0=>Ok(n as u64),_=>{eprintln!("FCM unreviewed check failed");Err(())}})
+    } else {None};
     let unhealthy = fcm_credentials.is_some_and(|value| match value {
         Ok((healthy, failed, _, minimum)) => healthy < minimum || failed > 0,
         Err(()) => true,
@@ -553,6 +560,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         || slack_cooldown.is_some_and(|v| !matches!(v, Ok((false,0,0))))
         || twilio_delayed.is_some_and(|v| !matches!(v, Ok((0,0,0))))
         || fcm_partial.is_some_and(|v| !matches!(v, Ok(0)))
+        || fcm_unreviewed.is_some_and(|v| !matches!(v, Ok(0)))
         || failed_jobs.is_some_and(|n| n > 0)
         || failed_checks.iter().any(|failed| *failed)
         || resend.is_some_and(|(overdue, stale)| overdue > 0 || stale)
@@ -591,6 +599,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         slack_cooldown,
         twilio_delayed,
         fcm_partial,
+        fcm_unreviewed,
         failed_jobs,
         failed_jobs_check_failed,
         database_probe: None,
@@ -642,6 +651,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         || slack_cooldown.is_some_and(|value| value.is_err())
         || twilio_delayed.is_some_and(|value| value.is_err())
         || fcm_partial.is_some_and(|value| value.is_err())
+        || fcm_unreviewed.is_some_and(|value| value.is_err())
         || channel_policy_check_failed
         || failed_checks.iter().any(|failed| *failed);
     let mut needs_review = false;
