@@ -1896,6 +1896,54 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     assert_eq!(mail["recipientCount"], 2);
     assert_eq!(mail["deliveredCount"], 1);
     assert_eq!(mail["pendingCount"], 1);
+    // A stale terminal job projection must not contradict the current recipient snapshot.
+    for terminal in ["delivered", "failed"] {
+        db.execute(
+            "UPDATE public.novu_queue_jobs SET sendgrid_delivery_result=$2 WHERE id=$1",
+            &[&mail_job, &terminal],
+        )
+        .await
+        .unwrap();
+        let response = app
+            .clone()
+            .oneshot(mail_request(&token, &mail_path))
+            .await
+            .unwrap();
+        let result: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(result["result"], "unknown");
+    }
+    db.execute("UPDATE public.novu_rust_sendgrid_recipients SET delivery_result='delivered' WHERE dispatch_id=$1", &[&dispatch]).await.unwrap();
+    db.execute(
+        "UPDATE public.novu_queue_jobs SET sendgrid_delivery_result='delivered' WHERE id=$1",
+        &[&mail_job],
+    )
+    .await
+    .unwrap();
+    let response = app
+        .clone()
+        .oneshot(mail_request(&token, &mail_path))
+        .await
+        .unwrap();
+    let result: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(result["result"], "delivered");
+    db.execute("UPDATE public.novu_rust_sendgrid_recipients SET delivery_result='failed' WHERE dispatch_id=$1", &[&dispatch]).await.unwrap();
+    db.execute(
+        "UPDATE public.novu_queue_jobs SET sendgrid_delivery_result='failed' WHERE id=$1",
+        &[&mail_job],
+    )
+    .await
+    .unwrap();
+    let response = app
+        .clone()
+        .oneshot(mail_request(&token, &mail_path))
+        .await
+        .unwrap();
+    let result: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(result["result"], "failed");
     assert!(
         !mail.to_string().contains("private-recipient")
             && !mail.to_string().contains("private-provider")
