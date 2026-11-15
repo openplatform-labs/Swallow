@@ -44,7 +44,7 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     let db = connect(&url).await;
     db.batch_execute("INSERT INTO public.novu_rust_environments VALUES('jwt-alert-a','org'),('jwt-alert-b','org')").await.unwrap();
     let role = format!("jwt_alert_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_alerts(text,text,text,text,bigint,text,text),public.novu_rust_console_alerts_page(text,text,text),public.novu_rust_operator_jwt_resend_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_resend_jobs(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_twilio_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_twilio_jobs(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_alerts(text,text,text,text,bigint,text,text),public.novu_rust_console_alerts_page(text,text,text),public.novu_rust_operator_jwt_resend_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_resend_jobs(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_twilio_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_twilio_jobs(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_jobs(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_read(text,text,text,text,bigint,text,text) TO {role}")).await.unwrap();
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_write(text,text,text,text,bigint,text,text,jsonb,jsonb,text) TO {role}")).await.unwrap();
     db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_workflow_audit_read(text,text,text,text,bigint,text,text,uuid) TO {role}")).await.unwrap();
@@ -115,6 +115,11 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     );
     assert!(
         api.query("SELECT * FROM public.novu_rust_twilio_attempts", &[])
+            .await
+            .is_err()
+    );
+    assert!(
+        api.query("SELECT * FROM public.novu_rust_fcm_attempts", &[])
             .await
             .is_err()
     );
@@ -1818,6 +1823,119 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     let mut waiting = false;
     for _ in 0..100 {
         if db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%novu_rust_operator_jwt_workflow_audit_read%')",&[]).await.unwrap().get::<_,bool>(0){waiting=true;break;}
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(waiting && !pending.is_finished());
+    tx.commit().await.unwrap();
+    assert_eq!(pending.await.unwrap(), StatusCode::UNAUTHORIZED);
+    let push_job = Uuid::new_v4();
+    novu_postgres_queue::enqueue(
+        &db,
+        push_job,
+        "jwt-alert-a",
+        novu_postgres_queue::fcm_queue::JOB_KIND,
+        &json!({"device":"private-token"}),
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO public.novu_rust_fcm_attempts(job_id,environment_id,target_index,state,provider_message_id,operator_resolution) VALUES ($1,'jwt-alert-a',0,'accepted','private-id','accepted'),($1,'jwt-alert-a',1,'unknown',NULL,NULL),($1,'jwt-alert-a',2,'rejected',NULL,'not_accepted')",&[&push_job]).await.unwrap();
+    let push_request = |jwt: &str, path: &str| {
+        Request::builder()
+            .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {jwt}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let push_path =
+        format!("/v1/experimental/operator/fcm-result?environmentId=jwt-alert-a&jobId={push_job}");
+    let push_list = "/v1/experimental/operator/fcm-jobs?environmentId=jwt-alert-a";
+    assert_eq!(
+        app.clone()
+            .oneshot(push_request(&token, &push_path))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_fcm_result_grants VALUES('https://issuer.test','person','console','jwt-alert-a')").await.unwrap();
+    let response = app
+        .clone()
+        .oneshot(push_request(&token, &push_path))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let push: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(push["attemptCount"], 3);
+    assert_eq!(push["acceptedCount"], 1);
+    assert_eq!(push["unknownCount"], 1);
+    assert_eq!(push["rejectedCount"], 1);
+    assert_eq!(push["operatorAcceptedCount"], 1);
+    assert_eq!(push["operatorNotAcceptedCount"], 1);
+    assert!(
+        !push.to_string().contains("private-token") && !push.to_string().contains("private-id")
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(push_request(&token, push_list))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_fcm_jobs_grants VALUES('https://issuer.test','person','console','jwt-alert-a'); INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) SELECT gen_random_uuid(),'jwt-alert-a','experimental_fcm_push','{}' FROM generate_series(1,21); INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) VALUES(gen_random_uuid(),'jwt-alert-b','experimental_fcm_push','{}')").await.unwrap();
+    let response = app
+        .clone()
+        .oneshot(push_request(&token, push_list))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(page["data"].as_array().unwrap().len(), 20);
+    let next = page["next"].as_str().unwrap();
+    let response = app
+        .clone()
+        .oneshot(push_request(&token, &format!("{push_list}&after={next}")))
+        .await
+        .unwrap();
+    let page: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(page["data"].as_array().unwrap().len(), 2);
+    assert_eq!(app.clone().oneshot(push_request(&token,&format!("/v1/experimental/operator/fcm-result?environmentId=jwt-alert-b&jobId={push_job}"))).await.unwrap().status(),StatusCode::UNAUTHORIZED);
+    db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES('https://issuer.test','person','console','jwt-alert-b'); INSERT INTO public.novu_rust_operator_jwt_fcm_result_grants VALUES('https://issuer.test','person','console','jwt-alert-b')").await.unwrap();
+    assert_eq!(app.clone().oneshot(push_request(&token,&format!("/v1/experimental/operator/fcm-result?environmentId=jwt-alert-b&jobId={push_job}"))).await.unwrap().status(),StatusCode::BAD_REQUEST);
+    db.execute("DELETE FROM public.novu_rust_operator_jwt_identities WHERE subject='person' AND environment_id='jwt-alert-b'",&[]).await.unwrap();
+    db.execute("DELETE FROM public.novu_rust_operator_jwt_fcm_result_grants WHERE subject='person' AND environment_id='jwt-alert-a'",&[]).await.unwrap();
+    assert_eq!(
+        app.clone()
+            .oneshot(push_request(&token, &push_path))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(push_request(&token, push_list))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_fcm_result_grants VALUES('https://issuer.test','person','console','jwt-alert-a')").await.unwrap();
+    let mut push_revoker = connect(&url).await;
+    let tx = push_revoker.transaction().await.unwrap();
+    tx.execute("DELETE FROM public.novu_rust_operator_jwt_fcm_result_grants WHERE subject='person' AND environment_id='jwt-alert-a'",&[]).await.unwrap();
+    let req = push_request(&token, &push_path);
+    let pending = tokio::spawn({
+        let app = app.clone();
+        async move { app.oneshot(req).await.unwrap().status() }
+    });
+    let mut waiting = false;
+    for _ in 0..100 {
+        if db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%novu_rust_operator_jwt_fcm_result%')",&[]).await.unwrap().get::<_,bool>(0){waiting=true;break;}
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert!(waiting && !pending.is_finished());

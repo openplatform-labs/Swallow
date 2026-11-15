@@ -1,0 +1,31 @@
+import { Component, Input, OnChanges, OnDestroy, signal } from '@angular/core';
+import { FormsModule } from '@angular/forms';
+type Result={jobId:string;jobStatus:string;attemptCount:number;acceptedCount:number;rejectedCount:number;unknownCount:number;dispatchingCount:number;skippedCount:number;operatorAcceptedCount:number;operatorNotAcceptedCount:number};
+@Component({selector:'app-fcm-results',imports:[FormsModule],templateUrl:'./fcm-results.html'})
+export class FcmResults implements OnChanges,OnDestroy {
+  @Input() apiOrigin='';@Input() environment='';@Input() token='';
+  jobId=''; readonly rows=signal<Result[]>([]); readonly result=signal<Result|null>(null); readonly next=signal<string|null>(null);
+  readonly listStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');readonly resultStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');
+  private listSequence=0;private resultSequence=0;private listAbort:AbortController|null=null;private resultAbort:AbortController|null=null;
+  ngOnChanges():void {this.clear();} ngOnDestroy():void {this.clear();this.token='';}
+  clear():void {this.listSequence++;this.resultSequence++;this.listAbort?.abort();this.resultAbort?.abort();this.listAbort=null;this.resultAbort=null;this.rows.set([]);this.result.set(null);this.next.set(null);this.listStatus.set('idle');this.resultStatus.set('idle');this.jobId='';}
+  clearResult():void {this.resultSequence++;this.resultAbort?.abort();this.resultAbort=null;this.result.set(null);this.resultStatus.set('idle');}
+  private validUuid(value:unknown):value is string {return typeof value==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);}
+  private origin():string {const url=new URL(this.apiOrigin.trim());if(!['http:','https:'].includes(url.protocol)||url.username||url.password||url.pathname!=='/'||url.search||url.hash||(url.protocol==='http:'&&!['localhost','127.0.0.1','[::1]'].includes(url.hostname)))throw new Error('origin');return url.origin;}
+  private params():URLSearchParams {const token=this.token.trim(),environment=this.environment.trim();if(token.length>16384||!/^[-_A-Za-z0-9]+\.[-_A-Za-z0-9]+\.[-_A-Za-z0-9]+$/.test(token)||!environment||new TextEncoder().encode(environment).length>512||/[\0\r\n]/.test(environment))throw new Error('credentials');return new URLSearchParams({environmentId:environment});}
+  private parse(value:unknown):Result {if(!value||typeof value!=='object')throw new Error('response');const r=value as Record<string,unknown>;
+    if(!this.validUuid(r['jobId'])||typeof r['jobStatus']!=='string'||!['pending','running','completed','failed','cancelled'].includes(r['jobStatus']))throw new Error('response');
+    const fields=['attemptCount','acceptedCount','rejectedCount','unknownCount','dispatchingCount','skippedCount','operatorAcceptedCount','operatorNotAcceptedCount'];
+    if(fields.some(k=>typeof r[k]!=='number'||!Number.isSafeInteger(r[k])||(r[k] as number)<0))throw new Error('response');
+    if((r['acceptedCount'] as number)+(r['rejectedCount'] as number)+(r['unknownCount'] as number)+(r['dispatchingCount'] as number)+(r['skippedCount'] as number)!==r['attemptCount']||(r['operatorAcceptedCount'] as number)>(r['acceptedCount'] as number)||(r['operatorNotAcceptedCount'] as number)>(r['rejectedCount'] as number))throw new Error('response');return r as Result;}
+  async list(more=false):Promise<void> {if(more&&!this.next())return;const after=this.next();const seq=++this.listSequence;this.listAbort?.abort();const controller=new AbortController();this.listAbort=controller;this.rows.set([]);this.listStatus.set('loading');
+    try{const params=this.params();if(more&&after)params.set('after',after);const response=await fetch(`${this.origin()}/v1/experimental/operator/fcm-jobs?${params}`,{headers:{Authorization:`Bearer ${this.token.trim()}`},credentials:'omit',cache:'no-store',redirect:'error',signal:controller.signal});if(!response.ok)throw new Error('request');const body:unknown=await response.json();if(!body||typeof body!=='object')throw new Error('response');const data=body as Record<string,unknown>;
+      if(!Array.isArray(data['data'])||data['data'].length>20||typeof data['hasMore']!=='boolean'||(data['hasMore']?!this.validUuid(data['next']):data['next']!==null))throw new Error('response');const rows=data['data'].map(v=>this.parse(v));if(seq!==this.listSequence)return;this.rows.set(rows);this.next.set(data['next'] as string|null);this.listStatus.set('loaded');
+    }catch{if(seq===this.listSequence){this.rows.set([]);this.next.set(null);this.listStatus.set('error');}}
+  }
+  select(row:Result):void {this.jobId=row.jobId;this.clearResult();}
+  async load():Promise<void> {this.clearResult();const seq=this.resultSequence,controller=new AbortController();this.resultAbort=controller;this.resultStatus.set('loading');
+    try{const params=this.params();if(!this.validUuid(this.jobId.trim()))throw new Error('job');params.set('jobId',this.jobId.trim());const response=await fetch(`${this.origin()}/v1/experimental/operator/fcm-result?${params}`,{headers:{Authorization:`Bearer ${this.token.trim()}`},credentials:'omit',cache:'no-store',redirect:'error',signal:controller.signal});if(!response.ok)throw new Error('request');const result=this.parse(await response.json());if(result.jobId.toLowerCase()!==this.jobId.trim().toLowerCase())throw new Error('response');if(seq!==this.resultSequence)return;this.result.set(result);this.resultStatus.set('loaded');
+    }catch{if(seq===this.resultSequence){this.result.set(null);this.resultStatus.set('error');}}
+  }
+}

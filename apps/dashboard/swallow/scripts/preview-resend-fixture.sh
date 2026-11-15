@@ -92,6 +92,15 @@ INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status,twilio_
 INSERT INTO public.novu_rust_twilio_attempts(job_id,environment_id,state,provider_message_id) VALUES ('2889f88e-c0a3-4ab5-b861-2fdc1f26f254','ui-fixture-env','accepted','fixture-provider');
 SQL
 fi
+if [[ "${SWALLOW_UI_FCM_RESULT_FIXTURE:-false}" == true ]]; then
+  docker exec -i "$name" psql -q -v ON_ERROR_STOP=1 -U postgres -d ui_test <<'SQL'
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_fcm_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_jobs(text,text,text,text,bigint,uuid) TO ui_resend_fixture;
+INSERT INTO public.novu_rust_operator_jwt_fcm_result_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
+INSERT INTO public.novu_rust_operator_jwt_fcm_jobs_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
+INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES ('3889f88e-c0a3-4ab5-b861-2fdc1f26f254','ui-fixture-env','experimental_fcm_push','{}','failed');
+INSERT INTO public.novu_rust_fcm_attempts(job_id,environment_id,target_index,state,operator_resolution) VALUES ('3889f88e-c0a3-4ab5-b861-2fdc1f26f254','ui-fixture-env',0,'accepted','accepted'),('3889f88e-c0a3-4ab5-b861-2fdc1f26f254','ui-fixture-env',1,'unknown',NULL);
+SQL
+fi
 if [[ "${SWALLOW_UI_SELF_REVOKE:-false}" == true ]]; then
   docker exec -i "$name" psql -q -v ON_ERROR_STOP=1 -U postgres -d ui_test <<'SQL'
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_self(text,text,text,text,bigint),public.novu_rust_operator_token_revoked(bytea,bytea,bytea,bytea),public.novu_rust_operator_token_guard(bytea,bytea,bytea,bytea),public.novu_rust_operator_jwt_self_revoke(text,text,text,text,bigint,bytea) TO ui_resend_fixture;
