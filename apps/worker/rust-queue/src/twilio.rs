@@ -311,6 +311,8 @@ impl Twilio {
         Ok(self)
     }
 
+    pub(crate) fn account_sid(&self) -> &str { &self.config.account_sid }
+
     pub(crate) fn tracks_status_callbacks(&self) -> bool {
         self.status_callback_base.is_some()
     }

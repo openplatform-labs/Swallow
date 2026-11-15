@@ -11,6 +11,7 @@ pub const JOB_KIND: &str = "experimental_twilio_sms";
 pub const MIGRATION: &str = include_str!("../migrations/0041_experimental_twilio_attempts.sql");
 pub const DISPATCH_ID_MIGRATION: &str =
     include_str!("../migrations/0055_twilio_attempt_identity.sql");
+pub const DISPATCH_ACCOUNT_MIGRATION: &str = include_str!("../migrations/0177_twilio_dispatch_account.sql");
 
 fn valid_phone(value: Option<&str>) -> Option<&str> {
     value.filter(|v| !v.trim().is_empty())
@@ -255,8 +256,8 @@ pub async fn process_one_with_step_policy(
         return Ok(true);
     }
     tx.execute(
-        "INSERT INTO novu_rust_twilio_dispatch_ids(id,job_id,environment_id) VALUES ($1,$2,$3)",
-        &[&dispatch, &job.id, &job.environment_id],
+        "INSERT INTO novu_rust_twilio_dispatch_ids(id,job_id,environment_id,account_sid) VALUES ($1,$2,$3,$4)",
+        &[&dispatch, &job.id, &job.environment_id, &provider.account_sid()],
     )
     .await?;
     apply_status_callback(&mut sms, provider, job.id, dispatch);
@@ -534,6 +535,7 @@ mod tests {
         db.batch_execute(crate::MIGRATION).await.unwrap();
         db.batch_execute(MIGRATION).await.unwrap();
         db.batch_execute(DISPATCH_ID_MIGRATION).await.unwrap();
+        db.batch_execute(DISPATCH_ACCOUNT_MIGRATION).await.unwrap();
         db.batch_execute(crate::reconciliation::MIGRATION)
             .await
             .unwrap();
@@ -652,6 +654,8 @@ mod tests {
             let row = db.query_one("SELECT a.state,j.status,a.provider_message_id FROM novu_rust_twilio_attempts a JOIN novu_queue_jobs j ON j.id=a.job_id WHERE a.job_id=$1", &[&id]).await.unwrap();
             let count: i64 = db.query_one("SELECT count(*) FROM novu_rust_twilio_dispatch_ids d JOIN novu_rust_twilio_attempts a ON a.dispatch_id=d.id AND a.job_id=d.job_id AND a.environment_id=d.environment_id WHERE d.job_id=$1 AND d.id=$2", &[&id,&captured_dispatch]).await.unwrap().get(0);
             assert_eq!(count, 1);
+            let account: String = db.query_one("SELECT account_sid FROM novu_rust_twilio_dispatch_ids WHERE id=$1", &[&captured_dispatch]).await.unwrap().get(0);
+            assert_eq!(account, "ACfixture");
             assert_eq!(row.get::<_, String>(0), expected);
             let delivery_state: String = db
                 .query_one(

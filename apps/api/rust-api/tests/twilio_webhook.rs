@@ -74,6 +74,7 @@ async fn signed_status_events_are_scoped_deduplicated_and_private() {
         novu_postgres_queue::reconciliation::OPERATOR_GRANTS_MIGRATION,
         novu_postgres_queue::reconciliation::OPERATOR_GRANT_LOCK_MIGRATION,
         novu_postgres_queue::twilio_queue::DISPATCH_ID_MIGRATION,
+        novu_postgres_queue::twilio_queue::DISPATCH_ACCOUNT_MIGRATION,
     ] {
         db.batch_execute(migration).await.unwrap();
     }
@@ -292,6 +293,7 @@ async fn signed_job_callbacks_bind_evidence_without_changing_attempt_state() {
         novu_postgres_queue::reconciliation::OPERATOR_GRANTS_MIGRATION,
         novu_postgres_queue::reconciliation::OPERATOR_GRANT_LOCK_MIGRATION,
         novu_postgres_queue::twilio_queue::DISPATCH_ID_MIGRATION,
+        novu_postgres_queue::twilio_queue::DISPATCH_ACCOUNT_MIGRATION,
     ] {
         db.batch_execute(migration).await.unwrap();
     }
@@ -468,8 +470,21 @@ async fn signed_job_callbacks_bind_evidence_without_changing_attempt_state() {
     let dispatch = uuid::Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
     let second_dispatch = uuid::Uuid::new_v4();
     db.execute("INSERT INTO novu_rust_twilio_dispatch_ids(id,job_id,environment_id) VALUES ($1,$2,'env-a'),($3,$2,'env-a')", &[&dispatch,&job,&second_dispatch]).await.unwrap();
+    db.execute("UPDATE novu_rust_twilio_dispatch_ids SET account_sid=$2 WHERE id=$1", &[&dispatch,&format!("AC{}", "3".repeat(32))]).await.unwrap();
     let dispatch_path = format!("{path}/attempts/{dispatch}");
     let dispatch_signature = "5O0nox9+3HMMACVPV2xPvSfX+kc="; // Twilio Node SDK 4.20.0
+    assert_eq!(
+        post(
+            router.clone(),
+            &dispatch_path,
+            BODY,
+            dispatch_signature,
+            form
+        )
+        .await,
+        StatusCode::NOT_FOUND
+    );
+    db.execute("UPDATE novu_rust_twilio_dispatch_ids SET account_sid=$2 WHERE id=$1", &[&dispatch,&format!("AC{}", "1".repeat(32))]).await.unwrap();
     assert_eq!(
         post(
             router.clone(),

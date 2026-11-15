@@ -49,6 +49,7 @@ async fn workers_reconnect_after_timeout_and_database_restart() {
         queue::MIGRATION,
         queue::twilio_queue::MIGRATION,
         queue::twilio_queue::DISPATCH_ID_MIGRATION,
+        queue::twilio_queue::DISPATCH_ACCOUNT_MIGRATION,
         queue::in_app::SMS_MESSAGES_MIGRATION,
         queue::twilio_projection::MIGRATION,
         include_str!("../../../api/rust-api/migrations/0005_twilio_webhooks.sql"),

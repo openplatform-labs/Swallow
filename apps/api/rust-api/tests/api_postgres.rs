@@ -549,6 +549,7 @@ async fn trigger_api_contract_inner() {
         novu_postgres_queue::sendgrid_queue::DISPATCH_PROOF_MIGRATION,
         novu_postgres_queue::twilio_queue::MIGRATION,
         novu_postgres_queue::twilio_queue::DISPATCH_ID_MIGRATION,
+        novu_postgres_queue::twilio_queue::DISPATCH_ACCOUNT_MIGRATION,
         novu_postgres_queue::fcm_queue::MIGRATION,
     ] {
         db.batch_execute(migration).await.unwrap();

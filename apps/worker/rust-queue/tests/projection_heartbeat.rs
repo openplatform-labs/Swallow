@@ -33,6 +33,7 @@ async fn strict_heartbeat_waits_for_skipped_jobs_in_each_channel() {
         queue::resend_projection::HEARTBEAT_MIGRATION,
         queue::twilio_queue::MIGRATION,
         queue::twilio_queue::DISPATCH_ID_MIGRATION,
+        queue::twilio_queue::DISPATCH_ACCOUNT_MIGRATION,
         queue::in_app::SMS_MESSAGES_MIGRATION,
         queue::twilio_projection::MIGRATION,
         include_str!("../../../api/rust-api/migrations/0010_resend_webhooks.sql"),

@@ -69,6 +69,7 @@ async fn changed_actor_is_rejected_by_all_channels() {
         crate::sendgrid_queue::DISPATCH_PROOF_MIGRATION,
         crate::twilio_queue::MIGRATION,
         crate::twilio_queue::DISPATCH_ID_MIGRATION,
+        crate::twilio_queue::DISPATCH_ACCOUNT_MIGRATION,
         crate::fcm_queue::MIGRATION,
         crate::in_app::DELIVERY_STATE_MIGRATION,
     ] {

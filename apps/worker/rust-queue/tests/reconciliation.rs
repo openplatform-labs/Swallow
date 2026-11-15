@@ -18,6 +18,7 @@ async fn decisions_are_fenced_audited_and_environment_scoped() {
         queue::sendgrid_queue::MIGRATION,
         queue::twilio_queue::MIGRATION,
         queue::twilio_queue::DISPATCH_ID_MIGRATION,
+        queue::twilio_queue::DISPATCH_ACCOUNT_MIGRATION,
         queue::fcm_queue::MIGRATION,
         queue::resend_queue::MIGRATION,
         queue::in_app::EMAIL_MESSAGES_MIGRATION,
