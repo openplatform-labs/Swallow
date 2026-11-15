@@ -1,3 +1,18 @@
+워커 0163은 Resend 자동 429 정책을 DB 직접 쓰기 없이 관리하는 선택형 CLI를 제공한다. 최초 권한은 DB 관리자가 환경과 로그인 역할별로 `novu_rust_resend_auto_policy_admins`에 등록하며 `can_read`, `can_write`, `can_audit`을 따로 선택한다. 역할 이름과 로그인 역할 OID를 함께 확인하므로 역할을 삭제·재생성하면 다시 등록해야 한다. 각 경로에는 해당 함수의 EXECUTE 권한도 부여한다. 예를 들어 세 권한을 모두 부여하려면 다음 SQL을 DB 관리자가 환경·역할에 맞게 실행한다.
+
+```sql
+INSERT INTO public.novu_rust_resend_auto_policy_admins
+ (environment_id,database_principal,principal_oid,can_read,can_write,can_audit)
+SELECT 'ENV',rolname,oid,true,true,true FROM pg_roles WHERE rolname='operator_role' AND rolcanlogin;
+GRANT EXECUTE ON FUNCTION public.novu_rust_resend_auto_policy_read(text),
+ public.novu_rust_resend_auto_policy_set(text,bigint,boolean,integer,text,text),
+ public.novu_rust_resend_auto_policy_audit_read(text,bigint) TO operator_role;
+```
+
+`delivery-reconcile resend-auto-policy-read ENV`는 정책 유무와 `revision`을 표시한다. 생성은 `resend-auto-policy-set ENV -1 enabled 3 now REASON`, 변경은 조회한 revision을 사용해 예를 들어 `resend-auto-policy-set ENV 0 disabled 3 preserve REASON`으로 수행한다. 최대 횟수는 1~10이고 `now`는 대상 시작 시각을 현재 DB 시각으로 변경하며 `preserve`는 기존 시각을 유지한다. 신규 정책에는 `now`가 필요하다. 비활성화 후 `preserve`로 다시 켜면 이전 시각 이후의 오래된 실패도 자동 재시도 대상이 될 수 있다. 한 번의 변경마다 revision이 증가하고 사유·이전/변경 내용·DB 로그인은 감사에 원자적으로 기록된다. 이미 예약된 작업은 정책 변경으로 취소되지 않는다. `resend-auto-policy-audit ENV [BEFORE]`는 ID 내림차순 50건과 다음 커서를 반환하며 ID 순서는 커밋 순서나 여러 페이지의 단일 스냅샷을 보장하지 않는다.
+
+동일 revision의 동시 변경은 하나만 성공하고 권한 회수는 진행 중인 변경을 기다린다. 응답 유실은 성공 여부가 불명이며 새 요청으로 자동 재시도하지 않는다. 현재 revision과 감사를 확인해 변경 내용과 사유를 대조한다. 요청 ID 기반 멱등성은 아직 없다. 감사에는 이 함수 경로만 기록되고 직접 DB 변경은 기록되지 않으며, DB 소유자와 감사 보관·사유의 민감정보를 별도 관리해야 한다. DB 로그인은 사람의 신원을 독립적으로 증명하지 않는다. 기존 직접 SQL 설정도 계속 작동하지만 revision·감사를 우회한다. 제한 DB 역할·실제 CLI·임시 PostgreSQL 17에서 권한 분리, 환경 격리, revision 경합, 감사 실패 롤백, 스케줄러 정책 잠금과 권한 회수 경합을 확인했다. 실제 IdP·운영 HA와 정책 대량 감사 페이지는 미검증이다. 재현: `TEST_DATABASE_URL=... cargo test --test resend_auto_policy_admin -- --ignored` (전체 마이그레이션을 적용한 폐기 가능한 DB와 역할 생성 권한 필요).
+
 워커 0162는 자동 429 재시도 감사에 별도 표시를 남기고, 새 Resend 워커가 작업을 잠근 상태에서 마지막 재시도 표시를 확인한다. 자동 재시도 작업에 태그·두 증거 가드·retry별 키 중 하나라도 빠졌으면 외부 요청이나 발송 시도를 만들지 않고 5초 뒤 다시 대기열에 넣는다. 정책을 끈 뒤에도 이미 예약한 자동 작업은 보호한다. 대기 중 부적절한 워커가 반복해서 가져가면 시작 지연과 작업 claim 횟수 증가가 발생하며 로그·대기열을 감시하고 워커 설정을 수정해야 한다. 기존 수동 재시도에는 이 추가 조건을 적용하지 않는다.
 
 모든 새 Resend 워커의 DB 계정에 `GRANT EXECUTE ON FUNCTION public.novu_rust_resend_auto_dispatch_allowed(text,uuid,boolean,boolean,boolean,boolean) TO worker_role`이 필요하며, 기능을 끈 경우에도 새 함수 실행 권한이 필요하다. 배포 전 0162를 적용하고 권한을 부여한 뒤 모든 구버전 워커를 교체한다. 0162는 0161에서 기록한 고정 이름·사유의 기존 감사 행을 자동으로 표시한다. 운영자가 동일한 이름·사유를 수동 입력한 과거 행은 보수적으로 자동으로 표시될 수 있다. 감사 테이블 변경·과거 행 갱신의 잠금과 부하를 계획한다. 함수 실행 권한이 있는 DB 계정은 알려진 환경·작업 ID에 대한 자동 여부를 유추할 수 있으므로 워커 계정에만 부여한다. 이전 바이너리, 직접 테이블 변경, 등록 정책을 사용하지 않는 라이브러리 호출과 DB 복원은 이 검사를 우회할 수 있다. DB 작업 잠금 이후 공급자 요청을 보내기 전에도 콜백이 도착할 수 있으며 중복 방지를 보장하지 않는다.
