@@ -22,6 +22,9 @@ fn run(url: &str, env: &str, check: &str) -> Output {
         "slack" => {
             cmd.env("SWALLOW_ALERT_SLACK_COOLDOWN_GRACE_SECONDS", "60");
         }
+        "invalid" => {
+            cmd.env("SWALLOW_ALERT_SLACK_COOLDOWN_GRACE_SECONDS", "0");
+        }
         "failed" => {
             cmd.env("SWALLOW_ALERT_FAILED_JOBS_ENABLED", "true");
         }
@@ -53,6 +56,10 @@ async fn target_binding_denies_other_checks_and_enforces_role_scope() {
     role_url.set_password(Some("test-only")).unwrap();
     assert!(!run(role_url.as_str(), &env, "slack").status.success());
     db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,$2,p,oid FROM pg_roles CROSS JOIN unnest(ARRAY['alert_view','alert_send']) p WHERE rolname::text=$2",&[&env,&role]).await.unwrap();
+    let invalid = run(role_url.as_str(), &env, "invalid");
+    assert!(!invalid.status.success());
+    let before: i64 = db.query_one("SELECT count(*) FROM public.novu_rust_alert_shared_check_bindings WHERE environment_id=$1", &[&env]).await.unwrap().get(0);
+    assert_eq!(before, 0, "invalid thresholds must not persist a binding");
     let ok = run(role_url.as_str(), &env, "slack");
     assert!(
         ok.status.success(),

@@ -109,19 +109,6 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     )
     .await
     .map_err(|_| "alert database setup timed out")??;
-    if bind_shared {
-        for (channel, target, enabled) in [("slack", slack_id.as_str(), slack.is_some()), ("email", email_id.as_str(), email.is_some())] {
-            if enabled {
-                let result = tokio::time::timeout(operation_timeout, db.query_one(
-                    "SELECT public.novu_rust_bind_alert_shared_check($1,$2,$3,$4)",
-                    &[&args[0], &channel, &target, &shared_check],
-                )).await;
-                if !matches!(result, Ok(Ok(ref row)) if row.get::<_,bool>(0)) {
-                    return Err("shared alert check binding failed".into());
-                }
-            }
-        }
-    }
     if let Some(key) = &binding_key {
         if let Some(provider) = &slack
             && !matches!(
@@ -239,6 +226,19 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
             .is_some_and(|(g, h)| !(1..=86_400).contains(&g) || !(1..=86_400).contains(&h))
     {
         return Err("invalid alert check threshold (1-86400 seconds)".into());
+    }
+    if bind_shared {
+        for (channel, target, enabled) in [("slack", slack_id.as_str(), slack.is_some()), ("email", email_id.as_str(), email.is_some())] {
+            if enabled {
+                let result = tokio::time::timeout(operation_timeout, db.query_one(
+                    "SELECT public.novu_rust_bind_alert_shared_check($1,$2,$3,$4)",
+                    &[&args[0], &channel, &target, &shared_check],
+                )).await;
+                if !matches!(result, Ok(Ok(ref row)) if row.get::<_,bool>(0)) {
+                    return Err("shared alert check binding failed".into());
+                }
+            }
+        }
     }
     let mut failed_checks = [false; 5];
     let resend = if resend_enabled {
