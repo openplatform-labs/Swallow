@@ -53,6 +53,14 @@ INSERT INTO public.novu_rust_operator_jwt_slack_decision_grants VALUES ('https:/
 INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'ui-fixture-env',rolname,'slack_retry',oid FROM pg_roles WHERE rolname='ui_channel_results_fixture';
 SQL
 fi
+if [[ "${SWALLOW_UI_SLACK_GRANT_FIXTURE:-false}" == true ]]; then
+ "$pgbin/psql" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_slack_decision_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_slack_decision_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_slack_decision_grant_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_slack_decision_grant_audit_read(text,text,text,text,bigint,uuid) TO ui_channel_results_fixture;
+INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES ('https://issuer.test','target-fixture','console','ui-fixture-env');
+INSERT INTO public.novu_rust_operator_jwt_slack_decision_grant_admins VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env',true,true);
+INSERT INTO public.novu_rust_operator_jwt_slack_decision_grant_audit_viewers VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
+SQL
+fi
 node --input-type=module - "$root" "$testdir" <<'JS'
 import {readFile,writeFile} from 'node:fs/promises';
 import {SignJWT,importPKCS8} from './node_modules/jose/dist/webapi/index.js';
