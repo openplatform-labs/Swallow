@@ -137,6 +137,75 @@ async fn signed_events_are_scoped_deduplicated_and_private() {
         .replace("\\\"", "\"")
         .into_bytes();
     let sig = signature(raw_secret, "msg_test", &timestamp, &body);
+    let new_raw = b"new-test-secret-is-32-bytes-long";
+    let new_key = format!("whsec_{}", STANDARD.encode(new_raw));
+    let new_sig = signature(new_raw, "msg_test", &timestamp, &body);
+    let rotation =
+        novu_rust_api::resend_webhook::Config::new_with_secrets("env-a".into(), &[&new_key, &key])
+            .unwrap();
+    let rotation_app = novu_rust_api::router_with_webhook_configs(
+        db.clone(),
+        None,
+        HashMap::new(),
+        None,
+        Some(rotation),
+    );
+    assert_eq!(
+        call(
+            rotation_app.clone(),
+            path,
+            "msg_test",
+            &timestamp,
+            &sig,
+            &body
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        call(
+            rotation_app.clone(),
+            path,
+            "msg_test",
+            &timestamp,
+            &new_sig,
+            &body
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        call(
+            rotation_app.clone(),
+            path,
+            "msg_test",
+            &timestamp,
+            &format!("{sig} {new_sig}"),
+            &body
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        call(rotation_app, path, "msg_test", &timestamp, &new_sig, b"{}").await,
+        StatusCode::UNAUTHORIZED
+    );
+    let new_only = novu_rust_api::resend_webhook::Config::new("env-a".into(), &new_key).unwrap();
+    let new_app = novu_rust_api::router_with_webhook_configs(
+        db.clone(),
+        None,
+        HashMap::new(),
+        None,
+        Some(new_only),
+    );
+    assert_eq!(
+        call(new_app.clone(), path, "msg_test", &timestamp, &sig, &body).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(new_app, path, "msg_test", &timestamp, &new_sig, &body).await,
+        StatusCode::NO_CONTENT
+    );
     assert_eq!(
         call(app.clone(), path, "msg_test", &timestamp, &sig, &body).await,
         StatusCode::NO_CONTENT

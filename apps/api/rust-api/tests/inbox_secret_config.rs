@@ -20,6 +20,8 @@ fn server() -> Command {
         .env_remove("NOVU_RESEND_WEBHOOK_ENVIRONMENT_ID")
         .env_remove("NOVU_RESEND_WEBHOOK_SECRET")
         .env_remove("NOVU_RESEND_WEBHOOK_SECRET_FILE")
+        .env_remove("NOVU_RESEND_WEBHOOK_PREVIOUS_SECRET")
+        .env_remove("NOVU_RESEND_WEBHOOK_PREVIOUS_SECRET_FILE")
         .env_remove("NOVU_RESEND_WEBHOOK_LOCK_RETRY_JOBS")
         .env_remove("NOVU_RESEND_WEBHOOK_CAPTURE_CORRELATION")
         .env_remove("NOVU_RESEND_WEBHOOK_LOCK_CORRELATION_JOBS")
@@ -55,6 +57,35 @@ fn strict_and_required_security_settings_control_startup() {
         assert!(!String::from_utf8_lossy(&output.stderr).contains("sensitive-test-token"));
     }
     check(&[("SWALLOW_API_STRICT_SECURITY_CONFIG", "true")], true);
+    check(
+        &[
+            ("SWALLOW_API_STRICT_SECURITY_CONFIG", "true"),
+            (
+                "NOVU_RESEND_WEBHOOK_PREVIOUS_SECRET",
+                "whsec_MDEyMzQ1Njc4OWFiY2RlZg==",
+            ),
+        ],
+        false,
+    );
+    let resend = [
+        ("SWALLOW_API_STRICT_SECURITY_CONFIG", "true"),
+        ("NOVU_RESEND_WEBHOOK_ENVIRONMENT_ID", "env"),
+        (
+            "NOVU_RESEND_WEBHOOK_SECRET",
+            "whsec_MDEyMzQ1Njc4OWFiY2RlZg==",
+        ),
+        (
+            "NOVU_RESEND_WEBHOOK_PREVIOUS_SECRET",
+            "whsec_YWJjZGVmMDEyMzQ1Njc4OQ==",
+        ),
+    ];
+    check(&resend, true);
+    let mut duplicate_resend = resend;
+    duplicate_resend[3].1 = resend[2].1;
+    check(&duplicate_resend, false);
+    let mut conflict_resend = resend.to_vec();
+    conflict_resend.push(("NOVU_RESEND_WEBHOOK_PREVIOUS_SECRET_FILE", "/missing"));
+    check(&conflict_resend, false);
     check(&[("NOVU_RESEND_WEBHOOK_ENVIRONMENT_ID", "env")], true); // legacy mode
     check(
         &[
@@ -174,6 +205,34 @@ fn strict_and_required_security_settings_control_startup() {
         ],
         true,
     );
+}
+
+#[test]
+fn previous_resend_secret_file_is_accepted_without_exposing_path_or_secret() {
+    let path = std::env::temp_dir().join(format!("swallow-resend-old-{}", uuid::Uuid::new_v4()));
+    fs::write(&path, "whsec_YWJjZGVmMDEyMzQ1Njc4OQ==\n").unwrap();
+    let mut child = server()
+        .env("SWALLOW_API_STRICT_SECURITY_CONFIG", "true")
+        .env("NOVU_RESEND_WEBHOOK_ENVIRONMENT_ID", "env")
+        .env(
+            "NOVU_RESEND_WEBHOOK_SECRET",
+            "whsec_MDEyMzQ1Njc4OWFiY2RlZg==",
+        )
+        .env("NOVU_RESEND_WEBHOOK_PREVIOUS_SECRET_FILE", &path)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let exited = child.try_wait().unwrap();
+    if exited.is_none() {
+        child.kill().unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(exited.is_none());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("whsec_"));
+    assert!(!stderr.contains(path.to_str().unwrap()));
+    fs::remove_file(path).unwrap();
 }
 
 #[test]

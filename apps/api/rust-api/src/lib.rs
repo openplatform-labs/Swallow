@@ -217,6 +217,8 @@ impl RuntimeConfig {
                     "NOVU_RESEND_WEBHOOK_ENVIRONMENT_ID",
                     "NOVU_RESEND_WEBHOOK_SECRET",
                     "NOVU_RESEND_WEBHOOK_SECRET_FILE",
+                    "NOVU_RESEND_WEBHOOK_PREVIOUS_SECRET",
+                    "NOVU_RESEND_WEBHOOK_PREVIOUS_SECRET_FILE",
                 ])))
             && resend.is_none()
         {

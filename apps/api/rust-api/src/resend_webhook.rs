@@ -16,20 +16,30 @@ use tokio_postgres::Client;
 #[derive(Clone)]
 pub struct Config {
     environment: String,
-    secret: Vec<u8>,
+    secrets: Vec<Vec<u8>>,
     lock_retry_jobs: bool,
     capture_correlation: bool,
     lock_correlation_jobs: bool,
 }
 impl Config {
     pub fn new(environment: String, secret: &str) -> Option<Self> {
-        let decoded = STANDARD.decode(secret.strip_prefix("whsec_")?).ok()?;
-        if environment.trim().is_empty() || decoded.len() < 16 || decoded.len() > 128 {
+        Self::new_with_secrets(environment, &[secret])
+    }
+    pub fn new_with_secrets(environment: String, secrets: &[&str]) -> Option<Self> {
+        if environment.trim().is_empty() || secrets.is_empty() || secrets.len() > 2 {
             return None;
+        }
+        let mut decoded = Vec::with_capacity(secrets.len());
+        for secret in secrets {
+            let value = STANDARD.decode(secret.strip_prefix("whsec_")?).ok()?;
+            if !(16..=128).contains(&value.len()) || decoded.contains(&value) {
+                return None;
+            }
+            decoded.push(value);
         }
         Some(Self {
             environment,
-            secret: decoded,
+            secrets: decoded,
             lock_retry_jobs: false,
             capture_correlation: false,
             lock_correlation_jobs: false,
@@ -69,14 +79,24 @@ impl Config {
         if lock_correlation_jobs && (!lock_retry_jobs || !capture_correlation) {
             return None;
         }
+        let current = novu_rust_contracts::secret::from_env(
+            "NOVU_RESEND_WEBHOOK_SECRET",
+            "NOVU_RESEND_WEBHOOK_SECRET_FILE",
+        )
+        .ok()??;
+        let previous = novu_rust_contracts::secret::from_env(
+            "NOVU_RESEND_WEBHOOK_PREVIOUS_SECRET",
+            "NOVU_RESEND_WEBHOOK_PREVIOUS_SECRET_FILE",
+        )
+        .ok()?;
+        let mut secrets = vec![current.as_str()];
+        if let Some(previous) = &previous {
+            secrets.push(previous.as_str());
+        }
         Some(
-            Self::new(
+            Self::new_with_secrets(
                 std::env::var("NOVU_RESEND_WEBHOOK_ENVIRONMENT_ID").ok()?,
-                &novu_rust_contracts::secret::from_env(
-                    "NOVU_RESEND_WEBHOOK_SECRET",
-                    "NOVU_RESEND_WEBHOOK_SECRET_FILE",
-                )
-                .ok()??,
+                &secrets,
             )?
             .with_retry_job_lock(lock_retry_jobs)
             .with_correlation_capture(capture_correlation)
@@ -139,10 +159,14 @@ pub async fn receive(
     let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
         return StatusCode::UNAUTHORIZED;
     };
-    if seconds > now.as_secs().saturating_add(300)
-        || now.as_secs().saturating_sub(seconds) > 300
-        || !verify(&config.secret, id, timestamp, &raw, signatures)
-    {
+    if seconds > now.as_secs().saturating_add(300) || now.as_secs().saturating_sub(seconds) > 300 {
+        return StatusCode::UNAUTHORIZED;
+    }
+    let mut valid = false;
+    for secret in &config.secrets {
+        valid |= verify(secret, id, timestamp, &raw, signatures);
+    }
+    if !valid {
         return StatusCode::UNAUTHORIZED;
     }
     let Ok(value) = serde_json::from_slice::<Value>(&raw) else {
