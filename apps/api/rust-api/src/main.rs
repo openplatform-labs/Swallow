@@ -54,6 +54,7 @@ struct ApiState {
     max_inflight_per_connection: usize,
     ready_require_capacity: bool,
     timeout: Duration,
+    request_timeout: Option<Duration>,
     draining: Arc<AtomicBool>,
 }
 
@@ -117,10 +118,28 @@ async fn forward(State(shared): State<ApiState>, request: Request) -> Response {
     }
     let current = shared.select();
     match current {
-        Selection::Selected(current, _active) => match current.router.oneshot(request).await {
-            Ok(response) => response,
-            Err(never) => match never {},
-        },
+        Selection::Selected(current, _active) => {
+            let work = current.router.oneshot(request);
+            let response =
+                match shared.request_timeout {
+                    Some(timeout) => match tokio::time::timeout(timeout, work).await {
+                        Ok(response) => response,
+                        Err(_) => return (
+                            StatusCode::GATEWAY_TIMEOUT,
+                            [(header::CACHE_CONTROL, "no-store")],
+                            Json(
+                                serde_json::json!({"message":"Request timed out","statusCode":504}),
+                            ),
+                        )
+                            .into_response(),
+                    },
+                    None => work.await,
+                };
+            match response {
+                Ok(response) => response,
+                Err(never) => match never {},
+            }
+        }
         Selection::Busy => (
             StatusCode::SERVICE_UNAVAILABLE,
             [
@@ -320,6 +339,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let interval = duration_env("SWALLOW_API_DB_HEALTH_INTERVAL_SECONDS", 10)?;
     let timeout = duration_env("SWALLOW_API_DB_HEALTH_TIMEOUT_SECONDS", 30)?;
+    let request_timeout = match std::env::var("SWALLOW_API_REQUEST_TIMEOUT_SECONDS") {
+        Ok(value) => {
+            let seconds: u64 = value.parse().map_err(|_| "invalid API request timeout")?;
+            if !(1..=300).contains(&seconds) {
+                return Err("invalid API request timeout".into());
+            }
+            Some(Duration::from_secs(seconds))
+        }
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => return Err("invalid API request timeout".into()),
+    };
     let connections: usize = match std::env::var("SWALLOW_API_DB_CONNECTIONS") {
         Ok(value) => value
             .parse()
@@ -373,6 +403,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         max_inflight_per_connection,
         ready_require_capacity,
         timeout,
+        request_timeout,
         draining: Arc::new(AtomicBool::new(false)),
     };
     for slot in shared.connections.iter() {

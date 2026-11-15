@@ -35,6 +35,7 @@ fn start(url: &str, port: u16, strict: bool, connections: &str) -> Server {
             )
             .env("SWALLOW_API_DB_HEALTH_INTERVAL_SECONDS", "30")
             .env("SWALLOW_API_DB_HEALTH_TIMEOUT_SECONDS", "2")
+            .env_remove("SWALLOW_API_REQUEST_TIMEOUT_SECONDS")
             .env_remove("SWALLOW_API_STRICT_SECURITY_CONFIG")
             .env_remove("SWALLOW_API_REQUIRED_SECURITY")
             .env_remove("JWT_SECRET")
