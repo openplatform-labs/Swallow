@@ -14,3 +14,4 @@ cargo run --quiet --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.t
 cargo test --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --test alert_fanout explicit_plain_smtp_fanout_records_relay_acceptance -- --ignored
 TEST_SMTP_TRANSPORT_GUARD=true cargo test --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --test smtp_queue worker_sends_workflow_through_explicit_plain_smtp -- --ignored
 cargo test --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --test smtp_transport_fence -- --ignored
+cargo test --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --test smtp_transport_admin -- --ignored
