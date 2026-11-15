@@ -32,6 +32,9 @@ async fn connect(url: &str) -> Client {
     db
 }
 fn token(subject: &str, client: &str, expires: u64) -> String {
+    token_with_id(subject, client, expires, "one")
+}
+fn token_with_id(subject: &str, client: &str, expires: u64, id: &str) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -39,7 +42,7 @@ fn token(subject: &str, client: &str, expires: u64) -> String {
     let mut h = Header::new(Algorithm::RS256);
     h.typ = Some("at+jwt".into());
     h.kid = Some("key".into());
-    encode(&h,&json!({"iss":"https://issuer.test","sub":subject,"aud":"swallow","exp":expires,"iat":now-1,"jti":"one","client_id":client}),&EncodingKey::from_rsa_pem(PRIVATE).unwrap()).unwrap()
+    encode(&h,&json!({"iss":"https://issuer.test","sub":subject,"aud":"swallow","exp":expires,"iat":now-1,"jti":id,"client_id":client}),&EncodingKey::from_rsa_pem(PRIVATE).unwrap()).unwrap()
 }
 fn request(token: &str, query: &str) -> Request<Body> {
     Request::builder()
@@ -105,6 +108,93 @@ async fn verifies_token_mapping_scope_revocation_and_expiry() {
             .unwrap()
             .status(),
         StatusCode::OK
+    );
+    let revocation_config = json!({"issuer":"https://issuer.test","audience":"swallow","keys":[{"kid":"key","pem":std::str::from_utf8(PUBLIC).unwrap()}],"check_token_revocation":true});
+    let guarded = novu_rust_api::router(Arc::new(connect(&actor_url).await)).layer(Extension(
+        Arc::new(AccessTokenVerifier::from_json(&revocation_config.to_string()).unwrap()),
+    ));
+    assert_eq!(
+        guarded
+            .clone()
+            .oneshot(request(&good, "environmentId=jwt-a"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_token_revoked(bytea,bytea,bytea,bytea) TO {role}")).await.unwrap();
+    assert_eq!(
+        guarded
+            .clone()
+            .oneshot(request(&good, "environmentId=jwt-a"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert!(
+        connect(&actor_url)
+            .await
+            .query(
+                "SELECT * FROM public.novu_rust_operator_token_revocations",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    db.execute("INSERT INTO public.novu_rust_operator_token_revocations(issuer_hash,subject_hash,client_hash,token_id_hash,reason) VALUES (sha256(convert_to('https://issuer.test','UTF8')),sha256(convert_to('user-1','UTF8')),sha256(convert_to('console','UTF8')),sha256(convert_to('one','UTF8')),'fixture')", &[]).await.unwrap();
+    assert_eq!(
+        guarded
+            .clone()
+            .oneshot(request(&good, "environmentId=jwt-a"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let revoked_write = Request::builder()
+        .method("POST")
+        .uri("/v1/experimental/operator/subscriber-create?environmentId=jwt-a")
+        .header(header::AUTHORIZATION, format!("Bearer {good}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    assert_eq!(
+        guarded
+            .clone()
+            .oneshot(revoked_write)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let other = token_with_id("user-1", "console", now + 120, "another");
+    assert_eq!(
+        guarded
+            .clone()
+            .oneshot(request(&other, "environmentId=jwt-a"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    // The legacy verifier remains usable until operators opt in everywhere.
+    assert_eq!(
+        app.clone()
+            .oneshot(request(&good, "environmentId=jwt-a"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    db.batch_execute(&format!("REVOKE EXECUTE ON FUNCTION public.novu_rust_operator_token_revoked(bytea,bytea,bytea,bytea) FROM {role}")).await.unwrap();
+    assert_eq!(
+        guarded
+            .oneshot(request(&other, "environmentId=jwt-a"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
     );
     assert_eq!(
         bare.oneshot(request(&good, "environmentId=jwt-a"))

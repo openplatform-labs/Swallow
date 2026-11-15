@@ -106,6 +106,20 @@ fn verifies_pinned_access_tokens_and_rejects_confusion() {
 fn rejects_invalid_or_duplicate_configuration() {
     let config = json!({"issuer":"https://issuer.test","audience":"api","keys":[{"kid":"one","pem":std::str::from_utf8(PUBLIC).unwrap()}]});
     assert!(AccessTokenVerifier::from_json(&config.to_string()).is_ok());
+    assert!(
+        !AccessTokenVerifier::from_json(&config.to_string())
+            .unwrap()
+            .checks_token_revocation()
+    );
+    let mut revocation = config.clone();
+    revocation["check_token_revocation"] = json!(true);
+    assert!(
+        AccessTokenVerifier::from_json(&revocation.to_string())
+            .unwrap()
+            .checks_token_revocation()
+    );
+    revocation["check_token_revocation"] = json!("true");
+    assert!(AccessTokenVerifier::from_json(&revocation.to_string()).is_err());
     assert!(AccessTokenVerifier::from_json("{}").is_err());
     assert!(AccessTokenVerifier::from_json(&" ".repeat(16385)).is_err());
     assert!(AccessTokenVerifier::new("issuer", "aud", &[("weak", WEAK_PUBLIC)]).is_err());

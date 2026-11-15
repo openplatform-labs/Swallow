@@ -38,6 +38,8 @@ struct VerifierConfig {
     audience: String,
     keys: Vec<VerifierKey>,
     max_token_lifetime_seconds: Option<u64>,
+    #[serde(default)]
+    check_token_revocation: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -55,6 +57,7 @@ pub struct AccessTokenVerifier {
     validation: Validation,
     keys: HashMap<String, DecodingKey>,
     max_token_lifetime_seconds: Option<u64>,
+    check_token_revocation: bool,
 }
 
 impl AccessTokenVerifier {
@@ -77,6 +80,7 @@ impl AccessTokenVerifier {
         }
         let mut verifier = Self::new(&config.issuer, &config.audience, &keys)?;
         verifier.max_token_lifetime_seconds = config.max_token_lifetime_seconds;
+        verifier.check_token_revocation = config.check_token_revocation;
         Ok(verifier)
     }
     /// Key material is trusted configuration; each entry is a unique key ID and RSA public PEM.
@@ -120,7 +124,12 @@ impl AccessTokenVerifier {
             validation,
             keys: decoding_keys,
             max_token_lifetime_seconds: None,
+            check_token_revocation: false,
         })
+    }
+
+    pub fn checks_token_revocation(&self) -> bool {
+        self.check_token_revocation
     }
 
     pub fn verify(&self, token: &str) -> Option<VerifiedSubject> {

@@ -41,7 +41,8 @@ enum Lookup {
     SubscriberActivityAudit,
 }
 
-fn authenticate(
+async fn authenticate(
+    db: &Client,
     headers: &HeaderMap,
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
 ) -> Result<VerifiedSubject, StatusCode> {
@@ -56,9 +57,32 @@ fn authenticate(
     if values.next().is_some() {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    token
+    let identity = token
         .and_then(|t| verifier.verify(t))
-        .ok_or(StatusCode::UNAUTHORIZED)
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    if verifier.checks_token_revocation() {
+        let hash = |s: &str| ring::digest::digest(&ring::digest::SHA256, s.as_bytes());
+        let issuer = hash(&identity.issuer);
+        let subject = hash(&identity.subject);
+        let client = hash(&identity.client_id);
+        let id = hash(&identity.token_id);
+        let row = db
+            .query_one(
+                "SELECT public.novu_rust_operator_token_revoked($1,$2,$3,$4)",
+                &[
+                    &issuer.as_ref(),
+                    &subject.as_ref(),
+                    &client.as_ref(),
+                    &id.as_ref(),
+                ],
+            )
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        if row.get::<_, bool>(0) {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+    Ok(identity)
 }
 
 fn failure(status: StatusCode, path: &str) -> Response {
@@ -245,7 +269,7 @@ pub(super) async fn subscriber_grant_change(
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
     body: Bytes,
 ) -> Response {
-    let identity = match authenticate(&headers, verifier) {
+    let identity = match authenticate(&db, &headers, verifier).await {
         Ok(v) => v,
         Err(status) => return failure(status, uri.path()),
     };
@@ -316,7 +340,7 @@ pub(super) async fn subscriber_delete(
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
     body: Bytes,
 ) -> Response {
-    let identity = match authenticate(&headers, verifier) {
+    let identity = match authenticate(&db, &headers, verifier).await {
         Ok(v) => v,
         Err(status) => return failure(status, uri.path()),
     };
@@ -383,7 +407,7 @@ pub(super) async fn subscriber_create(
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
     body: Bytes,
 ) -> Response {
-    let identity = match authenticate(&headers, verifier) {
+    let identity = match authenticate(&db, &headers, verifier).await {
         Ok(v) => v,
         Err(status) => return failure(status, uri.path()),
     };
@@ -497,7 +521,7 @@ pub(super) async fn subscriber_profile_write(
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
     body: Bytes,
 ) -> Response {
-    let identity = match authenticate(&headers, verifier) {
+    let identity = match authenticate(&db, &headers, verifier).await {
         Ok(v) => v,
         Err(status) => return failure(status, uri.path()),
     };
@@ -606,7 +630,7 @@ pub(super) async fn workflow_grant_change(
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
     body: Bytes,
 ) -> Response {
-    let identity = match authenticate(&headers, verifier) {
+    let identity = match authenticate(&db, &headers, verifier).await {
         Ok(v) => v,
         Err(status) => return failure(status, uri.path()),
     };
@@ -693,7 +717,7 @@ pub(super) async fn workflow_write_v2(
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
     body: Bytes,
 ) -> Response {
-    let identity = match authenticate(&headers, verifier) {
+    let identity = match authenticate(&db, &headers, verifier).await {
         Ok(v) => v,
         Err(status) => return failure(status, uri.path()),
     };
@@ -743,7 +767,7 @@ pub(super) async fn workflow_write(
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
     body: Bytes,
 ) -> Response {
-    let identity = match authenticate(&headers, verifier) {
+    let identity = match authenticate(&db, &headers, verifier).await {
         Ok(v) => v,
         Err(status) => return failure(status, uri.path()),
     };
@@ -824,7 +848,7 @@ async fn query(
         );
         response
     };
-    let identity = match authenticate(&headers, verifier) {
+    let identity = match authenticate(&db, &headers, verifier).await {
         Ok(identity) => identity,
         Err(status) => return self::failure(status, uri.path()),
     };
@@ -1362,7 +1386,7 @@ pub(super) async fn resolve(
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
     body: Bytes,
 ) -> Response {
-    let identity = match authenticate(&headers, verifier) {
+    let identity = match authenticate(&db, &headers, verifier).await {
         Ok(identity) => identity,
         Err(status) => return failure(status, uri.path()),
     };
@@ -1415,7 +1439,7 @@ pub(super) async fn change_permissions(
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
     body: Bytes,
 ) -> Response {
-    let identity = match authenticate(&headers, verifier) {
+    let identity = match authenticate(&db, &headers, verifier).await {
         Ok(identity) => identity,
         Err(status) => return failure(status, uri.path()),
     };
