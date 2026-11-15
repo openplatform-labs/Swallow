@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Two real recovery workers, actual SMTP worker and an isolated mock relay."""
-import json,os,pathlib,socket,socketserver,subprocess,threading,time,uuid
+import json,os,pathlib,signal,socket,socketserver,subprocess,threading,time,uuid
 psql=os.environ['TEST_PSQL'];db=os.environ['DATABASE_URL'];work=os.environ['TEST_WORKER_DIR'];children=[];messages=[];lock=threading.Lock()
 def sql(query):
     p=subprocess.run([psql,db,'-q','-At','-v','ON_ERROR_STOP=1','-c',query],capture_output=True,text=True,timeout=10)
@@ -38,10 +38,12 @@ try:
     env='smtp-auto-fixture';other='smtp-auto-other';first=str(uuid.uuid4());second=str(uuid.uuid4());old=str(uuid.uuid4());reviewed=str(uuid.uuid4())
     sql("""CREATE ROLE smtp_auto_fixture LOGIN; GRANT USAGE ON SCHEMA public TO smtp_auto_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_smtp_auto_retry_batch(text,integer),public.novu_rust_smtp_auto_retry_batch_observed(text,integer),public.novu_rust_smtp_auto_worker_health_check(text,integer),public.novu_rust_smtp_auto_history(text,bigint),public.novu_rust_smtp_auto_retry_health(text,integer) TO smtp_auto_fixture;
+GRANT EXECUTE ON FUNCTION public.novu_rust_prune_smtp_auto_worker_health(text,integer,integer),public.novu_rust_smtp_auto_worker_retention_audit_page(text,bigint,integer) TO smtp_auto_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_reserve_alert_v3(text,text,text,integer,bigint,bigint,bigint,bigint),public.novu_rust_observe_alert_conditions_v3(text,text,text,bigint,bigint,bigint,bigint) TO smtp_auto_fixture;
 INSERT INTO public.novu_rust_environments VALUES('smtp-auto-fixture','org'),('smtp-auto-other','org');
 INSERT INTO public.novu_rust_smtp_auto_retry_workers SELECT 'smtp-auto-fixture',rolname,oid FROM pg_roles WHERE rolname='smtp_auto_fixture';
 INSERT INTO public.novu_rust_smtp_auto_admins SELECT 'smtp-auto-fixture',rolname,oid,false,false,true FROM pg_roles WHERE rolname='smtp_auto_fixture';
+INSERT INTO public.novu_rust_smtp_auto_worker_retention_operators SELECT 'smtp-auto-fixture',rolname,oid FROM pg_roles WHERE rolname='smtp_auto_fixture';
 INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'smtp-auto-fixture',rolname,'alert_view',oid FROM pg_roles WHERE rolname='smtp_auto_fixture';
 INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'smtp-auto-fixture',rolname,'alert_send',oid FROM pg_roles WHERE rolname='smtp_auto_fixture';
 INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES('smtp-auto-fixture','slack','blocked','rejected');
@@ -113,6 +115,27 @@ SELECT public.novu_rust_ack_smtp('smtp-auto-fixture','%s',a.revision,j.failure_r
     assert alert.returncode==2 and 'requires operator review' in alert.stderr,alert.stderr
     invalid={k:v for k,v in worker_alert_env.items() if k!='SWALLOW_ALERT_SMTP_AUTO_WORKER_MIN_HEALTHY'}
     assert subprocess.run([str(pathlib.Path(work)/'send-delivery-alert'),env,'300','120','60'],env=invalid,capture_output=True,timeout=15).returncode==1
+    os.kill(children[-2].pid,signal.SIGSTOP)
+    sql("UPDATE public.novu_rust_smtp_auto_worker_health SET observed_at=clock_timestamp()-interval '2 days' WHERE environment_id='smtp-auto-fixture'")
+    before=int(sql("SELECT count(*) FROM public.novu_rust_smtp_auto_worker_health WHERE environment_id='smtp-auto-fixture'"));assert before>=2
+    def prune(environment=env,age='86401',reason='fixture'):
+        return subprocess.run([str(pathlib.Path(work)/'delivery-reconcile'),'prune-smtp-auto-workers',environment,age,'1000',reason],env=runner,capture_output=True,text=True,timeout=10)
+    assert prune(age='86400').returncode==1 and prune(environment='smtp-auto-other').returncode==1 and prune(reason=' ').returncode==1
+    sql("CREATE FUNCTION public.fixture_auto_retention_fail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$; CREATE TRIGGER fixture_auto_retention_fail BEFORE INSERT ON public.novu_rust_smtp_auto_worker_retention_audit FOR EACH ROW EXECUTE FUNCTION public.fixture_auto_retention_fail()")
+    failed=prune();assert failed.returncode==1,(failed.returncode,failed.stdout,failed.stderr)
+    assert int(sql("SELECT count(*) FROM public.novu_rust_smtp_auto_worker_health WHERE environment_id='smtp-auto-fixture'"))==before
+    sql("DROP TRIGGER fixture_auto_retention_fail ON public.novu_rust_smtp_auto_worker_retention_audit; DROP FUNCTION public.fixture_auto_retention_fail()")
+    cleaned=prune();assert cleaned.returncode==0 and json.loads(cleaned.stdout)=={'deleted':before-1},cleaned.stderr
+    assert sql("SELECT count(*) FROM public.novu_rust_smtp_auto_worker_health WHERE environment_id='smtp-auto-fixture'")=='1'
+    os.kill(children[-2].pid,signal.SIGCONT)
+    deadline=time.monotonic()+10
+    while worker_health('1')[1]['healthy']!=1:
+        assert time.monotonic()<deadline,'live worker did not resume'
+        time.sleep(.1)
+    audit=subprocess.run([str(pathlib.Path(work)/'delivery-reconcile'),'smtp-auto-worker-retention-audit',env],env=runner,capture_output=True,text=True,timeout=10)
+    assert audit.returncode==0 and json.loads(audit.stdout)['data'][0]['deleted']==before-1 and json.loads(audit.stdout)['data'][0]['reason']=='fixture'
+    sql("DELETE FROM public.novu_rust_smtp_auto_worker_retention_operators WHERE environment_id='smtp-auto-fixture' AND database_principal='smtp_auto_fixture'")
+    assert prune().returncode==1
     sql("DELETE FROM public.novu_rust_smtp_auto_retry_workers WHERE environment_id='smtp-auto-fixture' AND database_principal='smtp_auto_fixture'")
     status,counts=worker_health();assert status==2 and counts['healthy']==0
     denied=subprocess.run([str(pathlib.Path(work)/'delivery-reconcile'),'check-smtp-auto-workers','smtp-auto-other','10','1'],env=runner,capture_output=True,timeout=10)
@@ -120,7 +143,8 @@ SELECT public.novu_rust_ack_smtp('smtp-auto-fixture','%s',a.revision,j.failure_r
     print('Explicit SMTP auto retry duplicated a lost reply, respected cutoff and retry limit with two workers.')
 finally:
     for p in children:
-        if p.poll() is None:p.terminate()
+        if p.poll() is None:
+            os.kill(p.pid,signal.SIGCONT);p.terminate()
     for p in children:
         try:p.wait(timeout=10)
         except subprocess.TimeoutExpired:p.kill();p.wait()
