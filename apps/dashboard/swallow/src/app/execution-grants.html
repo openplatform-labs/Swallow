@@ -1,0 +1,31 @@
+<section class="card decision-card"><div class="card-block"><div class="card-eyebrow">EXECUTION PERMISSIONS</div><h2>워크플로 실행 권한 관리</h2>
+<p>실행 권한은 워크플로의 모든 활성 채널에서 실제 발송을 허용할 수 있습니다. 조회·변경·이력에는 각각 별도 권한이 필요합니다.</p>
+<form class="decision-form" (ngSubmit)="read()">
+<label for="exec-grant-env">환경 ID</label><input id="exec-grant-env" name="executionGrantEnvironment" [(ngModel)]="environment" (ngModelChange)="credentialsChanged()" autocomplete="off">
+<label for="exec-grant-token">운영자 JWT</label><input id="exec-grant-token" name="executionGrantToken" type="password" [(ngModel)]="token" (ngModelChange)="credentialsChanged()" autocomplete="off" spellcheck="false">
+<label for="exec-grant-issuer">대상 발급자</label><input id="exec-grant-issuer" name="executionGrantIssuer" [(ngModel)]="targetIssuer" (ngModelChange)="targetChanged()" [disabled]="changeStatus()!=='idle'">
+<label for="exec-grant-subject">대상 주체</label><input id="exec-grant-subject" name="executionGrantSubject" [(ngModel)]="targetSubject" (ngModelChange)="targetChanged()" [disabled]="changeStatus()!=='idle'">
+<label for="exec-grant-client">대상 클라이언트 ID</label><input id="exec-grant-client" name="executionGrantClient" [(ngModel)]="targetClientId" (ngModelChange)="targetChanged()" [disabled]="changeStatus()!=='idle'">
+<label for="exec-grant-workflow">워크플로 식별자</label><input id="exec-grant-workflow" name="executionGrantWorkflow" [(ngModel)]="workflow" (ngModelChange)="targetChanged()" [disabled]="changeStatus()!=='idle'">
+<button type="submit" class="btn btn-outline" [disabled]="readStatus()==='loading'||changeStatus()!=='idle'">현재 권한 조회</button></form>
+@if(readStatus()==='loading'){<p role="status">조회 중입니다.</p>}
+@if(readStatus()==='error'){<p role="alert">조회하지 못했습니다. 입력값과 조회 권한을 확인하세요.</p>}
+@if(readStatus()==='loaded'){<p>대상: {{targetExists()?'존재':'없음'}} · 워크플로: {{workflowExists()?'존재':'없음'}}<br>현재 상태: {{current() | json}}</p>
+<label for="exec-grant-binding">변경할 권한</label><select id="exec-grant-binding" [(ngModel)]="binding"><option value="none">회수</option><option value="identifier">식별자 기준 허용</option><option value="generation">특정 내부 ID 기준 허용</option></select>
+@if(binding==='generation'){<label for="exec-grant-generation">워크플로 내부 ID</label><input id="exec-grant-generation" [(ngModel)]="generation" autocomplete="off">}
+<label for="exec-grant-reason">변경 사유</label><input id="exec-grant-reason" [(ngModel)]="reason" autocomplete="off"><button class="btn btn-outline" type="button" (click)="prepare()" [disabled]="!targetExists()">변경 검토</button>}
+@if(snapshot();as snap){<p>요청 ID: {{snap.body.requestId}}<br>대상: {{snap.body.targetIssuer}} / {{snap.body.targetSubject}} / {{snap.body.targetClientId}}<br>워크플로: {{snap.body.workflow}}<br>이전: {{snap.body.expected | json}}<br>변경: {{snap.body.desired | json}}<br>사유: {{snap.body.reason}}</p>}
+@if(changeStatus()==='prepared'){<label><input type="checkbox" [(ngModel)]="confirm"> 위 변경 내용을 확인했습니다.</label><button type="button" class="btn btn-primary" (click)="submit()" [disabled]="!confirm">변경 제출</button>}
+@if(changeStatus()==='sending'||changeStatus()==='preparing'){<p role="status">처리 중입니다.</p>}
+@if(changeStatus()==='unknown'){<p role="alert">결과 불명입니다. 요청 ID와 내용을 기록하세요. 동일한 토큰·환경·주소로 동일 요청을 재시도할 수 있습니다.</p><label><input type="checkbox" [(ngModel)]="retryConfirm"> 같은 요청을 다시 보냅니다.</label><button type="button" class="btn btn-outline" (click)="submit(true)" [disabled]="!retryConfirm">동일 요청 재시도</button><label><input type="checkbox" [(ngModel)]="resetConfirm"> 결과를 확인하지 못한 요청의 화면 기록을 지웁니다.</label>}
+@if(message()){<p role="status">{{message()}}</p>}
+@if(changeStatus()==='error'){<p role="alert">변경 내용을 준비하지 못했습니다. 입력과 권한 상태를 확인하세요.</p>}
+@if(changeStatus()!=='idle'){<button type="button" class="btn btn-outline" (click)="reset()" [disabled]="changeStatus()==='sending'||changeStatus()==='preparing'||(changeStatus()==='unknown'&&!resetConfirm)">새 변경 준비</button>}
+<h3>요청 결과 확인</h3><label for="exec-grant-request">요청 ID</label><input id="exec-grant-request" [(ngModel)]="lookupId" (ngModelChange)="clearLookup()" autocomplete="off"><button type="button" class="btn btn-outline" (click)="lookup()" [disabled]="lookupStatus()==='loading'">요청 조회</button>
+@if(lookupStatus()==='missing'){<p>기록이 없습니다. 처리 중이거나 이후 기록될 가능성은 남아 있습니다.</p>}
+@if(lookupStatus()==='error'){<p role="alert">요청을 조회하지 못했습니다. 요청 ID와 변경 권한을 확인하세요.</p>}
+@if(lookupRecord();as record){<pre>{{record | json}}</pre>}
+<h3>권한 변경 이력</h3><p class="subscriber-hint">UUID 순서이며 조회 중 추가된 기록은 빠질 수 있습니다. 다시 처음부터 조회하세요. 직접 DB 변경은 표시되지 않습니다.</p><button type="button" class="btn btn-outline" (click)="history()" [disabled]="historyStatus()==='loading'">이력 조회</button>
+@if(historyStatus()==='error'){<p role="alert">이력을 조회하지 못했습니다. 별도 이력 조회 권한을 확인하세요.</p>}
+@if(historyStatus()==='loaded'){@if(historyRows().length===0){<p>조회된 이력이 없습니다.</p>}@else{<div class="table-wrap"><table class="table"><thead><tr><th>기록 및 요청</th><th>변경자</th><th>대상 및 변경</th></tr></thead><tbody>@for(row of historyRows();track row['id']){<tr><td>{{row['recordedAt']}}<br>{{row['requestId']}}</td><td>{{row['actorIssuer']}}<br>{{row['actorSubject']}} · {{row['actorClientId']}}</td><td>{{row['targetIssuer']}} / {{row['targetSubject']}} / {{row['targetClientId']}}<br>{{row['workflow']}}<br>{{row['expected'] | json}} → {{row['desired'] | json}}<br>{{row['reason']}}</td></tr>}</tbody></table></div>}<p>{{historyPage()}} 페이지</p><button type="button" class="btn btn-sm btn-outline" (click)="history('previous')" [disabled]="historyPage()<=1">이전</button><button type="button" class="btn btn-sm btn-outline" (click)="history('next')" [disabled]="!historyNext()">다음</button>}
+</div></section>

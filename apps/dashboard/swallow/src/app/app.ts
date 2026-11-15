@@ -20,6 +20,7 @@ import { DiscordRetryPolicyGrants } from './discord-retry-policy-grants';
 import { ResendAutoHealth } from './resend-auto-health';
 import { SendgridResults } from './sendgrid-results';
 import { WorkflowTrigger } from './workflow-trigger';
+import { ExecutionGrants } from './execution-grants';
 import { ClrAlertModule } from '@clr/angular/emphasis/alert';
 import { OperatorOidc, type PreparedOidc, type VerifiedSession } from './operator-oidc';
 
@@ -65,7 +66,7 @@ type SendgridKey = {identifier:string;active:boolean};
 type SendgridKeyAudit = {id:string;identifier:string;action:string;userId:string;recordedAt:string};
 
 @Component({
-  imports: [FormsModule, ClrAlertModule, FcmIntegrations, SlackIntegrations, TwilioResults, FcmResults, DiscordReviews, SmtpReviews, SmtpScope, DiscordEndpoints, SlackResults, SendgridResults, WorkflowTrigger, ResendAutoPolicy, ResendCooldownPolicy, DiscordPolicy, DiscordRetryPolicy, DiscordCooldown, AlertTiming, AlertTimingGrants, DiscordRetryPolicyGrants, ResendAutoHealth],
+  imports: [FormsModule, ClrAlertModule, FcmIntegrations, SlackIntegrations, TwilioResults, FcmResults, DiscordReviews, SmtpReviews, SmtpScope, DiscordEndpoints, SlackResults, SendgridResults, WorkflowTrigger, ExecutionGrants, ResendAutoPolicy, ResendCooldownPolicy, DiscordPolicy, DiscordRetryPolicy, DiscordCooldown, AlertTiming, AlertTimingGrants, DiscordRetryPolicyGrants, ResendAutoHealth],
   selector: 'app-root',
   styleUrl: './app.css',
   templateUrl: './app.html',
@@ -86,6 +87,7 @@ export class App implements OnDestroy {
   readonly detail = signal('');
   readonly operatorKeyHealth = signal<'idle'|'checking'|'healthy'|'unhealthy'|'unavailable'>('idle');
   private operatorKeyHealthSequence = 0;
+  executionGrantBusy=false;
   resendPolicyBusy=false;
   resendCooldownPolicyBusy=false;
   discordPolicyBusy=false;
@@ -95,7 +97,7 @@ export class App implements OnDestroy {
   discordRetryPolicyBusy=false;
   discordRetryPolicyGrantsBusy=false;
   smtpScopeBusy = false;
-  get policyBusy():boolean { return this.alertTimingBusy || this.alertTimingGrantsBusy || this.smtpScopeBusy || this.resendPolicyBusy || this.resendCooldownPolicyBusy || this.discordPolicyBusy || this.discordRetryPolicyBusy || this.discordCooldownBusy || this.discordRetryPolicyGrantsBusy; }
+  get policyBusy():boolean { return this.executionGrantBusy || this.alertTimingBusy || this.alertTimingGrantsBusy || this.smtpScopeBusy || this.resendPolicyBusy || this.resendCooldownPolicyBusy || this.discordPolicyBusy || this.discordRetryPolicyBusy || this.discordCooldownBusy || this.discordRetryPolicyGrantsBusy; }
   fcmBusy=false;
   slackBusy=false;
   discordEndpointsBusy=false;
