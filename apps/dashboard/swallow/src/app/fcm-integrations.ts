@@ -1,7 +1,7 @@
 import { Component, EventEmitter, Input, OnDestroy, Output, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 type Audit = {id:string;internalId:string;identifier:string;action:string;oldActive:boolean|null;newActive:boolean;userId:string;recordedAt:string};
-type Integration = {internalId:string;identifier:string;active:boolean;createdAt:string};
+type Integration = {internalId:string;identifier:string;active:boolean;revision:string;createdAt:string};
 @Component({selector:'app-fcm-integrations',imports:[FormsModule],templateUrl:'./fcm-integrations.html'})
 export class FcmIntegrations implements OnDestroy {
   @Input() apiOrigin=''; @Output() busy=new EventEmitter<boolean>();
@@ -30,7 +30,7 @@ export class FcmIntegrations implements OnDestroy {
   private validIdentifier(value:string):boolean {return value!=='.'&&value!=='..'&&/^[A-Za-z0-9._-]{1,128}$/.test(value);}
   private parse(value:unknown):Integration {
     if(!value||typeof value!=='object')throw new Error('invalid response');const row=value as Record<string,unknown>;
-    if(typeof row['internalId']!=='string'||!row['internalId'] || row['internalId'].length>128||typeof row['identifier']!=='string'||!this.validIdentifier(row['identifier'])||typeof row['active']!=='boolean'||typeof row['createdAt']!=='string')throw new Error('invalid response');
+    if(typeof row['internalId']!=='string'||!row['internalId'] || row['internalId'].length>128||typeof row['identifier']!=='string'||!this.validIdentifier(row['identifier'])||typeof row['active']!=='boolean'||typeof row['revision']!=='string'||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(row['revision'])||typeof row['createdAt']!=='string')throw new Error('invalid response');
     return row as Integration;
   }
   select(row:Integration):void {if(this.writeStatus()==='sending')return;this.selected.set(row);this.identifier=row.identifier;this.active=row.active;this.confirmed=false;}
@@ -71,7 +71,7 @@ export class FcmIntegrations implements OnDestroy {
     this.writeStatus.set('sending');this.busy.emit(true);this.confirmed=false;const identifier=this.identifier;
     try {
       const path=mode==='create'?'':`/${encodeURIComponent(identifier)}`;
-      const response=await fetch(`${origin}/v1/experimental/fcm-integrations${path}`,{method:mode==='create'?'POST':'PATCH',headers:{Authorization:`ApiKey ${this.key.trim()}`,'Content-Type':'application/json'},body:JSON.stringify(mode==='create'?{identifier,active:this.active}:{active:this.active,expectedActive:expected!.active,expectedInternalId:expected!.internalId}),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
+      const response=await fetch(`${origin}/v1/experimental/fcm-integrations${path}`,{method:mode==='create'?'POST':'PATCH',headers:{Authorization:`ApiKey ${this.key.trim()}`,'Content-Type':'application/json'},body:JSON.stringify(mode==='create'?{identifier,active:this.active}:{active:this.active,expectedActive:expected!.active,expectedInternalId:expected!.internalId,expectedRevision:expected!.revision}),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
       if(response.status>=400&&response.status<500&&response.status!==408){this.writeStatus.set('rejected');this.message.set('요청이 거절되었습니다. 권한과 현재 상태를 확인하세요.');}
       else if(!response.ok)throw new Error('unknown');else{const result:unknown=await response.json();if(!result||typeof result!=='object')throw new Error('invalid response');const row=this.parse((result as Record<string,unknown>)['data']);if(row.identifier!==identifier||row.active!==this.active)throw new Error('invalid response');this.writeStatus.set('saved');this.message.set('변경 응답을 확인했습니다. 목록을 다시 조회하세요.');}
     }catch{this.writeStatus.set('unknown');this.message.set('변경 결과가 불명입니다. 재요청 전에 목록과 감사 기록을 확인하세요.');}

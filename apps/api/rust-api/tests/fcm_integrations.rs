@@ -53,6 +53,7 @@ async fn fcm_metadata_management_is_scoped_authorized_and_audited() {
         include_str!("../migrations/0018_fcm_integration_management.sql"),
         include_str!("../migrations/0019_lock_active_fcm_integration.sql"),
         include_str!("../migrations/0072_fcm_integration_audit_access.sql"),
+        include_str!("../migrations/0073_fcm_integration_revision.sql"),
     ] {
         db.batch_execute(sql).await.unwrap();
     }
@@ -350,6 +351,52 @@ async fn fcm_metadata_management_is_scoped_authorized_and_audited() {
     .await;
     assert_eq!(second["data"].as_array().unwrap().len(), 6);
     assert!(second["nextCursor"].is_null());
+    // A state changed away and back is still a conflict with the original revision.
+    let (_, before) = request(app.clone(), "GET", &target, "a-key", Value::Null).await;
+    let stale_revision = before["data"]["revision"].as_str().unwrap().to_owned();
+    assert_eq!(
+        request(
+            app.clone(),
+            "PATCH",
+            &target,
+            "a-key",
+            json!({"active":true})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(
+            app.clone(),
+            "PATCH",
+            &target,
+            "a-key",
+            json!({"active":false})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(request(app.clone(),"PATCH",&target,"a-key",json!({"active":true,"expectedActive":false,"expectedInternalId":id,"expectedRevision":stale_revision})).await.0,StatusCode::CONFLICT);
+    assert_eq!(
+        request(
+            app.clone(),
+            "PATCH",
+            &target,
+            "a-key",
+            json!({"active":true,"expectedRevision":stale_revision})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    let (_, current) = request(app.clone(), "GET", &target, "a-key", Value::Null).await;
+    let fresh = current["data"]["revision"].as_str().unwrap();
+    assert_ne!(fresh, stale_revision);
+    let (status,updated)=request(app.clone(),"PATCH",&target,"a-key",json!({"active":false,"expectedActive":false,"expectedInternalId":id,"expectedRevision":fresh})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(updated["data"]["revision"], fresh);
     setup.batch_execute("INSERT INTO novu_rust_fcm_integrations(environment_id,internal_id,identifier,active) SELECT 'a','legacy-'||lpad(x::text,3,'0'),'legacy-'||x,false FROM generate_series(1,101) x").await.unwrap();
     let (_, page) = request(app.clone(), "GET", path, "a-key", Value::Null).await;
     assert_eq!(page["data"].as_array().unwrap().len(), 100);

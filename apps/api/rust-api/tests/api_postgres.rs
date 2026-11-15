@@ -4584,6 +4584,7 @@ async fn fcm_credentials_contract(app: axum::Router, db: &mut tokio_postgres::Cl
     assert_eq!(status, StatusCode::OK);
     assert!(db.query_opt("SELECT 1 FROM novu_rust_fcm_devices WHERE environment_id='env-a' AND subscriber_id='fcm-concurrent'",&[]).await.unwrap().is_none());
     db.batch_execute(include_str!("../migrations/0018_fcm_integration_management.sql")).await.unwrap();
+    db.batch_execute(include_str!("../migrations/0073_fcm_integration_revision.sql")).await.unwrap();
     db.batch_execute(include_str!("../migrations/0019_lock_active_fcm_integration.sql")).await.unwrap();
     let key_hash = format!("{:x}", Sha256::digest(b"test-key"));
     db.execute("INSERT INTO novu_rust_fcm_integration_permissions VALUES ($1,'write')", &[&key_hash]).await.unwrap();
