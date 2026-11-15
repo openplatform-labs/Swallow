@@ -4,6 +4,8 @@ use crate::{
     twilio::{Config, Region, Twilio},
     twilio_queue,
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
+use ring::hmac;
 use serde_json::json;
 use std::{
     collections::HashMap,
@@ -48,7 +50,10 @@ fn worker(url: &str, name: &str, proxy: &str) -> Worker {
             .env("DATABASE_URL", format!("{url}&application_name={name}"))
             .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
             .env("NOVU_TWILIO_ENVIRONMENT_ID", "sms-ha")
-            .env("NOVU_TWILIO_ACCOUNT_SID", "ACfixture")
+            .env(
+                "NOVU_TWILIO_ACCOUNT_SID",
+                "AC11111111111111111111111111111111",
+            )
             .env("NOVU_TWILIO_AUTH_TOKEN", "fixture")
             .env("NOVU_TWILIO_FROM", "+15550000001")
             .env("NOVU_TWILIO_DB_TIMEOUT_SECONDS", "10")
@@ -118,7 +123,7 @@ async fn synchronous_failover_during_twilio_dispatch_preserves_unknown() {
         let dispatch = Uuid::parse_str(callback.rsplit('/').next().unwrap()).unwrap();
         seen_tx.send(dispatch).unwrap();
         release_rx.await.unwrap();
-        let body = r#"{"sid":"SMfixture","date_created":"Wed, 28 Oct 2026 10:00:00 +0000"}"#;
+        let body = r#"{"sid":"SM22222222222222222222222222222222","date_created":"Wed, 28 Oct 2026 10:00:00 +0000"}"#;
         socket
             .write_all(
                 format!(
@@ -132,7 +137,7 @@ async fn synchronous_failover_during_twilio_dispatch_preserves_unknown() {
     });
     let provider = Twilio::test_origin(
         Config {
-            account_sid: "ACfixture".into(),
+            account_sid: "AC11111111111111111111111111111111".into(),
             auth_token: "fixture".into(),
             api_key_sid: None,
             api_key_secret: None,
@@ -195,7 +200,7 @@ async fn synchronous_failover_during_twilio_dispatch_preserves_unknown() {
             .unwrap()
             .success()
     );
-    let promoted = connect(&standby_url).await;
+    let mut promoted = connect(&standby_url).await;
     release_tx.send(()).unwrap();
     server.await.unwrap();
     assert!(
@@ -247,4 +252,87 @@ async fn synchronous_failover_during_twilio_dispatch_preserves_unknown() {
         "workers must not repeat an uncertain SMS"
     );
     proxy_task.abort();
+
+    // The provider response was lost. A later signed callback still has to find
+    // the replicated dispatch, but it cannot establish which provider ID was accepted.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let api_address = listener.local_addr().unwrap();
+    drop(listener);
+    let base =
+        "https://events.example.test/webhooks/organizations/org/environments/sms-ha/sms/twilio";
+    let account = "AC11111111111111111111111111111111";
+    let message = "SM22222222222222222222222222222222";
+    let _api = Worker(
+        Command::new(std::env::var("TEST_TWILIO_WEBHOOK_API_BINARY").unwrap())
+            .env_clear()
+            .env("DATABASE_URL", &cluster_url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("LISTEN_ADDR", api_address.to_string())
+            .env("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED", "true")
+            .env("NOVU_TWILIO_WEBHOOK_ENVIRONMENT_ID", "sms-ha")
+            .env("NOVU_TWILIO_WEBHOOK_ACCOUNT_SID", account)
+            .env("NOVU_TWILIO_WEBHOOK_AUTH_TOKEN", "fixture")
+            .env("NOVU_TWILIO_WEBHOOK_URL", base)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let mut ready = false;
+    for _ in 0..100 {
+        if let Ok(response) = http
+            .get(format!("http://{api_address}/health/ready"))
+            .send()
+            .await
+        {
+            if response.status().is_success() {
+                ready = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ready, "webhook API did not become ready");
+    let suffix = format!("/jobs/{job}/attempts/{dispatch}");
+    let signed =
+        format!("{base}{suffix}AccountSid{account}MessageSid{message}MessageStatusdelivered");
+    let signature = STANDARD.encode(
+        hmac::sign(
+            &hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, b"fixture"),
+            signed.as_bytes(),
+        )
+        .as_ref(),
+    );
+    let endpoint = format!(
+        "http://{api_address}/webhooks/organizations/org/environments/sms-ha/sms/twilio{suffix}"
+    );
+    let body = format!("AccountSid={account}&MessageSid={message}&MessageStatus=delivered");
+    for (signature, expected) in [
+        ("invalid", 401),
+        (signature.as_str(), 204),
+        (signature.as_str(), 204),
+    ] {
+        let response = http
+            .post(&endpoint)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("x-twilio-signature", signature)
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), expected);
+    }
+    let row = promoted.query_one("SELECT count(*),min(job_id::text),min(dispatch_id::text) FROM public.novu_rust_twilio_delivery_events WHERE environment_id='sms-ha' AND message_sid=$1 AND status='delivered'", &[&message]).await.unwrap();
+    assert_eq!(row.get::<_, i64>(0), 1);
+    assert_eq!(row.get::<_, Option<String>>(1), Some(job.to_string()));
+    assert_eq!(row.get::<_, Option<String>>(2), Some(dispatch.to_string()));
+    assert!(
+        crate::twilio_projection::project(&mut promoted, "sms-ha", job)
+            .await
+            .unwrap()
+    );
+    let row = promoted.query_one("SELECT j.twilio_delivery_result,m.twilio_delivery_result FROM public.novu_queue_jobs j JOIN public.novu_rust_sms_messages m ON m.sms_job_id=j.id WHERE j.id=$1", &[&job]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "unknown");
+    assert_eq!(row.get::<_, String>(1), "unknown");
 }

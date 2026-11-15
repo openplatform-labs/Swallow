@@ -51,7 +51,9 @@ export TEST_FAILOVER_URL="postgresql://postgres@127.0.0.1:$standby_port,127.0.0.
 cargo test --locked --test postgres_probe_role -- --ignored
 if [[ "$scenario" == twilio ]]; then
   cargo build --locked --bin twilio-worker >/dev/null
+  cargo build --locked --manifest-path "$root/apps/api/rust-api/Cargo.toml" --bin novu-rust-api >/dev/null
   export TEST_TWILIO_WORKER_BINARY="$(cd "$CARGO_TARGET_DIR" && pwd)/debug/twilio-worker"
+  export TEST_TWILIO_WEBHOOK_API_BINARY="$(cd "$CARGO_TARGET_DIR" && pwd)/debug/novu-rust-api"
   cargo test --locked --lib twilio_failover_test::synchronous_failover_during_twilio_dispatch_preserves_unknown -- --ignored
 elif [[ "$scenario" == operator-token ]]; then
   cargo test --locked --manifest-path "$root/apps/api/rust-api/Cargo.toml" --test operator_token_failover -- --ignored
