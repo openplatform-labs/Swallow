@@ -1,5 +1,7 @@
 ## Slack 공유 대기 상태 조회와 경보
 
+- Slack 공유 대기 프로세스 시험: 임시 PostgreSQL 17에 실제 Slack 워커 두 개를 연결해 작업 10건을 보류하고 한 프로세스를 강제 종료한 뒤 나머지 워커가 추가 10건을 보류하는 것을 확인했다. 발송 시도 기록은 0건이었다. 단일 호스트·단일 DB·관리자 계정 시험으로 실제 Slack 429, 진행 중 요청, 호스트·DB 장애 전환, 네트워크 분할 및 제한 권한 배포는 검증하지 않았다. 재현은 [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
 - Slack 공유 대기 조회: worker 0173의 집계 상태를 API 0098의 별도 환경별 JWT 조회 권한과 DB `alert_view`로 보호해 Angular 운영 경보 화면에 연결했다. 정책 미설정과 권한 실패는 오류로 표시하며 기존 결과를 지운다. 격리 PostgreSQL 통합 테스트, Angular 195개 테스트 및 실제 브라우저의 조회·권한 철회 확인을 수행했다. 실제 IdP·운영 HA나 모든 작업자의 공유 대기 활성화 여부는 검증하지 않았다.
 
 워커 0173과 `delivery-reconcile check-slack-cooldown ENV GRACE_SECONDS`는 환경별 공유 대기 활성 여부, 대체 초, 보류 작업 및 예약 시각이 기준 시간 이상 지난 작업 수를 조회한다. `SWALLOW_ALERT_SLACK_COOLDOWN_GRACE_SECONDS`를 설정하면 기존 Slack·메일 운영 경보에 이 상태를 포함한다. 별도 `alert_view` 및 함수 EXECUTE가 필요하며 정책 누락이나 조회 실패도 검사 실패로 처리한다. 경보는 선택형이며 스케줄러와 대체 경보 경로는 운영자가 구성해야 한다.
