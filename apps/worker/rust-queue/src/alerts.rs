@@ -334,6 +334,7 @@ pub struct Alert {
     pub database_probe: Option<(String, bool)>,
     pub operator_key_probe: Option<(String, bool)>,
     pub resend_webhook_key_probe: Option<(String, bool)>,
+    pub twilio_webhook_key_probe: Option<(String, bool)>,
     pub alert_store_unavailable: bool,
 }
 impl Alert {
@@ -385,6 +386,7 @@ impl Alert {
             .is_some_and(|(_, unhealthy)| *unhealthy)
             || self.operator_key_probe.as_ref().is_some_and(|(_, unhealthy)| *unhealthy)
             || self.resend_webhook_key_probe.as_ref().is_some_and(|(_, unhealthy)| *unhealthy)
+            || self.twilio_webhook_key_probe.as_ref().is_some_and(|(_, unhealthy)| *unhealthy)
         {
             mask |= 1 << 20;
         }
@@ -533,7 +535,7 @@ impl Alert {
         {
             known |= 1 << 19;
         }
-        if self.database_probe.is_some() || self.operator_key_probe.is_some() || self.resend_webhook_key_probe.is_some() {
+        if self.database_probe.is_some() || self.operator_key_probe.is_some() || self.resend_webhook_key_probe.is_some() || self.twilio_webhook_key_probe.is_some() {
             known |= 1 << 20;
         }
         if self.alert_store_unavailable {
@@ -717,6 +719,10 @@ impl Alert {
         if let Some((name, unhealthy)) = &self.resend_webhook_key_probe {
             if name.is_empty() || name.len()>48 || !name.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c)) {return Err(AlertError::InvalidConfiguration);}
             details.push(format!("Resend webhook key {name} probe failed: {unhealthy}"));
+        }
+        if let Some((name, unhealthy)) = &self.twilio_webhook_key_probe {
+            if name.is_empty() || name.len()>48 || !name.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c)) {return Err(AlertError::InvalidConfiguration);}
+            details.push(format!("Twilio webhook key {name} probe failed: {unhealthy}"));
         }
         if self.alert_store_unavailable {
             details.push("alert state database unavailable".into());
@@ -1493,6 +1499,7 @@ mod tests {
             database_probe: None,
             operator_key_probe: None,
             resend_webhook_key_probe: None,
+            twilio_webhook_key_probe: None,
             alert_store_unavailable: false,
         }
     }
@@ -2219,6 +2226,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn twilio_webhook_key_probe_alert_uses_both_mock_transports() {
+        let mut a = alert();
+        a.resend_enabled = false;
+        a.twilio_webhook_key_probe = Some(("instance-1".into(), true));
+        let expected = "Twilio webhook key instance-1 probe failed: true";
+        let (url, slack_server) = mock_server("200 OK", "ok").await;
+        assert_eq!(SlackWebhook::with_endpoint(url).unwrap().send(&a).await, Ok(()));
+        assert!(slack_server.await.unwrap().contains(expected));
+        let (url, mail_server) = mock_server("200 OK", r#"{"id":"fixture"}"#).await;
+        let provider = Resend::test_endpoint(crate::resend::Config { api_key:"fixture-key".into(), from:"from@example.test".into(), sender_name:String::new() }, url.as_str()).unwrap();
+        assert_eq!(send_email(&provider, "ops@example.test", &a, "key-alert-fixture").await, Ok(()));
+        assert!(mail_server.await.unwrap().contains(expected));
+    }
+
+    #[tokio::test]
     async fn database_probe_alert_uses_both_mock_transports() {
         let mut a = alert();
         a.resend_enabled = false;
@@ -2582,6 +2604,7 @@ mod tests {
             database_probe: None,
             operator_key_probe: None,
             resend_webhook_key_probe: None,
+            twilio_webhook_key_probe: None,
             alert_store_unavailable: false,
         };
         assert!(alert.projector_stale);

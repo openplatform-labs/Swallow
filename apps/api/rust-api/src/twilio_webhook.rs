@@ -117,6 +117,12 @@ impl Config {
         }));
         Some(config)
     }
+    pub fn bundle_reload_enabled(&self) -> bool {
+        self.reload.is_some()
+    }
+    pub async fn bundle_healthy(&self) -> bool {
+        self.reload_bundle().await.is_some()
+    }
     async fn reload_bundle(&self) -> Option<Vec<Vec<u8>>> {
         let reload = self.reload.as_ref()?;
         let permit = reload.permits.clone().try_acquire_owned().ok()?;

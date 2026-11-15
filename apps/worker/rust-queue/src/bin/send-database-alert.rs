@@ -56,13 +56,14 @@ async fn run() -> Result<()> {
     }
     let operator_url=std::env::var_os("SWALLOW_OPERATOR_KEY_PROBE_URL");
     let resend_url=std::env::var_os("SWALLOW_RESEND_WEBHOOK_KEY_PROBE_URL");
-    if operator_url.is_some() && resend_url.is_some() {return Err("select exactly one probe".into());}
-    let is_resend_probe=resend_url.is_some();
-    let key_probe=if let Some(raw)=operator_url.or(resend_url) {
+    let twilio_url=std::env::var_os("SWALLOW_TWILIO_WEBHOOK_KEY_PROBE_URL");
+    if [operator_url.is_some(),resend_url.is_some(),twilio_url.is_some()].into_iter().filter(|v|*v).count()>1 {return Err("select exactly one probe".into());}
+    let is_resend_probe=resend_url.is_some();let is_twilio_probe=twilio_url.is_some();
+    let key_probe=if let Some(raw)=operator_url.or(resend_url).or(twilio_url) {
         if std::env::var_os("SWALLOW_DB_PROBE_URL").is_some() {return Err("select exactly one probe".into());}
         let raw=raw.into_string().map_err(|_|"invalid key probe URL")?;
         let url=reqwest::Url::parse(&raw).map_err(|_|"invalid key probe URL")?;
-        let expected=if is_resend_probe {"/health/resend-webhook-bundle"} else {"/health/operator-keys"};
+        let expected=if is_resend_probe {"/health/resend-webhook-bundle"} else if is_twilio_probe {"/health/twilio-webhook-bundle"} else {"/health/operator-keys"};
         if !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() || url.path()!=expected
            || !(url.scheme()=="https" || (url.scheme()=="http" && matches!(url.host_str(),Some("localhost" | "127.0.0.1" | "[::1]")))) {return Err("invalid key probe URL".into());}
         Some(url)
@@ -147,12 +148,13 @@ async fn run() -> Result<()> {
         failed_jobs: None,
         failed_jobs_check_failed: false,
         database_probe: key_probe.is_none().then(|| (args[1].clone(), false)),
-        operator_key_probe: (key_probe.is_some() && !is_resend_probe).then(|| (args[1].clone(), false)),
+        operator_key_probe: (key_probe.is_some() && !is_resend_probe && !is_twilio_probe).then(|| (args[1].clone(), false)),
         resend_webhook_key_probe: is_resend_probe.then(|| (args[1].clone(), false)),
+        twilio_webhook_key_probe: is_twilio_probe.then(|| (args[1].clone(), false)),
         alert_store_unavailable: false,
     };
     alert.text().map_err(|_| "invalid alert label")?;
-    let default_target = format!("{}-{}", if is_resend_probe { "resend-key" } else if key_probe.is_some() { "key" } else { "db" }, args[1]);
+    let default_target = format!("{}-{}", if is_resend_probe { "resend-key" } else if is_twilio_probe { "twilio-key" } else if key_probe.is_some() { "key" } else { "db" }, args[1]);
     let slack_id = std::env::var("SWALLOW_DB_ALERT_SLACK_TARGET_ID")
         .unwrap_or_else(|_| default_target.clone());
     let email_id = std::env::var("SWALLOW_DB_ALERT_EMAIL_TARGET_ID").unwrap_or(default_target);
@@ -190,6 +192,7 @@ async fn run() -> Result<()> {
     if let Some((_, unhealthy)) = alert.database_probe.as_mut() { *unhealthy = probe_unhealthy; }
     if let Some((_, unhealthy)) = alert.operator_key_probe.as_mut() { *unhealthy = probe_unhealthy; }
     if let Some((_, unhealthy)) = alert.resend_webhook_key_probe.as_mut() { *unhealthy = probe_unhealthy; }
+    if let Some((_, unhealthy)) = alert.twilio_webhook_key_probe.as_mut() { *unhealthy = probe_unhealthy; }
     let mut delivery_config = (monitor_config.clone(), monitor_tls.clone());
     let monitor = tokio::time::timeout(
         Duration::from_secs(seconds),

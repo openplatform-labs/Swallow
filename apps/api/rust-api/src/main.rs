@@ -496,6 +496,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if resend_bundle_health && (!health_endpoints || !runtime.resend_bundle_reload_enabled()) {
         return Err("Resend webhook bundle health requires health endpoints and bundle reload".into());
     }
+    let twilio_bundle_health=match std::env::var("SWALLOW_API_TWILIO_WEBHOOK_BUNDLE_HEALTH_ENABLED").as_deref() {
+        Ok("true")=>true,Ok("false")|Err(std::env::VarError::NotPresent)=>false,_=>return Err("invalid Twilio webhook bundle health setting".into()),
+    };
+    if twilio_bundle_health && (!health_endpoints || !runtime.twilio_bundle_reload_enabled()) {return Err("Twilio webhook bundle health requires health endpoints and bundle reload".into());}
     runtime.start_operator_key_reload();
     let cors = cors_from_env()?;
     let shared = ApiState {
@@ -602,6 +606,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             let runtime=runtime.clone();
             async move {
                 let healthy=runtime.resend_bundle_healthy().await;
+                (if healthy {StatusCode::OK}else{StatusCode::SERVICE_UNAVAILABLE},[(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"status":if healthy {"healthy"}else{"unhealthy"}})))
+            }
+        }));
+    }
+    if twilio_bundle_health {
+        let runtime=runtime.clone();
+        app=app.route("/health/twilio-webhook-bundle",axum::routing::get(move || {
+            let runtime=runtime.clone();async move {
+                let healthy=runtime.twilio_bundle_healthy().await;
                 (if healthy {StatusCode::OK}else{StatusCode::SERVICE_UNAVAILABLE},[(header::CACHE_CONTROL,"no-store")],Json(serde_json::json!({"status":if healthy {"healthy"}else{"unhealthy"}})))
             }
         }));

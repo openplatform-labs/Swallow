@@ -652,6 +652,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         database_probe: None,
         operator_key_probe: None,
         resend_webhook_key_probe: None,
+        twilio_webhook_key_probe: None,
         alert_store_unavailable: false,
     };
     alert.text().map_err(|_| "invalid alert environment")?;

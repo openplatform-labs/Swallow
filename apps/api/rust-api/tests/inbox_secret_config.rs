@@ -14,6 +14,7 @@ fn server() -> Command {
         .env_remove("INBOX_HMAC_KEYS_JSON")
         .env_remove("INBOX_HMAC_KEYS_JSON_FILE")
         .env_remove("SWALLOW_API_RESEND_WEBHOOK_BUNDLE_HEALTH_ENABLED")
+        .env_remove("SWALLOW_API_TWILIO_WEBHOOK_BUNDLE_HEALTH_ENABLED")
         .env_remove("SWALLOW_API_STRICT_SECURITY_CONFIG")
         .env_remove("SWALLOW_API_REQUIRED_SECURITY")
         .env_remove("JWT_SECRET")
@@ -61,6 +62,17 @@ fn strict_and_required_security_settings_control_startup() {
         assert!(!String::from_utf8_lossy(&output.stderr).contains("sensitive-test-token"));
     }
     check(&[("SWALLOW_API_STRICT_SECURITY_CONFIG", "true")], true);
+    check(
+        &[("SWALLOW_API_TWILIO_WEBHOOK_BUNDLE_HEALTH_ENABLED", "true")],
+        false,
+    );
+    check(
+        &[(
+            "SWALLOW_API_TWILIO_WEBHOOK_BUNDLE_HEALTH_ENABLED",
+            "invalid",
+        )],
+        false,
+    );
     check(
         &[("SWALLOW_API_RESEND_WEBHOOK_BUNDLE_HEALTH_ENABLED", "true")],
         false,
@@ -338,7 +350,7 @@ fn twilio_token_bundle_requires_valid_exclusive_configuration() {
         let mut command = server();
         command.env("SWALLOW_API_STRICT_SECURITY_CONFIG","true").env("NOVU_TWILIO_WEBHOOK_ENVIRONMENT_ID","env")
         .env("NOVU_TWILIO_WEBHOOK_ACCOUNT_SID","AC11111111111111111111111111111111").env("NOVU_TWILIO_WEBHOOK_URL","https://events.example.test/webhooks/organizations/org/environments/env/sms/twilio")
-        .env("NOVU_TWILIO_WEBHOOK_TOKEN_BUNDLE_FILE",&path).stderr(Stdio::piped());
+        .env("NOVU_TWILIO_WEBHOOK_TOKEN_BUNDLE_FILE",&path).env("SWALLOW_API_TWILIO_WEBHOOK_BUNDLE_HEALTH_ENABLED","true").stderr(Stdio::piped());
         if conflict {
             command.env("NOVU_TWILIO_WEBHOOK_AUTH_TOKEN", "test-secret");
         }
