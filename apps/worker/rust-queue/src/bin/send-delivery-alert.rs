@@ -160,6 +160,11 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let smtp_enabled = env_bool("SWALLOW_ALERT_SMTP_ENABLED", false)?;
     if smtp_enabled && on_new_condition && !conditions_v2 { return Err("SMTP health with new-condition policy requires v2 conditions".into()); }
     let discord_enabled = env_bool("SWALLOW_ALERT_DISCORD_ENABLED", false)?;
+    let discord_cooldown_overdue_only = match std::env::var("SWALLOW_ALERT_DISCORD_COOLDOWN_MODE").as_deref() {
+        Ok("all") | Err(std::env::VarError::NotPresent) => false,
+        Ok("overdue") => true,
+        _ => return Err("invalid Discord cooldown alert mode".into()),
+    };
     let discord_cooldown_grace = env_optional_i32("SWALLOW_ALERT_DISCORD_COOLDOWN_GRACE_SECONDS")?;
     if discord_cooldown_grace.is_some_and(|v| !(1..=86400).contains(&v)) { return Err("invalid Discord cooldown grace".into()); }
     if discord_cooldown_grace.is_some() && on_new_condition && !conditions_v2 { return Err("Discord cooldown health with new-condition policy requires v2 conditions".into()); }
@@ -622,7 +627,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         });
         Some(match values {Some(value)=>Ok(value),None=>{eprintln!("FCM cooldown check failed");Err(())}})
     } else {None};
-    let unhealthy = discord_cooldown_health.is_some_and(|v| !matches!(v,Ok((0,0,0)))) || smtp_health.is_some_and(|v| !matches!(v,Ok((0,0,0)))) || discord_retry_health.is_some_and(|v| !matches!(v,Ok((_,0)))) || discord_health.is_some_and(|v| !matches!(v,Ok((0,0,0,0)))) || fcm_credentials.is_some_and(|value| match value {
+    let unhealthy = discord_cooldown_health.is_some_and(|v| match v {Ok((active,deferred,overdue))=>overdue>0||(!discord_cooldown_overdue_only&&(active>0||deferred>0)),Err(())=>true}) || smtp_health.is_some_and(|v| !matches!(v,Ok((0,0,0)))) || discord_retry_health.is_some_and(|v| !matches!(v,Ok((_,0)))) || discord_health.is_some_and(|v| !matches!(v,Ok((0,0,0,0)))) || fcm_credentials.is_some_and(|value| match value {
         Ok((healthy, failed, _, minimum)) => healthy < minimum || failed > 0,
         Err(()) => true,
     }) || sendgrid_webhook_keys.is_some_and(|v| !matches!(v, Ok(1..=10)))
@@ -674,6 +679,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         discord_health,
         discord_retry_health,
         discord_cooldown_health,
+        discord_cooldown_overdue_only,
         email_policy_cancelled,
         sms_policy_cancelled,
         push_policy_cancelled,

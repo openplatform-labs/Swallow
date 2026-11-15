@@ -193,6 +193,41 @@ async fn cooldown_health_is_scoped_and_detects_overdue_work() {
         String::from_utf8_lossy(&alert.stderr)
     );
     assert!(String::from_utf8_lossy(&alert.stderr).contains("requires operator review"));
+    db.execute("UPDATE public.novu_queue_jobs SET available_at=clock_timestamp()+interval '1 hour' WHERE id=$1", &[&overdue]).await.unwrap();
+    let overdue_alert = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"))
+            .env_clear()
+            .env("DATABASE_URL", role_url.as_str())
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
+            .env("SWALLOW_ALERT_DISCORD_COOLDOWN_GRACE_SECONDS", "60")
+            .env("SWALLOW_ALERT_DISCORD_COOLDOWN_MODE", "overdue")
+            .env("SWALLOW_ALERT_SCOPED_DELIVERY", "true")
+            .env("SWALLOW_ALERT_COOLDOWN_POLICY", "new-condition")
+            .env("SWALLOW_ALERT_CONDITIONS_V2", "true")
+            .env(
+                "SWALLOW_ALERT_SLACK_WEBHOOK",
+                "https://hooks.slack.com/services/A/B/C",
+            )
+            .env("SWALLOW_ALERT_SLACK_TARGET_ID", "blocked")
+            .args([&env, "300", "120", "60"])
+            .output()
+            .unwrap()
+    };
+    let future = overdue_alert();
+    assert!(
+        future.status.success(),
+        "{}",
+        String::from_utf8_lossy(&future.stderr)
+    );
+    db.execute("UPDATE public.novu_queue_jobs SET available_at=clock_timestamp()-interval '2 minutes' WHERE id=$1", &[&overdue]).await.unwrap();
+    let past = overdue_alert();
+    assert_eq!(
+        past.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&past.stderr)
+    );
     db.execute(
         "UPDATE public.novu_queue_jobs SET status='completed' WHERE id=ANY($1::uuid[])",
         &[&vec![pending, overdue]],
