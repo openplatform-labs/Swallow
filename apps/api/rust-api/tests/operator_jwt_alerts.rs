@@ -2098,6 +2098,24 @@ async fn jwt_alert_read_is_scoped_paginated_and_fenced() {
     assert_eq!(slack["kind"], "workflow-delivery");
     assert_eq!(slack["failureCategory"], "endpoint-review");
     assert!(slack["attemptState"].is_null());
+    assert!(slack["attemptId"].is_null());
+    let attempt: Uuid = db.query_one("INSERT INTO public.novu_rust_slack_attempts(job_id,environment_id,state) VALUES ($1,'jwt-alert-a','unknown') RETURNING attempt_id", &[&slack_job]).await.unwrap().get(0);
+    let response = app
+        .clone()
+        .oneshot(slack_request(&token, &slack_path))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let with_attempt: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(with_attempt["attemptId"], attempt.to_string());
+    assert_eq!(with_attempt["attemptState"], "unknown");
+    db.execute(
+        "DELETE FROM public.novu_rust_slack_attempts WHERE job_id=$1",
+        &[&slack_job],
+    )
+    .await
+    .unwrap();
     assert!(
         !slack.to_string().contains("private-token")
             && !slack.to_string().contains("private-channel")

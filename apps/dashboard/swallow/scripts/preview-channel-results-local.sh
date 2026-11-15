@@ -38,7 +38,9 @@ INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) SELECT gen_ra
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_slack_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_slack_jobs(text,text,text,text,bigint,uuid) TO ui_channel_results_fixture;
 INSERT INTO public.novu_rust_operator_jwt_slack_result_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
 INSERT INTO public.novu_rust_operator_jwt_slack_jobs_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
-INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) SELECT gen_random_uuid(),'ui-fixture-env','experimental_slack_chat','{}' FROM generate_series(1,21);
+INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload) SELECT ('11111111-1111-4111-8111-'||lpad(n::text,12,'0'))::uuid,'ui-fixture-env','experimental_slack_chat','{}' FROM generate_series(1,21) n;
+UPDATE public.novu_queue_jobs SET status='failed' WHERE id='11111111-1111-4111-8111-000000000001';
+INSERT INTO public.novu_rust_slack_attempts(job_id,environment_id,state,attempt_id) VALUES ('11111111-1111-4111-8111-000000000001','ui-fixture-env','unknown','22222222-2222-4222-8222-222222222222');
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_sendgrid_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_sendgrid_jobs(text,text,text,text,bigint,uuid) TO ui_channel_results_fixture;
 INSERT INTO public.novu_rust_operator_jwt_sendgrid_result_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');
 INSERT INTO public.novu_rust_operator_jwt_sendgrid_jobs_grants VALUES ('https://issuer.test','ui-fixture','console','ui-fixture-env');

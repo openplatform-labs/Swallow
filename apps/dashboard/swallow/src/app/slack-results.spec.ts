@@ -11,6 +11,13 @@ describe('Slack operator results',()=>{
     const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:page.map(r=>({...r,unexpectedSecret:"fixture-sensitive"})),hasMore:true,next:last}))).mockResolvedValueOnce(new Response(JSON.stringify({data:[],hasMore:false,next:null}))).mockResolvedValueOnce(new Response(JSON.stringify({...row,unexpectedSecret:"fixture-sensitive"})));
     const fixture=TestBed.createComponent(SlackResults);const c=fixture.componentInstance;c.apiOrigin='https://api.example.test';c.environment='env';c.token='aaa.bbb.ccc';await c.list();expect(c.rows()).toEqual(page);await c.list(true);expect(mock.mock.calls[1][0]).toContain(`after=${last}`);c.select(row);await c.load();expect(c.result()).toEqual(row);expect(mock.mock.calls[2][1]).toMatchObject({headers:{Authorization:'Bearer aaa.bbb.ccc'},credentials:'omit',cache:'no-store',redirect:'error'});fixture.destroy();
   });
+  it('shows the current attempt ID and rejects inconsistent IDs',async()=>{
+    const attempt='22222222-2222-4222-8222-222222222222';
+    vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({...row,attemptId:attempt}))).mockResolvedValueOnce(new Response(JSON.stringify({...row,attemptId:null})));
+    const fixture=TestBed.createComponent(SlackResults);const c=fixture.componentInstance;c.apiOrigin='https://api.example.test';c.environment='env';c.token='aaa.bbb.ccc';c.jobId=id;
+    await c.load();fixture.detectChanges();expect(c.result()?.attemptId).toBe(attempt);expect(fixture.nativeElement.textContent).toContain(attempt);
+    await c.load();expect(c.resultStatus()).toBe('error');expect(c.result()).toBeNull();fixture.destroy();
+  });
   it('rejects unsupported response values and clears results on denial',async()=>{
     vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({...row,failureCategory:'raw private error'}))).mockResolvedValueOnce(new Response('',{status:403}));const fixture=TestBed.createComponent(SlackResults);const c=fixture.componentInstance;c.apiOrigin='https://api.example.test';c.environment='env';c.token='aaa.bbb.ccc';c.jobId=id;await c.load();expect(c.resultStatus()).toBe('error');expect(c.result()).toBeNull();await c.list();expect(c.listStatus()).toBe('error');expect(c.rows()).toEqual([]);
     fixture.destroy();

@@ -1,3 +1,9 @@
+## Slack 시도 ID 관리 화면 표시
+
+워커 0158을 적용한 뒤 API 0086은 기존 Slack 결과·목록 권한으로 현재 로컬 시도 UUID를 제공한다. Angular 상세 화면에서 ID를 확인하고 별도 권한의 `slack-resolve-v2` CLI에 사용할 수 있다. 구버전 API와 시도 없는 작업은 구별한다. ID는 공급자의 접수 증거가 아니고 조회 이후 변경될 수 있으며 화면에서 판정하지 않는다.
+
+제한 API 로그인·테스트 JWT·임시 PostgreSQL에서 시도 없는 경우와 ID 반환을 검증했다. Angular 테스트 165개와 빌드가 통과했고 실제 브라우저에서 해당 ID와 안내 문구를 확인했다. 실제 Slack·외부 IdP·운영 HA는 미검증이다. [API README](apps/api/rust-api/README.md)와 [화면 README](apps/dashboard/swallow/README.md)를 참고한다.
+
 ## Slack 발송 시도별 수동 판정
 
 워커 0158은 Slack 발송 시도에 UUID를 부여한다. 새 `list-slack-v2`로 현재 시도 ID를 확인하고 `slack-resolve-v2`에 이를 지정하면, 작업이 재시도되어 새 시도가 생긴 뒤 이전 판정이 잘못 적용되는 것을 막는다. 권한·작업·시도를 잠근 뒤 식별자와 상태를 확인하고 판정과 감사 기록을 함께 처리한다. 기존 명령은 호환성을 위해 남아 있어 강제 적용하려면 이전 함수 권한과 직접 테이블 쓰기를 회수해야 한다.
