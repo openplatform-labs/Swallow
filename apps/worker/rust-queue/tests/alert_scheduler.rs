@@ -170,3 +170,145 @@ async fn schedules_real_fanout_with_blocked_destination() {
     assert_eq!(state, "rejected");
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires fully migrated disposable PostgreSQL"]
+async fn two_schedulers_do_not_retry_an_unknown_slack_attempt() {
+    use std::{
+        net::TcpListener,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+    };
+    let url = std::env::var("TEST_DATABASE_URL").unwrap();
+    let (db, driver) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    let env = format!("sched-ha-{}", Uuid::new_v4().simple());
+    db.execute(
+        "INSERT INTO novu_rust_environments VALUES ($1,'org')",
+        &[&env],
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,rolname,'alert_send',oid FROM pg_roles WHERE rolname=session_user", &[&env]).await.unwrap();
+    let job = Uuid::new_v4();
+    novu_postgres_queue::enqueue(&db, job, &env, "fixture", &serde_json::json!({}))
+        .await
+        .unwrap();
+    db.execute("UPDATE novu_queue_jobs SET available_at=clock_timestamp()-interval '5 minutes' WHERE id=$1", &[&job]).await.unwrap();
+    let dir = std::env::temp_dir().join(format!("swallow-scheduler-ha-{}", Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let webhook = dir.join("webhook");
+    let config = dir.join("config.json");
+    std::fs::write(&webhook, "https://hooks.slack.com/services/A/B/C").unwrap();
+    std::fs::write(
+        &config,
+        serde_json::to_vec(
+            &serde_json::json!({"targets":[{"channel":"slack","id":"ops","webhook_file":webhook}]}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let proxy = format!("http://{}", listener.local_addr().unwrap());
+    let count = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(AtomicBool::new(false));
+    let proxy_thread = {
+        let count = count.clone();
+        let done = done.clone();
+        thread::spawn(move || {
+            while !done.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((socket, _)) => {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(1200));
+                        drop(socket);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(e) => panic!("proxy: {e}"),
+                }
+            }
+        })
+    };
+    let mut children = Vec::new();
+    let mut logs = Vec::new();
+    for i in 0..2 {
+        let log = dir.join(format!("out-{i}"));
+        let file = std::fs::File::create(&log).unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_alert-scheduler"))
+            .args(["1", "delivery", &env, "300", "120", "60"])
+            .arg(&config)
+            .env("DATABASE_URL", &url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
+            .env("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS", "60")
+            .env("SWALLOW_ALERT_OPERATION_TIMEOUT_SECONDS", "4")
+            .env("SWALLOW_ALERT_SCHEDULER_SHUTDOWN_GRACE_SECONDS", "10")
+            .env("SWALLOW_ALERT_SCHEDULER_FAILURE_MODE", "continue")
+            .env("HTTPS_PROXY", &proxy)
+            .env("https_proxy", &proxy)
+            .env("NO_PROXY", "")
+            .env("no_proxy", "")
+            .env_remove("SWALLOW_ALERT_CHECK_SCOPED_ACCESS")
+            .env_remove("SWALLOW_ALERT_SCOPED_DELIVERY")
+            .env_remove("SWALLOW_ALERT_COOLDOWN_POLICY")
+            .env_remove("SWALLOW_ALERT_BINDING_KEY")
+            .env_remove("SWALLOW_ALERT_BINDING_KEY_FILE")
+            .stdout(Stdio::from(file.try_clone().unwrap()))
+            .stderr(Stdio::from(file))
+            .spawn()
+            .unwrap();
+        children.push(child);
+        logs.push(log);
+    }
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let success = loop {
+        let state: Option<String>=db.query_opt("SELECT state FROM novu_rust_alert_delivery_slots WHERE environment_id=$1 AND channel='slack' AND target_id='ops'",&[&env]).await.unwrap().map(|r|r.get(0));
+        if state.as_deref() == Some("unknown")
+            && logs.iter().all(|p| {
+                std::fs::read_to_string(p)
+                    .unwrap_or_default()
+                    .matches("alert scheduler: attention required")
+                    .count()
+                    >= 2
+            })
+        {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    for child in &children {
+        Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap();
+    }
+    for child in &mut children {
+        assert!(child.wait().unwrap().success());
+    }
+    done.store(true, Ordering::SeqCst);
+    proxy_thread.join().unwrap();
+    assert!(
+        success,
+        "schedulers did not reach unknown state: {:?}",
+        logs.iter()
+            .map(|p| std::fs::read_to_string(p).unwrap_or_default())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    let rows=db.query("SELECT state FROM novu_rust_alert_delivery_attempts WHERE environment_id=$1 AND channel='slack' AND target_id='ops'",&[&env]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, String>(0), "unknown");
+    std::fs::remove_dir_all(dir).unwrap();
+}
