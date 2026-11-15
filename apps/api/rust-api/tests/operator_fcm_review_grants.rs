@@ -66,7 +66,7 @@ async fn fcm_review_grants_are_independent_conditional_and_audited() {
     let db = connect(&url).await;
     db.batch_execute("INSERT INTO public.novu_rust_environments VALUES ('grant-a','org'),('grant-b','org'); INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES ('https://issuer.test','admin','console','grant-a'),('https://issuer.test','target','console','grant-a'),('https://issuer.test','target','console','grant-b'); INSERT INTO public.novu_rust_operator_jwt_channel_access_grant_admins VALUES ('https://issuer.test','admin','console','grant-a',true,true)").await.unwrap();
     let role = format!("fcm_grant_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_fcm_review_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_fcm_review_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_fcm_review_grant_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_review_grant_audit_read(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_unreviewed(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_cooldown_health(text,text,text,text,bigint,integer) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_fcm_review_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_fcm_review_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_fcm_review_grant_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_review_grant_audit_read(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_unreviewed(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_fcm_cooldown_health(text,text,text,text,bigint,integer),public.novu_rust_operator_jwt_fcm_unrecorded_claims(text,text,text,text,bigint,integer,integer,boolean,uuid) TO {role}")).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname::text=$1", &[&role]).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'grant-a',$1,'alert_view',oid FROM pg_roles WHERE rolname::text=$1", &[&role]).await.unwrap();
     let api = connect(&url).await;
@@ -189,6 +189,55 @@ async fn fcm_review_grants_are_independent_conditional_and_audited() {
             StatusCode::OK
         );
     }
+    for permission in ["claim-health", "claim-list"] {
+        let request = json!({"requestId":Uuid::new_v4(),"targetIssuer":"https://issuer.test","targetSubject":"target","targetClientId":"console","resource":"fcm-partial","permission":permission,"expected":false,"desired":true,"reason":"claim access"});
+        let first = response(app.clone(), &token, "PUT", path, Some(request.clone())).await;
+        assert_eq!(first.0, StatusCode::OK);
+        assert_eq!(first.1["changed"], true);
+        let replay = response(app.clone(), &token, "PUT", path, Some(request)).await;
+        assert_eq!(replay.0, StatusCode::OK);
+        assert_eq!(replay.1["replayed"], true);
+    }
+    let claims_health = "/v1/experimental/operator/fcm-unrecorded-claims-health?environmentId=grant-a&minGap=2&graceSeconds=60";
+    let claims_list = "/v1/experimental/operator/fcm-unrecorded-claims?environmentId=grant-a&minGap=2&graceSeconds=60";
+    assert_eq!(
+        response(app.clone(), &jwt("target"), "GET", claims_health, None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        response(app.clone(), &jwt("target"), "GET", claims_list, None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let revoke_claim = json!({"requestId":Uuid::new_v4(),"targetIssuer":"https://issuer.test","targetSubject":"target","targetClientId":"console","resource":"fcm-partial","permission":"claim-health","expected":true,"desired":false,"reason":"claim revoke"});
+    assert_eq!(
+        response(app.clone(), &token, "PUT", path, Some(revoke_claim))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        response(app.clone(), &jwt("target"), "GET", claims_health, None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        response(app.clone(), &jwt("target"), "GET", claims_list, None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let self_grant = json!({"requestId":Uuid::new_v4(),"targetIssuer":"https://issuer.test","targetSubject":"admin","targetClientId":"console","resource":"fcm-partial","permission":"claim-health","expected":false,"desired":true,"reason":"self"});
+    assert_eq!(
+        response(app.clone(), &token, "PUT", path, Some(self_grant))
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
     db.execute("INSERT INTO public.novu_rust_fcm_cooldown_policies(environment_id,fallback_seconds) VALUES('grant-a',60)",&[]).await.unwrap();
     let cooldown =
         "/v1/experimental/operator/fcm-cooldown-health?environmentId=grant-a&graceSeconds=60";

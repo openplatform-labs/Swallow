@@ -24,3 +24,9 @@ TEST_DATABASE_URL="$DATABASE_URL" cargo test --locked --manifest-path "$API/Carg
 TEST_DATABASE_URL="$DATABASE_URL" cargo test --locked --manifest-path "$API/Cargo.toml" --test operator_resend_cooldown_policy -- --ignored
 
 TEST_DATABASE_URL="$DATABASE_URL" cargo test --locked --manifest-path "$API/Cargo.toml" --test operator_fcm_unrecorded_claims -- --ignored
+"$TEST_PG_BIN/createdb" -h 127.0.0.1 -p "$PORT" -U postgres fcm_grants
+export DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/fcm_grants"
+cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply api "$API/migrations" --through 17
+cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply worker "$WORKER/migrations"
+cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply api "$API/migrations"
+TEST_DATABASE_URL="$DATABASE_URL" cargo test --locked --manifest-path "$API/Cargo.toml" --test operator_fcm_review_grants -- --ignored
