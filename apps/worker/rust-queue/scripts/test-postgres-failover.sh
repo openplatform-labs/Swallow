@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$(cd ../../.. && pwd)
 scenario=${SWALLOW_FAILOVER_TEST_SCENARIO:-in-app}
-case "$scenario" in in-app|resend|fcm|twilio|operator-token) ;; *) echo 'invalid failover test scenario' >&2; exit 2;; esac
+case "$scenario" in in-app|resend|fcm|twilio|slack|operator-token) ;; *) echo 'invalid failover test scenario' >&2; exit 2;; esac
 suffix="$$-$RANDOM"
 network="swallow-ha-net-$suffix"
 primary="swallow-ha-primary-$suffix"
@@ -49,7 +49,11 @@ export TEST_PRIMARY_CONTAINER="$primary" TEST_STANDBY_CONTAINER="$standby"
 export TEST_PRIMARY_URL="postgresql://postgres@127.0.0.1:$primary_port/postgres" TEST_STANDBY_URL="postgresql://postgres@127.0.0.1:$standby_port/postgres"
 export TEST_FAILOVER_URL="postgresql://postgres@127.0.0.1:$standby_port,127.0.0.1:$primary_port/postgres?target_session_attrs=read-write&connect_timeout=2"
 cargo test --locked --test postgres_probe_role -- --ignored
-if [[ "$scenario" == twilio ]]; then
+if [[ "$scenario" == slack ]]; then
+  cargo build --locked --bin slack-workflow-worker >/dev/null
+  export TEST_SLACK_WORKER_BINARY="$(cd "$CARGO_TARGET_DIR" && pwd)/debug/slack-workflow-worker"
+  cargo test --locked --lib slack_failover_test::synchronous_failover_fences_uncertain_and_changed_slack_jobs -- --ignored
+elif [[ "$scenario" == twilio ]]; then
   cargo build --locked --bin twilio-worker >/dev/null
   cargo build --locked --manifest-path "$root/apps/api/rust-api/Cargo.toml" --bin novu-rust-api >/dev/null
   export TEST_TWILIO_WORKER_BINARY="$(cd "$CARGO_TARGET_DIR" && pwd)/debug/twilio-worker"
