@@ -29,6 +29,31 @@ impl RateLimitPolicy {
     }
 }
 
+/// Control only the remaining, never-attempted targets after an HTTP 503.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnavailablePolicy {
+    Continue,
+    DelayKnown,
+    DelayMinimum,
+}
+impl UnavailablePolicy {
+    pub fn from_env() -> Result<Self, &'static str> {
+        match std::env::var("SWALLOW_FCM_MULTICAST_503_POLICY").as_deref() {
+            Ok("continue") | Err(std::env::VarError::NotPresent) => Ok(Self::Continue),
+            Ok("delay-known") => Ok(Self::DelayKnown),
+            Ok("delay-minimum") => Ok(Self::DelayMinimum),
+            _ => Err("invalid FCM multicast 503 policy"),
+        }
+    }
+}
+fn unavailable_delay(policy: UnavailablePolicy, retry_after: Option<i32>) -> i32 {
+    match policy {
+        UnavailablePolicy::Continue => 0,
+        UnavailablePolicy::DelayKnown => retry_after.map(|seconds| seconds.max(10)).unwrap_or(0),
+        UnavailablePolicy::DelayMinimum => retry_after.unwrap_or(0).max(10),
+    }
+}
+
 fn continuation_delay(
     policy: RateLimitPolicy,
     retry_after: Option<i32>,
@@ -159,6 +184,7 @@ pub async fn process_one(
         crate::push_step_policy::PreferencePolicy::Snapshot,
         crate::push_step_policy::TargetPolicy::Reference,
         RateLimitPolicy::Continue,
+        UnavailablePolicy::Continue,
         false,
     )
     .await
@@ -180,6 +206,7 @@ pub async fn process_one_with_shared_provider(
         crate::push_step_policy::PreferencePolicy::Snapshot,
         crate::push_step_policy::TargetPolicy::Reference,
         RateLimitPolicy::Continue,
+        UnavailablePolicy::Continue,
         false,
     )
     .await
@@ -202,6 +229,7 @@ pub async fn process_one_with_integrations(
         crate::push_step_policy::PreferencePolicy::Snapshot,
         crate::push_step_policy::TargetPolicy::Reference,
         RateLimitPolicy::Continue,
+        UnavailablePolicy::Continue,
         false,
     )
     .await
@@ -225,6 +253,7 @@ pub async fn process_one_with_policy(
         crate::push_step_policy::PreferencePolicy::Snapshot,
         crate::push_step_policy::TargetPolicy::Reference,
         RateLimitPolicy::Continue,
+        UnavailablePolicy::Continue,
         false,
     )
     .await
@@ -249,6 +278,7 @@ pub async fn process_one_with_policies(
         preference,
         crate::push_step_policy::TargetPolicy::Reference,
         RateLimitPolicy::Continue,
+        UnavailablePolicy::Continue,
         false,
     )
     .await
@@ -275,6 +305,7 @@ pub async fn process_one_with_target_policy(
         preference,
         target,
         RateLimitPolicy::Continue,
+        UnavailablePolicy::Continue,
         false,
     )
     .await
@@ -302,6 +333,7 @@ pub async fn process_one_with_rate_limit_policy(
         preference,
         target,
         rate_limit,
+        UnavailablePolicy::Continue,
         false,
     )
     .await
@@ -320,19 +352,30 @@ pub async fn process_one_with_shared_cooldown(
     rate_limit: RateLimitPolicy,
     cooldown: bool,
 ) -> Result<bool, Error> {
+    process_one_with_unavailable_policy(
+        client, environment, provider, providers, shared, policy, preference, target,
+        rate_limit, UnavailablePolicy::Continue, cooldown,
+    ).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn process_one_with_unavailable_policy(
+    client: &mut Client,
+    environment: &str,
+    provider: Option<&Fcm>,
+    providers: Option<&HashMap<String, Fcm>>,
+    shared: bool,
+    policy: crate::push_step_policy::Policy,
+    preference: crate::push_step_policy::PreferencePolicy,
+    target: crate::push_step_policy::TargetPolicy,
+    rate_limit: RateLimitPolicy,
+    unavailable: UnavailablePolicy,
+    cooldown: bool,
+) -> Result<bool, Error> {
     process_one_inner(
-        client,
-        environment,
-        provider,
-        providers,
-        shared,
-        policy,
-        preference,
-        target,
-        rate_limit,
-        cooldown,
-    )
-    .await
+        client, environment, provider, providers, shared, policy, preference, target,
+        rate_limit, unavailable, cooldown,
+    ).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -346,6 +389,7 @@ async fn process_one_inner(
     preference_policy: crate::push_step_policy::PreferencePolicy,
     target_policy: crate::push_step_policy::TargetPolicy,
     rate_limit_policy: RateLimitPolicy,
+    unavailable_policy: UnavailablePolicy,
     shared_cooldown: bool,
 ) -> Result<bool, Error> {
     let Some(job) = claim(client, environment).await? else {
@@ -971,7 +1015,7 @@ async fn process_one_inner(
     let result = selected_provider.send_wire(&messages[index]).await;
     let invalid_token = matches!(result, Err(SendError::InvalidDeviceToken(code)) if (400..500).contains(&code) && ![408, 409].contains(&code));
     let retry_after = match &result {
-        Err(SendError::RateLimited(seconds)) => seconds.map(|v| v as i32),
+        Err(SendError::RateLimited(seconds) | SendError::Unavailable(seconds)) => seconds.map(|v| v as i32),
         _ => None,
     };
     let header_missing = matches!(&result, Err(SendError::RateLimitedMissing));
@@ -992,6 +1036,7 @@ async fn process_one_inner(
         Err(SendError::RateLimited(_) | SendError::RateLimitedMissing) => {
             ("rejected", Some(429), None)
         }
+        Err(SendError::Unavailable(_)) => ("unknown", Some(503), None),
         Err(SendError::Transport | SendError::InvalidResponse) => ("unknown", None, None),
         Err(_) => ("rejected", None, None),
     };
@@ -1049,7 +1094,7 @@ async fn process_one_inner(
             refresh_group(&tx, environment, job.id, history_index, group_size).await?;
         }
         if attempted.len() + 1 < messages.len() {
-            let delay = continuation_delay(rate_limit_policy, retry_after, header_missing);
+            let delay = if status == Some(503) { unavailable_delay(unavailable_policy, retry_after) } else { continuation_delay(rate_limit_policy, retry_after, header_missing) };
             tx.execute("UPDATE novu_queue_jobs SET status='pending',available_at=clock_timestamp()+make_interval(secs=>$3::integer::double precision),lease_token=NULL,lease_until=NULL WHERE id=$1 AND lease_token=$2",&[&job.id,&job.lease_token,&delay]).await?;
         } else {
             finish(&tx, &job).await?;
@@ -1457,7 +1502,7 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(150)).await;
                 }
                 let response = r#"{"name":"projects/demo/messages/123"}"#;
-                socket.write_all(format!("HTTP/1.1 {status} Test\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{response}",if status == 429 {rate_limit_headers} else {""},response.len()).as_bytes()).await.unwrap();
+                socket.write_all(format!("HTTP/1.1 {status} Test\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{response}",if status == 429 || status == 503 {rate_limit_headers} else {""},response.len()).as_bytes()).await.unwrap();
             }
             targets
         });
@@ -2211,6 +2256,30 @@ mod tests {
         db.execute("UPDATE public.novu_queue_jobs SET available_at=clock_timestamp()-interval '1 second' WHERE id=$1", &[&date_job]).await.unwrap();
         assert!(process_one(&mut other_db, "date-header", &provider).await.unwrap());
         assert_eq!(server.await.unwrap(), ["a", "b"]);
+
+        // A 503 stays unknown; its selected policy only delays unattempted targets.
+        for (env, headers, policy, expected, advice) in [
+            ("unavailable-date", "Date: Sun, 15 Nov 2026 00:00:00 GMT\r\nRetry-After: Sun, 15 Nov 2026 00:02:00 GMT\r\n", UnavailablePolicy::DelayKnown, 120, Some(120)),
+            ("unavailable-min", "", UnavailablePolicy::DelayMinimum, 10, None),
+            ("unavailable-invalid", "Retry-After: invalid\r\n", UnavailablePolicy::DelayKnown, 0, None),
+            ("unavailable-continue", "Retry-After: 120\r\n", UnavailablePolicy::Continue, 0, Some(120)),
+        ] {
+            let job = Uuid::new_v4();
+            crate::enqueue(&db, job, env, JOB_KIND, &delayed_payload).await.unwrap();
+            let (provider, server) = mock_with_headers(vec![503, 200], headers).await;
+            assert!(process_one_with_unavailable_policy(&mut db, env, Some(&provider), None, false, crate::push_step_policy::Policy::Snapshot, crate::push_step_policy::PreferencePolicy::Snapshot, crate::push_step_policy::TargetPolicy::Reference, RateLimitPolicy::Continue, policy, false).await.unwrap());
+            let row = db.query_one("SELECT j.available_at > clock_timestamp()+make_interval(secs=>$2::double precision),a.retry_after_seconds,a.state,a.http_status,j.available_at<=clock_timestamp() FROM public.novu_queue_jobs j JOIN public.novu_rust_fcm_attempts a ON a.job_id=j.id WHERE j.id=$1 AND a.target_index=0", &[&job, &(expected as f64 - 2.0)]).await.unwrap();
+            if expected > 0 { assert!(row.get::<_,bool>(0)); assert!(!process_one(&mut other_db, env, &provider).await.unwrap()); } else { assert!(row.get::<_,bool>(4)); }
+            assert_eq!(row.get::<_,Option<i32>>(1), advice);
+            assert_eq!(row.get::<_,String>(2), "unknown");
+            assert_eq!(row.get::<_,Option<i32>>(3), Some(503));
+            db.execute("UPDATE public.novu_queue_jobs SET available_at=clock_timestamp()-interval '1 second' WHERE id=$1", &[&job]).await.unwrap();
+            assert!(process_one(&mut other_db, env, &provider).await.unwrap());
+            assert_eq!(server.await.unwrap(), ["a", "b"]);
+            let row = db.query_one("SELECT status,(SELECT count(*) FROM public.novu_rust_fcm_attempts WHERE job_id=$1) FROM public.novu_queue_jobs WHERE id=$1", &[&job]).await.unwrap();
+            assert_eq!(row.get::<_,String>(0), "failed");
+            assert_eq!(row.get::<_,i64>(1), 2);
+        }
 
         // Shared cooldown fences another job before its first provider request.
         db.batch_execute("CREATE TABLE IF NOT EXISTS public.novu_rust_environments(id text PRIMARY KEY); INSERT INTO public.novu_rust_environments(id) VALUES('shared-fcm');").await.unwrap();

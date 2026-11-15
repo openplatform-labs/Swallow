@@ -240,6 +240,7 @@ pub enum SendError {
     Provider(u16),
     RateLimited(Option<u32>),
     RateLimitedMissing,
+    Unavailable(Option<u32>),
     InvalidDeviceToken(u16),
     InvalidResponse,
     OAuth(crate::google_oauth::AuthError),
@@ -252,6 +253,7 @@ impl std::fmt::Display for SendError {
             Self::Transport => f.write_str("FCM transport failed"),
             Self::Provider(code) => write!(f, "FCM returned HTTP {code}"),
             Self::RateLimited(_) | Self::RateLimitedMissing => f.write_str("FCM returned HTTP 429"),
+            Self::Unavailable(_) => f.write_str("FCM returned HTTP 503"),
             Self::InvalidDeviceToken(code) => {
                 write!(f, "FCM returned HTTP {code}: invalid device token")
             }
@@ -1014,7 +1016,7 @@ impl Fcm {
             .map_err(|_| SendError::Transport)?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let retry_after = (status == 429)
+            let retry_after = (status == 429 || status == 503)
                 .then(|| retry_after_seconds(response.headers(), SystemTime::now()))
                 .flatten();
             let retry_after_missing = status == 429
@@ -1036,6 +1038,8 @@ impl Fcm {
                             } else {
                                 SendError::RateLimited(retry_after)
                             }
+                        } else if status == 503 {
+                            SendError::Unavailable(retry_after)
                         } else {
                             SendError::Provider(status)
                         });
@@ -1048,6 +1052,8 @@ impl Fcm {
                         } else {
                             SendError::RateLimited(retry_after)
                         }
+                    } else if status == 503 {
+                        SendError::Unavailable(retry_after)
                     } else {
                         SendError::Provider(status)
                     });
@@ -1069,6 +1075,8 @@ impl Fcm {
                 } else {
                     SendError::RateLimited(retry_after)
                 }
+            } else if status == 503 {
+                SendError::Unavailable(retry_after)
             } else {
                 SendError::Provider(status)
             });

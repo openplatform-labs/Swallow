@@ -1,6 +1,8 @@
 ## Slack 공유 대기 상태 조회와 경보
 
-- FCM 날짜형 재시도 지시: 429의 `Retry-After` HTTP 날짜를 제공자 `Date` 또는 로컬 시계와 비교해 기존 대상별 저장·선택형 지연에 반영한다. 모의 FCM과 임시 PostgreSQL에서 120초 저장, 미발송 대상 지연과 거절된 대상의 중복 발송 방지를 확인했다. 실제 FCM 날짜 응답·503 지시·운영 HA는 미검증이며, 시계와 허용 범위의 제약은 [워커 README](apps/worker/rust-queue/README.md)에 정리했다.
+- FCM 503 대기 정책: `SWALLOW_FCM_MULTICAST_503_POLICY`로 즉시 계속, 유효한 지시가 있을 때 대기, 최소 10초 대기 중 선택한다. 결과 불명인 503 대상은 재발송하지 않고 남은 대상만 지연한다. 모의 FCM·임시 PostgreSQL에서 날짜·누락·잘못된 지시와 각 정책을 검증했고 실제 워커의 잘못된 설정 거절을 시험했다. 다른 작업 공유 대기, 지수 백오프·실제 FCM·운영 HA는 미구현 또는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
+- FCM 날짜형 재시도 지시: 429의 `Retry-After` HTTP 날짜를 제공자 `Date` 또는 로컬 시계와 비교해 기존 대상별 저장·선택형 지연에 반영한다. 모의 FCM과 임시 PostgreSQL에서 120초 저장, 미발송 대상 지연과 거절된 대상의 중복 발송 방지를 확인했다. 실제 FCM 날짜 응답·운영 HA는 미검증이며, 시계와 허용 범위의 제약은 [워커 README](apps/worker/rust-queue/README.md)에 정리했다.
 
 - 경보 대상 설정 파일 보호: `SWALLOW_ALERT_FANOUT_CONFIG_REGULAR_ONLY=true`를 선택하면 Unix에서 FIFO 등을 읽기 전에 거절해 경보 스케줄러가 설정 입력을 기다리며 멈추는 상황을 줄인다. 실제 fanout 프로세스에서 FIFO·디렉터리 거절, 일반 파일 심볼릭 링크 및 기존 FIFO 입력 동작을 확인했다. 느린 일반 파일 시스템과 실제 외부 경보 수신은 이 시험의 범위 밖이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 

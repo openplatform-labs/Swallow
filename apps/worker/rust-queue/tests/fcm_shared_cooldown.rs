@@ -86,3 +86,13 @@ async fn cooldown_is_scoped_monotonic_and_worker_fails_closed() {
             .contains("FCM shared cooldown configuration denied")
     );
 }
+
+#[test]
+fn worker_rejects_invalid_unavailable_policy_before_connecting() {
+    let output = Command::new(env!("CARGO_BIN_EXE_fcm-worker"))
+        .env_clear()
+        .env("SWALLOW_FCM_MULTICAST_503_POLICY", "invalid")
+        .output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid FCM multicast 503 policy"));
+}

@@ -170,6 +170,7 @@ async fn run(
     let preference_policy = novu_postgres_queue::push_step_policy::PreferencePolicy::from_env()?;
     let target_policy = novu_postgres_queue::push_step_policy::TargetPolicy::from_env()?;
     let rate_limit_policy = fcm_queue::RateLimitPolicy::from_env()?;
+    let unavailable_policy = fcm_queue::UnavailablePolicy::from_env()?;
     let shared_cooldown = match std::env::var("SWALLOW_FCM_SHARED_COOLDOWN").as_deref() {
         Ok("true") => true,
         Ok("false") | Err(std::env::VarError::NotPresent) => false,
@@ -624,7 +625,7 @@ async fn run(
                         continue;
                     }
                     let dispatch = async {
-                        fcm_queue::process_one_with_shared_cooldown(
+                        fcm_queue::process_one_with_unavailable_policy(
                             &mut db,
                             &environment,
                             provider.as_ref(),
@@ -634,6 +635,7 @@ async fn run(
                             preference_policy,
                             target_policy,
                             rate_limit_policy,
+                            unavailable_policy,
                             shared_cooldown,
                         )
                         .await
