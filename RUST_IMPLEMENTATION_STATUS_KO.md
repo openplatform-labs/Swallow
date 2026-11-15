@@ -1,3 +1,5 @@
+Resend 예약 취소 CLI(실험): 워커 0258과 제한 DB 로그인 명령은 발송된 예약의 요청을 먼저 결과 불명으로 기록하고 공급자 취소를 한 번 호출한다. 동일 요청 ID 재제출은 호출을 반복하지 않는다. 격리 PostgreSQL·제한 계정·모의 HTTP에서 정상·응답 유실·동시 예약·권한 격리를 시험했다. API·UI, 불명 수동 정리, 큐·메시지·경보 동기화와 실제 Resend·운영 HA는 미구현 또는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
 Resend 예약 취소 어댑터: 공급자 취소 HTTP 호출과 정상·거절·결과 불명 분류만 추가했다. API·UI·운영 권한·감사·상태 동기화·장애 복구는 아직 연결되지 않아 운영자가 Swallow에서 예약 취소할 수 없다. 로컬 모의 HTTP만 시험했으며 실제 Resend와 운영 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
 Resend 예약 발송 경로 추가 검증: Angular jsdom 폼에서 실제 HTTP API·워크플로 워커·시험 전용 로컬 엔드포인트를 갖춘 실제 Resend 워커를 거쳐 모의 공급자 본문의 예약 시각·수신자와 DB 접수 기록을 확인했다. 실제 브라우저·외부 Resend 예약·수신, 제한 DB 로그인·JWT 및 운영 HA는 미검증이다. [대시보드 README](apps/dashboard/swallow/README.md)를 참고한다.
