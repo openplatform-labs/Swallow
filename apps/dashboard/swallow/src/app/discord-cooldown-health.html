@@ -1,0 +1,8 @@
+<section class="card subscriber-card" aria-labelledby="discord-cooldown-health-heading"><div class="card-block">
+ <h2 id="discord-cooldown-health-heading">Discord 공유 대기 현황</h2>
+ <p>현재 제한 중인 대상과 워커가 연기한 대기 작업의 집계입니다. 지연은 예정 시각과 유예 시간을 넘긴 작업입니다. 집계에는 아직 워커가 확인하지 않은 작업이 포함되지 않을 수 있습니다.</p>
+ <form class="subscriber-form" (ngSubmit)="load()"><label for="discord-cooldown-health-grace">지연 유예 시간(초)</label><input id="discord-cooldown-health-grace" name="discordCooldownHealthGrace" type="number" min="1" max="86400" step="1" [(ngModel)]="graceSeconds" (ngModelChange)="clear()" required><button type="submit" class="btn btn-outline" [disabled]="status()==='loading'">공유 대기 조회</button></form>
+ @if(status()==='error'){<p role="alert">현황을 조회하지 못했습니다. 인증과 집계 권한을 확인하세요.</p>}
+ @else if(status()==='loading'){<p role="status">조회 중입니다.</p>}
+ @else if(health();as count){<p role="status">제한 중인 대상 {{count.activeDestinations}}개 · 연기 {{count.deferred}}건 · 지연 {{count.overdue}}건</p><p>조회 시점의 집계이며 발송 실패나 워커 중지의 증거는 아닙니다. 재시도 집계와 중복될 수 있습니다.</p>}
+</div></section>

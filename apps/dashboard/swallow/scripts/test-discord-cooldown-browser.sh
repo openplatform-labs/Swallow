@@ -38,12 +38,16 @@ db_sql -q -v ON_ERROR_STOP=1 <<'SQL'
 CREATE ROLE ui_fixture_api LOGIN;
 GRANT USAGE ON SCHEMA public TO ui_fixture_api;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_discord_cooldown_read(text,text,text,text,bigint,text),public.novu_rust_operator_jwt_discord_cooldown_change(text,text,text,text,bigint,text,uuid,bigint,boolean,text),public.novu_rust_operator_jwt_discord_cooldown_request(text,text,text,text,bigint,text,uuid),public.novu_rust_operator_jwt_discord_cooldown_audit_read(text,text,text,text,bigint,text,uuid) TO ui_fixture_api;
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_discord_cooldown_health(text,text,text,text,bigint,integer) TO ui_fixture_api;
 INSERT INTO public.novu_rust_environments VALUES('fixture-env','fixture-org'),('other-env','fixture-org');
 INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES('https://issuer.test','admin','console','fixture-env'),('https://issuer.test','target','console','fixture-env'),('https://issuer.test','admin','console','other-env');
 INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname='ui_fixture_api';
 INSERT INTO public.novu_rust_discord_destinations(environment_id,destination_id,endpoint_hash) VALUES('fixture-env','ops','fixture'),('fixture-env','other','fixture');
 INSERT INTO public.novu_rust_discord_cooldown_admins(environment_id,destination_id,database_principal,principal_oid,can_read,can_write,can_audit) SELECT 'fixture-env','ops',rolname,oid,true,true,true FROM pg_roles WHERE rolname='ui_fixture_api';
 INSERT INTO public.novu_rust_operator_jwt_discord_cooldown_grants VALUES('https://issuer.test','admin','console','fixture-env','ops',true,true,true),('https://issuer.test','target','console','fixture-env','ops',false,false,false);
+INSERT INTO public.novu_rust_operator_jwt_discord_cooldown_health_grants VALUES('https://issuer.test','admin','console','fixture-env',true);
+INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'fixture-env',rolname,'alert_view',oid FROM pg_roles WHERE rolname='ui_fixture_api';
+INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,last_error,available_at) VALUES('11111111-1111-4111-8111-000000000031','fixture-env','experimental_discord_webhook','{}','Discord shared cooldown active',clock_timestamp()-interval '10 minutes');
 SQL
 python3 - "$API/tests/fixtures/operator_jwt/test-only-public.pem" "$API/tests/fixtures/operator_jwt/test-only-private.pem" "$TEST_DIR" <<'PY'
 import base64,json,subprocess,sys,time
@@ -112,6 +116,9 @@ await fill('input[name="permissionKey"]',target);await page.click('app-discord-c
 await page.waitForFunction(()=>document.querySelector('app-discord-cooldown')?.innerText.includes('정책을 조회하지 못했습니다.'));
 await fill('input[name="permissionKey"]',admin);await fill('input[name="permissionEnvironment"]','other-env');await page.click('app-discord-cooldown button:has-text("정책 조회")');
 await page.waitForFunction(()=>document.querySelector('app-discord-cooldown')?.innerText.includes('정책을 조회하지 못했습니다.'));
+await page.click('nav.sidenav button >> nth=5');await page.selectOption('select[name="alertAuthMode"]','jwt');await fill('input[name="alertEnvironment"]','fixture-env');await fill('input[name="alertKey"]',admin);
+await page.click('app-discord-cooldown-health button:has-text("공유 대기 조회")');await page.waitForFunction(()=>document.querySelector('app-discord-cooldown-health')?.innerText.includes('제한 중인 대상 0개 · 연기 1건 · 지연 1건'));
+await fill('input[name="alertKey"]',target);await page.click('app-discord-cooldown-health button:has-text("공유 대기 조회")');await page.waitForFunction(()=>document.querySelector('app-discord-cooldown-health')?.innerText.includes('현황을 조회하지 못했습니다.'));
 await fs.writeFile(ROOT+'/request-id',req);console.log('Discord cooldown: real browser read, change, request, audit and access isolation passed');
 '''
 with open(root+'/browser.mjs','w') as f:f.write('const API='+json.dumps(api)+'; const UI='+json.dumps(ui)+'; const ROOT='+json.dumps(root)+'; const SPACE='+json.dumps(int(space) if space else None)+';\n'+script)

@@ -1,13 +1,14 @@
 import { Component, EventEmitter, Input, OnChanges, OnDestroy, Output, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { DiscordRetryDiagnostics } from './discord-retry-diagnostics';
+import { DiscordCooldownHealth } from './discord-cooldown-health';
 
 type DiscordRow = {jobId:string;kind:string;status:string;attemptState:string|null;attemptRevision:string|null;failureRevision:string;attempts:number;httpStatus:number|null;retryAfterSeconds:number|null;retryNotBefore:string|null};
 type HistoryOperator = {issuer:string;subject:string;clientId:string;requestId:string};
 type HistoryRow = {operator:HistoryOperator|null;actor:string;actorOid:string;requestId:string;jobId:string;attemptRevision:string|null;failureRevision:string;decision:'accepted'|'retry'|'retry_after';attemptState:string|null;httpStatus:number|null;retryAfterSeconds:number|null;retryNotBefore:string|null;reason:string;createdAt:string};
 type HistoryCursor = {actorOid:string;requestId:string};
 type Review = {requestId:string;jobId:string;attemptRevision:string|null;failureRevision:string;reason:string;decision?:'accepted'|'retry'|'retry_after'};
-@Component({selector:'app-discord-reviews',imports:[FormsModule,DiscordRetryDiagnostics],templateUrl:'./discord-reviews.html'})
+@Component({selector:'app-discord-reviews',imports:[FormsModule,DiscordRetryDiagnostics,DiscordCooldownHealth],templateUrl:'./discord-reviews.html'})
 export class DiscordReviews implements OnChanges,OnDestroy {
   @Input() apiOrigin=''; @Input() environment=''; @Input() token=''; @Output() busyChange=new EventEmitter<boolean>();
   readonly rows=signal<DiscordRow[]>([]); readonly next=signal<string|null>(null); readonly listStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');

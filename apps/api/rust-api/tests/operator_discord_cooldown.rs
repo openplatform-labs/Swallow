@@ -151,6 +151,47 @@ async fn jwt_cooldown_admin_enforces_both_grants_and_audits() {
     let (status, result) = response(app.clone(), &alice, "PUT", &path, Some(body.clone())).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(result["policy"], json!({"enabled":true,"revision":"1"}));
+    let health = format!(
+        "/v1/experimental/operator/discord-cooldown-health?environmentId={env}&graceSeconds=60"
+    );
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_discord_cooldown_health(text,text,text,text,bigint,integer) TO {role}")).await.unwrap();
+    assert_eq!(
+        response(app.clone(), &alice, "GET", &health, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    db.execute("INSERT INTO public.novu_rust_operator_jwt_discord_cooldown_health_grants VALUES('https://issuer.test','alice','console',$1,true)",&[&env]).await.unwrap();
+    assert_eq!(
+        response(app.clone(), &alice, "GET", &health, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    db.execute("INSERT INTO public.novu_rust_delivery_operator_grants SELECT $1,rolname,'alert_view',oid FROM pg_roles WHERE rolname::text=$2",&[&env,&role]).await.unwrap();
+    db.execute("UPDATE public.novu_rust_discord_shared_cooldown SET not_before=clock_timestamp()+interval '1 hour' WHERE environment_id=$1",&[&env]).await.unwrap();
+    db.execute("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,last_error,available_at) VALUES($1,$2,'experimental_discord_webhook','{}','Discord shared cooldown active',clock_timestamp()-interval '2 minutes')",&[&Uuid::new_v4(),&env]).await.unwrap();
+    assert_eq!(
+        response(app.clone(), &alice, "GET", &health, None).await.1,
+        json!({"activeDestinations":1,"deferred":1,"overdue":1})
+    );
+    assert_eq!(
+        response(app.clone(), &bob, "GET", &health, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        response(
+            app.clone(),
+            &alice,
+            "GET",
+            &health.replace("graceSeconds=60", "graceSeconds=00"),
+            None
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    db.execute("UPDATE public.novu_rust_operator_jwt_discord_cooldown_health_grants SET can_health=false WHERE environment_id=$1",&[&env]).await.unwrap();
+    assert_eq!(
+        response(app.clone(), &alice, "GET", &health, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
     assert_eq!(
         response(app.clone(), &alice, "PUT", &path, Some(body.clone()))
             .await
