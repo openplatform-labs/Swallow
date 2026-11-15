@@ -71,6 +71,11 @@ async fn run(
         Ok("retry") => true,
         _ => return Err("invalid Resend idempotency scope".into()),
     };
+    let replay_uncertain_once = match std::env::var("NOVU_RESEND_REPLAY_UNCERTAIN_ONCE").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid Resend immediate replay setting".into()),
+    };
     let auto_429 = match std::env::var("NOVU_RESEND_AUTO_RETRY_429").as_deref() {
         Ok("true") => true,
         Ok("false") | Err(std::env::VarError::NotPresent) => false,
@@ -144,6 +149,13 @@ async fn run(
                         continue;
                     }
                 }
+                if replay_uncertain_once && !matches!(tokio::time::timeout(timeout, db.query_one("SELECT has_column_privilege(current_user,'public.novu_rust_resend_attempts','same_request_replays','UPDATE') AND has_column_privilege(current_user,'public.novu_rust_resend_attempts','same_request_replays','SELECT') AND has_table_privilege(current_user,'public.novu_rust_delivery_reconciliations','SELECT')", &[])).await, Ok(Ok(ref row)) if row.get::<_,bool>(0)) {
+                    eprintln!("Resend immediate replay migration or privilege unavailable; reconnecting");
+                    task.abort();
+                    let _ = task.await;
+                    stop.wait(Duration::from_secs(2)).await;
+                    continue;
+                }
                 if shared_cooldown && !matches!(tokio::time::timeout(timeout, db.query_one("SELECT public.novu_rust_resend_cooldown_check($1)", &[&environment])).await, Ok(Ok(_))) {
                     task.abort(); let _ = task.await;
                     eprintln!("Resend shared cooldown check unavailable; reconnecting");
@@ -196,7 +208,7 @@ async fn run(
                     }
                     match tokio::time::timeout(
                         timeout,
-                        resend_queue::process_one_with_registered_policy_and_cooldown(
+                        resend_queue::process_one_with_immediate_replay(
                             &mut db,
                             &environment,
                             &provider,
@@ -206,6 +218,7 @@ async fn run(
                             correlation_guard,
                             retry_key,
                             shared_cooldown,
+                            replay_uncertain_once,
                         ),
                     )
                     .await

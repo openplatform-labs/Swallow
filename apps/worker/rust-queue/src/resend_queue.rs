@@ -152,6 +152,7 @@ pub async fn process_one_with_retry_key(
         false,
         false,
         false,
+        false,
     )
     .await
 }
@@ -179,6 +180,7 @@ pub async fn process_one_with_registered_policy(
         true,
         false,
         false,
+        false,
     )
     .await
 }
@@ -190,7 +192,17 @@ pub async fn process_one_with_registered_policy_and_cooldown(
     correlation_guard: bool, retry_key: bool, cooldown: bool,
 ) -> Result<bool, Error> {
     process_one_inner(client, environment, provider, retry_guard, policy, correlation_enabled,
-        correlation_guard, retry_key, true, cooldown, true).await
+        correlation_guard, retry_key, true, cooldown, true, false).await
+}
+
+/// Optional one-time replay of an uncertain first dispatch using identical request and key.
+pub async fn process_one_with_immediate_replay(
+    client: &mut Client, environment: &str, provider: &Resend, retry_guard: bool,
+    policy: crate::email_step_policy::Policy, correlation_enabled: bool,
+    correlation_guard: bool, retry_key: bool, cooldown: bool, replay_uncertain_once: bool,
+) -> Result<bool, Error> {
+    process_one_inner(client, environment, provider, retry_guard, policy, correlation_enabled,
+        correlation_guard, retry_key, true, cooldown, true, replay_uncertain_once).await
 }
 
 async fn process_one_inner(
@@ -205,6 +217,7 @@ async fn process_one_inner(
     registered: bool,
     cooldown: bool,
     enforce_cooldown_policy: bool,
+    replay_uncertain_once: bool,
 ) -> Result<bool, Error> {
     let Some(job) = claim(client, environment).await? else {
         return Ok(false);
@@ -378,10 +391,21 @@ async fn process_one_inner(
         Some(id) => format!("swallow/{}/retry/{id}", job.id),
         None => format!("swallow/{}", job.id),
     };
-    let (state, code, id, diagnostic, retry_after) = match provider
-        .send_prepared_with_correlation(prepared, Some(&key), correlation)
-        .await
-    {
+    let result = if replay_uncertain_once && retry_id.is_none() {
+        let mut result = provider.send_prepared_with_correlation(prepared.clone(), Some(&key), correlation).await;
+        if matches!(&result, Err(SendError::Transport | SendError::InvalidResponse) | Err(SendError::Provider(408 | 500..=599))) {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if recheck_immediate_replay(client, environment, &job, provider, policy, &prepared).await? {
+                // A rejection or ambiguous replay cannot disprove acceptance of the first request.
+                let replay = provider.send_prepared_with_correlation(prepared, Some(&key), correlation).await;
+                if replay.is_ok() { result = replay; }
+            }
+        }
+        result
+    } else {
+        provider.send_prepared_with_correlation(prepared, Some(&key), correlation).await
+    };
+    let (state, code, id, diagnostic, retry_after) = match result {
         Ok(id) => ("accepted", None, Some(id), None, None),
         Err(SendError::RateLimited(delay)) => (
             "rejected",
@@ -442,6 +466,32 @@ async fn process_one_inner(
     Ok(true)
 }
 
+// Re-render from the original job under current subscriber and step checks. A
+// failed recheck rolls back any preparation side effects and keeps the first
+// attempt unknown; it must not mark a possibly delivered message cancelled.
+async fn recheck_immediate_replay(
+    client: &mut Client, environment: &str, job: &ClaimedJob, provider: &Resend,
+    policy: crate::email_step_policy::Policy, original: &serde_json::Value,
+) -> Result<bool, Error> {
+    let Ok(mut email) = serde_json::from_value::<Email>(job.payload.clone()) else { return Ok(false); };
+    let tx=client.transaction().await?;
+    let subscriber=crate::sendgrid_queue::lock_workflow_subscriber(&tx,environment,&email).await?;
+    if !live(&tx,job).await? { tx.rollback().await?; return Ok(false); }
+    if !matches!(crate::email_step_policy::check(&tx,environment,job,&email,policy).await?,crate::email_step_policy::Check::Continue) { tx.rollback().await?; return Ok(false); }
+    // Do not replay a job that has ever undergone an operator/automatic retry.
+    let previous:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM public.novu_rust_delivery_reconciliations WHERE environment_id=$1 AND job_id=$2 AND decision='retry')",&[&environment,&job.id]).await?.get(0);
+    if previous {tx.rollback().await?;return Ok(false);}
+    tx.batch_execute("SAVEPOINT resend_replay_render").await?;
+    let valid=crate::sendgrid_queue::prepare_workflow_email(&tx,environment,job,&mut email,subscriber).await?;
+    let same=valid && provider.prepare(&email).is_ok_and(|body| body==*original);
+    tx.batch_execute("ROLLBACK TO SAVEPOINT resend_replay_render").await?;
+    if !same {tx.rollback().await?;return Ok(false);}
+    let updated=tx.execute("UPDATE public.novu_rust_resend_attempts a SET same_request_replays=1 WHERE a.job_id=$1 AND a.environment_id=$2 AND a.state='dispatching' AND a.same_request_replays=0 AND EXISTS(SELECT 1 FROM public.novu_queue_jobs j WHERE j.id=a.job_id AND j.environment_id=$2 AND j.status='running' AND j.lease_token=$3 AND j.lease_until>clock_timestamp()+interval '20 seconds')",&[&job.id,&environment,&job.lease_token]).await?;
+    if updated!=1 {tx.rollback().await?;return Ok(false);}
+    tx.commit().await?;
+    Ok(true)
+}
+
 pub async fn recover_expired(client: &mut Client, environment: &str) -> Result<usize, Error> {
     let tx = client.transaction().await?;
     let rows=tx.query("SELECT id FROM novu_queue_jobs WHERE environment_id=$1 AND kind=$2 AND status='running' AND lease_until<=clock_timestamp() ORDER BY lease_until,id FOR UPDATE SKIP LOCKED LIMIT 100", &[&environment,&JOB_KIND]).await?;
@@ -477,6 +527,41 @@ mod tests {
         net::TcpListener,
     };
     use tokio_postgres::NoTls;
+
+    #[tokio::test]
+    #[ignore = "requires fully migrated disposable PostgreSQL and loopback"]
+    async fn immediate_replay_keeps_body_and_key_and_preserves_uncertainty() {
+        use tokio::time::timeout;
+        let url=std::env::var("TEST_DATABASE_URL").unwrap();
+        let (mut db,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);
+        let env=format!("resend-replay-{}",Uuid::new_v4().simple());db.execute("INSERT INTO public.novu_rust_environments VALUES($1,'org')",&[&env]).await.unwrap();assert!(register_worker_policy(&db,&env,false,false).await.unwrap());
+        for scenario in ["success","lost-response","invalid-success","http-408","rejected-replay","conflict-replay","first-conflict","disabled","changed-address","disabled-preference","short-lease","rate-limit","prior-retry"] {
+            let job=if ["changed-address","disabled-preference"].contains(&scenario) {
+                db.execute("INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,email_subject,email_html,email_provider,inbox_metadata) VALUES($1,'fixture',true,true,'Hello','<p>Hello</p>','resend','{\"id\":\"64a000000000000000000051\"}') ON CONFLICT(environment_id,identifier) DO NOTHING",&[&env]).await.unwrap();
+                db.execute("INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES($1,'alice','64a000000000000000000054','{\"email\":\"alice@example.test\"}') ON CONFLICT(environment_id,subscriber_id) DO UPDATE SET profile=EXCLUDED.profile",&[&env]).await.unwrap();
+                let transaction=format!("replay-{scenario}");
+                enqueue(&db,Uuid::new_v4(),&env,crate::in_app::JOB_KIND,&json!({"workflow":"fixture","transactionId":transaction,"content":"","payload":{},"recipients":[{"subscriberId":"alice"}],"recipientIdentitySnapshot":{"alice":"64a000000000000000000054"},"severityOverride":null})).await.unwrap();assert!(crate::in_app::process_one(&mut db).await.unwrap());
+                db.query_one("SELECT email_job_id FROM public.novu_rust_email_step_outcomes WHERE environment_id=$1 AND transaction_id=$2",&[&env,&transaction]).await.unwrap().get::<_,Uuid>(0)
+            } else {let id=Uuid::new_v4();enqueue(&db,id,&env,JOB_KIND,&json!({"to":["to@example.test"],"subject":"fixture","html":"hello"})).await.unwrap();id};
+            if scenario=="prior-retry" {db.execute("INSERT INTO public.novu_rust_delivery_reconciliations(id,environment_id,job_id,decision,operator_name,reason) VALUES($1,$2,$3,'retry','fixture','fixture')",&[&Uuid::new_v4(),&env,&job]).await.unwrap();}
+            let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();let provider=Resend::test_endpoint(Config{api_key:"fixture".into(),from:"sender@example.test".into(),sender_name:String::new()},&format!("http://{}/emails",listener.local_addr().unwrap())).unwrap();let env2=env.clone();let scenario2=scenario.to_owned();
+            let (mutator,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);
+            let server=tokio::spawn(async move {
+                async fn read_request(socket:&mut tokio::net::TcpStream)->(String,Vec<u8>) {let mut data=Vec::new();let mut buf=[0u8;4096];loop {let n=socket.read(&mut buf).await.unwrap();assert!(n>0);data.extend_from_slice(&buf[..n]);if let Some(pos)=data.windows(4).position(|x|x==b"\r\n\r\n"){let headers=String::from_utf8(data[..pos].to_vec()).unwrap();let length:usize=headers.lines().find_map(|line|line.to_ascii_lowercase().strip_prefix("content-length: ").and_then(|v|v.parse().ok())).unwrap();if data.len()>=pos+4+length{return (headers,data[pos+4..pos+4+length].to_vec());}}}}
+                let (mut first,_)=listener.accept().await.unwrap();let (headers,body)=read_request(&mut first).await;
+                if scenario2=="changed-address" {mutator.execute("UPDATE public.novu_rust_subscribers SET profile='{\"email\":\"new@example.test\"}' WHERE environment_id=$1 AND subscriber_id='alice'",&[&env2]).await.unwrap();}
+                if scenario2=="disabled-preference" {mutator.execute("INSERT INTO public.novu_rust_subscriber_preferences(environment_id,subscriber_id,channels) VALUES($1,'alice','{\"email\":false}') ON CONFLICT(environment_id,subscriber_id) DO UPDATE SET channels=EXCLUDED.channels",&[&env2]).await.unwrap();}
+                if scenario2=="short-lease" {mutator.execute("UPDATE public.novu_queue_jobs SET lease_until=clock_timestamp()+interval '5 seconds' WHERE id=$1",&[&job]).await.unwrap();}
+                if scenario2=="lost-response" {drop(first);} else if scenario2=="invalid-success" {first.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();} else {let status=match scenario2.as_str(){"rate-limit"=>"429 Too Many Requests","first-conflict"=>"409 Conflict","http-408"=>"408 Request Timeout",_=>"500 Internal Server Error"};first.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();}
+                if ["success","lost-response","invalid-success","http-408","rejected-replay","conflict-replay"].contains(&scenario2.as_str()) {let (mut second,_)=timeout(Duration::from_secs(3),listener.accept()).await.unwrap().unwrap();let (headers2,body2)=read_request(&mut second).await;let key=|h:&str| h.lines().find(|line|line.to_ascii_lowercase().starts_with("idempotency-key:")).unwrap().to_owned();assert_eq!(key(&headers),key(&headers2));assert_eq!(body,body2);let response=match scenario2.as_str() {"rejected-replay"=>"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n","conflict-replay"=>"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",_=>"HTTP/1.1 200 OK\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"id\":\"accepted\"}"};second.write_all(response.as_bytes()).await.unwrap();} else {assert!(timeout(Duration::from_millis(400),listener.accept()).await.is_err());}
+            });
+            assert!(process_one_with_immediate_replay(&mut db,&env,&provider,false,crate::email_step_policy::Policy::Snapshot,true,false,false,false,scenario!="disabled").await.unwrap());
+            server.await.unwrap();let row=db.query_one("SELECT j.status,a.state,a.same_request_replays FROM public.novu_queue_jobs j JOIN public.novu_rust_resend_attempts a ON a.job_id=j.id WHERE j.id=$1",&[&job]).await.unwrap();
+            if ["success","lost-response","invalid-success","http-408"].contains(&scenario) {assert_eq!(row.get::<_,String>(0),"completed");assert_eq!(row.get::<_,String>(1),"accepted");} else if scenario=="rate-limit" {assert_eq!(row.get::<_,String>(1),"rejected");} else {assert_eq!(row.get::<_,String>(1),"unknown");}
+            assert_eq!(row.get::<_,i32>(2),if ["success","lost-response","invalid-success","http-408","rejected-replay","conflict-replay"].contains(&scenario){1}else{0});
+            if ["changed-address","disabled-preference"].contains(&scenario) {let row=db.query_one("SELECT status,delivery_state FROM public.novu_rust_email_messages WHERE environment_id=$1 AND email_job_id=$2",&[&env,&job]).await.unwrap();assert_eq!(row.get::<_,String>(1),"unknown");}
+        }
+    }
 
     #[tokio::test]
     #[ignore = "requires fully migrated disposable PostgreSQL and loopback"]
