@@ -42,7 +42,7 @@ async fn resend_evidence_for_cli(
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if ![2, 3, 4, 5, 6, 7, 8].contains(&args.len()) {
-        return Err("usage: delivery-reconcile check-fcm-credentials ENV MAX_AGE_SECONDS MIN_HEALTHY | check-channel-policy ENV email|sms|push|all | list-channel-policy ENV email|sms|push|all [AFTER_JOB] | ack-channel-policy ENV JOB REVISION OPERATOR REASON | push-policy-evidence ENV JOB REVISION | list-skipped-fcm ENV JOB [AFTER_TARGET] | list-cancelled-push-resolutions ENV JOB REVISION [AFTER_TARGET] | resolve-cancelled-push ENV JOB REVISION TARGET accepted|not_accepted OPERATOR REASON | check-failed-jobs ENV | list-failed-jobs ENV [AFTER_JOB] | ack-failed-job ENV JOB OPERATOR REASON | list-failed-jobs-v2 ENV [AFTER_JOB] | ack-failed-job-v2 ENV JOB REVISION OPERATOR REASON | list-slack ENV [AFTER_JOB] | slack-ack ENV JOB OPERATOR REASON | operator-scope ENV | operator-scope-set ENV DB_LOGIN GRANT_JSON REVOKE_JSON REASON | operator-scope-audit ENV [AFTER_ID] | operator-grants ENV [AFTER_LOGIN AFTER_PERMISSION] | operator-grant-audit ENV [AFTER_ID] | operator-grant|operator-revoke ENV DB_LOGIN PERMISSION REASON | check|check-slack ENV | slack-resolve ENV JOB retry|accepted OPERATOR REASON | list-slack-v2 ENV [AFTER_JOB] | slack-resolve-v2 ENV JOB ATTEMPT_ID retry|accepted OPERATOR REASON | check-alert-delivery ENV | alert-status ENV | alert-resolve ENV CHANNEL TARGET DECISION OPERATOR REASON | alert-resolve-v2 ENV CHANNEL TARGET ATTEMPT_ID DECISION OPERATOR REASON | check-queue ENV MAX_WAIT_SECONDS | check-resend|check-resend-metrics|check-twilio|check-twilio-metrics|check-sendgrid|check-sendgrid-metrics ENV GRACE_SECONDS HEARTBEAT_MAX_SECONDS | list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | email-dispatch-evidence|sendgrid-result ENV EMAIL_JOB | resend-evidence|resend-check|resend-result ENV EMAIL_JOB | sms-evidence|sms-delivery|twilio-result ENV SMS_JOB | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
+        return Err("usage: delivery-reconcile check-fcm-credentials ENV MAX_AGE_SECONDS MIN_HEALTHY | check-channel-policy ENV email|sms|push|all | list-channel-policy ENV email|sms|push|all [AFTER_JOB] | ack-channel-policy ENV JOB REVISION OPERATOR REASON | push-policy-evidence ENV JOB REVISION | list-skipped-fcm ENV JOB [AFTER_TARGET] | list-cancelled-push-resolutions ENV JOB REVISION [AFTER_TARGET] | resolve-cancelled-push ENV JOB REVISION TARGET accepted|not_accepted OPERATOR REASON | check-failed-jobs ENV | list-failed-jobs ENV [AFTER_JOB] | ack-failed-job ENV JOB OPERATOR REASON | list-failed-jobs-v2 ENV [AFTER_JOB] | ack-failed-job-v2 ENV JOB REVISION OPERATOR REASON | list-slack ENV [AFTER_JOB] | slack-ack ENV JOB OPERATOR REASON | operator-scope ENV | operator-scope-set ENV DB_LOGIN GRANT_JSON REVOKE_JSON REASON | operator-scope-audit ENV [AFTER_ID] | operator-grants ENV [AFTER_LOGIN AFTER_PERMISSION] | operator-grant-audit ENV [AFTER_ID] | operator-grant|operator-revoke ENV DB_LOGIN PERMISSION REASON | check|check-slack ENV | slack-resolve ENV JOB retry|accepted OPERATOR REASON | list-slack-v2 ENV [AFTER_JOB] | slack-resolve-v2 ENV JOB ATTEMPT_ID retry|accepted OPERATOR REASON | check-alert-delivery ENV | alert-status ENV | alert-resolve ENV CHANNEL TARGET DECISION OPERATOR REASON | alert-resolve-v2 ENV CHANNEL TARGET ATTEMPT_ID DECISION OPERATOR REASON | check-queue ENV MAX_WAIT_SECONDS | check-resend|check-resend-metrics|check-twilio|check-twilio-metrics|check-sendgrid|check-sendgrid-metrics ENV GRACE_SECONDS HEARTBEAT_MAX_SECONDS | list ENV [AFTER_JOB AFTER_TARGET|-] | evidence ENV EMAIL_JOB | email-dispatch-evidence|sendgrid-result ENV EMAIL_JOB | resend-evidence|resend-check|resend-result ENV EMAIL_JOB | sms-evidence|sms-delivery|twilio-result ENV SMS_JOB | resend-retry-after ENV JOB OPERATOR REASON | retry|accepted ENV JOB TARGET_INDEX|- OPERATOR REASON".into());
     }
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let (mut db, connection) = config.connect(tls).await?;
@@ -646,6 +646,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 )
                 .await?
             )?
+        );
+    } else if args.len() == 5 && args[0] == "resend-retry-after" {
+        let job = Uuid::parse_str(&args[2])?;
+        let row = db
+            .query_one(
+                "SELECT public.novu_rust_resolve_resend_after($1,$2,$3,$4)::text",
+                &[&args[1], &job, &args[3], &args[4]],
+            )
+            .await?;
+        println!(
+            "reconciliation recorded; available at {}",
+            row.get::<_, String>(0)
         );
     } else if args.len() == 6 && ["retry", "accepted"].contains(&args[0].as_str()) {
         let job = Uuid::parse_str(&args[2])?;

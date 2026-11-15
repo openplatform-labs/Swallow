@@ -1,3 +1,9 @@
+Resend 429의 대기 안내를 적용하려면 워커 0160 적용 후 `delivery-reconcile resend-retry-after ENV JOB OPERATOR REASON`을 선택한다. 환경별 기존 `retry` 권한과 별도의 `GRANT EXECUTE ON FUNCTION public.novu_rust_resolve_resend_after(text,uuid,text,text) TO 운영자_DB_역할`이 필요하다. 별도 scoped 설정 없이 이 함수 경로를 사용한다. 실패한 Resend 429에 유효한 대기 안내가 있을 때만 기존 증거 검사와 감사·큐 변경을 한 트랜잭션에서 수행하고, 작업을 DB 시계 기준 안내 시각 이후로 예약한다. 안내가 이미 지났으면 즉시 대기열에 넣는다. 기존 `retry ENV JOB - OPERATOR REASON`은 즉시 재시도로 계속 사용할 수 있다.
+
+감사 행의 `resend_retry_not_before`에는 원래 안내 시각이 기록된다. 시도·안내가 없거나 이미 변경된 작업, 해당 공급자 콜백 증거가 있는 경우는 거절한다. 동시 결정은 작업 잠금으로 직렬화하며 감사 기록 오류는 전체 변경을 롤백한다. DB 직접 수정과 기존 즉시 재시도 경로는 이 선택형 대기를 우회할 수 있다. DB 시계 변경, 데이터 손실·비동기 장애 전환, 대기 기간 중 공급자 상태 변경, 다른 작업·계정 전체의 요청률은 보호하지 않는다. 이 명령은 운영자의 명시적 판정이며 자동 판정·자동 재시도는 제공하지 않는다. 잘못된 판정과 공급자 수신 확인의 한계로 중복 발송이 가능하다.
+
+임시 로컬 PostgreSQL 17, 제한 DB 계정과 실제 CLI에서 권한·환경 격리, 누락된 안내와 콜백 거절, 감사 실패 롤백, 두 동시 결정 중 하나만 성공, 감사 시각 보존을 확인했다. 실제 큐 함수와 모의 Resend에서 기한 전 미처리 및 기한을 테스트에서 앞당긴 뒤 발송을 확인했다. 실제 Resend 429와 다중 호스트 HA는 미검증이다. 재현: `TEST_DATABASE_URL=... cargo test --features test-mocks --test resend_retry_after_schedule -- --ignored` (전체 서비스 마이그레이션을 적용한 폐기 가능한 DB와 역할 생성 권한 필요).
+
 Resend가 HTTP 429와 단일 `Retry-After` 초 값을 보내면 워커 0159는 0~86,400초 정수만 수집하고 해당 시도의 `retry_after_seconds` 및 DB 시계 기준 `retry_not_before`를 저장한다. 다른 형식·여러 헤더·범위 초과·누락은 값을 저장하지 않는다. 원문 헤더와 응답 본문은 저장하지 않는다. API 0089는 기존 운영자 결과 조회 권한으로 이 안내를 제공한다. 새 워커 적용 전 0159를 배포하고 제한된 워커 DB 계정에 두 새 열의 UPDATE 권한을 부여한다. 이전 워커와 이 변경 전 시도에는 값이 없다. 새 API를 적용하기 전에 워커 0159가 필요하다. [Resend의 속도 제한 안내](https://www.resend.com/changelog/api-rate-limit)는 `Retry-After`를 재요청 전 대기 초로 설명한다.
 
 이 값은 참고 정보이며 재시도를 자동 예약하거나 강제하지 않는다. 수동 재시도는 운영자가 시각과 전송 결과를 독립 확인하고 결정하며 동일 계정의 다른 워커·서비스 요청률도 별도로 관리해야 한다. 저장 시 DB 시계가 정확해야 하고 중간 프록시가 헤더를 바꿀 수 있다. 해당 시도를 재시도하면 기존 시도 행과 안내는 삭제된다. HTTP 날짜 형식, 범위 밖 대기 값 및 실제 Resend 429는 미검증·미지원이다. 모의 Resend 및 임시 PostgreSQL로 헤더 범위, DB 기록 및 재발송 없음, 제한 JWT API와 실제 브라우저의 표시를 확인했다. 운영 HA는 미검증이다.
