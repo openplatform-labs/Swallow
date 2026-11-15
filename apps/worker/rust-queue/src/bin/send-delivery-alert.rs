@@ -41,15 +41,22 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     };
     // These checks share condition bits in the legacy mask.
     let require_distinct = env_bool("SWALLOW_ALERT_REQUIRE_DISTINCT_SHARED_CHECKS", false)?;
+    let bind_shared = env_bool("SWALLOW_ALERT_BIND_SHARED_CHECKS", false)?;
+    if bind_shared && (!require_distinct || !on_new_condition) {
+        return Err("shared check binding requires distinct checks and new-condition policy".into());
+    }
+    let mut shared_check = "none";
     if require_distinct && on_new_condition {
         let enabled = [
-            env_bool("SWALLOW_ALERT_FAILED_JOBS_ENABLED", false)?,
-            env_optional_i32("SWALLOW_ALERT_RESEND_AUTO_GRACE_SECONDS")?.is_some(),
-            env_optional_i32("SWALLOW_ALERT_SLACK_COOLDOWN_GRACE_SECONDS")?.is_some(),
+            (env_bool("SWALLOW_ALERT_FAILED_JOBS_ENABLED", false)?, "failed-jobs"),
+            (env_optional_i32("SWALLOW_ALERT_RESEND_AUTO_GRACE_SECONDS")?.is_some(), "resend-auto"),
+            (env_optional_i32("SWALLOW_ALERT_SLACK_COOLDOWN_GRACE_SECONDS")?.is_some(), "slack-cooldown"),
         ];
-        if enabled.into_iter().filter(|value| *value).count() > 1 {
+        let selected: Vec<_> = enabled.into_iter().filter(|(value, _)| *value).collect();
+        if selected.len() > 1 {
             return Err("shared alert condition checks require separate invocations and target IDs".into());
         }
+        if let Some((_, name)) = selected.first() { shared_check = name; }
     }
     let grace: i32 = args[1].parse()?;
     let heartbeat: i32 = args[2].parse()?;
@@ -102,6 +109,19 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     )
     .await
     .map_err(|_| "alert database setup timed out")??;
+    if bind_shared {
+        for (channel, target, enabled) in [("slack", slack_id.as_str(), slack.is_some()), ("email", email_id.as_str(), email.is_some())] {
+            if enabled {
+                let result = tokio::time::timeout(operation_timeout, db.query_one(
+                    "SELECT public.novu_rust_bind_alert_shared_check($1,$2,$3,$4)",
+                    &[&args[0], &channel, &target, &shared_check],
+                )).await;
+                if !matches!(result, Ok(Ok(ref row)) if row.get::<_,bool>(0)) {
+                    return Err("shared alert check binding failed".into());
+                }
+            }
+        }
+    }
     if let Some(key) = &binding_key {
         if let Some(provider) = &slack
             && !matches!(
