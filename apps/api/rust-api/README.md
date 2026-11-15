@@ -557,6 +557,21 @@ INSERT INTO public.novu_rust_operator_jwt_channel_access_grant_scopes
 VALUES ('ISSUER','SUBJECT','CLIENT','ENVIRONMENT','sendgrid',true,true);
 ```
 
-The actor must already be provisioned and enabled. Existing broad admin rows retain their original permissions; a broad permission overrides narrower rows, so remove broad rows when restricting an actor. Each scoped administrator can manage both `result` and `jobs` for that provider if granted write; this does not itself grant the administrator access to the results. The request receipt path requires current write permission for the recorded provider. An absent request returns `found:false` only to an actor with some channel write permission. Audit viewing remains a separate environment-wide grant and is not filtered by provider. The trusted function owners need EXECUTE on `public.novu_rust_operator_jwt_channel_access_scope_check(text,text,text,text,bigint,boolean,text)` and SELECT plus row-lock privileges on the new scope table, in addition to the earlier permissions. No scope is automatically assigned. Protect the scope table, function owners, schema and trusted API login.
+The actor must already be provisioned and enabled. Existing broad admin rows retain their original permissions; a broad permission overrides narrower rows, so remove broad rows when restricting an actor. Each scoped administrator can manage both `result` and `jobs` for that provider if granted write; this does not itself grant the administrator access to the results. The request receipt path requires current write permission for the recorded provider. An absent request returns `found:false` only to an actor with some channel write permission. Audit viewing remains separate; API 0083 additionally allows provider-scoped audit access as described below. The trusted function owners need EXECUTE on `public.novu_rust_operator_jwt_channel_access_scope_check(text,text,text,text,bigint,boolean,text)` and SELECT plus row-lock privileges on the new scope table, in addition to the earlier permissions. No scope is automatically assigned. Protect the scope table, function owners, schema and trusted API login.
 
 PostgreSQL tests cover provider isolation, independent read/write, receipt authorization after scope changes, broad-admin compatibility and revocation while a read waits. A browser/API fixture verifies one scoped provider and denial for another. Production authorization deployment, external IdP, HA and complete Novu compatibility remain unverified.
+
+### Resource-scoped channel-access audit
+
+Apply API migration `0083`. A trusted DBA can grant independent audit access for one provider to an already enabled operator identity:
+
+```sql
+INSERT INTO public.novu_rust_operator_jwt_channel_access_grant_audit_scopes
+ (issuer,subject,client_id,environment_id,resource)
+VALUES ('ISSUER','SUBJECT','CLIENT','ENVIRONMENT','sendgrid');
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_channel_access_grant_audit_filtered(text,text,text,text,bigint,text,uuid) TO API_LOGIN;
+```
+
+`GET .../channel-access-grants/audit?environmentId=ENV&resource=sendgrid[&after=UUID]` checks either the existing full-environment viewer grant or the matching provider scope. The supported values are `resend`, `sendgrid`, `twilio`, `fcm`, and `slack`. Omitting `resource` retains the original full-environment authorization; a scoped viewer cannot use it. Existing full-environment viewers can use either path. Administration rights and audit rights are independent; no scope or function EXECUTE is automatically granted. The function owner needs EXECUTE on the operator self function, SELECT and row-lock privileges on both viewer tables, and SELECT on the audit table. Protect the owners, schema and trusted API login. Migration adds an `(environment_id,resource,id)` index; plan for index creation locks and additional write cost on existing databases.
+
+The filtered path retains UUID-order pagination, not chronological or snapshot order; direct DB edits, rejected requests and tampering remain outside its audit coverage. PostgreSQL integration tests verify provider and environment isolation, legacy global viewer access, invalid filters, direct table denial and scope revocation while a query is waiting. Angular tests verify filter handling and stale-response removal. The new filter has not been validated against a real external IdP, deployed HA environment or a real browser, and is a Swallow extension rather than a claim of Novu API compatibility.

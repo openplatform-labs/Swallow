@@ -66,7 +66,7 @@ async fn delegated_channel_access_is_scoped_audited_and_idempotent() {
     let db = connect(&url).await;
     db.batch_execute("INSERT INTO public.novu_rust_environments VALUES ('channel-a','org'),('channel-b','org'); INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES ('https://issuer.test','admin','console','channel-a'),('https://issuer.test','target','console','channel-a'),('https://issuer.test','target','console','channel-b')").await.unwrap();
     let role = format!("channel_api_{}", Uuid::new_v4().simple());
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_channel_access_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_channel_access_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_channel_access_grant_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_channel_access_grant_audit_read(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_channel_access_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_channel_access_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_channel_access_grant_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_channel_access_grant_audit_read(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_channel_access_grant_audit_filtered(text,text,text,text,bigint,text,uuid) TO {role}")).await.unwrap();
     for provider in ["sendgrid", "resend", "twilio", "fcm", "slack"] {
         db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_{provider}_result(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_{provider}_jobs(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
     }
@@ -323,6 +323,80 @@ async fn delegated_channel_access_is_scoped_audited_and_idempotent() {
     let mut blocked = false;
     for _ in 0..100 {
         if db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%novu_rust_operator_jwt_channel_access_grant_read%')",&[]).await.unwrap().get::<_,bool>(0){blocked=true;break;}
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(blocked);
+    tx.commit().await.unwrap();
+    assert_eq!(pending.await.unwrap(), StatusCode::UNAUTHORIZED);
+    // Scoped audit access never implies unrestricted or other-provider access.
+    db.batch_execute("INSERT INTO public.novu_rust_operator_jwt_channel_access_grant_audit_scopes VALUES ('https://issuer.test','scoped','console','channel-a','sendgrid')").await.unwrap();
+    let sendgrid_audit = format!("{audit}&resource=sendgrid");
+    let twilio_audit = format!("{audit}&resource=twilio");
+    assert_eq!(
+        response(app.clone(), &scoped, "GET", audit, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        response(app.clone(), &scoped, "GET", &twilio_audit, None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        response(
+            app.clone(),
+            &scoped,
+            "GET",
+            &sendgrid_audit.replace("environmentId=channel-a", "environmentId=channel-b"),
+            None
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        response(
+            app.clone(),
+            &scoped,
+            "GET",
+            &format!("{audit}&resource=unknown"),
+            None
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    let (status, page) = response(app.clone(), &scoped, "GET", &sendgrid_audit, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let records = page["data"].as_array().unwrap();
+    assert!(!records.is_empty());
+    assert!(
+        records
+            .iter()
+            .all(|record| record["resource"] == "sendgrid")
+    );
+    let (status, page) = response(app.clone(), &token, "GET", &twilio_audit, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        page["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|record| record["resource"] == "twilio")
+    );
+    assert!(db.query_one("SELECT has_table_privilege($1,'public.novu_rust_operator_jwt_channel_access_grant_audit','SELECT')", &[&role]).await.unwrap().get::<_, bool>(0) == false);
+    let mut revoker = connect(&url).await;
+    let tx = revoker.transaction().await.unwrap();
+    tx.execute("DELETE FROM public.novu_rust_operator_jwt_channel_access_grant_audit_scopes WHERE subject='scoped' AND resource='sendgrid'", &[]).await.unwrap();
+    let pending = tokio::spawn({
+        let app = app.clone();
+        let token = scoped.clone();
+        let path = sendgrid_audit.clone();
+        async move { response(app, &token, "GET", &path, None).await.0 }
+    });
+    let mut blocked = false;
+    for _ in 0..100 {
+        if db.query_one("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%novu_rust_operator_jwt_channel_access_grant_audit_filtered%')", &[]).await.unwrap().get::<_,bool>(0) { blocked=true; break; }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(blocked);

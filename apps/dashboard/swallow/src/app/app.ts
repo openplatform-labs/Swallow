@@ -308,6 +308,7 @@ export class App implements OnDestroy {
   private activityAuditSequence=0;
   private activityAuditAbort:AbortController|null=null;
   grantAuditScope:'workflow'|'subscriber'|'channel'='workflow';
+  grantAuditResource='';
   readonly grantAuditStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');
   readonly grantAuditRows=signal<GrantAudit[]>([]);
   readonly grantAuditNext=signal<string|null>(null);
@@ -537,6 +538,7 @@ export class App implements OnDestroy {
     try {
       const key=this.permissionKey.trim(),environment=this.permissionEnvironment.trim(),scope=this.grantAuditScope;if(!this.validJwt(key)||!this.validEnvironment(environment))throw new Error('invalid input');
       const params=new URLSearchParams({environmentId:environment});if(cursor)params.set('after',cursor);
+      const resource=scope==='channel'?this.grantAuditResource:'';if(resource&&!['sendgrid','resend','twilio','fcm','slack'].includes(resource))throw new Error('invalid resource');if(resource)params.set('resource',resource);
       const response=await fetch(`${this.validatedOrigin()}/v1/experimental/operator/${scope==='subscriber'?'subscriber-grants':scope==='channel'?'channel-access-grants':'workflow-grants'}/audit?${params}`,{headers:{Authorization:`Bearer ${key}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
       if(!response.ok)throw new Error('request failed');const value:unknown=await response.json();
       if(typeof value!=='object'||value===null)throw new Error('invalid response');const result=value as Record<string,unknown>;
@@ -544,7 +546,7 @@ export class App implements OnDestroy {
       const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
       const rows:GrantAudit[]=result['data'].map((entry:unknown)=>{
         if(typeof entry!=='object'||entry===null)throw new Error('invalid row');const r=entry as Record<string,unknown>;
-        if(['id','actorIssuer','actorSubject','actorClientId','databasePrincipal','requestId','targetIssuer','targetSubject','targetClientId','resource','permission','reason','recordedAt'].some(k=>typeof r[k]!=='string')||!uuid.test(r['id'] as string)||!uuid.test(r['requestId'] as string)||typeof r['previous']!=='boolean'||typeof r['current']!=='boolean'||!(scope==='subscriber'?/^subscriber:(read|write|create|delete)$/.test(`${r['resource']}:${r['permission']}`):scope==='channel'?/^(sendgrid|resend|twilio|fcm|slack):(result|jobs)$/.test(`${r['resource']}:${r['permission']}`):(/^(email|sms|push|slack|email-provider):(read|write)$/.test(`${r['resource']}:${r['permission']}`)||`${r['resource']}:${r['permission']}`==='audit:read')))throw new Error('invalid row');
+        if(['id','actorIssuer','actorSubject','actorClientId','databasePrincipal','requestId','targetIssuer','targetSubject','targetClientId','resource','permission','reason','recordedAt'].some(k=>typeof r[k]!=='string')||!uuid.test(r['id'] as string)||!uuid.test(r['requestId'] as string)||typeof r['previous']!=='boolean'||typeof r['current']!=='boolean'||(!!resource&&r['resource']!==resource)||!(scope==='subscriber'?/^subscriber:(read|write|create|delete)$/.test(`${r['resource']}:${r['permission']}`):scope==='channel'?/^(sendgrid|resend|twilio|fcm|slack):(result|jobs)$/.test(`${r['resource']}:${r['permission']}`):(/^(email|sms|push|slack|email-provider):(read|write)$/.test(`${r['resource']}:${r['permission']}`)||`${r['resource']}:${r['permission']}`==='audit:read')))throw new Error('invalid row');
         return {id:r['id'] as string,actorIssuer:r['actorIssuer'] as string,actorSubject:r['actorSubject'] as string,actorClientId:r['actorClientId'] as string,databasePrincipal:r['databasePrincipal'] as string,requestId:r['requestId'] as string,targetIssuer:r['targetIssuer'] as string,targetSubject:r['targetSubject'] as string,targetClientId:r['targetClientId'] as string,resource:r['resource'] as string,permission:r['permission'] as string,previous:r['previous'],current:r['current'],reason:r['reason'] as string,recordedAt:r['recordedAt'] as string};
       });
       const ids=rows.map(r=>r.id.toLowerCase());if(ids.some((id,i)=>(i>0&&ids[i-1]>=id)||(!!cursor&&id<=cursor.toLowerCase()))||(result['hasMore']?rows.length!==50||typeof result['next']!=='string'||result['next'].toLowerCase()!==ids[ids.length-1]:result['next']!==null))throw new Error('invalid page');

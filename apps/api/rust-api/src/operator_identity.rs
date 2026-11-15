@@ -1194,7 +1194,8 @@ async fn query(
         Lookup::WorkflowGrantRequest | Lookup::ChannelAccessGrantRequest => {
             &["environmentId", "requestId"]
         }
-        Lookup::WorkflowGrantAudit | Lookup::ChannelAccessGrantAudit => &["environmentId", "after"],
+        Lookup::WorkflowGrantAudit => &["environmentId", "after"],
+        Lookup::ChannelAccessGrantAudit => &["environmentId", "after", "resource"],
         Lookup::SubscriberProfileRead => &["environmentId", "subscriberId"],
         Lookup::SubscriberProfileRequest => &["environmentId", "requestId"],
         Lookup::SubscriberCreateRequest => &["environmentId", "requestId"],
@@ -1375,7 +1376,17 @@ async fn query(
                 },
                 None => None,
             };
-            guarded_query(
+            if let Some(resource) = params.get("resource") {
+                if !["resend", "sendgrid", "twilio", "fcm", "slack"].contains(&resource.as_str()) {
+                    return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+                }
+                guarded_query(
+                    &db, &identity,
+                    "SELECT public.novu_rust_operator_jwt_channel_access_grant_audit_filtered($1,$2,$3,$4,$5,$6,$7)",
+                    &[&identity.issuer, &identity.subject, &identity.client_id, &env, &exp, &resource, &after],
+                ).await
+            } else {
+                guarded_query(
                 &db,
                 &identity,
                 "SELECT public.novu_rust_operator_jwt_channel_access_grant_audit_read($1,$2,$3,$4,$5,$6)",
@@ -1389,6 +1400,7 @@ async fn query(
                 ],
             )
             .await
+            }
         }
         Lookup::WorkflowGrantRead => {
             let (Some(issuer), Some(subject), Some(client), Some(resource), Some(permission)) = (
