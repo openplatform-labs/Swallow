@@ -2036,27 +2036,30 @@ fn in_app_redirect(value: &Value) -> Option<Value> {
 
 fn notification_dto(row: &tokio_postgres::Row, to: &Value) -> Option<Value> {
     let metadata: Option<Value> = row.get(13);
-    let metadata = metadata.filter(Value::is_object)?;
-    if !metadata.get("id").is_some_and(Value::is_string)
-        || !metadata.get("identifier").is_some_and(Value::is_string)
-        || !metadata.get("name").is_some_and(Value::is_string)
-        || !metadata.get("critical").is_some_and(Value::is_boolean)
-        || !metadata.get("tags").is_some_and(Value::is_array)
-        || !metadata.get("payloadAsData").is_some_and(Value::is_boolean)
-        || !metadata
-            .get("severity")
-            .and_then(Value::as_str)
-            .is_some_and(|value| matches!(value, "none" | "low" | "medium" | "high"))
+    if let Some(metadata) = &metadata
+        && (!metadata.is_object()
+            || !metadata.get("id").is_some_and(Value::is_string)
+            || !metadata.get("identifier").is_some_and(Value::is_string)
+            || !metadata.get("name").is_some_and(Value::is_string)
+            || !metadata.get("critical").is_some_and(Value::is_boolean)
+            || !metadata.get("tags").is_some_and(Value::is_array)
+            || !metadata.get("payloadAsData").is_some_and(Value::is_boolean)
+            || !metadata
+                .get("severity")
+                .and_then(Value::as_str)
+                .is_some_and(|value| matches!(value, "none" | "low" | "medium" | "high")))
     {
         return None;
     }
-    let workflow = json!({"id":metadata["id"],"identifier":metadata["identifier"],"name":metadata["name"],"critical":metadata["critical"],"tags":metadata["tags"],"severity":metadata["severity"]});
     let tags: Value = row.get(12);
     let snoozed_until: Option<String> = row.get("snoozed_until");
     let message_severity = row
         .get::<_, Option<String>>("message_severity")
         .unwrap_or_else(|| "none".to_string());
-    let mut item = json!({"id":row.get::<_, String>(0), "transactionId":row.get::<_, String>(1), "body":row.get::<_, String>(2), "to":to, "isRead":row.get::<_, bool>(4), "isSeen":row.get::<_, bool>(5), "isArchived":row.get::<_, bool>(6), "isSnoozed":snoozed_until.is_some(), "createdAt":row.get::<_, String>(7), "channelType":"in_app", "tags":tags, "severity":message_severity, "workflow":workflow});
+    let mut item = json!({"id":row.get::<_, String>(0), "transactionId":row.get::<_, String>(1), "body":row.get::<_, String>(2), "to":to, "isRead":row.get::<_, bool>(4), "isSeen":row.get::<_, bool>(5), "isArchived":row.get::<_, bool>(6), "isSnoozed":snoozed_until.is_some(), "createdAt":row.get::<_, String>(7), "channelType":"in_app", "tags":tags, "severity":message_severity});
+    if let Some(metadata) = &metadata {
+        item["workflow"] = json!({"id":metadata["id"],"identifier":metadata["identifier"],"name":metadata["name"],"critical":metadata["critical"],"tags":metadata["tags"],"severity":metadata["severity"]});
+    }
     if let Some(value) = snoozed_until {
         item["snoozedUntil"] = json!(value);
     }
@@ -2090,7 +2093,10 @@ fn notification_dto(row: &tokio_postgres::Row, to: &Value) -> Option<Value> {
     let message_data: Option<Value> = row.get(16);
     if let Some(data) = message_data.filter(|value| !value.is_null()) {
         item["data"] = data;
-    } else if metadata.get("payloadAsData") == Some(&Value::Bool(true))
+    } else if metadata
+        .as_ref()
+        .and_then(|value| value.get("payloadAsData"))
+        == Some(&Value::Bool(true))
         && payload.as_object().is_some_and(|value| !value.is_empty())
     {
         item["data"] = payload;

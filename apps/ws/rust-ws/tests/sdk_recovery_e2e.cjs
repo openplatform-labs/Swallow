@@ -32,6 +32,7 @@ function sql(query) {
     const initial=await sdk.notifications.list({useCache:false});
     assert(!initial.error, String(initial.error));
     assert.equal(initial.data.notifications.length,0);
+    sql("UPDATE novu_rust_workflows SET inbox_metadata=NULL WHERE environment_id='env-a' AND identifier='greeting'");
     // Pause WS, terminate its LISTEN connection, and store a real worker message
     // before resuming. This makes the missed event deterministic.
     process.kill(Number(process.env.WS_PID),'SIGSTOP');
@@ -40,7 +41,7 @@ function sql(query) {
       sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name='novu-rust-ws-listener'");
       const response=await fetch(process.env.NOVU_RUST_URL+'/v1/events/trigger',{
         method:'POST',headers:{'content-type':'application/json','authorization':'ApiKey compat-key'},
-        body:JSON.stringify({name:'greeting',to:{subscriberId:'alice'},transactionId:'recovery-gap-1',payload:{}}),
+        body:JSON.stringify({name:'greeting',to:{subscriberId:'alice'},transactionId:'recovery-gap-1',payload:{test:'not inferred'}}),
       });
       assert.equal(response.status,201,await response.text());
       await until(()=>sql("SELECT count(*) FROM novu_rust_in_app_messages WHERE transaction_id='recovery-gap-1'")==='1','worker failed to store message');
@@ -54,7 +55,24 @@ function sql(query) {
     }
     assert.equal(notifications,0,'unexpected live replay during listener gap');
     assert(connects>=2);
-    assert.equal(recovered.find(item=>item.transactionId==='recovery-gap-1').body,'hello recovery');
+    const item=recovered.find(item=>item.transactionId==='recovery-gap-1');
+    assert.equal(item.body,'hello recovery');
+    assert.equal(item.workflow,undefined,'missing metadata must not fabricate a workflow');
+    assert.equal(item.data,undefined,'missing metadata must not infer payload mapping');
+    sql("UPDATE novu_rust_in_app_messages SET data=jsonb_build_object('explicit',true) WHERE transaction_id='recovery-gap-1'");
+    const withData=await sdk.notifications.list({useCache:false});
+    assert(!withData.error, String(withData.error));
+    assert.deepEqual(withData.data.notifications[0].data,{explicit:true});
+    const update=await item.read();
+    assert.equal(update.error?.originalError?.status,501,'mutation without metadata must still be rejected');
+    assert.equal(sql("SELECT is_read FROM novu_rust_in_app_messages WHERE transaction_id='recovery-gap-1'"),'f');
+    sql("UPDATE novu_rust_workflows SET inbox_metadata='{}'::jsonb WHERE environment_id='env-a' AND identifier='greeting'");
+    const partial=await sdk.notifications.list({useCache:false});
+    assert.equal(partial.error?.originalError?.status,501,'partial metadata should remain rejected');
+    sql("UPDATE novu_rust_workflows SET inbox_metadata=jsonb_build_object('id','64a000000000000000000004','identifier','greeting','name','Greeting','critical',false,'tags',jsonb_build_array(),'severity','none','payloadAsData',false) WHERE environment_id='env-a' AND identifier='greeting'");
+    const restored=await sdk.notifications.list({useCache:false});
+    assert(!restored.error, String(restored.error));
+    assert.equal(restored.data.notifications[0].workflow.id,'64a000000000000000000004');
     console.log('real SDK recovered Inbox state from Rust API after a lost WS event');
   } finally {
     stop();
