@@ -127,9 +127,9 @@ export class App implements OnDestroy {
   private workflowExpected:{title:string|null;content:string|null;active:boolean}|null=null;
   readonly providerStatus=signal<'idle'|'loading'|'loaded'|'saving'|'saved'|'error'|'unknown'>('idle');
   readonly providerMessage=signal('');
-  providerChoice:'resend'|'sendgrid'='sendgrid';
+  providerChoice:'resend'|'sendgrid'|'smtp'='sendgrid';
   providerConfirmed=false;
-  private providerExpected:'resend'|'sendgrid'|null=null;
+  private providerExpected:'resend'|'sendgrid'|'smtp'|null=null;
   private providerSequence=0;
   private providerAbort:AbortController|null=null;
   workflowAuditResource:WorkflowChannel|'email-provider'='email';
@@ -970,7 +970,7 @@ export class App implements OnDestroy {
         if(typeof value!=='object'||value===null)throw new Error('invalid row');const row=value as Record<string,unknown>;
         const required=['id','issuer','subject','clientId','databasePrincipal','reason','recordedAt'];
         const nullableBoolean=['previousActive','newActive'], nullableNumber=['previousTitleBytes','newTitleBytes','previousContentBytes','newContentBytes'], nullableString=['previousProvider','newProvider'];
-        if(required.some(k=>typeof row[k]!=='string')||row['workflowIdentifier']!==identifier||row['resource']!==resource||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(row['id'] as string)||nullableBoolean.some(k=>!(row[k]===null||typeof row[k]==='boolean'))||nullableNumber.some(k=>!(row[k]===null||(typeof row[k]==='number'&&Number.isSafeInteger(row[k])&&(row[k] as number)>=0)))||nullableString.some(k=>!(row[k]===null||row[k]==='resend'||row[k]==='sendgrid')))throw new Error('invalid row');
+        if(required.some(k=>typeof row[k]!=='string')||row['workflowIdentifier']!==identifier||row['resource']!==resource||!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(row['id'] as string)||nullableBoolean.some(k=>!(row[k]===null||typeof row[k]==='boolean'))||nullableNumber.some(k=>!(row[k]===null||(typeof row[k]==='number'&&Number.isSafeInteger(row[k])&&(row[k] as number)>=0)))||nullableString.some(k=>!(row[k]===null||row[k]==='resend'||row[k]==='sendgrid'||row[k]==='smtp')))throw new Error('invalid row');
         return {id:row['id'] as string,issuer:row['issuer'] as string,subject:row['subject'] as string,clientId:row['clientId'] as string,databasePrincipal:row['databasePrincipal'] as string,reason:row['reason'] as string,recordedAt:row['recordedAt'] as string,previousActive:row['previousActive'] as boolean|null,newActive:row['newActive'] as boolean|null,previousTitleBytes:row['previousTitleBytes'] as number|null,newTitleBytes:row['newTitleBytes'] as number|null,previousContentBytes:row['previousContentBytes'] as number|null,newContentBytes:row['newContentBytes'] as number|null,previousProvider:row['previousProvider'] as string|null,newProvider:row['newProvider'] as string|null};
       });
       const ids=rows.map(row=>row.id.toLowerCase());
@@ -1063,7 +1063,7 @@ export class App implements OnDestroy {
       if(sequence!==this.providerSequence)return;
       if(typeof value!=='object'||value===null||!('data' in value)||typeof value.data!=='object'||value.data===null)throw new Error('invalid response');
       const data=value.data as Record<string,unknown>;
-      if(data['workflowIdentifier']!==identifier||(data['provider']!=='resend'&&data['provider']!=='sendgrid'))throw new Error('invalid response');
+      if(data['workflowIdentifier']!==identifier||(data['provider']!=='resend'&&data['provider']!=='sendgrid'&&data['provider']!=='smtp'))throw new Error('invalid response');
       this.providerExpected=data['provider'];this.providerChoice=data['provider'];this.providerStatus.set('loaded');
     } catch {this.expireOidcIfNeeded();if(sequence===this.providerSequence){this.providerStatus.set('error');this.providerMessage.set('공급자를 조회하지 못했습니다. 식별자와 공급자 읽기 권한을 확인하세요.');}}
     finally {if(sequence===this.providerSequence)this.providerAbort=null;}
@@ -1071,7 +1071,7 @@ export class App implements OnDestroy {
 
   async saveProvider():Promise<void> {
     this.expireOidcIfNeeded();
-    if(this.providerStatus()!=='loaded'||!this.providerConfirmed||!this.providerExpected||!['resend','sendgrid'].includes(this.providerChoice)||this.workflowStatus()==='saving')return;
+    if(this.providerStatus()!=='loaded'||!this.providerConfirmed||!this.providerExpected||!['resend','sendgrid','smtp'].includes(this.providerChoice)||this.workflowStatus()==='saving')return;
     if(this.workflowAuthMode==='jwt'&&!this.validWorkflowReason(this.providerReason)){this.providerMessage.set('변경 사유를 1,000바이트 이내로 입력하세요.');return;}
     let endpoint:string;try {endpoint=this.providerEndpoint(true);}catch{this.providerStatus.set('error');this.providerMessage.set('워크플로 식별자와 인증을 확인하세요.');return;}
     const identifier=this.workflowIdentifier.trim(),choice=this.providerChoice,expected=this.providerExpected;

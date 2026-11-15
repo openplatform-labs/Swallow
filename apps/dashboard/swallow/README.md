@@ -368,3 +368,7 @@ Angular 테스트 253개와 빌드가 통과했다. `scripts/test-discord-retry-
 설정 화면에서 환경·대상·운영자별 정책 조회, 변경, 감사 JWT 권한을 조회하고 위임·회수할 수 있다. API 0126의 위임 관리자 권한과 API 로그인 함수 실행 권한은 DBA가 별도로 설정해야 한다. 위임된 JWT 권한은 정책 접근에 필요한 API DB 로그인 권한을 자동 부여하지 않는다. 자기 자신의 권한 변경은 거절된다. 요청은 확인 후 제출하며 응답이 불명확한 경우 원래 토큰·환경·대상·주소로 동일 요청을 재제출하거나 요청 ID를 조회한다. 요청 정보는 화면 메모리에만 보관되며 감사는 실제 변경만 표시하고 UUID 순서로 조회한다.
 
 Angular 테스트 262건과 빌드가 통과했다. `scripts/test-discord-retry-policy-grants-browser.sh`는 실제 브라우저, Rust API, 제한 DB 로그인과 테스트 JWT를 사용해 조회·부여·요청·감사·회수와 대상의 정책 접근 변경을 검증한다. 기본은 Docker PostgreSQL이며 `TEST_POSTGRES_MODE=local`은 임시 로컬 PostgreSQL을 사용한다. Docker Desktop 시작 불가로 로컬 PostgreSQL 17에서 검증했다. 외부 IdP·운영 HA는 미검증이며 빌드 크기 경고가 남아 있다. [API README](../../api/rust-api/README.md)에 권한과 함수 설정 절차가 있다.
+
+### Experimental SMTP selection
+
+The workflow email-provider screen supports SMTP with the existing API-key and operator JWT authorization flows. Configure and start the SMTP worker separately and drain old generators and queued email jobs before switching; see the worker README. Selection alone does not verify delivery or provide SMTP outcome reconciliation. The SMTP browser fixture is `scripts/test-smtp-provider-browser.sh` (Docker PostgreSQL by default; `TEST_POSTGRES_MODE=local` uses a temporary local PostgreSQL installation). It exercises provider selection and audit through the API, not external email delivery. The browser test passed with a temporary local PostgreSQL instance; the Docker mode was not exercised in this run.

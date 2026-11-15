@@ -431,6 +431,14 @@ describe('Swallow console', () => {
     expect(app.workflowStatus()).toBe('saved');expect(app.workflowContent).toBe('');fixture.destroy();
   });
 
+  it('selects SMTP with API keys and operator JWTs',async()=>{
+    const ack=async (_url:unknown,init?:RequestInit)=>new Response(JSON.stringify({recorded:true,replayed:false,requestId:JSON.parse(init?.body as string).requestId}));
+    const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:{workflowIdentifier:'welcome',provider:'sendgrid'}}))).mockResolvedValueOnce(new Response(JSON.stringify({data:{workflowIdentifier:'welcome',provider:'smtp'}}))).mockResolvedValueOnce(new Response(JSON.stringify({data:{workflowIdentifier:'welcome',provider:'smtp'}}))).mockImplementationOnce(ack);
+    const fixture=TestBed.createComponent(App),app=fixture.componentInstance;app.setSection('workflows');app.workflowIdentifier='welcome';app.workflowKey='key';await app.loadProvider();fixture.detectChanges();expect(fixture.nativeElement.textContent).toContain('SMTP');app.providerChoice='smtp';app.providerConfirmed=true;await app.saveProvider();expect(app.providerStatus()).toBe('saved');expect(JSON.parse(mock.mock.calls[1][1]!.body as string)).toEqual({provider:'smtp',expected:'sendgrid'});
+    app.workflowAuthMode='jwt';app.workflowEnvironment='env-a';app.workflowKey='aaa.bbb.ccc';await app.loadProvider();expect(app.providerChoice).toBe('smtp');app.providerChoice='resend';app.providerReason='ticket';app.providerConfirmed=true;await app.saveProvider();expect(app.providerStatus()).toBe('saved');expect(JSON.parse(mock.mock.calls[3][1]!.body as string)).toMatchObject({expected:{provider:'smtp'},desired:{provider:'resend'}});
+    fixture.destroy();
+  });
+
   it('reads and conditionally changes the workflow email provider', async () => {
     const fetchMock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:{workflowIdentifier:'welcome',provider:'sendgrid'}}))).mockResolvedValueOnce(new Response(JSON.stringify({data:{workflowIdentifier:'welcome',provider:'resend'}})));
     const app=TestBed.createComponent(App).componentInstance;app.setSection('workflows');app.workflowIdentifier='welcome';app.workflowKey='key';await app.loadProvider();expect(app.providerChoice).toBe('sendgrid');app.providerChoice='resend';app.providerConfirmed=true;await app.saveProvider();

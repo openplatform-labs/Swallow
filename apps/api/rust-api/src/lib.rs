@@ -3055,7 +3055,7 @@ async fn set_workflow_email_provider(
     let Some(provider) = object
         .get("provider")
         .and_then(Value::as_str)
-        .filter(|p| ["sendgrid", "resend"].contains(p))
+        .filter(|p| ["sendgrid", "resend", "smtp"].contains(p))
     else {
         return error_at(
             StatusCode::BAD_REQUEST,
@@ -3066,7 +3066,7 @@ async fn set_workflow_email_provider(
     };
     let expected = match object.get("expected") {
         None => None,
-        Some(Value::String(s)) if ["sendgrid", "resend"].contains(&s.as_str()) => Some(s.as_str()),
+        Some(Value::String(s)) if ["sendgrid", "resend", "smtp"].contains(&s.as_str()) => Some(s.as_str()),
         _ => return error_at(StatusCode::BAD_REQUEST, "Invalid expected provider", "Bad Request", &path),
     };
     // Hold matching authorization locks; update and audit commit atomically.
