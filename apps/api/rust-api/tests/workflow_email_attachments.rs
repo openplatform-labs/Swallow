@@ -263,7 +263,12 @@ async fn resend_attachment_policy_rejects_unrepresentable_dispositions_before_tr
     }
     let long=json!({"name":"image.png","mime":"image/png","file":"YQ==","disposition":"inline","cid":"x".repeat(128)});
     assert_eq!(strict.clone().oneshot(request("resend-workflow","inline-long",long.clone())).await.unwrap().status(),StatusCode::UNPROCESSABLE_ENTITY);
-    for id in ["inline-missing","attachment-cid","inline-long"] {assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_trigger_transactions WHERE transaction_id=$1",&[&id]).await.unwrap().get::<_,i64>(0),0);}
+    let implicit_long=json!({"name":"image.png","mime":"image/png","file":"YQ==","cid":"x".repeat(128)});
+    assert_eq!(strict.clone().oneshot(request("resend-workflow","implicit-long",implicit_long.clone())).await.unwrap().status(),StatusCode::UNPROCESSABLE_ENTITY);
+    let implicit_short=json!({"name":"image.png","mime":"image/png","file":"YQ==","cid":"x".repeat(127)});
+    assert_eq!(strict.clone().oneshot(request("resend-workflow","implicit-short",implicit_short)).await.unwrap().status(),StatusCode::CREATED);
+    assert_eq!(default.clone().oneshot(request("resend-workflow","implicit-defer",implicit_long)).await.unwrap().status(),StatusCode::CREATED);
+    for id in ["inline-missing","attachment-cid","inline-long","implicit-long"] {assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_trigger_transactions WHERE transaction_id=$1",&[&id]).await.unwrap().get::<_,i64>(0),0);}
     assert_eq!(default.clone().oneshot(request("resend-workflow","defer-long",long.clone())).await.unwrap().status(),StatusCode::CREATED);
     assert_eq!(strict.clone().oneshot(request("sendgrid-workflow","other-provider",long.clone())).await.unwrap().status(),StatusCode::CREATED);
     db.execute("UPDATE public.novu_rust_workflows SET email_step_active=false WHERE environment_id='attachment-policy-env' AND identifier='resend-workflow'",&[]).await.unwrap();

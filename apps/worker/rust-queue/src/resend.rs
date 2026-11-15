@@ -320,6 +320,12 @@ mod tests {
         email.attachments[0].disposition = Some("inline".into());
         email.attachments[0].cid = Some("x".repeat(128));
         assert_eq!(request_body(&config(), &email), Err(SendError::InvalidMessage));
+        email.attachments[0].disposition = None;
+        assert_eq!(request_body(&config(), &email), Err(SendError::InvalidMessage));
+        email.attachments[0].cid = Some("x".repeat(127));
+        assert!(request_body(&config(), &email).is_ok());
+        email.attachments[0].cid = Some("é".repeat(127));
+        assert!(request_body(&config(), &email).is_ok());
         email.attachments[0].disposition = Some("unknown".into());
         assert_eq!(request_body(&config(), &email), Err(SendError::InvalidMessage));
     }

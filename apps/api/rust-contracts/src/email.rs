@@ -45,12 +45,15 @@ pub fn validate(value: &str) -> Option<bool> {
     )
 }
 
-/// Whether an explicit disposition can be represented by Resend's CID field.
+/// Whether the disposition and CID can be represented by Resend.
 pub fn supports_resend_attachment_disposition(disposition: Option<&str>, cid: Option<&str>) -> bool {
+    if cid.is_some_and(|value| value.is_empty() || value.chars().count() >= 128) {
+        return false;
+    }
     match disposition {
         None => true,
         Some("attachment") => cid.is_none(),
-        Some("inline") => cid.is_some_and(|v| !v.is_empty() && v.len() < 128),
+        Some("inline") => cid.is_some_and(|v| !v.is_empty() && v.chars().count() < 128),
         Some(_) => false,
     }
 }
