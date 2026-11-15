@@ -1,6 +1,7 @@
 import { Component, EventEmitter, Input, OnChanges, OnDestroy, Output, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { SmtpAutoHealth } from './smtp-auto-health';
+import { SmtpAutoWorkerHealth } from './smtp-auto-worker-health';
 
 type Policy={enabled:boolean;maxRetries:number;delaySeconds:number;eligibleSince:string|null;revision:string};
 type Body={requestId:string;expectedRevision:string;enabled:boolean;maxRetries:number;delaySeconds:number;cutoff:'now'|'preserve'|'all';reason:string};
@@ -9,7 +10,7 @@ type RecordView={requestId:string;expectedRevision:string;enabled:boolean;maxRet
 type History={id:string;jobId:string;attemptRevision:string;failureRevision:string;databasePrincipal:string;maxRetries:number;delaySeconds:number;recordedAt:string};
 type Audit={id:string;actorIssuer:string;actorSubject:string;actorClientId:string;databasePrincipal:string;requestId:string;previous:Policy|null;current:Policy;reason:string;recordedAt:string};
 
-@Component({selector:'app-smtp-auto-policy',imports:[FormsModule,SmtpAutoHealth],templateUrl:'./smtp-auto-policy.html'})
+@Component({selector:'app-smtp-auto-policy',imports:[FormsModule,SmtpAutoHealth,SmtpAutoWorkerHealth],templateUrl:'./smtp-auto-policy.html'})
 export class SmtpAutoPolicy implements OnChanges,OnDestroy {
   @Input() apiOrigin=''; @Input() environment=''; @Input() token=''; @Input() blocked=false; @Output() busyChange=new EventEmitter<boolean>();
   enabled=false; maxRetries=1; delaySeconds=60; cutoff:'now'|'preserve'|'all'='now'; reason=''; confirm=false; submitConfirm=false; retryConfirm=false; resetConfirm=false; lookupId='';

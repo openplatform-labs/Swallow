@@ -105,7 +105,7 @@ async fn smtp_auto_grants_are_independent_conditional_and_audited() {
     db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_smtp_auto_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_smtp_auto_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_smtp_auto_grant_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_smtp_auto_grant_audit_read(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_smtp_auto_policy_read(text,text,text,text,bigint),public.novu_rust_operator_jwt_smtp_auto_policy_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_smtp_auto_policy_audit_read(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_smtp_auto_history(text,text,text,text,bigint,bigint) TO {role}")).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname::text=$1",&[&role]).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_smtp_auto_admins(environment_id,database_principal,principal_oid,can_read,can_write,can_audit) SELECT $1,rolname,oid,true,true,true FROM pg_roles WHERE rolname::text=$2",&[&env,&role]).await.unwrap();
-    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_smtp_auto_health(text,text,text,text,bigint,integer) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_smtp_auto_health(text,text,text,text,bigint,integer),public.novu_rust_operator_jwt_smtp_auto_worker_health(text,text,text,text,bigint,integer,integer) TO {role}")).await.unwrap();
     db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,rolname,'alert_view',oid FROM pg_roles WHERE rolname::text=$2",&[&env,&role]).await.unwrap();
     let api = connect(&url).await;
     api.batch_execute(&format!("SET SESSION AUTHORIZATION {role}"))
@@ -205,7 +205,9 @@ async fn smtp_auto_grants_are_independent_conditional_and_audited() {
     assert_eq!(response(app.clone(), &target, "GET", &history, None).await.0, StatusCode::UNAUTHORIZED);
     let health=format!("/v1/experimental/operator/smtp-auto-health?environmentId={env}&graceSeconds=60");
     assert_eq!(response(app.clone(), &target, "GET", &health, None).await.0, StatusCode::UNAUTHORIZED);
-    for permission in ["write", "audit", "history", "health"] {
+    let workers=format!("/v1/experimental/operator/smtp-auto-worker-health?environmentId={env}&maxAgeSeconds=60&minimumHealthy=1");
+    assert_eq!(response(app.clone(), &target, "GET", &workers, None).await.0, StatusCode::UNAUTHORIZED);
+    for permission in ["write", "audit", "history", "health", "worker-health"] {
         let body = json!({"requestId":Uuid::new_v4(),"targetIssuer":"https://issuer.test","targetSubject":"target","targetClientId":"console","resource":"smtp-auto","permission":permission,"expected":false,"desired":true,"reason":"ticket"});
         assert_eq!(response(app.clone(), &token, "PUT", &path, Some(body)).await.0, StatusCode::OK);
     }
@@ -214,6 +216,10 @@ async fn smtp_auto_grants_are_independent_conditional_and_audited() {
     assert_eq!(response(app.clone(), &target, "GET", &target_audit, None).await.0, StatusCode::OK);
     assert_eq!(response(app.clone(), &target, "GET", &history, None).await.0, StatusCode::OK);
     assert_eq!(response(app.clone(), &target, "GET", &health, None).await.1, json!({"enabled":false,"eligible":0,"overdue":0,"exhausted":0}));
+    assert_eq!(response(app.clone(), &target, "GET", &workers, None).await.1, json!({"healthy":0,"stale":0,"minimumHealthy":1,"needsAttention":true}));
+    let revoke_worker=json!({"requestId":Uuid::new_v4(),"targetIssuer":"https://issuer.test","targetSubject":"target","targetClientId":"console","resource":"smtp-auto","permission":"worker-health","expected":true,"desired":false,"reason":"done"});
+    assert_eq!(response(app.clone(), &token, "PUT", &path, Some(revoke_worker)).await.0, StatusCode::OK);
+    assert_eq!(response(app.clone(), &target, "GET", &workers, None).await.0, StatusCode::UNAUTHORIZED);
     let revoke_health=json!({"requestId":Uuid::new_v4(),"targetIssuer":"https://issuer.test","targetSubject":"target","targetClientId":"console","resource":"smtp-auto","permission":"health","expected":true,"desired":false,"reason":"done"});
     assert_eq!(response(app.clone(), &token, "PUT", &path, Some(revoke_health)).await.0, StatusCode::OK);
     assert_eq!(response(app.clone(), &target, "GET", &health, None).await.0, StatusCode::UNAUTHORIZED);
