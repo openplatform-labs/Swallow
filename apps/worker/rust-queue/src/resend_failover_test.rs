@@ -69,8 +69,6 @@ async fn synchronous_failover_during_resend_dispatch_preserves_unknown() {
     let primary_url = std::env::var("TEST_PRIMARY_URL").unwrap();
     let standby_url = std::env::var("TEST_STANDBY_URL").unwrap();
     let cluster_url = std::env::var("TEST_FAILOVER_URL").unwrap();
-    let primary = std::env::var("TEST_PRIMARY_CONTAINER").unwrap();
-    let standby = std::env::var("TEST_STANDBY_CONTAINER").unwrap();
     let mut db = connect(&primary_url).await;
     db.batch_execute("INSERT INTO public.novu_rust_environments VALUES('resend-ha','org'); INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,email_subject,email_html,email_provider,inbox_metadata) VALUES('resend-ha','resend-ha-workflow',true,true,'Hello','<p>Fixture</p>','resend','{\"id\":\"64a000000000000000000051\",\"name\":\"Fixture\",\"critical\":false,\"tags\":[]}'); INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES('resend-ha','alice','64a000000000000000000054','{\"email\":\"receiver@example.test\"}')").await.unwrap();
     let trigger = Uuid::new_v4();
@@ -215,32 +213,55 @@ async fn synchronous_failover_during_resend_dispatch_preserves_unknown() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(replicated, "dispatch marker not replayed");
-    assert!(
-        Command::new("docker")
-            .args(["kill", &primary])
-            .stdout(Stdio::null())
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(
-        Command::new("docker")
-            .args([
-                "exec",
-                "-u",
-                "postgres",
-                &standby,
-                "pg_ctl",
-                "promote",
-                "-D",
-                "/var/lib/postgresql/data",
-                "-w"
-            ])
-            .stdout(Stdio::null())
-            .status()
-            .unwrap()
-            .success()
-    );
+    if let Ok(pgctl) = std::env::var("TEST_LOCAL_PG_CTL") {
+        let primary = std::env::var("TEST_LOCAL_PRIMARY_DATA").unwrap();
+        let standby = std::env::var("TEST_LOCAL_STANDBY_DATA").unwrap();
+        assert!(
+            Command::new(&pgctl)
+                .args(["-D", &primary, "-m", "immediate", "stop"])
+                .stdout(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new(&pgctl)
+                .args(["-D", &standby, "promote", "-w"])
+                .stdout(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+    } else {
+        let primary = std::env::var("TEST_PRIMARY_CONTAINER").unwrap();
+        let standby = std::env::var("TEST_STANDBY_CONTAINER").unwrap();
+        assert!(
+            Command::new("docker")
+                .args(["kill", &primary])
+                .stdout(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("docker")
+                .args([
+                    "exec",
+                    "-u",
+                    "postgres",
+                    &standby,
+                    "pg_ctl",
+                    "promote",
+                    "-D",
+                    "/var/lib/postgresql/data",
+                    "-w"
+                ])
+                .stdout(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
     let mut promoted = connect(&standby_url).await;
     promoted.execute("INSERT INTO public.novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type,recipient_hash,correlation_id) VALUES ('resend-ha','auto-after-failover','different-provider','email.delivered','fixture-hash',$1)",&[&auto_tag]).await.unwrap();
     let row=promoted.query_one("SELECT j.resend_delivery_result,m.resend_delivery_result,public.novu_rust_resend_auto_evidence_conflicts('resend-ha',j.id),(SELECT count(*) FROM public.novu_rust_resend_auto_correlations c WHERE c.job_id=j.id) FROM public.novu_queue_jobs j JOIN public.novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1",&[&auto_job]).await.unwrap();
