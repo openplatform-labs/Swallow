@@ -21,7 +21,7 @@ async fn independent_bits_bypass_and_recover_without_access_to_other_environment
         .await
         .unwrap();
     admin.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_reserve_alert_v2(text,text,text,integer,bigint),public.novu_rust_observe_alert_conditions_v2(text,text,text,bigint,bigint),public.novu_rust_finish_alert(text,text,text,uuid,text,integer),public.novu_rust_reserve_alert(text,text,text,integer,integer) TO {role}")).await.unwrap();
-    let (user, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    let (mut user, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move {
         let _ = connection.await;
     });
@@ -52,6 +52,57 @@ async fn independent_bits_bypass_and_recover_without_access_to_other_environment
         .await
         .unwrap();
     assert_eq!(old.get::<_, String>(0), "claimed");
+    // An occupied legacy target is never silently reinterpreted as V2.
+    let legacy: Uuid = admin.query_one("SELECT attempt_id FROM public.novu_rust_alert_delivery_slots WHERE environment_id=$1 AND target_id='legacy'", &[&environment]).await.unwrap().get(0);
+    assert!(
+        user.query_one(
+            "SELECT public.novu_rust_finish_alert($1,'slack','legacy',$2,'accepted',NULL)",
+            &[&environment, &legacy]
+        )
+        .await
+        .unwrap()
+        .get::<_, bool>(0)
+    );
+    assert!(
+        user.query_one(
+            "SELECT result FROM public.novu_rust_reserve_alert_v2($1,'slack','legacy',60,$2)",
+            &[&environment, &failed_jobs]
+        )
+        .await
+        .is_err()
+    );
+    // A legacy reservation racing the first V2 reservation waits for the slot lock
+    // and sees the committed version instead of starting a duplicate dispatch.
+    let (competing, conn) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    competing
+        .batch_execute(&format!("SET SESSION AUTHORIZATION {role}"))
+        .await
+        .unwrap();
+    let tx = user.transaction().await.unwrap();
+    assert_eq!(
+        tx.query_one(
+            "SELECT result FROM public.novu_rust_reserve_alert_v2($1,'slack','race',60,$2)",
+            &[&environment, &failed_jobs]
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0),
+        "claimed"
+    );
+    let competing_env = environment.clone();
+    let mut pending = tokio::spawn(async move {
+        competing.query_one("SELECT result FROM public.novu_rust_reserve_alert($1,'slack','race',60,1::integer)", &[&competing_env]).await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut pending)
+            .await
+            .is_err()
+    );
+    tx.commit().await.unwrap();
+    assert!(pending.await.unwrap().is_err());
     let mut mask = failed_jobs;
     for bit in [failed_jobs, resend, slack] {
         mask |= bit;
@@ -78,6 +129,15 @@ async fn independent_bits_bypass_and_recover_without_access_to_other_environment
             "cooldown"
         );
     }
+    // V2 registration prevents scoped legacy reservations on the same target.
+    assert!(
+        user.query_one(
+            "SELECT result FROM public.novu_rust_reserve_alert($1,'slack','ops',60,1::integer)",
+            &[&environment]
+        )
+        .await
+        .is_err()
+    );
     user.query_one(
         "SELECT public.novu_rust_observe_alert_conditions_v2($1,'slack','ops',$2,$3)",
         &[&environment, &failed_jobs, &(failed_jobs | resend)],
