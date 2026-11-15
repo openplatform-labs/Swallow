@@ -151,6 +151,85 @@ async fn checks_active_identity_bounded_errors_and_timeout() {
 }
 
 #[tokio::test]
+async fn concurrency_limit_rejects_without_calling_idp_and_recovers() {
+    let fixture = Arc::new(Fixture::default());
+    fixture.mode.store(6, Ordering::SeqCst);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/introspect", listener.local_addr().unwrap());
+    let server = tokio::spawn(
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/introspect", post(endpoint))
+                .with_state(fixture.clone()),
+        )
+        .into_future(),
+    );
+    assert!(
+        Introspection::new(&url, "id", "secret", true, Duration::from_secs(1))
+            .unwrap()
+            .with_max_in_flight(0)
+            .is_err()
+    );
+    assert!(
+        Introspection::new(&url, "id", "secret", true, Duration::from_secs(1))
+            .unwrap()
+            .with_max_in_flight(1025)
+            .is_err()
+    );
+    let checker = Arc::new(
+        Introspection::new(&url, "id", "secret", true, Duration::from_secs(1))
+            .unwrap()
+            .with_max_in_flight(1)
+            .unwrap(),
+    );
+    let first_checker = checker.clone();
+    let first = tokio::spawn(async move { first_checker.check("first", &identity(), "api").await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while fixture.calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        checker.check("second", &identity(), "api").await,
+        Outcome::Unavailable
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(first.await.unwrap(), Outcome::Unavailable);
+    fixture.mode.store(0, Ordering::SeqCst);
+    assert_eq!(
+        checker.check("third", &identity(), "api").await,
+        Outcome::Active(None)
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+    fixture.mode.store(6, Ordering::SeqCst);
+    let cancelled_checker = checker.clone();
+    let cancelled = tokio::spawn(async move {
+        cancelled_checker
+            .check("cancelled", &identity(), "api")
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while fixture.calls.load(Ordering::SeqCst) < 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    cancelled.abort();
+    assert!(cancelled.await.unwrap_err().is_cancelled());
+    fixture.mode.store(0, Ordering::SeqCst);
+    assert_eq!(
+        checker.check("after-cancel", &identity(), "api").await,
+        Outcome::Active(None)
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 4);
+    server.abort();
+}
+
+#[tokio::test]
 #[ignore = "requires fully migrated disposable PostgreSQL and role creation"]
 async fn real_api_enforces_live_introspection_and_fails_closed() {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -232,6 +311,7 @@ async fn real_api_enforces_live_introspection_and_fails_closed() {
             .env("SWALLOW_OPERATOR_INTROSPECTION_CLIENT_SECRET_FILE", &secret)
             .env("SWALLOW_OPERATOR_INTROSPECTION_ALLOW_LOOPBACK_HTTP", "true")
             .env("SWALLOW_OPERATOR_INTROSPECTION_TIMEOUT_SECONDS", "1")
+            .env("SWALLOW_OPERATOR_INTROSPECTION_MAX_IN_FLIGHT", "1")
             .stdout(Stdio::from(output.try_clone().unwrap()))
             .stderr(Stdio::from(output))
             .spawn()
@@ -291,6 +371,35 @@ async fn real_api_enforces_live_introspection_and_fails_closed() {
         fixture.mode.store(mode, Ordering::SeqCst);
         assert_eq!(request(token.clone()).await, status, "mode {mode}");
     }
+    fixture.mode.store(6, Ordering::SeqCst);
+    let calls = fixture.calls.load(Ordering::SeqCst);
+    let pending = tokio::spawn({
+        let client = client.clone();
+        let path = format!("{origin}/v1/experimental/operator/me?environmentId={env}");
+        let token = token.clone();
+        async move {
+            client
+                .get(path)
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while fixture.calls.load(Ordering::SeqCst) == calls {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        request(token.clone()).await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), calls + 1);
+    assert_eq!(pending.await.unwrap(), StatusCode::SERVICE_UNAVAILABLE);
     fixture.mode.store(0, Ordering::SeqCst);
     assert_eq!(request(token.clone()).await, StatusCode::OK);
     // The introspected expiry must also fence an operator request waiting for a DB lock.
@@ -364,7 +473,7 @@ fn invalid_or_partial_introspection_configuration_fails_startup_without_secrets(
         std::str::from_utf8(include_bytes!("fixtures/operator_jwt/test-only-public.pem")).unwrap();
     std::fs::write(&config,serde_json::to_vec(&serde_json::json!({"issuer":"https://issuer.test","audience":"api","keys":[{"kid":"key","pem":public}]})).unwrap()).unwrap();
     std::fs::write(&secret, "fixture-sensitive-secret").unwrap();
-    for mode in 0..5 {
+    for mode in 0..6 {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_novu-rust-api"));
         cmd.env_clear()
             .env("DATABASE_URL", "postgres://127.0.0.1:1/test")
@@ -395,9 +504,13 @@ fn invalid_or_partial_introspection_configuration_fails_startup_without_secrets(
                         "fixture-sensitive-secret",
                     );
             }
-            _ => {
+            4 => {
                 cmd.env_remove("SWALLOW_OPERATOR_INTROSPECTION_CLIENT_ID")
                     .env("SWALLOW_OPERATOR_INTROSPECTION_ALLOW_LOOPBACK_HTTP", "true");
+            }
+            _ => {
+                cmd.env("SWALLOW_OPERATOR_INTROSPECTION_ALLOW_LOOPBACK_HTTP", "true")
+                    .env("SWALLOW_OPERATOR_INTROSPECTION_MAX_IN_FLIGHT", "0");
             }
         }
         let mut child = cmd.spawn().unwrap();

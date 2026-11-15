@@ -4,6 +4,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{Client, Url, header};
 use serde_json::Value;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::Semaphore;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
@@ -16,6 +17,7 @@ pub struct Introspection {
     client: Client,
     endpoint: Url,
     authorization: String,
+    in_flight: Option<Semaphore>,
 }
 impl Introspection {
     /// Credentials and response contents must not appear in logs or errors.
@@ -69,7 +71,16 @@ impl Introspection {
             client,
             endpoint: url,
             authorization,
+            in_flight: None,
         })
+    }
+    /// Limit concurrent local checks; saturation fails closed without waiting.
+    pub fn with_max_in_flight(mut self, limit: usize) -> Result<Self, ()> {
+        if !(1..=1024).contains(&limit) {
+            return Err(());
+        }
+        self.in_flight = Some(Semaphore::new(limit));
+        Ok(self)
     }
     pub fn from_env() -> Result<Option<Self>, ()> {
         let names = [
@@ -79,6 +90,7 @@ impl Introspection {
             "SWALLOW_OPERATOR_INTROSPECTION_CLIENT_SECRET_FILE",
             "SWALLOW_OPERATOR_INTROSPECTION_ALLOW_LOOPBACK_HTTP",
             "SWALLOW_OPERATOR_INTROSPECTION_TIMEOUT_SECONDS",
+            "SWALLOW_OPERATOR_INTROSPECTION_MAX_IN_FLIGHT",
         ];
         if !names.iter().any(|name| std::env::var_os(name).is_some()) {
             return Ok(None);
@@ -102,9 +114,22 @@ impl Introspection {
             Err(std::env::VarError::NotPresent) => 5,
             Err(_) => return Err(()),
         };
-        Self::new(&endpoint, &id, &secret, allow, Duration::from_secs(timeout)).map(Some)
+        let checker = Self::new(&endpoint, &id, &secret, allow, Duration::from_secs(timeout))?;
+        let checker = match std::env::var(names[6]) {
+            Ok(v) => checker.with_max_in_flight(v.parse().map_err(|_| ())?)?,
+            Err(std::env::VarError::NotPresent) => checker,
+            Err(_) => return Err(()),
+        };
+        Ok(Some(checker))
     }
     pub async fn check(&self, token: &str, identity: &VerifiedSubject, audience: &str) -> Outcome {
+        let _permit = match &self.in_flight {
+            Some(limit) => match limit.try_acquire() {
+                Ok(permit) => Some(permit),
+                Err(_) => return Outcome::Unavailable,
+            },
+            None => None,
+        };
         let body = form_urlencoded::Serializer::new(String::new())
             .append_pair("token", token)
             .append_pair("token_type_hint", "access_token")
