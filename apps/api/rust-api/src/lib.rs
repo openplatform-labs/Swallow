@@ -148,10 +148,13 @@ pub struct RuntimeConfig {
     resend: Option<resend_webhook::Config>,
     require_jwt_exp: bool,
     reassert_fcm_registration: bool,
+    reject_resend_alternatives: bool,
     operator_verifier: Option<Arc<operator_access_token::AccessTokenVerifier>>,
     operator_reload: Option<(std::path::PathBuf, std::time::Duration, bool)>,
     operator_reload_health: Option<Arc<std::sync::Mutex<(std::time::Instant, bool)>>>,
 }
+#[derive(Clone, Copy)]
+pub struct RejectResendAlternatives(pub bool);
 impl RuntimeConfig {
     pub fn from_env() -> Self {
         Self::try_from_env().expect("invalid API runtime configuration")
@@ -179,6 +182,11 @@ impl RuntimeConfig {
                 Ok("false") | Err(std::env::VarError::NotPresent) => false,
                 _ => return Err(invalid()),
             };
+        let reject_resend_alternatives = match std::env::var("SWALLOW_RESEND_ALTERNATIVES_POLICY").as_deref() {
+            Ok("defer") | Err(std::env::VarError::NotPresent) => false,
+            Ok("reject") => true,
+            _ => return Err(invalid()),
+        };
         let required = match std::env::var("SWALLOW_API_REQUIRED_SECURITY") {
             Ok(value) => {
                 let mut items = std::collections::HashSet::new();
@@ -327,6 +335,7 @@ impl RuntimeConfig {
             resend,
             require_jwt_exp,
             reassert_fcm_registration,
+            reject_resend_alternatives,
             operator_verifier,
             operator_reload_health: operator_reload.as_ref().map(|_| Arc::new(std::sync::Mutex::new((std::time::Instant::now(), true)))),
             operator_reload,
@@ -387,6 +396,7 @@ impl RuntimeConfig {
             self.require_jwt_exp,
             self.reassert_fcm_registration,
         );
+        let router = router.layer(Extension(RejectResendAlternatives(self.reject_resend_alternatives)));
         match &self.operator_verifier {
             Some(verifier) => router.layer(Extension(verifier.clone())),
             None => router,
@@ -3653,6 +3663,7 @@ async fn patch_subscriber(
 async fn trigger(
     State(db): State<Arc<Client>>,
     headers: HeaderMap,
+    reject_resend: Option<Extension<RejectResendAlternatives>>,
     bytes: Bytes,
 ) -> (StatusCode, Json<Value>) {
     let environment_id = match authenticate(&db, &headers, "/v1/events/trigger").await {
@@ -4009,7 +4020,7 @@ async fn trigger(
     let context_entries = parsed_context
         .map(|context| context.entries)
         .unwrap_or_else(|| json!([]));
-    let row = match db.query_opt("SELECT active, has_steps, in_app_content, inbox_metadata, (SELECT organization_id FROM novu_rust_environments WHERE id=$1), email_subject, email_html, sms_content, push_title, push_content, to_jsonb(w)->>'chat_content' FROM novu_rust_workflows w WHERE environment_id = $1 AND identifier = $2", &[&environment_id, &name]).await {
+    let row = match db.query_opt("SELECT active, has_steps, in_app_content, inbox_metadata, (SELECT organization_id FROM novu_rust_environments WHERE id=$1), email_subject, email_html, sms_content, push_title, push_content, to_jsonb(w)->>'chat_content', to_jsonb(w)->>'email_provider', to_jsonb(w)->>'email_step_id', COALESCE((to_jsonb(w)->>'email_step_active')::boolean,true) FROM novu_rust_workflows w WHERE environment_id = $1 AND identifier = $2", &[&environment_id, &name]).await {
         Ok(Some(row)) => row,
         Ok(None) => return error(StatusCode::UNPROCESSABLE_ENTITY, "workflow_not_found", "Unprocessable Entity"),
         Err(_) => return error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error", "Internal Server Error"),
@@ -4028,6 +4039,20 @@ async fn trigger(
     };
     let decision = evaluate(row.get(0), row.get(1), TenantState::NotSpecified);
     if decision == GateResult::Dispatch {
+        if reject_resend.is_some_and(|Extension(policy)| policy.0)
+            && row.get::<_, Option<String>>(11).as_deref() == Some("resend")
+            && row.get::<_, bool>(13)
+            && row.get::<_, Option<String>>(5).is_some()
+            && row.get::<_, Option<String>>(6).is_some()
+        {
+            let step = row.get::<_, Option<String>>(12);
+            let channel = email_override.as_ref().and_then(|v| v.get("alternatives"));
+            let provider = providers.and_then(|v| v.get("resend")).and_then(|v| v.get("alternatives"));
+            let step_provider = step.as_ref().and_then(|id| steps.and_then(|v| v.get(id))).and_then(|v| v.get("providers")).and_then(|v| v.get("resend")).and_then(|v| v.get("alternatives"));
+            if step_provider.or(provider).or(channel).and_then(Value::as_array).is_some_and(|v| !v.is_empty()) {
+                return error(StatusCode::UNPROCESSABLE_ENTITY, "Resend does not support email alternatives", "Unprocessable Entity");
+            }
+        }
         let actor = match object.get("actor") {
             None | Some(Value::Null) => None,
             Some(value) => match novu_rust_contracts::recipients::normalize(value) {
