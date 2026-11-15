@@ -30,6 +30,13 @@ fn run(url: &str, env: &str, check: &str) -> Output {
         }
         _ => {}
     }
+    if check == "both" {
+        cmd.env("SWALLOW_ALERT_SLACK_COOLDOWN_GRACE_SECONDS", "60")
+            .env("SWALLOW_ALERT_EMAIL_TO", "recipient@example.test")
+            .env("SWALLOW_ALERT_EMAIL_TARGET_ID", "email-conflict")
+            .env("NOVU_RESEND_FROM", "sender@example.test")
+            .env("NOVU_RESEND_API_KEY", "re_test_only");
+    }
     cmd.output().unwrap()
 }
 #[tokio::test]
@@ -60,6 +67,24 @@ async fn target_binding_denies_other_checks_and_enforces_role_scope() {
     assert!(!invalid.status.success());
     let before: i64 = db.query_one("SELECT count(*) FROM public.novu_rust_alert_shared_check_bindings WHERE environment_id=$1", &[&env]).await.unwrap().get(0);
     assert_eq!(before, 0, "invalid thresholds must not persist a binding");
+    db.execute("INSERT INTO public.novu_rust_alert_shared_check_bindings(environment_id,channel,target_id,check_name) VALUES ($1,'email','email-conflict','failed-jobs')", &[&env]).await.unwrap();
+    let both = run(role_url.as_str(), &env, "both");
+    assert!(!both.status.success());
+    assert!(String::from_utf8_lossy(&both.stderr).contains("shared alert check binding failed"));
+    let partial: i64 = db.query_one("SELECT count(*) FROM public.novu_rust_alert_shared_check_bindings WHERE environment_id=$1 AND channel='slack'", &[&env]).await.unwrap().get(0);
+    assert_eq!(
+        partial, 0,
+        "email conflict must roll back the Slack binding"
+    );
+    db.execute("DELETE FROM public.novu_rust_alert_shared_check_bindings WHERE environment_id=$1 AND channel='email' AND target_id='email-conflict'", &[&env]).await.unwrap();
+    let both_ok = run(role_url.as_str(), &env, "both");
+    assert!(
+        both_ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&both_ok.stderr)
+    );
+    let registered: i64 = db.query_one("SELECT count(*) FROM public.novu_rust_alert_shared_check_bindings WHERE environment_id=$1 AND check_name='slack-cooldown'", &[&env]).await.unwrap().get(0);
+    assert_eq!(registered, 2);
     let ok = run(role_url.as_str(), &env, "slack");
     assert!(
         ok.status.success(),
