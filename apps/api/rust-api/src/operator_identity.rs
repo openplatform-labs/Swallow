@@ -58,6 +58,7 @@ enum Lookup {
     TriggerGrantRead,
     TriggerGrantRequest,
     TriggerGrantAudit,
+    ExecutionAudit,
     WorkflowRead,
     WorkflowAudit,
     WorkflowRequest,
@@ -572,6 +573,7 @@ pub(super) async fn workflow_trigger_result(
 ) -> Response {query(db,headers,uri,verifier,Lookup::TriggerResult).await}
 pub(super) async fn trigger_grant_read(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {query(db,headers,uri,verifier,Lookup::TriggerGrantRead).await}
 pub(super) async fn trigger_grant_request(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {query(db,headers,uri,verifier,Lookup::TriggerGrantRequest).await}
+pub(super) async fn execution_audit(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {query(db,headers,uri,verifier,Lookup::ExecutionAudit).await}
 pub(super) async fn trigger_grant_audit(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {query(db,headers,uri,verifier,Lookup::TriggerGrantAudit).await}
 pub(super) async fn sendgrid_jobs(
     State(db): State<Arc<Client>>,
@@ -2548,7 +2550,7 @@ async fn query(
         Lookup::SubscriberCreateRequest => &["environmentId", "requestId"],
         Lookup::SubscriberDeleteRequest => &["environmentId", "requestId"],
         Lookup::SubscriberGrantRequest | Lookup::TriggerGrantRequest => &["environmentId", "requestId"],
-        Lookup::SubscriberGrantAudit | Lookup::TriggerGrantAudit => &["environmentId", "after"],
+        Lookup::SubscriberGrantAudit | Lookup::TriggerGrantAudit | Lookup::ExecutionAudit => &["environmentId", "after"],
         Lookup::SubscriberActivityAudit => &["environmentId", "kind", "after"],
         Lookup::SubscriberGrantRead | Lookup::TriggerGrantRead => &[
             "environmentId",
@@ -2926,7 +2928,7 @@ async fn query(
             };
             guarded_query(&db, &identity, "SELECT public.novu_rust_operator_jwt_subscriber_activity_read($1,$2,$3,$4,$5,$6,$7)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&kind,&after]).await
         }
-        Lookup::SubscriberGrantAudit | Lookup::TriggerGrantAudit => {
+        Lookup::SubscriberGrantAudit | Lookup::TriggerGrantAudit | Lookup::ExecutionAudit => {
             let after = match params.get("after") {
                 Some(value) => match Uuid::parse_str(value) {
                     Ok(id) => Some(id),
@@ -2936,7 +2938,7 @@ async fn query(
                 },
                 None => None,
             };
-            guarded_query(&db, &identity, if matches!(lookup,Lookup::TriggerGrantAudit) {"SELECT public.novu_rust_operator_jwt_trigger_grant_audit_read($1,$2,$3,$4,$5,$6)"} else {"SELECT public.novu_rust_operator_jwt_subscriber_grant_audit_read($1,$2,$3,$4,$5,$6)"},&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&after]).await
+            guarded_query(&db, &identity, if matches!(lookup,Lookup::ExecutionAudit) {"SELECT public.novu_rust_operator_jwt_execution_audit_read($1,$2,$3,$4,$5,$6)"} else if matches!(lookup,Lookup::TriggerGrantAudit) {"SELECT public.novu_rust_operator_jwt_trigger_grant_audit_read($1,$2,$3,$4,$5,$6)"} else {"SELECT public.novu_rust_operator_jwt_subscriber_grant_audit_read($1,$2,$3,$4,$5,$6)"},&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&after]).await
         }
         Lookup::SubscriberGrantRequest | Lookup::TriggerGrantRequest => {
             let Some(request) = params
