@@ -229,6 +229,92 @@ async fn verifies_token_mapping_scope_revocation_and_expiry() {
         .unwrap()
         .get::<_, i64>(0);
     assert_eq!(audit_count, 2);
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let path = std::env::temp_dir().join(format!("swallow-revocation-{}", Uuid::new_v4()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        write!(file,"{}",json!({"issuer":"https://issuer.test","subject":"user-1","client_id":"console","jti":"cli-fixture","reason":"fixture CLI"})).unwrap();
+        drop(file);
+        let admin_url = url.replacen("postgres://postgres@", "postgres://jwt_revoke_admin@", 1);
+        let run = || async {
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_operator-token-admin"))
+                .env_clear()
+                .env("DATABASE_URL", &admin_url)
+                .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+                .arg("revoke")
+                .arg(&path)
+                .output()
+                .await
+                .unwrap()
+        };
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!run().await.status.success());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = path.with_extension("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        let link_result = tokio::process::Command::new(env!("CARGO_BIN_EXE_operator-token-admin"))
+            .env_clear()
+            .env("DATABASE_URL", &admin_url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .arg("revoke")
+            .arg(&link)
+            .output()
+            .await
+            .unwrap();
+        assert!(!link_result.status.success());
+        std::fs::remove_file(link).unwrap();
+        let output = run().await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.stdout).unwrap()["created"],
+            true
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("cli-fixture"));
+        let cli_token = token_with_id("user-1", "console", now + 120, "cli-fixture");
+        assert_eq!(
+            guarded
+                .clone()
+                .oneshot(request(&cli_token, "environmentId=jwt-a"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let reader_url = url.replacen("postgres://postgres@", "postgres://jwt_revoke_reader@", 1);
+        let audit = tokio::process::Command::new(env!("CARGO_BIN_EXE_operator-token-admin"))
+            .env_clear()
+            .env("DATABASE_URL", reader_url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .arg("audit")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            audit.status.success(),
+            "{}",
+            String::from_utf8_lossy(&audit.stderr)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&audit.stdout).unwrap()["data"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(!String::from_utf8_lossy(&audit.stdout).contains("cli-fixture"));
+        std::fs::remove_file(path).unwrap();
+    }
     let mut locking_admin =
         connect(&url.replacen("postgres://postgres@", "postgres://jwt_revoke_admin@", 1)).await;
     let tx = locking_admin.transaction().await.unwrap();
