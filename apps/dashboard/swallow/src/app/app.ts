@@ -307,7 +307,7 @@ export class App implements OnDestroy {
   private activityAuditHistory:(string|null)[]=[null];
   private activityAuditSequence=0;
   private activityAuditAbort:AbortController|null=null;
-  grantAuditScope:'workflow'|'subscriber'='workflow';
+  grantAuditScope:'workflow'|'subscriber'|'channel'='workflow';
   readonly grantAuditStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');
   readonly grantAuditRows=signal<GrantAudit[]>([]);
   readonly grantAuditNext=signal<string|null>(null);
@@ -316,7 +316,7 @@ export class App implements OnDestroy {
   private grantAuditSequence=0;
   private grantAuditAbort:AbortController|null=null;
   grantRequestId='';
-  grantRequestScope:'workflow'|'subscriber'='workflow';
+  grantRequestScope:'workflow'|'subscriber'|'channel'='workflow';
   readonly grantRequestStatus=signal<'idle'|'loading'|'found'|'missing'|'error'>('idle');
   readonly grantRequestRecord=signal<GrantRecord|null>(null);
   private grantRequestSequence=0;
@@ -537,14 +537,14 @@ export class App implements OnDestroy {
     try {
       const key=this.permissionKey.trim(),environment=this.permissionEnvironment.trim(),scope=this.grantAuditScope;if(!this.validJwt(key)||!this.validEnvironment(environment))throw new Error('invalid input');
       const params=new URLSearchParams({environmentId:environment});if(cursor)params.set('after',cursor);
-      const response=await fetch(`${this.validatedOrigin()}/v1/experimental/operator/${scope==='subscriber'?'subscriber-grants':'workflow-grants'}/audit?${params}`,{headers:{Authorization:`Bearer ${key}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      const response=await fetch(`${this.validatedOrigin()}/v1/experimental/operator/${scope==='subscriber'?'subscriber-grants':scope==='channel'?'channel-access-grants':'workflow-grants'}/audit?${params}`,{headers:{Authorization:`Bearer ${key}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
       if(!response.ok)throw new Error('request failed');const value:unknown=await response.json();
       if(typeof value!=='object'||value===null)throw new Error('invalid response');const result=value as Record<string,unknown>;
       if(!Array.isArray(result['data'])||result['data'].length>50||typeof result['hasMore']!=='boolean'||!(result['next']===null||typeof result['next']==='string'))throw new Error('invalid response');
       const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
       const rows:GrantAudit[]=result['data'].map((entry:unknown)=>{
         if(typeof entry!=='object'||entry===null)throw new Error('invalid row');const r=entry as Record<string,unknown>;
-        if(['id','actorIssuer','actorSubject','actorClientId','databasePrincipal','requestId','targetIssuer','targetSubject','targetClientId','resource','permission','reason','recordedAt'].some(k=>typeof r[k]!=='string')||!uuid.test(r['id'] as string)||!uuid.test(r['requestId'] as string)||typeof r['previous']!=='boolean'||typeof r['current']!=='boolean'||!(scope==='subscriber'?/^subscriber:(read|write|create|delete)$/.test(`${r['resource']}:${r['permission']}`):(/^(email|sms|push|slack|email-provider):(read|write)$/.test(`${r['resource']}:${r['permission']}`)||`${r['resource']}:${r['permission']}`==='audit:read')))throw new Error('invalid row');
+        if(['id','actorIssuer','actorSubject','actorClientId','databasePrincipal','requestId','targetIssuer','targetSubject','targetClientId','resource','permission','reason','recordedAt'].some(k=>typeof r[k]!=='string')||!uuid.test(r['id'] as string)||!uuid.test(r['requestId'] as string)||typeof r['previous']!=='boolean'||typeof r['current']!=='boolean'||!(scope==='subscriber'?/^subscriber:(read|write|create|delete)$/.test(`${r['resource']}:${r['permission']}`):scope==='channel'?/^(sendgrid|resend|twilio|fcm|slack):(result|jobs)$/.test(`${r['resource']}:${r['permission']}`):(/^(email|sms|push|slack|email-provider):(read|write)$/.test(`${r['resource']}:${r['permission']}`)||`${r['resource']}:${r['permission']}`==='audit:read')))throw new Error('invalid row');
         return {id:r['id'] as string,actorIssuer:r['actorIssuer'] as string,actorSubject:r['actorSubject'] as string,actorClientId:r['actorClientId'] as string,databasePrincipal:r['databasePrincipal'] as string,requestId:r['requestId'] as string,targetIssuer:r['targetIssuer'] as string,targetSubject:r['targetSubject'] as string,targetClientId:r['targetClientId'] as string,resource:r['resource'] as string,permission:r['permission'] as string,previous:r['previous'],current:r['current'],reason:r['reason'] as string,recordedAt:r['recordedAt'] as string};
       });
       const ids=rows.map(r=>r.id.toLowerCase());if(ids.some((id,i)=>(i>0&&ids[i-1]>=id)||(!!cursor&&id<=cursor.toLowerCase()))||(result['hasMore']?rows.length!==50||typeof result['next']!=='string'||result['next'].toLowerCase()!==ids[ids.length-1]:result['next']!==null))throw new Error('invalid page');
@@ -568,7 +568,7 @@ export class App implements OnDestroy {
     this.grantReason='';this.grantConfirmed=false;this.grantRetryConfirmed=false;
   }
   private grantSelection():[string,string] {
-    if(!/^(email|sms|push|slack|email-provider):(read|write)$/.test(this.grantKind) && !/^subscriber:(read|write|create|delete)$/.test(this.grantKind) && this.grantKind!=='audit:read')throw new Error('invalid grant');
+    if(!/^(email|sms|push|slack|email-provider):(read|write)$/.test(this.grantKind) && !/^subscriber:(read|write|create|delete)$/.test(this.grantKind) && !/^(sendgrid|resend|twilio|fcm|slack):(result|jobs)$/.test(this.grantKind) && this.grantKind!=='audit:read')throw new Error('invalid grant');
     const [resource,permission]=this.grantKind.split(':');return [resource,permission];
   }
   private grantInputs():{origin:string;key:string;environment:string;targetIssuer:string;targetSubject:string;targetClientId:string;resource:string;permission:string} {
@@ -586,7 +586,7 @@ export class App implements OnDestroy {
     try {
       const {origin,key,environment,targetIssuer,targetSubject,targetClientId,resource,permission}=this.grantInputs();
       const params=new URLSearchParams({environmentId:environment,targetIssuer,targetSubject,targetClientId,permission});if(resource!=='subscriber')params.set('resource',resource);
-      const response=await fetch(`${origin}/v1/experimental/operator/${resource==='subscriber'?'subscriber-grants':'workflow-grants'}?${params}`,{headers:{Authorization:`Bearer ${key}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      const response=await fetch(`${origin}/v1/experimental/operator/${resource==='subscriber'?'subscriber-grants':(permission==='result'||permission==='jobs')?'channel-access-grants':'workflow-grants'}?${params}`,{headers:{Authorization:`Bearer ${key}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
       if(!response.ok)throw new Error('request failed');const value:unknown=await response.json();
       if(typeof value!=='object'||value===null||!('targetExists' in value)||typeof value.targetExists!=='boolean'||!('granted' in value)||typeof value.granted!=='boolean')throw new Error('invalid response');
       this.expireOidcIfNeeded();if(sequence!==this.grantSequence)return;
@@ -604,7 +604,7 @@ export class App implements OnDestroy {
     let input:ReturnType<App['grantInputs']>;let requestId:string;
     try {input=this.grantInputs();requestId=crypto.randomUUID();}catch{this.grantChangeStatus.set('unavailable');return;}
     const {origin,key,environment,targetIssuer,targetSubject,targetClientId,resource,permission}=input;
-    const body:GrantBody={requestId,targetIssuer,targetSubject,targetClientId,...(resource==='subscriber'?{}:{resource}),permission,expected:this.grantValue()!,desired:this.grantDesired,reason:this.grantReason.trim()};this.grantRequestScope=resource==='subscriber'?'subscriber':'workflow';
+    const body:GrantBody={requestId,targetIssuer,targetSubject,targetClientId,...(resource==='subscriber'?{}:{resource}),permission,expected:this.grantValue()!,desired:this.grantDesired,reason:this.grantReason.trim()};this.grantRequestScope=resource==='subscriber'?'subscriber':(permission==='result'||permission==='jobs')?'channel':'workflow';
     this.grantChangeStatus.set('sending');this.grantMessage.set('');
     try {
       let keyHash:string;try{keyHash=await this.credentialFingerprint(key);}catch{this.grantChangeStatus.set('unavailable');return;}
@@ -616,7 +616,7 @@ export class App implements OnDestroy {
   }
   private async sendGrant(key:string,snapshot:GrantSnapshot,retry=false):Promise<void> {
     const params=new URLSearchParams({environmentId:snapshot.environment});
-    const response=await fetch(`${snapshot.origin}/v1/experimental/operator/${snapshot.body.resource===undefined?'subscriber-grants':'workflow-grants'}?${params}`,{method:'PUT',headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},body:JSON.stringify(snapshot.body),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
+    const response=await fetch(`${snapshot.origin}/v1/experimental/operator/${snapshot.body.resource===undefined?'subscriber-grants':(snapshot.body.permission==='result'||snapshot.body.permission==='jobs')?'channel-access-grants':'workflow-grants'}?${params}`,{method:'PUT',headers:{Authorization:`Bearer ${key}`,'Content-Type':'application/json'},body:JSON.stringify(snapshot.body),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
     if(!response.ok){this.grantChangeStatus.set(!retry&&[400,401,403,409].includes(response.status)?'rejected':'unknown');if(retry)this.grantMessage.set('재제출이 거절되거나 실패했습니다. 원래 요청의 결과는 여전히 불명확합니다.');return;}
     const value:unknown=await response.json();
     if(typeof value!=='object'||value===null||!('changed' in value)||typeof value.changed!=='boolean'||!('replayed' in value)||typeof value.replayed!=='boolean'||!('requestId' in value)||value.requestId!==snapshot.body.requestId)throw new Error('invalid response');
@@ -641,13 +641,13 @@ export class App implements OnDestroy {
     const controller=new AbortController();this.grantRequestAbort=controller;this.grantRequestStatus.set('loading');
     try {
       const params=new URLSearchParams({environmentId:environment,requestId});
-      const response=await fetch(`${this.validatedOrigin()}/v1/experimental/operator/${scope==='subscriber'?'subscriber-grants':'workflow-grants'}/request?${params}`,{headers:{Authorization:`Bearer ${key}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
+      const response=await fetch(`${this.validatedOrigin()}/v1/experimental/operator/${scope==='subscriber'?'subscriber-grants':scope==='channel'?'channel-access-grants':'workflow-grants'}/request?${params}`,{headers:{Authorization:`Bearer ${key}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});
       if(!response.ok)throw new Error('request failed');const value:unknown=await response.json();
       if(typeof value!=='object'||value===null||!('found' in value)||typeof value.found!=='boolean')throw new Error('invalid response');
       this.expireOidcIfNeeded();if(sequence!==this.grantRequestSequence)return;
       if(!value.found){this.grantRequestStatus.set('missing');return;}
       const r=value as Record<string,unknown>;
-      if(typeof r['requestId']!=='string'||r['requestId'].toLowerCase()!==requestId.toLowerCase()||['targetIssuer','targetSubject','targetClientId','permission','reason','createdAt'].some(k=>typeof r[k]!=='string')||(scope==='workflow'&&typeof r['resource']!=='string')||['expected','desired','changed'].some(k=>typeof r[k]!=='boolean'))throw new Error('invalid response');
+      if(typeof r['requestId']!=='string'||r['requestId'].toLowerCase()!==requestId.toLowerCase()||['targetIssuer','targetSubject','targetClientId','permission','reason','createdAt'].some(k=>typeof r[k]!=='string')||(scope!=='subscriber'&&typeof r['resource']!=='string')||['expected','desired','changed'].some(k=>typeof r[k]!=='boolean'))throw new Error('invalid response');
       this.grantRequestRecord.set({requestId:r['requestId'] as string,targetIssuer:r['targetIssuer'] as string,targetSubject:r['targetSubject'] as string,targetClientId:r['targetClientId'] as string,resource:scope==='subscriber'?'subscriber':r['resource'] as string,permission:r['permission'] as string,expected:r['expected'] as boolean,desired:r['desired'] as boolean,reason:r['reason'] as string,changed:r['changed'] as boolean,createdAt:r['createdAt'] as string});this.grantRequestStatus.set('found');
     }catch{this.expireOidcIfNeeded();if(sequence===this.grantRequestSequence)this.grantRequestStatus.set('error');}
     finally{if(sequence===this.grantRequestSequence)this.grantRequestAbort=null;}
