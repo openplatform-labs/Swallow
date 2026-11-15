@@ -11,7 +11,7 @@ describe('workflow trigger',()=>{
     const {fixture,c}=setup();c.payload='{"name":"Lee"}';await c.submit();fixture.detectChanges();
     const [url,options]=fetcher.mock.calls[0];expect(url).toBe('https://api.example.test/v1/events/trigger');expect(options).toMatchObject({method:'POST',headers:{Authorization:'ApiKey test-key','Content-Type':'application/json'},credentials:'omit',redirect:'error',cache:'no-store'});
     expect(JSON.parse(options!.body as string)).toEqual({name:'welcome',to:'person',payload:{name:'Lee'},transactionId:id,overrides:{providers:{sendgrid:{mailSettings:{sandboxMode:{enable:true}}}}}});
-    expect(c.status()).toBe('accepted');expect(fixture.nativeElement.textContent).toContain('다른 이메일 공급자는 실제로 실행될 수 있습니다');await c.submit();expect(fetcher).toHaveBeenCalledTimes(1);fixture.destroy();
+    expect(c.status()).toBe('accepted');expect(fixture.nativeElement.textContent).toContain('다른 이메일 공급자는 실제로 실행될 수 있습니다');expect(fixture.nativeElement.textContent).toContain('새 구독자로 생성될 수 있으며');await c.submit();expect(fetcher).toHaveBeenCalledTimes(1);fixture.destroy();
   });
   it('sends a normal trigger only when selected and prevents automatic retries on uncertain responses',async()=>{
     const id='22222222-2222-4222-8222-222222222222';vi.spyOn(crypto,'randomUUID').mockReturnValue(id);
