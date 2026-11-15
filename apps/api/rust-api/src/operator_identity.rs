@@ -26,6 +26,7 @@ enum Lookup {
     ResendAutoHealthJobs,
     ResendAutoHealth,
     SlackCooldownHealth,
+    FcmCooldownHealth,
     TwilioDelayedHealth,
     FcmPartialHealth,
     FcmPartialJobs,
@@ -367,6 +368,15 @@ pub(super) async fn slack_cooldown_health(
     verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
 ) -> Response {
     query(db, headers, uri, verifier, Lookup::SlackCooldownHealth).await
+}
+
+pub(super) async fn fcm_cooldown_health(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+) -> Response {
+    query(db, headers, uri, verifier, Lookup::FcmCooldownHealth).await
 }
 
 pub(super) async fn twilio_delayed_health(
@@ -1660,7 +1670,7 @@ async fn query(
         | Lookup::FcmResult
         | Lookup::SlackResult
         | Lookup::SendgridResult => &["environmentId", "jobId"],
-        Lookup::ResendAutoHealth | Lookup::SlackCooldownHealth | Lookup::TwilioDelayedHealth => &["environmentId", "graceSeconds"],
+        Lookup::ResendAutoHealth | Lookup::SlackCooldownHealth | Lookup::FcmCooldownHealth | Lookup::TwilioDelayedHealth => &["environmentId", "graceSeconds"],
         Lookup::FcmPartialHealth => &["environmentId", "windowSeconds"],
         Lookup::FcmPartialJobs => &["environmentId", "windowSeconds", "after"],
         Lookup::FcmUnreviewed => &["environmentId", "after"],
@@ -1790,6 +1800,29 @@ async fn query(
                 &db,
                 &identity,
                 "SELECT public.novu_rust_operator_jwt_slack_cooldown_health($1,$2,$3,$4,$5,$6)",
+                &[
+                    &identity.issuer,
+                    &identity.subject,
+                    &identity.client_id,
+                    &env,
+                    &exp,
+                    &grace,
+                ],
+            )
+            .await
+        }
+        Lookup::FcmCooldownHealth => {
+            let Some(grace) = params.get("graceSeconds").and_then(|v| {
+                v.parse::<i32>()
+                    .ok()
+                    .filter(|n| (1..=86400).contains(n) && n.to_string() == *v)
+            }) else {
+                return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+            };
+            guarded_query(
+                &db,
+                &identity,
+                "SELECT public.novu_rust_operator_jwt_fcm_cooldown_health($1,$2,$3,$4,$5,$6)",
                 &[
                     &identity.issuer,
                     &identity.subject,

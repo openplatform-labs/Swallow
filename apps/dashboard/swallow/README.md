@@ -1,5 +1,8 @@
 ## Slack 429 지연 재시도 화면
 
+The FCM results panel displays the shared cooldown's active state, end time, fallback and deferred/overdue job counts using the independent operator JWT and DB `alert_view` grants. Apply API `0108` after worker `0188`–`0190`. This aggregate does not prove that every worker uses the policy or that devices received pushes. A local browser with restricted API and disposable PostgreSQL verified display and clearing after permission revocation; real IdP and production HA remain unverified.
+
+
 
 The existing permission settings screen supports delegated FCM partial-failure `health`, `recent-list`, `unreviewed`, and `review` JWT grants, as well as request lookup and independently authorized grant audit. It uses the existing prepare/confirm and same-request recovery flow. API migration `0107` and separate FCM grant administrator/audit-viewer provisioning are required; granting a JWT permission does not provision the API DB login's `alert_view` or `queue_ack` right. The target identity must already exist and self-changes are denied. A local browser with a restricted API and disposable PostgreSQL exercised grant, audit and revoke; Angular tests cover all four permission types and endpoint routing. Real IdP, production HA and direct DBA operations remain outside that validation.
 

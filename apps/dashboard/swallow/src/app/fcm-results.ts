@@ -1,6 +1,7 @@
 import { Component, EventEmitter, Input, OnChanges, OnDestroy, Output, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { validChannelPage } from './channel-page';
+type FcmCooldown={active:boolean;notBefore:string|null;fallbackSeconds:number;deferred:number;overdue:number};
 type ReviewJob={jobId:string;acceptedCount:number;rejectedCount:number;revision:string};
 type ReviewRequest={requestId:string;jobId:string;revision:string;reason:string};
 type PartialJob={jobId:string;acceptedCount:number;rejectedCount:number};
@@ -14,13 +15,22 @@ export class FcmResults implements OnChanges,OnDestroy {
   readonly reviewStatus=signal<'idle'|'prepared'|'sending'|'recorded'|'unknown'|'unavailable'>('idle');readonly reviewSnapshot=signal<ReviewRequest|null>(null);readonly reviewRecorded=signal<boolean|null>(null);readonly reviewMessage=signal('');
   readonly reviewLookupStatus=signal<'idle'|'loading'|'found'|'not-found'|'error'>('idle');readonly reviewLookupRecord=signal<(ReviewRequest & {recorded:boolean})|null>(null);
   private reviewSequence=0;private reviewAbort:AbortController|null=null;private reviewLookupSequence=0;private reviewLookupAbort:AbortController|null=null;private reviewToken:string|null=null;private reviewOrigin:string|null=null;private reviewEnvironment:string|null=null;
+  cooldownGraceSeconds=300;readonly cooldownStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');readonly cooldownHealth=signal<FcmCooldown|null>(null);private cooldownSequence=0;private cooldownAbort:AbortController|null=null;
   jobId=''; readonly rows=signal<Result[]>([]); readonly result=signal<Result|null>(null); readonly next=signal<string|null>(null);
   readonly listStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');readonly resultStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');
   readonly partialRows=signal<PartialJob[]>([]); readonly partialNext=signal<string|null>(null); readonly partialListStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle'); private partialListSequence=0; private partialListAbort:AbortController|null=null;
   windowSeconds=3600; readonly partialCount=signal<number|null>(null); readonly partialStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle'); private partialSequence=0; private partialAbort:AbortController|null=null;
   private listSequence=0;private resultSequence=0;private listAbort:AbortController|null=null;private resultAbort:AbortController|null=null;
   ngOnChanges():void {this.clear();} ngOnDestroy():void {this.clear();this.token='';}
-  clear():void {this.clearReview();this.clearPartial();this.listSequence++;this.resultSequence++;this.listAbort?.abort();this.resultAbort?.abort();this.listAbort=null;this.resultAbort=null;this.rows.set([]);this.result.set(null);this.next.set(null);this.listStatus.set('idle');this.resultStatus.set('idle');this.jobId='';}
+  clear():void {this.clearCooldown();this.clearReview();this.clearPartial();this.listSequence++;this.resultSequence++;this.listAbort?.abort();this.resultAbort?.abort();this.listAbort=null;this.resultAbort=null;this.rows.set([]);this.result.set(null);this.next.set(null);this.listStatus.set('idle');this.resultStatus.set('idle');this.jobId='';}
+  clearCooldown():void {this.cooldownSequence++;this.cooldownAbort?.abort();this.cooldownAbort=null;this.cooldownHealth.set(null);this.cooldownStatus.set('idle');}
+  async loadCooldown():Promise<void> {this.clearCooldown();const seq=this.cooldownSequence,controller=new AbortController();this.cooldownAbort=controller;this.cooldownStatus.set('loading');
+    try {const params=this.params(),grace=this.cooldownGraceSeconds;if(!Number.isInteger(grace)||grace<1||grace>86400)throw new Error('input');params.set('graceSeconds',String(grace));
+      const response=await fetch(`${this.origin()}/v1/experimental/operator/fcm-cooldown-health?${params}`,{headers:{Authorization:`Bearer ${this.token.trim()}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});if(!response.ok)throw new Error('request');const value:unknown=await response.json();if(!value||typeof value!=='object')throw new Error('response');const row=value as Record<string,unknown>;
+      if(typeof row['active']!=='boolean'||!(row['notBefore']===null||(typeof row['notBefore']==='string'&&row['notBefore'].length>0&&row['notBefore'].length<=128))||(row['active']&&row['notBefore']===null)||!Number.isSafeInteger(row['fallbackSeconds'])||(row['fallbackSeconds'] as number)<60||(row['fallbackSeconds'] as number)>86400||['deferred','overdue'].some(k=>!Number.isSafeInteger(row[k])||(row[k] as number)<0)||(row['overdue'] as number)>(row['deferred'] as number))throw new Error('response');
+      if(seq!==this.cooldownSequence)return;this.cooldownHealth.set({active:row['active'],notBefore:row['notBefore'] as string|null,fallbackSeconds:row['fallbackSeconds'] as number,deferred:row['deferred'] as number,overdue:row['overdue'] as number});this.cooldownStatus.set('loaded');
+    }catch{if(seq===this.cooldownSequence){this.cooldownHealth.set(null);this.cooldownStatus.set('error');}}finally{if(seq===this.cooldownSequence)this.cooldownAbort=null;}
+  }
   clearReviewList():void {this.reviewListSequence++;this.reviewListAbort?.abort();this.reviewListAbort=null;this.reviewRows.set([]);this.reviewNext.set(null);this.reviewListStatus.set('idle');}
   clearReviewLookup():void {this.reviewLookupSequence++;this.reviewLookupAbort?.abort();this.reviewLookupAbort=null;this.reviewLookupRecord.set(null);this.reviewLookupStatus.set('idle');}
   clearReview():void {this.clearReviewList();this.clearReviewLookup();this.reviewToken=null;this.reviewOrigin=null;this.reviewEnvironment=null;this.reviewConfirmed=false;this.reviewRetryConfirmed=false;this.reviewResetConfirmed=false;if(this.reviewStatus()==='sending'){this.reviewSequence++;this.reviewAbort?.abort();this.reviewAbort=null;this.reviewStatus.set('unknown');this.busyChange.emit(false);}else if(['prepared','recorded','unavailable'].includes(this.reviewStatus())){this.reviewStatus.set('idle');this.reviewSnapshot.set(null);this.reviewReason='';this.reviewLookupId='';this.reviewRecorded.set(null);}}
