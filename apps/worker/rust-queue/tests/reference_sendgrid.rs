@@ -88,6 +88,16 @@ fn original_sendgrid_wire_body() {
         }],
         ..Email::default()
     };
+    let multi_alternatives = Email {
+        to: vec!["a@example.test".into()], subject: "Hi".into(), html: "<p>Hi</p>".into(),
+        alternatives: vec![Alternative { content_type: "text/calendar; method=REQUEST".into(), content: "BEGIN:VCALENDAR".into() }, Alternative { content_type: "text/x-amp-html".into(), content: "<html amp4email></html>".into() }],
+        ..Email::default()
+    };
+    let empty_alternative = Email {
+        to: vec!["a@example.test".into()], subject: "Hi".into(), html: "<p>Hi</p>".into(), text: Some("".into()),
+        alternatives: vec![Alternative { content_type: "text/calendar".into(), content: "".into() }],
+        ..Email::default()
+    };
     let attachment = Email {
         to: vec!["a@example.test".into()],
         subject: "Hi".into(),
@@ -125,6 +135,8 @@ fn original_sendgrid_wire_body() {
             request_body(&config, &full).unwrap(),
             request_body(&config, &dynamic).unwrap(),
             request_body(&config, &alternative).unwrap(),
+            request_body(&config, &multi_alternatives).unwrap(),
+            request_body(&config, &empty_alternative).unwrap(),
             request_body(&config, &attachment).unwrap()
         ],
         original
