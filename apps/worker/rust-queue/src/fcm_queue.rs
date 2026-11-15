@@ -38,25 +38,32 @@ pub enum UnavailablePolicy {
     Continue,
     DelayKnown,
     DelayMinimum,
+    Exponential,
 }
 impl UnavailablePolicy {
     pub fn as_str(self) -> &'static str {
-        match self { Self::Continue => "continue", Self::DelayKnown => "delay-known", Self::DelayMinimum => "delay-minimum" }
+        match self { Self::Continue => "continue", Self::DelayKnown => "delay-known", Self::DelayMinimum => "delay-minimum", Self::Exponential => "exponential" }
     }
     pub fn from_env() -> Result<Self, &'static str> {
         match std::env::var("SWALLOW_FCM_MULTICAST_503_POLICY").as_deref() {
             Ok("continue") | Err(std::env::VarError::NotPresent) => Ok(Self::Continue),
             Ok("delay-known") => Ok(Self::DelayKnown),
             Ok("delay-minimum") => Ok(Self::DelayMinimum),
+            Ok("exponential") => Ok(Self::Exponential),
             _ => Err("invalid FCM multicast 503 policy"),
         }
     }
 }
-fn unavailable_delay(policy: UnavailablePolicy, retry_after: Option<i32>) -> i32 {
+fn unavailable_delay(policy: UnavailablePolicy, retry_after: Option<i32>, failures: u64, jitter: u32) -> i32 {
     match policy {
         UnavailablePolicy::Continue => 0,
         UnavailablePolicy::DelayKnown => retry_after.map(|seconds| seconds.max(10)).unwrap_or(0),
         UnavailablePolicy::DelayMinimum => retry_after.unwrap_or(0).max(10),
+        UnavailablePolicy::Exponential => {
+            let base = (10_i32 * (1_i32 << failures.saturating_sub(1).min(9))).min(3600);
+            let jittered = (base + (jitter % (base as u32 / 4 + 1)) as i32).min(3600);
+            retry_after.unwrap_or(0).max(jittered)
+        },
     }
 }
 
@@ -1135,7 +1142,14 @@ async fn process_one_inner(
             refresh_group(&tx, environment, job.id, history_index, group_size).await?;
         }
         if attempted.len() + 1 < messages.len() {
-            let delay = if status == Some(503) { unavailable_delay(unavailable_policy, retry_after) } else { continuation_delay(rate_limit_policy, retry_after, header_missing) };
+            let delay = if status == Some(503) {
+                let failures = if unavailable_policy == UnavailablePolicy::Exponential {
+                    tx.query_one("SELECT count(*) FROM public.novu_rust_fcm_attempts WHERE job_id=$1 AND environment_id=$2 AND http_status=503", &[&job.id,&environment]).await?.get::<_,i64>(0) as u64
+                } else { 1 };
+                let random = Uuid::new_v4();
+                let jitter = u32::from_le_bytes(random.as_bytes()[..4].try_into().expect("UUID bytes"));
+                unavailable_delay(unavailable_policy, retry_after, failures, jitter)
+            } else { continuation_delay(rate_limit_policy, retry_after, header_missing) };
             tx.execute("UPDATE novu_queue_jobs SET status='pending',available_at=clock_timestamp()+make_interval(secs=>$3::integer::double precision),lease_token=NULL,lease_until=NULL WHERE id=$1 AND lease_token=$2",&[&job.id,&job.lease_token,&delay]).await?;
         } else {
             finish(&tx, &job).await?;
@@ -1161,6 +1175,17 @@ pub async fn recover_expired(client: &mut Client, environment: &str) -> Result<u
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exponential_503_delay_is_bounded_jittered_and_honors_advice() {
+        use super::{UnavailablePolicy, unavailable_delay};
+        let p=UnavailablePolicy::Exponential;
+        assert_eq!(unavailable_delay(p,None,1,0),10);
+        assert_eq!(unavailable_delay(p,None,1,2),12);
+        assert_eq!(unavailable_delay(p,None,2,0),20);
+        assert_eq!(unavailable_delay(p,Some(120),2,0),120);
+        assert_eq!(unavailable_delay(p,None,100,u32::MAX),3600);
+        assert_eq!(unavailable_delay(p,Some(86400),100,0),86400);
+    }
     #[test]
     fn continuation_respects_selected_policy_and_known_advice() {
         use super::{RateLimitPolicy, continuation_delay};
@@ -2321,6 +2346,23 @@ mod tests {
             assert_eq!(row.get::<_,String>(0), "failed");
             assert_eq!(row.get::<_,i64>(1), 2);
         }
+
+        // Each failed target is attempted once; repeated 503s increase the wait.
+        let exp_job = Uuid::new_v4();
+        let exp_payload = json!({"title":"Hi","content":"Hello","targets":["a","b","c"]});
+        crate::enqueue(&db, exp_job, "exp-test", JOB_KIND, &exp_payload).await.unwrap();
+        let (exp_provider, exp_server) = mock_with_headers(vec![503, 503, 200], "").await;
+        for (lo,hi) in [(8,13),(18,26)] {
+            assert!(process_one_with_unavailable_policy(&mut db,"exp-test",Some(&exp_provider),None,false,crate::push_step_policy::Policy::Snapshot,crate::push_step_policy::PreferencePolicy::Snapshot,crate::push_step_policy::TargetPolicy::Reference,RateLimitPolicy::Continue,UnavailablePolicy::Exponential,false).await.unwrap());
+            let row=db.query_one("SELECT available_at>clock_timestamp()+make_interval(secs=>$2::double precision),available_at<clock_timestamp()+make_interval(secs=>$3::double precision) FROM public.novu_queue_jobs WHERE id=$1", &[&exp_job,&(lo as f64),&(hi as f64)]).await.unwrap();
+            assert!(row.get::<_,bool>(0) && row.get::<_,bool>(1));
+            assert!(!process_one(&mut other_db,"exp-test",&exp_provider).await.unwrap());
+            db.execute("UPDATE public.novu_queue_jobs SET available_at=clock_timestamp()-interval '1 second' WHERE id=$1", &[&exp_job]).await.unwrap();
+        }
+        assert!(process_one(&mut other_db,"exp-test",&exp_provider).await.unwrap());
+        assert_eq!(exp_server.await.unwrap(), ["a","b","c"]);
+        let states=db.query("SELECT state FROM public.novu_rust_fcm_attempts WHERE job_id=$1 ORDER BY target_index", &[&exp_job]).await.unwrap();
+        assert_eq!(states.iter().map(|r|r.get::<_,String>(0)).collect::<Vec<_>>(),["unknown","unknown","accepted"]);
 
         // Shared cooldown fences another job before its first provider request.
         db.batch_execute("CREATE TABLE IF NOT EXISTS public.novu_rust_environments(id text PRIMARY KEY); INSERT INTO public.novu_rust_environments(id) VALUES('shared-fcm');").await.unwrap();

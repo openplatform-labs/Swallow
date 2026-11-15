@@ -39,7 +39,7 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
     }
     let (db, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(async move { driver.await.unwrap() });
-    db.batch_execute("INSERT INTO novu_rust_environments VALUES ('guard-env','org'),('map-env','org'),('pref-env','org'),('cool-env','org'),('rate-env','org'),('race-env','org'),('shared503-env','org'); INSERT INTO novu_rust_fcm_routing_workers SELECT e.id,r.rolname,r.oid FROM novu_rust_environments e CROSS JOIN pg_roles r WHERE r.rolname=session_user; INSERT INTO novu_rust_operator_grant_admins(environment_id,database_principal,principal_oid) SELECT 'guard-env',rolname,oid FROM pg_roles WHERE rolname=session_user").await.unwrap();
+    db.batch_execute("INSERT INTO novu_rust_environments VALUES ('guard-env','org'),('map-env','org'),('pref-env','org'),('cool-env','org'),('rate-env','org'),('race-env','org'),('shared503-env','org'),('exp-env','org'); INSERT INTO novu_rust_fcm_routing_workers SELECT e.id,r.rolname,r.oid FROM novu_rust_environments e CROSS JOIN pg_roles r WHERE r.rolname=session_user; INSERT INTO novu_rust_operator_grant_admins(environment_id,database_principal,principal_oid) SELECT 'guard-env',rolname,oid FROM pg_roles WHERE rolname=session_user").await.unwrap();
     db.batch_execute("INSERT INTO public.novu_rust_fcm_cooldown_policies(environment_id,fallback_seconds) VALUES ('guard-env',60),('cool-env',60),('shared503-env',60); INSERT INTO public.novu_rust_fcm_cooldown_workers SELECT e.id,r.rolname,r.oid FROM public.novu_rust_environments e CROSS JOIN pg_roles r WHERE e.id IN ('guard-env','cool-env','shared503-env') AND r.rolname=session_user").await.unwrap();
     let command = |env: &str, project: &str, token: &str| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_fcm-worker"));
@@ -141,6 +141,19 @@ async fn guarded_workers_match_routes_and_reset_requires_quiescence() {
     let row = db.query_one("SELECT multicast_429_policy,multicast_503_policy FROM public.novu_rust_push_workflow_worker_config WHERE environment_id='rate-env'", &[]).await.unwrap();
     assert_eq!(row.get::<_,String>(0), "delay-default");
     assert_eq!(row.get::<_,String>(1), "delay-minimum");
+    let mut exponential = Worker(command("exp-env", "project-a", "fixture-token")
+        .env("SWALLOW_FCM_MULTICAST_503_POLICY", "exponential").spawn().unwrap());
+    let mut exp_registered = false;
+    for _ in 0..100 {
+        exp_registered = db.query_opt("SELECT multicast_503_policy='exponential' FROM public.novu_rust_push_workflow_worker_config WHERE environment_id='exp-env'", &[]).await.unwrap().is_some_and(|r|r.get::<_,bool>(0));
+        if exp_registered { break; }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(exp_registered);
+    assert!(exponential.0.try_wait().unwrap().is_none());
+    let mismatch = command("exp-env", "project-a", "fixture-token").output().unwrap();
+    assert!(!mismatch.status.success());
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("multicast 429/503 policies"));
     // Competing first registrations cannot both claim different policy pairs.
     let mut race_a = Worker(command("race-env", "project-a", "fixture-token")
         .env("SWALLOW_FCM_MULTICAST_503_POLICY", "delay-known").spawn().unwrap());
