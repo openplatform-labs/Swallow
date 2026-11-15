@@ -9,6 +9,14 @@
 @else if(listStatus()==='loaded'){@if(rows().length===0){<p>조회된 작업이 없습니다.</p>}@else{<div class="table-wrap"><table class="table"><thead><tr><th>작업 UUID</th><th>상태</th><th>대기 시각</th><th>발송 시도</th><th>상세</th></tr></thead><tbody>@for(row of rows();track row.jobId){<tr><td>{{ row.jobId }}</td><td>{{ row.jobStatus }}</td><td>{{ row.availableAt }}</td><td>{{ row.attemptState || '없음' }} · HTTP {{ row.httpStatus ?? '—' }}</td><td><button type="button" class="btn btn-sm btn-outline" (click)="selectJob.emit(row.jobId)">발송 상세 보기</button></td></tr>}</tbody></table></div>}<p>{{ page() }} 페이지</p><button type="button" class="btn btn-sm btn-outline" [disabled]="page()<=1" (click)="list('previous')">이전</button><button type="button" class="btn btn-sm btn-outline" [disabled]="!next()" (click)="list('next')">다음</button>}
 </div></section>
 
+<section class="card decision-card" aria-labelledby="resend-cooldown-heading">
+  <h3 id="resend-cooldown-heading">Resend 공유 대기 상태</h3>
+  <p>선택한 환경의 조회 시점 상태입니다. 별도의 조회 권한과 공유 대기 정책이 필요합니다.</p>
+  <form class="decision-form" (ngSubmit)="loadResendCooldown()"><label for="resend-cooldown-grace">기준 시간(초)</label><input id="resend-cooldown-grace" name="resendCooldownGrace" type="number" min="1" max="86400" step="1" [(ngModel)]="resendCooldownGraceSeconds" (ngModelChange)="clearResendCooldown()" required><button type="submit" class="btn btn-outline" [disabled]="resendCooldownStatus()==='loading'">Resend 대기 상태 조회</button></form>
+  @if(resendCooldownStatus()==='error'){<p role="alert">조회하지 못했습니다. 권한, 정책 및 연결 상태를 확인하세요.</p>}
+  @if(resendCooldownHealth(); as health){<p role="status">공유 대기: {{health.active ? '진행 중' : '없음'}} · 대기 종료 시각: {{health.notBefore || '없음'}} · 기본 대기: {{health.fallbackSeconds}}초</p><p>연기된 작업: {{health.deferred}} · 기준 시간 초과: {{health.overdue}}</p><p>이 상태만으로 모든 작업자가 공유 대기를 사용 중인지 확인할 수 없습니다.</p>}
+</section>
+
 <section class="card decision-card" aria-labelledby="slack-cooldown-heading">
   <h3 id="slack-cooldown-heading">Slack 공유 대기 상태</h3>
   <p>선택한 환경의 조회 시점 상태입니다. 별도의 조회 권한과 공유 대기 정책이 필요합니다.</p>
