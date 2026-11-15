@@ -18,6 +18,16 @@ pub fn recipient_hash(address: &str) -> String {
     STANDARD.encode(ring::digest::digest(&ring::digest::SHA256, address.as_bytes()).as_ref())
 }
 
+/// Register a shared policy before a new worker processes jobs. Old workers do not participate.
+pub async fn register_idempotency_scope(
+    client: &Client,
+    environment: &str,
+    retry_key: bool,
+) -> Result<bool, Error> {
+    let scope = if retry_key { "retry" } else { "job" };
+    Ok(client.query_opt("INSERT INTO public.novu_rust_resend_idempotency_policy(environment_id,scope) VALUES ($1,$2) ON CONFLICT(environment_id) DO UPDATE SET scope=EXCLUDED.scope WHERE novu_rust_resend_idempotency_policy.scope=EXCLUDED.scope RETURNING 1", &[&environment,&scope]).await?.is_some())
+}
+
 async fn claim(client: &Client, environment: &str) -> Result<Option<ClaimedJob>, Error> {
     let token = Uuid::new_v4();
     let row=client.query_opt("WITH candidate AS (SELECT id FROM novu_queue_jobs WHERE environment_id=$1 AND kind=$2 AND status='pending' AND available_at<=now() ORDER BY available_at,created_at,id FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE novu_queue_jobs j SET status='running',attempts=j.attempts+1,lease_token=$3,lease_until=clock_timestamp()+interval '60 seconds' FROM candidate WHERE j.id=candidate.id RETURNING j.id,j.environment_id,j.kind,j.payload,j.attempts", &[&environment,&JOB_KIND,&token]).await?;

@@ -115,6 +115,25 @@ async fn run(
                         continue;
                     }
                 }
+                match tokio::time::timeout(
+                    timeout,
+                    resend_queue::register_idempotency_scope(&db, &environment, retry_key),
+                )
+                .await
+                {
+                    Ok(Ok(true)) => {}
+                    Ok(Ok(false)) => {
+                        task.abort();
+                        return Err("Resend workers have different idempotency scopes".into());
+                    }
+                    _ => {
+                        task.abort();
+                        let _ = task.await;
+                        eprintln!("Resend idempotency policy registration failed; reconnecting");
+                        stop.wait(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                }
                 loop {
                     if stop.requested() {
                         break;
