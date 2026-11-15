@@ -310,6 +310,7 @@ pub struct Alert {
     pub twilio: Option<(u64, bool)>,
     pub sendgrid: Option<(u64, bool)>,
     pub sendgrid_check_failed: bool,
+    pub sendgrid_webhook_keys: Option<Result<u64, ()>>,
     pub slack_attempts: Option<(u64, u64, u64, u64, Option<u64>)>,
     pub slack_policy_cancelled: Option<u64>,
     pub email_policy_cancelled: Option<u64>,
@@ -388,6 +389,12 @@ impl Alert {
         if self.push_policy_cancelled.is_some_and(|n| n > 0) {
             mask |= 1 << 29;
         }
+        if self
+            .sendgrid_webhook_keys
+            .is_some_and(|v| !matches!(v, Ok(1..=10)))
+        {
+            mask |= 1 << 30;
+        }
         mask
     }
     /// Bits whose current state was actually observed, excluding unavailable or disabled checks.
@@ -456,6 +463,9 @@ impl Alert {
         if self.push_policy_cancelled.is_some() {
             known |= 1 << 29;
         }
+        if self.sendgrid_webhook_keys.is_some() {
+            known |= 1 << 30;
+        }
         if self.email_policy_cancelled.is_some()
             || self.sms_policy_cancelled.is_some()
             || self.push_policy_cancelled.is_some()
@@ -499,6 +509,12 @@ impl Alert {
         }
         if self.sendgrid_check_failed {
             details.push("SendGrid check failed".into());
+        }
+        if let Some(result) = self.sendgrid_webhook_keys {
+            match result {
+                Ok(count) => details.push(format!("SendGrid active webhook keys: {count}")),
+                Err(()) => details.push("SendGrid webhook key check failed".into()),
+            }
         }
         if let Some((overdue, stale)) = self.twilio {
             details.push(format!(
@@ -1231,6 +1247,7 @@ mod tests {
             twilio: None,
             sendgrid: None,
             sendgrid_check_failed: false,
+            sendgrid_webhook_keys: None,
             slack_attempts: None,
             slack_policy_cancelled: None,
             email_policy_cancelled: None,
@@ -1243,6 +1260,28 @@ mod tests {
             database_probe: None,
             alert_store_unavailable: false,
         }
+    }
+
+    #[test]
+    fn sendgrid_webhook_key_health_is_optional_and_independent() {
+        let mut a = alert();
+        assert_eq!(a.observed_condition_mask() & (1 << 30), 0);
+        for (value, unhealthy) in [
+            (Ok(0), true),
+            (Ok(1), false),
+            (Ok(10), false),
+            (Ok(11), true),
+            (Err(()), true),
+        ] {
+            a.sendgrid_webhook_keys = Some(value);
+            assert_ne!(a.observed_condition_mask() & (1 << 30), 0);
+            assert_eq!(a.condition_mask() & (1 << 30) != 0, unhealthy);
+        }
+        assert!(
+            a.text()
+                .unwrap()
+                .contains("SendGrid webhook key check failed")
+        );
     }
 
     #[test]
@@ -1814,6 +1853,7 @@ mod tests {
             twilio: None,
             sendgrid: Some((1, true)),
             sendgrid_check_failed: false,
+            sendgrid_webhook_keys: None,
             slack_attempts: None,
             slack_policy_cancelled: None,
             email_policy_cancelled: None,

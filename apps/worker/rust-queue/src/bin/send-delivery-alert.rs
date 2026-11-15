@@ -135,6 +135,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let sms_policy_enabled = env_bool("SWALLOW_ALERT_SMS_POLICY_CANCELLED_ENABLED", false)?;
     let push_policy_enabled = env_bool("SWALLOW_ALERT_PUSH_POLICY_CANCELLED_ENABLED", false)?;
     let slack_policy_enabled = env_bool("SWALLOW_ALERT_SLACK_POLICY_CANCELLED_ENABLED", false)?;
+    let sendgrid_keys_enabled = env_bool("SWALLOW_ALERT_SENDGRID_WEBHOOK_KEYS_ENABLED", false)?;
     let twilio_grace = env_optional_i32("SWALLOW_ALERT_TWILIO_GRACE_SECONDS")?;
     let twilio_heartbeat = env_optional_i32("SWALLOW_ALERT_TWILIO_HEARTBEAT_MAX_SECONDS")?;
     let twilio_thresholds = match (twilio_grace, twilio_heartbeat) {
@@ -166,6 +167,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         && queue_wait.is_none()
         && twilio_thresholds.is_none()
         && sendgrid_thresholds.is_none()
+        && !sendgrid_keys_enabled
     {
         return Err("no alert checks configured".into());
     }
@@ -297,6 +299,25 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     } else {
         None
     };
+    let sendgrid_webhook_keys = if sendgrid_keys_enabled {
+        let result = tokio::time::timeout(
+            operation_timeout,
+            db.query_one(
+                "SELECT public.novu_rust_sendgrid_webhook_key_count($1)",
+                &[&args[0]],
+            ),
+        )
+        .await;
+        Some(match result {
+            Ok(Ok(row)) => u64::try_from(row.get::<_, i64>(0)).map_err(|_| ()),
+            _ => {
+                eprintln!("SendGrid webhook key check failed");
+                Err(())
+            }
+        })
+    } else {
+        None
+    };
     let slack_attempts = if slack_jobs_enabled {
         let scoped_slack = env_bool("SWALLOW_ALERT_SLACK_SCOPED_ACCESS", false)?;
         let result = tokio::time::timeout(operation_timeout, async {
@@ -388,7 +409,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     } else {
         None
     };
-    let unhealthy = channel_policy_check_failed
+    let unhealthy = sendgrid_webhook_keys.is_some_and(|v| !matches!(v, Ok(1..=10)))
+        || channel_policy_check_failed
         || email_policy_cancelled.is_some_and(|n| n > 0)
         || sms_policy_cancelled.is_some_and(|n| n > 0)
         || push_policy_cancelled.is_some_and(|n| n > 0)
@@ -420,6 +442,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         twilio,
         sendgrid,
         sendgrid_check_failed,
+        sendgrid_webhook_keys,
         slack_attempts,
         slack_policy_cancelled,
         email_policy_cancelled,
@@ -470,6 +493,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     let mut error = configuration_error
         || observation_error
+        || sendgrid_webhook_keys.is_some_and(|v| v.is_err())
         || sendgrid_check_failed
         || failed_jobs_check_failed
         || channel_policy_check_failed

@@ -1132,6 +1132,8 @@ API 마이그레이션 `0004_sendgrid_webhooks.sql`은 환경별 SendGrid 공개
 
 공개키 교체 시 환경별로 최대 10개의 키를 동시에 활성화해 기존·신규 서명을 검증할 수 있다. 활성 키가 11개 이상이면 임의의 일부만 검사하지 않고 HTTP 503을 반환하며 이벤트를 기록하지 않는다. 일반적인 설정 오류 로그를 감시하고 불필요한 키를 비활성화해야 한다. 공급자의 재전송 여부는 별도 확인이 필요하다. Docker PostgreSQL과 합성 서명으로 두 키의 동시 사용·기존 키 비활성화·10개 경계·초과 시 기록 차단을 검증한다. 실제 SendGrid 키 교체 및 웹훅 전달, 키 관리 API와 자동 회전은 아직 검증 또는 구현하지 않았다.
 
+워커 0141과 `SWALLOW_ALERT_SENDGRID_WEBHOOK_KEYS_ENABLED=true`를 사용하면 `send-delivery-alert`가 해당 환경의 활성 SendGrid 웹훅 키가 0개이거나 10개를 넘는 경우 선택한 Slack·메일 대상으로 경보한다. 기본값은 비활성화이며 다른 SendGrid 전달 상태 검사와 독립적으로 선택할 수 있다. 검사 실패도 경보하고 명령은 오류 종료한다. 경보 계정에는 환경별 `alert_view`와 `public.novu_rust_sendgrid_webhook_key_count(text)` 실행 권한을 부여하며 키 테이블 직접 조회 권한은 필요하지 않다. 함수 소유자·스키마를 보호하고 API 0004, 워커 0141 및 새 경보 바이너리를 배포한 후 스케줄러와 실패 감시를 구성한다. 카운트는 순간 상태일 뿐 키의 유효성·공급자 설정 일치·콜백 수신을 보장하지 않는다. 기존 예약·쿨다운과 불명 결과 확인의 제한도 적용된다. Docker PostgreSQL에서 명령의 정상·누락·초과·권한 실패, 제한 계정의 환경 격리 및 차단된 경보 슬롯을 확인했다. 실제 Slack·메일 수신 및 SendGrid 콜백은 검증하지 않았다.
+
 `delivered`, `bounce`, `dropped`, `blocked`, `deferred`, `processed` 이벤트의 근거만 저장하며, `delivered`는 수신 메일 서버의 수락이지 수신함 표시나 사용자의 읽음을 보장하지 않는다. 이벤트를 자동으로 `delivery_state`·작업 상태에 반영하거나 불명 작업을 재시도하지 않는다. 검증 후 7일이 넘는 서명 timestamp는 거절하며 배치 1,000개·본문 1 MiB와 활성 키 10개로 제한한다. 서명이 없는 원본 Novu 요청과 통합 ID 경로, 원본 webhook 응답 및 전체 이벤트 계약은 호환되지 않는다. 키 관리 API·회전 자동화, 이벤트 보존·삭제, 받는 사람별 집계, 원본 webhook 서버와 실제 SendGrid의 종단 간 검증, 운영 접근 제어는 미구현 또는 미검증이다. 외부 HTTPS 종단과 방화벽·DB 권한을 별도로 구성해야 한다. [격리 테스트](apps/api/rust-api/tests/sendgrid_webhook.rs)는 임시 서명 키와 PostgreSQL로 변조·재생·환경 격리·유효하지 않은 배치를 확인한다.
 
 

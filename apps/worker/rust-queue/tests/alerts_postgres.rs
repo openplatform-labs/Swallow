@@ -371,6 +371,106 @@ async fn alert_reservations_fence_concurrency_and_ambiguous_recovery() {
         a.batch_execute(sql).await.unwrap();
     }
     a.execute("INSERT INTO novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES ('env-a','slack','check','rejected')", &[]).await.unwrap();
+    a.batch_execute(include_str!(
+        "../../../api/rust-api/migrations/0004_sendgrid_webhooks.sql"
+    ))
+    .await
+    .unwrap();
+    for sql in [
+        include_str!("../migrations/0072_operator_grant_management.sql"),
+        include_str!("../migrations/0073_operator_role_identity.sql"),
+        include_str!("../migrations/0087_alert_view_permission.sql"),
+    ] {
+        a.batch_execute(sql).await.unwrap();
+    }
+    a.batch_execute(include_str!(
+        "../migrations/0141_sendgrid_webhook_key_health.sql"
+    ))
+    .await
+    .unwrap();
+    a.execute(
+        "INSERT INTO novu_rust_delivery_operator_grants VALUES ('env-a',session_user,'alert_view',(SELECT oid FROM pg_roles WHERE rolname=session_user))",
+        &[],
+    )
+    .await
+    .unwrap();
+    let key_alert = |env: &str, enabled: &str| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_send-delivery-alert"))
+            .args([env, "300", "120", "60"])
+            .env("DATABASE_URL", &url)
+            .env("NOVU_POSTGRES_ALLOW_INSECURE", "true")
+            .env(
+                "SWALLOW_ALERT_SLACK_WEBHOOK",
+                "https://hooks.slack.com/services/A/B/C",
+            )
+            .env_remove("SWALLOW_ALERT_SLACK_WEBHOOK_FILE")
+            .env_remove("SWALLOW_ALERT_EMAIL_TO")
+            .env("SWALLOW_ALERT_SLACK_TARGET_ID", "check")
+            .env("SWALLOW_ALERT_RESEND_ENABLED", "false")
+            .env("SWALLOW_ALERT_SENDGRID_WEBHOOK_KEYS_ENABLED", enabled)
+            .output()
+            .unwrap()
+    };
+    assert_eq!(key_alert("env-a", "true").status.code(), Some(2));
+    a.execute(
+        "INSERT INTO novu_rust_sendgrid_webhook_keys VALUES ('env-a','first','Zmlyc3Q=',true)",
+        &[],
+    )
+    .await
+    .unwrap();
+    assert_eq!(key_alert("env-a", "true").status.code(), Some(0));
+    a.execute("INSERT INTO novu_rust_sendgrid_webhook_keys SELECT 'env-a','extra-' || n,encode(convert_to('key-' || n,'UTF8'),'base64'),true FROM generate_series(1,10) n", &[]).await.unwrap();
+    assert_eq!(key_alert("env-a", "true").status.code(), Some(2));
+    assert_eq!(key_alert("env-b", "true").status.code(), Some(1));
+    assert_eq!(key_alert("env-a", "invalid").status.code(), Some(1));
+    a.batch_execute("CREATE ROLE swallow_key_health_test LOGIN; GRANT EXECUTE ON FUNCTION public.novu_rust_sendgrid_webhook_key_count(text) TO swallow_key_health_test;").await.unwrap();
+    b.batch_execute("SET SESSION AUTHORIZATION swallow_key_health_test")
+        .await
+        .unwrap();
+    assert!(
+        b.query_one(
+            "SELECT public.novu_rust_sendgrid_webhook_key_count('env-a')",
+            &[]
+        )
+        .await
+        .is_err()
+    );
+    a.execute("INSERT INTO novu_rust_delivery_operator_grants VALUES ('env-a','swallow_key_health_test','alert_view',(SELECT oid FROM pg_roles WHERE rolname='swallow_key_health_test'))", &[]).await.unwrap();
+    assert_eq!(
+        b.query_one(
+            "SELECT public.novu_rust_sendgrid_webhook_key_count('env-a')",
+            &[]
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0),
+        11
+    );
+    assert!(
+        b.query_one(
+            "SELECT public.novu_rust_sendgrid_webhook_key_count('env-b')",
+            &[]
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        b.query_one(
+            "SELECT public_key_base64 FROM public.novu_rust_sendgrid_webhook_keys LIMIT 1",
+            &[]
+        )
+        .await
+        .is_err()
+    );
+    b.batch_execute("RESET SESSION AUTHORIZATION")
+        .await
+        .unwrap();
+    a.execute(
+        "DELETE FROM novu_rust_sendgrid_webhook_keys WHERE environment_id='env-a'",
+        &[],
+    )
+    .await
+    .unwrap();
     let job = uuid::Uuid::new_v4();
     novu_postgres_queue::enqueue(&a, job, "env-a", "fixture", &serde_json::json!({}))
         .await
