@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$(cd ../../.. && pwd)
 scenario=${SWALLOW_LOCAL_FAILOVER_SCENARIO:-alert-binding}
-case "$scenario" in alert-binding|alert-scheduler|alert-v2|smtp|smtp-rls|smtp-resolution|in-app|resend|resend-cooldown|twilio|fcm|fcm-delay|fcm-exp|fcm-exp-repeat|fcm-review) ;; *) echo 'invalid local failover scenario' >&2; exit 2;; esac
+case "$scenario" in alert-binding|alert-scheduler|alert-v2|smtp|smtp-rls|smtp-resolution|discord-manual-retry|in-app|resend|resend-cooldown|twilio|fcm|fcm-delay|fcm-exp|fcm-exp-repeat|fcm-review) ;; *) echo 'invalid local failover scenario' >&2; exit 2;; esac
 pgbin=${SWALLOW_TEST_POSTGRES_BIN:-/opt/homebrew/opt/postgresql@17/bin}
 [[ -x "$pgbin/pg_ctl" && -x "$pgbin/pg_basebackup" ]] || { echo 'PostgreSQL 17 server binaries are required' >&2; exit 1; }
 testdir=$(mktemp -d /private/tmp/swallow-alert-ha.XXXXXX)
@@ -46,7 +46,9 @@ done
 export TEST_PRIMARY_URL="$DATABASE_URL" TEST_STANDBY_URL="postgres://postgres@127.0.0.1:$standby_port/postgres"
 export TEST_FAILOVER_URL="postgres://postgres@127.0.0.1:$standby_port,127.0.0.1:$primary_port/postgres?target_session_attrs=read-write&connect_timeout=2"
 export TEST_LOCAL_PRIMARY_DATA="$testdir/primary" TEST_LOCAL_STANDBY_DATA="$testdir/standby" TEST_LOCAL_PG_CTL="$pgbin/pg_ctl"
-if [[ "$scenario" == smtp-resolution ]]; then
+if [[ "$scenario" == discord-manual-retry ]]; then
+  cargo test --locked --features test-mocks --test discord_manual_retry_failover -- --ignored --nocapture
+elif [[ "$scenario" == smtp-resolution ]]; then
   cargo test --locked --test smtp_resolution_failover -- --ignored --nocapture
 elif [[ "$scenario" == smtp || "$scenario" == smtp-rls ]]; then
   TEST_SMTP_FAILOVER_RLS=$([[ "$scenario" == smtp-rls ]] && printf true || printf false) cargo test --locked --test smtp_failover -- --ignored --nocapture
