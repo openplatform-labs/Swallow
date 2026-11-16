@@ -1,4 +1,4 @@
-import json,os,subprocess,threading,time
+import json,os,subprocess,tempfile,threading,time
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 psql=os.environ['TEST_PSQL'];admin=os.environ['DATABASE_URL'];port=os.environ['TEST_PORT'];worker=os.environ['TEST_CANCEL_WORKER']
 submit=admin.replace('postgres://postgres@','postgres://cancel_submitter@');worker_db=admin.replace('postgres://postgres@','postgres://cancel_worker@');resolver=admin.replace('postgres://postgres@','postgres://cancel_resolver@')
@@ -6,10 +6,13 @@ def sql(query,url=admin,ok=True):
     p=subprocess.run([psql,url,'-qAt','-v','ON_ERROR_STOP=1','-c',query],capture_output=True,text=True,timeout=10)
     if ok and p.returncode:raise RuntimeError(p.stderr)
     return p.stdout.strip() if ok else p.returncode
-calls=[];received=threading.Event();release=threading.Event()
+calls=[];auths={};received=threading.Event();release=threading.Event()
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
-        calls.append(self.path);assert self.headers.get('Authorization')=='Bearer fixture'
+        calls.append(self.path);auths[self.path]=self.headers.get('Authorization')
+        if self.path.startswith('/emails/rotation-'):
+            data=json.dumps({'object':'email','id':self.path.split('/')[2]}).encode();self.send_response(200);self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data);return
+        assert self.headers.get('Authorization')=='Bearer fixture'
         if self.path=='/emails/fixture-five/cancel':received.set();release.wait(10);return
         if self.path in ('/emails/status-408/cancel','/emails/status-409/cancel'):
             self.send_response(int(self.path.split('-')[1].split('/')[0]));self.send_header('Content-Length','0');self.end_headers();return
@@ -97,6 +100,35 @@ try:
     time.sleep(2)
     for code in (408,409):assert calls.count('/emails/status-%s/cancel'%code)==1,calls
     worker2.terminate();worker2.wait(timeout=5)
+    # Rotate the key between commands; invalid files must stop claims, not use stale keys.
+    with tempfile.TemporaryDirectory(prefix='swallow-cancel-key-') as directory:
+        key=os.path.join(directory,'key');open(key,'w').write('rotation-one');os.chmod(key,0o600)
+        rotation_env={**env,'NOVU_RESEND_API_KEY_FILE':key,'NOVU_RESEND_RELOAD_API_KEY':'true'};rotation_env.pop('NOVU_RESEND_API_KEY')
+        rotated=subprocess.Popen([worker],env=rotation_env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE);children.append(rotated)
+        def rotation_job(n):
+            job='cccccccc-cccc-4ccc-8ccc-'+str(n).zfill(12);request='eeeeeeee-eeee-4eee-8eee-'+str(n).zfill(12)
+            sql("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status,resend_scheduled_at) VALUES('%s','cancel-env','experimental_resend_email','{}','completed',clock_timestamp()+interval '1 hour'); INSERT INTO public.novu_rust_resend_attempts(job_id,environment_id,state,provider_message_id,account_tag) VALUES('%s','cancel-env','accepted','rotation-%s','account-a')"%(job,job,n))
+            enqueue(request,job);return request
+        first=rotation_job(1);wait(lambda:sql("SELECT state FROM public.novu_rust_resend_cancel_commands WHERE request_id='%s'"%first)=='finished')
+        assert auths['/emails/rotation-1/cancel']=='Bearer rotation-one'
+        open(key,'w').write('');time.sleep(3);second=rotation_job(2);time.sleep(3)
+        assert sql("SELECT state FROM public.novu_rust_resend_cancel_commands WHERE request_id='%s'"%second)=='pending'
+        assert '/emails/rotation-2/cancel' not in calls
+        replacement=os.path.join(directory,'replacement');open(replacement,'w').write('rotation-two');os.chmod(replacement,0o600);os.replace(replacement,key)
+        wait(lambda:sql("SELECT state FROM public.novu_rust_resend_cancel_commands WHERE request_id='%s'"%second)=='finished')
+        assert auths['/emails/rotation-2/cancel']=='Bearer rotation-two'
+        rotated.terminate();rotated.wait(timeout=5)
+        exit_env={**rotation_env,'SWALLOW_RESEND_CANCEL_RELOAD_FAILURE_POLICY':'exit'}
+        exiting=subprocess.Popen([worker],env=exit_env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE);children.append(exiting)
+        time.sleep(2);open(key,'w').write('');exiting.wait(timeout=8);assert exiting.returncode!=0
+        log=exiting.stderr.read().decode();assert 'reload failed' in log and 'rotation-two' not in log and key not in log
+        conflict={**rotation_env,'NOVU_RESEND_API_KEY':'inline'}
+        bad=subprocess.run([worker],env=conflict,capture_output=True,text=True,timeout=5);assert bad.returncode!=0 and 'inline' not in bad.stderr and key not in bad.stderr
+        missing_file=dict(rotation_env);missing_file.pop('NOVU_RESEND_API_KEY_FILE')
+        invalid_policy={**rotation_env,'SWALLOW_RESEND_CANCEL_RELOAD_FAILURE_POLICY':'invalid'}
+        exit_without_reload={**env,'SWALLOW_RESEND_CANCEL_RELOAD_FAILURE_POLICY':'exit'}
+        for settings in (missing_file,invalid_policy,exit_without_reload):
+            failed=subprocess.run([worker],env=settings,capture_output=True,text=True,timeout=5);assert failed.returncode!=0 and key not in failed.stderr
 finally:
     release.set()
     for p in children:
