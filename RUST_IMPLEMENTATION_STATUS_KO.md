@@ -2889,3 +2889,5 @@ Inbox 워크플로 생성과 SendGrid·Resend·SMTP·Twilio·FCM의 발송 예�
 격리 PostgreSQL에서 워커 연결 기본값을 `REPEATABLE READ`로 지정한 뒤 이메일 3개 공급자와 제한 SMTP, SMS, FCM 최초·준비 작업, Inbox 생성의 수신 거부 경합 시험이 통과했다. Resend 즉시 재시도 재검사, Slack·Discord·Telegram 및 모든 다른 워커의 비기본 격리 수준과 운영 HA는 이번 시험에서 검증하지 않았다. [워커 문서](apps/worker/rust-queue/README.md)를 참고한다.
 
 Slack 워크플로 팬아웃과 개별 발송 예약에도 `READ COMMITTED`를 명시했다. 연결 기본값을 `REPEATABLE READ`로 설정한 격리 PostgreSQL에서 두 단계의 기본 설정 변경 경합을, 별도 시험에서 기존 단계 정책과 잠금을 확인했다. 독립 Slack 경보 발송 경로는 이 변경 범위가 아니며 실제 Slack, Discord·Telegram의 비기본 격리 수준 및 운영 HA는 검증하지 않았다.
+
+Discord 발송 예약에도 `READ COMMITTED`를 명시했다. 격리 PostgreSQL에서 발송 연결 기본값을 `REPEATABLE READ`로 두고 API 트리거·워크플로·모의 Discord 경로의 기본 설정 변경 우선 취소와 발송 예약 우선 시 설정 작성 대기를 확인했다. 실제 Discord, Telegram의 비기본 격리 수준 및 운영 HA는 이번 시험 범위 밖이다.

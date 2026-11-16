@@ -261,7 +261,7 @@ async fn trigger_renders_and_guards_subscriber_endpoint_and_preferences() {
     let tx=changer.transaction().await.unwrap();
     tx.execute("INSERT INTO public.novu_rust_workflow_preferences(environment_id,workflow_identifier,chat_enabled) VALUES('a','discord-workflow',false)",&[]).await.unwrap();
     let (mut sender,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);
-    sender.batch_execute("SET application_name='discord_preference_fence'").await.unwrap();
+    sender.batch_execute("SET application_name='discord_preference_fence'; SET default_transaction_isolation='repeatable read'").await.unwrap();
     let sender_endpoint=endpoint.clone();
     let task=tokio::spawn(async move {
         let provider=novu_postgres_queue::discord::Webhook::test_endpoint(&sender_endpoint).unwrap();
@@ -287,7 +287,7 @@ async fn trigger_renders_and_guards_subscriber_endpoint_and_preferences() {
     let (mut blocker,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);let blocker_tx=blocker.transaction().await.unwrap();blocker_tx.query_one("SELECT pg_advisory_xact_lock(766481)",&[]).await.unwrap();
     let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();let endpoint2=format!("http://{}/api/webhooks/1/token",listener.local_addr().unwrap());
     let server2=tokio::spawn(async move {let (mut socket,_)=listener.accept().await.unwrap();let mut bytes=[0u8;4096];assert!(socket.read(&mut bytes).await.unwrap()>0);let body=r#"{"id":"2","timestamp":"2026-01-01Z"}"#;socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();});
-    let (mut sender,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);sender.batch_execute("SET application_name='discord_reservation_first'").await.unwrap();
+    let (mut sender,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);sender.batch_execute("SET application_name='discord_reservation_first'; SET default_transaction_isolation='repeatable read'").await.unwrap();
     let send=tokio::spawn(async move {let provider=novu_postgres_queue::discord::Webhook::test_endpoint(&endpoint2).unwrap();novu_postgres_queue::discord_queue::process_one(&mut sender,"a","dest",&provider).await});
     let mut paused=false;for _ in 0..150 {paused=db.query_one("SELECT count(*)=1 FROM pg_stat_activity WHERE application_name='discord_reservation_first' AND wait_event='advisory'",&[]).await.unwrap().get(0);if paused {break;}assert!(!send.is_finished());tokio::time::sleep(Duration::from_millis(100)).await;}assert!(paused,"sender did not reach attempt reservation");
     let (writer,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);writer.batch_execute("SET application_name='discord_preference_writer'").await.unwrap();

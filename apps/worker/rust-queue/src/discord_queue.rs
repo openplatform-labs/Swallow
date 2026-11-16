@@ -171,7 +171,7 @@ pub async fn process_one(
         crate::fail(db, job.id, job.lease_token, "invalid Discord job").await?;
         return Ok(true);
     }
-    let tx = db.transaction().await?;
+    let tx = db.build_transaction().isolation_level(tokio_postgres::IsolationLevel::ReadCommitted).start().await?;
     let result = if let Some(ctx) = message.workflow_context.as_ref() {
         workflow_body(&tx, &job, &message, ctx).await?
     } else {
