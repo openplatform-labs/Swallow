@@ -59,4 +59,3 @@ BEGIN
  RETURN jsonb_build_object('changed',v_changed,'replayed',false,'requestId',p_request);
 END; $$;
 REVOKE ALL ON FUNCTION public.novu_rust_operator_jwt_telegram_policy_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text) FROM PUBLIC;
-
