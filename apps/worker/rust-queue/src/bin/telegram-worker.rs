@@ -9,6 +9,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 async fn run(
     stop: novu_postgres_queue::shutdown::Stop,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let scoped = match std::env::var("NOVU_TELEGRAM_SCOPED_DB").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid Telegram scoped database setting".into()),
+    };
     let environment = std::env::var("NOVU_TELEGRAM_ENVIRONMENT_ID")?;
     if environment.trim().is_empty() {
         return Err("Telegram environment required".into());
@@ -52,7 +57,18 @@ async fn run(
             tokio::time::timeout(timeout, config.connect(tls.clone())).await
         {
             let task = tokio::spawn(driver);
-            let registered=tokio::time::timeout(timeout,db.query_opt("INSERT INTO public.novu_rust_telegram_destinations(environment_id,destination_id,token_hash) VALUES($1,$2,$3) ON CONFLICT(environment_id,destination_id) DO UPDATE SET token_hash=EXCLUDED.token_hash WHERE public.novu_rust_telegram_destinations.token_hash=EXCLUDED.token_hash RETURNING 1",&[&environment,&destination,&hash])).await;
+            let registered = if scoped {
+                tokio::time::timeout(
+                    timeout,
+                    db.query_opt(
+                        "SELECT 1 WHERE public.novu_rust_telegram_worker_register($1,$2,$3)",
+                        &[&environment, &destination, &hash],
+                    ),
+                )
+                .await
+            } else {
+                tokio::time::timeout(timeout,db.query_opt("INSERT INTO public.novu_rust_telegram_destinations(environment_id,destination_id,token_hash) VALUES($1,$2,$3) ON CONFLICT(environment_id,destination_id) DO UPDATE SET token_hash=EXCLUDED.token_hash WHERE public.novu_rust_telegram_destinations.token_hash=EXCLUDED.token_hash RETURNING 1",&[&environment,&destination,&hash])).await
+            };
             match registered {
                 Ok(Ok(Some(_))) => {}
                 Ok(Ok(None)) => {
@@ -72,7 +88,12 @@ async fn run(
                     if !matches!(
                         tokio::time::timeout(
                             timeout,
-                            telegram_queue::recover_expired(&mut db, &environment, &destination)
+                            telegram_queue::recover_expired_with_scope(
+                                &mut db,
+                                &environment,
+                                &destination,
+                                scoped
+                            )
                         )
                         .await,
                         Ok(Ok(_))
@@ -83,7 +104,13 @@ async fn run(
                 }
                 match tokio::time::timeout(
                     timeout,
-                    telegram_queue::process_one(&mut db, &environment, &destination, &provider),
+                    telegram_queue::process_one_with_scope(
+                        &mut db,
+                        &environment,
+                        &destination,
+                        &provider,
+                        scoped,
+                    ),
                 )
                 .await
                 {
