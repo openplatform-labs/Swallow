@@ -1621,7 +1621,7 @@ export class App implements OnDestroy {
   canResolve(): boolean {
     const slot = this.selectedAlert();
     const reason = this.decisionReason.trim();
-    return this.decisionStatus() === 'idle' && (this.decisionProtocol === 'legacy' || this.decisionProtocol === 'idempotent') && (this.alertAuthMode !== 'jwt' || this.validEnvironment(this.alertEnvironment.trim())) && !!slot?.attemptId && this.decisionConfirmed && this.validAlertKey(this.decisionKey.trim()) && !!reason && new TextEncoder().encode(reason).length <= 512 && (this.decision === 'retry' || (this.decision === 'accepted' && slot.state === 'unknown'));
+    return this.decisionStatus() === 'idle' && (this.decisionProtocol === 'legacy' || this.decisionProtocol === 'idempotent') && (this.alertAuthMode !== 'jwt' || this.validEnvironment(this.alertEnvironment.trim())) && !!slot?.attemptId && this.decisionConfirmed && this.validAlertKey(this.decisionKey.trim()) && !!reason && new TextEncoder().encode(reason).length <= 512 && (this.decision === 'retry' || (this.decision === 'accepted' && (slot.state === 'unknown' || !!slot.legacyAmbiguousHttpStatus)));
   }
 
   async resolveAlert(): Promise<void> {

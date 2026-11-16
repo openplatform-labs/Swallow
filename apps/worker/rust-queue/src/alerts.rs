@@ -2658,6 +2658,29 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires fully migrated disposable PostgreSQL"]
+    async fn legacy_ambiguous_acceptance_requires_current_attempt_and_audit() {
+        let url=std::env::var("TEST_DATABASE_URL").unwrap();let (db,driver)=tokio_postgres::connect(&url,tokio_postgres::NoTls).await.unwrap();tokio::spawn(driver);
+        let env=format!("legacy-accept-{}",Uuid::new_v4());let role=format!("alert_accept_{}",Uuid::new_v4().simple());
+        db.execute("INSERT INTO public.novu_rust_environments VALUES($1,'org')",&[&env]).await.unwrap();
+        db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_resolve_alert_v2(text,text,text,uuid,text,text,text) TO {role}")).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,rolname,'alert_accepted',oid FROM pg_roles WHERE rolname=$2",&[&env,&role]).await.unwrap();
+        let a=Uuid::new_v4();let b=Uuid::new_v4();let c=Uuid::new_v4();
+        db.execute("INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state,attempt_id) VALUES($1,'slack','one','rejected',$2),($1,'slack','two','rejected',$3),($1,'email','three','rejected',$4)",&[&env,&a,&b,&c]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_alert_delivery_attempts(id,environment_id,channel,target_id,state,http_status) VALUES($1,$4,'slack','one','rejected',408),($2,$4,'slack','two','rejected',409),($3,$4,'email','three','rejected',400)",&[&a,&b,&c,&env]).await.unwrap();
+        let (actor,driver)=tokio_postgres::connect(&url,tokio_postgres::NoTls).await.unwrap();tokio::spawn(driver);actor.batch_execute(&format!("SET SESSION AUTHORIZATION {role}")).await.unwrap();
+        let q="SELECT public.novu_rust_resolve_alert_v2($1,$2,$3,$4,'accepted','operator','provider checked')";
+        assert!(actor.query_one(q,&[&env,&"email",&"three",&c]).await.is_err());assert!(actor.query_one(q,&[&env,&"slack",&"one",&Uuid::new_v4()]).await.is_err());
+        db.batch_execute("CREATE FUNCTION public.fail_legacy_alert_accept() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test'; END $$; CREATE TRIGGER fail_legacy_alert_accept BEFORE INSERT ON public.novu_rust_alert_delivery_resolutions FOR EACH ROW EXECUTE FUNCTION public.fail_legacy_alert_accept()").await.unwrap();
+        assert!(actor.query_one(q,&[&env,&"slack",&"one",&a]).await.is_err());assert_eq!(db.query_one("SELECT state FROM public.novu_rust_alert_delivery_slots WHERE environment_id=$1 AND target_id='one'",&[&env]).await.unwrap().get::<_,String>(0),"rejected");
+        db.batch_execute("DROP TRIGGER fail_legacy_alert_accept ON public.novu_rust_alert_delivery_resolutions").await.unwrap();
+        actor.query_one(q,&[&env,&"slack",&"one",&a]).await.unwrap();actor.query_one(q,&[&env,&"slack",&"two",&b]).await.unwrap();
+        assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_alert_delivery_resolutions WHERE environment_id=$1 AND previous_state='rejected' AND decision='accepted'",&[&env]).await.unwrap().get::<_,i64>(0),2);
+        assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_alert_delivery_attempts WHERE environment_id=$1 AND state='rejected' AND http_status IN (408,409)",&[&env]).await.unwrap().get::<_,i64>(0),2);
+        db.execute("DELETE FROM public.novu_rust_delivery_operator_grants WHERE environment_id=$1 AND database_principal=$2 AND decision='alert_accepted'",&[&env,&role]).await.unwrap();assert!(actor.query_one(q,&[&env,&"email",&"three",&c]).await.is_err());
+    }
+
+    #[tokio::test]
     async fn operator_key_probe_alert_uses_both_mock_transports() {
         let mut a = alert();
         a.resend_enabled = false;

@@ -18,3 +18,4 @@ cargo build --quiet --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo
 export TEST_DELIVERY_CLI="$ROOT/apps/worker/rust-queue/target/debug/delivery-reconcile"
 cargo test --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --lib slack_ambiguous_status_is_fenced_in_scoped_alerts -- --ignored
 cargo test --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --lib legacy_ambiguous_alert_listing_is_scoped_and_paginated -- --ignored
+cargo test --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --lib legacy_ambiguous_acceptance_requires_current_attempt_and_audit -- --ignored

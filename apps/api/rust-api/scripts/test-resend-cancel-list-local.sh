@@ -20,6 +20,7 @@ GRANT SELECT ON public.novu_rust_environments TO cancel_api_fixture;
 GRANT SELECT,INSERT,UPDATE ON public.novu_rust_resend_delivery_events TO cancel_api_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_evidence_health(text),public.novu_rust_reserve_alert_v3(text,text,text,integer,bigint,bigint,bigint,bigint),public.novu_rust_observe_alert_conditions_v3(text,text,text,bigint,bigint,bigint,bigint) TO cancel_api_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_alerts(text,text,text,text,bigint,text,text),public.novu_rust_console_alerts_page(text,text,text) TO cancel_api_fixture;
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resolve_alert(text,text,text,text,bigint,uuid,text,text,uuid,text,text),public.novu_rust_console_resolve_alert_v2(text,uuid,text,text,uuid,text,text) TO cancel_api_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_cancel_credential_health(text,text,text,text,bigint,integer,integer) TO cancel_api_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_cancel_list(text,text,text,text,bigint,integer,uuid) TO cancel_api_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_cancel_detail(text,text,text,text,bigint,uuid) TO cancel_api_fixture;
@@ -34,10 +35,14 @@ GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_cancel_grant_read
 INSERT INTO public.novu_rust_environments VALUES ('cancel-api-env','org'),('cancel-api-other','org');
 INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname='cancel_api_fixture';
 INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES ('https://issuer.test','fixture','console','cancel-api-env'),('https://issuer.test','fixture','console','cancel-api-other'),('https://issuer.test','target','console','cancel-api-env');
-UPDATE public.novu_rust_operator_jwt_identities SET alert_read=true WHERE environment_id='cancel-api-env' AND subject='fixture';
+UPDATE public.novu_rust_operator_jwt_identities SET alert_read=true,alert_accepted=true WHERE environment_id='cancel-api-env' AND subject='fixture';
 WITH c AS (INSERT INTO public.novu_rust_console_credentials(token_hash,environment_id,expires_at,subscriber_read) VALUES(encode(sha256(convert_to(repeat('a',64),'UTF8')),'hex'),'cancel-api-env',clock_timestamp()+interval '1 hour',false) RETURNING credential_id) INSERT INTO public.novu_rust_console_alert_grants SELECT credential_id FROM c;
 INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state,attempt_id) VALUES('cancel-api-env','slack','legacy-409','rejected','abababab-abab-4bab-8bab-abababababab'),('cancel-api-env','slack','current-400','rejected','acacacac-acac-4cac-8cac-acacacacacac');
 INSERT INTO public.novu_rust_alert_delivery_attempts(id,environment_id,channel,target_id,state,http_status) VALUES('abababab-abab-4bab-8bab-abababababab','cancel-api-env','slack','legacy-409','rejected',409),('acacacac-acac-4cac-8cac-acacacacacac','cancel-api-env','slack','current-400','rejected',400);
+INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state,attempt_id) VALUES('cancel-api-env','slack','legacy-408-ui','rejected','adadadad-adad-4dad-8dad-adadadadadad'),('cancel-api-env','email','legacy-408-console','rejected','aeaeaeae-aeae-4eae-8eae-aeaeaeaeaeae');
+INSERT INTO public.novu_rust_alert_delivery_attempts(id,environment_id,channel,target_id,state,http_status) VALUES('adadadad-adad-4dad-8dad-adadadadadad','cancel-api-env','slack','legacy-408-ui','rejected',408),('aeaeaeae-aeae-4eae-8eae-aeaeaeaeaeae','cancel-api-env','email','legacy-408-console','rejected',408);
+INSERT INTO public.novu_rust_console_alert_decision_grants SELECT credential_id,'accepted' FROM public.novu_rust_console_credentials WHERE token_hash=encode(sha256(convert_to(repeat('a',64),'UTF8')),'hex');
+
 INSERT INTO public.novu_rust_operator_jwt_resend_cancel_grant_admins VALUES ('https://issuer.test','fixture','console','cancel-api-env',true,true);
 INSERT INTO public.novu_rust_operator_jwt_resend_cancel_grant_audit_viewers VALUES ('https://issuer.test','fixture','console','cancel-api-env');
 INSERT INTO public.novu_rust_operator_jwt_resend_cancel_credential_health_grants VALUES ('https://issuer.test','fixture','console','cancel-api-env',true);
@@ -56,6 +61,7 @@ INSERT INTO public.novu_rust_operator_jwt_resend_cancel_command_review_grants VA
 INSERT INTO public.novu_rust_resend_cancel_command_reviewers SELECT 'cancel-api-env',rolname,oid FROM pg_roles WHERE rolname='cancel_api_fixture';
 INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'cancel-api-env',rolname,'alert_view',oid FROM pg_roles WHERE rolname='cancel_api_fixture';
 INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'cancel-api-env',rolname,'alert_send',oid FROM pg_roles WHERE rolname='cancel_api_fixture';
+INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'cancel-api-env',rolname,'alert_accepted',oid FROM pg_roles WHERE rolname='cancel_api_fixture';
 INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state) VALUES('cancel-api-env','slack','blocked-evidence','rejected');
 INSERT INTO public.novu_rust_alert_v2_targets(environment_id,channel,target_id) VALUES('cancel-api-env','slack','blocked-evidence');
 INSERT INTO public.novu_rust_resend_cancel_operators(environment_id,database_principal,principal_oid,can_read,can_resolve) SELECT 'cancel-api-env',rolname,oid,true,true FROM pg_roles WHERE rolname='cancel_api_fixture';

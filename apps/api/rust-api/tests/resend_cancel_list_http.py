@@ -24,6 +24,18 @@ request=urllib.request.Request(origin+'/v1/experimental/console/alerts',headers=
 with urllib.request.urlopen(request,timeout=5) as response:console=json.loads(response.read())
 assert next(r for r in console['data'] if r['targetId']=='legacy-409')['legacyAmbiguousHttpStatus']==409
 assert get('environmentId=cancel-api-other',endpoint='alerts')[0] in (401,403)
+def alert_decide(endpoint,scheme,credential,payload):
+    request=urllib.request.Request(origin+endpoint,data=json.dumps(payload).encode(),headers={'Authorization':scheme+' '+credential,'Content-Type':'application/json'},method='POST')
+    try:
+        with urllib.request.urlopen(request,timeout=5) as r:return r.status,json.loads(r.read())
+    except urllib.error.HTTPError as e:return e.code,json.loads(e.read())
+alert_body={'requestId':'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1','channel':'slack','targetId':'legacy-409','attemptId':'abababab-abab-4bab-8bab-abababababab','decision':'accepted','reason':'provider checked'}
+assert alert_decide('/v1/experimental/operator/alerts/resolve?environmentId=cancel-api-env','Bearer',token,alert_body)[0]==200
+assert alert_decide('/v1/experimental/operator/alerts/resolve?environmentId=cancel-api-env','Bearer',token,alert_body)[1]['replayed']
+console_body={**alert_body,'requestId':'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2','channel':'email','targetId':'legacy-408-console','attemptId':'aeaeaeae-aeae-4eae-8eae-aeaeaeaeaeae'}
+assert alert_decide('/v1/experimental/console/alerts/resolve-v2','SwallowConsole','a'*64,console_body)[0]==200
+assert alert_decide('/v1/experimental/console/alerts/resolve-v2','SwallowConsole','a'*64,console_body)[1]['replayed']
+
 # Credential health requires independent JWT and database grants, and is environment scoped.
 health_query='environmentId=cancel-api-env&maxAgeSeconds=60&minimumHealthy=1'
 status,health=get(health_query,endpoint='resend-cancel-credential-health');assert status==200 and health=={'healthy':0,'unhealthy':0,'stale':0,'minimumHealthy':1,'needsAttention':True},(status,health)
