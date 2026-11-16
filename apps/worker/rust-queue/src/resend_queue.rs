@@ -561,9 +561,12 @@ mod tests {
         db.execute("INSERT INTO public.novu_rust_environments VALUES($1,'org')",&[&env]).await.unwrap();
         db.execute("INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,email_subject,email_html,email_provider,inbox_metadata) VALUES($1,'fixture',true,true,'hello','<p>hello</p>','resend','{\"id\":\"64a000000000000000000051\"}')",&[&env]).await.unwrap();
         db.execute("INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES($1,'alice','64a000000000000000000054','{\"email\":\"alice@example.test\"}')",&[&env]).await.unwrap();
-        for kind in ["resend", "sendgrid", "smtp"] {
-          db.execute("UPDATE public.novu_rust_workflows SET email_provider=$2 WHERE environment_id=$1 AND identifier='fixture'",&[&env,&kind]).await.unwrap();
-          for mode in ["global","workflow"] {
+        db.batch_execute("CREATE ROLE email_fence_smtp LOGIN; GRANT USAGE ON SCHEMA public TO email_fence_smtp; GRANT SELECT,UPDATE ON public.novu_queue_jobs,public.novu_rust_subscribers TO email_fence_smtp; GRANT SELECT,INSERT,UPDATE ON public.novu_rust_smtp_attempts,public.novu_rust_email_workflow_worker_config TO email_fence_smtp; GRANT UPDATE(email_subject) ON public.novu_rust_workflows TO email_fence_smtp; GRANT SELECT ON public.novu_rust_workflow_preferences,public.novu_rust_subscriber_preferences,public.novu_rust_subscriber_workflow_preferences,public.novu_rust_workflows,public.novu_rust_contexts TO email_fence_smtp; GRANT SELECT,INSERT,UPDATE,DELETE ON public.novu_rust_email_messages TO email_fence_smtp; GRANT SELECT,UPDATE ON public.novu_rust_email_step_outcomes TO email_fence_smtp; SELECT public.novu_rust_install_smtp_scoped_rls();").await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_smtp_scoped_logins(principal_oid,database_principal,environment_id) SELECT oid,rolname,$1 FROM pg_roles WHERE rolname='email_fence_smtp'",&[&env]).await.unwrap();
+        for kind in ["resend", "sendgrid", "smtp", "smtp-scoped"] {
+          let workflow_provider=if kind=="smtp-scoped" {"smtp"} else {kind};
+          db.execute("UPDATE public.novu_rust_workflows SET email_provider=$2 WHERE environment_id=$1 AND identifier='fixture'",&[&env,&workflow_provider]).await.unwrap();
+          for mode in ["global","workflow","default"] {
             let transaction=format!("preference-{kind}-{mode}");
             enqueue(&db,Uuid::new_v4(),&env,crate::in_app::JOB_KIND,&json!({"workflow":"fixture","transactionId":transaction,"content":"","payload":{},"recipients":[{"subscriberId":"alice"}],"recipientIdentitySnapshot":{"alice":"64a000000000000000000054"},"severityOverride":null})).await.unwrap();
             assert!(crate::in_app::process_one(&mut db).await.unwrap());
@@ -572,31 +575,51 @@ mod tests {
             let address=listener.local_addr().unwrap();
             let endpoint=format!("http://{address}/emails");
             let pref_tx=db.transaction().await.unwrap();
-            pref_tx.query_one("SELECT 1 FROM public.novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id='alice' FOR UPDATE",&[&env]).await.unwrap();
+            if mode!="default" {pref_tx.query_one("SELECT 1 FROM public.novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id='alice' FOR UPDATE",&[&env]).await.unwrap();}
             if mode=="global" {pref_tx.execute("INSERT INTO public.novu_rust_subscriber_preferences(environment_id,subscriber_id,channels) VALUES($1,'alice','{\"email\":false}')",&[&env]).await.unwrap();}
-            else {pref_tx.execute("INSERT INTO public.novu_rust_subscriber_workflow_preferences(environment_id,subscriber_id,workflow_identifier,channels) VALUES($1,'alice','fixture','{\"email\":false}')",&[&env]).await.unwrap();}
-            let (mut worker,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);
+            else if mode=="workflow" {pref_tx.execute("INSERT INTO public.novu_rust_subscriber_workflow_preferences(environment_id,subscriber_id,workflow_identifier,channels) VALUES($1,'alice','fixture','{\"email\":false}')",&[&env]).await.unwrap();}
+            else {pref_tx.execute("INSERT INTO public.novu_rust_workflow_preferences(environment_id,workflow_identifier,email_enabled) VALUES($1,'fixture',false)",&[&env]).await.unwrap();}
+            let mut config:tokio_postgres::Config=url.parse().unwrap();
+            if kind=="smtp-scoped" {config.user("email_fence_smtp");}
+            let (mut worker,driver)=config.connect(NoTls).await.unwrap();tokio::spawn(driver);
+            if kind=="smtp-scoped" {worker.query_one("SELECT public.novu_rust_assert_smtp_scoped_login($1)",&[&env]).await.unwrap();}
             worker.batch_execute("SET application_name='email_preference_fence'").await.unwrap();
             let target_env=env.clone();
             let task=tokio::spawn(async move {match kind {
                 "resend" => {let provider=Resend::test_endpoint(Config{api_key:"fixture".into(),from:"sender@example.test".into(),sender_name:String::new()},&endpoint).unwrap();process_one(&mut worker,&target_env,&provider).await},
                 "sendgrid" => {let provider=crate::sendgrid::Sendgrid::test_endpoint(crate::sendgrid::Config{api_key:"fixture".into(),from:"sender@example.test".into(),sender_name:String::new(),region:crate::sendgrid::Region::Global},&endpoint).unwrap();crate::sendgrid_queue::process_one(&mut worker,&target_env,&provider).await},
-                "smtp" => {let provider=crate::smtp_alert::SmtpAlert::test_transport("127.0.0.1".into(),address.port());crate::smtp_queue::process_one(&mut worker,&target_env,&provider,crate::email_step_policy::Policy::Snapshot).await},
+                "smtp" | "smtp-scoped" => {let provider=crate::smtp_alert::SmtpAlert::test_transport("127.0.0.1".into(),address.port());crate::smtp_queue::process_one(&mut worker,&target_env,&provider,crate::email_step_policy::Policy::Snapshot).await},
                 _ => unreachable!(),
             }});
             let mut waiting=false;
             for _ in 0..150 {waiting=pref_tx.query_one("SELECT count(*)=1 FROM pg_stat_activity WHERE application_name='email_preference_fence' AND wait_event_type='Lock'",&[]).await.unwrap().get(0);if waiting {break;}assert!(!task.is_finished());tokio::time::sleep(Duration::from_millis(100)).await;}
-            assert!(waiting,"email worker did not wait for the subscriber preference update");
+            assert!(waiting,"{kind} worker did not wait for the {mode} preference update");
             pref_tx.commit().await.unwrap();
             assert!(tokio::time::timeout(Duration::from_secs(10),task).await.unwrap().unwrap().unwrap());
             assert_eq!(db.query_one("SELECT status FROM public.novu_queue_jobs WHERE id=$1",&[&job]).await.unwrap().get::<_,String>(0),"cancelled");
-            let attempts=match kind {"resend"=>"SELECT count(*) FROM public.novu_rust_resend_attempts WHERE job_id=$1","sendgrid"=>"SELECT count(*) FROM public.novu_rust_sendgrid_attempts WHERE job_id=$1","smtp"=>"SELECT count(*) FROM public.novu_rust_smtp_attempts WHERE job_id=$1",_=>unreachable!()};
+            let attempts=match kind {"resend"=>"SELECT count(*) FROM public.novu_rust_resend_attempts WHERE job_id=$1","sendgrid"=>"SELECT count(*) FROM public.novu_rust_sendgrid_attempts WHERE job_id=$1","smtp" | "smtp-scoped"=>"SELECT count(*) FROM public.novu_rust_smtp_attempts WHERE job_id=$1",_=>unreachable!()};
             assert_eq!(db.query_one(attempts,&[&job]).await.unwrap().get::<_,i64>(0),0,"{kind} {mode}");
             assert!(tokio::time::timeout(Duration::from_millis(200),listener.accept()).await.is_err());
             db.execute("DELETE FROM public.novu_rust_subscriber_preferences WHERE environment_id=$1 AND subscriber_id='alice'",&[&env]).await.unwrap();
             db.execute("DELETE FROM public.novu_rust_subscriber_workflow_preferences WHERE environment_id=$1 AND subscriber_id='alice'",&[&env]).await.unwrap();
+            db.execute("DELETE FROM public.novu_rust_workflow_preferences WHERE environment_id=$1 AND workflow_identifier='fixture'",&[&env]).await.unwrap();
           }
         }
+        // Exercise the opposite ordering: a workflow preference writer must
+        // wait while the email reservation holds the workflow's share lock.
+        let payload:serde_json::Value=db.query_one("SELECT payload FROM public.novu_queue_jobs WHERE environment_id=$1 AND kind='experimental_smtp_email' ORDER BY created_at DESC LIMIT 1",&[&env]).await.unwrap().get(0);
+        let email:crate::sendgrid::Email=serde_json::from_value(payload).unwrap();
+        let reserve=db.transaction().await.unwrap();
+        assert!(crate::sendgrid_queue::lock_workflow_subscriber(&reserve,&env,&email).await.unwrap().is_some());
+        let (writer,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);
+        writer.batch_execute("SET application_name='email_preference_writer'").await.unwrap();
+        let writer_env=env.clone();
+        let writer_task=tokio::spawn(async move {writer.execute("INSERT INTO public.novu_rust_workflow_preferences(environment_id,workflow_identifier,email_enabled) VALUES($1,'fixture',false)",&[&writer_env]).await});
+        let mut waiting=false;
+        for _ in 0..150 {waiting=reserve.query_one("SELECT count(*)=1 FROM pg_stat_activity WHERE application_name='email_preference_writer' AND wait_event_type='Lock'",&[]).await.unwrap().get(0);if waiting {break;}assert!(!writer_task.is_finished());tokio::time::sleep(Duration::from_millis(100)).await;}
+        assert!(waiting,"default preference writer did not wait for email reservation");
+        reserve.commit().await.unwrap();
+        assert_eq!(tokio::time::timeout(Duration::from_secs(10),writer_task).await.unwrap().unwrap().unwrap(),1);
     }
 
     #[tokio::test]

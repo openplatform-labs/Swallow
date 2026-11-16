@@ -63,7 +63,7 @@ async fn lock_live(tx: &tokio_postgres::Transaction<'_>, job: &ClaimedJob) -> Re
         .get(0))
 }
 
-// Acquire the subscriber lock before the queue row lock for both email providers.
+// Acquire the subscriber and workflow locks before the queue row lock.
 pub(crate) async fn lock_workflow_subscriber(
     tx: &tokio_postgres::Transaction<'_>,
     environment: &str,
@@ -78,6 +78,10 @@ pub(crate) async fn lock_workflow_subscriber(
         if tx.query_opt("SELECT 1 FROM public.novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2 FOR UPDATE",&[&environment,&id]).await?.is_none() {
             return Ok(None);
         }
+        // Migration 0292 makes default-preference writers lock the workflow.
+        // Use a separate statement before reading preferences so a writer that
+        // committed while we waited is visible under READ COMMITTED.
+        tx.query_opt("SELECT 1 FROM public.novu_rust_workflows WHERE environment_id=$1 AND identifier=$2 FOR SHARE",&[&environment,&workflow]).await?;
         tx.query_opt("SELECT s.profile,w.read_only,w.all_enabled,w.email_enabled,(p.channels->>'email')::boolean,(sp.channels->>'email')::boolean,EXISTS(SELECT 1 FROM novu_rust_workflows wf WHERE wf.environment_id=s.environment_id AND wf.identifier=$3 AND ($4::text IS NULL OR wf.inbox_metadata->>'id'=$4)),s.internal_id FROM novu_rust_subscribers s LEFT JOIN novu_rust_workflow_preferences w ON w.environment_id=s.environment_id AND w.workflow_identifier=$3 LEFT JOIN novu_rust_subscriber_preferences p ON p.environment_id=s.environment_id AND p.subscriber_id=s.subscriber_id LEFT JOIN novu_rust_subscriber_workflow_preferences sp ON sp.environment_id=s.environment_id AND sp.subscriber_id=s.subscriber_id AND sp.workflow_identifier=$3 WHERE s.environment_id=$1 AND s.subscriber_id=$2", &[&environment,&id,&workflow,&context.workflow_internal_id]).await?
     } else {
         None
