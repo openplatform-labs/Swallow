@@ -6213,6 +6213,38 @@ pub(super) async fn discord_retry_grant_audit(State(db):State<Arc<Client>>,heade
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all="camelCase",deny_unknown_fields)]
+struct CancelCredentialRetentionBody {request_id:String,older_than_seconds:i32,batch_limit:i32,reason:String}
+pub(super) async fn resend_cancel_credential_retention_submit(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>,body:Bytes)->Response {
+    let identity=match authenticate(&db,&headers,verifier).await {Ok(v)=>v,Err(status)=>return failure(status,uri.path())};
+    let params:Vec<_>=form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).collect();
+    if params.len()!=1||params[0].0!="environmentId"||params[0].1.is_empty()||params[0].1.len()>512||params[0].1.contains('\0'){return failure(StatusCode::BAD_REQUEST,uri.path());}
+    let Some(input)=(body.len()<=4096).then(||serde_json::from_slice::<CancelCredentialRetentionBody>(&body).ok()).flatten() else{return failure(StatusCode::BAD_REQUEST,uri.path());};
+    if !(86401..=31536000).contains(&input.older_than_seconds)||!(1..=1000).contains(&input.batch_limit)||input.reason.trim().is_empty()||input.reason.len()>500||input.reason.chars().any(char::is_control){return failure(StatusCode::BAD_REQUEST,uri.path());}
+    let (Ok(request),Ok(exp))=(Uuid::parse_str(&input.request_id),i64::try_from(identity.expires_at)) else{return failure(StatusCode::BAD_REQUEST,uri.path());};let env=params[0].1.as_ref();
+    match guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_cancel_cred_retention_submit($1,$2,$3,$4,$5,$6,$7,$8,$9)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&input.older_than_seconds,&input.batch_limit,&input.reason]).await {
+        Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
+        Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
+        Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
+        Err(e) if e.code().is_some_and(|c|matches!(c.code(),"P4090"|"23505"|"55000"|"40001"))=>{let mut response=error_at(StatusCode::CONFLICT,"Retention request conflict","Conflict",uri.path()).into_response();response.headers_mut().insert(header::CACHE_CONTROL,header::HeaderValue::from_static("no-store"));response},
+        Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path()),
+    }
+}
+pub(super) async fn resend_cancel_credential_retention_get(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
+    let identity=match authenticate(&db,&headers,verifier).await {Ok(v)=>v,Err(status)=>return failure(status,uri.path())};
+    let params:Vec<_>=form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).collect();
+    if params.len()!=2{return failure(StatusCode::BAD_REQUEST,uri.path());}
+    let env=params.iter().find(|(k,_)|k=="environmentId").map(|(_,v)|v.as_ref());let request=params.iter().find(|(k,_)|k=="requestId").and_then(|(_,v)|Uuid::parse_str(v).ok());
+    let (Some(env),Some(request),Ok(exp))=(env.filter(|v|!v.is_empty()&&v.len()<=512&&!v.contains('\0')),request,i64::try_from(identity.expires_at)) else{return failure(StatusCode::BAD_REQUEST,uri.path());};
+    match guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_cancel_cred_retention_get($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request]).await {
+        Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
+        Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
+        Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
+        Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path()),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all="camelCase",deny_unknown_fields)]
 struct ResendCancelCommandReviewBody {review_id:String,command_id:String,failed_at:String,reason:String}
 pub(super) async fn resend_cancel_command_review(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>,body:Bytes)->Response {
     let identity=match authenticate(&db,&headers,verifier).await {Ok(v)=>v,Err(status)=>return failure(status,uri.path())};

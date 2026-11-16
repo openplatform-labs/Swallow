@@ -1,0 +1,104 @@
+//! Operator Resend auto-policy API against a disposable database.
+use axum::{
+    Extension,
+    body::Body,
+    http::{Request, StatusCode, header},
+};
+use http_body_util::BodyExt;
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use novu_rust_api::operator_access_token::AccessTokenVerifier;
+use serde_json::{Value, json};
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
+use tokio_postgres::{Client, NoTls};
+use tower::ServiceExt;
+use uuid::Uuid;
+const PRIVATE: &[u8] = include_bytes!("fixtures/operator_jwt/test-only-private.pem");
+const PUBLIC: &[u8] = include_bytes!("fixtures/operator_jwt/test-only-public.pem");
+async fn connect(url: &str) -> Client {
+    let (db, driver) = tokio_postgres::connect(url, NoTls).await.unwrap();
+    tokio::spawn(async move { driver.await.unwrap() });
+    db
+}
+fn jwt(subject: &str) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut h = Header::new(Algorithm::RS256);
+    h.typ = Some("at+jwt".into());
+    h.kid = Some("key".into());
+    encode(&h,&json!({"iss":"https://issuer.test","sub":subject,"aud":"swallow","exp":now+300,"iat":now-1,"jti":"token","client_id":"console"}),&EncodingKey::from_rsa_pem(PRIVATE).unwrap()).unwrap()
+}
+fn request(token: &str, method: &str, path: &str, body: Option<Value>) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.map(|b| b.to_string()).unwrap_or_default()))
+        .unwrap()
+}
+async fn response(
+    app: axum::Router,
+    token: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let r = app
+        .oneshot(request(token, method, path, body))
+        .await
+        .unwrap();
+    let status = r.status();
+    let bytes = r.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+#[tokio::test]
+#[ignore = "requires fully migrated disposable PostgreSQL and role creation"]
+async fn retention_api_is_scoped_idempotent_and_atomic() {
+    let url=std::env::var("TEST_DATABASE_URL").unwrap();let db=connect(&url).await;
+    let env=format!("jwt-cancel-retention-{}",Uuid::new_v4());let other=format!("jwt-cancel-other-{}",Uuid::new_v4());let role=format!("jwt_cancel_ret_{}",Uuid::new_v4().simple());
+    db.execute("INSERT INTO public.novu_rust_environments VALUES ($1,'org'),($2,'org')",&[&env,&other]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES('https://issuer.test','alice','console',$1),('https://issuer.test','bob','console',$1)",&[&env]).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_cancel_cred_retention_submit(text,text,text,text,bigint,uuid,integer,integer,text),public.novu_rust_operator_jwt_cancel_cred_retention_get(text,text,text,text,bigint,uuid) TO {role}")).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname::text=$1",&[&role]).await.unwrap();
+    let api=connect(&url).await;api.batch_execute(&format!("SET SESSION AUTHORIZATION {role}")).await.unwrap();
+    assert!(api.query("SELECT * FROM public.novu_rust_resend_cancel_credential_health",&[]).await.is_err());
+    let verifier=Arc::new(AccessTokenVerifier::new("https://issuer.test","swallow",&[("key",PUBLIC)]).unwrap());
+    let app=novu_rust_api::router(Arc::new(api)).layer(Extension(verifier.clone()));
+    let api2=connect(&url).await;api2.batch_execute(&format!("SET SESSION AUTHORIZATION {role}")).await.unwrap();
+    let app2=novu_rust_api::router(Arc::new(api2)).layer(Extension(verifier));
+    let alice=jwt("alice");let bob=jwt("bob");let path=format!("/v1/experimental/operator/resend-cancel-credential-retention?environmentId={env}");let id=Uuid::new_v4();
+    let body=json!({"requestId":id,"olderThanSeconds":86401,"batchLimit":1,"reason":"ticket"});
+    assert_eq!(response(app.clone(),&alice,"POST",&path,Some(body.clone())).await.0,StatusCode::UNAUTHORIZED);
+    db.execute("INSERT INTO public.novu_rust_operator_jwt_cancel_cred_retention_grants VALUES('https://issuer.test','alice','console',$1)",&[&env]).await.unwrap();
+    assert_eq!(response(app.clone(),&alice,"POST",&path,Some(body.clone())).await.0,StatusCode::UNAUTHORIZED);
+    db.execute("INSERT INTO public.novu_rust_resend_cancel_cred_retention_operators SELECT $1,rolname,oid FROM pg_roles WHERE rolname::text=$2",&[&env,&role]).await.unwrap();
+    let a=Uuid::new_v4();let b=Uuid::new_v4();db.execute("INSERT INTO public.novu_rust_resend_cancel_credential_health VALUES($1,$2,session_user,-1,clock_timestamp()-interval '5 days','unhealthy',clock_timestamp()-interval '3 days'),($1,$3,session_user,-1,clock_timestamp()-interval '5 days','unhealthy',clock_timestamp()-interval '3 days')",&[&env,&a,&b]).await.unwrap();
+    let (one,two)=tokio::join!(response(app.clone(),&alice,"POST",&path,Some(body.clone())),response(app2.clone(),&alice,"POST",&path,Some(body.clone())));
+    assert_eq!(one.0,StatusCode::OK,"{one:?}");assert_eq!(two.0,StatusCode::OK,"{two:?}");assert_ne!(one.1["replayed"],two.1["replayed"]);assert_eq!(one.1["deleted"],1);assert_eq!(two.1["deleted"],1);
+    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_resend_cancel_credential_health WHERE instance_id=ANY($1)",&[&vec![a,b]]).await.unwrap().get::<_,i64>(0),1);
+    let mut changed=body.clone();changed["reason"]=json!("different");assert_eq!(response(app.clone(),&alice,"POST",&path,Some(changed)).await.0,StatusCode::CONFLICT);
+    let lookup=format!("{path}&requestId={id}");assert_eq!(response(app.clone(),&alice,"GET",&lookup,None).await.1["found"],true);
+    assert_eq!(response(app.clone(),&bob,"GET",&lookup,None).await.0,StatusCode::UNAUTHORIZED);
+    db.execute("INSERT INTO public.novu_rust_operator_jwt_cancel_cred_retention_grants VALUES('https://issuer.test','bob','console',$1)",&[&env]).await.unwrap();
+    assert_eq!(response(app.clone(),&bob,"GET",&lookup,None).await.1["found"],false);
+    let failed=Uuid::new_v4();let failed_body=json!({"requestId":failed,"olderThanSeconds":86401,"batchLimit":1,"reason":"rollback"});
+    db.batch_execute("ALTER TABLE public.novu_rust_resend_cancel_cred_retention_audit ADD CONSTRAINT fixture_fail CHECK (deleted_count=0) NOT VALID").await.unwrap();
+    assert_eq!(response(app.clone(),&alice,"POST",&path,Some(failed_body)).await.0,StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_resend_cancel_credential_health WHERE instance_id=ANY($1)",&[&vec![a,b]]).await.unwrap().get::<_,i64>(0),1);
+    assert_eq!(response(app.clone(),&alice,"GET",&format!("{path}&requestId={failed}"),None).await.1["found"],false);
+    db.batch_execute("ALTER TABLE public.novu_rust_resend_cancel_cred_retention_audit DROP CONSTRAINT fixture_fail").await.unwrap();
+    db.execute("DELETE FROM public.novu_rust_operator_jwt_cancel_cred_retention_grants WHERE environment_id=$1 AND subject='alice'",&[&env]).await.unwrap();
+    assert_eq!(response(app.clone(),&alice,"GET",&lookup,None).await.0,StatusCode::UNAUTHORIZED);
+    db.execute("INSERT INTO public.novu_rust_operator_jwt_cancel_cred_retention_grants VALUES('https://issuer.test','alice','console',$1)",&[&env]).await.unwrap();
+    db.execute("DELETE FROM public.novu_rust_resend_cancel_cred_retention_operators WHERE environment_id=$1",&[&env]).await.unwrap();
+    assert_eq!(response(app.clone(),&alice,"GET",&lookup,None).await.0,StatusCode::UNAUTHORIZED);
+    assert_eq!(response(app.clone(),&alice,"POST",&path,Some(body)).await.0,StatusCode::UNAUTHORIZED);
+}
