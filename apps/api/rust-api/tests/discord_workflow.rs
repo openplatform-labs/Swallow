@@ -313,6 +313,26 @@ async fn trigger_renders_and_guards_subscriber_endpoint_and_preferences() {
     );
     assert_eq!(db.query_one("SELECT count(*) FROM public.novu_queue_jobs WHERE kind=$1 AND status='cancelled' AND last_error='chat preference disabled'",&[&novu_postgres_queue::discord_queue::WORKFLOW_KIND]).await.unwrap().get::<_,i64>(0),2);
     db.batch_execute("DELETE FROM public.novu_rust_subscriber_preferences WHERE environment_id='a' AND subscriber_id='alice'").await.unwrap();
+    // Pause the actual API update after it has locked the subscriber and
+    // written the opt-out, then start the real channel reservation.
+    produce(&mut db,app.clone(),"api-preference-race").await;
+    db.batch_execute("CREATE FUNCTION public.test_api_preference_pause() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(766482); RETURN NEW; END $$; CREATE TRIGGER test_api_preference_pause AFTER INSERT OR UPDATE ON public.novu_rust_subscriber_preferences FOR EACH ROW EXECUTE FUNCTION public.test_api_preference_pause()").await.unwrap();
+    db.query_one("SELECT pg_advisory_lock(766482)",&[]).await.unwrap();
+    let api_app=app.clone();
+    let api_task=tokio::spawn(async move {api_app.oneshot(Request::builder().method("PATCH").uri("/v2/subscribers/alice/preferences").header("authorization","ApiKey discord-key").header("content-type","application/json").body(Body::from(json!({"channels":{"chat":false}}).to_string())).unwrap()).await});
+    let mut api_pid=None;for _ in 0..150 {api_pid=db.query_opt("SELECT pid FROM pg_stat_activity WHERE wait_event='advisory' AND query LIKE '%novu_rust_subscriber_preferences%'",&[]).await.unwrap().map(|r|r.get::<_,i32>(0));if api_pid.is_some() {break;}assert!(!api_task.is_finished());tokio::time::sleep(Duration::from_millis(100)).await;}
+    let api_pid=api_pid.expect("preference API did not reach fixture barrier");
+    let (mut sender,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);let sender_pid:i32=sender.query_one("SELECT pg_backend_pid()",&[]).await.unwrap().get(0);
+    let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();let endpoint3=format!("http://{}/api/webhooks/1/token",listener.local_addr().unwrap());
+    let task=tokio::spawn(async move {let provider=novu_postgres_queue::discord::Webhook::test_endpoint(&endpoint3).unwrap();novu_postgres_queue::discord_queue::process_one(&mut sender,"a","dest",&provider).await});
+    let mut waiting=false;for _ in 0..150 {waiting=db.query_one("SELECT $1=ANY(pg_blocking_pids($2))",&[&api_pid,&sender_pid]).await.unwrap().get(0);if waiting {break;}assert!(!task.is_finished());tokio::time::sleep(Duration::from_millis(100)).await;}
+    assert!(waiting,"Discord sender did not wait for actual preference API");
+    db.query_one("SELECT pg_advisory_unlock(766482)",&[]).await.unwrap();
+    let response=tokio::time::timeout(Duration::from_secs(10),api_task).await.unwrap().unwrap().unwrap();assert_eq!(response.status(),StatusCode::OK);
+    assert!(tokio::time::timeout(Duration::from_secs(10),task).await.unwrap().unwrap().unwrap());
+    assert!(tokio::time::timeout(Duration::from_millis(200),listener.accept()).await.is_err());
+    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_queue_jobs WHERE kind=$1 AND status='cancelled' AND last_error='chat preference disabled'",&[&novu_postgres_queue::discord_queue::WORKFLOW_KIND]).await.unwrap().get::<_,i64>(0),3);
+    db.batch_execute("DROP TRIGGER test_api_preference_pause ON public.novu_rust_subscriber_preferences; DROP FUNCTION public.test_api_preference_pause(); DELETE FROM public.novu_rust_subscriber_preferences WHERE environment_id='a' AND subscriber_id='alice'").await.unwrap();
     produce(&mut db, app.clone(), "workflow-change").await;
     db.batch_execute("UPDATE public.novu_rust_workflows SET chat_content='different' WHERE environment_id='a' AND identifier='discord-workflow'").await.unwrap();
     assert!(
