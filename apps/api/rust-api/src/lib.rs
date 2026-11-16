@@ -1,6 +1,7 @@
 //! Experimental, deliberately incomplete Novu trigger endpoint.
 mod contexts;
 mod discord_endpoints;
+mod telegram_endpoints;
 mod console_auth;
 mod console_subscribers;
 mod console_alerts;
@@ -730,6 +731,10 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/slack-integrations/{integration}", get(slack_integrations::get_integration).delete(slack_integrations::delete_integration))
         .route("/v1/experimental/slack-integrations/{integration}/connections", get(slack_integrations::list_connections).post(slack_integrations::create_connection))
         .route("/v1/experimental/slack-integrations/{integration}/connections/{connection}", get(slack_integrations::get_connection).delete(slack_integrations::delete_connection))
+        .route("/v1/experimental/telegram-destinations", get(telegram_endpoints::destinations))
+        .route("/v1/experimental/telegram-endpoints", post(telegram_endpoints::create).get(telegram_endpoints::list))
+        .route("/v1/experimental/telegram-endpoint-audit", get(telegram_endpoints::audit))
+        .route("/v1/experimental/telegram-endpoints/{identifier}", get(telegram_endpoints::get).patch(telegram_endpoints::update).delete(telegram_endpoints::delete))
         .route("/v1/experimental/discord-destinations", get(discord_endpoints::destinations))
         .route("/v1/experimental/discord-endpoints", post(discord_endpoints::create).get(discord_endpoints::list))
         .route("/v1/experimental/discord-endpoint-audit", get(discord_endpoints::audit))
