@@ -552,6 +552,8 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/operator/resend-cancel-resolution", post(operator_identity::resend_cancel_resolve))
         .route("/v1/experimental/operator/resend-cancel-command", get(operator_identity::resend_cancel_command_get).post(operator_identity::resend_cancel_command_submit))
         .route("/v1/experimental/operator/resend-cancel-command-review", get(operator_identity::resend_cancel_command_review_get).post(operator_identity::resend_cancel_command_review))
+        .route("/v1/experimental/operator/resend-cancel-legacy-health", get(operator_identity::resend_cancel_legacy_health))
+        .route("/v1/experimental/operator/resend-cancel-legacy-list", get(operator_identity::resend_cancel_legacy_list))
         .route("/v1/experimental/operator/resend-cancel-evidence-health", get(operator_identity::resend_cancel_evidence_health))
         .route("/v1/experimental/operator/resend-cancel-evidence-list", get(operator_identity::resend_cancel_evidence_list))
         .route("/v1/experimental/operator/resend-cancel-command-health", get(operator_identity::resend_cancel_command_health))

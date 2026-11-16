@@ -23,7 +23,7 @@ GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_cancel_list(text,
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_cancel_detail(text,text,text,text,bigint,uuid) TO cancel_api_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_cancel_resolve(text,text,text,text,bigint,uuid,uuid,text,text) TO cancel_api_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_cancel_submit(text,text,text,text,bigint,uuid,uuid,text),public.novu_rust_operator_jwt_resend_cancel_command_get(text,text,text,text,bigint,uuid) TO cancel_api_fixture;
-GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_cancel_evidence_monitor(text,text,text,text,bigint,boolean,uuid) TO cancel_api_fixture;
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_cancel_evidence_monitor(text,text,text,text,bigint,boolean,uuid),public.novu_rust_operator_jwt_resend_cancel_legacy_monitor(text,text,text,text,bigint,boolean,uuid) TO cancel_api_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_cancel_command_monitor(text,text,text,text,bigint,integer,boolean,uuid) TO cancel_api_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_cancel_command_review(text,text,text,text,bigint,uuid,uuid,text,text),public.novu_rust_operator_jwt_resend_cancel_command_review_get(text,text,text,text,bigint,uuid) TO cancel_api_fixture;
 GRANT USAGE ON SCHEMA public TO cancel_api_worker;
@@ -38,6 +38,8 @@ INSERT INTO public.novu_rust_operator_jwt_resend_cancel_list_grants VALUES ('htt
 INSERT INTO public.novu_rust_operator_jwt_resend_cancel_detail_grants VALUES ('https://issuer.test','fixture','console','cancel-api-env');
 INSERT INTO public.novu_rust_operator_jwt_resend_cancel_resolution_grants VALUES ('https://issuer.test','fixture','console','cancel-api-env','confirmed');
 INSERT INTO public.novu_rust_operator_jwt_resend_cancel_submit_grants VALUES ('https://issuer.test','fixture','console','cancel-api-env');
+INSERT INTO public.novu_rust_operator_jwt_resend_cancel_legacy_health_grants VALUES ('https://issuer.test','fixture','console','cancel-api-env');
+INSERT INTO public.novu_rust_operator_jwt_resend_cancel_legacy_list_grants VALUES ('https://issuer.test','fixture','console','cancel-api-env');
 INSERT INTO public.novu_rust_operator_jwt_resend_cancel_evidence_health_grants VALUES ('https://issuer.test','fixture','console','cancel-api-env');
 INSERT INTO public.novu_rust_operator_jwt_resend_cancel_evidence_list_grants VALUES ('https://issuer.test','fixture','console','cancel-api-env');
 INSERT INTO public.novu_rust_operator_jwt_resend_cancel_command_health_grants VALUES ('https://issuer.test','fixture','console','cancel-api-env');

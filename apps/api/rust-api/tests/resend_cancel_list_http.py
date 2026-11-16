@@ -19,7 +19,7 @@ def grant(method,path,body=None):
     except urllib.error.HTTPError as e:return e.code,json.loads(e.read())
 target=os.environ['TEST_TARGET_JWT']
 target_params={'environmentId':'cancel-api-env','targetIssuer':'https://issuer.test','targetSubject':'target','targetClientId':'console','resource':'resend-cancel'}
-for n,permission in enumerate(['list','detail','confirmed','not_cancelled','submit','command-health','command-list','command-review','evidence-health','evidence-list'],1):
+for n,permission in enumerate(['list','detail','confirmed','not_cancelled','submit','command-health','command-list','command-review','evidence-health','evidence-list','legacy-health','legacy-list'],1):
     params={**target_params,'permission':permission};status,data=grant('GET','?'+urllib.parse.urlencode(params));assert status==200 and data['targetExists'] and not data['granted']
     body={'requestId':'11111111-1111-4111-8111-'+str(n).zfill(12),'targetIssuer':'https://issuer.test','targetSubject':'target','targetClientId':'console','resource':'resend-cancel','permission':permission,'expected':False,'desired':True,'reason':'delegate'}
     if n==1:
@@ -35,7 +35,7 @@ for n,permission in enumerate(['list','detail','confirmed','not_cancelled','subm
     assert grant('PUT','?environmentId=cancel-api-env',body)[1]['replayed']
     assert grant('PUT','?environmentId=cancel-api-env',{**body,'reason':'changed'})[0]==409
     assert grant('GET','?'+urllib.parse.urlencode(params))[1]['granted']
-status,audit=grant('GET','/audit?environmentId=cancel-api-env');assert status==200 and len(audit['data'])==12
+status,audit=grant('GET','/audit?environmentId=cancel-api-env');assert status==200 and len(audit['data'])==14
 evidence='environmentId=cancel-api-env'
 status,counts=get(evidence,endpoint='resend-cancel-evidence-health');assert status==200 and counts['conflicting']==1 and counts['ambiguous']>=1,(status,counts)
 status,page=get(evidence,endpoint='resend-cancel-evidence-list');assert status==200 and any(x['evidence']=='conflicting' for x in page['data']) and 'private' not in json.dumps(page)
@@ -159,8 +159,22 @@ assert resolve(second_body)[0]==200
 # Historical 409 can be reviewed through independently authorized JWT resolution.
 legacy_id='88888888-8888-4888-8888-888888888887';legacy_job='88888888-8888-4888-8888-888888888886'
 sql("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES('%s','cancel-api-env','experimental_resend_email','{}','completed'); INSERT INTO public.novu_rust_resend_cancel_requests(environment_id,request_id,job_id,provider_id,database_principal,principal_oid,reason,state,http_status) SELECT 'cancel-api-env','%s','%s','legacy-id',rolname,oid,'fixture','rejected',409 FROM pg_roles WHERE rolname='cancel_api_fixture'"%(legacy_job,legacy_id,legacy_job))
+legacy_query='environmentId=cancel-api-env'
+status,legacy_health=get(legacy_query,endpoint='resend-cancel-legacy-health');assert status==200 and legacy_health['legacyAmbiguous']==1,(status,legacy_health)
+status,legacy_page=get(legacy_query,endpoint='resend-cancel-legacy-list');assert status==200 and len(legacy_page['data'])==1 and legacy_page['data'][0]['requestId']==legacy_id and legacy_page['data'][0]['httpStatus']==409
+assert get(legacy_query,target,endpoint='resend-cancel-legacy-list')[0]==200
+assert get('environmentId=cancel-api-other',endpoint='resend-cancel-legacy-health')[0] in (401,403)
+assert get(legacy_query+'&after=invalid',endpoint='resend-cancel-legacy-list')[0]==400
+sql("DELETE FROM public.novu_rust_operator_jwt_resend_cancel_legacy_list_grants WHERE environment_id='cancel-api-env' AND subject='fixture'")
+assert get(legacy_query,endpoint='resend-cancel-legacy-list')[0] in (401,403) and get(legacy_query,endpoint='resend-cancel-legacy-health')[0]==200
+sql("INSERT INTO public.novu_rust_operator_jwt_resend_cancel_legacy_list_grants VALUES('https://issuer.test','fixture','console','cancel-api-env'); UPDATE public.novu_rust_resend_cancel_operators SET can_read=false WHERE environment_id='cancel-api-env' AND database_principal='cancel_api_fixture'")
+assert get(legacy_query,endpoint='resend-cancel-legacy-list')[0] in (401,403) and get(legacy_query,endpoint='resend-cancel-legacy-health')[0]==200
+sql("UPDATE public.novu_rust_resend_cancel_operators SET can_read=true WHERE environment_id='cancel-api-env' AND database_principal='cancel_api_fixture'; DELETE FROM public.novu_rust_delivery_operator_grants WHERE environment_id='cancel-api-env' AND database_principal='cancel_api_fixture' AND decision='alert_view'")
+assert get(legacy_query,endpoint='resend-cancel-legacy-health')[0] in (401,403) and get(legacy_query,endpoint='resend-cancel-legacy-list')[0]==200
+sql("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'cancel-api-env',rolname,'alert_view',oid FROM pg_roles WHERE rolname='cancel_api_fixture'")
 legacy_body={'resolutionId':'abababab-abab-4bab-8bab-abababababab','requestId':legacy_id,'decision':'not_cancelled','reason':'reviewed provider evidence'}
 assert resolve(legacy_body)[0]==200
+assert get(legacy_query,endpoint='resend-cancel-legacy-health')[1]['legacyAmbiguous']==0
 status,legacy_detail=get('environmentId=cancel-api-env&requestId='+legacy_id,endpoint='resend-cancel-detail')
 assert status==200 and legacy_detail['request']['state']=='not_cancelled' and legacy_detail['request']['httpStatus']==409 and legacy_detail['resolution']['operator']['subject']=='fixture'
 sql("DELETE FROM public.novu_rust_operator_jwt_resend_cancel_resolution_grants WHERE environment_id='cancel-api-env' AND decision='confirmed'")

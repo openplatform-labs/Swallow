@@ -37,6 +37,11 @@ describe('Resend cancellation list',()=>{
     for(const code of [408,409]){await c.loadDetail(id(1));fixture.detectChanges();expect(fixture.nativeElement.textContent).toContain('과거 408·409');c.prepareResolution();expect(c.resolutionStatus()).toBe('prepared');c.resetResolution();}
     await c.loadDetail(id(1));c.prepareResolution();expect(c.resolutionStatus()).toBe('idle');fixture.destroy();
   });
+  it('loads legacy counts and bounded pages, rejects malformed and stale responses',async()=>{
+    let finish!:(r:Response)=>void;
+    vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({legacyAmbiguous:1}))).mockResolvedValueOnce(new Response(JSON.stringify({data:[{requestId:id(1),jobId:id(2),httpStatus:409,createdAt:'today',private:'discard'}],next:null}))).mockResolvedValueOnce(new Response(JSON.stringify({data:[{requestId:id(1),jobId:id(2),httpStatus:400,createdAt:'today'}],next:null}))).mockReturnValueOnce(new Promise(resolve=>finish=resolve));
+    const {fixture,c}=setup();await c.loadLegacyHealth();await c.listLegacy();expect(c.legacyHealth()).toBe(1);expect(c.legacyRows()[0]).not.toHaveProperty('private');fixture.detectChanges();expect(fixture.nativeElement.textContent).toContain('미판정 과거 기록');await c.listLegacy();expect(c.legacyListStatus()).toBe('error');const pending=c.loadLegacyHealth();c.environment='other';c.ngOnChanges();finish(new Response(JSON.stringify({legacyAmbiguous:2})));await pending;expect(c.legacyHealth()).toBeNull();expect(c.legacyHealthStatus()).toBe('idle');fixture.destroy();
+  });
   it('preserves the cancellation command ID across an uncertain submission',async()=>{
     const requestId=id(42),jobId=id(100),commandId=id(200);vi.spyOn(crypto,'randomUUID').mockReturnValue(requestId as `${string}-${string}-${string}-${string}-${string}`);
     const mock=vi.spyOn(globalThis,'fetch').mockRejectedValueOnce(Error('network')).mockResolvedValueOnce(new Response(JSON.stringify({requestId,command:{requestId:commandId,jobId,state:'pending',attemptState:null},replayed:true})));
