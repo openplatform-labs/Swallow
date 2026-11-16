@@ -1306,6 +1306,53 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires fully migrated disposable PostgreSQL and loopback"]
+    async fn workflow_multicast_preference_change_respects_selected_policy() {
+        let url=std::env::var("TEST_DATABASE_URL").unwrap();
+        let (mut db,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);
+        let env=format!("push-multicast-race-{}",Uuid::new_v4());
+        db.execute("INSERT INTO public.novu_rust_environments VALUES($1,'org')",&[&env]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,push_title,push_content,inbox_metadata) VALUES($1,'fixture',true,true,'title','hello','{\"id\":\"64a000000000000000000051\"}')",&[&env]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES($1,'alice','64a000000000000000000054','{}')",&[&env]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_fcm_devices(environment_id,subscriber_id,device_tokens) VALUES($1,'alice',ARRAY['a','b'])",&[&env]).await.unwrap();
+        for policy in [crate::push_step_policy::PreferencePolicy::Recheck,crate::push_step_policy::PreferencePolicy::Snapshot] {
+            let transaction=format!("multicast-{}",policy.as_str());
+            crate::enqueue(&db,Uuid::new_v4(),&env,crate::in_app::JOB_KIND,&json!({"workflow":"fixture","transactionId":transaction,"content":"","payload":{},"recipients":[{"subscriberId":"alice"}],"recipientIdentitySnapshot":{"alice":"64a000000000000000000054"},"severityOverride":null})).await.unwrap();
+            assert!(crate::in_app::process_one(&mut db).await.unwrap());
+            let job:Uuid=db.query_one("SELECT push_job_id FROM public.novu_rust_push_step_outcomes WHERE environment_id=$1 AND transaction_id=$2",&[&env,&transaction]).await.unwrap().get(0);
+            let (first,server)=mock(vec![200]).await;
+            assert!(process_one_with_policies(&mut db,&env,Some(&first),None,false,crate::push_step_policy::Policy::Snapshot,policy).await.unwrap());
+            assert_eq!(server.await.unwrap(),vec!["a"]);
+            let row=db.query_one("SELECT status,payload->'prepared_context' IS NOT NULL FROM public.novu_queue_jobs WHERE id=$1",&[&job]).await.unwrap();
+            assert_eq!(row.get::<_,String>(0),"pending");assert!(row.get::<_,bool>(1));
+            assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_fcm_attempts WHERE job_id=$1 AND state='accepted'",&[&job]).await.unwrap().get::<_,i64>(0),1);
+            if policy==crate::push_step_policy::PreferencePolicy::Recheck {
+                let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();let origin=format!("http://{}",listener.local_addr().unwrap());
+                let pref_tx=db.transaction().await.unwrap();
+                pref_tx.execute("INSERT INTO public.novu_rust_workflow_preferences(environment_id,workflow_identifier,push_enabled) VALUES($1,'fixture',false)",&[&env]).await.unwrap();
+                let (mut worker,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);
+                worker.batch_execute("SET application_name='push_multicast_fence'").await.unwrap();let target_env=env.clone();
+                let task=tokio::spawn(async move {let provider=Fcm::with_origin("demo","fixture".into(),&origin).unwrap();process_one_with_policies(&mut worker,&target_env,Some(&provider),None,false,crate::push_step_policy::Policy::Snapshot,policy).await});
+                let mut waiting=false;for _ in 0..150 {waiting=pref_tx.query_one("SELECT count(*)=1 FROM pg_stat_activity WHERE application_name='push_multicast_fence' AND wait_event_type='Lock'",&[]).await.unwrap().get(0);if waiting {break;}assert!(!task.is_finished());tokio::time::sleep(Duration::from_millis(100)).await;}
+                assert!(waiting,"prepared multicast worker did not wait for default preference");pref_tx.commit().await.unwrap();
+                assert!(tokio::time::timeout(Duration::from_secs(10),task).await.unwrap().unwrap().unwrap());
+                assert!(tokio::time::timeout(Duration::from_millis(200),listener.accept()).await.is_err());
+                assert_eq!(db.query_one("SELECT status FROM public.novu_queue_jobs WHERE id=$1",&[&job]).await.unwrap().get::<_,String>(0),"cancelled");
+                assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_fcm_attempts WHERE job_id=$1 AND state='accepted'",&[&job]).await.unwrap().get::<_,i64>(0),1);
+                assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_fcm_attempts WHERE job_id=$1",&[&job]).await.unwrap().get::<_,i64>(0),1);
+            } else {
+                db.execute("INSERT INTO public.novu_rust_workflow_preferences(environment_id,workflow_identifier,push_enabled) VALUES($1,'fixture',false)",&[&env]).await.unwrap();
+                let (second,server)=mock(vec![200]).await;
+                assert!(process_one_with_policies(&mut db,&env,Some(&second),None,false,crate::push_step_policy::Policy::Snapshot,policy).await.unwrap());
+                assert_eq!(server.await.unwrap(),vec!["b"]);
+                assert_eq!(db.query_one("SELECT status FROM public.novu_queue_jobs WHERE id=$1",&[&job]).await.unwrap().get::<_,String>(0),"completed");
+                assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_fcm_attempts WHERE job_id=$1 AND state='accepted'",&[&job]).await.unwrap().get::<_,i64>(0),2);
+            }
+            db.execute("DELETE FROM public.novu_rust_workflow_preferences WHERE environment_id=$1 AND workflow_identifier='fixture'",&[&env]).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     #[ignore = "requires migrated disposable PostgreSQL, token cleanup enabled, and loopback"]
     async fn invalid_token_policy_controls_actual_cleanup() {
         assert_eq!(
