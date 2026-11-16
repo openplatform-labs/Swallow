@@ -23,7 +23,7 @@ def stop_api():
 def start_api(url):
     global api
     with socket.socket() as sock:sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
-    settings={**os.environ,'DATABASE_URL':url.replace('postgres://postgres@','postgres://cancel_evidence_ha_api@',1),'NOVU_POSTGRES_ALLOW_INSECURE':'true','LISTEN_ADDR':'127.0.0.1:'+str(port),'SWALLOW_API_HEALTH_ENDPOINTS_ENABLED':'true','NOVU_RESEND_WEBHOOK_ENVIRONMENT_ID':env,'NOVU_RESEND_WEBHOOK_SECRET':'whsec_'+base64.b64encode(secret).decode()}
+    settings={**os.environ,'DATABASE_URL':url.replace('postgres://postgres@','postgres://cancel_evidence_ha_api@',1),'NOVU_POSTGRES_ALLOW_INSECURE':'true','LISTEN_ADDR':'127.0.0.1:'+str(port),'SWALLOW_API_HEALTH_ENDPOINTS_ENABLED':'true','SWALLOW_API_READY_REQUIRE_WRITABLE':'true','NOVU_RESEND_WEBHOOK_ENVIRONMENT_ID':env,'NOVU_RESEND_WEBHOOK_SECRET':'whsec_'+base64.b64encode(secret).decode()}
     api=subprocess.Popen([os.environ['TEST_API_BINARY']],env=settings,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     origin='http://127.0.0.1:'+str(port)
     def ready():
@@ -32,6 +32,11 @@ def start_api(url):
             with urllib.request.urlopen(origin+'/health/ready',timeout=1) as res:return res.status==200
         except (OSError,urllib.error.URLError):return False
     until(ready,'API not ready');return origin
+def ready(origin):
+    try:
+        with urllib.request.urlopen(origin+'/health/ready',timeout=2) as res:return res.status
+    except urllib.error.HTTPError as e:return e.code
+    except (OSError,urllib.error.URLError):return 0
 def alert(url):
     settings={**os.environ,'DATABASE_URL':url.replace('postgres://postgres@','postgres://cancel_evidence_ha_monitor@',1),'NOVU_POSTGRES_ALLOW_INSECURE':'true','SWALLOW_ALERT_RESEND_ENABLED':'true','SWALLOW_ALERT_CHECK_SCOPED_ACCESS':'true','SWALLOW_ALERT_RESEND_EXCLUDE_CONFIRMED_CANCEL':'true','SWALLOW_ALERT_RESEND_CANCEL_EVIDENCE_ENABLED':'true','SWALLOW_ALERT_SCOPED_DELIVERY':'true','SWALLOW_ALERT_COOLDOWN_POLICY':'new-condition','SWALLOW_ALERT_CONDITIONS_V3':'true','SWALLOW_ALERT_SLACK_WEBHOOK':'https://hooks.slack.com/services/A/B/C','SWALLOW_ALERT_SLACK_TARGET_ID':'blocked'}
     return subprocess.run([os.environ['TEST_ALERT_BINARY'],env,'60','120','60'],env=settings,capture_output=True,text=True,timeout=15)
@@ -39,7 +44,9 @@ def webhook(origin):
     body=json.dumps({'type':'email.delivery_delayed','data':{'email_id':'fixture-provider','to':['fixture@example.test']}},separators=(',',':')).encode();ts=str(int(time.time()));eid='after-promotion'
     signature=base64.b64encode(hmac.new(secret,(eid+'.'+ts+'.').encode()+body,hashlib.sha256).digest()).decode()
     req=urllib.request.Request(origin+'/webhooks/organizations/org/environments/'+env+'/email/resend',data=body,method='POST',headers={'svix-id':eid,'svix-timestamp':ts,'svix-signature':'v1,'+signature,'Content-Type':'application/json'})
-    with urllib.request.urlopen(req,timeout=5) as res:return res.status
+    try:
+        with urllib.request.urlopen(req,timeout=5) as res:return res.status
+    except urllib.error.HTTPError as e:return e.code
 try:
     sql(primary,"""CREATE ROLE cancel_evidence_ha_api LOGIN;CREATE ROLE cancel_evidence_ha_monitor LOGIN;
 GRANT USAGE ON SCHEMA public TO cancel_evidence_ha_api,cancel_evidence_ha_monitor;
@@ -59,14 +66,20 @@ INSERT INTO public.novu_rust_resend_projection_heartbeat VALUES('cancel-evidence
     assert sql(monitor_primary,query)=='0|0'
     first=alert(primary);assert first.returncode==0,(first.returncode,first.stderr)
     until(lambda:sql(standby,"SELECT count(*) FROM public.novu_rust_resend_cancel_requests WHERE request_id='%s' AND state='confirmed'"%request)=='1','confirmation not replicated')
-    origin=start_api(primary);control(os.environ['TEST_LOCAL_PRIMARY_DATA'],'-m','immediate','stop');control(os.environ['TEST_LOCAL_STANDBY_DATA'],'promote');stop_api()
-    origin=start_api(standby)
+    origin=start_api(os.environ['TEST_FAILOVER_URL']);api_pid=api.pid
+    control(os.environ['TEST_LOCAL_PRIMARY_DATA'],'-m','immediate','stop')
+    until(lambda:ready(origin)==503,'API did not become unready after primary stopped')
+    assert api.poll() is None and api.pid==api_pid
+    assert webhook(origin)==503
+    control(os.environ['TEST_LOCAL_STANDBY_DATA'],'promote')
+    until(lambda:ready(origin)==200,'API did not reconnect after promotion')
+    assert api.poll() is None and api.pid==api_pid
     monitor_standby=standby.replace('postgres://postgres@','postgres://cancel_evidence_ha_monitor@',1)
     assert sql(monitor_standby,query)=='0|0'
     assert webhook(origin)==204 and webhook(origin)==204
     assert sql(monitor_standby,"SELECT conflicting,ambiguous FROM public.novu_rust_resend_cancel_evidence_health('cancel-evidence-ha')")=='1|0'
     assert sql(monitor_standby,query)=='1|1'
     after=alert(standby);assert after.returncode==2 and 'requires operator review' in after.stderr,(after.returncode,after.stderr)
-    print('Synchronous promotion preserved cancellation; signed callback after API restart reactivated health and blocked alert.')
+    print('Synchronous promotion preserved cancellation; same API process reconnected; signed callback reactivated health and blocked alert.')
 finally:
     stop_api()
