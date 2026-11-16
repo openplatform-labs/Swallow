@@ -177,6 +177,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     if smtp_auto_grace.is_some() && on_new_condition && !conditions_v3 { return Err("SMTP auto retry health new-condition requires v3 conditions".into()); }
     let smtp_enabled = env_bool("SWALLOW_ALERT_SMTP_ENABLED", false)?;
     if smtp_enabled && on_new_condition && !extended_conditions { return Err("SMTP health with new-condition policy requires v2 conditions".into()); }
+    let telegram_enabled = env_bool("SWALLOW_ALERT_TELEGRAM_ENABLED", false)?;
+    if telegram_enabled && on_new_condition && !conditions_v3 { return Err("Telegram health with new-condition policy requires v3 conditions".into()); }
     let discord_enabled = env_bool("SWALLOW_ALERT_DISCORD_ENABLED", false)?;
     let discord_cooldown_overdue_only = match std::env::var("SWALLOW_ALERT_DISCORD_COOLDOWN_MODE").as_deref() {
         Ok("all") | Err(std::env::VarError::NotPresent) => false,
@@ -291,6 +293,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     };
     if !resend_enabled
         && !attempts_enabled
+        && !telegram_enabled
         && !discord_enabled
         && !smtp_enabled
         && !resend_cancel_legacy_enabled
@@ -636,6 +639,15 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
             _ => { eprintln!("Discord health check failed"); Err(()) }
         })
     } else { None };
+    let telegram_health = if telegram_enabled {
+        let result = tokio::time::timeout(operation_timeout, db.query_one("SELECT * FROM public.novu_rust_telegram_health($1)", &[&args[0]])).await;
+        Some(match result {
+            Ok(Ok(row)) => match (u64::try_from(row.get::<_,i64>(0)),u64::try_from(row.get::<_,i64>(1)),u64::try_from(row.get::<_,i64>(2)),u64::try_from(row.get::<_,i64>(3))) {
+                (Ok(a),Ok(b),Ok(c),Ok(d)) => Ok((a,b,c,d)), _ => Err(())
+            },
+            _ => { eprintln!("Telegram health check failed"); Err(()) }
+        })
+    } else { None };
     let slack_attempts = if slack_jobs_enabled {
         let scoped_slack = env_bool("SWALLOW_ALERT_SLACK_SCOPED_ACCESS", false)?;
         let result = tokio::time::timeout(operation_timeout, async {
@@ -794,7 +806,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         });
         Some(match values {Some(value)=>Ok(value),None=>{eprintln!("FCM cooldown check failed");Err(())}})
     } else {None};
-    let unhealthy = resend_cancel_credentials.is_some_and(|value| match value {Ok((healthy,unhealthy,_,minimum))=>healthy<minimum||unhealthy>0,Err(())=>true}) || resend_cancel_legacy.is_some_and(|v|!matches!(v,Ok(0))) || resend_cancel_evidence.is_some_and(|v|!matches!(v,Ok((0,0)))) || resend_cancel_commands.is_some_and(|v|!matches!(v,Ok((_,0,0)))) || resend_cancel_health.is_some_and(|v|!matches!(v,Ok((_,0)))) || smtp_auto_workers.is_some_and(|v| match v {Ok((healthy,_,minimum))=>healthy<minimum,Err(())=>true}) || smtp_auto_health.is_some_and(|v| !matches!(v,Ok((_,_,0,0)))) || smtp_ca.is_some_and(|value| match value {Ok((healthy,unhealthy,_,minimum))=>healthy<minimum||unhealthy>0,Err(())=>true}) || smtp_credentials.is_some_and(|value| match value {Ok((healthy,unhealthy,_,minimum))=>healthy<minimum||unhealthy>0,Err(())=>true}) || discord_cooldown_health.is_some_and(|v| match v {Ok((active,deferred,overdue))=>overdue>0||(!discord_cooldown_overdue_only&&(active>0||deferred>0)),Err(())=>true}) || smtp_health.is_some_and(|v| !matches!(v,Ok((0,0,0)))) || discord_retry_health.is_some_and(|v| !matches!(v,Ok((_,0)))) || discord_health.is_some_and(|v| !matches!(v,Ok((0,0,0,0)))) || fcm_credentials.is_some_and(|value| match value {
+    let unhealthy = telegram_health.is_some_and(|v| !matches!(v,Ok((0,0,0,0)))) || resend_cancel_credentials.is_some_and(|value| match value {Ok((healthy,unhealthy,_,minimum))=>healthy<minimum||unhealthy>0,Err(())=>true}) || resend_cancel_legacy.is_some_and(|v|!matches!(v,Ok(0))) || resend_cancel_evidence.is_some_and(|v|!matches!(v,Ok((0,0)))) || resend_cancel_commands.is_some_and(|v|!matches!(v,Ok((_,0,0)))) || resend_cancel_health.is_some_and(|v|!matches!(v,Ok((_,0)))) || smtp_auto_workers.is_some_and(|v| match v {Ok((healthy,_,minimum))=>healthy<minimum,Err(())=>true}) || smtp_auto_health.is_some_and(|v| !matches!(v,Ok((_,_,0,0)))) || smtp_ca.is_some_and(|value| match value {Ok((healthy,unhealthy,_,minimum))=>healthy<minimum||unhealthy>0,Err(())=>true}) || smtp_credentials.is_some_and(|value| match value {Ok((healthy,unhealthy,_,minimum))=>healthy<minimum||unhealthy>0,Err(())=>true}) || discord_cooldown_health.is_some_and(|v| match v {Ok((active,deferred,overdue))=>overdue>0||(!discord_cooldown_overdue_only&&(active>0||deferred>0)),Err(())=>true}) || smtp_health.is_some_and(|v| !matches!(v,Ok((0,0,0)))) || discord_retry_health.is_some_and(|v| !matches!(v,Ok((_,0)))) || discord_health.is_some_and(|v| !matches!(v,Ok((0,0,0,0)))) || fcm_credentials.is_some_and(|value| match value {
         Ok((healthy, failed, _, minimum)) => healthy < minimum || failed > 0,
         Err(()) => true,
     }) || sendgrid_webhook_keys.is_some_and(|v| !matches!(v, Ok(1..=10)))
@@ -853,6 +865,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         resend_cancel_evidence,
         resend_cancel_health,
         resend_cancel_commands,
+        telegram_health,
         discord_health,
         discord_retry_health,
         discord_cooldown_health,
@@ -919,7 +932,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         println!("{{\"status\":\"healthy\"}}");
         return Ok(());
     }
-    let mut error = resend_cancel_legacy.is_some_and(|v|v.is_err()) || resend_cancel_evidence.is_some_and(|v|v.is_err()) || resend_cancel_commands.is_some_and(|v|v.is_err()) || resend_cancel_health.is_some_and(|v|v.is_err()) || smtp_auto_workers.is_some_and(|v| v.is_err()) || smtp_auto_health.is_some_and(|v| v.is_err()) || discord_cooldown_health.is_some_and(|v| v.is_err()) || smtp_health.is_some_and(|v| v.is_err()) || discord_retry_health.is_some_and(|v| v.is_err()) || discord_health.is_some_and(|v| v.is_err()) || configuration_error
+    let mut error = telegram_health.is_some_and(|v|v.is_err()) || resend_cancel_legacy.is_some_and(|v|v.is_err()) || resend_cancel_evidence.is_some_and(|v|v.is_err()) || resend_cancel_commands.is_some_and(|v|v.is_err()) || resend_cancel_health.is_some_and(|v|v.is_err()) || smtp_auto_workers.is_some_and(|v| v.is_err()) || smtp_auto_health.is_some_and(|v| v.is_err()) || discord_cooldown_health.is_some_and(|v| v.is_err()) || smtp_health.is_some_and(|v| v.is_err()) || discord_retry_health.is_some_and(|v| v.is_err()) || discord_health.is_some_and(|v| v.is_err()) || configuration_error
         || observation_error
         || sendgrid_webhook_keys.is_some_and(|v| v.is_err())
         || fcm_credentials.is_some_and(|v| v.is_err())

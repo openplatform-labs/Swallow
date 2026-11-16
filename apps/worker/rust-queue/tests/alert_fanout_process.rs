@@ -89,18 +89,18 @@ fn delivery_checks_are_selected_per_target_and_invalid_config_starts_no_children
     let fanout = dir.join("alert-fanout");
     std::fs::copy(env!("CARGO_BIN_EXE_alert-fanout"), &fanout).unwrap();
     let child = dir.join("send-delivery-alert");
-    std::fs::write(&child, "#!/bin/sh\nprintf '%s:%s:%s:%s:%s:%s:%s:%s:%s\\n' \"$SWALLOW_ALERT_SLACK_TARGET_ID\" \"$SWALLOW_ALERT_RESEND_ENABLED\" \"$SWALLOW_ALERT_DISCORD_ENABLED\" \"$SWALLOW_ALERT_FAILED_JOBS_ENABLED\" \"${SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS:-disabled}\" \"$SWALLOW_ALERT_DISCORD_COOLDOWN_MODE\" \"$SWALLOW_ALERT_RESEND_CANCEL_EVIDENCE_ENABLED\" \"$SWALLOW_ALERT_RESEND_EXCLUDE_CONFIRMED_CANCEL\" \"$SWALLOW_ALERT_RESEND_CANCEL_LEGACY_ENABLED\" >> \"$FANOUT_TEST_LOG\"\n").unwrap();
+    std::fs::write(&child, "#!/bin/sh\nprintf '%s:%s:%s:%s:%s:%s:%s:%s:%s:%s\\n' \"$SWALLOW_ALERT_SLACK_TARGET_ID\" \"$SWALLOW_ALERT_RESEND_ENABLED\" \"$SWALLOW_ALERT_DISCORD_ENABLED\" \"$SWALLOW_ALERT_FAILED_JOBS_ENABLED\" \"${SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS:-disabled}\" \"$SWALLOW_ALERT_DISCORD_COOLDOWN_MODE\" \"$SWALLOW_ALERT_RESEND_CANCEL_EVIDENCE_ENABLED\" \"$SWALLOW_ALERT_RESEND_EXCLUDE_CONFIRMED_CANCEL\" \"$SWALLOW_ALERT_RESEND_CANCEL_LEGACY_ENABLED\" \"$SWALLOW_ALERT_TELEGRAM_ENABLED\" >> \"$FANOUT_TEST_LOG\"\n").unwrap();
     std::fs::set_permissions(child, std::fs::Permissions::from_mode(0o700)).unwrap();
     let config=dir.join("targets.json"); let log=dir.join("log");
     let targets=serde_json::json!({"targets":[
-        {"channel":"slack","id":"a","webhook_file":dir.join("key"),"delivery_checks":{"resend":false,"discord":true,"discord_cooldown_mode":"overdue","resend_cancel_evidence":true,"resend_exclude_confirmed_cancel":true,"resend_cancel_legacy":true},"delivery_thresholds":{"queue_max_wait_seconds":120}},
+        {"channel":"slack","id":"a","webhook_file":dir.join("key"),"delivery_checks":{"resend":false,"discord":true,"telegram":true,"discord_cooldown_mode":"overdue","resend_cancel_evidence":true,"resend_exclude_confirmed_cancel":true,"resend_cancel_legacy":true},"delivery_thresholds":{"queue_max_wait_seconds":120}},
         {"channel":"slack","id":"b","webhook_file":dir.join("key"),"delivery_checks":{"failed_jobs":true,"discord_cooldown_mode":"all"},"delivery_thresholds":{"queue_max_wait_seconds":"disabled"}},
         {"channel":"slack","id":"c","webhook_file":dir.join("key")}
     ]});
     std::fs::write(&config,serde_json::to_vec(&targets).unwrap()).unwrap();
-    let run=|| Command::new(&fanout).args(["delivery","env","300","120","60"]).arg(&config).env("FANOUT_TEST_LOG",&log).env("SWALLOW_ALERT_RESEND_ENABLED","true").env("SWALLOW_ALERT_DISCORD_ENABLED","false").env("SWALLOW_ALERT_FAILED_JOBS_ENABLED","false").env("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS","60").env("SWALLOW_ALERT_DISCORD_COOLDOWN_MODE","overdue").env("SWALLOW_ALERT_RESEND_CANCEL_EVIDENCE_ENABLED","false").env("SWALLOW_ALERT_RESEND_EXCLUDE_CONFIRMED_CANCEL","false").env("SWALLOW_ALERT_RESEND_CANCEL_LEGACY_ENABLED","false").output().unwrap();
+    let run=|| Command::new(&fanout).args(["delivery","env","300","120","60"]).arg(&config).env("FANOUT_TEST_LOG",&log).env("SWALLOW_ALERT_RESEND_ENABLED","true").env("SWALLOW_ALERT_DISCORD_ENABLED","false").env("SWALLOW_ALERT_TELEGRAM_ENABLED","false").env("SWALLOW_ALERT_FAILED_JOBS_ENABLED","false").env("SWALLOW_ALERT_QUEUE_MAX_WAIT_SECONDS","60").env("SWALLOW_ALERT_DISCORD_COOLDOWN_MODE","overdue").env("SWALLOW_ALERT_RESEND_CANCEL_EVIDENCE_ENABLED","false").env("SWALLOW_ALERT_RESEND_EXCLUDE_CONFIRMED_CANCEL","false").env("SWALLOW_ALERT_RESEND_CANCEL_LEGACY_ENABLED","false").output().unwrap();
     assert!(run().status.success());
-    assert_eq!(std::fs::read_to_string(&log).unwrap(),"a:false:true:false:120:overdue:true:true:true\nb:true:false:true:disabled:all:false:false:false\nc:true:false:false:60:overdue:false:false:false\n");
+    assert_eq!(std::fs::read_to_string(&log).unwrap(),"a:false:true:false:120:overdue:true:true:true:true\nb:true:false:true:disabled:all:false:false:false:false\nc:true:false:false:60:overdue:false:false:false:false\n");
     for invalid in [
         serde_json::json!({"channel":"slack","id":"d","webhook_file":dir.join("key"),"delivery_checks":{"resned":true}}),
         serde_json::json!({"channel":"slack","id":"d","webhook_file":dir.join("key"),"delivery_checks":{"resend":"false"}}),

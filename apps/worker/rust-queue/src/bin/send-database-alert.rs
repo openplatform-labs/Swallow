@@ -141,6 +141,7 @@ async fn run() -> Result<()> {
         resend_cancel_evidence: None,
         resend_cancel_health: None,
         resend_cancel_commands: None,
+        telegram_health: None,
         discord_health: None,
         discord_retry_health: None,
         discord_cooldown_health: None,
