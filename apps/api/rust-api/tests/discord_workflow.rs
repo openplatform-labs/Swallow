@@ -252,6 +252,50 @@ async fn trigger_renders_and_guards_subscriber_endpoint_and_preferences() {
         .get::<_, i64>(0),
         1
     );
+    // A workflow default change that has locked the parent before reservation
+    // must be visible to the sender after the change commits, including insertion
+    // of a preference row that did not previously exist.
+    produce(&mut db, app.clone(), "preference-race").await;
+    let (mut changer, driver) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(driver);
+    let tx=changer.transaction().await.unwrap();
+    tx.execute("INSERT INTO public.novu_rust_workflow_preferences(environment_id,workflow_identifier,chat_enabled) VALUES('a','discord-workflow',false)",&[]).await.unwrap();
+    let (mut sender,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);
+    sender.batch_execute("SET application_name='discord_preference_fence'").await.unwrap();
+    let sender_endpoint=endpoint.clone();
+    let task=tokio::spawn(async move {
+        let provider=novu_postgres_queue::discord::Webhook::test_endpoint(&sender_endpoint).unwrap();
+        novu_postgres_queue::discord_queue::process_one(&mut sender,"a","dest",&provider).await
+    });
+    let mut waiting=false;
+    for _ in 0..150 {
+        waiting=db.query_one("SELECT count(*)=1 FROM pg_stat_activity WHERE application_name='discord_preference_fence' AND wait_event_type='Lock'",&[]).await.unwrap().get(0);
+        if waiting {break;}
+        assert!(!task.is_finished(),"sender finished before preference commit");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(waiting,"sender did not wait for the preference writer");
+    tx.commit().await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(10),task).await.unwrap().unwrap().unwrap());
+    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_queue_jobs WHERE kind=$1 AND status='cancelled' AND last_error='chat preference disabled'",&[&novu_postgres_queue::discord_queue::WORKFLOW_KIND]).await.unwrap().get::<_,i64>(0),1);
+    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_discord_attempts",&[]).await.unwrap().get::<_,i64>(0),1);
+    db.batch_execute("DELETE FROM public.novu_rust_workflow_preferences WHERE environment_id='a' AND workflow_identifier='discord-workflow'").await.unwrap();
+    // Reservation first holds the workflow lock until the dispatch attempt is
+    // committed; a later preference change waits but cannot retract that send.
+    db.batch_execute("INSERT INTO public.novu_rust_workflow_preferences(environment_id,workflow_identifier,chat_enabled) VALUES('a','discord-workflow',true); CREATE FUNCTION public.test_discord_reservation_pause() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(766481); RETURN NEW; END $$; CREATE TRIGGER test_discord_reservation_pause BEFORE INSERT ON public.novu_rust_discord_attempts FOR EACH ROW EXECUTE FUNCTION public.test_discord_reservation_pause()").await.unwrap();
+    produce(&mut db,app.clone(),"reservation-first").await;
+    let (mut blocker,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);let blocker_tx=blocker.transaction().await.unwrap();blocker_tx.query_one("SELECT pg_advisory_xact_lock(766481)",&[]).await.unwrap();
+    let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();let endpoint2=format!("http://{}/api/webhooks/1/token",listener.local_addr().unwrap());
+    let server2=tokio::spawn(async move {let (mut socket,_)=listener.accept().await.unwrap();let mut bytes=[0u8;4096];assert!(socket.read(&mut bytes).await.unwrap()>0);let body=r#"{"id":"2","timestamp":"2026-01-01Z"}"#;socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();});
+    let (mut sender,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);sender.batch_execute("SET application_name='discord_reservation_first'").await.unwrap();
+    let send=tokio::spawn(async move {let provider=novu_postgres_queue::discord::Webhook::test_endpoint(&endpoint2).unwrap();novu_postgres_queue::discord_queue::process_one(&mut sender,"a","dest",&provider).await});
+    let mut paused=false;for _ in 0..150 {paused=db.query_one("SELECT count(*)=1 FROM pg_stat_activity WHERE application_name='discord_reservation_first' AND wait_event='advisory'",&[]).await.unwrap().get(0);if paused {break;}assert!(!send.is_finished());tokio::time::sleep(Duration::from_millis(100)).await;}assert!(paused,"sender did not reach attempt reservation");
+    let (writer,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);writer.batch_execute("SET application_name='discord_preference_writer'").await.unwrap();
+    let change=tokio::spawn(async move {writer.execute("UPDATE public.novu_rust_workflow_preferences SET chat_enabled=false WHERE environment_id='a' AND workflow_identifier='discord-workflow'",&[]).await});
+    let mut writer_waiting=false;for _ in 0..150 {writer_waiting=db.query_one("SELECT count(*)=1 FROM pg_stat_activity WHERE application_name='discord_preference_writer' AND wait_event_type='Lock'",&[]).await.unwrap().get(0);if writer_waiting {break;}assert!(!change.is_finished());tokio::time::sleep(Duration::from_millis(100)).await;}assert!(writer_waiting,"preference writer did not wait for reservation");
+    blocker_tx.commit().await.unwrap();assert!(tokio::time::timeout(Duration::from_secs(10),send).await.unwrap().unwrap().unwrap());tokio::time::timeout(Duration::from_secs(10),change).await.unwrap().unwrap().unwrap();tokio::time::timeout(Duration::from_secs(10),server2).await.unwrap().unwrap();
+    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_discord_attempts WHERE state='accepted'",&[]).await.unwrap().get::<_,i64>(0),2);
+    db.batch_execute("DROP TRIGGER test_discord_reservation_pause ON public.novu_rust_discord_attempts; DROP FUNCTION public.test_discord_reservation_pause(); DELETE FROM public.novu_rust_workflow_preferences WHERE environment_id='a' AND workflow_identifier='discord-workflow'").await.unwrap();
     produce(&mut db, app.clone(), "revision").await;
     db.batch_execute("UPDATE public.novu_rust_discord_workflow_endpoints SET context_keys=ARRAY['x:1'] WHERE identifier='ep'; UPDATE public.novu_rust_discord_workflow_endpoints SET context_keys=ARRAY[]::text[] WHERE identifier='ep'").await.unwrap();
     assert!(
@@ -267,7 +311,7 @@ async fn trigger_renders_and_guards_subscriber_endpoint_and_preferences() {
             .await
             .unwrap()
     );
-    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_queue_jobs WHERE kind=$1 AND status='cancelled' AND last_error='chat preference disabled'",&[&novu_postgres_queue::discord_queue::WORKFLOW_KIND]).await.unwrap().get::<_,i64>(0),1);
+    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_queue_jobs WHERE kind=$1 AND status='cancelled' AND last_error='chat preference disabled'",&[&novu_postgres_queue::discord_queue::WORKFLOW_KIND]).await.unwrap().get::<_,i64>(0),2);
     db.batch_execute("DELETE FROM public.novu_rust_subscriber_preferences WHERE environment_id='a' AND subscriber_id='alice'").await.unwrap();
     produce(&mut db, app.clone(), "workflow-change").await;
     db.batch_execute("UPDATE public.novu_rust_workflows SET chat_content='different' WHERE environment_id='a' AND identifier='discord-workflow'").await.unwrap();
@@ -294,6 +338,6 @@ async fn trigger_renders_and_guards_subscriber_endpoint_and_preferences() {
         .await
         .unwrap()
         .get::<_, i64>(0),
-        1
+        2
     );
 }
