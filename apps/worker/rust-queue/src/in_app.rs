@@ -1217,6 +1217,42 @@ mod preference_concurrency_tests {
 
     #[tokio::test]
     #[ignore = "requires fully migrated disposable PostgreSQL"]
+    async fn multiple_recipients_serialize_default_and_subscriber_preferences() {
+        let url=std::env::var("TEST_DATABASE_URL").unwrap();
+        let (mut db,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);
+        let env=format!("inbox-multiple-race-{}",Uuid::new_v4());
+        db.execute("INSERT INTO public.novu_rust_environments VALUES($1,'org')",&[&env]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,in_app_content,inbox_metadata) VALUES($1,'fixture',true,true,'hello','{\"id\":\"64a000000000000000000051\"}')",&[&env]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES($1,'alice','64a000000000000000000054','{}'),($1,'bob','64a000000000000000000055','{}')",&[&env]).await.unwrap();
+        let job=Uuid::new_v4();crate::enqueue(&db,job,&env,JOB_KIND,&json!({"workflow":"fixture","transactionId":"multiple-race","content":"","payload":{},"recipients":[{"subscriberId":"alice"},{"subscriberId":"bob"}],"recipientIdentitySnapshot":{"alice":"64a000000000000000000054","bob":"64a000000000000000000055"},"severityOverride":null})).await.unwrap();
+        let pref_tx=db.transaction().await.unwrap();
+        pref_tx.query_one("SELECT 1 FROM public.novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id='bob' FOR UPDATE",&[&env]).await.unwrap();
+        pref_tx.execute("INSERT INTO public.novu_rust_subscriber_preferences(environment_id,subscriber_id,channels) VALUES($1,'bob','{\"in_app\":false}')",&[&env]).await.unwrap();
+        let pref_pid:i32=pref_tx.query_one("SELECT pg_backend_pid()",&[]).await.unwrap().get(0);
+        let (mut worker,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);
+        worker.batch_execute("SET application_name='inbox_multiple_worker'").await.unwrap();
+        let worker_pid:i32=worker.query_one("SELECT pg_backend_pid()",&[]).await.unwrap().get(0);
+        let worker_task=tokio::spawn(async move {process_one(&mut worker).await});
+        let mut waiting=false;for _ in 0..150 {waiting=pref_tx.query_one("SELECT $1=ANY(pg_blocking_pids($2))",&[&pref_pid,&worker_pid]).await.unwrap().get(0);if waiting {break;}assert!(!worker_task.is_finished());tokio::time::sleep(Duration::from_millis(100)).await;}
+        assert!(waiting,"generator did not wait for second subscriber");
+        let (default_writer,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);
+        default_writer.batch_execute("SET application_name='inbox_multiple_default_writer'").await.unwrap();let default_pid:i32=default_writer.query_one("SELECT pg_backend_pid()",&[]).await.unwrap().get(0);let target_env=env.clone();
+        let default_task=tokio::spawn(async move {default_writer.execute("INSERT INTO public.novu_rust_workflow_preferences(environment_id,workflow_identifier,in_app_enabled) VALUES($1,'fixture',false)",&[&target_env]).await});
+        let mut default_waiting=false;for _ in 0..150 {default_waiting=pref_tx.query_one("SELECT $1=ANY(pg_blocking_pids($2))",&[&worker_pid,&default_pid]).await.unwrap().get(0);if default_waiting {break;}assert!(!default_task.is_finished());tokio::time::sleep(Duration::from_millis(100)).await;}
+        assert!(default_waiting,"default writer did not wait for generator's workflow lock");
+        pref_tx.commit().await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(10),worker_task).await.unwrap().unwrap().unwrap());
+        assert_eq!(tokio::time::timeout(Duration::from_secs(10),default_task).await.unwrap().unwrap().unwrap(),1);
+        let outcomes=db.query("SELECT subscriber_id,status FROM public.novu_rust_in_app_step_outcomes WHERE job_id=$1 ORDER BY subscriber_id",&[&job]).await.unwrap();
+        assert_eq!(outcomes.iter().map(|r|(r.get::<_,String>(0),r.get::<_,String>(1))).collect::<Vec<_>>(),vec![("alice".into(),"completed".into()),("bob".into(),"canceled".into())]);
+        let messages=db.query("SELECT subscriber_id FROM public.novu_rust_in_app_messages WHERE environment_id=$1 AND transaction_id='multiple-race'",&[&env]).await.unwrap();
+        assert_eq!(messages.len(),1);assert_eq!(messages[0].get::<_,String>(0),"alice");
+        assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_ws_events WHERE environment_id=$1 AND subscriber_internal_id='64a000000000000000000054' AND event='notification_received'",&[&env]).await.unwrap().get::<_,i64>(0),1);
+        assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_ws_events WHERE environment_id=$1 AND subscriber_internal_id='64a000000000000000000055' AND event='notification_received'",&[&env]).await.unwrap().get::<_,i64>(0),0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires fully migrated disposable PostgreSQL"]
     async fn inbox_preference_commit_before_generation_is_observed() {
         let url=std::env::var("TEST_DATABASE_URL").unwrap();
         let (mut db,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);

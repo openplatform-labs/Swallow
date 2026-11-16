@@ -18,3 +18,4 @@ cargo run --quiet --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.t
 cargo run --quiet --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --bin migrate-worker -- apply worker "$ROOT/apps/worker/rust-queue/migrations"
 cargo run --quiet --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --bin migrate-worker -- apply api "$ROOT/apps/api/rust-api/migrations"
 cargo test --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --features test-mocks --lib in_app::preference_concurrency_tests::inbox_preference_commit_before_generation_is_observed -- --ignored --nocapture
+cargo test --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --features test-mocks --lib in_app::preference_concurrency_tests::multiple_recipients_serialize_default_and_subscriber_preferences -- --ignored --nocapture
