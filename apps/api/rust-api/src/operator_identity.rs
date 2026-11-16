@@ -5955,9 +5955,12 @@ pub(super) async fn change_permissions(
 }
 
 #[derive(Clone,Copy)]
-enum TelegramQuery { Attention }
+enum TelegramQuery { Attention, Predispatch }
 pub(super) async fn telegram_attention(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
     telegram_query(db,headers,uri,verifier,TelegramQuery::Attention).await
+}
+pub(super) async fn telegram_predispatch(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
+    telegram_query(db,headers,uri,verifier,TelegramQuery::Predispatch).await
 }
 async fn telegram_query(db:Arc<Client>,headers:HeaderMap,uri:Uri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>,kind:TelegramQuery) -> Response {
     let identity=match authenticate(&db,&headers,verifier).await {Ok(v)=>v,Err(status)=>return failure(status,uri.path())};
@@ -5965,13 +5968,13 @@ async fn telegram_query(db:Arc<Client>,headers:HeaderMap,uri:Uri,verifier:Option
     for (key,value) in form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()) {
         match key.as_ref() {
             "environmentId" if env.is_none() && !value.is_empty() && value.len()<=512 && !value.contains('\0') => env=Some(value.into_owned()),
-            "after" if matches!(kind,TelegramQuery::Attention) && cursor.is_none() => match Uuid::parse_str(&value) {Ok(v)=>cursor=Some(v),Err(_)=>return failure(StatusCode::BAD_REQUEST,uri.path())},
+            "after" if cursor.is_none() => match Uuid::parse_str(&value) {Ok(v)=>cursor=Some(v),Err(_)=>return failure(StatusCode::BAD_REQUEST,uri.path())},
             _=>return failure(StatusCode::BAD_REQUEST,uri.path()),
         }
     }
     let Some(env)=env else{return failure(StatusCode::BAD_REQUEST,uri.path())};
     let Ok(exp)=i64::try_from(identity.expires_at) else{return failure(StatusCode::BAD_REQUEST,uri.path())};
-    let sql=match kind {TelegramQuery::Attention=>"SELECT public.novu_rust_operator_jwt_telegram_attention($1,$2,$3,$4,$5,$6)"};
+    let sql=match kind {TelegramQuery::Attention=>"SELECT public.novu_rust_operator_jwt_telegram_attention($1,$2,$3,$4,$5,$6)",TelegramQuery::Predispatch=>"SELECT public.novu_rust_operator_jwt_telegram_predispatch($1,$2,$3,$4,$5,$6)"};
     match guarded_query(&db,&identity,sql,&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&cursor]).await {
         Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
         Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),

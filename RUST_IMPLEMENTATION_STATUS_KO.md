@@ -1,4 +1,4 @@
-Telegram 발송 전 실패 조회: 워커 0288과 CLI가 기존 환경별 조회 권한으로 시도 기록이 없는 실패 작업의 ID·종류·실패 리비전과 제한된 진단을 반환한다. 본문과 임의 오류는 제외하며 기존 조회 권한의 정보 범위가 확대된다. 격리 PostgreSQL·제한 로그인·실제 CLI에서 페이지, 권한 회수, 환경 격리와 정보 제외를 확인했다. 재실행·확인 처리와 JWT API·UI는 아직 없고 실제 Telegram·운영 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+Telegram 발송 전 실패 조회: 워커 0288과 CLI가 기존 환경별 조회 권한으로 시도 기록이 없는 실패 작업의 ID·종류·실패 리비전과 제한된 진단을 반환한다. API 0192와 Angular 화면에서 기존 JWT 목록 권한으로 조회할 수 있으며 이 권한의 정보 범위가 확대된다. 본문과 임의 오류는 제외한다. 격리 PostgreSQL·제한 로그인·실제 CLI와 Rust API 라우터에서 페이지, 권한 회수, 환경 격리와 정보 제외를, jsdom에서 화면 표시·오래된 응답 제거를 확인했다. 재실행·확인 처리와 실제 브라우저·IdP·Telegram·운영 HA는 미구현 또는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)와 [API README](apps/api/rust-api/README.md)를 참고한다.
 
 Telegram 워크플로 DB 승격 시험: 격리된 단일 호스트 동기 복제 환경에서 제한 DB 로그인을 사용하는 실제 워커 두 개와 모의 Telegram으로 발송 중 주 서버 중단·수동 승격을 시험했다. 복제된 진행 중 작업은 결과 불명으로 처리되고 자동 재발송되지 않았으며 두 워커가 재연결하고 새 작업을 처리했다. 실제 Telegram·자동 승격·비동기 복제·분할 뇌·다중 호스트 운영 HA는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 

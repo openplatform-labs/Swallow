@@ -581,6 +581,7 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/operator/smtp-resolution-history", get(operator_identity::smtp_resolution_history))
         .route("/v1/experimental/operator/smtp-review-request", get(operator_identity::smtp_review_request))
         .route("/v1/experimental/operator/telegram-attention", get(operator_identity::telegram_attention))
+        .route("/v1/experimental/operator/telegram-predispatch", get(operator_identity::telegram_predispatch))
         .route("/v1/experimental/operator/telegram-resolution", post(operator_identity::telegram_resolve))
         .route("/v1/experimental/operator/telegram-resolution-history", get(operator_identity::telegram_resolution_history))
         .route("/v1/experimental/operator/telegram-resolution-request", get(operator_identity::telegram_resolution_request))
