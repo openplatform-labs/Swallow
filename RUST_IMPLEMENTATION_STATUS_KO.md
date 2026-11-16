@@ -2720,3 +2720,6 @@ API 0179와 Angular 화면은 과거 취소 408·409의 미판정 집계와 목�
 
 
 예약 취소 워커의 선택형 Resend 키 교체: `NOVU_RESEND_RELOAD_API_KEY=true`와 키 파일을 지정하면 새 취소 명령을 선점하기 전에 정규 파일을 다시 읽는다. 잘못된 파일을 발견한 경우 기존 키로 계속 호출하지 않고 기본적으로 대기하며, `SWALLOW_RESEND_CANCEL_RELOAD_FAILURE_POLICY=exit`를 선택하면 오류 종료한다. 파일을 원자적으로 교체하고 모든 워커의 공급자 계정과 설정을 조정해야 한다. 이미 선점하거나 진행 중인 호출에는 변경이 적용되지 않으며 형식이 유효한 잘못된 계정의 키인지는 판별하지 못한다. 전용 재읽기 health 지표는 없다. 격리 PostgreSQL·제한 로그인·실제 워커·모의 Resend에서 키 교체, 잘못된 파일 중 선점 차단, 복구, 종료 정책과 설정 오류를 테스트했다. 실제 Resend와 다중 호스트 HA는 미검증이다. [워커 문서](apps/worker/rust-queue/README.md)를 참고한다.
+
+
+취소 워커 키 재읽기 상태 감시: 워커 0273과 선택형 `SWALLOW_RESEND_CANCEL_CREDENTIAL_HEALTH_ENABLED=true`는 키 파일의 정상·오류 관찰을 기록하고 별도 권한의 `delivery-reconcile check-resend-cancel-credentials`로 최소 정상 워커 수와 오류를 확인한다. 상태 기록 실패 시 새 명령 선점을 중지하고 DB에 다시 연결한다. 운영자가 실행 주기와 임계값을 정해야 하며, 공급자 인증 성공을 뜻하지 않는다. 별도 Slack·이메일 경보, 대시보드와 관찰 기록 자동 정리는 미구현이다. 격리 PostgreSQL·제한 로그인·모의 공급자에서 상태 전환, 종료, 환경·권한 격리와 선점 중단을 테스트했다. 실제 공급자와 다중 호스트 HA는 미검증이다. [워커 문서](apps/worker/rust-queue/README.md)를 참고한다.

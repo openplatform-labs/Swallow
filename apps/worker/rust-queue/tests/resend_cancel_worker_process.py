@@ -103,31 +103,48 @@ try:
     # Rotate the key between commands; invalid files must stop claims, not use stale keys.
     with tempfile.TemporaryDirectory(prefix='swallow-cancel-key-') as directory:
         key=os.path.join(directory,'key');open(key,'w').write('rotation-one');os.chmod(key,0o600)
-        rotation_env={**env,'NOVU_RESEND_API_KEY_FILE':key,'NOVU_RESEND_RELOAD_API_KEY':'true'};rotation_env.pop('NOVU_RESEND_API_KEY')
+        rotation_env={**env,'NOVU_RESEND_API_KEY_FILE':key,'NOVU_RESEND_RELOAD_API_KEY':'true','SWALLOW_RESEND_CANCEL_CREDENTIAL_HEALTH_ENABLED':'true'};rotation_env.pop('NOVU_RESEND_API_KEY')
         rotated=subprocess.Popen([worker],env=rotation_env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE);children.append(rotated)
         def rotation_job(n):
             job='cccccccc-cccc-4ccc-8ccc-'+str(n).zfill(12);request='eeeeeeee-eeee-4eee-8eee-'+str(n).zfill(12)
             sql("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status,resend_scheduled_at) VALUES('%s','cancel-env','experimental_resend_email','{}','completed',clock_timestamp()+interval '1 hour'); INSERT INTO public.novu_rust_resend_attempts(job_id,environment_id,state,provider_message_id,account_tag) VALUES('%s','cancel-env','accepted','rotation-%s','account-a')"%(job,job,n))
             enqueue(request,job);return request
+        wait(lambda:sql("SELECT count(*) FROM public.novu_rust_resend_cancel_credential_health WHERE environment_id='cancel-env' AND state='healthy'")=='1')
+        healthy=cli(['check-resend-cancel-credentials','cancel-env','60','1']);assert healthy.returncode==0 and json.loads(healthy.stdout)['healthy']==1
+        assert cli(['check-resend-cancel-credentials','cancel-other','60','1']).returncode!=0
+        denied={**monitor,'DATABASE_URL':admin.replace('postgres://postgres@','postgres://cancel_unprivileged@')};assert cli(['check-resend-cancel-credentials','cancel-env','60','1'],denied).returncode!=0
         first=rotation_job(1);wait(lambda:sql("SELECT state FROM public.novu_rust_resend_cancel_commands WHERE request_id='%s'"%first)=='finished')
         assert auths['/emails/rotation-1/cancel']=='Bearer rotation-one'
-        open(key,'w').write('');time.sleep(3);second=rotation_job(2);time.sleep(3)
+        open(key,'w').write('');wait(lambda:sql("SELECT count(*) FROM public.novu_rust_resend_cancel_credential_health WHERE environment_id='cancel-env' AND state='unhealthy'")=='1')
+        unhealthy=cli(['check-resend-cancel-credentials','cancel-env','60','1']);assert unhealthy.returncode==2 and json.loads(unhealthy.stdout)['unhealthy']==1
+        second=rotation_job(2);time.sleep(3)
         assert sql("SELECT state FROM public.novu_rust_resend_cancel_commands WHERE request_id='%s'"%second)=='pending'
         assert '/emails/rotation-2/cancel' not in calls
         replacement=os.path.join(directory,'replacement');open(replacement,'w').write('rotation-two');os.chmod(replacement,0o600);os.replace(replacement,key)
         wait(lambda:sql("SELECT state FROM public.novu_rust_resend_cancel_commands WHERE request_id='%s'"%second)=='finished')
         assert auths['/emails/rotation-2/cancel']=='Bearer rotation-two'
+        assert cli(['check-resend-cancel-credentials','cancel-env','60','1']).returncode==0
+        # A revoked heartbeat grant must stop claims until an authorized reconnect.
+        sql('REVOKE EXECUTE ON FUNCTION public.novu_rust_resend_cancel_credential_heartbeat(text,uuid,text) FROM cancel_worker')
+        open(key,'w').write('');time.sleep(3);third=rotation_job(3);time.sleep(3)
+        assert sql("SELECT state FROM public.novu_rust_resend_cancel_commands WHERE request_id='%s'"%third)=='pending'
+        assert '/emails/rotation-3/cancel' not in calls
+        open(key,'w').write('rotation-three');sql('GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_credential_heartbeat(text,uuid,text) TO cancel_worker')
+        wait(lambda:sql("SELECT state FROM public.novu_rust_resend_cancel_commands WHERE request_id='%s'"%third)=='finished')
+        assert auths['/emails/rotation-3/cancel']=='Bearer rotation-three'
         rotated.terminate();rotated.wait(timeout=5)
+        assert cli(['check-resend-cancel-credentials','cancel-env','60','1']).returncode==2
         exit_env={**rotation_env,'SWALLOW_RESEND_CANCEL_RELOAD_FAILURE_POLICY':'exit'}
         exiting=subprocess.Popen([worker],env=exit_env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE);children.append(exiting)
         time.sleep(2);open(key,'w').write('');exiting.wait(timeout=8);assert exiting.returncode!=0
-        log=exiting.stderr.read().decode();assert 'reload failed' in log and 'rotation-two' not in log and key not in log
+        log=exiting.stderr.read().decode();assert 'reload failed' in log and 'rotation-three' not in log and key not in log
         conflict={**rotation_env,'NOVU_RESEND_API_KEY':'inline'}
         bad=subprocess.run([worker],env=conflict,capture_output=True,text=True,timeout=5);assert bad.returncode!=0 and 'inline' not in bad.stderr and key not in bad.stderr
         missing_file=dict(rotation_env);missing_file.pop('NOVU_RESEND_API_KEY_FILE')
         invalid_policy={**rotation_env,'SWALLOW_RESEND_CANCEL_RELOAD_FAILURE_POLICY':'invalid'}
         exit_without_reload={**env,'SWALLOW_RESEND_CANCEL_RELOAD_FAILURE_POLICY':'exit'}
-        for settings in (missing_file,invalid_policy,exit_without_reload):
+        health_without_reload={**env,'SWALLOW_RESEND_CANCEL_CREDENTIAL_HEALTH_ENABLED':'true'}
+        for settings in (missing_file,invalid_policy,exit_without_reload,health_without_reload):
             failed=subprocess.run([worker],env=settings,capture_output=True,text=True,timeout=5);assert failed.returncode!=0 and key not in failed.stderr
 finally:
     release.set()

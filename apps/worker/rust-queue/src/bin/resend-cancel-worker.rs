@@ -18,6 +18,11 @@ async fn run(stop:novu_postgres_queue::shutdown::Stop)->Result<(),Box<dyn Error+
         Ok("exit") if reload_path.is_some()=>true,
         _=>return Err("invalid cancellation key reload failure policy".into()),
     };
+    let credential_health=match std::env::var("SWALLOW_RESEND_CANCEL_CREDENTIAL_HEALTH_ENABLED").as_deref(){
+        Ok("true") if reload_path.is_some()=>true,
+        Ok("false")|Err(std::env::VarError::NotPresent)=>false,
+        _=>return Err("invalid cancellation credential health setting".into()),
+    };
     let api_key=if let Some(path)=&reload_path {
         if std::env::var_os("NOVU_RESEND_API_KEY").is_some(){return Err("Resend key sources conflict".into());}
         novu_rust_contracts::secret::read_regular_file(path)?
@@ -37,8 +42,19 @@ async fn run(stop:novu_postgres_queue::shutdown::Stop)->Result<(),Box<dyn Error+
     while !stop.requested(){
         if let Ok(Ok((db,driver)))=tokio::time::timeout(timeout,config.connect(tls.clone())).await {
             let task=tokio::spawn(driver);
+            let health_instance=Uuid::new_v4();
+            let mut health_previous=None;
+            let mut health_next=tokio::time::Instant::now();
             while !stop.requested(){
-                if reload_path.as_ref().is_some_and(|path|provider.reload_api_key_file(path).is_err()) {
+                let reload_failed=reload_path.as_ref().is_some_and(|path|provider.reload_api_key_file(path).is_err());
+                let healthy=!reload_failed;
+                if credential_health && (health_previous!=Some(healthy)||tokio::time::Instant::now()>=health_next) {
+                    let state=if healthy {"healthy"} else {"unhealthy"};
+                    let observation=tokio::time::timeout(timeout,db.query_one("SELECT public.novu_rust_resend_cancel_credential_heartbeat($1,$2,$3)",&[&environment,&health_instance,&state])).await;
+                    if !matches!(observation,Ok(Ok(row)) if row.get::<_,bool>(0)) {eprintln!("Resend cancellation credential observation failed; reconnecting");break;}
+                    health_previous=Some(healthy);health_next=tokio::time::Instant::now()+Duration::from_secs(10);
+                }
+                if reload_failed {
                     eprintln!("Resend cancellation key reload failed; claims paused");
                     if exit_on_reload_failure {task.abort();let _=task.await;return Err("Resend cancellation key reload failed".into());}
                     stop.wait(Duration::from_secs(2)).await;

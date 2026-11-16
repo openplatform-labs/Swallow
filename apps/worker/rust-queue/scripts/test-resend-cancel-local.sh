@@ -25,10 +25,13 @@ GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_list(text,integer,uuid)
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_enqueue(text,uuid,uuid,text),public.novu_rust_resend_cancel_command_get(text,uuid) TO cancel_submitter,cancel_unprivileged;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_claim(text),public.novu_rust_resend_cancel_finish(text,uuid,text,integer) TO cancel_worker;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_claim_tagged(text,text) TO cancel_worker;
+GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_credential_heartbeat(text,uuid,text) TO cancel_worker;
+GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_credential_health_check(text,integer) TO cancel_fixture,cancel_unprivileged;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_health(text,integer),public.novu_rust_reserve_alert_v3(text,text,text,integer,bigint,bigint,bigint,bigint),public.novu_rust_observe_alert_conditions_v3(text,text,text,bigint,bigint,bigint,bigint) TO cancel_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_command_health(text,integer),public.novu_rust_resend_cancel_command_failed_list(text,uuid) TO cancel_fixture,cancel_unprivileged;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_command_ack(text,uuid,timestamptz,text) TO cancel_resolver,cancel_unprivileged;
 INSERT INTO public.novu_rust_environments VALUES ('cancel-env','org'),('cancel-other','org');
+INSERT INTO public.novu_rust_resend_cancel_credential_workers SELECT 'cancel-env',rolname,oid FROM pg_roles WHERE rolname='cancel_worker';
 INSERT INTO public.novu_rust_resend_cancel_operators(environment_id,database_principal,principal_oid,can_cancel,can_read,can_resolve) SELECT 'cancel-env',rolname,oid,rolname='cancel_fixture',true,rolname='cancel_resolver' FROM pg_roles WHERE rolname IN ('cancel_fixture','cancel_resolver');
 INSERT INTO public.novu_rust_resend_cancel_operators(environment_id,database_principal,principal_oid,can_cancel) SELECT 'cancel-env',rolname,oid,true FROM pg_roles WHERE rolname='cancel_worker';
 INSERT INTO public.novu_rust_resend_cancel_submitters SELECT 'cancel-env',rolname,oid FROM pg_roles WHERE rolname='cancel_submitter';
