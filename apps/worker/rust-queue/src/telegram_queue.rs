@@ -43,6 +43,15 @@ async fn workflow_body(
     if row.get::<_, String>(1) != ctx.subscriber_internal_id {
         return Ok(Err("subscriber identity changed"));
     }
+    let workflow = tx.query_opt("SELECT active,has_steps,chat_step_active,chat_content FROM public.novu_rust_workflows WHERE environment_id=$1 AND identifier=$2 AND ($3::text IS NULL OR inbox_metadata->>'id'=$3) FOR SHARE", &[&job.environment_id,&ctx.workflow_identifier,&ctx.workflow_internal_id]).await?;
+    if !workflow.is_some_and(|w| {
+        w.get::<_, bool>(0)
+            && w.get::<_, bool>(1)
+            && w.get::<_, bool>(2)
+            && w.get::<_, Option<String>>(3).as_deref() == Some(ctx.content_template.as_str())
+    }) {
+        return Ok(Err("Telegram workflow step changed or disabled"));
+    }
     let pref = tx.query_one("SELECT w.read_only,w.all_enabled,w.chat_enabled,(p.channels->>'chat')::boolean,(sp.channels->>'chat')::boolean FROM (SELECT 1) singleton LEFT JOIN public.novu_rust_workflow_preferences w ON w.environment_id=$1 AND w.workflow_identifier=$3 LEFT JOIN public.novu_rust_subscriber_preferences p ON p.environment_id=$1 AND p.subscriber_id=$2 LEFT JOIN public.novu_rust_subscriber_workflow_preferences sp ON sp.environment_id=$1 AND sp.subscriber_id=$2 AND sp.workflow_identifier=$3", &[&job.environment_id,&ctx.subscriber_id,&ctx.workflow_identifier]).await?;
     if !novu_rust_contracts::preference::in_app_enabled(
         pref.get(0),
@@ -52,15 +61,6 @@ async fn workflow_body(
         pref.get(4),
     ) {
         return Ok(Err("chat preference disabled"));
-    }
-    let workflow = tx.query_opt("SELECT active,has_steps,chat_step_active,chat_content FROM public.novu_rust_workflows WHERE environment_id=$1 AND identifier=$2 AND ($3::text IS NULL OR inbox_metadata->>'id'=$3) FOR SHARE", &[&job.environment_id,&ctx.workflow_identifier,&ctx.workflow_internal_id]).await?;
-    if !workflow.is_some_and(|w| {
-        w.get::<_, bool>(0)
-            && w.get::<_, bool>(1)
-            && w.get::<_, bool>(2)
-            && w.get::<_, Option<String>>(3).as_deref() == Some(ctx.content_template.as_str())
-    }) {
-        return Ok(Err("Telegram workflow step changed or disabled"));
     }
     let endpoint = tx.query_opt("SELECT chat_id FROM public.novu_rust_telegram_workflow_endpoints WHERE environment_id=$1 AND internal_id=$2 AND revision=$3 AND subscriber_internal_id=$4 AND destination_id=$5 AND context_keys @> $6 AND context_keys <@ $6 AND cardinality(context_keys)=cardinality($6) FOR SHARE", &[&job.environment_id,&ctx.endpoint_id,&ctx.endpoint_revision,&ctx.subscriber_internal_id,&m.destination,&ctx.context_keys]).await?;
     let Some(endpoint) = endpoint else {
