@@ -4,7 +4,7 @@ from pathlib import Path
 root=Path(os.environ['TEST_ROOT']);directory=Path(os.environ['TEST_FIXTURE_DIR'])
 psql=os.environ['TEST_PSQL'];primary=os.environ['TEST_PRIMARY_URL'];standby=os.environ['TEST_STANDBY_URL']
 cluster=os.environ['TEST_FAILOVER_URL'].replace('postgres://postgres@','postgres://retention_ha_api@',1)
-pgctl=os.environ['TEST_LOCAL_PG_CTL'];api=os.environ['TEST_API_BINARY'];process=None
+pgctl=os.environ['TEST_LOCAL_PG_CTL'];api=os.environ['TEST_API_BINARY'];process=None;blocker=None
 
 def sql(url,statement):
     return subprocess.run([psql,url,'-v','ON_ERROR_STOP=1','-Atc',statement],check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True).stdout.strip()
@@ -70,8 +70,29 @@ try:
         if sql(standby,"SELECT (SELECT count(*)=1 FROM public.novu_rust_operator_jwt_cancel_cred_retention_requests WHERE environment_id='ha-retention') AND (SELECT count(*)=1 FROM public.novu_rust_resend_cancel_credential_health WHERE environment_id='ha-retention')")=='t':break
         time.sleep(.1)
     else:raise RuntimeError('standby did not replay committed retention')
-    process.terminate();process.wait(timeout=10);process=None
+    # Pause a second request after deleting a row but before its audit insert.
+    # Terminating the primary here must roll back the whole transaction.
+    sql(primary,"CREATE FUNCTION public.test_retention_ha_pause() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(9911001); RETURN NEW; END $$; CREATE TRIGGER test_retention_ha_pause BEFORE INSERT ON public.novu_rust_resend_cancel_cred_retention_audit FOR EACH ROW EXECUTE FUNCTION public.test_retention_ha_pause()")
+    blocker=subprocess.Popen([psql,primary,'-v','ON_ERROR_STOP=1','-c','SELECT pg_advisory_lock(9911001); SELECT pg_sleep(60)'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    for _ in range(100):
+        if sql(primary,"SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND objid=9911001 AND granted)")=='t':break
+        if blocker.poll() is not None:raise RuntimeError('barrier exited')
+        time.sleep(.1)
+    else:raise RuntimeError('barrier did not lock')
+    pending_id=str(uuid.uuid4());pending_body={'requestId':pending_id,'olderThanSeconds':86401,'batchLimit':1,'reason':'inflight'};pending_result=[]
+    def submit_pending():
+        try:pending_result.append(request('POST',body=pending_body)[0])
+        except Exception:pending_result.append('connection-lost')
+    pending=threading.Thread(target=submit_pending,daemon=True);pending.start()
+    for _ in range(100):
+        if sql(primary,"SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event='advisory' AND query LIKE '%operator_jwt_cancel_cred_retention_submit%')")=='t':break
+        if not pending.is_alive():raise RuntimeError('inflight request finished before barrier')
+        time.sleep(.1)
+    else:raise RuntimeError('inflight request did not reach audit barrier')
     subprocess.run([pgctl,'-D',os.environ['TEST_LOCAL_PRIMARY_DATA'],'-m','immediate','stop','-w'],check=True,stdout=subprocess.DEVNULL)
+    pending.join(timeout=10);assert not pending.is_alive(), 'inflight API call did not end after primary stop'
+    blocker.wait(timeout=10);blocker=None
+    process.terminate();process.wait(timeout=10);process=None
     subprocess.run([pgctl,'-D',os.environ['TEST_LOCAL_STANDBY_DATA'],'promote','-w'],check=True,stdout=subprocess.DEVNULL)
     process=start();status,result=request('POST',body=body);assert status==200 and result['deleted']==1 and result['replayed'] is True,(status,result)
     status,record=request('GET','&requestId='+rid);assert status==200 and record['found'] and record['deleted']==1,(status,record)
@@ -80,11 +101,21 @@ try:
     assert len(audit['data'])==1 and audit['data'][0]['requestId']==rid
     assert sql(standby,"SELECT count(*) FROM public.novu_rust_resend_cancel_credential_health WHERE environment_id='ha-retention'")=='1'
     assert sql(standby,"SELECT count(*) FROM public.novu_rust_resend_cancel_cred_retention_audit WHERE environment_id='ha-retention'")=='1'
+    status,missing=request('GET','&requestId='+pending_id);assert status==200 and missing['found'] is False,(status,missing)
+    sql(standby,"DROP TRIGGER test_retention_ha_pause ON public.novu_rust_resend_cancel_cred_retention_audit; DROP FUNCTION public.test_retention_ha_pause()")
+    status,result=request('POST',body=pending_body);assert status==200 and result['deleted']==1 and result['replayed'] is False,(status,result)
+    status,result=request('POST',body=pending_body);assert status==200 and result['deleted']==1 and result['replayed'] is True,(status,result)
+    assert sql(standby,"SELECT count(*) FROM public.novu_rust_resend_cancel_credential_health WHERE environment_id='ha-retention'")=='0'
+    assert sql(standby,"SELECT count(*) FROM public.novu_rust_resend_cancel_cred_retention_audit WHERE environment_id='ha-retention'")=='2'
     sql(standby,"DELETE FROM public.novu_rust_operator_jwt_cancel_cred_retention_audit_viewers WHERE environment_id='ha-retention'")
     try:urllib.request.urlopen(audit_req,timeout=8);raise AssertionError('revoked audit access succeeded')
     except urllib.error.HTTPError as e:assert e.code==401,e.code
-    print('synchronous promotion preserved retention request, replay, audit and revocation')
+    print('synchronous promotion preserved replay, rolled back in-flight retention, and enforced audit revocation')
 finally:
+    if blocker is not None:
+        blocker.terminate()
+        try:blocker.wait(timeout=10)
+        except subprocess.TimeoutExpired:blocker.kill();blocker.wait()
     if process is not None:
         process.terminate()
         try:process.wait(timeout=10)
