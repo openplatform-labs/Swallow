@@ -118,6 +118,9 @@ enum Lookup {
     ResendCancelGrantRead,
     ResendCancelGrantRequest,
     ResendCancelGrantAudit,
+    TelegramResolutionGrantRead,
+    TelegramResolutionGrantRequest,
+    TelegramResolutionGrantAudit,
     DiscordResolutionGrantRead,
     DiscordResolutionGrantRequest,
     DiscordResolutionGrantAudit,
@@ -2370,6 +2373,65 @@ pub(super) async fn resend_cancel_grant_change(
     }
 }
 
+pub(super) async fn telegram_resolution_grant_change(
+    State(db): State<Arc<Client>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    verifier: Option<Extension<Arc<AccessTokenVerifier>>>,
+    body: Bytes,
+) -> Response {
+    let identity = match authenticate(&db, &headers, verifier).await {
+        Ok(v) => v,
+        Err(status) => return failure(status, uri.path()),
+    };
+    let params: Vec<_> = form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).collect();
+    if params.len() != 1
+        || params[0].0 != "environmentId"
+        || params[0].1.is_empty()
+        || params[0].1.len() > 512
+        || params[0].1.contains('\0')
+    {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    }
+    let Some(input) = (body.len() <= 8192)
+        .then(|| serde_json::from_slice::<WorkflowGrantChange>(&body).ok())
+        .flatten()
+    else {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    };
+    if [
+        &input.target_issuer,
+        &input.target_subject,
+        &input.target_client_id,
+        &input.resource,
+        &input.permission,
+        &input.reason,
+    ]
+    .iter()
+    .any(|s| s.contains('\0'))
+    {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    }
+    let (Ok(request), Ok(exp)) = (
+        Uuid::parse_str(&input.request_id),
+        i64::try_from(identity.expires_at),
+    ) else {
+        return failure(StatusCode::BAD_REQUEST, uri.path());
+    };
+    let env = params[0].1.as_ref();
+    match guarded_query(&db, &identity, "SELECT public.novu_rust_operator_jwt_telegram_resolution_grant_change($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&input.target_issuer,&input.target_subject,&input.target_client_id,&input.resource,&input.permission,&input.expected,&input.desired,&input.reason]).await{
+        Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
+        Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
+        Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
+        Err(e) if e.code().is_some_and(|c|c.code()=="P4090")=>{
+            let mut response=error_at(StatusCode::CONFLICT,"Grant changed or request ID conflict","Conflict",uri.path()).into_response();
+            response.headers_mut().insert(header::CACHE_CONTROL,header::HeaderValue::from_static("no-store"));
+            response
+        },
+        Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path()),
+    }
+}
+
 pub(super) async fn discord_resolution_grant_change(
     State(db): State<Arc<Client>>,
     headers: HeaderMap,
@@ -3142,6 +3204,7 @@ async fn query(
         | Lookup::SmtpReviewGrantRead
         | Lookup::SmtpResolutionGrantRead
         | Lookup::ResendCancelGrantRead
+        | Lookup::TelegramResolutionGrantRead
         | Lookup::DiscordResolutionGrantRead
         | Lookup::DiscordReviewGrantRead
         | Lookup::SmtpScopeGrantRead
@@ -3165,6 +3228,7 @@ async fn query(
         | Lookup::SmtpReviewGrantRequest
         | Lookup::SmtpResolutionGrantRequest
         | Lookup::ResendCancelGrantRequest
+        | Lookup::TelegramResolutionGrantRequest
         | Lookup::DiscordResolutionGrantRequest
         | Lookup::DiscordReviewGrantRequest
         | Lookup::SmtpScopeGrantRequest
@@ -3181,6 +3245,7 @@ async fn query(
         | Lookup::SmtpReviewGrantAudit
         | Lookup::SmtpResolutionGrantAudit
         | Lookup::ResendCancelGrantAudit
+        | Lookup::TelegramResolutionGrantAudit
         | Lookup::DiscordResolutionGrantAudit
         | Lookup::DiscordReviewGrantAudit
         | Lookup::SmtpScopeGrantAudit
@@ -4010,6 +4075,31 @@ async fn query(
             )
             .await
         }
+        Lookup::TelegramResolutionGrantAudit => {
+            let after = match params.get("after") {
+                Some(value) => match Uuid::parse_str(value) {
+                    Ok(id) => Some(id),
+                    Err(_) => {
+                        return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+                    }
+                },
+                None => None,
+            };
+            guarded_query(
+                &db,
+                &identity,
+                "SELECT public.novu_rust_operator_jwt_telegram_resolution_grant_audit_read($1,$2,$3,$4,$5,$6)",
+                &[
+                    &identity.issuer,
+                    &identity.subject,
+                    &identity.client_id,
+                    &env,
+                    &exp,
+                    &after,
+                ],
+            )
+            .await
+        }
         Lookup::DiscordResolutionGrantAudit => {
             let after = match params.get("after") {
                 Some(value) => match Uuid::parse_str(value) {
@@ -4397,6 +4487,24 @@ async fn query(
             }
             guarded_query(&db, &identity, "SELECT public.novu_rust_operator_jwt_resend_cancel_grant_read($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&issuer,&subject,&client,&resource,&permission]).await
         }
+        Lookup::TelegramResolutionGrantRead => {
+            let (Some(issuer), Some(subject), Some(client), Some(resource), Some(permission)) = (
+                params.get("targetIssuer"),
+                params.get("targetSubject"),
+                params.get("targetClientId"),
+                params.get("resource"),
+                params.get("permission"),
+            ) else {
+                return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+            };
+            if [issuer, subject, client, resource, permission]
+                .iter()
+                .any(|v| v.contains('\0'))
+            {
+                return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+            }
+            guarded_query(&db, &identity, "SELECT public.novu_rust_operator_jwt_telegram_resolution_grant_read($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&issuer,&subject,&client,&resource,&permission]).await
+        }
         Lookup::DiscordResolutionGrantRead => {
             let (Some(issuer), Some(subject), Some(client), Some(resource), Some(permission)) = (
                 params.get("targetIssuer"),
@@ -4702,6 +4810,28 @@ async fn query(
                 &db,
                 &identity,
                 "SELECT public.novu_rust_operator_jwt_resend_cancel_grant_request($1,$2,$3,$4,$5,$6)",
+                &[
+                    &identity.issuer,
+                    &identity.subject,
+                    &identity.client_id,
+                    &env,
+                    &exp,
+                    &request,
+                ],
+            )
+            .await
+        }
+        Lookup::TelegramResolutionGrantRequest => {
+            let Some(request) = params
+                .get("requestId")
+                .and_then(|v| Uuid::parse_str(v).ok())
+            else {
+                return failure(StatusCode::BAD_REQUEST, "Invalid request", "Bad Request");
+            };
+            guarded_query(
+                &db,
+                &identity,
+                "SELECT public.novu_rust_operator_jwt_telegram_resolution_grant_request($1,$2,$3,$4,$5,$6)",
                 &[
                     &identity.issuer,
                     &identity.subject,
@@ -6015,6 +6145,9 @@ pub(super) async fn smtp_resolution_grant_audit(State(db):State<Arc<Client>>,hea
 pub(super) async fn resend_cancel_grant_read(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response { query(db,headers,uri,verifier,Lookup::ResendCancelGrantRead).await }
 pub(super) async fn resend_cancel_grant_request(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response { query(db,headers,uri,verifier,Lookup::ResendCancelGrantRequest).await }
 pub(super) async fn resend_cancel_grant_audit(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response { query(db,headers,uri,verifier,Lookup::ResendCancelGrantAudit).await }
+pub(super) async fn telegram_resolution_grant_read(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response { query(db,headers,uri,verifier,Lookup::TelegramResolutionGrantRead).await }
+pub(super) async fn telegram_resolution_grant_request(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response { query(db,headers,uri,verifier,Lookup::TelegramResolutionGrantRequest).await }
+pub(super) async fn telegram_resolution_grant_audit(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response { query(db,headers,uri,verifier,Lookup::TelegramResolutionGrantAudit).await }
 pub(super) async fn discord_resolution_grant_read(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response { query(db,headers,uri,verifier,Lookup::DiscordResolutionGrantRead).await }
 pub(super) async fn discord_resolution_grant_request(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response { query(db,headers,uri,verifier,Lookup::DiscordResolutionGrantRequest).await }
 pub(super) async fn discord_resolution_grant_audit(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response { query(db,headers,uri,verifier,Lookup::DiscordResolutionGrantAudit).await }
