@@ -98,10 +98,23 @@ try:
     subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',insert_event],check=True,capture_output=True)
     conflict=json.loads(result(job1).stdout)
     assert conflict['cancellationEvidence']=='conflicting' and conflict['result']==provider['result'],conflict
+    def evidence_cli(command, environment='cancel-env', extra=(), selected_env=None):
+        return subprocess.run([health_bin,command,environment,*extra],env=selected_env or env,text=True,capture_output=True,timeout=10)
+    check=evidence_cli('check-resend-cancel-evidence');assert check.returncode==2 and json.loads(check.stdout)=={'conflicting':1,'ambiguous':0},(check.stdout,check.stderr)
+    listed=evidence_cli('list-resend-cancel-evidence'); page=json.loads(listed.stdout)
+    assert listed.returncode==0 and page['data']==[{'requestId':req1,'jobId':job1,'evidence':'conflicting'}] and page['next'] is None,page
+    assert evidence_cli('list-resend-cancel-evidence',extra=(req1,)).stdout.strip()=='{"data":[],"next":null}'
+    assert evidence_cli('check-resend-cancel-evidence','cancel-other').returncode!=0
+    assert evidence_cli('check-resend-cancel-evidence',selected_env=denied).returncode!=0
+    conflict_alert={**alert_env,'SWALLOW_ALERT_RESEND_CANCEL_GRACE_SECONDS':'','SWALLOW_ALERT_RESEND_CANCEL_EVIDENCE_ENABLED':'true'}
+    conflict_alert.pop('SWALLOW_ALERT_RESEND_CANCEL_GRACE_SECONDS')
+    sent=subprocess.run([os.path.join(env['TEST_WORKER_DIR'],'send-delivery-alert'),'cancel-env','300','120','60'],env=conflict_alert,text=True,capture_output=True,timeout=15)
+    assert sent.returncode==2 and 'requires operator review' in sent.stderr,(sent.stdout,sent.stderr)
     collision="UPDATE public.novu_rust_resend_attempts SET provider_message_id='fixture-one' WHERE job_id='88888888-8888-4888-8888-888888888888'"
     subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',collision],check=True,capture_output=True)
     ambiguous=json.loads(result(job1).stdout)
     assert ambiguous['cancellationEvidence']=='ambiguous' and ambiguous['result']=='unknown',ambiguous
+    check=evidence_cli('check-resend-cancel-evidence');assert json.loads(check.stdout)=={'conflicting':0,'ambiguous':1},check.stdout
     # Page unknown requests without exposing provider IDs or investigation reasons.
     insert="""WITH jobs AS (INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) SELECT gen_random_uuid(),'cancel-env','experimental_resend_email','{}','completed' FROM generate_series(1,55) RETURNING id)
     INSERT INTO public.novu_rust_resend_cancel_requests(environment_id,request_id,job_id,provider_id,database_principal,principal_oid,reason,state,created_at)

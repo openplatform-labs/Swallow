@@ -135,6 +135,7 @@ async fn run() -> Result<()> {
         smtp_health: None,
         smtp_auto_workers: None,
         smtp_auto_health: None,
+        resend_cancel_evidence: None,
         resend_cancel_health: None,
         resend_cancel_commands: None,
         discord_health: None,

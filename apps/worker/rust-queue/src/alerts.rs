@@ -319,6 +319,7 @@ pub struct Alert {
     pub smtp_health: Option<Result<(u64,u64,u64), ()>>,
     pub smtp_auto_workers: Option<Result<(u64,u64,u64), ()>>,
     pub smtp_auto_health: Option<Result<(bool,u64,u64,u64), ()>>,
+    pub resend_cancel_evidence: Option<Result<(u64,u64), ()>>,
     pub resend_cancel_health: Option<Result<(u64,u64), ()>>,
     pub resend_cancel_commands: Option<Result<(u64,u64,u64), ()>>,
     pub discord_health: Option<Result<(u64,u64,u64,u64), ()>>,
@@ -388,6 +389,7 @@ impl Alert {
             || self.smtp_credentials.is_some_and(|v| matches!(v,Ok((healthy,unhealthy,_,minimum)) if healthy<minimum||unhealthy>0))
             || self.smtp_health.is_some_and(|v| matches!(v,Ok((a,b,c)) if a>0||b>0||c>0))
             || self.resend_cancel_commands.is_some_and(|v| matches!(v,Ok((_,overdue,unreviewed)) if overdue>0||unreviewed>0))
+            || self.resend_cancel_evidence.is_some_and(|v| matches!(v,Ok((conflicting,ambiguous)) if conflicting>0||ambiguous>0))
             || self.resend_cancel_health.is_some_and(|v| matches!(v,Ok((_,overdue)) if overdue>0))
             || self.smtp_auto_health.is_some_and(|v| matches!(v,Ok((_,_,overdue,exhausted)) if overdue>0||exhausted>0))
             || self.smtp_auto_workers.is_some_and(|v| matches!(v,Ok((healthy,_,minimum)) if healthy<minimum))
@@ -398,7 +400,7 @@ impl Alert {
         {
             mask |= 1 << 18;
         }
-        if self.resend_cancel_commands.is_some_and(|value| value.is_err()) || self.resend_cancel_health.is_some_and(|value| value.is_err()) || self.smtp_auto_workers.is_some_and(|value| value.is_err()) || self.smtp_auto_health.is_some_and(|value| value.is_err()) || self.smtp_ca.is_some_and(|value| value.is_err()) || self.smtp_credentials.is_some_and(|value| value.is_err()) || self.discord_cooldown_health.is_some_and(|value| value.is_err()) || self.smtp_health.is_some_and(|value| value.is_err()) || self.discord_retry_health.is_some_and(|value| value.is_err()) || self.discord_health.is_some_and(|value| value.is_err()) || self.fcm_unrecorded_claims.is_some_and(|value| value.is_err()) || self.failed_jobs_check_failed || self.resend_auto.is_some_and(|value| value.is_err()) || self.slack_cooldown.is_some_and(|value| value.is_err()) || self.resend_cooldown.is_some_and(|value| value.is_err()) || self.twilio_delayed.is_some_and(|value| value.is_err()) || self.fcm_partial.is_some_and(|value| value.is_err()) || self.fcm_unreviewed.is_some_and(|value| value.is_err()) || self.fcm_cooldown.is_some_and(|value| value.is_err()) {
+        if self.resend_cancel_evidence.is_some_and(|value| value.is_err()) || self.resend_cancel_commands.is_some_and(|value| value.is_err()) || self.resend_cancel_health.is_some_and(|value| value.is_err()) || self.smtp_auto_workers.is_some_and(|value| value.is_err()) || self.smtp_auto_health.is_some_and(|value| value.is_err()) || self.smtp_ca.is_some_and(|value| value.is_err()) || self.smtp_credentials.is_some_and(|value| value.is_err()) || self.discord_cooldown_health.is_some_and(|value| value.is_err()) || self.smtp_health.is_some_and(|value| value.is_err()) || self.discord_retry_health.is_some_and(|value| value.is_err()) || self.discord_health.is_some_and(|value| value.is_err()) || self.fcm_unrecorded_claims.is_some_and(|value| value.is_err()) || self.failed_jobs_check_failed || self.resend_auto.is_some_and(|value| value.is_err()) || self.slack_cooldown.is_some_and(|value| value.is_err()) || self.resend_cooldown.is_some_and(|value| value.is_err()) || self.twilio_delayed.is_some_and(|value| value.is_err()) || self.fcm_partial.is_some_and(|value| value.is_err()) || self.fcm_unreviewed.is_some_and(|value| value.is_err()) || self.fcm_cooldown.is_some_and(|value| value.is_err()) {
             mask |= 1 << 19;
         }
         if self
@@ -507,6 +509,8 @@ impl Alert {
         if self.resend_cancel_commands.is_some_and(|v|matches!(v,Ok((_,overdue,_)) if overdue>0)) {high|=2048;}
         if self.resend_cancel_commands.is_some_and(|v|matches!(v,Ok((_,_,unreviewed)) if unreviewed>0)) {high|=4096;}
         if self.resend_cancel_commands.is_some_and(|v|v.is_err()) {high|=8192;}
+        if self.resend_cancel_evidence.is_some_and(|v|matches!(v,Ok((conflicting,ambiguous)) if conflicting>0||ambiguous>0)) {high|=16384;}
+        if self.resend_cancel_evidence.is_some_and(|v|v.is_err()) {high|=32768;}
         (self.condition_mask_v2(),high)
     }
     pub fn observed_condition_mask_v3(&self) -> (i64,i64) {
@@ -523,6 +527,8 @@ impl Alert {
         if self.resend_cancel_health.is_some() {high|=1024;}
         if self.resend_cancel_commands.is_some_and(|v|v.is_ok()) {high|=2048|4096;}
         if self.resend_cancel_commands.is_some() {high|=8192;}
+        if self.resend_cancel_evidence.is_some_and(|v|v.is_ok()) {high|=16384;}
+        if self.resend_cancel_evidence.is_some() {high|=32768;}
         (self.observed_condition_mask_v2(),high)
     }
     pub fn observed_condition_mask_v2(&self) -> i64 {
@@ -594,7 +600,8 @@ impl Alert {
         }
         // Both checks share the existing failed-job cooldown category. Do
         // not mark it observed healthy if either enabled check failed.
-        if (self.resend_cancel_commands.is_some() || self.resend_cancel_health.is_some() || self.smtp_auto_workers.is_some() || self.smtp_auto_health.is_some() || self.smtp_ca.is_some() || self.smtp_credentials.is_some() || self.discord_cooldown_health.is_some() || self.smtp_health.is_some() || self.discord_retry_health.is_some() || self.discord_health.is_some() || self.fcm_unrecorded_claims.is_some() || self.failed_jobs.is_some() || self.resend_auto.is_some() || self.slack_cooldown.is_some() || self.resend_cooldown.is_some() || self.twilio_delayed.is_some() || self.fcm_partial.is_some() || self.fcm_unreviewed.is_some() || self.fcm_cooldown.is_some())
+        if (self.resend_cancel_evidence.is_some() || self.resend_cancel_commands.is_some() || self.resend_cancel_health.is_some() || self.smtp_auto_workers.is_some() || self.smtp_auto_health.is_some() || self.smtp_ca.is_some() || self.smtp_credentials.is_some() || self.discord_cooldown_health.is_some() || self.smtp_health.is_some() || self.discord_retry_health.is_some() || self.discord_health.is_some() || self.fcm_unrecorded_claims.is_some() || self.failed_jobs.is_some() || self.resend_auto.is_some() || self.slack_cooldown.is_some() || self.resend_cooldown.is_some() || self.twilio_delayed.is_some() || self.fcm_partial.is_some() || self.fcm_unreviewed.is_some() || self.fcm_cooldown.is_some())
+            && !self.resend_cancel_evidence.is_some_and(|value| value.is_err())
             && !self.resend_cancel_commands.is_some_and(|value| value.is_err())
             && !self.resend_cancel_health.is_some_and(|value| value.is_err())
             && !self.smtp_auto_workers.is_some_and(|value| value.is_err())
@@ -617,7 +624,7 @@ impl Alert {
         {
             known |= 1 << 18;
         }
-        if self.resend_cancel_commands.is_some() || self.resend_cancel_health.is_some() || self.smtp_auto_workers.is_some() || self.smtp_auto_health.is_some() || self.smtp_ca.is_some() || self.smtp_credentials.is_some() || self.discord_cooldown_health.is_some() || self.smtp_health.is_some() || self.discord_retry_health.is_some() || self.discord_health.is_some() || self.fcm_unrecorded_claims.is_some() || self.failed_jobs.is_some() || self.failed_jobs_check_failed || self.resend_auto.is_some() || self.slack_cooldown.is_some() || self.resend_cooldown.is_some() || self.twilio_delayed.is_some() || self.fcm_partial.is_some() || self.fcm_unreviewed.is_some() || self.fcm_cooldown.is_some()
+        if self.resend_cancel_evidence.is_some() || self.resend_cancel_commands.is_some() || self.resend_cancel_health.is_some() || self.smtp_auto_workers.is_some() || self.smtp_auto_health.is_some() || self.smtp_ca.is_some() || self.smtp_credentials.is_some() || self.discord_cooldown_health.is_some() || self.smtp_health.is_some() || self.discord_retry_health.is_some() || self.discord_health.is_some() || self.fcm_unrecorded_claims.is_some() || self.failed_jobs.is_some() || self.failed_jobs_check_failed || self.resend_auto.is_some() || self.slack_cooldown.is_some() || self.resend_cooldown.is_some() || self.twilio_delayed.is_some() || self.fcm_partial.is_some() || self.fcm_unreviewed.is_some() || self.fcm_cooldown.is_some()
         {
             known |= 1 << 19;
         }
@@ -726,6 +733,9 @@ impl Alert {
         }
         if let Some(result) = self.smtp_auto_workers {
             match result { Ok((healthy,stale,minimum)) => details.push(format!("SMTP auto retry workers: healthy {healthy}; stale {stale}; minimum {minimum}")), Err(()) => details.push("SMTP auto retry worker health check failed".into()) }
+        }
+        if let Some(result) = self.resend_cancel_evidence {
+            match result { Ok((conflicting,ambiguous)) => details.push(format!("Resend cancellation evidence: conflicting {conflicting}; ambiguous {ambiguous}")), Err(()) => details.push("Resend cancellation evidence health check failed".into()) }
         }
         if let Some(result) = self.resend_cancel_commands {
             match result { Ok((pending,overdue,unreviewed)) => details.push(format!("Resend cancellation commands: pending {pending}; overdue {overdue}; unreviewed failures {unreviewed}")), Err(()) => details.push("Resend cancellation command health check failed".into()) }
@@ -1647,6 +1657,7 @@ mod tests {
             smtp_health: None,
             smtp_auto_workers: None,
             smtp_auto_health: None,
+            resend_cancel_evidence: None,
             resend_cancel_health: None,
             resend_cancel_commands: None,
             discord_health: None,
@@ -1895,6 +1906,18 @@ mod tests {
         assert_eq!(sent.0,Some(Ok(())));assert_eq!(sent.1,Some(Ok(())));
         for payload in [server.await.unwrap(),email_server.await.unwrap()] {assert!(payload.contains("Resend cancellation commands: pending 3; overdue 2; unreviewed failures 1"));}
         a.resend_cancel_commands=Some(Err(()));assert_eq!(a.condition_mask_v3().1,8192);assert_eq!(a.observed_condition_mask_v3().1&(2048|4096),0);assert_ne!(a.observed_condition_mask_v3().1&8192,0);
+    }
+    #[tokio::test]
+    async fn resend_cancel_evidence_alerts_both_destinations_and_preserves_failed_observation() {
+        let mut a=alert();a.resend_enabled=false;a.resend_cancel_evidence=Some(Ok((2,1)));
+        assert_eq!(a.condition_mask_v3().1,16384);
+        let (url,server)=mock_server("200 OK","ok").await;let slack=SlackWebhook::with_endpoint(url).unwrap();
+        let (email_url,email_server)=mock_server("200 OK",r#"{"id":"mock-email"}"#).await;
+        let email=AlertEmailProvider::Resend(crate::resend::Resend::test_endpoint(crate::resend::Config{api_key:"re_test".into(),from:"sender@example.test".into(),sender_name:String::new()},email_url.as_str()).unwrap());
+        let sent=send_uncoordinated_selected(&a,Some(&slack),Some((&email,"ops@example.test")),Duration::from_secs(2),false).await;
+        assert_eq!(sent.0,Some(Ok(())));assert_eq!(sent.1,Some(Ok(())));
+        for payload in [server.await.unwrap(),email_server.await.unwrap()] {assert!(payload.contains("Resend cancellation evidence: conflicting 2; ambiguous 1"));}
+        a.resend_cancel_evidence=Some(Err(()));assert_eq!(a.condition_mask_v3().1,32768);assert_eq!(a.observed_condition_mask_v3().1&16384,0);assert_ne!(a.observed_condition_mask_v3().1&32768,0);
     }
     #[tokio::test]
     async fn resend_cancel_health_has_independent_v3_conditions_and_both_destinations() {
@@ -2915,6 +2938,7 @@ mod tests {
             smtp_health: None,
             smtp_auto_workers: None,
             smtp_auto_health: None,
+            resend_cancel_evidence: None,
             resend_cancel_health: None,
             resend_cancel_commands: None,
             discord_health: None,
