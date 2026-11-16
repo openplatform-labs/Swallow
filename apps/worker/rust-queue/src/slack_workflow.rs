@@ -138,9 +138,10 @@ async fn subscriber(
     ctx: &Context,
 ) -> Result<Option<SubscriberState>, Error> {
     let Some(row)=tx.query_opt("SELECT profile,internal_id FROM novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2 FOR UPDATE",&[&job.environment_id,&ctx.subscriber_id]).await? else {return Ok(None)};
-    // Use a fresh statement snapshot after acquiring the subscriber lock: a
-    // preference update that held that lock may have committed while we waited.
-    let pref=tx.query_one("SELECT w.read_only,w.all_enabled,w.chat_enabled,(p.channels->>'chat')::boolean,(sp.channels->>'chat')::boolean,EXISTS(SELECT 1 FROM novu_rust_workflows wf WHERE wf.environment_id=$1 AND wf.identifier=$3 AND ($4::text IS NULL OR wf.inbox_metadata->>'id'=$4)) FROM (SELECT 1) singleton LEFT JOIN novu_rust_workflow_preferences w ON w.environment_id=$1 AND w.workflow_identifier=$3 LEFT JOIN novu_rust_subscriber_preferences p ON p.environment_id=$1 AND p.subscriber_id=$2 LEFT JOIN novu_rust_subscriber_workflow_preferences sp ON sp.environment_id=$1 AND sp.subscriber_id=$2 AND sp.workflow_identifier=$3",&[&job.environment_id,&ctx.subscriber_id,&ctx.workflow_identifier,&ctx.workflow_internal_id]).await?;
+    // Lock before a fresh preference statement snapshot. Preference writers
+    // lock the parent even when a preference row does not yet exist.
+    let workflow=tx.query_opt("SELECT 1 FROM public.novu_rust_workflows WHERE environment_id=$1 AND identifier=$2 AND ($3::text IS NULL OR inbox_metadata->>'id'=$3) FOR SHARE",&[&job.environment_id,&ctx.workflow_identifier,&ctx.workflow_internal_id]).await?;
+    let pref=tx.query_one("SELECT w.read_only,w.all_enabled,w.chat_enabled,(p.channels->>'chat')::boolean,(sp.channels->>'chat')::boolean FROM (SELECT 1) singleton LEFT JOIN novu_rust_workflow_preferences w ON w.environment_id=$1 AND w.workflow_identifier=$3 LEFT JOIN novu_rust_subscriber_preferences p ON p.environment_id=$1 AND p.subscriber_id=$2 LEFT JOIN novu_rust_subscriber_workflow_preferences sp ON sp.environment_id=$1 AND sp.subscriber_id=$2 AND sp.workflow_identifier=$3",&[&job.environment_id,&ctx.subscriber_id,&ctx.workflow_identifier]).await?;
     Ok(Some(SubscriberState {
         profile: row.get(0),
         internal_id: row.get(1),
@@ -151,7 +152,7 @@ async fn subscriber(
             pref.get(3),
             pref.get(4),
         ),
-        workflow_exists: pref.get(5),
+        workflow_exists: workflow.is_some(),
     }))
 }
 fn valid_subscriber(row: Option<&SubscriberState>, ctx: &Context) -> Result<(), &'static str> {
@@ -677,6 +678,7 @@ pub async fn recover_expired(db: &mut Client, environment: &str) -> Result<usize
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -978,6 +980,10 @@ mod tests {
         ] {
             db.batch_execute(migration).await.unwrap();
         }
+        // This fixture intentionally installs only the shared workflow preference
+        // trigger from 0292; its Telegram function needs the full schema.
+        let preference_fence=include_str!("../migrations/0292_telegram_workflow_preference_fence.sql").split("CREATE OR REPLACE FUNCTION public.novu_rust_telegram_workflow_snapshot").next().unwrap();
+        db.batch_execute(preference_fence).await.unwrap();
         db.batch_execute("INSERT INTO novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES ('env','alice','old','{\"firstName\":\"Jane\"}'),('other','alice','other','{}'); INSERT INTO novu_rust_slack_endpoint_integrations VALUES ('env','main'),('other','main'); INSERT INTO novu_rust_slack_channel_endpoints(environment_id,identifier,subscriber_id,subscriber_internal_id,integration_identifier,endpoint_type,endpoint) VALUES ('env','one','alice','old','main','slack_channel','{\"channelId\":\"C123\"}'),('env','two','alice','old','main','slack_user','{\"userId\":\"U456\"}'),('other','one','alice','other','main','slack_channel','{\"channelId\":\"OTHER\"}')").await.unwrap();
         let ctx = Context {
             subscriber_id: "alice".into(),
@@ -1145,6 +1151,29 @@ mod tests {
             "failed"
         );
         db.execute("DELETE FROM novu_rust_subscriber_preferences WHERE environment_id='env' AND subscriber_id='alice'",&[]).await.unwrap();
+        // The writer inserts a previously absent workflow preference while
+        // holding the parent lock. Both fanout and delivery must wait and see it.
+        let fenced_parent=Uuid::new_v4();
+        crate::enqueue(&db,fenced_parent,"env",FANOUT_KIND,&serde_json::to_value(&next_ctx).unwrap()).await.unwrap();
+        let pref_tx=db.transaction().await.unwrap();
+        pref_tx.execute("INSERT INTO novu_rust_workflow_preferences(environment_id,workflow_identifier,chat_enabled) VALUES('env','workflow',false)",&[]).await.unwrap();
+        let (mut other,driver)=tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(),NoTls).await.unwrap();tokio::spawn(driver);
+        other.batch_execute("SET application_name='slack_fanout_preference_fence'").await.unwrap();
+        let fanout=tokio::spawn(async move {fanout_one(&mut other,"env").await});
+        let mut waiting=false;for _ in 0..150 {waiting=pref_tx.query_one("SELECT count(*)=1 FROM pg_stat_activity WHERE application_name='slack_fanout_preference_fence' AND wait_event_type='Lock'",&[]).await.unwrap().get(0);if waiting {break;}assert!(!fanout.is_finished());tokio::time::sleep(Duration::from_millis(100)).await;}assert!(waiting);
+        pref_tx.commit().await.unwrap();assert!(tokio::time::timeout(Duration::from_secs(10),fanout).await.unwrap().unwrap().unwrap());
+        assert_eq!(db.query_one("SELECT status FROM novu_queue_jobs WHERE id=$1",&[&fenced_parent]).await.unwrap().get::<_,String>(0),"cancelled");
+        assert_eq!(db.query_one("SELECT count(*) FROM novu_rust_slack_workflow_fanout WHERE parent_job_id=$1",&[&fenced_parent]).await.unwrap().get::<_,i64>(0),0);
+        db.execute("DELETE FROM novu_rust_workflow_preferences WHERE environment_id='env' AND workflow_identifier='workflow'",&[]).await.unwrap();
+        let fenced_delivery_parent=Uuid::new_v4();crate::enqueue(&db,fenced_delivery_parent,"env",FANOUT_KIND,&serde_json::to_value(&next_ctx).unwrap()).await.unwrap();assert!(fanout_one(&mut db,"env").await.unwrap());
+        let fenced_child:Uuid=db.query_one("SELECT delivery_job_id FROM novu_rust_slack_workflow_fanout WHERE parent_job_id=$1",&[&fenced_delivery_parent]).await.unwrap().get(0);
+        let pref_tx=db.transaction().await.unwrap();pref_tx.execute("INSERT INTO novu_rust_workflow_preferences(environment_id,workflow_identifier,chat_enabled) VALUES('env','workflow',false)",&[]).await.unwrap();
+        let (mut other,driver)=tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(),NoTls).await.unwrap();tokio::spawn(driver);other.batch_execute("SET application_name='slack_delivery_preference_fence'").await.unwrap();
+        let delivery=tokio::spawn(async move {delivery_one(&mut other,"env",&Providers::new()).await});
+        let mut waiting=false;for _ in 0..150 {waiting=pref_tx.query_one("SELECT count(*)=1 FROM pg_stat_activity WHERE application_name='slack_delivery_preference_fence' AND wait_event_type='Lock'",&[]).await.unwrap().get(0);if waiting {break;}assert!(!delivery.is_finished());tokio::time::sleep(Duration::from_millis(100)).await;}assert!(waiting);
+        pref_tx.commit().await.unwrap();assert!(tokio::time::timeout(Duration::from_secs(10),delivery).await.unwrap().unwrap().unwrap());
+        assert_eq!(db.query_one("SELECT status FROM novu_queue_jobs WHERE id=$1",&[&fenced_child]).await.unwrap().get::<_,String>(0),"cancelled");assert_eq!(db.query_one("SELECT count(*) FROM novu_rust_slack_attempts WHERE job_id=$1",&[&fenced_child]).await.unwrap().get::<_,i64>(0),0);
+        db.execute("DELETE FROM novu_rust_workflow_preferences WHERE environment_id='env' AND workflow_identifier='workflow'",&[]).await.unwrap();
         let parent4 = Uuid::new_v4();
         crate::enqueue(
             &db,
