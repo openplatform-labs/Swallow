@@ -14,4 +14,7 @@ PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print
 export TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/postgres" DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/postgres" NOVU_POSTGRES_ALLOW_INSECURE=true CARGO_INCREMENTAL=0
 cargo run --quiet --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --bin migrate-worker -- apply api "$ROOT/apps/api/rust-api/migrations" --through 17
 cargo run --quiet --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --bin migrate-worker -- apply worker "$ROOT/apps/worker/rust-queue/migrations"
+cargo build --quiet --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --bin delivery-reconcile
+export TEST_DELIVERY_CLI="$ROOT/apps/worker/rust-queue/target/debug/delivery-reconcile"
 cargo test --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --lib slack_ambiguous_status_is_fenced_in_scoped_alerts -- --ignored
+cargo test --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --lib legacy_ambiguous_alert_listing_is_scoped_and_paginated -- --ignored

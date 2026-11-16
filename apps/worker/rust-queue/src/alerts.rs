@@ -2636,6 +2636,28 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires fully migrated disposable PostgreSQL"]
+    async fn legacy_ambiguous_alert_listing_is_scoped_and_paginated() {
+        let url=std::env::var("TEST_DATABASE_URL").unwrap();let (db,driver)=tokio_postgres::connect(&url,tokio_postgres::NoTls).await.unwrap();tokio::spawn(driver);
+        let env=format!("legacy-alert-{}",Uuid::new_v4());let other=format!("legacy-other-{}",Uuid::new_v4());let role=format!("alert_viewer_{}",Uuid::new_v4().simple());
+        db.execute("INSERT INTO public.novu_rust_environments VALUES($1,'org'),($2,'org')",&[&env,&other]).await.unwrap();
+        db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_alert_legacy_ambiguous(text,text,text) TO {role}")).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,rolname,'alert_view',oid FROM pg_roles WHERE rolname=$2",&[&env,&role]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state,attempt_id) SELECT $1,'slack','target-'||lpad(n::text,3,'0'),'rejected',gen_random_uuid() FROM generate_series(1,52) n",&[&env]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_alert_delivery_attempts(id,environment_id,channel,target_id,state,http_status) SELECT attempt_id,environment_id,channel,target_id,'rejected',CASE WHEN target_id='target-052' THEN 400 WHEN target_id='target-001' THEN 408 ELSE 409 END FROM public.novu_rust_alert_delivery_slots WHERE environment_id=$1",&[&env]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_alert_delivery_slots(environment_id,channel,target_id,state,attempt_id) VALUES($1,'slack','resolved','accepted',gen_random_uuid()),($2,'slack','other','rejected',gen_random_uuid())",&[&env,&other]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_alert_delivery_attempts(id,environment_id,channel,target_id,state,http_status) SELECT attempt_id,environment_id,channel,target_id,'rejected',409 FROM public.novu_rust_alert_delivery_slots WHERE target_id IN ('resolved','other') AND environment_id IN ($1,$2)",&[&env,&other]).await.unwrap();
+        let (viewer,driver)=tokio_postgres::connect(&url,tokio_postgres::NoTls).await.unwrap();tokio::spawn(driver);viewer.batch_execute(&format!("SET SESSION AUTHORIZATION {role}")).await.unwrap();
+        let query="SELECT public.novu_rust_alert_legacy_ambiguous($1,$2,$3)";let none:Option<&str>=None;
+        let first:serde_json::Value=viewer.query_one(query,&[&env,&none,&none]).await.unwrap().get(0);assert_eq!(first["data"].as_array().unwrap().len(),50);assert_eq!(first["data"][0]["httpStatus"],408);assert_eq!(first["hasMore"],true);assert_eq!(first["next"]["targetId"],"target-050");
+        let channel=Some("slack");let after=Some("target-050");let second:serde_json::Value=viewer.query_one(query,&[&env,&channel,&after]).await.unwrap().get(0);assert_eq!(second["data"].as_array().unwrap().len(),1);assert_eq!(second["data"][0]["targetId"],"target-051");assert_eq!(second["hasMore"],false);
+        assert!(viewer.query_one(query,&[&other,&none,&none]).await.is_err());assert!(viewer.query_one(query,&[&env,&channel,&none]).await.is_err());
+        let cli=std::env::var("TEST_DELIVERY_CLI").unwrap();let viewer_url=url.replace("postgres://postgres@",&format!("postgres://{role}@"));
+        let output=std::process::Command::new(cli).args(["list-alert-legacy-ambiguous",&env,"slack","target-050"]).env("DATABASE_URL",viewer_url).env("NOVU_POSTGRES_ALLOW_INSECURE","true").output().unwrap();assert!(output.status.success());let value:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();assert_eq!(value,second);
+        db.execute("DELETE FROM public.novu_rust_delivery_operator_grants WHERE environment_id=$1 AND database_principal=$2 AND decision='alert_view'",&[&env,&role]).await.unwrap();assert!(viewer.query_one(query,&[&env,&none,&none]).await.is_err());
+    }
+
+    #[tokio::test]
     async fn operator_key_probe_alert_uses_both_mock_transports() {
         let mut a = alert();
         a.resend_enabled = false;
