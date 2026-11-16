@@ -5955,7 +5955,7 @@ pub(super) async fn change_permissions(
 }
 
 #[derive(Clone,Copy)]
-enum TelegramQuery { Attention, Predispatch, PredispatchRequest }
+enum TelegramQuery { Attention, Predispatch, PredispatchRequest, PredispatchCancelRequest }
 pub(super) async fn telegram_attention(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
     telegram_query(db,headers,uri,verifier,TelegramQuery::Attention).await
 }
@@ -5965,21 +5965,24 @@ pub(super) async fn telegram_predispatch(State(db):State<Arc<Client>>,headers:He
 pub(super) async fn telegram_predispatch_request(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
     telegram_query(db,headers,uri,verifier,TelegramQuery::PredispatchRequest).await
 }
+pub(super) async fn telegram_predispatch_cancel_request(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
+    telegram_query(db,headers,uri,verifier,TelegramQuery::PredispatchCancelRequest).await
+}
 async fn telegram_query(db:Arc<Client>,headers:HeaderMap,uri:Uri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>,kind:TelegramQuery) -> Response {
     let identity=match authenticate(&db,&headers,verifier).await {Ok(v)=>v,Err(status)=>return failure(status,uri.path())};
     let mut env=None;let mut cursor=None;
     for (key,value) in form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()) {
         match key.as_ref() {
             "environmentId" if env.is_none() && !value.is_empty() && value.len()<=512 && !value.contains('\0') => env=Some(value.into_owned()),
-            "after" if !matches!(kind,TelegramQuery::PredispatchRequest) && cursor.is_none() => match Uuid::parse_str(&value) {Ok(v)=>cursor=Some(v),Err(_)=>return failure(StatusCode::BAD_REQUEST,uri.path())},
-            "requestId" if matches!(kind,TelegramQuery::PredispatchRequest) && cursor.is_none() => match Uuid::parse_str(&value) {Ok(v)=>cursor=Some(v),Err(_)=>return failure(StatusCode::BAD_REQUEST,uri.path())},
+            "after" if matches!(kind,TelegramQuery::Attention|TelegramQuery::Predispatch) && cursor.is_none() => match Uuid::parse_str(&value) {Ok(v)=>cursor=Some(v),Err(_)=>return failure(StatusCode::BAD_REQUEST,uri.path())},
+            "requestId" if matches!(kind,TelegramQuery::PredispatchRequest|TelegramQuery::PredispatchCancelRequest) && cursor.is_none() => match Uuid::parse_str(&value) {Ok(v)=>cursor=Some(v),Err(_)=>return failure(StatusCode::BAD_REQUEST,uri.path())},
             _=>return failure(StatusCode::BAD_REQUEST,uri.path()),
         }
     }
     let Some(env)=env else{return failure(StatusCode::BAD_REQUEST,uri.path())};
-    if matches!(kind,TelegramQuery::PredispatchRequest) && cursor.is_none() {return failure(StatusCode::BAD_REQUEST,uri.path());}
+    if matches!(kind,TelegramQuery::PredispatchRequest|TelegramQuery::PredispatchCancelRequest) && cursor.is_none() {return failure(StatusCode::BAD_REQUEST,uri.path());}
     let Ok(exp)=i64::try_from(identity.expires_at) else{return failure(StatusCode::BAD_REQUEST,uri.path())};
-    let sql=match kind {TelegramQuery::Attention=>"SELECT public.novu_rust_operator_jwt_telegram_attention($1,$2,$3,$4,$5,$6)",TelegramQuery::Predispatch=>"SELECT public.novu_rust_operator_jwt_telegram_predispatch($1,$2,$3,$4,$5,$6)",TelegramQuery::PredispatchRequest=>"SELECT public.novu_rust_operator_jwt_telegram_predispatch_request($1,$2,$3,$4,$5,$6)"};
+    let sql=match kind {TelegramQuery::Attention=>"SELECT public.novu_rust_operator_jwt_telegram_attention($1,$2,$3,$4,$5,$6)",TelegramQuery::Predispatch=>"SELECT public.novu_rust_operator_jwt_telegram_predispatch($1,$2,$3,$4,$5,$6)",TelegramQuery::PredispatchRequest=>"SELECT public.novu_rust_operator_jwt_telegram_predispatch_request($1,$2,$3,$4,$5,$6)",TelegramQuery::PredispatchCancelRequest=>"SELECT public.novu_rust_operator_jwt_telegram_predispatch_cancel_request($1,$2,$3,$4,$5,$6)"};
     match guarded_query(&db,&identity,sql,&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&cursor]).await {
         Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
         Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
@@ -5991,6 +5994,12 @@ async fn telegram_query(db:Arc<Client>,headers:HeaderMap,uri:Uri,verifier:Option
 #[serde(rename_all="camelCase",deny_unknown_fields)]
 struct TelegramPredispatchRetryBody {request_id:String,job_id:String,failure_revision:String,reason:String}
 pub(super) async fn telegram_predispatch_retry(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>,body:Bytes) -> Response {
+    telegram_predispatch_action(db,headers,uri,verifier,body,false).await
+}
+pub(super) async fn telegram_predispatch_cancel(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>,body:Bytes) -> Response {
+    telegram_predispatch_action(db,headers,uri,verifier,body,true).await
+}
+async fn telegram_predispatch_action(db:Arc<Client>,headers:HeaderMap,uri:Uri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>,body:Bytes,cancel:bool) -> Response {
     let identity=match authenticate(&db,&headers,verifier).await {Ok(v)=>v,Err(status)=>return failure(status,uri.path())};
     let params:Vec<_>=form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).collect();
     if params.len()!=1 || params[0].0!="environmentId" || params[0].1.is_empty() || params[0].1.len()>512 || params[0].1.contains('\0') {return failure(StatusCode::BAD_REQUEST,uri.path());}
@@ -5999,7 +6008,8 @@ pub(super) async fn telegram_predispatch_retry(State(db):State<Arc<Client>>,head
     let (Ok(request),Ok(job),Ok(revision),Ok(exp))=(Uuid::parse_str(&input.request_id),Uuid::parse_str(&input.job_id),input.failure_revision.parse::<i64>(),i64::try_from(identity.expires_at)) else{return failure(StatusCode::BAD_REQUEST,uri.path());};
     if revision<0 || revision.to_string()!=input.failure_revision {return failure(StatusCode::BAD_REQUEST,uri.path());}
     let env=params[0].1.as_ref();
-    match guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_telegram_predispatch_retry($1,$2,$3,$4,$5,$6,$7,$8,$9)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&job,&revision,&input.reason]).await {
+    let sql=if cancel {"SELECT public.novu_rust_operator_jwt_telegram_predispatch_cancel($1,$2,$3,$4,$5,$6,$7,$8,$9)"} else {"SELECT public.novu_rust_operator_jwt_telegram_predispatch_retry($1,$2,$3,$4,$5,$6,$7,$8,$9)"};
+    match guarded_query(&db,&identity,sql,&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&job,&revision,&input.reason]).await {
         Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
         Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
         Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
