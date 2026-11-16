@@ -39,6 +39,8 @@ INSERT INTO public.novu_rust_telegram_history_viewers SELECT 'fixture-env',rolna
 INSERT INTO public.novu_rust_operator_jwt_telegram_resolution_history_viewers VALUES('https://issuer.test','admin','console','fixture-env');
 INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES('11111111-1111-4111-8111-111111111111','fixture-env','experimental_telegram_workflow','{"destination":"secret"}','failed');
 INSERT INTO public.novu_rust_telegram_attempts(job_id,environment_id,state) VALUES('11111111-1111-4111-8111-111111111111','fixture-env','unknown');
+INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES('22222222-2222-4222-8222-222222222222','fixture-env','experimental_telegram','{"destination":"secret"}','failed');
+INSERT INTO public.novu_rust_telegram_attempts(job_id,environment_id,state,http_status,retry_after_seconds) VALUES('22222222-2222-4222-8222-222222222222','fixture-env','rejected',429,42);
 SQL
 python3 - "$API/tests/fixtures/operator_jwt/test-only-public.pem" "$API/tests/fixtures/operator_jwt/test-only-private.pem" "$TEST_DIR" <<'PY'
 import base64,json,subprocess,sys,time
@@ -79,7 +81,8 @@ await page.click('nav.sidenav button >> nth=5');await page.selectOption('select[
 await fill('input[name="alertEnvironment"]','fixture-env');await fill('input[name="alertKey"]',admin);
 await page.click('app-discord-reviews button:has-text("Telegram 검토 목록 조회")');
 await page.waitForFunction(()=>document.querySelector('app-discord-reviews')?.innerText.includes('11111111-1111-4111-8111-111111111111'));
-await fill('textarea[name="telegramReviewReason"]','checked browser');await page.click('app-discord-reviews button:has-text("재시도 준비")');await page.waitForSelector('input[name="telegramDecisionConfirm"]');
+await page.waitForFunction(()=>document.querySelector('app-discord-reviews')?.innerText.includes('대기 안내: 42초'));
+await fill('textarea[name="telegramReviewReason"]','checked browser');await page.click('app-discord-reviews button:has-text("재시도 준비") >> nth=0');await page.waitForSelector('input[name="telegramDecisionConfirm"]');
 const req=await page.evaluate(()=>{const text=document.querySelector('app-discord-reviews')?.innerText||'';const m=text.match(/요청 ID ([0-9a-f-]{36})/);if(!m)throw Error('request id missing');return m[1]});
 await page.click('input[name="telegramDecisionConfirm"]');await page.click('app-discord-reviews button:has-text("Telegram 판정 제출")');
 await page.waitForFunction(()=>document.querySelector('app-discord-reviews')?.innerText.includes('Telegram 판정이 기록됐습니다.'));
