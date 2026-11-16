@@ -2793,4 +2793,9 @@ Telegram 발송 기반: 워커 0277은 Bot API `sendMessage`의 독립 작업 �
 
 ### Telegram 수신 주소 관리 화면
 
-Angular 22·Clarity 18 관리 콘솔의 기존 채널 연결 카드에서 Discord 또는 Telegram을 선택해 Telegram 구독자 연결과 채팅 ID를 등록·조회·변경·삭제하고 감사 이력을 조회할 수 있다. 환경 API 키의 별도 권한이 필요하며 채널 전환 시 키와 조회 정보를 지운다. 변경 응답의 채팅 ID를 검증하고 결과가 불명이면 자동 재요청하지 않는다. 로컬 PostgreSQL, 제한 API DB 로그인, 실제 Rust API와 브라우저에서 등록부터 삭제·감사 조회까지 확인했다. 봇 시크릿·워크플로 활성화·발송 상태·운영자 판정 화면은 구현하지 않았고 실제 Telegram 및 원본 Novu 전체 호환성은 미검증이다. [콘솔 문서](apps/dashboard/swallow/README.md)를 참고한다.
+Angular 22·Clarity 18 관리 콘솔의 기존 채널 연결 카드에서 Discord 또는 Telegram을 선택해 Telegram 구독자 연결과 채팅 ID를 등록·조회·변경·삭제하고 감사 이력을 조회할 수 있다. 환경 API 키의 별도 권한이 필요하며 채널 전환 시 키와 조회 정보를 지운다. 변경 응답의 채팅 ID를 검증하고 결과가 불명이면 자동 재요청하지 않는다. 로컬 PostgreSQL, 제한 API DB 로그인, 실제 Rust API와 브라우저에서 등록부터 삭제·감사 조회까지 확인했다. 봇 시크릿·발송 상태·운영자 판정 화면은 구현하지 않았고 워크플로 정책 화면은 아래 최신 항목을 참고한다. 실제 Telegram 및 원본 Novu 전체 호환성은 미검증이다. [콘솔 문서](apps/dashboard/swallow/README.md)를 참고한다.
+
+
+### Telegram 워크플로 정책 관리 (워커 0286, API 0184)
+
+환경별 Telegram 워크플로 정책을 DB 로그인과 운영자 JWT 각각의 읽기·쓰기·감사 권한으로 관리하며 리비전 충돌 방지, 요청 ID 재제출, 요청 조회와 감사 기록을 지원한다. 기존 구버전 워커 펜스와 정책 행 잠금을 유지한다. Angular 정책 화면에서 Discord 또는 Telegram을 선택해 변경을 준비·제출하고 요청과 이력을 조회할 수 있다. 준비된 요청은 선택한 채널에 고정된다. 격리 PostgreSQL에서 DB·JWT 권한, 동시 변경, 재제출, 감사 롤백과 잠금을 테스트했으며 실제 Rust API 및 브라우저에서 변경·조회와 다른 환경/운영자 차단을 검증했다. Telegram 정책 권한 위임 API/UI는 아직 없으므로 DBA가 DB 권한과 JWT 권한을 설정해야 한다. 정책 활성화는 워커 배포나 자격 증명 설정을 대신하지 않으며, 이미 예약된 발송을 취소하지 않는다. 실제 IdP·Telegram·운영 HA와 원본 전체 호환성은 미검증이다. [워커 문서](apps/worker/rust-queue/README.md)를 참고한다.

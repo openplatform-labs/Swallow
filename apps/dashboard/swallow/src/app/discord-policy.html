@@ -1,15 +1,16 @@
 <section class="card decision-card"><div class="card-block">
-  <div class="card-eyebrow">DISCORD WORKFLOW</div><h2>Discord 워크플로 정책</h2>
-  <p>환경별 Discord 발송을 선택합니다. 운영자 JWT와 API DB 로그인에 각각 해당 권한이 필요합니다. 활성화 전에 워커 배포와 호환성 보호 절차를 확인하세요.</p>
+  <div class="card-eyebrow">{{channel==='telegram' ? 'TELEGRAM' : 'DISCORD'}} WORKFLOW</div><h2>{{channel==='telegram' ? 'Telegram' : 'Discord'}} 워크플로 정책</h2>
+  <p>환경별 {{channel==='telegram' ? 'Telegram' : 'Discord'}} 발송을 선택합니다. 운영자 JWT와 API DB 로그인에 각각 해당 권한이 필요합니다. 활성화 전에 워커 배포와 호환성 보호 절차를 확인하세요.</p>
+  <label for="workflow-policy-channel">채널</label><select id="workflow-policy-channel" name="workflowPolicyChannel" [(ngModel)]="channel" (ngModelChange)="changeChannel()" [disabled]="changeStatus()!=='idle'"><option value="discord">Discord</option><option value="telegram">Telegram</option></select>
   <button type="button" class="btn btn-outline" [disabled]="readStatus() === 'loading' || changeStatus() === 'sending' || changeStatus() === 'preparing'" (click)="load()">정책 조회</button>
   @if(readStatus()==='loading'){<p role="status">조회 중입니다.</p>}
   @else if(readStatus()==='error'){<p class="subscriber-error" role="alert">정책을 조회하지 못했습니다. 인증과 정책 조회 권한을 확인하세요.</p>}
   @else if(readStatus()==='loaded'){
-    @if(policy();as current){<p role="status">Discord 발송: {{ current.enabled ? '활성' : '비활성' }} · revision {{ current.revision }}</p>}
+    @if(policy();as current){<p role="status">{{channel==='telegram' ? 'Telegram' : 'Discord'}} 발송: {{ current.enabled ? '활성' : '비활성' }} · revision {{ current.revision }}</p>}
     @else {<p role="status">등록된 정책이 없습니다.</p>}
     @if(changeStatus()==='idle'){
       <form class="decision-form" (ngSubmit)="prepare()">
-        <label for="discord-policy-enabled">Discord 발송</label><select id="discord-policy-enabled" name="discordPolicyEnabled" [(ngModel)]="enabled"><option [ngValue]="true">활성</option><option [ngValue]="false">비활성</option></select>
+        <label for="discord-policy-enabled">{{channel==='telegram' ? 'Telegram' : 'Discord'}} 발송</label><select id="discord-policy-enabled" name="discordPolicyEnabled" [(ngModel)]="enabled"><option [ngValue]="true">활성</option><option [ngValue]="false">비활성</option></select>
         <label for="discord-policy-reason">변경 사유</label><textarea id="discord-policy-reason" name="discordPolicyReason" [(ngModel)]="reason" maxlength="512" required></textarea>
         <label class="decision-confirm"><input type="checkbox" name="discordPolicyConfirm" [(ngModel)]="confirm"> 정책과 적용 범위를 확인했습니다.</label>
         <button type="submit" class="btn btn-primary" [disabled]="!canPrepare()">정책 변경 요청 준비</button>
@@ -18,7 +19,7 @@
   }
 </div></section>
 @if(snapshot();as request){<section class="card decision-card"><div class="card-block"><h2>정책 변경 요청</h2>
-  <p>요청 ID: {{ request.body.requestId }}<br>환경: {{ request.environment }} · 예상 revision: {{ request.body.expectedRevision }}<br>Discord 발송: {{ request.body.enabled ? '활성' : '비활성' }}<br>사유: {{ request.body.reason }}</p>
+  <p>요청 ID: {{ request.body.requestId }}<br>환경: {{ request.environment }} · 예상 revision: {{ request.body.expectedRevision }}<br>{{channel==='telegram' ? 'Telegram' : 'Discord'}} 발송: {{ request.body.enabled ? '활성' : '비활성' }}<br>사유: {{ request.body.reason }}</p>
   @if(changeStatus()==='prepared'){<p role="status">아직 전송하지 않았습니다. 요청 ID와 내용을 기록하세요. 화면을 떠나거나 새로고침하면 사라집니다.</p><label class="decision-confirm"><input type="checkbox" name="discordPolicySubmitConfirm" [(ngModel)]="submitConfirm"> 요청 ID와 내용을 확인하고 제출합니다.</label><button type="button" class="btn btn-primary" [disabled]="blocked || !submitConfirm" (click)="submit()">정책 변경 제출</button>}
   @else if(changeStatus()==='sending'){<p role="status">요청을 처리 중입니다.</p>}
   @else if(changeStatus()==='recorded'){<p role="status">요청이 기록됐습니다. 현재 정책은 다시 조회하세요.</p>}
@@ -32,13 +33,13 @@
   <form class="decision-form" (ngSubmit)="lookup()"><label for="discord-policy-request">요청 ID</label><input id="discord-policy-request" name="discordPolicyRequest" [(ngModel)]="lookupId" (ngModelChange)="clearLookup()" required><button type="submit" class="btn btn-outline" [disabled]="lookupStatus()==='loading' || changeStatus()==='sending' || changeStatus()==='preparing'">정책 요청 조회</button></form>
   @if(lookupStatus()==='missing'){<p>기록이 없습니다. 요청이 진행 중일 수 있습니다.</p>}
   @else if(lookupStatus()==='error'){<p role="alert" class="subscriber-error">요청을 조회하지 못했습니다. 인증과 쓰기 권한을 확인하세요.</p>}
-  @else if(lookupRecord();as record){<p role="status">요청 {{ record.requestId }} · {{ record.createdAt }}<br>예상 revision {{ record.expectedRevision }} → 결과 {{ record.policy.revision }}<br>Discord 발송: {{ record.enabled ? '활성' : '비활성' }}<br>사유: {{ record.reason }}</p><p>보관한 원래 요청과 대조하세요. 결과는 현재 정책이 아닐 수 있습니다.</p>}
+  @else if(lookupRecord();as record){<p role="status">요청 {{ record.requestId }} · {{ record.createdAt }}<br>예상 revision {{ record.expectedRevision }} → 결과 {{ record.policy.revision }}<br>{{channel==='telegram' ? 'Telegram' : 'Discord'}} 발송: {{ record.enabled ? '활성' : '비활성' }}<br>사유: {{ record.reason }}</p><p>보관한 원래 요청과 대조하세요. 결과는 현재 정책이 아닐 수 있습니다.</p>}
 </div></section>
 <section class="card decision-card"><div class="card-block"><h2>정책 변경 이력</h2><p>별도 감사 권한이 필요합니다. JWT API 변경만 표시하며 UUID 순서는 시간순이 아니고 페이지는 단일 스냅샷이 아닙니다.</p><button type="button" class="btn btn-outline" [disabled]="auditStatus()==='loading' || changeStatus()==='sending' || changeStatus()==='preparing'" (click)="audit()">정책 이력 조회</button>
   @if(auditStatus()==='error'){<p role="alert" class="subscriber-error">이력을 조회하지 못했습니다. 인증과 감사 권한을 확인하세요.</p>}
   @else if(auditStatus()==='loaded'){
     @if(auditRows().length===0){<p>조회된 이력이 없습니다.</p>}
-    @else{<div class="table-wrap"><table class="table"><thead><tr><th>기록</th><th>변경자</th><th>정책</th><th>사유</th></tr></thead><tbody>@for(row of auditRows();track row.id){<tr><td>{{ row.recordedAt }}<br>요청: {{ row.requestId }}<br>기록: {{ row.id }}</td><td>{{ row.actorIssuer }}<br>{{ row.actorSubject }} · {{ row.actorClientId }}<br>DB: {{ row.databasePrincipal }}</td><td>{{ row.previous ? row.previous.revision : '없음' }} → {{ row.current.revision }}<br>Discord 발송 {{ row.current.enabled ? '활성' : '비활성' }}</td><td>{{ row.reason }}</td></tr>}</tbody></table></div>}
+    @else{<div class="table-wrap"><table class="table"><thead><tr><th>기록</th><th>변경자</th><th>정책</th><th>사유</th></tr></thead><tbody>@for(row of auditRows();track row.id){<tr><td>{{ row.recordedAt }}<br>요청: {{ row.requestId }}<br>기록: {{ row.id }}</td><td>{{ row.actorIssuer }}<br>{{ row.actorSubject }} · {{ row.actorClientId }}<br>DB: {{ row.databasePrincipal }}</td><td>{{ row.previous ? row.previous.revision : '없음' }} → {{ row.current.revision }}<br>{{channel==='telegram' ? 'Telegram' : 'Discord'}} 발송 {{ row.current.enabled ? '활성' : '비활성' }}</td><td>{{ row.reason }}</td></tr>}</tbody></table></div>}
     <p>{{ auditPage() }} 페이지</p><button type="button" class="btn btn-sm btn-outline" [disabled]="auditPage()<=1" (click)="audit('previous')">이전</button><button type="button" class="btn btn-sm btn-outline" [disabled]="!auditNext()" (click)="audit('next')">다음</button>
   }
 </div></section>
