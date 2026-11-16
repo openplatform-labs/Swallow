@@ -14,6 +14,14 @@ async fn run(
         Ok("false") | Err(std::env::VarError::NotPresent) => false,
         _ => return Err("invalid Telegram scoped database setting".into()),
     };
+    let workflow = match std::env::var("NOVU_TELEGRAM_WORKFLOW_ENABLED").as_deref() {
+        Ok("true") => true,
+        Ok("false") | Err(std::env::VarError::NotPresent) => false,
+        _ => return Err("invalid Telegram workflow setting".into()),
+    };
+    if workflow && scoped {
+        return Err("Telegram workflow is not supported by scoped workers".into());
+    }
     let environment = std::env::var("NOVU_TELEGRAM_ENVIRONMENT_ID")?;
     if environment.trim().is_empty() {
         return Err("Telegram environment required".into());
@@ -88,11 +96,12 @@ async fn run(
                     if !matches!(
                         tokio::time::timeout(
                             timeout,
-                            telegram_queue::recover_expired_with_scope(
+                            telegram_queue::recover_expired_with_workflow(
                                 &mut db,
                                 &environment,
                                 &destination,
-                                scoped
+                                scoped,
+                                workflow
                             )
                         )
                         .await,
@@ -104,12 +113,13 @@ async fn run(
                 }
                 match tokio::time::timeout(
                     timeout,
-                    telegram_queue::process_one_with_scope(
+                    telegram_queue::process_one_with_workflow(
                         &mut db,
                         &environment,
                         &destination,
                         &provider,
                         scoped,
+                        workflow,
                     ),
                 )
                 .await

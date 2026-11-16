@@ -292,6 +292,16 @@ pub async fn process_one_with_chat_options(
     snapshot_slack_endpoints: bool,
     discord_workflow: bool,
 ) -> WorkerResult<bool> {
+    process_one_with_channel_options(client, lease, snapshot_slack_endpoints, discord_workflow, false).await
+}
+
+pub async fn process_one_with_channel_options(
+    client: &mut Client,
+    lease: Duration,
+    snapshot_slack_endpoints: bool,
+    discord_workflow: bool,
+    telegram_workflow: bool,
+) -> WorkerResult<bool> {
     let token = Uuid::new_v4();
     let seconds = lease.as_secs_f64();
     let kinds = [JOB_KIND, ATTACHMENT_JOB_KIND];
@@ -306,18 +316,19 @@ pub async fn process_one_with_chat_options(
     }) else {
         return Ok(false);
     };
-    match Box::pin(process_claimed(client, &job, snapshot_slack_endpoints, discord_workflow)).await {
+    match Box::pin(process_claimed(client, &job, snapshot_slack_endpoints, discord_workflow, telegram_workflow)).await {
         Ok(()) => Ok(true),
         Err(error) if error.downcast_ref::<LeaseLost>().is_some() => Ok(true),
         Err(error) if error.downcast_ref::<InvalidJob>().is_some() => {
             // Store only a fixed diagnostic, never the job payload or rendered content.
             // A false return means ownership was already lost. Do not overwrite
             // a newer lease; the recovery loop will handle an expired job.
-            if discord_workflow {
+            if discord_workflow || telegram_workflow {
                 let tx=client.transaction().await?;
                 let live=tx.query_opt("SELECT 1 FROM public.novu_queue_jobs WHERE id=$1 AND environment_id=$2 AND status='running' AND lease_token=$3 AND lease_until>clock_timestamp() FOR UPDATE", &[&job.id,&job.environment_id,&job.lease_token]).await?;
                 if live.is_some() {
-                    tx.query_one("SELECT public.novu_rust_discord_workflow_guard($1,$2,$3)", &[&job.environment_id,&job.id,&job.lease_token]).await?;
+                    if discord_workflow { tx.query_one("SELECT public.novu_rust_discord_workflow_guard($1,$2,$3)", &[&job.environment_id,&job.id,&job.lease_token]).await?; }
+                    if telegram_workflow { tx.query_one("SELECT public.novu_rust_telegram_workflow_guard($1,$2,$3)", &[&job.environment_id,&job.id,&job.lease_token]).await?; }
                     tx.execute("UPDATE public.novu_queue_jobs SET status='failed',last_error=$3,lease_token=NULL,lease_until=NULL WHERE id=$1 AND lease_token=$2 AND lease_until>clock_timestamp()", &[&job.id,&job.lease_token,&error.to_string()]).await?;
                 }
                 tx.commit().await?;
@@ -335,6 +346,7 @@ async fn process_claimed(
     job: &crate::ClaimedJob,
     snapshot_slack_endpoints: bool,
     discord_workflow: bool,
+    telegram_workflow: bool,
 ) -> WorkerResult<()> {
     let data = &job.payload;
     if !crate::allow_recreated_subscriber()
@@ -463,6 +475,9 @@ async fn process_claimed(
     let discord_workflow = if discord_workflow {
         // The guard holds the environment policy lock until this transaction commits.
         tx.query_one("SELECT public.novu_rust_discord_workflow_guard($1,$2,$3)", &[&job.environment_id,&job.id,&job.lease_token]).await?.get::<_,bool>(0)
+    } else { false };
+    let telegram_workflow = if telegram_workflow {
+        tx.query_one("SELECT public.novu_rust_telegram_workflow_guard($1,$2,$3)", &[&job.environment_id,&job.id,&job.lease_token]).await?.get::<_,bool>(0)
     } else { false };
     // The reference's first workflow worker resolves the trigger identifier
     // after enqueue. Older queued jobs retain their previous semantics.
@@ -1014,6 +1029,22 @@ async fn process_claimed(
                     let discord_id = Uuid::new_v4();
                     let discord_payload = serde_json::json!({"destination":destination,"content":"","workflowContext":{"subscriber_id":subscriber,"subscriber_internal_id":subscriber_internal_id,"workflow_identifier":workflow,"workflow_internal_id":workflow_internal_id,"content_template":chat_content,"payload":payload,"context_keys":context_keys,"actor":actor_profile,"actor_internal_id":actor_internal_id,"endpoint_id":endpoint_id,"endpoint_revision":revision}});
                     tx.execute("INSERT INTO novu_queue_jobs(id,environment_id,kind,payload) VALUES ($1,$2,$3,$4)", &[&discord_id,&job.environment_id,&crate::discord_queue::WORKFLOW_KIND,&discord_payload]).await?;
+                }
+            }
+        }
+        if telegram_workflow {
+            if let Some(chat_content) = chat_step.as_ref() {
+                // The subscriber lock is held by the upsert. Snapshot the endpoint
+                // generation so edits/deletes cannot redirect pending deliveries.
+                let endpoints = tx.query("SELECT internal_id,revision,destination_id FROM public.novu_rust_telegram_workflow_endpoints WHERE environment_id=$1 AND subscriber_internal_id=$2 AND context_keys @> $3 AND context_keys <@ $3 AND cardinality(context_keys)=cardinality($3) ORDER BY internal_id FOR SHARE LIMIT 1001", &[&job.environment_id,&subscriber_internal_id,&context_keys]).await?;
+                if endpoints.len() > 1000 { return Err(InvalidJob("too many Telegram endpoints").into()); }
+                for endpoint in endpoints {
+                    let endpoint_id: Uuid = endpoint.get(0);
+                    let revision: Uuid = endpoint.get(1);
+                    let destination: String = endpoint.get(2);
+                    let telegram_id = Uuid::new_v4();
+                    let telegram_payload = serde_json::json!({"destination":destination,"workflowContext":{"subscriber_id":subscriber,"subscriber_internal_id":subscriber_internal_id,"workflow_identifier":workflow,"workflow_internal_id":workflow_internal_id,"content_template":chat_content,"payload":payload,"context_keys":context_keys,"actor":actor_profile,"actor_internal_id":actor_internal_id,"endpoint_id":endpoint_id,"endpoint_revision":revision}});
+                    tx.execute("INSERT INTO novu_queue_jobs(id,environment_id,kind,payload) VALUES ($1,$2,$3,$4)", &[&telegram_id,&job.environment_id,&crate::telegram_queue::WORKFLOW_KIND,&telegram_payload]).await?;
                 }
             }
         }
