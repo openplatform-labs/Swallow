@@ -40,6 +40,22 @@ async fn trigger(app: axum::Router, txn: &str, time: Value) -> StatusCode {
     );
     status
 }
+async fn trigger_topic(app: axum::Router, txn: &str, topic: &str) {
+    let body = json!({"name":"event-time-workflow","to":"fixture-subscriber","transactionId":txn,"payload":{},"overrides":{"providers":{"fcm":{"topic":topic}}}});
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/events/trigger")
+                .header("authorization", "ApiKey event-time-key")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
 async fn capture(url: &str, count: usize) -> Vec<Value> {
     let path = std::env::temp_dir().join(format!("swallow-fcm-capture-{}.json", Uuid::new_v4()));
     let path2 = path.clone();
@@ -123,7 +139,7 @@ async fn event_time_flows_from_trigger_through_queue_to_fcm() {
     let row=worker.query_one("SELECT j.status,(SELECT count(*) FROM public.novu_rust_fcm_attempts a WHERE a.job_id=j.id AND a.state='accepted') FROM public.novu_queue_jobs j JOIN public.novu_rust_push_step_outcomes o ON o.push_job_id=j.id WHERE o.transaction_id='event-time-valid'",&[]).await.unwrap();
     assert_eq!(row.get::<_, String>(0), "completed");
     assert_eq!(row.get::<_, i64>(1), 1);
-    trigger(app, "event-time-invalid", json!("bad timestamp")).await;
+    trigger(app.clone(), "event-time-invalid", json!("bad timestamp")).await;
     assert!(
         novu_postgres_queue::in_app::process_one(&mut worker)
             .await
@@ -134,4 +150,25 @@ async fn event_time_flows_from_trigger_through_queue_to_fcm() {
     assert_eq!(row.get::<_, String>(0), "failed");
     assert_eq!(row.get::<_, i64>(1), 0);
     assert_eq!(row.get::<_, String>(2), "failed");
+    trigger_topic(app.clone(), "topic-valid", "/topics/orders").await;
+    assert!(
+        novu_postgres_queue::in_app::process_one(&mut worker)
+            .await
+            .unwrap()
+    );
+    let rows = capture(&url, 1).await;
+    assert_eq!(rows[0]["message"]["topic"], "orders");
+    let row=worker.query_one("SELECT j.status,(SELECT count(*) FROM public.novu_rust_fcm_attempts a WHERE a.job_id=j.id AND a.state='accepted') FROM public.novu_queue_jobs j JOIN public.novu_rust_push_step_outcomes o ON o.push_job_id=j.id WHERE o.transaction_id='topic-valid'",&[]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "completed");
+    assert_eq!(row.get::<_, i64>(1), 1);
+    trigger_topic(app, "topic-invalid", "invalid topic").await;
+    assert!(
+        novu_postgres_queue::in_app::process_one(&mut worker)
+            .await
+            .unwrap()
+    );
+    assert!(capture(&url, 0).await.is_empty());
+    let row=worker.query_one("SELECT j.status,(SELECT count(*) FROM public.novu_rust_fcm_attempts a WHERE a.job_id=j.id) FROM public.novu_queue_jobs j WHERE j.kind='experimental_fcm_push' AND j.payload->'workflow_context'->>'transaction_id'='topic-invalid'",&[]).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "failed");
+    assert_eq!(row.get::<_, i64>(1), 0);
 }

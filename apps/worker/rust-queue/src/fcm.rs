@@ -808,14 +808,24 @@ pub fn wire_messages(plan: &Plan) -> Result<Vec<Value>, SendError> {
             return Err(SendError::UnsupportedMessage);
         }
         let (key, value) = routes[0];
-        vec![(
-            key,
+        let value = value
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .ok_or(SendError::UnsupportedMessage)?;
+        let value = if key == "topic" {
+            let topic = value.strip_prefix("/topics/").unwrap_or(value);
+            if topic.is_empty()
+                || !topic
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.~%".contains(&b))
+            {
+                return Err(SendError::UnsupportedMessage);
+            }
+            topic
+        } else {
             value
-                .as_str()
-                .filter(|v| !v.is_empty())
-                .ok_or(SendError::UnsupportedMessage)?
-                .to_owned(),
-        )]
+        };
+        vec![(key, value.to_owned())]
     };
     Ok(routes
         .into_iter()
@@ -1485,6 +1495,37 @@ mod tests {
                 }),
                 Err(SendError::UnsupportedMessage)
             );
+        }
+    }
+
+    #[test]
+    fn topics_follow_firebase_prefix_and_character_rules() {
+        for (input, expected) in [
+            ("/topics/orders", "orders"),
+            ("orders-_.~%123", "orders-_.~%123"),
+        ] {
+            let plan = Plan {
+                multicast: false,
+                message: json!({"topic":input,"data":{"type":"update"}}),
+            };
+            assert_eq!(
+                wire_messages(&plan).unwrap()[0]["message"]["topic"],
+                expected
+            );
+        }
+        for input in [
+            "/topics/",
+            "bad topic",
+            "/topics//other",
+            "한글",
+            "a/b",
+            "*",
+        ] {
+            let plan = Plan {
+                multicast: false,
+                message: json!({"topic":input}),
+            };
+            assert_eq!(wire_messages(&plan), Err(SendError::UnsupportedMessage));
         }
     }
 

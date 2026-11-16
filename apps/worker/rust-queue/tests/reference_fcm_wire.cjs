@@ -8,6 +8,9 @@ const {validateMessage}=require(path.join(path.dirname(entry),'messaging-interna
 require('assert').throws(()=>validateMessage({token:'json-date',android:{notification:{eventTimestamp:'2026-11-14T12:34:56.123Z'}}}));
 require('assert').throws(()=>validateMessage({token:'bad-label',android:{fcmOptions:{analyticsLabel:7}}}));
 require('assert').throws(()=>validateMessage({token:'bad-options',android:{fcmOptions:null}}));
+for (const topic of ['/topics/','bad topic','/topics//other','한글','a/b','*']) {
+  require('assert').throws(()=>validateMessage({topic}));
+}
 const messages=[
   {token:'device-a',notification:{title:'Hi',body:'Hello',imageUrl:'https://example.test/a.png'},data:{key:'value'}},
   {topic:'orders',data:{title:'Hi',message:'Hello'}},
@@ -28,6 +31,8 @@ const messages=[
   {token:'event-c',android:{notification:{eventTimestamp:new Date('1969-12-31T23:59:59Z')}}},
   {token:'android-options-a',android:{fcmOptions:{analyticsLabel:'campaign',otherOption:'value'}}},
   {token:'android-options-b',android:{fcmOptions:{}}},
+  {topic:'/topics/orders',data:{type:'update'}},
+  {topic:'orders-_.~%123',data:{type:'update'}},
 ];
 for(const message of messages) validateMessage(message);
 process.stdout.write(JSON.stringify(messages.map(message=>({message}))));

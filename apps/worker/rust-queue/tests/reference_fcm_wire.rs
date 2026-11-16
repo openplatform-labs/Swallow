@@ -96,6 +96,14 @@ fn original_firebase_http_conversion() {
             multicast: false,
             message: json!({"token":"android-options-b","android":{"fcmOptions":{}}}),
         },
+        Plan {
+            multicast: false,
+            message: json!({"topic":"/topics/orders","data":{"type":"update"}}),
+        },
+        Plan {
+            multicast: false,
+            message: json!({"topic":"orders-_.~%123","data":{"type":"update"}}),
+        },
     ];
     for (index, plan) in plans.iter().enumerate() {
         assert_eq!(wire_messages(plan).unwrap(), vec![original[index].clone()]);
