@@ -19,7 +19,7 @@ def grant(method,path,body=None):
     except urllib.error.HTTPError as e:return e.code,json.loads(e.read())
 target=os.environ['TEST_TARGET_JWT']
 target_params={'environmentId':'cancel-api-env','targetIssuer':'https://issuer.test','targetSubject':'target','targetClientId':'console','resource':'resend-cancel'}
-for n,permission in enumerate(['list','detail','confirmed','not_cancelled','submit','command-health','command-list','command-review'],1):
+for n,permission in enumerate(['list','detail','confirmed','not_cancelled','submit','command-health','command-list','command-review','evidence-health','evidence-list'],1):
     params={**target_params,'permission':permission};status,data=grant('GET','?'+urllib.parse.urlencode(params));assert status==200 and data['targetExists'] and not data['granted']
     body={'requestId':'11111111-1111-4111-8111-'+str(n).zfill(12),'targetIssuer':'https://issuer.test','targetSubject':'target','targetClientId':'console','resource':'resend-cancel','permission':permission,'expected':False,'desired':True,'reason':'delegate'}
     if n==1:
@@ -35,7 +35,16 @@ for n,permission in enumerate(['list','detail','confirmed','not_cancelled','subm
     assert grant('PUT','?environmentId=cancel-api-env',body)[1]['replayed']
     assert grant('PUT','?environmentId=cancel-api-env',{**body,'reason':'changed'})[0]==409
     assert grant('GET','?'+urllib.parse.urlencode(params))[1]['granted']
-status,audit=grant('GET','/audit?environmentId=cancel-api-env');assert status==200 and len(audit['data'])==10
+status,audit=grant('GET','/audit?environmentId=cancel-api-env');assert status==200 and len(audit['data'])==12
+evidence='environmentId=cancel-api-env'
+status,counts=get(evidence,endpoint='resend-cancel-evidence-health');assert status==200 and counts['conflicting']==1 and counts['ambiguous']>=1,(status,counts)
+status,page=get(evidence,endpoint='resend-cancel-evidence-list');assert status==200 and any(x['evidence']=='conflicting' for x in page['data']) and 'private' not in json.dumps(page)
+assert get(evidence,target,endpoint='resend-cancel-evidence-list')[0]==200
+assert get('environmentId=cancel-api-other',endpoint='resend-cancel-evidence-health')[0] in (401,403)
+assert get(evidence+'&after=bad',endpoint='resend-cancel-evidence-list')[0]==400
+sql("DELETE FROM public.novu_rust_operator_jwt_resend_cancel_evidence_list_grants WHERE environment_id='cancel-api-env' AND subject='fixture'")
+assert get(evidence,endpoint='resend-cancel-evidence-list')[0] in (401,403) and get(evidence,endpoint='resend-cancel-evidence-health')[0]==200
+sql("INSERT INTO public.novu_rust_operator_jwt_resend_cancel_evidence_list_grants VALUES('https://issuer.test','fixture','console','cancel-api-env')")
 query_target='environmentId=cancel-api-env&graceSeconds=60';assert get(query_target,target)[0]==200
 self_change={**body,'requestId':'22222222-2222-4222-8222-222222222222','targetSubject':'fixture'};assert grant('PUT','?environmentId=cancel-api-env',self_change)[0] in (401,403)
 revoke={**body,'requestId':'33333333-3333-4333-8333-333333333333','permission':'list','expected':True,'desired':False};assert grant('PUT','?environmentId=cancel-api-env',revoke)[0]==200

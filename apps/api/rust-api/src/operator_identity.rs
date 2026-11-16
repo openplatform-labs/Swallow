@@ -28,6 +28,8 @@ enum Lookup {
     ResendCancelDetail,
     ResendCancelCommand,
     ResendCancelCommandReviewGet,
+    ResendCancelEvidenceHealth,
+    ResendCancelEvidenceList,
     ResendCancelCommandHealth,
     ResendCancelCommandFailures,
     ResendAutoHealth,
@@ -473,6 +475,8 @@ pub(super) async fn smtp_auto_worker_health(State(db):State<Arc<Client>>,headers
 pub(super) async fn discord_cooldown_health(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
     query(db,headers,uri,verifier,Lookup::DiscordCooldownHealth).await
 }
+pub(super) async fn resend_cancel_evidence_health(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {query(db,headers,uri,verifier,Lookup::ResendCancelEvidenceHealth).await}
+pub(super) async fn resend_cancel_evidence_list(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {query(db,headers,uri,verifier,Lookup::ResendCancelEvidenceList).await}
 pub(super) async fn resend_cancel_command_health(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {query(db,headers,uri,verifier,Lookup::ResendCancelCommandHealth).await}
 pub(super) async fn resend_cancel_command_failures(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {query(db,headers,uri,verifier,Lookup::ResendCancelCommandFailures).await}
 pub(super) async fn resend_cancel_command_review_get(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {query(db,headers,uri,verifier,Lookup::ResendCancelCommandReviewGet).await}
@@ -2951,6 +2955,8 @@ async fn query(
         Lookup::DiscordRetryList => &["environmentId", "graceSeconds", "filter", "after"],
         Lookup::ResendCancelList | Lookup::ResendCancelCommandFailures => &["environmentId", "graceSeconds", "after"],
         Lookup::ResendCancelCommandHealth => &["environmentId", "graceSeconds"],
+        Lookup::ResendCancelEvidenceHealth => &["environmentId"],
+        Lookup::ResendCancelEvidenceList => &["environmentId", "after"],
         Lookup::ResendCancelDetail | Lookup::ResendCancelCommand | Lookup::ResendCancelCommandReviewGet => &["environmentId", "requestId"],
         Lookup::FcmUnrecordedClaimHealth => &["environmentId", "minGap", "graceSeconds"],
         Lookup::FcmUnrecordedClaimList => &["environmentId", "minGap", "graceSeconds", "after"],
@@ -3173,6 +3179,11 @@ async fn query(
         Lookup::DiscordCooldownHealth => {
             let Some(grace)=params.get("graceSeconds").and_then(|v|v.parse::<i32>().ok().filter(|n|(1..=86400).contains(n)&&n.to_string()==*v)) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};
             guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_discord_cooldown_health($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&grace]).await
+        }
+        Lookup::ResendCancelEvidenceHealth | Lookup::ResendCancelEvidenceList => {
+            let after=match params.get("after") {Some(v)=>match Uuid::parse_str(v){Ok(v)=>Some(v),Err(_)=>return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request")},None=>None};
+            let list=matches!(lookup,Lookup::ResendCancelEvidenceList);
+            guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_resend_cancel_evidence_monitor($1,$2,$3,$4,$5,$6,$7)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&list,&after]).await
         }
         Lookup::ResendCancelCommandHealth | Lookup::ResendCancelCommandFailures => {
             let Some(grace)=params.get("graceSeconds").and_then(|v|v.parse::<i32>().ok().filter(|n|(1..=86400).contains(n)&&n.to_string()==*v)) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};

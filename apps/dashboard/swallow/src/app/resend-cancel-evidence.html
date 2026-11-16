@@ -1,0 +1,8 @@
+<section class="card decision-card"><div class="card-block"><div class="card-eyebrow">CANCELLATION EVIDENCE</div><h2>Resend 취소 증거 확인</h2>
+<p>취소 확인과 발송 이벤트가 충돌하거나 식별자가 모호한 건을 표시합니다. 웹훅 지연이나 누락으로 목록이 비어도 실제 미발송이 보장되지는 않습니다.</p>
+<button type="button" class="btn btn-outline" [disabled]="healthStatus()==='loading'" (click)="load()">충돌 현황 조회</button>
+@if(healthStatus()==='error'){<p role="alert">현황을 조회하지 못했습니다. 현황 조회 권한을 확인하세요.</p>} @if(health();as h){<p role="status">충돌: {{h.conflicting}} · 식별자 모호: {{h.ambiguous}}</p>}
+<button type="button" class="btn btn-outline" [disabled]="listStatus()==='loading'" (click)="list()">충돌 목록 조회</button><p>목록 권한은 별도이며 각 페이지는 서로 다른 시점의 조회 결과입니다.</p>
+@if(listStatus()==='error'){<p role="alert">목록을 조회하지 못했습니다. 목록 조회 권한을 확인하세요.</p>}
+@if(listStatus()==='loaded'){@if(!rows().length){<p>현재 관찰된 충돌이 없습니다.</p>}@else{<div class="table-wrap"><table class="table"><thead><tr><th>요청 ID</th><th>작업 ID</th><th>증거</th></tr></thead><tbody>@for(row of rows();track row.requestId){<tr><td>{{row.requestId}}</td><td>{{row.jobId}}</td><td>{{row.evidence === 'conflicting' ? '발송 이벤트 충돌' : '식별자 모호'}}</td></tr>}</tbody></table></div>}<div class="pagination"><span>{{page()}}페이지</span><button type="button" class="btn btn-sm btn-outline" [disabled]="page()===1" (click)="list('previous')">이전</button><button type="button" class="btn btn-sm btn-outline" [disabled]="!next()" (click)="list('next')">다음</button></div>}
+</div></section>
