@@ -1,3 +1,9 @@
+<section class="card decision-card"><div class="card-block"><h2>Telegram 발송 상태</h2>
+<p>환경의 결과 불명, 거절, 중단된 발송과 발송 전 실패 건수를 확인합니다. 별도의 Telegram 상태 조회 권한이 필요합니다.</p>
+<button type="button" class="btn btn-outline" (click)="loadTelegramHealth()" [disabled]="telegramHealthStatus()==='loading'">Telegram 상태 조회</button>
+@if(telegramHealthStatus()==='loading'){<p role="status">조회 중입니다.</p>} @else if(telegramHealthStatus()==='error'){<p role="alert">Telegram 상태를 조회하지 못했습니다. 인증과 조회 권한을 확인하세요.</p>} @else if(telegramHealth();as h){<p role="status">결과 불명 {{h.unknownAttempts}} · 거절 {{h.rejectedAttempts}} · 중단된 발송 {{h.strandedDispatches}} · 발송 전 실패 {{h.preDispatchFailures}}</p>}
+<p>상태 확인과 재시도는 운영 절차에 따라 처리하세요. 결과 불명 발송을 재시도하면 중복될 수 있습니다.</p>
+</div></section>
 <section class="card subscriber-card"><div class="card-block">
   <div class="card-eyebrow">DISCORD</div><h2>Discord 발송 실패 검토</h2>
   <p>운영자 JWT와 환경을 사용합니다. 목록 조회와 확인에는 별도 권한이 필요합니다. 검토 확인은 발송 상태를 바꾸지 않습니다. 판정에는 별도 권한과 독립적인 근거가 필요합니다.</p>

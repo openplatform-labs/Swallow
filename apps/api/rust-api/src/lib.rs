@@ -548,6 +548,7 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/operator/resend-cancel-credential-health", get(operator_identity::resend_cancel_credential_health))
         .route("/v1/experimental/operator/smtp-credential-health", get(operator_identity::smtp_credential_health))
         .route("/v1/experimental/operator/smtp-ca-health", get(operator_identity::smtp_ca_health))
+        .route("/v1/experimental/operator/telegram-health", get(operator_identity::telegram_health))
         .route("/v1/experimental/operator/discord-cooldown-health", get(operator_identity::discord_cooldown_health))
         .route("/v1/experimental/operator/resend-cancel-list", get(operator_identity::resend_cancel_list))
         .route("/v1/experimental/operator/resend-cancel-detail", get(operator_identity::resend_cancel_detail))

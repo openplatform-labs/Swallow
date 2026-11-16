@@ -42,6 +42,7 @@ enum Lookup {
     ResendCancelCredentialHealth,
     SmtpCaHealth,
     SmtpAutoWorkerHealth,
+    TelegramHealth,
     DiscordCooldownHealth,
     SmtpAutoHealth,
     DiscordRetryHealth,
@@ -483,6 +484,9 @@ pub(super) async fn smtp_ca_health(State(db):State<Arc<Client>>,headers:HeaderMa
 }
 pub(super) async fn smtp_auto_worker_health(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
     query(db,headers,uri,verifier,Lookup::SmtpAutoWorkerHealth).await
+}
+pub(super) async fn telegram_health(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
+    query(db,headers,uri,verifier,Lookup::TelegramHealth).await
 }
 pub(super) async fn discord_cooldown_health(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
     query(db,headers,uri,verifier,Lookup::DiscordCooldownHealth).await
@@ -3094,7 +3098,7 @@ async fn query(
         Lookup::DiscordRetryPolicyRead => &["environmentId","destinationId"],
         Lookup::DiscordRetryPolicyRequest => &["environmentId","destinationId","requestId"],
         Lookup::DiscordRetryPolicyAudit => &["environmentId","destinationId","after"],
-        Lookup::Identity | Lookup::SmtpAutoPolicyRead | Lookup::ResendAutoPolicyRead | Lookup::ResendCooldownPolicyRead | Lookup::SmtpTransportPolicyRead | Lookup::DiscordPolicyRead | Lookup::TelegramPolicyRead => &["environmentId"],
+        Lookup::TelegramHealth | Lookup::Identity | Lookup::SmtpAutoPolicyRead | Lookup::ResendAutoPolicyRead | Lookup::ResendCooldownPolicyRead | Lookup::SmtpTransportPolicyRead | Lookup::DiscordPolicyRead | Lookup::TelegramPolicyRead => &["environmentId"],
         Lookup::PermissionIdentity => &["environmentId", "issuer", "subject", "clientId"],
         Lookup::PermissionAudit | Lookup::SmtpAutoHistory => &["environmentId", "before"],
         Lookup::PermissionChangeRequest | Lookup::SmtpAutoPolicyRequest | Lookup::ResendAutoPolicyRequest | Lookup::ResendCooldownPolicyRequest | Lookup::SmtpTransportPolicyRequest | Lookup::DiscordPolicyRequest | Lookup::TelegramPolicyRequest => {
@@ -3342,6 +3346,9 @@ async fn query(
             let Some(age)=params.get("maxAgeSeconds").and_then(|v|v.parse::<i32>().ok().filter(|n|(1..=86400).contains(n)&&n.to_string()==*v)) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};
             let Some(minimum)=params.get("minimumHealthy").and_then(|v|v.parse::<i32>().ok().filter(|n|(1..=1000).contains(n)&&n.to_string()==*v)) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};
             guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_smtp_auto_worker_health($1,$2,$3,$4,$5,$6,$7)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&age,&minimum]).await
+        }
+        Lookup::TelegramHealth => {
+            guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_telegram_health($1,$2,$3,$4,$5)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp]).await
         }
         Lookup::DiscordCooldownHealth => {
             let Some(grace)=params.get("graceSeconds").and_then(|v|v.parse::<i32>().ok().filter(|n|(1..=86400).contains(n)&&n.to_string()==*v)) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};

@@ -3,6 +3,7 @@ import { FormsModule } from '@angular/forms';
 import { DiscordRetryDiagnostics } from './discord-retry-diagnostics';
 import { DiscordCooldownHealth } from './discord-cooldown-health';
 
+type TelegramHealth = {unknownAttempts:number;rejectedAttempts:number;strandedDispatches:number;preDispatchFailures:number};
 type DiscordRow = {jobId:string;kind:string;status:string;attemptState:string|null;attemptRevision:string|null;failureRevision:string;attempts:number;httpStatus:number|null;retryAfterSeconds:number|null;retryNotBefore:string|null};
 type HistoryOperator = {issuer:string;subject:string;clientId:string;requestId:string};
 type HistoryRow = {operator:HistoryOperator|null;actor:string;actorOid:string;requestId:string;jobId:string;attemptRevision:string|null;failureRevision:string;decision:'accepted'|'retry'|'retry_after';attemptState:string|null;httpStatus:number|null;retryAfterSeconds:number|null;retryNotBefore:string|null;reason:string;createdAt:string};
@@ -11,6 +12,8 @@ type Review = {requestId:string;jobId:string;attemptRevision:string|null;failure
 @Component({selector:'app-discord-reviews',imports:[FormsModule,DiscordRetryDiagnostics,DiscordCooldownHealth],templateUrl:'./discord-reviews.html'})
 export class DiscordReviews implements OnChanges,OnDestroy {
   @Input() apiOrigin=''; @Input() environment=''; @Input() token=''; @Output() busyChange=new EventEmitter<boolean>();
+  readonly telegramHealth=signal<TelegramHealth|null>(null);readonly telegramHealthStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');
+  private telegramHealthSeq=0;private telegramHealthAbort:AbortController|null=null;
   readonly rows=signal<DiscordRow[]>([]); readonly next=signal<string|null>(null); readonly listStatus=signal<'idle'|'loading'|'loaded'|'error'>('idle');
   readonly review=signal<Review|null>(null); readonly reviewStatus=signal<'idle'|'prepared'|'sending'|'unknown'|'recorded'|'unavailable'>('idle'); readonly recorded=signal<boolean|null>(null);
   readonly lookupStatus=signal<'idle'|'loading'|'found'|'not-found'|'error'>('idle'); readonly lookupRecord=signal<(Review & {recorded:boolean})|null>(null);
@@ -20,8 +23,13 @@ export class DiscordReviews implements OnChanges,OnDestroy {
   private listSeq=0; private reviewSeq=0; private lookupSeq=0;
   private listAbort:AbortController|null=null; private reviewAbort:AbortController|null=null; private lookupAbort:AbortController|null=null;
   private sentToken:string|null=null; private sentOrigin:string|null=null; private sentEnvironment:string|null=null;
-  ngOnChanges():void { this.clearList(); this.clearLookup(); this.clearHistory(); if(this.reviewStatus()==='sending'){this.reviewSeq++;this.reviewAbort?.abort();this.reviewAbort=null;this.reviewStatus.set('unknown');this.busyChange.emit(false);} if(['prepared','recorded','unavailable'].includes(this.reviewStatus()))this.resetReview(); if(this.reviewStatus()!=='unknown'||!this.token.trim()){this.sentToken=null;this.sentOrigin=null;this.sentEnvironment=null;} }
+  ngOnChanges():void { this.clearTelegramHealth(); this.clearList(); this.clearLookup(); this.clearHistory(); if(this.reviewStatus()==='sending'){this.reviewSeq++;this.reviewAbort?.abort();this.reviewAbort=null;this.reviewStatus.set('unknown');this.busyChange.emit(false);} if(['prepared','recorded','unavailable'].includes(this.reviewStatus()))this.resetReview(); if(this.reviewStatus()!=='unknown'||!this.token.trim()){this.sentToken=null;this.sentOrigin=null;this.sentEnvironment=null;} }
   ngOnDestroy():void {this.ngOnChanges();this.token='';this.sentToken=null;this.sentOrigin=null;this.sentEnvironment=null;}
+  clearTelegramHealth():void {this.telegramHealthSeq++;this.telegramHealthAbort?.abort();this.telegramHealthAbort=null;this.telegramHealth.set(null);this.telegramHealthStatus.set('idle');}
+  async loadTelegramHealth():Promise<void> {
+    this.clearTelegramHealth();const seq=this.telegramHealthSeq,c=new AbortController();this.telegramHealthAbort=c;this.telegramHealthStatus.set('loading');
+    try {const params=this.params(),response=await fetch(`${this.origin()}/v1/experimental/operator/telegram-health?${params}`,{headers:{Authorization:`Bearer ${this.token.trim()}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([c.signal,AbortSignal.timeout(10000)])});if(!response.ok)throw Error('request');const v:unknown=await response.json();if(!v||typeof v!=='object')throw Error('response');const r=v as Record<string,unknown>;const fields=['unknownAttempts','rejectedAttempts','strandedDispatches','preDispatchFailures'] as const;if(fields.some(k=>!Number.isSafeInteger(r[k])||(r[k] as number)<0))throw Error('response');if(seq!==this.telegramHealthSeq)return;this.telegramHealth.set({unknownAttempts:r['unknownAttempts'] as number,rejectedAttempts:r['rejectedAttempts'] as number,strandedDispatches:r['strandedDispatches'] as number,preDispatchFailures:r['preDispatchFailures'] as number});this.telegramHealthStatus.set('loaded');}catch{if(seq===this.telegramHealthSeq)this.telegramHealthStatus.set('error');}finally{if(seq===this.telegramHealthSeq)this.telegramHealthAbort=null;}
+  }
   private uuid(v:unknown):v is string {return typeof v==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);}
   private revision(v:unknown):v is string {return typeof v==='string'&&/^(0|[1-9][0-9]{0,18})$/.test(v)&&BigInt(v)<=9223372036854775807n;}
   private origin():string {const u=new URL(this.apiOrigin.trim());if(!['https:','http:'].includes(u.protocol)||u.username||u.password||u.pathname!=='/'||u.search||u.hash||(u.protocol==='http:'&&!['localhost','127.0.0.1','[::1]'].includes(u.hostname)))throw new Error('origin');return u.origin;}
