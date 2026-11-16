@@ -235,7 +235,7 @@ pub async fn fanout_one_with_policies(
             return Ok(true);
         }
     };
-    let tx = db.transaction().await?;
+    let tx = db.build_transaction().isolation_level(tokio_postgres::IsolationLevel::ReadCommitted).start().await?;
     let row = subscriber(&tx, &job, &ctx).await?;
     if !live(&tx, &job).await? {
         tx.rollback().await?;
@@ -450,7 +450,7 @@ pub async fn delivery_one_with_cooldown(
         }
     };
     let ctx = &delivery.context;
-    let tx = db.transaction().await?;
+    let tx = db.build_transaction().isolation_level(tokio_postgres::IsolationLevel::ReadCommitted).start().await?;
     if endpoint_policy == EndpointPolicy::SnapshotRevision && delivery.endpoint_revision.is_none() {
         if !live(&tx, &job).await? {
             tx.rollback().await?;
@@ -1158,7 +1158,7 @@ mod tests {
         let pref_tx=db.transaction().await.unwrap();
         pref_tx.execute("INSERT INTO novu_rust_workflow_preferences(environment_id,workflow_identifier,chat_enabled) VALUES('env','workflow',false)",&[]).await.unwrap();
         let (mut other,driver)=tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(),NoTls).await.unwrap();tokio::spawn(driver);
-        other.batch_execute("SET application_name='slack_fanout_preference_fence'").await.unwrap();
+        other.batch_execute("SET application_name='slack_fanout_preference_fence'; SET default_transaction_isolation='repeatable read'").await.unwrap();
         let fanout=tokio::spawn(async move {fanout_one(&mut other,"env").await});
         let mut waiting=false;for _ in 0..150 {waiting=pref_tx.query_one("SELECT count(*)=1 FROM pg_stat_activity WHERE application_name='slack_fanout_preference_fence' AND wait_event_type='Lock'",&[]).await.unwrap().get(0);if waiting {break;}assert!(!fanout.is_finished());tokio::time::sleep(Duration::from_millis(100)).await;}assert!(waiting);
         pref_tx.commit().await.unwrap();assert!(tokio::time::timeout(Duration::from_secs(10),fanout).await.unwrap().unwrap().unwrap());
@@ -1168,7 +1168,7 @@ mod tests {
         let fenced_delivery_parent=Uuid::new_v4();crate::enqueue(&db,fenced_delivery_parent,"env",FANOUT_KIND,&serde_json::to_value(&next_ctx).unwrap()).await.unwrap();assert!(fanout_one(&mut db,"env").await.unwrap());
         let fenced_child:Uuid=db.query_one("SELECT delivery_job_id FROM novu_rust_slack_workflow_fanout WHERE parent_job_id=$1",&[&fenced_delivery_parent]).await.unwrap().get(0);
         let pref_tx=db.transaction().await.unwrap();pref_tx.execute("INSERT INTO novu_rust_workflow_preferences(environment_id,workflow_identifier,chat_enabled) VALUES('env','workflow',false)",&[]).await.unwrap();
-        let (mut other,driver)=tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(),NoTls).await.unwrap();tokio::spawn(driver);other.batch_execute("SET application_name='slack_delivery_preference_fence'").await.unwrap();
+        let (mut other,driver)=tokio_postgres::connect(&std::env::var("TEST_DATABASE_URL").unwrap(),NoTls).await.unwrap();tokio::spawn(driver);other.batch_execute("SET application_name='slack_delivery_preference_fence'; SET default_transaction_isolation='repeatable read'").await.unwrap();
         let delivery=tokio::spawn(async move {delivery_one(&mut other,"env",&Providers::new()).await});
         let mut waiting=false;for _ in 0..150 {waiting=pref_tx.query_one("SELECT count(*)=1 FROM pg_stat_activity WHERE application_name='slack_delivery_preference_fence' AND wait_event_type='Lock'",&[]).await.unwrap().get(0);if waiting {break;}assert!(!delivery.is_finished());tokio::time::sleep(Duration::from_millis(100)).await;}assert!(waiting);
         pref_tx.commit().await.unwrap();assert!(tokio::time::timeout(Duration::from_secs(10),delivery).await.unwrap().unwrap().unwrap());
