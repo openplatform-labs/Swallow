@@ -17,7 +17,20 @@ def grant(method,path,body=None):
     try:
         with urllib.request.urlopen(req,timeout=5) as r:return r.status,json.loads(r.read())
     except urllib.error.HTTPError as e:return e.code,json.loads(e.read())
+# Credential health requires independent JWT and database grants, and is environment scoped.
+health_query='environmentId=cancel-api-env&maxAgeSeconds=60&minimumHealthy=1'
+status,health=get(health_query,endpoint='resend-cancel-credential-health');assert status==200 and health=={'healthy':0,'unhealthy':0,'stale':0,'minimumHealthy':1,'needsAttention':True},(status,health)
+assert get('environmentId=cancel-api-other&maxAgeSeconds=60&minimumHealthy=1',endpoint='resend-cancel-credential-health')[0] in (401,403)
+assert get('environmentId=cancel-api-env&maxAgeSeconds=060&minimumHealthy=1',endpoint='resend-cancel-credential-health')[0]==400
+assert get(health_query,credential='',endpoint='resend-cancel-credential-health')[0]==401
+sql("UPDATE public.novu_rust_operator_jwt_resend_cancel_credential_health_grants SET can_health=false WHERE environment_id='cancel-api-env'")
+assert get(health_query,endpoint='resend-cancel-credential-health')[0] in (401,403)
+sql("UPDATE public.novu_rust_operator_jwt_resend_cancel_credential_health_grants SET can_health=true WHERE environment_id='cancel-api-env'; DELETE FROM public.novu_rust_delivery_operator_grants WHERE environment_id='cancel-api-env' AND database_principal='cancel_api_fixture' AND decision='alert_view'")
+assert get(health_query,endpoint='resend-cancel-credential-health')[0] in (401,403)
+sql("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'cancel-api-env',rolname,'alert_view',oid FROM pg_roles WHERE rolname='cancel_api_fixture'")
+assert get(health_query,endpoint='resend-cancel-credential-health')[0]==200
 target=os.environ['TEST_TARGET_JWT']
+assert get(health_query,target,endpoint='resend-cancel-credential-health')[0] in (401,403)
 target_params={'environmentId':'cancel-api-env','targetIssuer':'https://issuer.test','targetSubject':'target','targetClientId':'console','resource':'resend-cancel'}
 for n,permission in enumerate(['list','detail','confirmed','not_cancelled','submit','command-health','command-list','command-review','evidence-health','evidence-list','legacy-health','legacy-list'],1):
     params={**target_params,'permission':permission};status,data=grant('GET','?'+urllib.parse.urlencode(params));assert status==200 and data['targetExists'] and not data['granted']

@@ -1,9 +1,10 @@
 import { Component, Input, OnChanges, OnDestroy, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
+import { SmtpCredentialHealth } from './smtp-credential-health';
 type LegacyRow={requestId:string;jobId:string;httpStatus:408|409;createdAt:string};
 type Row={requestId:string;jobId:string;createdAt:string;overdue:boolean};
 type Detail={requestId:string;jobId:string;providerId:string;databasePrincipal:string;reason:string;state:string;httpStatus:number|null;createdAt:string;updatedAt:string;resolution:{resolutionId:string;decision:string;databasePrincipal:string;reason:string;recordedAt:string;operator:{issuer:string;subject:string;clientId:string;resolutionId:string}|null}|null};
-@Component({selector:'app-resend-cancel-list',imports:[FormsModule],templateUrl:'./resend-cancel-list.html'})
+@Component({selector:'app-resend-cancel-list',imports:[FormsModule,SmtpCredentialHealth],templateUrl:'./resend-cancel-list.html'})
 export class ResendCancelList implements OnChanges,OnDestroy {
   @Input() apiOrigin='';@Input() environment='';@Input() token='';
   grace=300;readonly status=signal<'idle'|'loading'|'loaded'|'error'>('idle');readonly rows=signal<Row[]>([]);readonly next=signal<string|null>(null);readonly page=signal(1);

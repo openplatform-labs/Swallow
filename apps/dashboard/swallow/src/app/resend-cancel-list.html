@@ -35,3 +35,5 @@
 @if(resolutionStatus()==='sending'){<p role="status">판정 기록 중입니다.</p>}@if(resolutionStatus()==='unknown'){<p role="alert">결과가 불명입니다. 동일한 환경과 운영자 인증으로 같은 판정을 재제출하거나 기록을 확인하세요.</p>}@if(resolutionStatus()==='recorded'){<p role="status">판정이 기록되었습니다. 상세를 다시 조회하세요.</p>}
 <button type="button" class="btn btn-outline" [disabled]="resolutionStatus()==='sending'" (click)="resetResolution()">판정 준비 지우기</button>}
 </div></section>
+
+<app-smtp-credential-health kind="resend-cancel" [apiOrigin]="apiOrigin" [environment]="environment" [token]="token"></app-smtp-credential-health>
