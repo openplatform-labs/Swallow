@@ -33,6 +33,8 @@ pub mod slack_workflow;
 pub mod sms_step_policy;
 pub mod smtp_alert;
 pub mod smtp_queue;
+pub mod telegram;
+pub mod telegram_queue;
 pub mod twilio;
 #[cfg(test)]
 mod twilio_failover_test;
