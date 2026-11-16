@@ -22,6 +22,35 @@ try:
     guarded=env.copy();guarded.update(SWALLOW_RESEND_CANCEL_REQUIRE_ACCOUNT_TAG='true',SWALLOW_RESEND_ACCOUNT_TAG='wrong-account')
     assert run('cancel','cancel-env','99999999-9999-4999-8999-999999999998','44444444-4444-4444-8444-444444444444','wrong',override=guarded).returncode!=0
     assert not server.calls
+    # A prior retry identity or a pre-existing delivery event forbids a new external cancellation.
+    psql=env['TEST_PSQL'];admin=os.environ['DATABASE_URL']
+    audit="INSERT INTO public.novu_rust_delivery_reconciliations(id,environment_id,job_id,decision,operator_name,reason,retry_provider_message_id) VALUES(gen_random_uuid(),'cancel-env','44444444-4444-4444-8444-444444444444','retry','fixture','fixture','fixture-four')"
+    subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',audit],check=True,capture_output=True)
+    assert run('cancel','cancel-env','99999999-9999-4999-8999-999999999997','44444444-4444-4444-8444-444444444444','fixture').returncode!=0
+    subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',"DELETE FROM public.novu_rust_delivery_reconciliations WHERE retry_provider_message_id='fixture-four'"],check=True,capture_output=True)
+    stale="BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT public.novu_rust_resend_cancel_reserve('cancel-env','99999999-9999-4999-8999-999999999994','44444444-4444-4444-8444-444444444444','fixture'); COMMIT"
+    assert subprocess.run([psql,env['DATABASE_URL'],'-qAt','-v','ON_ERROR_STOP=1','-c',stale],capture_output=True).returncode!=0
+    # The retry audit holds the shared provider lock until commit; reservation must re-read it.
+    race=subprocess.Popen([psql,admin,'-qAt','-v','ON_ERROR_STOP=1','-c','BEGIN; '+audit+'; SELECT pg_sleep(2); COMMIT'],env={**os.environ,'PGAPPNAME':'cancel-retry-race'},stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+    try:
+        deadline=time.monotonic()+5
+        while time.monotonic()<deadline:
+            state=subprocess.run([psql,admin,'-qAt','-c',"SELECT count(*) FROM pg_stat_activity WHERE application_name='cancel-retry-race' AND wait_event='PgSleep'"],text=True,capture_output=True)
+            if state.stdout.strip()=='1':break
+            assert race.poll() is None
+            time.sleep(.05)
+        else:raise AssertionError('retry transaction did not acquire provider lock')
+        refused=run('cancel','cancel-env','99999999-9999-4999-8999-999999999995','44444444-4444-4444-8444-444444444444','fixture')
+        assert refused.returncode!=0 and not server.calls,(refused.stdout,refused.stderr)
+        out,err=race.communicate(timeout=5);assert race.returncode==0,(out,err)
+    finally:
+        if race.poll() is None:race.kill();race.wait()
+    subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',"DELETE FROM public.novu_rust_delivery_reconciliations WHERE retry_provider_message_id='fixture-four'"],check=True,capture_output=True)
+    event="INSERT INTO public.novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type) VALUES('cancel-env','prior-event','fixture-five','email.delivery_delayed')"
+    subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',event],check=True,capture_output=True)
+    assert run('cancel','cancel-env','99999999-9999-4999-8999-999999999996','55555555-5555-4555-8555-555555555555','fixture').returncode!=0
+    subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',"DELETE FROM public.novu_rust_resend_delivery_events WHERE event_id='prior-event'; UPDATE public.novu_queue_jobs SET resend_delivery_result=NULL WHERE id='55555555-5555-4555-8555-555555555555'"],check=True,capture_output=True)
+    assert not server.calls
     result=run('cancel','cancel-env',req1,job1,'fixture');assert result.returncode==0,(result.stdout,result.stderr)
     assert json.loads(result.stdout)['state']=='confirmed'
     replay=run('cancel','cancel-env',req1,job1,'fixture');assert replay.returncode==0 and json.loads(replay.stdout)['fresh'] is False
@@ -118,6 +147,14 @@ try:
     disabled={**policy_alert,'SWALLOW_ALERT_RESEND_CANCEL_EVIDENCE_ENABLED':'false'}
     sent=subprocess.run([os.path.join(env['TEST_WORKER_DIR'],'send-delivery-alert'),'cancel-env','60','120','60'],env=disabled,text=True,capture_output=True,timeout=15)
     assert sent.returncode==1 and 'requires scoped Resend health and cancellation evidence alerts' in sent.stderr,(sent.stdout,sent.stderr)
+    # A later retry identity also reopens the alert and prevents exclusion.
+    for audit_job in (job1,'44444444-4444-4444-8444-444444444444'):
+        audit="INSERT INTO public.novu_rust_delivery_reconciliations(id,environment_id,job_id,decision,operator_name,reason,retry_provider_message_id) VALUES(gen_random_uuid(),'cancel-env','%s','retry','fixture','fixture','fixture-one')"%audit_job
+        subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',audit],check=True,capture_output=True)
+        assert json.loads(result(job1).stdout)['cancellationEvidence']=='ambiguous'
+        assert policy_health().stdout.strip()=='2|2'
+        subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',"DELETE FROM public.novu_rust_delivery_reconciliations WHERE retry_provider_message_id='fixture-one'"],check=True,capture_output=True)
+        assert policy_health().stdout.strip()=='1|1'
     # Each stored event independently changes the live result and alert count;
     # a scheduled-only event is not a delivery conflict.
     for kind in ('email.scheduled','email.delivery_delayed','email.opened','email.clicked'):
