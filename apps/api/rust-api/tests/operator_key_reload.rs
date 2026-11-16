@@ -219,3 +219,90 @@ fn jwks_public_rsa_keys_rotate_and_invalid_sets_leave_previous_keys() {
     let valid_mixed=jwks(vec![json!({"kty":"EC","kid":"other"}),old]);
     assert!(AccessTokenVerifier::from_json(&valid_mixed.to_string()).unwrap().verify(&token("old")).is_some());
 }
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL, OpenSSL and Python"]
+async fn https_jwks_refreshes_and_applies_failure_policy() {
+    use std::{fs,net::TcpListener,path::Path,process::{Child,Command,Stdio},time::Duration};
+    use tokio_postgres::NoTls;
+    use uuid::Uuid;
+    struct Process(Child);
+    impl Drop for Process {fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
+    struct Directory(std::path::PathBuf);
+    impl Drop for Directory {fn drop(&mut self){let _=fs::remove_dir_all(&self.0);}}
+    fn replace(path:&Path,value:&str){let tmp=path.with_extension("tmp");fs::write(&tmp,value).unwrap();fs::rename(tmp,path).unwrap();}
+    fn port()->u16{TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()}
+    async fn wait_status(c:&reqwest::Client,url:&str,token:&str,want:u16){let end=tokio::time::Instant::now()+Duration::from_secs(15);loop{let status=c.get(url).bearer_auth(token).send().await.ok().map(|r|r.status().as_u16());if status==Some(want){return} assert!(tokio::time::Instant::now()<end,"expected {want}, got {status:?}");tokio::time::sleep(Duration::from_millis(100)).await;}}
+    let suffix=Uuid::new_v4().simple().to_string();let role=format!("jwks_http_{suffix}");let environment=format!("jwks-http-{suffix}");
+    let database_url=std::env::var("TEST_DATABASE_URL").unwrap();let (db,driver)=tokio_postgres::connect(&database_url,NoTls).await.unwrap();tokio::spawn(async move {driver.await.unwrap()});
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_self(text,text,text,text,bigint) TO {role}")).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_environments VALUES($1,'org')",&[&environment]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES('https://issuer.test','alice','console',$1)",&[&environment]).await.unwrap();
+    db.execute("INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname::text=$1",&[&role]).await.unwrap();
+    let api_url=database_url.replace("postgres://postgres@",&format!("postgres://{role}@"));assert_ne!(api_url,database_url);
+    let dir=Directory(std::env::temp_dir().join(format!("swallow-jwks-http-{suffix}")));fs::create_dir(&dir.0).unwrap();
+    let run=|args:&[&str]|{let status=Command::new("openssl").args(args).current_dir(&dir.0).stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap();assert!(status.success());};
+    run(&["req","-x509","-newkey","rsa:2048","-nodes","-keyout","ca.key","-out","ca.pem","-days","1","-subj","/CN=JWKS test CA","-addext","basicConstraints=critical,CA:TRUE"]);
+    run(&["req","-newkey","rsa:2048","-nodes","-keyout","server.key","-out","server.csr","-subj","/CN=localhost"]);
+    fs::write(dir.0.join("extensions"),"subjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\nextendedKeyUsage=serverAuth\n").unwrap();
+    run(&["x509","-req","-in","server.csr","-CA","ca.pem","-CAkey","ca.key","-CAcreateserial","-out","server.pem","-days","1","-extfile","extensions"]);
+    let jwks_path=dir.0.join("jwks.json");replace(&jwks_path,&jwks_config(&["old"])["jwks"].to_string());let jwks_port=port();
+    let server_code=r#"import http.server,ssl,sys
+class Handler(http.server.BaseHTTPRequestHandler):
+ def do_GET(self):
+  data=open(sys.argv[2],'rb').read()
+  if data==b'REDIRECT': self.send_response(302);self.send_header('Location','https://127.0.0.1:1/');self.end_headers();return
+  self.send_response(200);self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
+ def log_message(self,*a):pass
+s=http.server.HTTPServer(('127.0.0.1',int(sys.argv[1])),Handler);c=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);c.load_cert_chain(sys.argv[3],sys.argv[4]);s.socket=c.wrap_socket(s.socket,server_side=True);s.serve_forever()"#;
+    let server=Process(Command::new("python3").args(["-u","-c",server_code,&jwks_port.to_string(),jwks_path.to_str().unwrap(),dir.0.join("server.pem").to_str().unwrap(),dir.0.join("server.key").to_str().unwrap()]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    let client=reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(2)).build().unwrap();let mut processes=Vec::new();
+    for policy in ["retain","reject"] {
+        let p=port();let child=Command::new(env!("CARGO_BIN_EXE_novu-rust-api")).env_clear().env("DATABASE_URL",&api_url).env("NOVU_POSTGRES_ALLOW_INSECURE","true").env("LISTEN_ADDR",format!("127.0.0.1:{p}"))
+            .env("SWALLOW_OPERATOR_JWT_CONFIG",config(&["old"]).to_string()).env("SWALLOW_OPERATOR_JWT_JWKS_URL",format!("https://127.0.0.1:{jwks_port}/keys"))
+            .env("SWALLOW_OPERATOR_JWT_JWKS_CA_FILE",dir.0.join("ca.pem")).env("SWALLOW_OPERATOR_JWT_RELOAD_SECONDS","1").env("SWALLOW_OPERATOR_JWT_RELOAD_FAILURE",policy)
+            .env("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED","true").env("SWALLOW_API_OPERATOR_KEY_HEALTH_ENABLED","true").stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        processes.push((Process(child),format!("http://127.0.0.1:{p}/v1/experimental/operator/me?environmentId={environment}")));
+    }
+    let health=|url:&str|format!("{}/health/operator-keys",url.split("/v1/").next().unwrap());
+    let old=token("old");let new=token("new");
+    for (_,url) in &processes {wait_status(&client,url,&old,200).await;wait_status(&client,&health(url),"",200).await;}
+    replace(&jwks_path,&jwks_config(&["old","new"])["jwks"].to_string());
+    for (_,url) in &processes {wait_status(&client,url,&new,200).await;wait_status(&client,url,&old,200).await;}
+    replace(&jwks_path,&jwks_config(&["new"])["jwks"].to_string());
+    for (_,url) in &processes {wait_status(&client,url,&old,401).await;wait_status(&client,url,&new,200).await;}
+    replace(&jwks_path,"REDIRECT");
+    for (_,url) in &processes {wait_status(&client,&health(url),"",503).await;}
+    wait_status(&client,&processes[0].1,&new,200).await;wait_status(&client,&processes[1].1,&new,503).await;
+    replace(&jwks_path,&jwks_config(&["old","new"])["jwks"].to_string());
+    for (_,url) in &processes {wait_status(&client,&health(url),"",200).await;wait_status(&client,url,&old,200).await;}
+    replace(&jwks_path,&"x".repeat(16385));
+    for (_,url) in &processes {wait_status(&client,&health(url),"",503).await;}
+    wait_status(&client,&processes[0].1,&old,200).await;wait_status(&client,&processes[1].1,&old,503).await;
+    replace(&jwks_path,&jwks_config(&["old","new"])["jwks"].to_string());
+    for (_,url) in &processes {wait_status(&client,&health(url),"",200).await;}
+    // Without the fixture CA, TLS fails and reject mode stops accepting the bootstrap key.
+    let untrusted_port=port();let untrusted=Process(Command::new(env!("CARGO_BIN_EXE_novu-rust-api")).env_clear().env("DATABASE_URL",&api_url).env("NOVU_POSTGRES_ALLOW_INSECURE","true").env("LISTEN_ADDR",format!("127.0.0.1:{untrusted_port}"))
+        .env("SWALLOW_OPERATOR_JWT_CONFIG",config(&["old"]).to_string()).env("SWALLOW_OPERATOR_JWT_JWKS_URL",format!("https://127.0.0.1:{jwks_port}/keys"))
+        .env("SWALLOW_OPERATOR_JWT_RELOAD_SECONDS","1").env("SWALLOW_OPERATOR_JWT_RELOAD_FAILURE","reject").env("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED","true").env("SWALLOW_API_OPERATOR_KEY_HEALTH_ENABLED","true")
+        .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    let untrusted_url=format!("http://127.0.0.1:{untrusted_port}/v1/experimental/operator/me?environmentId={environment}");
+    wait_status(&client,&health(&untrusted_url),"",503).await;wait_status(&client,&untrusted_url,&old,503).await;drop(untrusted);
+    drop(processes);drop(server);
+    db.execute("DELETE FROM public.novu_rust_operator_jwt_identities WHERE environment_id=$1",&[&environment]).await.unwrap();
+    db.execute("DELETE FROM public.novu_rust_operator_jwt_api_logins WHERE database_principal=$1",&[&role]).await.unwrap();db.execute("DELETE FROM public.novu_rust_environments WHERE id=$1",&[&environment]).await.unwrap();
+    db.batch_execute(&format!("DROP OWNED BY {role}; DROP ROLE {role}")).await.unwrap();
+}
+
+#[test]
+fn remote_jwks_rejects_unsafe_or_incomplete_startup_configuration() {
+    use std::process::{Command,Stdio};
+    for (url,interval,ca) in [("http://127.0.0.1/keys",Some("1"),None),("https://user@example.test/keys",Some("1"),None),("https://example.test/keys",None,None),("https://example.test/keys",Some("1"),Some("/nonexistent-ca"))] {
+        let mut cmd=Command::new(env!("CARGO_BIN_EXE_novu-rust-api"));
+        cmd.env_clear().env("DATABASE_URL","postgres://postgres@127.0.0.1:1/postgres").env("NOVU_POSTGRES_ALLOW_INSECURE","true")
+            .env("SWALLOW_OPERATOR_JWT_CONFIG",config(&["old"]).to_string()).env("SWALLOW_OPERATOR_JWT_JWKS_URL",url);
+        if let Some(v)=interval {cmd.env("SWALLOW_OPERATOR_JWT_RELOAD_SECONDS",v);}
+        if let Some(v)=ca {cmd.env("SWALLOW_OPERATOR_JWT_JWKS_CA_FILE",v);}
+        assert!(!cmd.stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap().success());
+    }
+}

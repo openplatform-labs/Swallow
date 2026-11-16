@@ -12,6 +12,7 @@ mod inbox_data;
 mod preferences;
 pub mod operator_access_token;
 pub mod operator_introspection;
+mod operator_jwks;
 mod operator_identity;
 pub mod resend_webhook;
 mod sendgrid_webhook;
@@ -141,6 +142,9 @@ mod operator_key_health_tests {
 }
 
 #[derive(Clone)]
+enum OperatorReloadSource { File(std::path::PathBuf), Remote(operator_jwks::RemoteJwks) }
+
+#[derive(Clone)]
 pub struct RuntimeConfig {
     secret: Option<Vec<u8>>,
     keys: HashMap<String, Vec<String>>,
@@ -151,7 +155,7 @@ pub struct RuntimeConfig {
     reject_resend_alternatives: bool,
     reject_resend_attachment_disposition: bool,
     operator_verifier: Option<Arc<operator_access_token::AccessTokenVerifier>>,
-    operator_reload: Option<(std::path::PathBuf, std::time::Duration, bool)>,
+    operator_reload: Option<(OperatorReloadSource, std::time::Duration, bool)>,
     operator_reload_health: Option<Arc<std::sync::Mutex<(std::time::Instant, bool)>>>,
 }
 #[derive(Clone, Copy)]
@@ -319,16 +323,28 @@ impl RuntimeConfig {
             Err(std::env::VarError::NotPresent) => false,
             _ => return Err(invalid()),
         };
-        let operator_reload = if let Some(interval) = reload_interval {
+        let remote_url = match std::env::var("SWALLOW_OPERATOR_JWT_JWKS_URL") {
+            Ok(url)=>Some(url), Err(std::env::VarError::NotPresent)=>None, Err(_)=>return Err(invalid()),
+        };
+        let ca_path=std::env::var_os("SWALLOW_OPERATOR_JWT_JWKS_CA_FILE");
+        if (remote_url.is_some() && reload_interval.is_none()) || (ca_path.is_some() && remote_url.is_none()) { return Err(invalid()); }
+        let operator_config = if reload_interval.is_some() && remote_url.is_none() {
             if std::env::var_os("SWALLOW_OPERATOR_JWT_CONFIG").is_some() { return Err(invalid()); }
-            let path = std::env::var_os("SWALLOW_OPERATOR_JWT_CONFIG_FILE").ok_or_else(invalid)?;
-            Some((std::path::PathBuf::from(path), interval, reload_reject))
-        } else { None };
-        let operator_config = if let Some((path,_,_)) = &operator_reload {
-            Some(novu_rust_contracts::secret::read_regular_file(path).map_err(|_| invalid())?)
+            let path=std::env::var_os("SWALLOW_OPERATOR_JWT_CONFIG_FILE").ok_or_else(invalid)?;
+            Some(novu_rust_contracts::secret::read_regular_file(std::path::Path::new(&path)).map_err(|_| invalid())?)
         } else {
             novu_rust_contracts::secret::from_env("SWALLOW_OPERATOR_JWT_CONFIG", "SWALLOW_OPERATOR_JWT_CONFIG_FILE").map_err(|_| invalid())?
         };
+        let operator_reload = if let Some(interval)=reload_interval {
+            let source=if let Some(url)=remote_url {
+                let config=operator_config.as_ref().ok_or_else(invalid)?;
+                let ca=ca_path.map(|path|novu_rust_contracts::secret::read_regular_multiline_file(std::path::Path::new(&path),65536).map_err(|_|invalid())).transpose()?;
+                OperatorReloadSource::Remote(operator_jwks::RemoteJwks::new(&url,config,ca.as_deref()).map_err(|_|invalid())?)
+            } else {
+                OperatorReloadSource::File(std::path::PathBuf::from(std::env::var_os("SWALLOW_OPERATOR_JWT_CONFIG_FILE").ok_or_else(invalid)?))
+            };
+            Some((source,interval,reload_reject))
+        } else { None };
         let introspection = operator_introspection::Introspection::from_env().map_err(|_| invalid())?;
         if introspection.is_some() && operator_config.is_none() { return Err(invalid()); }
         let operator_verifier = operator_config.map(|value| {
@@ -352,8 +368,8 @@ impl RuntimeConfig {
     }
     /// Start a single process-local key refresh loop; callers own process lifetime.
     pub fn start_operator_key_reload(&self) {
-        let (Some(verifier), Some((path, interval, reject))) = (&self.operator_verifier, &self.operator_reload) else { return; };
-        let verifier=verifier.clone(); let path=path.clone(); let interval=*interval; let reject=*reject;
+        let (Some(verifier), Some((source, interval, reject))) = (&self.operator_verifier, &self.operator_reload) else { return; };
+        let verifier=verifier.clone(); let source=source.clone(); let interval=*interval; let reject=*reject;
         let health = self.operator_reload_health.clone().expect("reload health initialized");
         if reject {
             tokio::spawn(monitor_operator_key_reload(health.clone(), verifier.clone(), interval));
@@ -361,11 +377,16 @@ impl RuntimeConfig {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                let source=path.clone();
-                let read=tokio::task::spawn_blocking(move || novu_rust_contracts::secret::read_regular_file(&source)).await;
+                let read = match &source {
+                    OperatorReloadSource::File(path) => {
+                        let path=path.clone();
+                        tokio::task::spawn_blocking(move || novu_rust_contracts::secret::read_regular_file(&path)).await.ok().and_then(Result::ok)
+                    }
+                    OperatorReloadSource::Remote(remote) => remote.fetch().await.ok(),
+                };
                 let valid = match health.lock() {
                     Ok(mut state) => {
-                        let valid = match read { Ok(Ok(value)) => verifier.reload_keys(&value).is_ok(), _ => false };
+                        let valid = read.is_some_and(|value| verifier.reload_keys(&value).is_ok());
                         *state = (std::time::Instant::now(), valid);
                         if !valid && reject { verifier.reject_until_reloaded(); }
                         valid
