@@ -197,7 +197,7 @@ pub async fn process_one_with_workflow(
     let Some(job) = claimed else { return Ok(false) };
     let body = if job.kind == WORKFLOW_KIND && scoped {
         let message = serde_json::from_value::<WorkflowMessage>(job.payload.clone());
-        let tx = db.transaction().await?;
+        let tx = db.build_transaction().isolation_level(tokio_postgres::IsolationLevel::ReadCommitted).start().await?;
         let result: Result<Value, &str> = match message {
             Ok(ref m) if m.destination == destination => {
                 let snapshot: Option<Value> = tx
@@ -281,7 +281,7 @@ pub async fn process_one_with_workflow(
         }
     } else if job.kind == WORKFLOW_KIND {
         let message = serde_json::from_value::<WorkflowMessage>(job.payload.clone());
-        let tx = db.transaction().await?;
+        let tx = db.build_transaction().isolation_level(tokio_postgres::IsolationLevel::ReadCommitted).start().await?;
         let result = match message {
             Ok(m) if m.destination == destination => {
                 workflow_body(&tx, &job, &m, &m.workflow_context).await?

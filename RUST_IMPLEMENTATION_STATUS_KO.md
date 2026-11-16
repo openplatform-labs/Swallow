@@ -2891,3 +2891,5 @@ Inbox 워크플로 생성과 SendGrid·Resend·SMTP·Twilio·FCM의 발송 예�
 Slack 워크플로 팬아웃과 개별 발송 예약에도 `READ COMMITTED`를 명시했다. 연결 기본값을 `REPEATABLE READ`로 설정한 격리 PostgreSQL에서 두 단계의 기본 설정 변경 경합을, 별도 시험에서 기존 단계 정책과 잠금을 확인했다. 독립 Slack 경보 발송 경로는 이 변경 범위가 아니며 실제 Slack, Discord·Telegram의 비기본 격리 수준 및 운영 HA는 검증하지 않았다.
 
 Discord 발송 예약에도 `READ COMMITTED`를 명시했다. 격리 PostgreSQL에서 발송 연결 기본값을 `REPEATABLE READ`로 두고 API 트리거·워크플로·모의 Discord 경로의 기본 설정 변경 우선 취소와 발송 예약 우선 시 설정 작성 대기를 확인했다. 실제 Discord, Telegram의 비기본 격리 수준 및 운영 HA는 이번 시험 범위 밖이다.
+
+Telegram 워크플로 발송의 일반·제한 DB 권한 경로에도 `READ COMMITTED`를 명시했다. 격리 PostgreSQL에서 발송 연결 기본값을 `REPEATABLE READ`로 두고 API 트리거와 모의 Telegram을 이용해, 기본 설정 변경이 먼저 확정되면 두 경로 모두 발송을 취소하고 시도 기록과 외부 연결을 만들지 않는 것을 확인했다. 제한 워커는 직접 테이블 조회 권한이 없는 별도 로그인이다. 실제 Telegram, 반대 잠금 순서의 비기본 격리 수준 및 운영 HA는 이번 시험 범위 밖이다.

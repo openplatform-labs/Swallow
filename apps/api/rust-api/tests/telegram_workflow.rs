@@ -279,6 +279,28 @@ async fn trigger_renders_and_guards_subscriber_endpoint_and_preferences() {
     );
     assert_eq!(db.query_one("SELECT count(*) FROM public.novu_queue_jobs WHERE kind=$1 AND status='cancelled' AND last_error='chat preference disabled'",&[&novu_postgres_queue::telegram_queue::WORKFLOW_KIND]).await.unwrap().get::<_,i64>(0),1);
     db.batch_execute("DELETE FROM public.novu_rust_subscriber_preferences WHERE environment_id='a' AND subscriber_id='alice'").await.unwrap();
+    // A default preference insertion holds the workflow lock while the sender
+    // has REPEATABLE READ configured as its connection default.
+    produce(&mut db, app.clone(), "default-preference-race").await;
+    let (mut changer,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);
+    let pref_tx=changer.transaction().await.unwrap();
+    pref_tx.execute("INSERT INTO public.novu_rust_workflow_preferences(environment_id,workflow_identifier,chat_enabled) VALUES('a','telegram-workflow',false)",&[]).await.unwrap();
+    let writer_pid:i32=pref_tx.query_one("SELECT pg_backend_pid()",&[]).await.unwrap().get(0);
+    let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let test_endpoint=format!("http://{}/sendMessage",listener.local_addr().unwrap());
+    let worker_url=url.replace("postgres://postgres@","postgres://postgres@");
+    let (mut sender,driver)=tokio_postgres::connect(&worker_url,NoTls).await.unwrap();tokio::spawn(driver);
+    sender.batch_execute("SET default_transaction_isolation='repeatable read'").await.unwrap();
+    let sender_pid:i32=sender.query_one("SELECT pg_backend_pid()",&[]).await.unwrap().get(0);
+    let attempts:i64=db.query_one("SELECT count(*) FROM public.novu_rust_telegram_attempts",&[]).await.unwrap().get(0);
+    let task=tokio::spawn(async move {let provider=novu_postgres_queue::telegram::Telegram::test_endpoint(&test_endpoint).unwrap();novu_postgres_queue::telegram_queue::process_one_with_workflow(&mut sender,"a","dest",&provider,false,true).await});
+    let mut waiting=false;for _ in 0..150 {waiting=pref_tx.query_one("SELECT $1=ANY(pg_blocking_pids($2))",&[&writer_pid,&sender_pid]).await.unwrap().get(0);if waiting {break;}assert!(!task.is_finished());tokio::time::sleep(Duration::from_millis(100)).await;}assert!(waiting,"Telegram sender did not wait for preference writer");
+    pref_tx.commit().await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(10),task).await.unwrap().unwrap().unwrap());
+    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_queue_jobs WHERE kind=$1 AND status='cancelled' AND last_error='chat preference disabled'",&[&novu_postgres_queue::telegram_queue::WORKFLOW_KIND]).await.unwrap().get::<_,i64>(0),2);
+    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_telegram_attempts",&[]).await.unwrap().get::<_,i64>(0),attempts);
+    assert!(tokio::time::timeout(Duration::from_millis(200),listener.accept()).await.is_err());
+    db.batch_execute("DELETE FROM public.novu_rust_workflow_preferences WHERE environment_id='a' AND workflow_identifier='telegram-workflow'").await.unwrap();
     produce(&mut db, app.clone(), "workflow-change").await;
     db.batch_execute("UPDATE public.novu_rust_workflows SET chat_content='different' WHERE environment_id='a' AND identifier='telegram-workflow'").await.unwrap();
     assert!(
