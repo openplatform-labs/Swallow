@@ -47,6 +47,13 @@ async fn synchronous_standby_promotion_recovers_pending_and_leased_work() {
     let cluster_url = std::env::var("TEST_FAILOVER_URL").unwrap();
     let db = connect(&primary_url).await;
     db.batch_execute("INSERT INTO public.novu_rust_environments VALUES('ha-env','org'); INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,in_app_content,inbox_metadata) VALUES('ha-env','ha-workflow',true,true,'Hello {{subscriber.firstName}}','{\"id\":\"64a000000000000000000051\",\"name\":\"Fixture\",\"critical\":false,\"tags\":[]}'); INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES('ha-env','alice','64a000000000000000000054','{\"firstName\":\"Alice\"}')").await.unwrap();
+    db.batch_execute("INSERT INTO public.novu_rust_environments VALUES('ha-optout','org'); INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,in_app_content,inbox_metadata) VALUES('ha-optout','default-off',true,true,'hello','{\"id\":\"64a000000000000000000061\"}'),('ha-optout','subscriber-off',true,true,'hello','{\"id\":\"64a000000000000000000062\"}'); INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES('ha-optout','alice','64a000000000000000000063','{}'),('ha-optout','bob','64a000000000000000000064','{}'); INSERT INTO public.novu_rust_workflow_preferences(environment_id,workflow_identifier,in_app_enabled) VALUES('ha-optout','default-off',false); INSERT INTO public.novu_rust_subscriber_preferences(environment_id,subscriber_id,channels) VALUES('ha-optout','bob','{\"in_app\":false}')").await.unwrap();
+    let default_optout=Uuid::new_v4();let subscriber_optout=Uuid::new_v4();
+    for (id,workflow,subscriber,internal) in [(default_optout,"default-off","alice","64a000000000000000000063"),(subscriber_optout,"subscriber-off","bob","64a000000000000000000064")] {
+        let body=json!({"workflow":workflow,"transactionId":id.to_string(),"content":"","payload":{},"recipients":[{"subscriberId":subscriber}],"recipientIdentitySnapshot":{subscriber:internal},"severityOverride":null});
+        queue::enqueue(&db,id,"ha-optout",in_app::JOB_KIND,&body).await.unwrap();
+        db.execute("UPDATE public.novu_queue_jobs SET available_at='infinity' WHERE id=$1",&[&id]).await.unwrap();
+    }
     let pending = Uuid::new_v4();
     let leased = Uuid::new_v4();
     for (id, txn) in [(pending, "ha-pending"), (leased, "ha-lease")] {
@@ -75,6 +82,10 @@ async fn synchronous_standby_promotion_recovers_pending_and_leased_work() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(replicated, "standby did not replay committed jobs");
+    let mut optouts_replicated=false;for _ in 0..100 {
+        optouts_replicated=replica.query_one("SELECT EXISTS(SELECT 1 FROM public.novu_rust_workflow_preferences WHERE environment_id='ha-optout' AND workflow_identifier='default-off' AND in_app_enabled=false) AND EXISTS(SELECT 1 FROM public.novu_rust_subscriber_preferences WHERE environment_id='ha-optout' AND subscriber_id='bob' AND channels->>'in_app'='false') AND (SELECT count(*)=2 FROM public.novu_queue_jobs WHERE id=ANY($1::uuid[]))",&[&vec![default_optout,subscriber_optout]]).await.unwrap().get(0);
+        if optouts_replicated {break;}tokio::time::sleep(Duration::from_millis(100)).await;
+    }assert!(optouts_replicated,"standby did not replay opt-outs and jobs");
     // The standby is listed first in cluster_url and must be skipped while read-only.
     let mut first = worker(&cluster_url, "failover_worker_1");
     let mut second = worker(&cluster_url, "failover_worker_2");
@@ -195,4 +206,11 @@ async fn synchronous_standby_promotion_recovers_pending_and_leased_work() {
             && second.0.try_wait().unwrap().is_none(),
         "workers failed to recover after promotion"
     );
+    promoted.execute("UPDATE public.novu_queue_jobs SET available_at=clock_timestamp() WHERE id=ANY($1::uuid[])",&[&vec![default_optout,subscriber_optout]]).await.unwrap();
+    let mut stopped=false;for _ in 0..250 {
+        stopped=promoted.query_one("SELECT (SELECT count(*)=2 FROM public.novu_rust_in_app_step_outcomes WHERE job_id=ANY($1::uuid[]) AND status='canceled' AND detail='preference') AND (SELECT count(*)=2 FROM public.novu_queue_jobs WHERE id=ANY($1::uuid[]) AND status='completed')",&[&vec![default_optout,subscriber_optout]]).await.unwrap().get(0);
+        if stopped {break;}tokio::time::sleep(Duration::from_millis(100)).await;
+    }assert!(stopped,"promoted workers did not honor replicated opt-outs");
+    let row=promoted.query_one("SELECT (SELECT count(*) FROM public.novu_rust_in_app_messages WHERE environment_id='ha-optout'),(SELECT count(*) FROM public.novu_rust_ws_events WHERE environment_id='ha-optout' AND event='notification_received')",&[]).await.unwrap();
+    assert_eq!(row.get::<_,i64>(0),0);assert_eq!(row.get::<_,i64>(1),0);
 }
