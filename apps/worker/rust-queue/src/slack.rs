@@ -54,7 +54,7 @@ pub fn request_body(message: &Message) -> Result<Value, SendError> {
     if channel.is_empty()
         || channel.len() > 255
         || channel.contains(['\r', '\n', '\0'])
-        || text.len() > 40_000
+        || text.chars().nth(40_000).is_some()
         || text.contains('\0')
         || body.get("blocks").is_some_and(|v| !v.is_array())
     {

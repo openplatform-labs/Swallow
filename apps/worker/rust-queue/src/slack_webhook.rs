@@ -39,7 +39,7 @@ pub fn request_body(message: &Message) -> Result<Value, SendError> {
         .get("text")
         .and_then(Value::as_str)
         .ok_or(SendError::Invalid)?;
-    if text.len() > 40_000
+    if text.chars().nth(40_000).is_some()
         || text.contains('\0')
         || body.get("blocks").is_some_and(|v| !v.is_array())
         || serde_json::to_vec(&body)
@@ -137,6 +137,29 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+    #[test]
+    fn unicode_text_limit_and_serialized_body_limit_apply_to_both_transports() {
+        for (text, expected) in [
+            ("한".repeat(40_000), true),
+            ("a".repeat(40_001), false),
+            ("😀".repeat(40_000), false),
+        ] {
+            let webhook = Message {
+                destination: "ops".into(),
+                text: text.clone(),
+                blocks: None,
+                custom_data: None,
+            };
+            let app = crate::slack::Message {
+                channel: "ops".into(),
+                text,
+                blocks: None,
+                custom_data: None,
+            };
+            assert_eq!(request_body(&webhook).is_ok(), expected);
+            assert_eq!(crate::slack::request_body(&app).is_ok(), expected);
+        }
+    }
     #[tokio::test]
     async fn webhook_wire_response_and_url_validation() {
         for url in [
