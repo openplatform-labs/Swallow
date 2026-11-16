@@ -326,9 +326,16 @@ impl RuntimeConfig {
         let remote_url = match std::env::var("SWALLOW_OPERATOR_JWT_JWKS_URL") {
             Ok(url)=>Some(url), Err(std::env::VarError::NotPresent)=>None, Err(_)=>return Err(invalid()),
         };
+        let discover = match std::env::var("SWALLOW_OPERATOR_JWT_DISCOVER_JWKS").as_deref() {
+            Ok("true")=>true, Ok("false")|Err(std::env::VarError::NotPresent)=>false, _=>return Err(invalid()),
+        };
+        let allowed_origin=match std::env::var("SWALLOW_OPERATOR_JWT_JWKS_ALLOWED_ORIGIN") {
+            Ok(value)=>Some(value),Err(std::env::VarError::NotPresent)=>None,Err(_)=>return Err(invalid()),
+        };
+        if (discover && remote_url.is_some()) || (allowed_origin.is_some() && !discover) {return Err(invalid());}
         let ca_path=std::env::var_os("SWALLOW_OPERATOR_JWT_JWKS_CA_FILE");
-        if (remote_url.is_some() && reload_interval.is_none()) || (ca_path.is_some() && remote_url.is_none()) { return Err(invalid()); }
-        let operator_config = if reload_interval.is_some() && remote_url.is_none() {
+        if ((remote_url.is_some() || discover) && reload_interval.is_none()) || (ca_path.is_some() && remote_url.is_none() && !discover) { return Err(invalid()); }
+        let operator_config = if reload_interval.is_some() && remote_url.is_none() && !discover {
             if std::env::var_os("SWALLOW_OPERATOR_JWT_CONFIG").is_some() { return Err(invalid()); }
             let path=std::env::var_os("SWALLOW_OPERATOR_JWT_CONFIG_FILE").ok_or_else(invalid)?;
             Some(novu_rust_contracts::secret::read_regular_file(std::path::Path::new(&path)).map_err(|_| invalid())?)
@@ -336,10 +343,11 @@ impl RuntimeConfig {
             novu_rust_contracts::secret::from_env("SWALLOW_OPERATOR_JWT_CONFIG", "SWALLOW_OPERATOR_JWT_CONFIG_FILE").map_err(|_| invalid())?
         };
         let operator_reload = if let Some(interval)=reload_interval {
-            let source=if let Some(url)=remote_url {
+            let source=if remote_url.is_some() || discover {
                 let config=operator_config.as_ref().ok_or_else(invalid)?;
                 let ca=ca_path.map(|path|novu_rust_contracts::secret::read_regular_multiline_file(std::path::Path::new(&path),65536).map_err(|_|invalid())).transpose()?;
-                OperatorReloadSource::Remote(operator_jwks::RemoteJwks::new(&url,config,ca.as_deref()).map_err(|_|invalid())?)
+                let remote=if discover {operator_jwks::RemoteJwks::discover(config,ca.as_deref(),allowed_origin.as_deref())} else {operator_jwks::RemoteJwks::new(remote_url.as_deref().expect("URL present"),config,ca.as_deref())};
+                OperatorReloadSource::Remote(remote.map_err(|_|invalid())?)
             } else {
                 OperatorReloadSource::File(std::path::PathBuf::from(std::env::var_os("SWALLOW_OPERATOR_JWT_CONFIG_FILE").ok_or_else(invalid)?))
             };

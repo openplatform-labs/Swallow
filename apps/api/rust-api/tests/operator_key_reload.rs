@@ -21,12 +21,13 @@ fn jwks_config(kids:&[&str]) -> Value {
     }).collect();
     json!({"issuer":"https://issuer.test","audience":"swallow","jwks":{"keys":keys}})
 }
-fn token(kid: &str) -> String {
+fn token(kid: &str) -> String { token_for_issuer(kid,"https://issuer.test") }
+fn token_for_issuer(kid: &str, issuer:&str) -> String {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     let mut header = Header::new(Algorithm::RS256);
     header.typ = Some("at+jwt".into());
     header.kid = Some(kid.into());
-    encode(&header, &json!({"iss":"https://issuer.test","aud":"swallow","sub":"alice",
+    encode(&header, &json!({"iss":issuer,"aud":"swallow","sub":"alice",
         "client_id":"console","jti":"test","iat":now-1,"exp":now+300}),
         &EncodingKey::from_rsa_pem(if kid == "new" { OTHER_PRIVATE } else { PRIVATE }).unwrap()).unwrap()
 }
@@ -247,15 +248,18 @@ async fn https_jwks_refreshes_and_applies_failure_policy() {
     fs::write(dir.0.join("extensions"),"subjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\nextendedKeyUsage=serverAuth\n").unwrap();
     run(&["x509","-req","-in","server.csr","-CA","ca.pem","-CAkey","ca.key","-CAcreateserial","-out","server.pem","-days","1","-extfile","extensions"]);
     let jwks_path=dir.0.join("jwks.json");replace(&jwks_path,&jwks_config(&["old"])["jwks"].to_string());let jwks_port=port();
+    let issuer=format!("https://127.0.0.1:{jwks_port}/tenant");let discovery_path=dir.0.join("discovery.json");
+    let metadata=|iss:&str,uri:&str|json!({"issuer":iss,"jwks_uri":uri}).to_string();
+    let key_uri=format!("https://127.0.0.1:{jwks_port}/keys");replace(&discovery_path,&metadata(&issuer,&key_uri));
     let server_code=r#"import http.server,ssl,sys
 class Handler(http.server.BaseHTTPRequestHandler):
  def do_GET(self):
-  data=open(sys.argv[2],'rb').read()
+  data=open(sys.argv[5] if self.path=='/tenant/.well-known/openid-configuration' else sys.argv[2],'rb').read()
   if data==b'REDIRECT': self.send_response(302);self.send_header('Location','https://127.0.0.1:1/');self.end_headers();return
   self.send_response(200);self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
  def log_message(self,*a):pass
 s=http.server.HTTPServer(('127.0.0.1',int(sys.argv[1])),Handler);c=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);c.load_cert_chain(sys.argv[3],sys.argv[4]);s.socket=c.wrap_socket(s.socket,server_side=True);s.serve_forever()"#;
-    let server=Process(Command::new("python3").args(["-u","-c",server_code,&jwks_port.to_string(),jwks_path.to_str().unwrap(),dir.0.join("server.pem").to_str().unwrap(),dir.0.join("server.key").to_str().unwrap()]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    let server=Process(Command::new("python3").args(["-u","-c",server_code,&jwks_port.to_string(),jwks_path.to_str().unwrap(),dir.0.join("server.pem").to_str().unwrap(),dir.0.join("server.key").to_str().unwrap(),discovery_path.to_str().unwrap()]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
     let client=reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(2)).build().unwrap();let mut processes=Vec::new();
     for policy in ["retain","reject"] {
         let p=port();let child=Command::new(env!("CARGO_BIN_EXE_novu-rust-api")).env_clear().env("DATABASE_URL",&api_url).env("NOVU_POSTGRES_ALLOW_INSECURE","true").env("LISTEN_ADDR",format!("127.0.0.1:{p}"))
@@ -288,6 +292,32 @@ s=http.server.HTTPServer(('127.0.0.1',int(sys.argv[1])),Handler);c=ssl.SSLContex
         .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
     let untrusted_url=format!("http://127.0.0.1:{untrusted_port}/v1/experimental/operator/me?environmentId={environment}");
     wait_status(&client,&health(&untrusted_url),"",503).await;wait_status(&client,&untrusted_url,&old,503).await;drop(untrusted);
+    db.execute("INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES($1,'alice','console',$2)",&[&issuer,&environment]).await.unwrap();
+    let p=port();let mut bootstrap=config(&["old"]);bootstrap["issuer"]=json!(issuer);
+    let discover=Process(Command::new(env!("CARGO_BIN_EXE_novu-rust-api")).env_clear().env("DATABASE_URL",&api_url).env("NOVU_POSTGRES_ALLOW_INSECURE","true").env("LISTEN_ADDR",format!("127.0.0.1:{p}"))
+        .env("SWALLOW_OPERATOR_JWT_CONFIG",bootstrap.to_string()).env("SWALLOW_OPERATOR_JWT_DISCOVER_JWKS","true").env("SWALLOW_OPERATOR_JWT_JWKS_CA_FILE",dir.0.join("ca.pem"))
+        .env("SWALLOW_OPERATOR_JWT_RELOAD_SECONDS","1").env("SWALLOW_OPERATOR_JWT_RELOAD_FAILURE","reject").env("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED","true").env("SWALLOW_API_OPERATOR_KEY_HEALTH_ENABLED","true")
+        .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    let discovery_url=format!("http://127.0.0.1:{p}/v1/experimental/operator/me?environmentId={environment}");let discovered_new=token_for_issuer("new",&issuer);
+    wait_status(&client,&discovery_url,&discovered_new,200).await;
+    replace(&discovery_path,&metadata("https://wrong-issuer.test",&key_uri));
+    wait_status(&client,&health(&discovery_url),"",503).await;wait_status(&client,&discovery_url,&discovered_new,503).await;
+    replace(&discovery_path,&metadata(&issuer,&format!("https://localhost:{jwks_port}/keys")));
+    tokio::time::sleep(Duration::from_millis(1200)).await;wait_status(&client,&health(&discovery_url),"",503).await;
+    replace(&discovery_path,&metadata(&issuer,&key_uri));
+    wait_status(&client,&health(&discovery_url),"",200).await;
+    // A different TLS origin is rejected by default and accepted only when pinned.
+    let second_port=port();let server2=Process(Command::new("python3").args(["-u","-c",server_code,&second_port.to_string(),jwks_path.to_str().unwrap(),dir.0.join("server.pem").to_str().unwrap(),dir.0.join("server.key").to_str().unwrap(),discovery_path.to_str().unwrap()]).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    let other_origin=format!("https://127.0.0.1:{second_port}");replace(&discovery_path,&metadata(&issuer,&format!("{other_origin}/keys")));
+    tokio::time::sleep(Duration::from_millis(1200)).await;wait_status(&client,&health(&discovery_url),"",503).await;
+    let other_port=port();let selected=Process(Command::new(env!("CARGO_BIN_EXE_novu-rust-api")).env_clear().env("DATABASE_URL",&api_url).env("NOVU_POSTGRES_ALLOW_INSECURE","true").env("LISTEN_ADDR",format!("127.0.0.1:{other_port}"))
+        .env("SWALLOW_OPERATOR_JWT_CONFIG",bootstrap.to_string()).env("SWALLOW_OPERATOR_JWT_DISCOVER_JWKS","true").env("SWALLOW_OPERATOR_JWT_JWKS_ALLOWED_ORIGIN",&other_origin).env("SWALLOW_OPERATOR_JWT_JWKS_CA_FILE",dir.0.join("ca.pem"))
+        .env("SWALLOW_OPERATOR_JWT_RELOAD_SECONDS","1").env("SWALLOW_OPERATOR_JWT_RELOAD_FAILURE","reject").env("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED","true").env("SWALLOW_API_OPERATOR_KEY_HEALTH_ENABLED","true")
+        .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    let selected_url=format!("http://127.0.0.1:{other_port}/v1/experimental/operator/me?environmentId={environment}");wait_status(&client,&selected_url,&discovered_new,200).await;
+    drop(selected);drop(server2);
+    replace(&discovery_path,&metadata(&issuer,&key_uri));
+    wait_status(&client,&health(&discovery_url),"",200).await;wait_status(&client,&discovery_url,&discovered_new,200).await;drop(discover);
     drop(processes);drop(server);
     db.execute("DELETE FROM public.novu_rust_operator_jwt_identities WHERE environment_id=$1",&[&environment]).await.unwrap();
     db.execute("DELETE FROM public.novu_rust_operator_jwt_api_logins WHERE database_principal=$1",&[&role]).await.unwrap();db.execute("DELETE FROM public.novu_rust_environments WHERE id=$1",&[&environment]).await.unwrap();
@@ -303,6 +333,22 @@ fn remote_jwks_rejects_unsafe_or_incomplete_startup_configuration() {
             .env("SWALLOW_OPERATOR_JWT_CONFIG",config(&["old"]).to_string()).env("SWALLOW_OPERATOR_JWT_JWKS_URL",url);
         if let Some(v)=interval {cmd.env("SWALLOW_OPERATOR_JWT_RELOAD_SECONDS",v);}
         if let Some(v)=ca {cmd.env("SWALLOW_OPERATOR_JWT_JWKS_CA_FILE",v);}
+        assert!(!cmd.stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap().success());
+    }
+}
+
+#[test]
+fn discovery_rejects_conflicting_and_unsafe_settings() {
+    use std::process::{Command,Stdio};
+    for mode in 0..4 {
+        let mut cfg=config(&["old"]);
+        if mode==0 {cfg["issuer"]=json!("http://issuer.test");}
+        let mut cmd=Command::new(env!("CARGO_BIN_EXE_novu-rust-api"));
+        cmd.env_clear().env("DATABASE_URL","postgres://postgres@127.0.0.1:1/postgres").env("NOVU_POSTGRES_ALLOW_INSECURE","true").env("SWALLOW_OPERATOR_JWT_CONFIG",cfg.to_string()).env("SWALLOW_OPERATOR_JWT_RELOAD_SECONDS","1");
+        if mode!=3 {cmd.env("SWALLOW_OPERATOR_JWT_DISCOVER_JWKS","true");}
+        if mode==1 {cmd.env("SWALLOW_OPERATOR_JWT_JWKS_URL","https://issuer.test/keys");}
+        if mode==2 {cmd.env("SWALLOW_OPERATOR_JWT_JWKS_ALLOWED_ORIGIN","https://keys.test/path");}
+        if mode==3 {cmd.env("SWALLOW_OPERATOR_JWT_JWKS_ALLOWED_ORIGIN","https://keys.test");}
         assert!(!cmd.stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap().success());
     }
 }
