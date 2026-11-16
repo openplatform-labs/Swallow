@@ -466,7 +466,13 @@ async fn process_one_inner(
     let tx = client.transaction().await?;
     // Match subscriber mutation lock ordering before locking the job.
     let subscriber = if let Some(context) = push.workflow_context.as_ref() {
-        tx.query_opt("SELECT s.profile,w.read_only,w.all_enabled,w.push_enabled,(p.channels->>'push')::boolean,(sp.channels->>'push')::boolean,EXISTS(SELECT 1 FROM novu_rust_workflows wf WHERE wf.environment_id=s.environment_id AND wf.identifier=$3 AND ($4::text IS NULL OR wf.inbox_metadata->>'id'=$4)),d.device_tokens,d.integration_internal_id IS NULL OR EXISTS(SELECT 1 FROM novu_rust_fcm_integrations i WHERE i.environment_id=s.environment_id AND i.internal_id=d.integration_internal_id AND i.active),d.integration_internal_id,EXISTS(SELECT 1 FROM novu_rust_fcm_devices x WHERE x.environment_id=s.environment_id AND x.subscriber_id=s.subscriber_id OFFSET 1),s.internal_id FROM novu_rust_subscribers s LEFT JOIN novu_rust_workflow_preferences w ON w.environment_id=s.environment_id AND w.workflow_identifier=$3 LEFT JOIN novu_rust_subscriber_preferences p ON p.environment_id=s.environment_id AND p.subscriber_id=s.subscriber_id LEFT JOIN novu_rust_subscriber_workflow_preferences sp ON sp.environment_id=s.environment_id AND sp.subscriber_id=s.subscriber_id AND sp.workflow_identifier=$3 LEFT JOIN LATERAL (SELECT * FROM novu_rust_fcm_devices d WHERE d.environment_id=s.environment_id AND d.subscriber_id=s.subscriber_id ORDER BY d.channel_order LIMIT 1) d ON true WHERE s.environment_id=$1 AND s.subscriber_id=$2 FOR UPDATE OF s",&[&environment,&context.subscriber_id,&context.workflow_identifier,&context.workflow_internal_id]).await?
+        // Subscriber preference writers lock the subscriber; migration 0292
+        // serializes default preference writes through the workflow row.
+        // Read preferences after both locks with a fresh READ COMMITTED snapshot.
+        if tx.query_opt("SELECT 1 FROM public.novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2 FOR UPDATE",&[&environment,&context.subscriber_id]).await?.is_some() {
+            tx.query_opt("SELECT 1 FROM public.novu_rust_workflows WHERE environment_id=$1 AND identifier=$2 FOR SHARE",&[&environment,&context.workflow_identifier]).await?;
+            tx.query_opt("SELECT s.profile,w.read_only,w.all_enabled,w.push_enabled,(p.channels->>'push')::boolean,(sp.channels->>'push')::boolean,EXISTS(SELECT 1 FROM novu_rust_workflows wf WHERE wf.environment_id=s.environment_id AND wf.identifier=$3 AND ($4::text IS NULL OR wf.inbox_metadata->>'id'=$4)),d.device_tokens,d.integration_internal_id IS NULL OR EXISTS(SELECT 1 FROM novu_rust_fcm_integrations i WHERE i.environment_id=s.environment_id AND i.internal_id=d.integration_internal_id AND i.active),d.integration_internal_id,EXISTS(SELECT 1 FROM novu_rust_fcm_devices x WHERE x.environment_id=s.environment_id AND x.subscriber_id=s.subscriber_id OFFSET 1),s.internal_id FROM novu_rust_subscribers s LEFT JOIN novu_rust_workflow_preferences w ON w.environment_id=s.environment_id AND w.workflow_identifier=$3 LEFT JOIN novu_rust_subscriber_preferences p ON p.environment_id=s.environment_id AND p.subscriber_id=s.subscriber_id LEFT JOIN novu_rust_subscriber_workflow_preferences sp ON sp.environment_id=s.environment_id AND sp.subscriber_id=s.subscriber_id AND sp.workflow_identifier=$3 LEFT JOIN LATERAL (SELECT * FROM novu_rust_fcm_devices d WHERE d.environment_id=s.environment_id AND d.subscriber_id=s.subscriber_id ORDER BY d.channel_order LIMIT 1) d ON true WHERE s.environment_id=$1 AND s.subscriber_id=$2",&[&environment,&context.subscriber_id,&context.workflow_identifier,&context.workflow_internal_id]).await?
+        } else { None }
     } else {
         None
     };
@@ -491,6 +497,13 @@ async fn process_one_inner(
     } else {
         true
     };
+    if prepared_identity_valid && push.workflow_context.is_none()
+        && preference_policy == crate::push_step_policy::PreferencePolicy::Recheck
+    {
+        if let Some(workflow) = prepared_context.as_ref().and_then(|c| c.get("workflow_identifier")).and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
+            tx.query_opt("SELECT 1 FROM public.novu_rust_workflows WHERE environment_id=$1 AND identifier=$2 FOR SHARE", &[&environment,&workflow]).await?;
+        }
+    }
     if !lock_live(&tx, &job).await? {
         tx.rollback().await?;
         return Ok(true);
@@ -1243,6 +1256,54 @@ mod tests {
         net::TcpListener,
     };
     use tokio_postgres::NoTls;
+
+    #[tokio::test]
+    #[ignore = "requires fully migrated disposable PostgreSQL and loopback"]
+    async fn workflow_preference_commit_before_reservation_is_observed() {
+        let url=std::env::var("TEST_DATABASE_URL").unwrap();
+        let (mut db,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);
+        let env=format!("push-preference-race-{}",Uuid::new_v4());
+        db.execute("INSERT INTO public.novu_rust_environments VALUES($1,'org')",&[&env]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,push_title,push_content,inbox_metadata) VALUES($1,'fixture',true,true,'title','hello','{\"id\":\"64a000000000000000000051\"}')",&[&env]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES($1,'alice','64a000000000000000000054','{}')",&[&env]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_fcm_devices(environment_id,subscriber_id,device_tokens) VALUES($1,'alice',ARRAY['token'])",&[&env]).await.unwrap();
+        for phase in ["initial","prepared"] {
+          for mode in ["global","workflow","default"] {
+            let transaction=format!("push-preference-{phase}-{mode}");
+            let job=if phase=="initial" {
+                crate::enqueue(&db,Uuid::new_v4(),&env,crate::in_app::JOB_KIND,&json!({"workflow":"fixture","transactionId":transaction,"content":"","payload":{},"recipients":[{"subscriberId":"alice"}],"recipientIdentitySnapshot":{"alice":"64a000000000000000000054"},"severityOverride":null})).await.unwrap();
+                assert!(crate::in_app::process_one(&mut db).await.unwrap());
+                db.query_one("SELECT push_job_id FROM public.novu_rust_push_step_outcomes WHERE environment_id=$1 AND transaction_id=$2",&[&env,&transaction]).await.unwrap().get::<_,Uuid>(0)
+            } else {
+                let id=Uuid::new_v4();
+                let payload=json!({"prepared_messages":[{"message":{"token":"token","notification":{"title":"hi","body":"body"},"data":{}}}],"prepared_context":{"subscriber_id":"alice","subscriber_internal_id":"64a000000000000000000054","notification_internal_id":"notification","workflow_identifier":"fixture","transaction_id":transaction,"title":"hi","content":"body","target_metadata":[{"message_id":Uuid::new_v4().simple().to_string(),"device_tokens":["token"]}]}});
+                crate::enqueue(&db,id,&env,JOB_KIND,&payload).await.unwrap();id
+            };
+            let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin=format!("http://{}",listener.local_addr().unwrap());
+            let pref_tx=db.transaction().await.unwrap();
+            if mode!="default" {pref_tx.query_one("SELECT 1 FROM public.novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id='alice' FOR UPDATE",&[&env]).await.unwrap();}
+            if mode=="global" {pref_tx.execute("INSERT INTO public.novu_rust_subscriber_preferences(environment_id,subscriber_id,channels) VALUES($1,'alice','{\"push\":false}')",&[&env]).await.unwrap();}
+            else if mode=="workflow" {pref_tx.execute("INSERT INTO public.novu_rust_subscriber_workflow_preferences(environment_id,subscriber_id,workflow_identifier,channels) VALUES($1,'alice','fixture','{\"push\":false}')",&[&env]).await.unwrap();}
+            else {pref_tx.execute("INSERT INTO public.novu_rust_workflow_preferences(environment_id,workflow_identifier,push_enabled) VALUES($1,'fixture',false)",&[&env]).await.unwrap();}
+            let (mut worker,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);
+            worker.batch_execute("SET application_name='push_preference_fence'").await.unwrap();
+            let target_env=env.clone();
+            let task=tokio::spawn(async move {let provider=Fcm::with_origin("demo","fixture".into(),&origin).unwrap();process_one_with_policies(&mut worker,&target_env,Some(&provider),None,false,crate::push_step_policy::Policy::Snapshot,if phase=="prepared" {crate::push_step_policy::PreferencePolicy::Recheck} else {crate::push_step_policy::PreferencePolicy::Snapshot}).await});
+            let mut waiting=false;
+            for _ in 0..150 {waiting=pref_tx.query_one("SELECT count(*)=1 FROM pg_stat_activity WHERE application_name='push_preference_fence' AND wait_event_type='Lock'",&[]).await.unwrap().get(0);if waiting {break;}assert!(!task.is_finished());tokio::time::sleep(Duration::from_millis(100)).await;}
+            assert!(waiting,"push {phase} worker did not wait for {mode} preference update");
+            pref_tx.commit().await.unwrap();
+            assert!(tokio::time::timeout(Duration::from_secs(10),task).await.unwrap().unwrap().unwrap());
+            assert_eq!(db.query_one("SELECT status FROM public.novu_queue_jobs WHERE id=$1",&[&job]).await.unwrap().get::<_,String>(0),"cancelled","{phase} {mode}");
+            assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_fcm_attempts WHERE job_id=$1",&[&job]).await.unwrap().get::<_,i64>(0),0);
+            assert!(tokio::time::timeout(Duration::from_millis(200),listener.accept()).await.is_err());
+            db.execute("DELETE FROM public.novu_rust_subscriber_preferences WHERE environment_id=$1 AND subscriber_id='alice'",&[&env]).await.unwrap();
+            db.execute("DELETE FROM public.novu_rust_subscriber_workflow_preferences WHERE environment_id=$1 AND subscriber_id='alice'",&[&env]).await.unwrap();
+            db.execute("DELETE FROM public.novu_rust_workflow_preferences WHERE environment_id=$1 AND workflow_identifier='fixture'",&[&env]).await.unwrap();
+          }
+        }
+    }
 
     #[tokio::test]
     #[ignore = "requires migrated disposable PostgreSQL, token cleanup enabled, and loopback"]
