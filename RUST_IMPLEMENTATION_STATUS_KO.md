@@ -2902,4 +2902,4 @@ Resend 즉시 재시도 재검사도 연결 기본값 `REPEATABLE READ`와 격�
 
 ### 실제 구독자 설정 API와 Discord 발송 경합
 
-격리 PostgreSQL에서 Rust 구독자 설정 PATCH API의 전역 채팅 수신 거부 트랜잭션을 시험용 DB 트리거로 일시 중지한 뒤 Discord 워커를 실행했다. 워커가 API 트랜잭션의 구독자 잠금을 기다리는 것을 확인하고 API를 완료하자 발송이 취소됐으며 모의 공급자 연결은 발생하지 않았다. 요청은 실제 HTTP 서버를 통하지 않은 인프로세스 라우터에서 실행했다. 워크플로별 설정 API, 다른 채널·잠금 순서, 실제 Discord와 운영 HA는 이 시험에서 검증하지 않았다. [워커 문서](apps/worker/rust-queue/README.md)를 참고한다.
+격리 PostgreSQL에서 Rust 구독자 설정 PATCH API의 전역 및 워크플로별 채팅 수신 거부 트랜잭션을 각각 시험용 DB 트리거로 일시 중지한 뒤 Discord 워커를 실행했다. 두 경우 모두 워커가 API 트랜잭션의 구독자 잠금을 기다리는 것을 확인하고 API를 완료하자 발송이 취소됐으며 모의 공급자 연결은 발생하지 않았다. 요청은 실제 HTTP 서버를 통하지 않은 인프로세스 라우터에서 실행했다. 다른 채널·잠금 순서, 실제 Discord와 운영 HA는 이 시험에서 검증하지 않았다. [워커 문서](apps/worker/rust-queue/README.md)를 참고한다.
