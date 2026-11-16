@@ -156,6 +156,13 @@ assert resolve(second_body)[0]==500
 assert get('environmentId=cancel-api-env&requestId='+ids[2],endpoint='resend-cancel-detail')[1]['request']['state']=='unknown'
 sql('DROP TRIGGER fail_cancel_attribution ON public.novu_rust_operator_jwt_resend_cancel_resolution_audit')
 assert resolve(second_body)[0]==200
+# Historical 409 can be reviewed through independently authorized JWT resolution.
+legacy_id='88888888-8888-4888-8888-888888888887';legacy_job='88888888-8888-4888-8888-888888888886'
+sql("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES('%s','cancel-api-env','experimental_resend_email','{}','completed'); INSERT INTO public.novu_rust_resend_cancel_requests(environment_id,request_id,job_id,provider_id,database_principal,principal_oid,reason,state,http_status) SELECT 'cancel-api-env','%s','%s','legacy-id',rolname,oid,'fixture','rejected',409 FROM pg_roles WHERE rolname='cancel_api_fixture'"%(legacy_job,legacy_id,legacy_job))
+legacy_body={'resolutionId':'abababab-abab-4bab-8bab-abababababab','requestId':legacy_id,'decision':'not_cancelled','reason':'reviewed provider evidence'}
+assert resolve(legacy_body)[0]==200
+status,legacy_detail=get('environmentId=cancel-api-env&requestId='+legacy_id,endpoint='resend-cancel-detail')
+assert status==200 and legacy_detail['request']['state']=='not_cancelled' and legacy_detail['request']['httpStatus']==409 and legacy_detail['resolution']['operator']['subject']=='fixture'
 sql("DELETE FROM public.novu_rust_operator_jwt_resend_cancel_resolution_grants WHERE environment_id='cancel-api-env' AND decision='confirmed'")
 assert resolve(body)[0] in (401,403)
 sql("INSERT INTO public.novu_rust_operator_jwt_resend_cancel_resolution_grants VALUES ('https://issuer.test','fixture','console','cancel-api-env','confirmed'); UPDATE public.novu_rust_resend_cancel_operators SET can_resolve=false WHERE environment_id='cancel-api-env' AND database_principal='cancel_api_fixture'")

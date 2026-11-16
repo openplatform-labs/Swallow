@@ -194,7 +194,9 @@ try:
     assert policy_health().stdout.strip()=='2|2'
     check=evidence_cli('check-resend-cancel-evidence');assert json.loads(check.stdout)=={'conflicting':0,'ambiguous':1},check.stdout
     # Historical 408/409 rows remain unchanged but can be found by scoped readers.
-    legacy="INSERT INTO public.novu_rust_resend_cancel_requests(environment_id,request_id,job_id,provider_id,database_principal,principal_oid,reason,state,http_status) SELECT 'cancel-env','aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa0','66666666-6666-4666-8666-666666666666','fixture-six',rolname,oid,'private reason','rejected',408 FROM pg_roles WHERE rolname='cancel_fixture'"
+    legacy_job='12121212-1212-4212-8212-121212121212'
+    subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',"INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status,resend_scheduled_at) VALUES('%s','cancel-env','experimental_resend_email','{}','completed',clock_timestamp()+interval '1 hour'); INSERT INTO public.novu_rust_resend_attempts(job_id,environment_id,state,provider_message_id) VALUES('%s','cancel-env','accepted','legacy-fixture')"%(legacy_job,legacy_job)],check=True,capture_output=True)
+    legacy="INSERT INTO public.novu_rust_resend_cancel_requests(environment_id,request_id,job_id,provider_id,database_principal,principal_oid,reason,state,http_status) SELECT 'cancel-env','aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa0','%s','legacy-fixture',rolname,oid,'private reason','rejected',408 FROM pg_roles WHERE rolname='cancel_fixture'"%legacy_job
     subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',legacy],check=True,capture_output=True)
     legacy409=legacy.replace('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa0','aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1').replace("'rejected',408","'rejected',409")
     subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',legacy409],check=True,capture_output=True)
@@ -203,6 +205,43 @@ try:
     assert json.loads(run('list-legacy-ambiguous','cancel-env',page['data'][-1]['requestId'],override=resolver).stdout)['data']==[]
     assert run('list-legacy-ambiguous','cancel-other',override=resolver).returncode!=0
     assert run('list-legacy-ambiguous','cancel-env',override=denied).returncode!=0
+    req408=page['data'][0]['requestId'];req409=page['data'][1]['requestId'];review408='abababab-abab-4bab-8bab-abababababab';review409='cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd'
+    fresh='dddddddd-aaaa-4ddd-8ddd-dddddddddddd'
+    reserve="SELECT public.novu_rust_resend_cancel_reserve('cancel-env','%s','%s','fixture')"%(fresh,legacy_job)
+    assert subprocess.run([psql,env['DATABASE_URL'],'-qAt','-v','ON_ERROR_STOP=1','-c',reserve],capture_output=True).returncode!=0
+    assert run('resolve','cancel-env',review408,req408,'not_cancelled','checked',override=env).returncode!=0
+    subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c','CREATE TRIGGER fail_cancel_resolution BEFORE INSERT ON public.novu_rust_resend_cancel_resolutions FOR EACH ROW EXECUTE FUNCTION public.fail_cancel_resolution()'],check=True,capture_output=True)
+    assert run('resolve','cancel-env',review408,req408,'not_cancelled','checked',override=resolver).returncode!=0
+    assert json.loads(run('get','cancel-env',req408).stdout)['request']['state']=='rejected'
+    subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c','DROP TRIGGER fail_cancel_resolution ON public.novu_rust_resend_cancel_resolutions'],check=True,capture_output=True)
+    assert run('resolve','cancel-env',review408,req408,'not_cancelled','checked',override=resolver).returncode==0
+    assert json.loads(run('get','cancel-env',req408).stdout)['request']['httpStatus']==408
+    assert json.loads(run('resolve','cancel-env',review408,req408,'not_cancelled','checked',override=resolver).stdout)['replayed'] is True
+    assert subprocess.run([psql,env['DATABASE_URL'],'-qAt','-v','ON_ERROR_STOP=1','-c',reserve],capture_output=True).returncode!=0
+    review_sql="SELECT public.novu_rust_resend_cancel_resolve('cancel-env','%s','%s','not_cancelled','checked')"%(review409,req409)
+    race=subprocess.Popen([psql,resolver['DATABASE_URL'],'-qAt','-v','ON_ERROR_STOP=1','-c','BEGIN; '+review_sql+'; SELECT pg_sleep(2); COMMIT'],env={**os.environ,'PGAPPNAME':'cancel-legacy-review'},stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+    try:
+        deadline=time.monotonic()+5
+        while time.monotonic()<deadline:
+            state=subprocess.run([psql,admin,'-qAt','-c',"SELECT count(*) FROM pg_stat_activity WHERE application_name='cancel-legacy-review' AND wait_event='PgSleep'"],text=True,capture_output=True)
+            if state.stdout.strip()=='1':break
+            assert race.poll() is None
+            time.sleep(.05)
+        else:raise AssertionError('legacy review did not hold job lock')
+        reserved=subprocess.run([psql,env['DATABASE_URL'],'-qAt','-v','ON_ERROR_STOP=1','-c',reserve],capture_output=True,text=True,timeout=10)
+        assert reserved.returncode==0 and json.loads(reserved.stdout)['fresh'] is True,(reserved.stdout,reserved.stderr)
+        out,err=race.communicate(timeout=5);assert race.returncode==0,(out,err)
+    finally:
+        if race.poll() is None:race.kill();race.wait()
+    # If a later unknown request already exists, marking an older one confirmed must roll back.
+    third=req408[:-1]+'2';third_resolution='efefefef-efef-4fef-8fef-efefefefefef'
+    third_sql=legacy.replace(req408,third)
+    subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',third_sql],check=True,capture_output=True)
+    assert run('resolve','cancel-env',third_resolution,third,'confirmed','checked',override=resolver).returncode!=0
+    assert json.loads(run('get','cancel-env',third).stdout)['request']['state']=='rejected'
+    assert run('resolve','cancel-env',third_resolution,third,'not_cancelled','checked',override=resolver).returncode==0
+    assert json.loads(run('get','cancel-env',req409).stdout)['request']['httpStatus']==409
+    assert json.loads(run('list-legacy-ambiguous','cancel-env',override=resolver).stdout)['data']==[]
     # Page unknown requests without exposing provider IDs or investigation reasons.
     insert="""WITH jobs AS (INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) SELECT gen_random_uuid(),'cancel-env','experimental_resend_email','{}','completed' FROM generate_series(1,55) RETURNING id)
     INSERT INTO public.novu_rust_resend_cancel_requests(environment_id,request_id,job_id,provider_id,database_principal,principal_oid,reason,state,created_at)
@@ -211,8 +250,8 @@ try:
     first=run('list','cancel-env','60',override=resolver);assert first.returncode==0,(first.stdout,first.stderr)
     page=json.loads(first.stdout);assert len(page['data'])==50 and page['next'];assert 'private' not in first.stdout
     second=run('list','cancel-env','60',page['next'],override=resolver);more=json.loads(second.stdout)
-    assert second.returncode==0 and len(more['data'])==6 and more['next'] is None
-    ids=[x['requestId'] for x in page['data']+more['data']];assert len(set(ids))==56 and ids==sorted(ids)
+    assert second.returncode==0 and len(more['data'])==7 and more['next'] is None
+    ids=[x['requestId'] for x in page['data']+more['data']];assert len(set(ids))==57 and ids==sorted(ids)
     assert all(set(x)=={'requestId','jobId','createdAt','overdue'} for x in page['data']+more['data'])
     assert run('list','cancel-env','0',override=resolver).returncode!=0
     assert run('list','cancel-other','60',override=resolver).returncode!=0

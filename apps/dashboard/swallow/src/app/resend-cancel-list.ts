@@ -46,7 +46,8 @@ export class ResendCancelList implements OnChanges,OnDestroy {
     }catch{if(seq===this.commandSeq){this.command.set(null);this.commandLookupStatus.set('error');}}finally{if(seq===this.commandSeq)this.commandAbort=null;}
   }
   prepareResolution():void {
-    if(this.resolutionStatus()!=='idle'||this.detail()?.state!=='unknown')return;
+    const item=this.detail();
+    if(this.resolutionStatus()!=='idle'||!item||!(item.state==='unknown'||(item.state==='rejected'&&(item.httpStatus===408||item.httpStatus===409))))return;
     try {const origin=this.origin(),environment=this.environment.trim(),token=this.token.trim(),requestId=this.detail()!.requestId,reason=this.reason.trim();
       if(!this.uuid(requestId)||!environment||new TextEncoder().encode(environment).length>512||/[\0\r\n]/.test(environment)||token.length>16384||!/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(token)||!['confirmed','not_cancelled'].includes(this.decision)||!reason||new TextEncoder().encode(reason).length>500||/[\x00-\x1f\x7f]/.test(reason))throw Error('input');
       this.resolutionDraft.set({origin,environment,token,resolutionId:crypto.randomUUID(),requestId,decision:this.decision,reason});this.confirm=false;this.resolutionStatus.set('prepared');

@@ -30,6 +30,13 @@ describe('Resend cancellation list',()=>{
     c.environment='other';await c.submitResolution();expect(fetcher).toHaveBeenCalledTimes(2);c.environment='env';await c.submitResolution();expect(c.resolutionStatus()).toBe('recorded');
     const first=JSON.parse(fetcher.mock.calls[1][1]!.body as string),second=JSON.parse(fetcher.mock.calls[2][1]!.body as string);expect(first).toEqual(second);expect(first.resolutionId).toBe(resolutionId);fixture.destroy();
   });
+  it('offers resolution for legacy 408 and 409 but not other rejections',async()=>{
+    const base={requestId:id(1),jobId:id(101),providerId:'provider',databasePrincipal:'service',reason:'fixture',state:'rejected',createdAt:'today',updatedAt:'today'};
+    vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({request:{...base,httpStatus:408},resolution:null}))).mockResolvedValueOnce(new Response(JSON.stringify({request:{...base,httpStatus:409},resolution:null}))).mockResolvedValueOnce(new Response(JSON.stringify({request:{...base,httpStatus:400},resolution:null})));
+    const {fixture,c}=setup();c.reason='checked';
+    for(const code of [408,409]){await c.loadDetail(id(1));fixture.detectChanges();expect(fixture.nativeElement.textContent).toContain('과거 408·409');c.prepareResolution();expect(c.resolutionStatus()).toBe('prepared');c.resetResolution();}
+    await c.loadDetail(id(1));c.prepareResolution();expect(c.resolutionStatus()).toBe('idle');fixture.destroy();
+  });
   it('preserves the cancellation command ID across an uncertain submission',async()=>{
     const requestId=id(42),jobId=id(100),commandId=id(200);vi.spyOn(crypto,'randomUUID').mockReturnValue(requestId as `${string}-${string}-${string}-${string}-${string}`);
     const mock=vi.spyOn(globalThis,'fetch').mockRejectedValueOnce(Error('network')).mockResolvedValueOnce(new Response(JSON.stringify({requestId,command:{requestId:commandId,jobId,state:'pending',attemptState:null},replayed:true})));
