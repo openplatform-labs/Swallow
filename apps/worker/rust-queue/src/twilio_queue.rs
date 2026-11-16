@@ -99,7 +99,13 @@ pub async fn process_one_with_step_policy(
     };
     let tx = client.transaction().await?;
     let subscriber = if let Some(context) = sms.workflow_context.as_ref() {
-        tx.query_opt("SELECT s.profile,w.read_only,w.all_enabled,w.sms_enabled,(p.channels->>'sms')::boolean,(sp.channels->>'sms')::boolean,EXISTS(SELECT 1 FROM novu_rust_workflows wf WHERE wf.environment_id=s.environment_id AND wf.identifier=$3 AND ($4::text IS NULL OR wf.inbox_metadata->>'id'=$4)),s.internal_id FROM novu_rust_subscribers s LEFT JOIN novu_rust_workflow_preferences w ON w.environment_id=s.environment_id AND w.workflow_identifier=$3 LEFT JOIN novu_rust_subscriber_preferences p ON p.environment_id=s.environment_id AND p.subscriber_id=s.subscriber_id LEFT JOIN novu_rust_subscriber_workflow_preferences sp ON sp.environment_id=s.environment_id AND sp.subscriber_id=s.subscriber_id AND sp.workflow_identifier=$3 WHERE s.environment_id=$1 AND s.subscriber_id=$2 FOR UPDATE OF s", &[&environment,&context.subscriber_id,&context.workflow_identifier,&context.workflow_internal_id]).await?
+        // Preference writers lock the subscriber, and migration 0292 locks the
+        // workflow for default preference changes. Read after both waits so the
+        // READ COMMITTED snapshot includes any committed changes.
+        if tx.query_opt("SELECT 1 FROM public.novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id=$2 FOR UPDATE",&[&environment,&context.subscriber_id]).await?.is_some() {
+            tx.query_opt("SELECT 1 FROM public.novu_rust_workflows WHERE environment_id=$1 AND identifier=$2 FOR SHARE",&[&environment,&context.workflow_identifier]).await?;
+            tx.query_opt("SELECT s.profile,w.read_only,w.all_enabled,w.sms_enabled,(p.channels->>'sms')::boolean,(sp.channels->>'sms')::boolean,EXISTS(SELECT 1 FROM novu_rust_workflows wf WHERE wf.environment_id=s.environment_id AND wf.identifier=$3 AND ($4::text IS NULL OR wf.inbox_metadata->>'id'=$4)),s.internal_id FROM novu_rust_subscribers s LEFT JOIN novu_rust_workflow_preferences w ON w.environment_id=s.environment_id AND w.workflow_identifier=$3 LEFT JOIN novu_rust_subscriber_preferences p ON p.environment_id=s.environment_id AND p.subscriber_id=s.subscriber_id LEFT JOIN novu_rust_subscriber_workflow_preferences sp ON sp.environment_id=s.environment_id AND sp.subscriber_id=s.subscriber_id AND sp.workflow_identifier=$3 WHERE s.environment_id=$1 AND s.subscriber_id=$2", &[&environment,&context.subscriber_id,&context.workflow_identifier,&context.workflow_internal_id]).await?
+        } else { None }
     } else {
         None
     };
@@ -374,6 +380,50 @@ pub async fn recover_expired(client: &mut Client, environment: &str) -> Result<u
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    #[ignore = "requires fully migrated disposable PostgreSQL and loopback"]
+    async fn workflow_preference_commit_before_reservation_is_observed() {
+        use super::*;
+        use crate::twilio::{Config,Region};
+        use serde_json::json;
+        use tokio::net::TcpListener;
+        use tokio_postgres::NoTls;
+        let url=std::env::var("TEST_DATABASE_URL").unwrap();
+        let (mut db,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);
+        let env=format!("sms-preference-race-{}",Uuid::new_v4());
+        db.execute("INSERT INTO public.novu_rust_environments VALUES($1,'org')",&[&env]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,sms_content,inbox_metadata) VALUES($1,'fixture',true,true,'hello','{\"id\":\"64a000000000000000000051\"}')",&[&env]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES($1,'alice','64a000000000000000000054','{\"phone\":\"+15550000002\"}')",&[&env]).await.unwrap();
+        for mode in ["global","workflow","default"] {
+            let transaction=format!("sms-preference-{mode}");
+            crate::enqueue(&db,Uuid::new_v4(),&env,crate::in_app::JOB_KIND,&json!({"workflow":"fixture","transactionId":transaction,"content":"","payload":{},"recipients":[{"subscriberId":"alice"}],"recipientIdentitySnapshot":{"alice":"64a000000000000000000054"},"severityOverride":null})).await.unwrap();
+            assert!(crate::in_app::process_one(&mut db).await.unwrap());
+            let job:Uuid=db.query_one("SELECT sms_job_id FROM public.novu_rust_sms_step_outcomes WHERE environment_id=$1 AND transaction_id=$2",&[&env,&transaction]).await.unwrap().get(0);
+            let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin=format!("http://{}",listener.local_addr().unwrap());
+            let pref_tx=db.transaction().await.unwrap();
+            if mode!="default" {pref_tx.query_one("SELECT 1 FROM public.novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id='alice' FOR UPDATE",&[&env]).await.unwrap();}
+            if mode=="global" {pref_tx.execute("INSERT INTO public.novu_rust_subscriber_preferences(environment_id,subscriber_id,channels) VALUES($1,'alice','{\"sms\":false}')",&[&env]).await.unwrap();}
+            else if mode=="workflow" {pref_tx.execute("INSERT INTO public.novu_rust_subscriber_workflow_preferences(environment_id,subscriber_id,workflow_identifier,channels) VALUES($1,'alice','fixture','{\"sms\":false}')",&[&env]).await.unwrap();}
+            else {pref_tx.execute("INSERT INTO public.novu_rust_workflow_preferences(environment_id,workflow_identifier,sms_enabled) VALUES($1,'fixture',false)",&[&env]).await.unwrap();}
+            let (mut worker,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);
+            worker.batch_execute("SET application_name='sms_preference_fence'").await.unwrap();
+            let target_env=env.clone();
+            let task=tokio::spawn(async move {let provider=Twilio::test_origin(Config{account_sid:"ACfixture".into(),auth_token:"fixture".into(),api_key_sid:None,api_key_secret:None,from:"+15550000001".into(),region:Region::Us},&origin).unwrap();process_one(&mut worker,&target_env,&provider).await});
+            let mut waiting=false;
+            for _ in 0..150 {waiting=pref_tx.query_one("SELECT count(*)=1 FROM pg_stat_activity WHERE application_name='sms_preference_fence' AND wait_event_type='Lock'",&[]).await.unwrap().get(0);if waiting {break;}assert!(!task.is_finished());tokio::time::sleep(Duration::from_millis(100)).await;}
+            assert!(waiting,"SMS worker did not wait for {mode} preference update");
+            pref_tx.commit().await.unwrap();
+            assert!(tokio::time::timeout(Duration::from_secs(10),task).await.unwrap().unwrap().unwrap());
+            assert_eq!(db.query_one("SELECT status FROM public.novu_queue_jobs WHERE id=$1",&[&job]).await.unwrap().get::<_,String>(0),"cancelled");
+            assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_twilio_attempts WHERE job_id=$1",&[&job]).await.unwrap().get::<_,i64>(0),0);
+            assert!(tokio::time::timeout(Duration::from_millis(200),listener.accept()).await.is_err());
+            db.execute("DELETE FROM public.novu_rust_subscriber_preferences WHERE environment_id=$1 AND subscriber_id='alice'",&[&env]).await.unwrap();
+            db.execute("DELETE FROM public.novu_rust_subscriber_workflow_preferences WHERE environment_id=$1 AND subscriber_id='alice'",&[&env]).await.unwrap();
+            db.execute("DELETE FROM public.novu_rust_workflow_preferences WHERE environment_id=$1 AND workflow_identifier='fixture'",&[&env]).await.unwrap();
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires fully migrated disposable PostgreSQL and loopback"]
     async fn invalid_sms_is_rejected_before_dispatch_reservation() {
