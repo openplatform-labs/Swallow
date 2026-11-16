@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$(cd ../../.. && pwd)
 scenario=${SWALLOW_LOCAL_FAILOVER_SCENARIO:-alert-binding}
-case "$scenario" in alert-binding|alert-scheduler|alert-v2|alert-v3|alert-timing|trigger-key|trigger-inflight|execution-grant-inflight|sendgrid-inflight|sendgrid-sandbox-inflight|smtp|smtp-rls|smtp-plain|smtp-plain-rls|smtp-plain-fenced|smtp-policy|smtp-auto-policy|smtp-auto-inflight|smtp-resolution|discord-manual-retry|discord-cooldown|discord-inflight|in-app|resend|resend-cooldown|resend-invalid|resend-replay-inflight|resend-reconciliation|twilio|fcm|fcm-delay|fcm-exp|fcm-exp-repeat|fcm-review) ;; *) echo 'invalid local failover scenario' >&2; exit 2;; esac
+case "$scenario" in alert-binding|alert-scheduler|alert-v2|alert-v3|alert-timing|trigger-key|trigger-inflight|execution-grant-inflight|sendgrid-inflight|sendgrid-sandbox-inflight|smtp|smtp-rls|smtp-plain|smtp-plain-rls|smtp-plain-fenced|smtp-policy|smtp-auto-policy|smtp-auto-inflight|smtp-resolution|discord-manual-retry|discord-cooldown|discord-inflight|in-app|resend|resend-cooldown|resend-invalid|resend-cancel-inflight|resend-replay-inflight|resend-reconciliation|twilio|fcm|fcm-delay|fcm-exp|fcm-exp-repeat|fcm-review) ;; *) echo 'invalid local failover scenario' >&2; exit 2;; esac
 pgbin=${SWALLOW_TEST_POSTGRES_BIN:-/opt/homebrew/opt/postgresql@17/bin}
 [[ -x "$pgbin/pg_ctl" && -x "$pgbin/pg_basebackup" ]] || { echo 'PostgreSQL 17 server binaries are required' >&2; exit 1; }
 testdir=$(mktemp -d /private/tmp/swallow-alert-ha.XXXXXX)
@@ -75,6 +75,11 @@ elif [[ "$scenario" == smtp || "$scenario" == smtp-rls || "$scenario" == smtp-pl
   TEST_SMTP_FAILOVER_RLS=$([[ "$scenario" == smtp-rls || "$scenario" == smtp-plain-rls || "$scenario" == smtp-plain-fenced ]] && printf true || printf false) TEST_SMTP_FAILOVER_PLAIN=$([[ "$scenario" == smtp-plain || "$scenario" == smtp-plain-rls || "$scenario" == smtp-plain-fenced ]] && printf true || printf false) TEST_SMTP_FAILOVER_FENCE=$([[ "$scenario" == smtp-plain-fenced ]] && printf true || printf false) cargo test --locked --test smtp_failover -- --ignored --nocapture
 elif [[ "$scenario" == in-app ]]; then
   cargo test --locked --test postgres_failover -- --ignored
+elif [[ "$scenario" == resend-cancel-inflight ]]; then
+  cargo build --quiet --locked --features test-mocks --bin resend-cancel-worker
+  cp target/debug/resend-cancel-worker "$testdir/resend-cancel-worker-mock"
+  cargo build --quiet --locked --bin resend-cancel-worker
+  TEST_CANCEL_WORKER="$testdir/resend-cancel-worker-mock" TEST_PSQL="$pgbin/psql" python3 tests/resend_cancel_failover.py
 elif [[ "$scenario" == resend-replay-inflight ]]; then
   cargo build --quiet --locked --features test-mocks --bin resend-worker
   cp target/debug/resend-worker "$testdir/resend-worker-mock"
