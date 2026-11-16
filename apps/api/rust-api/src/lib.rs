@@ -155,7 +155,7 @@ pub struct RuntimeConfig {
     reject_resend_alternatives: bool,
     reject_resend_attachment_disposition: bool,
     operator_verifier: Option<Arc<operator_access_token::AccessTokenVerifier>>,
-    operator_reload: Option<(OperatorReloadSource, std::time::Duration, bool)>,
+    operator_reload: Option<(OperatorReloadSource, std::time::Duration, bool, bool)>,
     operator_reload_health: Option<Arc<std::sync::Mutex<(std::time::Instant, bool)>>>,
 }
 #[derive(Clone, Copy)]
@@ -329,6 +329,10 @@ impl RuntimeConfig {
         let discover = match std::env::var("SWALLOW_OPERATOR_JWT_DISCOVER_JWKS").as_deref() {
             Ok("true")=>true, Ok("false")|Err(std::env::VarError::NotPresent)=>false, _=>return Err(invalid()),
         };
+        let require_initial_refresh=match std::env::var("SWALLOW_OPERATOR_JWT_REQUIRE_INITIAL_REFRESH").as_deref() {
+            Ok("true")=>true, Ok("false")|Err(std::env::VarError::NotPresent)=>false, _=>return Err(invalid()),
+        };
+        if require_initial_refresh && remote_url.is_none() && !discover {return Err(invalid());}
         let allowed_origin=match std::env::var("SWALLOW_OPERATOR_JWT_JWKS_ALLOWED_ORIGIN") {
             Ok(value)=>Some(value),Err(std::env::VarError::NotPresent)=>None,Err(_)=>return Err(invalid()),
         };
@@ -351,7 +355,7 @@ impl RuntimeConfig {
             } else {
                 OperatorReloadSource::File(std::path::PathBuf::from(std::env::var_os("SWALLOW_OPERATOR_JWT_CONFIG_FILE").ok_or_else(invalid)?))
             };
-            Some((source,interval,reload_reject))
+            Some((source,interval,reload_reject,require_initial_refresh))
         } else { None };
         let introspection = operator_introspection::Introspection::from_env().map_err(|_| invalid())?;
         if introspection.is_some() && operator_config.is_none() { return Err(invalid()); }
@@ -360,6 +364,9 @@ impl RuntimeConfig {
             if let Some(config)=introspection {verifier.set_introspection(config);}
             Ok::<_,std::io::Error>(Arc::new(verifier))
         }).transpose()?;
+        if require_initial_refresh {
+            operator_verifier.as_ref().ok_or_else(invalid)?.reject_until_reloaded();
+        }
         Ok(Self {
             secret,
             keys,
@@ -370,21 +377,23 @@ impl RuntimeConfig {
             reject_resend_alternatives,
             reject_resend_attachment_disposition,
             operator_verifier,
-            operator_reload_health: operator_reload.as_ref().map(|_| Arc::new(std::sync::Mutex::new((std::time::Instant::now(), true)))),
+            operator_reload_health: operator_reload.as_ref().map(|_| Arc::new(std::sync::Mutex::new((std::time::Instant::now(), !require_initial_refresh)))),
             operator_reload,
         })
     }
     /// Start a single process-local key refresh loop; callers own process lifetime.
     pub fn start_operator_key_reload(&self) {
-        let (Some(verifier), Some((source, interval, reject))) = (&self.operator_verifier, &self.operator_reload) else { return; };
-        let verifier=verifier.clone(); let source=source.clone(); let interval=*interval; let reject=*reject;
+        let (Some(verifier), Some((source, interval, reject, initial))) = (&self.operator_verifier, &self.operator_reload) else { return; };
+        let verifier=verifier.clone(); let source=source.clone(); let interval=*interval; let reject=*reject; let initial=*initial;
         let health = self.operator_reload_health.clone().expect("reload health initialized");
         if reject {
             tokio::spawn(monitor_operator_key_reload(health.clone(), verifier.clone(), interval));
         }
         tokio::spawn(async move {
+            let mut first=true;
             loop {
-                tokio::time::sleep(interval).await;
+                if !first || !initial {tokio::time::sleep(interval).await;}
+                first=false;
                 let read = match &source {
                     OperatorReloadSource::File(path) => {
                         let path=path.clone();
@@ -411,7 +420,7 @@ impl RuntimeConfig {
 
     /// Local polling health, including stale or blocked reads. None means reload is disabled.
     pub fn operator_key_reload_healthy(&self) -> Option<bool> {
-        let (_, interval, _) = self.operator_reload.as_ref()?;
+        let (_, interval, _, _) = self.operator_reload.as_ref()?;
         let state = self.operator_reload_health.as_ref()?;
         Some(state.lock().map(|value| key_reload_state_healthy(value.0, value.1, *interval)).unwrap_or(false))
     }

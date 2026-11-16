@@ -295,7 +295,7 @@ s=http.server.HTTPServer(('127.0.0.1',int(sys.argv[1])),Handler);c=ssl.SSLContex
     db.execute("INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES($1,'alice','console',$2)",&[&issuer,&environment]).await.unwrap();
     let p=port();let mut bootstrap=config(&["old"]);bootstrap["issuer"]=json!(issuer);
     let discover=Process(Command::new(env!("CARGO_BIN_EXE_novu-rust-api")).env_clear().env("DATABASE_URL",&api_url).env("NOVU_POSTGRES_ALLOW_INSECURE","true").env("LISTEN_ADDR",format!("127.0.0.1:{p}"))
-        .env("SWALLOW_OPERATOR_JWT_CONFIG",bootstrap.to_string()).env("SWALLOW_OPERATOR_JWT_DISCOVER_JWKS","true").env("SWALLOW_OPERATOR_JWT_JWKS_CA_FILE",dir.0.join("ca.pem"))
+        .env("SWALLOW_OPERATOR_JWT_CONFIG",bootstrap.to_string()).env("SWALLOW_OPERATOR_JWT_DISCOVER_JWKS","true").env("SWALLOW_OPERATOR_JWT_REQUIRE_INITIAL_REFRESH","true").env("SWALLOW_OPERATOR_JWT_JWKS_CA_FILE",dir.0.join("ca.pem"))
         .env("SWALLOW_OPERATOR_JWT_RELOAD_SECONDS","1").env("SWALLOW_OPERATOR_JWT_RELOAD_FAILURE","reject").env("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED","true").env("SWALLOW_API_OPERATOR_KEY_HEALTH_ENABLED","true")
         .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
     let discovery_url=format!("http://127.0.0.1:{p}/v1/experimental/operator/me?environmentId={environment}");let discovered_new=token_for_issuer("new",&issuer);
@@ -318,6 +318,19 @@ s=http.server.HTTPServer(('127.0.0.1',int(sys.argv[1])),Handler);c=ssl.SSLContex
     drop(selected);drop(server2);
     replace(&discovery_path,&metadata(&issuer,&key_uri));
     wait_status(&client,&health(&discovery_url),"",200).await;wait_status(&client,&discovery_url,&discovered_new,200).await;drop(discover);
+    // Initial refresh is required even under retain; after first success retain remains available on failures.
+    replace(&jwks_path,"invalid");
+    let strict_port=port();let strict=Process(Command::new(env!("CARGO_BIN_EXE_novu-rust-api")).env_clear().env("DATABASE_URL",&api_url).env("NOVU_POSTGRES_ALLOW_INSECURE","true").env("LISTEN_ADDR",format!("127.0.0.1:{strict_port}"))
+        .env("SWALLOW_OPERATOR_JWT_CONFIG",config(&["old"]).to_string()).env("SWALLOW_OPERATOR_JWT_JWKS_URL",format!("https://127.0.0.1:{jwks_port}/keys"))
+        .env("SWALLOW_OPERATOR_JWT_JWKS_CA_FILE",dir.0.join("ca.pem")).env("SWALLOW_OPERATOR_JWT_RELOAD_SECONDS","1").env("SWALLOW_OPERATOR_JWT_RELOAD_FAILURE","retain")
+        .env("SWALLOW_OPERATOR_JWT_REQUIRE_INITIAL_REFRESH","true").env("SWALLOW_API_HEALTH_ENDPOINTS_ENABLED","true").env("SWALLOW_API_OPERATOR_KEY_HEALTH_ENABLED","true").env("SWALLOW_API_READY_REQUIRE_OPERATOR_KEYS","true")
+        .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    let strict_url=format!("http://127.0.0.1:{strict_port}/v1/experimental/operator/me?environmentId={environment}");let ready=|url:&str|format!("{}/health/ready",url.split("/v1/").next().unwrap());
+    wait_status(&client,&health(&strict_url),"",503).await;wait_status(&client,&strict_url,&old,503).await;wait_status(&client,&ready(&strict_url),"",503).await;
+    replace(&jwks_path,&jwks_config(&["new"])["jwks"].to_string());
+    wait_status(&client,&health(&strict_url),"",200).await;wait_status(&client,&ready(&strict_url),"",200).await;
+    wait_status(&client,&strict_url,&new,200).await;wait_status(&client,&strict_url,&old,401).await;
+    replace(&jwks_path,"invalid");wait_status(&client,&health(&strict_url),"",503).await;wait_status(&client,&strict_url,&new,200).await;wait_status(&client,&ready(&strict_url),"",503).await;drop(strict);
     drop(processes);drop(server);
     db.execute("DELETE FROM public.novu_rust_operator_jwt_identities WHERE environment_id=$1",&[&environment]).await.unwrap();
     db.execute("DELETE FROM public.novu_rust_operator_jwt_api_logins WHERE database_principal=$1",&[&role]).await.unwrap();db.execute("DELETE FROM public.novu_rust_environments WHERE id=$1",&[&environment]).await.unwrap();
@@ -350,5 +363,16 @@ fn discovery_rejects_conflicting_and_unsafe_settings() {
         if mode==2 {cmd.env("SWALLOW_OPERATOR_JWT_JWKS_ALLOWED_ORIGIN","https://keys.test/path");}
         if mode==3 {cmd.env("SWALLOW_OPERATOR_JWT_JWKS_ALLOWED_ORIGIN","https://keys.test");}
         assert!(!cmd.stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap().success());
+    }
+}
+
+#[test]
+fn required_initial_refresh_requires_a_remote_source_and_a_boolean() {
+    use std::process::{Command,Stdio};
+    for value in ["true","invalid"] {
+        let status=Command::new(env!("CARGO_BIN_EXE_novu-rust-api")).env_clear().env("DATABASE_URL","postgres://postgres@127.0.0.1:1/postgres")
+            .env("NOVU_POSTGRES_ALLOW_INSECURE","true").env("SWALLOW_OPERATOR_JWT_CONFIG",config(&["old"]).to_string())
+            .env("SWALLOW_OPERATOR_JWT_REQUIRE_INITIAL_REFRESH",value).stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap();
+        assert!(!status.success());
     }
 }
