@@ -1288,3 +1288,5 @@ API 0199의 `GET /v1/experimental/operator/resend-cancel-credential-retention/au
 격리 PostgreSQL·제한 로그인·시험 JWT 테스트는 양쪽 권한과 회수, 환경 격리 및 53건 페이지 경계를 확인한다. 관리 화면·실제 Rust API·브라우저에서도 제출 후 이력 표시를 확인했다. 외부 IdP와 운영 HA는 미검증이다.
 
 API 0200 적용 후 기존 Resend 취소 위임 관리자는 `resend-cancel:credential-retention-audit` JWT 권한을 기존 위임 API와 콘솔에서 부여·회수할 수 있다. **기존 관리자의 권한이 확대되므로 적용 전 관리자 명단을 검토한다.** 정리 실행 권한과 별개이며 API DB 로그인의 `novu_rust_cancel_cred_retention_audit_db_viewers` 등록은 DBA가 따로 수행한다. 격리 PostgreSQL·제한 로그인·시험 JWT에서 정리 권한과 독립성, 동시 중복 위임, 충돌, 이력과 회수를 확인했고 실제 API·브라우저에서도 접근과 회수 후 거절을 확인했다. 외부 IdP와 운영 HA는 미검증이다.
+
+Telegram 429 선택형 지연 재시도: 워커 0296과 API 0201 적용 후 기존 Telegram 판정 API에 `decision: "retry_after"`를 전달한다. 기존 JWT `can_retry`와 API DB 로그인별 Telegram 재시도 권한이 필요하며, 이들의 권한 범위가 확대된다. 동일 요청 재제출과 조회는 기존 요청 ID를 사용하고 즉시 재시도와 충돌한다. 감사·예약과 JWT 요청 연결은 원자적이다. 대시보드에서 대기 안내가 있는 429에 예약을 선택하고 요청을 조회할 수 있다. 테스트 JWT·제한 로그인·격리 PostgreSQL·실제 로컬 API 및 브라우저에서 권한·동시 제출·감사 실패 롤백·예약·조회·이력을 시험했다. 실제 Telegram, 외부 IdP 및 운영 HA는 미검증이다. [워커 문서](../../worker/rust-queue/README.md)를 참고한다.

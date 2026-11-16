@@ -55,7 +55,7 @@ describe('Discord operator reviews',()=>{
     const telegram={jobId:job,jobKind:'experimental_telegram',jobStatus:'failed',attemptId:revision,state:'rejected',httpStatus:429,attempts:1,updatedAt:'2026-11-16T00:00:00Z'};
     const page=(entry:object)=>new Response(JSON.stringify({data:[entry],hasMore:false,next:null}));
     vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(page({...telegram,retryAfterSeconds:42})).mockResolvedValueOnce(page(telegram)).mockResolvedValueOnce(page({...telegram,retryAfterSeconds:86401})).mockResolvedValueOnce(page({...telegram,state:'unknown',httpStatus:null,retryAfterSeconds:42}));
-    const {fixture,c}=component();await c.listTelegram();fixture.detectChanges();expect(c.telegramRows()[0].retryAfterSeconds).toBe(42);expect(fixture.nativeElement.textContent).toContain('대기 안내: 42초');expect(fixture.nativeElement.textContent).toContain('자동 재시도나 대기 강제는 없습니다');
+    const {fixture,c}=component();await c.listTelegram();fixture.detectChanges();expect(c.telegramRows()[0].retryAfterSeconds).toBe(42);expect(fixture.nativeElement.textContent).toContain('대기 안내: 42초');expect(fixture.nativeElement.textContent).toContain('안내만으로 재시도가 예약되지는 않습니다');
     await c.listTelegram();fixture.detectChanges();expect(fixture.nativeElement.textContent).toContain('API 업데이트 필요');
     await c.listTelegram();expect(c.telegramListStatus()).toBe('error');await c.listTelegram();expect(c.telegramListStatus()).toBe('error');fixture.destroy();
   });
@@ -64,6 +64,12 @@ describe('Discord operator reviews',()=>{
     const page=(entry:object)=>new Response(JSON.stringify({data:[entry],hasMore:false,next:null}));
     vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(page(record)).mockResolvedValueOnce(page({...record,retryAfterSeconds:-1}));
     const {fixture,c}=component();c.telegramHistoryJob=job;await c.loadTelegramHistory();fixture.detectChanges();expect(c.telegramHistory()[0].decision).toBe('retry_after');expect(fixture.nativeElement.textContent).toContain('공급자 안내: 120초');await c.loadTelegramHistory();expect(c.telegramHistoryStatus()).toBe('error');fixture.destroy();
+  });
+  it('prepares, submits and looks up a Telegram delayed retry',async()=>{
+    vi.spyOn(crypto,'randomUUID').mockReturnValue(requestId);
+    const telegram={jobId:job,jobKind:'experimental_telegram',jobStatus:'failed',attemptId:revision,state:'rejected',httpStatus:429,retryAfterSeconds:42,attempts:1,updatedAt:'2026-11-16T00:00:00Z'};
+    const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[telegram],hasMore:false,next:null}))).mockRejectedValueOnce(Error('lost')).mockResolvedValueOnce(new Response(JSON.stringify({requestId,recorded:true,replayed:true}))).mockResolvedValueOnce(new Response(JSON.stringify({found:true,requestId,jobId:job,attemptId:revision,decision:'retry_after',reason:'checked',recorded:true})));
+    const {fixture,c}=component();await c.listTelegram();fixture.detectChanges();expect(fixture.nativeElement.textContent).toContain('안내 시각 이후 재시도 준비');c.telegramReason='checked';c.prepareTelegram(c.telegramRows()[0],'retry_after');c.telegramConfirm=true;await c.submitTelegram();expect(c.telegramDecisionStatus()).toBe('unknown');c.telegramRetryConfirm=true;await c.submitTelegram(true);expect(c.telegramDecisionStatus()).toBe('recorded');expect(mock.mock.calls[1][1]!.body).toBe(mock.mock.calls[2][1]!.body);await c.lookupTelegram();expect(c.telegramLookupStatus()).toBe('found');expect(new URL(mock.mock.calls[3][0] as string).searchParams.get('decision')).toBe('retry_after');fixture.destroy();
   });
   it('loads Telegram aggregate health, rejects malformed data and clears stale responses',async()=>{
     let finish!:(r:Response)=>void;const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({unknownAttempts:1,rejectedAttempts:2,strandedDispatches:3,preDispatchFailures:4,secret:'discard'}))).mockResolvedValueOnce(new Response(JSON.stringify({unknownAttempts:-1,rejectedAttempts:0,strandedDispatches:0,preDispatchFailures:0}))).mockReturnValueOnce(new Promise(resolve=>finish=resolve));

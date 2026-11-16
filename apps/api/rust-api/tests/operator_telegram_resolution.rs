@@ -147,6 +147,23 @@ async fn telegram_resolution_requires_scoped_grants_and_replays_atomically() {
  let history=format!("/v1/experimental/operator/telegram-resolution-history?environmentId={env}&jobId={job}");assert_eq!(response(app.clone(),&alice,"GET",&history,None).await.0,StatusCode::UNAUTHORIZED);
  db.execute("INSERT INTO public.novu_rust_operator_jwt_telegram_resolution_history_viewers VALUES('https://issuer.test','alice','console',$1)",&[&env]).await.unwrap();assert_eq!(response(app.clone(),&alice,"GET",&history,None).await.0,StatusCode::UNAUTHORIZED);
  db.execute("INSERT INTO public.novu_rust_telegram_history_viewers SELECT $1,rolname,oid FROM pg_roles WHERE rolname::text=$2",&[&env,&role]).await.unwrap();
+ // Scheduled 429 retry shares the JWT request namespace and retry authority.
+ let delay_job=Uuid::new_v4();let delay_request=Uuid::new_v4();
+ db.execute("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES($1,$2,'experimental_telegram','{}','failed')",&[&delay_job,&env]).await.unwrap();
+ let delay_attempt:Uuid=db.query_one("INSERT INTO public.novu_rust_telegram_attempts(job_id,environment_id,state,http_status,retry_after_seconds) VALUES($1,$2,'rejected',429,120) RETURNING attempt_id",&[&delay_job,&env]).await.unwrap().get(0);
+ let delayed=json!({"requestId":delay_request,"jobId":delay_job,"attemptId":delay_attempt,"decision":"retry_after","reason":"checked"});
+ assert_eq!(response(app.clone(),&bob,"POST",&resolve,Some(delayed.clone())).await.0,StatusCode::UNAUTHORIZED);
+ db.batch_execute("CREATE TRIGGER reject_telegram_jwt_resolution BEFORE INSERT ON public.novu_rust_operator_jwt_telegram_resolution_requests FOR EACH ROW EXECUTE FUNCTION public.reject_telegram_jwt_resolution()").await.unwrap();
+ assert_eq!(response(app.clone(),&alice,"POST",&resolve,Some(delayed.clone())).await.0,StatusCode::INTERNAL_SERVER_ERROR);
+ assert_eq!(db.query_one("SELECT status FROM public.novu_queue_jobs WHERE id=$1",&[&delay_job]).await.unwrap().get::<_,String>(0),"failed");
+ db.batch_execute("DROP TRIGGER reject_telegram_jwt_resolution ON public.novu_rust_operator_jwt_telegram_resolution_requests").await.unwrap();
+ let (first_delay,second_delay)=tokio::join!(response(app.clone(),&alice,"POST",&resolve,Some(delayed.clone())),response(app2.clone(),&alice,"POST",&resolve,Some(delayed.clone())));
+ assert_eq!(first_delay.0,StatusCode::OK);assert_eq!(second_delay.0,StatusCode::OK);assert_ne!(first_delay.1["replayed"],second_delay.1["replayed"]);
+ assert!(db.query_one("SELECT available_at>clock_timestamp()+interval '60 seconds' FROM public.novu_queue_jobs WHERE id=$1",&[&delay_job]).await.unwrap().get::<_,bool>(0));
+ let mut changed=delayed.clone();changed["decision"]=json!("retry");assert_eq!(response(app.clone(),&alice,"POST",&resolve,Some(changed)).await.0,StatusCode::CONFLICT);
+ let delay_lookup=format!("/v1/experimental/operator/telegram-resolution-request?environmentId={env}&requestId={delay_request}&decision=retry_after");assert_eq!(response(app.clone(),&alice,"GET",&delay_lookup,None).await.1["jobId"],delay_job.to_string());
+ let delay_history=format!("/v1/experimental/operator/telegram-resolution-history?environmentId={env}&jobId={delay_job}");let entry=response(app.clone(),&alice,"GET",&delay_history,None).await.1;assert_eq!(entry["data"][0]["operator"]["requestId"],delay_request.to_string());assert_eq!(entry["data"][0]["retryAfterSeconds"],120);
+ db.execute("UPDATE public.novu_rust_operator_jwt_telegram_resolution_grants SET can_retry=false WHERE environment_id=$1",&[&env]).await.unwrap();assert_eq!(response(app.clone(),&alice,"GET",&delay_lookup,None).await.0,StatusCode::UNAUTHORIZED);db.execute("UPDATE public.novu_rust_operator_jwt_telegram_resolution_grants SET can_retry=true WHERE environment_id=$1",&[&env]).await.unwrap();
  let cli=connect(&url).await;cli.batch_execute(&format!("SET SESSION AUTHORIZATION {role}")).await.unwrap();
  let prehistory=format!("/v1/experimental/operator/telegram-predispatch-history?environmentId={env}&jobId={prejob}");
  let predata=response(app.clone(),&alice,"GET",&prehistory,None).await;assert_eq!(predata.0,StatusCode::OK);assert_eq!(predata.1["data"][0]["operator"]["requestId"],prerequest.to_string());assert_eq!(predata.1["data"][0]["operator"]["subject"],"alice");assert_eq!(predata.1["data"][0]["failureRevision"],bigrevision.to_string());
