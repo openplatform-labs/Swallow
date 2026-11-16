@@ -530,3 +530,8 @@ Telegram 발송 전 실패: 운영 검토 화면의 조회 버튼은 별도 결�
 Telegram 발송 전 취소 권한 위임: API 0195 적용 후 설정 화면에서 `Telegram 발송 전 실패 취소` 권한을 조회·위임·회수하고 기존 Telegram 판정 권한 감사에서 확인한다. 기존 판정 권한 관리자의 범위가 확대되며 최초 관리자와 API DB 취소 권한은 DBA가 설정한다. 실제 브라우저·로컬 API·시험 JWT·격리 PostgreSQL에서 위임·회수와 감사 기록을 검증했다. 재현은 `TMPDIR=/tmp TEST_PG_BIN=/path/to/postgresql/bin scripts/test-telegram-resolution-grants-browser.sh`. 실제 IdP·운영 HA는 미검증이다.
 
 Telegram 발송 전 조치 이력: API 0196과 기존 Telegram 이력 JWT·DB 권한을 사용해 작업별 재시도·취소, 사유, DB 로그인과 API 조치의 JWT 운영자를 표시한다. UUID와 조치로 페이지를 이동하며 시간순이 아니다. CLI 조치에는 JWT 운영자가 없다. jsdom에서 동일 UUID의 페이지 경계와 오래된 응답을, 실제 브라우저·로컬 API에서 취소 이력과 운영자 표시를 검증했다. `TMPDIR=/tmp TEST_PG_BIN=/path/to/postgresql/bin scripts/test-telegram-predispatch-browser.sh`로 재현한다. 실제 IdP·운영 HA는 미검증이다.
+# Resend 취소 워커 관측 기록 정리
+
+운영 경보 화면에서 인증 방식을 운영자 JWT로 선택하면 오래된 취소 워커 자격 증명 관측 기록을 정리하는 카드가 나타난다. 환경별 정리 JWT 권한과 API DB 로그인 권한은 DBA가 별도로 등록해야 하며 API 0197 및 워커 0293–0294가 필요하다. 사용자가 보존 기간·최대 건수·사유를 선택하고 확인해 요청을 준비한 뒤 별도로 제출한다. 결과가 불명확하면 요청 ID를 기록하고 원래 환경·토큰으로 같은 요청을 재제출하거나 조회한다. 조회 결과가 없어도 진행 중일 수 있다. 화면의 요청 상태는 메모리에서만 유지되며 새로고침하거나 화면을 떠나기 전에 ID를 보관해야 한다. 백업이나 복제본의 기록은 제거하지 않는다.
+
+컴포넌트 테스트는 준비·확인, 동일 요청 재제출, 인증 변경, 지연 응답 폐기, 입력 제한과 전송 중 화면 이동 차단을 확인한다. 실제 브라우저에서 카드 표시와 초기 버튼 상태를 확인했다. 실제 API 연결 브라우저 제출, 외부 IdP, 권한 위임 UI 및 운영 HA는 검증하지 않았다. 서버 권한과 동작은 [API 문서](../../api/rust-api/README.md)를 참고한다.
