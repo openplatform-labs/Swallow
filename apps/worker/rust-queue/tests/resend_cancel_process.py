@@ -94,6 +94,18 @@ try:
     assert operator['cancellationConfirmationSource']=='operator' and operator['cancellationEvidence']=='no_conflict_observed',operator
     assert result(job1,denied['DATABASE_URL']).returncode!=0
     assert result(job1,environment='cancel-other').returncode!=0
+    # Each stored event independently changes the live result and alert count;
+    # a scheduled-only event is not a delivery conflict.
+    for kind in ('email.scheduled','email.delivery_delayed','email.opened','email.clicked'):
+        insert="INSERT INTO public.novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type) VALUES ('cancel-env','kind-fixture','fixture-one','%s')"%kind
+        subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',insert],check=True,capture_output=True)
+        observed=json.loads(result(job1).stdout)
+        expected='no_conflict_observed' if kind=='email.scheduled' else 'conflicting'
+        assert observed['cancellationEvidence']==expected,(kind,observed)
+        if kind!='email.scheduled':
+            check=subprocess.run([health_bin,'check-resend-cancel-evidence','cancel-env'],env=env,text=True,capture_output=True,timeout=10)
+            assert check.returncode==2 and json.loads(check.stdout)['conflicting']==1,(kind,check.stdout,check.stderr)
+        subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',"DELETE FROM public.novu_rust_resend_delivery_events WHERE event_id='kind-fixture'"],check=True,capture_output=True)
     insert_event="INSERT INTO public.novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type) VALUES ('cancel-env','cancel-conflict','fixture-one','email.delivered')"
     subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',insert_event],check=True,capture_output=True)
     conflict=json.loads(result(job1).stdout)
