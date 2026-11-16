@@ -443,7 +443,7 @@ impl SmtpAlert {
             .map_err(|_| ())
     }
     #[cfg(test)]
-    fn test_transport(host: String, port: u16) -> Self {
+    pub(crate) fn test_transport(host: String, port: u16) -> Self {
         Self {
             transport: AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&host)
                 .port(port)
