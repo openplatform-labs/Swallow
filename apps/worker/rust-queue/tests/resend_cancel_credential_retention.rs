@@ -16,7 +16,7 @@ async fn restricted_retention_preserves_live_and_recent_records_and_audits() {
     )
     .await
     .unwrap();
-    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_prune_resend_cancel_credential_health(text,integer,integer),public.novu_rust_resend_cancel_cred_retention_audit_page(text,bigint,integer) TO {role}")).await.unwrap();
+    db.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_prune_resend_cancel_credential_health(text,integer,integer),public.novu_rust_resend_cancel_cred_retention_audit_page(text,bigint,integer),public.novu_rust_resend_cancel_cred_retention_submit(text,uuid,integer,integer,text),public.novu_rust_resend_cancel_cred_retention_request(text,uuid) TO {role}")).await.unwrap();
     let mut login = reqwest::Url::parse(&url).unwrap();
     login.set_username(&role).unwrap();
     let (mut client, driver) = tokio_postgres::connect(login.as_str(), NoTls)
@@ -121,6 +121,29 @@ async fn restricted_retention_preserves_live_and_recent_records_and_audits() {
         .env("DATABASE_URL",login.as_str()).env("NOVU_POSTGRES_ALLOW_INSECURE","true")
         .args(["prune-resend-cancel-credentials",&env,"86401","10",""]).output().unwrap();
     assert!(!empty.status.success());
+    let a=Uuid::new_v4();let b=Uuid::new_v4();
+    db.execute("INSERT INTO public.novu_rust_resend_cancel_credential_health VALUES($1,$2,session_user,-1,clock_timestamp()-interval '5 days','unhealthy',clock_timestamp()-interval '3 days'),($1,$3,session_user,-1,clock_timestamp()-interval '5 days','unhealthy',clock_timestamp()-interval '3 days')",&[&env,&a,&b]).await.unwrap();
+    let (second,driver)=tokio_postgres::connect(login.as_str(),NoTls).await.unwrap();tokio::spawn(driver);
+    let request=Uuid::new_v4();let submit="SELECT public.novu_rust_resend_cancel_cred_retention_submit($1,$2,$3,$4,$5)";
+    let params:&[&(dyn tokio_postgres::types::ToSql+Sync)]=&[&env,&request,&86401_i32,&1_i32,&"batch"];
+    let (left,right)=tokio::join!(client.query_one(submit,params),second.query_one(submit,params));
+    let left:serde_json::Value=left.unwrap().get(0);let right:serde_json::Value=right.unwrap().get(0);
+    let mut replayed=[left["replayed"].as_bool().unwrap(),right["replayed"].as_bool().unwrap()];replayed.sort();assert_eq!(replayed,[false,true]);
+    assert_eq!(left["deleted"],1);assert_eq!(right["deleted"],1);
+    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_resend_cancel_credential_health WHERE instance_id=ANY($1)",&[&vec![a,b]]).await.unwrap().get::<_,i64>(0),1);
+    assert!(client.query_one(submit,&[&env,&request,&86401_i32,&1_i32,&"different"]).await.is_err());
+    let lookup:serde_json::Value=client.query_one("SELECT public.novu_rust_resend_cancel_cred_retention_request($1,$2)",&[&env,&request]).await.unwrap().get(0);assert_eq!(lookup["found"],true);assert_eq!(lookup["deleted"],1);
+    assert!(client.query_one("SELECT public.novu_rust_resend_cancel_cred_retention_request($1,$2)",&[&other,&request]).await.is_err());
+    let output=std::process::Command::new(env!("CARGO_BIN_EXE_delivery-reconcile")).env("DATABASE_URL",login.as_str()).env("NOVU_POSTGRES_ALLOW_INSECURE","true").args(["prune-resend-cancel-credentials-v2",&env,&request.to_string(),"86401","1","batch"]).output().unwrap();
+    assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));let result:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();assert_eq!(result["replayed"],true);
+    let output=std::process::Command::new(env!("CARGO_BIN_EXE_delivery-reconcile")).env("DATABASE_URL",login.as_str()).env("NOVU_POSTGRES_ALLOW_INSECURE","true").args(["resend-cancel-credential-retention-request",&env,&request.to_string()]).output().unwrap();
+    assert!(output.status.success());let result:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();assert_eq!(result["found"],true);
+    let failing_request=Uuid::new_v4();
+    db.batch_execute("ALTER TABLE public.novu_rust_resend_cancel_cred_retention_audit ADD CONSTRAINT force_v2_failure CHECK (deleted_count=0) NOT VALID").await.unwrap();
+    assert!(client.query_one(submit,&[&env,&failing_request,&86401_i32,&1_i32,&"rollback"]).await.is_err());
+    let lookup:serde_json::Value=client.query_one("SELECT public.novu_rust_resend_cancel_cred_retention_request($1,$2)",&[&env,&failing_request]).await.unwrap().get(0);assert_eq!(lookup["found"],false);
+    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_resend_cancel_credential_health WHERE instance_id=ANY($1)",&[&vec![a,b]]).await.unwrap().get::<_,i64>(0),1);
+    db.batch_execute("ALTER TABLE public.novu_rust_resend_cancel_cred_retention_audit DROP CONSTRAINT force_v2_failure").await.unwrap();
     db.execute(
         "DELETE FROM public.novu_rust_resend_cancel_cred_retention_operators WHERE environment_id=$1",
         &[&env],
@@ -131,4 +154,5 @@ async fn restricted_retention_preserves_live_and_recent_records_and_audits() {
         .query_one(sql, &[&env, &86401_i32, &10_i32])
         .await
         .is_err());
+    assert!(client.query_one("SELECT public.novu_rust_resend_cancel_cred_retention_request($1,$2)",&[&env,&request]).await.is_err());
 }
