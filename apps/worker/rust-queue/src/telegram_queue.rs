@@ -367,14 +367,18 @@ pub async fn process_one_with_workflow(
         }
         body
     };
-    let (state, code, id, timestamp, diagnostic) = match provider.send(&body).await {
-        Ok(v) => ("accepted", None, Some(v.id), Some(v.timestamp), None),
+    let (state, code, id, timestamp, diagnostic, retry_after) = match provider.send(&body).await {
+        Ok(v) => ("accepted", None, Some(v.id), Some(v.timestamp), None, None),
         Err(SendError::Rejected(code)) => (
             "rejected",
             Some(i32::from(code)),
             None,
             None,
             Some("Telegram rejected request"),
+            None,
+        ),
+        Err(SendError::RateLimited(retry)) => (
+            "rejected", Some(429), None, None, Some("Telegram rejected request"), retry.map(|v| v as i32),
         ),
         Err(SendError::Invalid) => (
             "unknown",
@@ -382,6 +386,7 @@ pub async fn process_one_with_workflow(
             None,
             None,
             Some("Telegram outcome unknown"),
+            None,
         ),
         Err(SendError::Unknown) => (
             "unknown",
@@ -389,9 +394,22 @@ pub async fn process_one_with_workflow(
             None,
             None,
             Some("Telegram outcome unknown"),
+            None,
         ),
     };
     if scoped {
+        if let Some(retry) = retry_after {
+            match db.query_one(
+                "SELECT public.novu_rust_telegram_worker_finish_rate_limit($1,$2,$3,$4,$5)",
+                &[&env, &destination, &job.id, &job.lease_token, &retry],
+            ).await {
+                Ok(_) => return Ok(true),
+                Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE) => {
+                    eprintln!("Telegram retry guidance unavailable: check database privileges");
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
         db.query_one(
             "SELECT public.novu_rust_telegram_worker_finish($1,$2,$3,$4,$5,$6,$7,$8)",
             &[
@@ -413,7 +431,7 @@ pub async fn process_one_with_workflow(
         tx.rollback().await?;
         return Ok(true);
     }
-    let updated=tx.execute("UPDATE public.novu_rust_telegram_attempts SET state=$3,http_status=$4,provider_message_id=$5,provider_timestamp=$6,updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$2 AND state='dispatching'",&[&job.id,&env,&state,&code,&id,&timestamp]).await?;
+    let updated=tx.execute("UPDATE public.novu_rust_telegram_attempts SET state=$3,http_status=$4,provider_message_id=$5,provider_timestamp=$6,retry_after_seconds=$7,updated_at=clock_timestamp() WHERE job_id=$1 AND environment_id=$2 AND state='dispatching'",&[&job.id,&env,&state,&code,&id,&timestamp,&retry_after]).await?;
     if updated == 1 {
         let job_status = if state == "accepted" {
             "completed"

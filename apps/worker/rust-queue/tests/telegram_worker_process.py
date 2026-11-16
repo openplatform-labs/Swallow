@@ -17,7 +17,7 @@ class Handler(BaseHTTPRequestHandler):
   data=json.loads(self.rfile.read(int(self.headers['Content-Length'])));calls.append(data)
   if data['text']=='hold':received.set();release.wait(15);return
   if data['text']=='conflict':self.send_response(409);body=b'conflict'
-  elif data['text']=='rate':self.send_response(429);body=b'rate limit'
+  elif data['text']=='rate':self.send_response(429);body=b'{"ok":false,"error_code":429,"parameters":{"retry_after":17}}'
   else:self.send_response(200);body=b'{"ok":true,"result":{"message_id":42,"date":100}}'
   self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
  def log_message(self,*args):pass
@@ -33,6 +33,7 @@ try:
  assert sql("SELECT state FROM public.novu_rust_telegram_attempts WHERE job_id='11111111-1111-4111-8111-111111111111'")=='accepted'
  assert sql("SELECT state FROM public.novu_rust_telegram_attempts WHERE job_id='22222222-2222-4222-8222-222222222222'")=='unknown'
  assert sql("SELECT state FROM public.novu_rust_telegram_attempts WHERE job_id='66666666-6666-4666-8666-666666666666'")=='rejected'
+ assert sql("SELECT retry_after_seconds FROM public.novu_rust_telegram_attempts WHERE job_id='66666666-6666-4666-8666-666666666666'")=='17'
  assert sorted(x['text'] for x in calls)==['conflict','ok','rate'];assert next(x for x in calls if x['text']=='ok')=={'chat_id':'123','text':'ok','parse_mode':'HTML'}
  assert sql("SELECT count(*) FROM public.novu_queue_jobs WHERE id IN ('33333333-3333-4333-8333-333333333333','44444444-4444-4444-8444-444444444444') AND status='pending'")=='2'
  bad=start({**env,'NOVU_TELEGRAM_BOT_TOKEN':'123:different-secret'});bad.wait(timeout=8);assert bad.returncode!=0;assert b'different-secret' not in bad.stderr.read()

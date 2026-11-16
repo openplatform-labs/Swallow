@@ -12,6 +12,7 @@ def wait(check):
   time.sleep(.1)
  raise AssertionError('timed out')
 sql("CREATE ROLE telegram_worker_scoped LOGIN; GRANT USAGE ON SCHEMA public TO telegram_worker_scoped; GRANT EXECUTE ON FUNCTION public.novu_rust_telegram_worker_register(text,text,text),public.novu_rust_telegram_worker_claim(text,text,uuid),public.novu_rust_telegram_worker_prepare(text,text,uuid,uuid,boolean),public.novu_rust_telegram_worker_finish(text,text,uuid,uuid,text,integer,text,text),public.novu_rust_telegram_worker_recover(text,text) TO telegram_worker_scoped; INSERT INTO public.novu_rust_environments VALUES('telegram-scope','org'),('telegram-scope-other','org'); INSERT INTO public.novu_rust_telegram_worker_grants SELECT 'telegram-scope','ops',rolname,oid FROM pg_roles WHERE rolname='telegram_worker_scoped'")
+sql("GRANT EXECUTE ON FUNCTION public.novu_rust_telegram_worker_finish_rate_limit(text,text,uuid,uuid,integer) TO telegram_worker_scoped; CREATE ROLE telegram_hint_viewer LOGIN; GRANT USAGE ON SCHEMA public TO telegram_hint_viewer; GRANT EXECUTE ON FUNCTION public.novu_rust_telegram_attention(text,uuid) TO telegram_hint_viewer; INSERT INTO public.novu_rust_telegram_operator_grants(environment_id,database_principal,principal_oid,can_view) SELECT 'telegram-scope',rolname,oid,true FROM pg_roles WHERE rolname='telegram_hint_viewer'")
 assert sql('SELECT * FROM public.novu_queue_jobs',scoped,False)!=0
 assert sql('SELECT * FROM public.novu_rust_telegram_attempts',scoped,False)!=0
 assert sql("SELECT * FROM public.novu_rust_telegram_worker_claim('telegram-scope','other',gen_random_uuid())",scoped,False)!=0
@@ -23,7 +24,7 @@ class Handler(BaseHTTPRequestHandler):
   payload=json.loads(self.rfile.read(int(self.headers['Content-Length'])));calls.append(payload)
   if payload['text']=='hold':received.set();release.wait(15);return
   if payload['text']=='conflict':self.send_response(409);body=b'conflict'
-  elif payload['text']=='rate':self.send_response(429);body=b'rate limit'
+  elif payload['text'].startswith('rate'):self.send_response(429);body=b'{"ok":false,"error_code":429,"parameters":{"retry_after":42}}'
   else:self.send_response(200);body=b'{"ok":true,"result":{"message_id":42,"date":100}}'
   self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
  def log_message(self,*args):pass
@@ -41,6 +42,10 @@ try:
  conflict='55555555-5555-4555-8555-555555555556';rate='66666666-6666-4666-8666-666666666667';add(conflict,'conflict');add(rate,'rate')
  wait(lambda:sql("SELECT count(*) FROM public.novu_rust_telegram_attempts WHERE job_id IN ('%s','%s') AND state IN ('unknown','rejected')"%(conflict,rate))=='2')
  assert sql("SELECT state FROM public.novu_rust_telegram_attempts WHERE job_id='%s'"%conflict)=='unknown' and sql("SELECT state FROM public.novu_rust_telegram_attempts WHERE job_id='%s'"%rate)=='rejected'
+ assert sql("SELECT retry_after_seconds FROM public.novu_rust_telegram_attempts WHERE job_id='%s'"%rate)=='42'
+ hint=json.loads(sql("SET SESSION AUTHORIZATION telegram_hint_viewer; SELECT public.novu_rust_telegram_attention('telegram-scope',NULL)"))
+ assert next(item for item in hint['data'] if item['jobId']==rate)['retryAfterSeconds']==42
+ assert sql("SELECT public.novu_rust_telegram_worker_finish_rate_limit('telegram-scope-other','ops',gen_random_uuid(),gen_random_uuid(),42)",scoped,False)!=0
 
  bad=start({**env,'NOVU_TELEGRAM_BOT_TOKEN':'123:another-secret'});bad.wait(timeout=8);assert bad.returncode!=0 and b'another-secret' not in bad.stderr.read()
  sql("DELETE FROM public.novu_rust_telegram_worker_grants WHERE environment_id='telegram-scope' AND destination_id='ops' AND database_principal='telegram_worker_scoped'")
@@ -56,6 +61,11 @@ try:
  sql("UPDATE public.novu_queue_jobs SET lease_until=clock_timestamp()-interval '1 second' WHERE id='%s'"%third);d=start()
  wait(lambda:sql("SELECT state FROM public.novu_rust_telegram_attempts WHERE job_id='%s'"%third)=='unknown');time.sleep(2)
  assert sum(1 for x in calls if x['text']=='hold')==1
+ sql("REVOKE EXECUTE ON FUNCTION public.novu_rust_telegram_worker_finish_rate_limit(text,text,uuid,uuid,integer) FROM telegram_worker_scoped")
+ no_grant='77777777-7777-4777-8777-777777777778';add(no_grant,'rate-no-grant')
+ wait(lambda:sql("SELECT state FROM public.novu_rust_telegram_attempts WHERE job_id='%s'"%no_grant)=='rejected')
+ assert sql("SELECT retry_after_seconds IS NULL FROM public.novu_rust_telegram_attempts WHERE job_id='%s'"%no_grant)=='t'
+ assert sum(1 for x in calls if x['text']=='rate-no-grant')==1
  print('Scoped Telegram workers enforced grants, revocation, binding and crash recovery.')
 finally:
  release.set()

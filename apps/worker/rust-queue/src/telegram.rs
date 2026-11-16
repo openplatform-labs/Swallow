@@ -8,7 +8,37 @@ use std::time::Duration;
 pub enum SendError {
     Invalid,
     Rejected(u16),
+    RateLimited(Option<u32>),
     Unknown,
+}
+#[derive(Deserialize)]
+struct RateLimitResponse {
+    ok: bool,
+    error_code: u16,
+    parameters: Option<RateLimitParameters>,
+}
+#[derive(Deserialize)]
+struct RateLimitParameters {
+    retry_after: Option<u32>,
+}
+fn retry_after_body(bytes: &[u8]) -> Option<u32> {
+    let value: RateLimitResponse = serde_json::from_slice(bytes).ok()?;
+    if value.ok || value.error_code != 429 {
+        return None;
+    }
+    value.parameters?.retry_after.filter(|v| *v <= 86_400)
+}
+async fn retry_after_response(response: &mut reqwest::Response) -> Option<u32> {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.ok()? {
+            if bytes.len().checked_add(chunk.len())? > 64 * 1024 {
+                return None;
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        retry_after_body(&bytes)
+    }).await.ok().flatten()
 }
 #[derive(Debug, PartialEq, Eq)]
 pub struct Accepted {
@@ -103,6 +133,15 @@ impl Telegram {
             .await
             .map_err(|_| SendError::Unknown)?;
         let status = response.status().as_u16();
+        if status == 429 {
+            let header = crate::slack::retry_after_seconds(response.headers());
+            let body = retry_after_response(&mut response).await;
+            return Err(SendError::RateLimited(match (header, body) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            }));
+        }
         if (400..500).contains(&status) && ![408, 409].contains(&status) {
             return Err(SendError::Rejected(status));
         }
@@ -178,6 +217,8 @@ mod tests {
             ),
             ("200 OK", r#"{"ok":true}"#, Err(SendError::Unknown)),
             ("400 Bad Request", "bad", Err(SendError::Rejected(400))),
+            ("429 Too Many Requests", r#"{"ok":false,"error_code":429,"parameters":{"retry_after":42}}"#, Err(SendError::RateLimited(Some(42)))),
+            ("429 Too Many Requests", "bad", Err(SendError::RateLimited(None))),
             ("408 Request Timeout", "bad", Err(SendError::Unknown)),
             ("409 Conflict", "bad", Err(SendError::Unknown)),
             ("500 Server Error", "bad", Err(SendError::Unknown)),
@@ -199,5 +240,32 @@ mod tests {
             );
             server.await.unwrap();
         }
+    }
+    #[test]
+    fn rate_limit_body_rejects_ambiguous_or_unbounded_values() {
+        for body in [
+            r#"{"ok":true,"error_code":429,"parameters":{"retry_after":1}}"#,
+            r#"{"ok":false,"error_code":400,"parameters":{"retry_after":1}}"#,
+            r#"{"ok":false,"error_code":429,"parameters":{"retry_after":86401}}"#,
+            r#"{"ok":false,"error_code":429,"parameters":{"retry_after":-1}}"#,
+            r#"{"ok":false,"error_code":429,"parameters":{"retry_after":1,"retry_after":2}}"#,
+        ] {
+            assert_eq!(retry_after_body(body.as_bytes()), None);
+        }
+        assert_eq!(retry_after_body(br#"{"ok":false,"error_code":429,"parameters":{"retry_after":86400}}"#), Some(86400));
+    }
+    #[tokio::test]
+    async fn rate_limit_header_and_body_choose_the_longer_delay() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/sendMessage", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 4096];
+            socket.read(&mut buf).await.unwrap();
+            let body = r#"{"ok":false,"error_code":429,"parameters":{"retry_after":42}}"#;
+            socket.write_all(format!("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        assert_eq!(Telegram::test_endpoint(&url).unwrap().send(&json!({"chat_id":"123","text":"Hello"})).await, Err(SendError::RateLimited(Some(60))));
+        server.await.unwrap();
     }
 }
