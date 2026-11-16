@@ -493,3 +493,11 @@ With worker migration `0271`, the existing Resend cancellation detail card also 
 The cancellation card can query historical 408/409 counts and UUID-cursor pages, then open a selected request in the existing detail and decision flow. Count, list, detail and decision use independent JWT permissions; the API DB LOGIN also needs the documented environment-specific grants. Page results may change between requests. Angular and local API tests exercise the flow with synthetic records; external IdP and real Resend outcomes remain unverified.
 
 If the API origin, environment or token changes while a Resend cancellation decision is in flight, its response is not shown as a successful decision in the new context. The screen retains the original draft and shows an unknown result; return to the original context to retry the same resolution ID or inspect the request. The operation may already have committed. A component test and local API/PostgreSQL integration hold a successful response across an environment change and verify same-ID replay; they do not cover every browser lifecycle or real IdP behavior.
+
+### 채널 판정 요청 중 환경 변경
+
+SMTP·Discord 검토 및 Slack·Twilio·FCM 운영자 판정에서 요청을 보낸 뒤 API 주소·환경·토큰이 바뀌면 늦게 도착한 응답을 새 환경의 성공으로 표시하지 않고 결과 불명으로 둔다. 서버에서 이미 반영됐을 수 있으므로 운영자는 기존 요청 ID로 결과를 확인해야 한다. 화면에 미확정 요청이 남아 있는 동안 원래 토큰·환경·주소로 돌아가면 같은 내용과 요청 ID를 다시 제출할 수 있다. 다른 토큰이나 환경으로 재제출할 수는 없다. OIDC 토큰 갱신으로 토큰이 바뀌었다면 새 토큰으로 동일 요청을 재제출할 수 없으며 권한이 있는 운영자가 요청 ID를 별도로 조회해야 한다.
+
+복구에 필요한 원래 토큰과 요청 내용은 화면 메모리에 유지되며 브라우저 저장소나 서버에 저장하지 않는다. 토큰 참조는 요청 초기화, 입력 변경 후 확정 상태 정리 또는 화면 종료 시에도 지운다. 토큰 입력을 비우거나 화면을 종료하면 원래 토큰 참조를 지운다. 이 경우 및 새로고침 후에는 동일 토큰 검증을 이용한 화면 재제출이 불가능하므로 먼저 요청 ID를 기록하고 서버의 요청 조회로 확인해야 한다. 토큰을 메모리에 두는 동안 브라우저의 악성 스크립트나 확장 프로그램으로부터 보호되지는 않는다.
+
+Angular 단위 테스트는 다섯 채널의 입력 변경 후 동일 요청 재제출과 변경된 환경 거절을 확인하며, SMTP·Discord·FCM의 지연 응답과 SMTP·Discord의 로그아웃 시 토큰 정리를 확인한다. 이 변경에 대한 실제 브라우저·외부 IdP·공급자와의 종단 간 검증은 수행하지 않았다.

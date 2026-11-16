@@ -19,8 +19,8 @@ export class SmtpReviews implements OnChanges,OnDestroy {
   private listSeq=0; private reviewSeq=0; private lookupSeq=0;
   private listAbort:AbortController|null=null; private reviewAbort:AbortController|null=null; private lookupAbort:AbortController|null=null;
   private sentToken:string|null=null; private sentOrigin:string|null=null; private sentEnvironment:string|null=null;
-  ngOnChanges():void { this.clearList(); this.clearLookup(); this.clearHistory(); if(this.reviewStatus()==='sending'){this.reviewSeq++;this.reviewAbort?.abort();this.reviewAbort=null;this.reviewStatus.set('unknown');this.busyChange.emit(false);} if(['prepared','recorded','unavailable'].includes(this.reviewStatus()))this.resetReview(); this.sentToken=null;this.sentOrigin=null;this.sentEnvironment=null; }
-  ngOnDestroy():void {this.ngOnChanges();this.token='';}
+  ngOnChanges():void { this.clearList(); this.clearLookup(); this.clearHistory(); if(this.reviewStatus()==='sending'){this.reviewSeq++;this.reviewAbort?.abort();this.reviewAbort=null;this.reviewStatus.set('unknown');this.busyChange.emit(false);} if(['prepared','recorded','unavailable'].includes(this.reviewStatus()))this.resetReview(); if(this.reviewStatus()!=='unknown'||!this.token.trim()){this.sentToken=null;this.sentOrigin=null;this.sentEnvironment=null;} }
+  ngOnDestroy():void {this.ngOnChanges();this.token='';this.sentToken=null;this.sentOrigin=null;this.sentEnvironment=null;}
   private uuid(v:unknown):v is string {return typeof v==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);}
   private revision(v:unknown):v is string {return typeof v==='string'&&/^(0|[1-9][0-9]{0,18})$/.test(v)&&BigInt(v)<=9223372036854775807n;}
   private origin():string {const u=new URL(this.apiOrigin.trim());if(!['https:','http:'].includes(u.protocol)||u.username||u.password||u.pathname!=='/'||u.search||u.hash||(u.protocol==='http:'&&!['localhost','127.0.0.1','[::1]'].includes(u.hostname)))throw new Error('origin');return u.origin;}

@@ -16,7 +16,7 @@ describe('Discord operator reviews',()=>{
   it('keeps an uncertain request and only retries with original identity',async()=>{
     vi.spyOn(crypto,'randomUUID').mockReturnValue(requestId);
     const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[row],hasMore:false,next:null}))).mockRejectedValueOnce(new Error('lost')).mockResolvedValueOnce(new Response(JSON.stringify({recorded:true,replayed:true})));
-    const {fixture,c}=component();await c.list();c.reason='checked';c.prepare(c.rows()[0]);c.confirmed=true;await c.submit();expect(c.reviewStatus()).toBe('unknown');c.resetReview();expect(c.review()).not.toBeNull();c.retryConfirmed=true;c.token='other.token.value';await c.submit(true);expect(mock).toHaveBeenCalledTimes(2);c.token='aaa.bbb.ccc';await c.submit(true);expect(c.reviewStatus()).toBe('recorded');expect(c.recorded()).toBe(true);fixture.destroy();
+    const {fixture,c}=component();await c.list();c.reason='checked';c.prepare(c.rows()[0]);c.confirmed=true;await c.submit();expect(c.reviewStatus()).toBe('unknown');c.resetReview();expect(c.review()).not.toBeNull();c.token='other.token.value';c.ngOnChanges();c.retryConfirmed=true;await c.submit(true);expect(mock).toHaveBeenCalledTimes(2);c.token='aaa.bbb.ccc';c.ngOnChanges();c.retryConfirmed=true;await c.submit(true);expect(c.reviewStatus()).toBe('recorded');expect(c.recorded()).toBe(true);expect(mock.mock.calls[2][1]?.body).toBe(mock.mock.calls[1][1]?.body);fixture.destroy();expect((c as any).sentToken).toBeNull();
   });
   it('rejects malformed pages and ignores stale responses after environment changes',async()=>{
     let resolve!:(r:Response)=>void;const mock=vi.spyOn(globalThis,'fetch').mockImplementationOnce(()=>new Promise(r=>resolve=r)).mockResolvedValueOnce(new Response(JSON.stringify({data:[{...row,failureRevision:'9223372036854775808'}],hasMore:false,next:null})));
@@ -50,6 +50,17 @@ describe('Discord operator reviews',()=>{
 
   it('finds an acknowledged 429 and prepares guided retry',async()=>{
     const limited={...row,attemptState:'rejected',httpStatus:429,retryAfterSeconds:60,retryNotBefore:'2026-11-15T00:01:00Z'};vi.spyOn(crypto,'randomUUID').mockReturnValue(requestId);const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({found:true,...limited,reviewed:true})));const {fixture,c}=component();c.findJob=job;await c.findFailure();expect(c.foundReviewed()).toBe(true);fixture.detectChanges();expect(fixture.nativeElement.textContent).toContain('검토 확인된 상태');expect(fixture.nativeElement.textContent).toContain('60초');c.reason='reviewed';c.prepare(c.rows()[0],'retry_after');expect(c.review()?.decision).toBe('retry_after');expect(mock.mock.calls[0][0]).toContain('/discord-failure?');fixture.destroy();
+  });
+
+  it('recovers an in-flight request after a context change and clears credentials on destroy',async()=>{
+    vi.spyOn(crypto,'randomUUID').mockReturnValue(requestId);let finish!:(response:Response)=>void;
+    const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[row],hasMore:false,next:null}))).mockReturnValueOnce(new Promise(resolve=>finish=resolve));
+    const {fixture,c}=component();await c.list();c.reason='checked';c.prepare(c.rows()[0]);c.confirmed=true;const pending=c.submit();c.environment='other';c.ngOnChanges();finish(new Response(JSON.stringify({recorded:true,replayed:false})));await pending;expect(c.reviewStatus()).toBe('unknown');
+    c.environment='env';c.ngOnChanges();c.retryConfirmed=true;mock.mockResolvedValueOnce(new Response(JSON.stringify({recorded:true,replayed:true})));await c.submit(true);expect(c.reviewStatus()).toBe('recorded');expect(mock.mock.calls[2][1]?.body).toBe(mock.mock.calls[1][1]?.body);fixture.destroy();expect((c as any).sentToken).toBeNull();
+  });
+  it('forgets the original token on logout with an uncertain review',async()=>{
+    vi.spyOn(crypto,'randomUUID').mockReturnValue(requestId);vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[row],hasMore:false,next:null}))).mockRejectedValueOnce(new Error('lost'));
+    const {fixture,c}=component();await c.list();c.reason='checked';c.prepare(c.rows()[0]);c.confirmed=true;await c.submit();c.token='';c.ngOnChanges();expect(c.reviewStatus()).toBe('unknown');expect((c as any).sentToken).toBeNull();fixture.destroy();
   });
 
 });
