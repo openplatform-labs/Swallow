@@ -374,6 +374,9 @@ async fn process_one_inner(
             return Ok(true);
         }
     };
+    if let Some(tag)=provider.account_tag() {
+        tx.execute("UPDATE public.novu_rust_resend_attempts SET account_tag=$3 WHERE environment_id=$1 AND job_id=$2 AND state='dispatching'",&[&environment,&job.id,&tag]).await?;
+    }
     tx.execute("UPDATE public.novu_queue_jobs SET resend_scheduled_at=$3::text::timestamptz WHERE environment_id=$1 AND id=$2", &[&environment,&job.id,&email.resend_scheduled_at]).await?;
     if email.message_id.is_some() {
         tx.execute("UPDATE novu_rust_email_messages SET delivery_state='dispatching' WHERE environment_id=$1 AND email_job_id=$2", &[&environment,&job.id]).await?;

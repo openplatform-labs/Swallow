@@ -19,6 +19,9 @@ bin=env['TEST_CANCEL']; req1='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'; req2='bbbbb
 def run(*args,override=None):
     return subprocess.run([bin,*args],env=override or env,text=True,capture_output=True,timeout=20)
 try:
+    guarded=env.copy();guarded.update(SWALLOW_RESEND_CANCEL_REQUIRE_ACCOUNT_TAG='true',SWALLOW_RESEND_ACCOUNT_TAG='wrong-account')
+    assert run('cancel','cancel-env','99999999-9999-4999-8999-999999999998','44444444-4444-4444-8444-444444444444','wrong',override=guarded).returncode!=0
+    assert not server.calls
     result=run('cancel','cancel-env',req1,job1,'fixture');assert result.returncode==0,(result.stdout,result.stderr)
     assert json.loads(result.stdout)['state']=='confirmed'
     replay=run('cancel','cancel-env',req1,job1,'fixture');assert replay.returncode==0 and json.loads(replay.stdout)['fresh'] is False

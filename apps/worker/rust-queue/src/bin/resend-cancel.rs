@@ -28,6 +28,10 @@ async fn main() -> Result<(),Box<dyn Error+Send+Sync>> {
         let result=Resend::new(config);
         Some(result?)
     } else {None};
+    let tag=if args[0]=="cancel" {match std::env::var("SWALLOW_RESEND_CANCEL_REQUIRE_ACCOUNT_TAG").as_deref(){
+        Ok("true")=>{let v=std::env::var("SWALLOW_RESEND_ACCOUNT_TAG")?;if v.is_empty()||v.len()>128||!v.bytes().all(|b|b.is_ascii_alphanumeric()||matches!(b,b'.'|b'_'|b'-')){return Err("invalid Resend account tag".into());}Some(v)},
+        Ok("false")|Err(std::env::VarError::NotPresent)=>None,_=>return Err("invalid account tag guard".into()),
+    }}else{None};
     let (config,tls)=novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let (db,connection)=config.connect(tls).await?;
     tokio::spawn(async move {if connection.await.is_err(){eprintln!("database connection failed");}});
@@ -51,7 +55,7 @@ async fn main() -> Result<(),Box<dyn Error+Send+Sync>> {
         println!("{}",row.get::<_,serde_json::Value>(0));return Ok(());
     }
     let job=Uuid::parse_str(&args[3])?;
-    let row=db.query_one("SELECT public.novu_rust_resend_cancel_reserve($1,$2,$3,$4)",&[&args[1],&request,&job,&args[4]]).await?;
+    let row=if let Some(tag)=&tag {db.query_one("SELECT public.novu_rust_resend_cancel_reserve_tagged($1,$2,$3,$4,$5)",&[&args[1],&request,&job,&args[4],tag]).await?}else{db.query_one("SELECT public.novu_rust_resend_cancel_reserve($1,$2,$3,$4)",&[&args[1],&request,&job,&args[4]]).await?};
     let reserved:serde_json::Value=row.get(0);
     if reserved["fresh"]!=true {println!("{reserved}");if reserved["state"]!="confirmed" {std::process::exit(2);}return Ok(());}
     let id=reserved["providerId"].as_str().ok_or("missing provider ID")?;

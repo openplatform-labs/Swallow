@@ -16,10 +16,12 @@ cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-wo
 CREATE ROLE cancel_fixture LOGIN; CREATE ROLE cancel_unprivileged LOGIN; CREATE ROLE cancel_resolver LOGIN; CREATE ROLE cancel_submitter LOGIN; CREATE ROLE cancel_worker LOGIN;
 GRANT USAGE ON SCHEMA public TO cancel_fixture,cancel_unprivileged,cancel_resolver,cancel_submitter,cancel_worker;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_reserve(text,uuid,uuid,text),public.novu_rust_resend_cancel_finish(text,uuid,text,integer),public.novu_rust_resend_cancel_get(text,uuid) TO cancel_fixture,cancel_unprivileged;
+GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_reserve_tagged(text,uuid,uuid,text,text) TO cancel_fixture,cancel_unprivileged;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_resolve(text,uuid,uuid,text,text),public.novu_rust_resend_cancel_resolution_get(text,uuid),public.novu_rust_resend_cancel_get(text,uuid) TO cancel_resolver,cancel_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_list(text,integer,uuid) TO cancel_resolver,cancel_fixture,cancel_unprivileged;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_enqueue(text,uuid,uuid,text),public.novu_rust_resend_cancel_command_get(text,uuid) TO cancel_submitter,cancel_unprivileged;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_claim(text),public.novu_rust_resend_cancel_finish(text,uuid,text,integer) TO cancel_worker;
+GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_claim_tagged(text,text) TO cancel_worker;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_health(text,integer),public.novu_rust_reserve_alert_v3(text,text,text,integer,bigint,bigint,bigint,bigint),public.novu_rust_observe_alert_conditions_v3(text,text,text,bigint,bigint,bigint,bigint) TO cancel_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_command_health(text,integer),public.novu_rust_resend_cancel_command_failed_list(text,uuid) TO cancel_fixture,cancel_unprivileged;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_command_ack(text,uuid,timestamptz,text) TO cancel_resolver,cancel_unprivileged;
@@ -38,14 +40,20 @@ INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status,resend_
  ('33333333-3333-4333-8333-333333333333','cancel-env','experimental_resend_email','{}','completed',clock_timestamp()+interval '1 hour'),
  ('44444444-4444-4444-8444-444444444444','cancel-env','experimental_resend_email','{}','completed',clock_timestamp()+interval '1 hour'),
  ('55555555-5555-4555-8555-555555555555','cancel-env','experimental_resend_email','{}','completed',clock_timestamp()+interval '1 hour'),
- ('66666666-6666-4666-8666-666666666666','cancel-env','experimental_resend_email','{}','completed',clock_timestamp()-interval '1 hour');
+ ('66666666-6666-4666-8666-666666666666','cancel-env','experimental_resend_email','{}','completed',clock_timestamp()-interval '1 hour'),
+ ('77777777-7777-4777-8777-777777777777','cancel-env','experimental_resend_email','{}','completed',clock_timestamp()+interval '1 hour'),
+ ('88888888-8888-4888-8888-888888888888','cancel-env','experimental_resend_email','{}','completed',clock_timestamp()+interval '1 hour');
 INSERT INTO public.novu_rust_resend_attempts(job_id,environment_id,state,provider_message_id) VALUES
  ('11111111-1111-4111-8111-111111111111','cancel-env','accepted','fixture-one'),
  ('22222222-2222-4222-8222-222222222222','cancel-env','accepted','fixture-two'),
  ('33333333-3333-4333-8333-333333333333','cancel-env','accepted','fixture-three'),
  ('44444444-4444-4444-8444-444444444444','cancel-env','accepted','fixture-four'),
  ('55555555-5555-4555-8555-555555555555','cancel-env','accepted','fixture-five'),
- ('66666666-6666-4666-8666-666666666666','cancel-env','accepted','fixture-six');
+ ('66666666-6666-4666-8666-666666666666','cancel-env','accepted','fixture-six'),
+ ('77777777-7777-4777-8777-777777777777','cancel-env','accepted','fixture-seven'),
+ ('88888888-8888-4888-8888-888888888888','cancel-env','accepted','fixture-eight');
+UPDATE public.novu_rust_resend_attempts SET account_tag='account-a' WHERE job_id IN ('44444444-4444-4444-8444-444444444444','55555555-5555-4555-8555-555555555555','66666666-6666-4666-8666-666666666666');
+UPDATE public.novu_rust_resend_attempts SET account_tag='account-b' WHERE job_id='77777777-7777-4777-8777-777777777777';
 SQL
 cargo build --quiet --locked --manifest-path "$WORKER/Cargo.toml" --features test-mocks --bin resend-cancel
 cp "$WORKER/target/debug/resend-cancel" "$DIR/cancel-fixture"

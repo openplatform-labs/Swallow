@@ -56,7 +56,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args): pass
 server=HTTPServer(('127.0.0.1',0),Handler);server.timeout=0.1;server.body=None
 thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
-env=os.environ.copy();env.update(NOVU_RESEND_ENVIRONMENT_ID='schedule-env',NOVU_RESEND_API_KEY='fixture',NOVU_RESEND_FROM='sender@example.test',SWALLOW_TEST_RESEND_ENDPOINT='http://127.0.0.1:%d/emails'%server.server_port)
+env=os.environ.copy();env.update(NOVU_RESEND_ENVIRONMENT_ID='schedule-env',NOVU_RESEND_API_KEY='fixture',NOVU_RESEND_FROM='sender@example.test',SWALLOW_RESEND_ACCOUNT_TAG='account-a',SWALLOW_TEST_RESEND_ENDPOINT='http://127.0.0.1:%d/emails'%server.server_port)
 worker=subprocess.Popen([env['TEST_WORKER']],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
 try:
     deadline=time.monotonic()+20
@@ -67,7 +67,7 @@ try:
     assert server.path_received=='/emails'
     assert server.body.get('scheduled_at')=='2030-01-01T09:00:00+09:00',server.body
     assert server.body.get('to')==['recipient@example.test'],server.body
-    query="SELECT count(*) FROM public.novu_rust_resend_attempts WHERE environment_id='schedule-env' AND state='accepted' AND provider_message_id='fixture-scheduled-id'"
+    query="SELECT count(*) FROM public.novu_rust_resend_attempts WHERE environment_id='schedule-env' AND state='accepted' AND provider_message_id='fixture-scheduled-id' AND account_tag='account-a'"
     while time.monotonic()<deadline:
         result=subprocess.check_output([env['TEST_PSQL'],env['DATABASE_URL'],'-qAtc',query],text=True).strip()
         if result=='1': break

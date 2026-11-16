@@ -140,6 +140,7 @@ pub struct Resend {
     http: Client,
     endpoint: String,
     config: Config,
+    account_tag: Option<String>,
 }
 impl Resend {
     pub(crate) fn binding_parts(&self) -> [&str; 4] {
@@ -172,8 +173,15 @@ impl Resend {
             http,
             endpoint: endpoint.to_owned(),
             config,
+            account_tag: None,
         })
     }
+    /// Set an operator-provided account label; it is not provider authentication.
+    pub fn set_account_tag(&mut self, tag: Option<String>) -> Result<(), SendError> {
+        if tag.as_ref().is_some_and(|v|v.is_empty()||v.len()>128||!v.bytes().all(|b|b.is_ascii_alphanumeric()||matches!(b,b'.'|b'_'|b'-'))) {return Err(SendError::InvalidConfiguration);}
+        self.account_tag=tag;Ok(())
+    }
+    pub(crate) fn account_tag(&self)->Option<&str>{self.account_tag.as_deref()}
     /// Reload before claiming a new job. Failed validation leaves the old key
     /// in memory; the caller must not dispatch while this method fails.
     pub fn reload_api_key_file(&mut self, path: &Path) -> Result<(), SendError> {
@@ -302,6 +310,13 @@ mod tests {
             html: "<b>Hi</b>".into(),
             ..Default::default()
         }
+    }
+    #[test]
+    fn account_tag_validation_is_bounded() {
+        let mut provider=Resend::new(config()).unwrap();
+        for tag in ["", "bad tag", "bad\nvalue", &"a".repeat(129)] {assert_eq!(provider.set_account_tag(Some(tag.into())),Err(SendError::InvalidConfiguration));}
+        provider.set_account_tag(Some("account-A_1.prod".into())).unwrap();assert_eq!(provider.account_tag(),Some("account-A_1.prod"));
+        provider.set_account_tag(None).unwrap();assert_eq!(provider.account_tag(),None);
     }
     #[tokio::test]
     async fn cancellation_is_bounded_and_ambiguous_results_are_not_confirmed() {

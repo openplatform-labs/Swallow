@@ -15,7 +15,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200);self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
     def log_message(self,*args):pass
 server=ThreadingHTTPServer(('127.0.0.1',0),Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
-env={**os.environ,'DATABASE_URL':worker_db,'NOVU_RESEND_ENVIRONMENT_ID':'cancel-env','NOVU_RESEND_API_KEY':'fixture','SWALLOW_TEST_RESEND_ENDPOINT':'http://127.0.0.1:%d/emails'%server.server_port};children=[]
+env={**os.environ,'DATABASE_URL':worker_db,'NOVU_RESEND_ENVIRONMENT_ID':'cancel-env','NOVU_RESEND_API_KEY':'fixture','SWALLOW_RESEND_CANCEL_REQUIRE_ACCOUNT_TAG':'true','SWALLOW_RESEND_ACCOUNT_TAG':'account-a','SWALLOW_TEST_RESEND_ENDPOINT':'http://127.0.0.1:%d/emails'%server.server_port};children=[]
 def start():
     p=subprocess.Popen([worker],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE);children.append(p);return p
 def wait(predicate):
@@ -47,6 +47,12 @@ try:
     assert sql("SELECT state FROM public.novu_rust_resend_cancel_commands WHERE request_id='%s'"%r2)=='dispatching'
     sql("SELECT public.novu_rust_resend_cancel_resolve('cancel-env','aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab','%s','not_cancelled','verified')"%r2,resolver)
     assert sql("SELECT state FROM public.novu_rust_resend_cancel_commands WHERE request_id='%s'"%r2)=='finished'
+    mismatch='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaad';job7='77777777-7777-4777-8777-777777777777';enqueue(mismatch,job7)
+    wait(lambda:sql("SELECT state FROM public.novu_rust_resend_cancel_commands WHERE request_id='%s'"%mismatch)=='failed')
+    assert '/emails/fixture-seven/cancel' not in calls
+    missing='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaae';job8='88888888-8888-4888-8888-888888888888';enqueue(missing,job8)
+    wait(lambda:sql("SELECT state FROM public.novu_rust_resend_cancel_commands WHERE request_id='%s'"%missing)=='failed')
+    assert '/emails/fixture-eight/cancel' not in calls
     # An expired scheduled job becomes a visible failed command with no network call.
     fail='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaac';job6='66666666-6666-4666-8666-666666666666';enqueue(fail,job6)
     wait(lambda:sql("SELECT state FROM public.novu_rust_resend_cancel_commands WHERE request_id='%s'"%fail)=='failed')
@@ -57,21 +63,21 @@ try:
     monitor={**os.environ,'DATABASE_URL':admin.replace('postgres://postgres@','postgres://cancel_fixture@')}
     reconcile=os.path.join(os.environ['TEST_WORKER_DIR'],'delivery-reconcile')
     def cli(args,env=monitor):return subprocess.run([reconcile,*args],env=env,capture_output=True,text=True,timeout=10)
-    health=cli(['check-resend-cancel-commands','cancel-env','60']);assert health.returncode==2 and json.loads(health.stdout)=={'pending':1,'overdue':1,'unreviewed':1}
+    health=cli(['check-resend-cancel-commands','cancel-env','60']);assert health.returncode==2 and json.loads(health.stdout)=={'pending':1,'overdue':1,'unreviewed':3}
     assert cli(['check-resend-cancel-commands','cancel-other','60']).returncode!=0
-    listing=cli(['list-resend-cancel-failed','cancel-env']);rows=json.loads(listing.stdout)['data'];assert len(rows)==1 and rows[0]['requestId']==fail
-    assert cli(['ack-resend-cancel-failed','cancel-env',fail,rows[0]['failedAt'],'checked'],monitor).returncode!=0
+    listing=cli(['list-resend-cancel-failed','cancel-env']);rows=json.loads(listing.stdout)['data'];assert len(rows)==3;failed=next(r for r in rows if r['requestId']==fail)
+    assert cli(['ack-resend-cancel-failed','cancel-env',fail,failed['failedAt'],'checked'],monitor).returncode!=0
     reviewer={**monitor,'DATABASE_URL':resolver};assert cli(['ack-resend-cancel-failed','cancel-env',fail,'2020-01-01T00:00:00Z','checked'],reviewer).returncode!=0
     alert_env={**monitor,'SWALLOW_ALERT_RESEND_ENABLED':'false','SWALLOW_ALERT_RESEND_CANCEL_COMMAND_GRACE_SECONDS':'60','SWALLOW_ALERT_SCOPED_DELIVERY':'true','SWALLOW_ALERT_COOLDOWN_POLICY':'new-condition','SWALLOW_ALERT_CONDITIONS_V3':'true','SWALLOW_ALERT_SLACK_WEBHOOK':'https://hooks.slack.com/services/A/B/C','SWALLOW_ALERT_SLACK_TARGET_ID':'blocked'}
     alert=subprocess.run([os.path.join(os.environ['TEST_WORKER_DIR'],'send-delivery-alert'),'cancel-env','300','120','60'],env=alert_env,capture_output=True,text=True,timeout=10)
     assert alert.returncode==2 and 'requires operator review' in alert.stderr,(alert.stdout,alert.stderr)
     sql("CREATE FUNCTION public.fail_cancel_review() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$; CREATE TRIGGER fail_cancel_review BEFORE INSERT ON public.novu_rust_resend_cancel_command_reviews FOR EACH ROW EXECUTE FUNCTION public.fail_cancel_review()")
-    assert cli(['ack-resend-cancel-failed','cancel-env',fail,rows[0]['failedAt'],'checked'],reviewer).returncode!=0
-    assert json.loads(cli(['check-resend-cancel-commands','cancel-env','60']).stdout)['unreviewed']==1
+    assert cli(['ack-resend-cancel-failed','cancel-env',fail,failed['failedAt'],'checked'],reviewer).returncode!=0
+    assert json.loads(cli(['check-resend-cancel-commands','cancel-env','60']).stdout)['unreviewed']==3
     sql('DROP TRIGGER fail_cancel_review ON public.novu_rust_resend_cancel_command_reviews')
-    ack=cli(['ack-resend-cancel-failed','cancel-env',fail,rows[0]['failedAt'],'checked'],reviewer);assert ack.returncode==0 and json.loads(ack.stdout)['recorded'] is True
-    assert json.loads(cli(['check-resend-cancel-commands','cancel-env','60']).stdout)=={'pending':1,'overdue':1,'unreviewed':0}
-    assert json.loads(cli(['ack-resend-cancel-failed','cancel-env',fail,rows[0]['failedAt'],'checked'],reviewer).stdout)['recorded'] is False
+    ack=cli(['ack-resend-cancel-failed','cancel-env',fail,failed['failedAt'],'checked'],reviewer);assert ack.returncode==0 and json.loads(ack.stdout)['recorded'] is True
+    assert json.loads(cli(['check-resend-cancel-commands','cancel-env','60']).stdout)=={'pending':1,'overdue':1,'unreviewed':2}
+    assert json.loads(cli(['ack-resend-cancel-failed','cancel-env',fail,failed['failedAt'],'checked'],reviewer).stdout)['recorded'] is False
 finally:
     release.set()
     for p in children:

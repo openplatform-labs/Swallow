@@ -60,6 +60,8 @@ async fn run(
         from: std::env::var("NOVU_RESEND_FROM")?,
         sender_name: std::env::var("NOVU_RESEND_SENDER_NAME").unwrap_or_default(),
     })?;
+    let account_tag=match std::env::var("SWALLOW_RESEND_ACCOUNT_TAG") {Ok(v)=>Some(v),Err(std::env::VarError::NotPresent)=>None,Err(_)=>return Err("invalid Resend account tag".into())};
+    provider.set_account_tag(account_tag)?;
     let (config, tls) = novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let timeout = match std::env::var("NOVU_RESEND_DB_TIMEOUT_SECONDS") {
         Ok(value) => value

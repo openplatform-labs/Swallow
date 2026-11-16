@@ -16,13 +16,15 @@ async fn run(stop:novu_postgres_queue::shutdown::Stop)->Result<(),Box<dyn Error+
     };
     #[cfg(not(feature="test-mocks"))]
     let provider=Resend::new(cfg)?;
+    let require_tag=match std::env::var("SWALLOW_RESEND_CANCEL_REQUIRE_ACCOUNT_TAG").as_deref(){Ok("true")=>true,Ok("false")|Err(std::env::VarError::NotPresent)=>false,_=>return Err("invalid account tag guard".into())};
+    let tag=if require_tag {let v=std::env::var("SWALLOW_RESEND_ACCOUNT_TAG")?;if v.is_empty()||v.len()>128||!v.bytes().all(|b|b.is_ascii_alphanumeric()||matches!(b,b'.'|b'_'|b'-')){return Err("invalid Resend account tag".into());}Some(v)}else{None};
     let (config,tls)=novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let timeout=Duration::from_secs(30);
     while !stop.requested(){
         if let Ok(Ok((db,driver)))=tokio::time::timeout(timeout,config.connect(tls.clone())).await {
             let task=tokio::spawn(driver);
             while !stop.requested(){
-                let result=tokio::time::timeout(timeout,db.query_one("SELECT public.novu_rust_resend_cancel_claim($1)",&[&environment])).await;
+                let result=if let Some(tag)=&tag {tokio::time::timeout(timeout,db.query_one("SELECT public.novu_rust_resend_cancel_claim_tagged($1,$2)",&[&environment,tag])).await}else{tokio::time::timeout(timeout,db.query_one("SELECT public.novu_rust_resend_cancel_claim($1)",&[&environment])).await};
                 let row=match result {Ok(Ok(row))=>row,_=>{eprintln!("cancellation claim failed; reconnecting");break;}};
                 let command:Option<serde_json::Value>=row.get(0);
                 let Some(command)=command else {stop.wait(Duration::from_secs(1)).await;continue;};
