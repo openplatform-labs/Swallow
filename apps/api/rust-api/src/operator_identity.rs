@@ -27,6 +27,7 @@ enum Lookup {
     ResendCancelList,
     ResendCancelDetail,
     ResendCancelCommand,
+    ResendCancelCommandReviewGet,
     ResendCancelCommandHealth,
     ResendCancelCommandFailures,
     ResendAutoHealth,
@@ -474,6 +475,7 @@ pub(super) async fn discord_cooldown_health(State(db):State<Arc<Client>>,headers
 }
 pub(super) async fn resend_cancel_command_health(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {query(db,headers,uri,verifier,Lookup::ResendCancelCommandHealth).await}
 pub(super) async fn resend_cancel_command_failures(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {query(db,headers,uri,verifier,Lookup::ResendCancelCommandFailures).await}
+pub(super) async fn resend_cancel_command_review_get(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {query(db,headers,uri,verifier,Lookup::ResendCancelCommandReviewGet).await}
 pub(super) async fn resend_cancel_command_get(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
     query(db,headers,uri,verifier,Lookup::ResendCancelCommand).await
 }
@@ -2949,7 +2951,7 @@ async fn query(
         Lookup::DiscordRetryList => &["environmentId", "graceSeconds", "filter", "after"],
         Lookup::ResendCancelList | Lookup::ResendCancelCommandFailures => &["environmentId", "graceSeconds", "after"],
         Lookup::ResendCancelCommandHealth => &["environmentId", "graceSeconds"],
-        Lookup::ResendCancelDetail | Lookup::ResendCancelCommand => &["environmentId", "requestId"],
+        Lookup::ResendCancelDetail | Lookup::ResendCancelCommand | Lookup::ResendCancelCommandReviewGet => &["environmentId", "requestId"],
         Lookup::FcmUnrecordedClaimHealth => &["environmentId", "minGap", "graceSeconds"],
         Lookup::FcmUnrecordedClaimList => &["environmentId", "minGap", "graceSeconds", "after"],
         Lookup::FcmPartialHealth => &["environmentId", "windowSeconds"],
@@ -3177,6 +3179,10 @@ async fn query(
             let after=match params.get("after") {Some(v)=>match Uuid::parse_str(v){Ok(v)=>Some(v),Err(_)=>return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request")},None=>None};
             let list=matches!(lookup,Lookup::ResendCancelCommandFailures);
             guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_resend_cancel_command_monitor($1,$2,$3,$4,$5,$6,$7,$8)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&grace,&list,&after]).await
+        }
+        Lookup::ResendCancelCommandReviewGet => {
+            let Some(request)=params.get("requestId").and_then(|v|Uuid::parse_str(v).ok()) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};
+            guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_resend_cancel_command_review_get($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request]).await
         }
         Lookup::ResendCancelCommand => {
             let Some(request)=params.get("requestId").and_then(|v|Uuid::parse_str(v).ok()) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};
@@ -5714,6 +5720,26 @@ pub(super) async fn smtp_auto_grant_audit(State(db):State<Arc<Client>>,headers:H
 pub(super) async fn discord_retry_grant_read(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response { query(db,headers,uri,verifier,Lookup::DiscordRetryGrantRead).await }
 pub(super) async fn discord_retry_grant_request(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response { query(db,headers,uri,verifier,Lookup::DiscordRetryGrantRequest).await }
 pub(super) async fn discord_retry_grant_audit(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response { query(db,headers,uri,verifier,Lookup::DiscordRetryGrantAudit).await }
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all="camelCase",deny_unknown_fields)]
+struct ResendCancelCommandReviewBody {review_id:String,command_id:String,failed_at:String,reason:String}
+pub(super) async fn resend_cancel_command_review(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>,body:Bytes)->Response {
+    let identity=match authenticate(&db,&headers,verifier).await {Ok(v)=>v,Err(status)=>return failure(status,uri.path())};
+    let params:Vec<_>=form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).collect();
+    if params.len()!=1||params[0].0!="environmentId"||params[0].1.is_empty()||params[0].1.len()>512||params[0].1.contains('\0'){return failure(StatusCode::BAD_REQUEST,uri.path());}
+    let Some(input)=(body.len()<=4096).then(||serde_json::from_slice::<ResendCancelCommandReviewBody>(&body).ok()).flatten() else{return failure(StatusCode::BAD_REQUEST,uri.path());};
+    if input.reason.trim().is_empty()||input.reason.len()>500||input.reason.chars().any(char::is_control)||input.failed_at.is_empty()||input.failed_at.len()>128||input.failed_at.chars().any(char::is_control){return failure(StatusCode::BAD_REQUEST,uri.path());}
+    let (Ok(review),Ok(command),Ok(exp))=(Uuid::parse_str(&input.review_id),Uuid::parse_str(&input.command_id),i64::try_from(identity.expires_at)) else{return failure(StatusCode::BAD_REQUEST,uri.path());};
+    let env=params[0].1.as_ref();
+    match guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_resend_cancel_command_review($1,$2,$3,$4,$5,$6,$7,$8,$9)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&review,&command,&input.failed_at,&input.reason]).await {
+        Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
+        Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
+        Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
+        Err(e) if e.code().is_some_and(|c|matches!(c.code(),"P4090"|"23505"|"55000"|"40001"))=>{let mut response=error_at(StatusCode::CONFLICT,"Review conflict","Conflict",uri.path()).into_response();response.headers_mut().insert(header::CACHE_CONTROL,header::HeaderValue::from_static("no-store"));response},
+        Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path()),
+    }
+}
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all="camelCase",deny_unknown_fields)]

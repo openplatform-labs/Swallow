@@ -19,7 +19,7 @@ def grant(method,path,body=None):
     except urllib.error.HTTPError as e:return e.code,json.loads(e.read())
 target=os.environ['TEST_TARGET_JWT']
 target_params={'environmentId':'cancel-api-env','targetIssuer':'https://issuer.test','targetSubject':'target','targetClientId':'console','resource':'resend-cancel'}
-for n,permission in enumerate(['list','detail','confirmed','not_cancelled','submit','command-health','command-list'],1):
+for n,permission in enumerate(['list','detail','confirmed','not_cancelled','submit','command-health','command-list','command-review'],1):
     params={**target_params,'permission':permission};status,data=grant('GET','?'+urllib.parse.urlencode(params));assert status==200 and data['targetExists'] and not data['granted']
     body={'requestId':'11111111-1111-4111-8111-'+str(n).zfill(12),'targetIssuer':'https://issuer.test','targetSubject':'target','targetClientId':'console','resource':'resend-cancel','permission':permission,'expected':False,'desired':True,'reason':'delegate'}
     if n==1:
@@ -35,7 +35,7 @@ for n,permission in enumerate(['list','detail','confirmed','not_cancelled','subm
     assert grant('PUT','?environmentId=cancel-api-env',body)[1]['replayed']
     assert grant('PUT','?environmentId=cancel-api-env',{**body,'reason':'changed'})[0]==409
     assert grant('GET','?'+urllib.parse.urlencode(params))[1]['granted']
-status,audit=grant('GET','/audit?environmentId=cancel-api-env');assert status==200 and len(audit['data'])==9
+status,audit=grant('GET','/audit?environmentId=cancel-api-env');assert status==200 and len(audit['data'])==10
 query_target='environmentId=cancel-api-env&graceSeconds=60';assert get(query_target,target)[0]==200
 self_change={**body,'requestId':'22222222-2222-4222-8222-222222222222','targetSubject':'fixture'};assert grant('PUT','?environmentId=cancel-api-env',self_change)[0] in (401,403)
 revoke={**body,'requestId':'33333333-3333-4333-8333-333333333333','permission':'list','expected':True,'desired':False};assert grant('PUT','?environmentId=cancel-api-env',revoke)[0]==200
@@ -43,6 +43,26 @@ assert get(query_target,target)[0] in (401,403)
 query='environmentId=cancel-api-env&graceSeconds=60'
 status,monitor=get(query,endpoint='resend-cancel-command-health');assert status==200 and monitor['unreviewed']==1
 status,failures=get(query,endpoint='resend-cancel-command-failures');assert status==200 and len(failures['data'])==1 and failures['data'][0]['requestId']=='ffffffff-ffff-4fff-8fff-ffffffffffff'
+def review(body):
+    req=urllib.request.Request(origin+'/v1/experimental/operator/resend-cancel-command-review?environmentId=cancel-api-env',data=json.dumps(body).encode(),headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'},method='POST')
+    try:
+        with urllib.request.urlopen(req,timeout=5) as r:return r.status,json.loads(r.read())
+    except urllib.error.HTTPError as e:return e.code,json.loads(e.read())
+review_body={'reviewId':'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1','commandId':failures['data'][0]['requestId'],'failedAt':failures['data'][0]['failedAt'],'reason':'checked failure'}
+assert review({**review_body,'failedAt':'2020-01-01T00:00:00Z'})[0]==409
+sql("CREATE FUNCTION public.fail_review_actor() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$; CREATE TRIGGER fail_review_actor BEFORE INSERT ON public.novu_rust_operator_jwt_resend_cancel_command_reviews FOR EACH ROW EXECUTE FUNCTION public.fail_review_actor()")
+assert review(review_body)[0]==500
+assert get(query,endpoint='resend-cancel-command-health')[1]['unreviewed']==1
+sql('DROP TRIGGER fail_review_actor ON public.novu_rust_operator_jwt_resend_cancel_command_reviews')
+status,result=review(review_body);assert status==200 and not result['replayed']
+assert review(review_body)[1]['replayed']
+assert review({**review_body,'reason':'different'})[0]==409
+assert get('environmentId=cancel-api-env&requestId='+review_body['reviewId'],endpoint='resend-cancel-command-review')[1]['review']['reason']=='checked failure'
+assert get(query,endpoint='resend-cancel-command-health')[1]['unreviewed']==0
+sql("DELETE FROM public.novu_rust_operator_jwt_resend_cancel_command_review_grants WHERE environment_id='cancel-api-env' AND subject='fixture'")
+assert review(review_body)[0] in (401,403)
+sql("INSERT INTO public.novu_rust_operator_jwt_resend_cancel_command_review_grants VALUES('https://issuer.test','fixture','console','cancel-api-env'); DELETE FROM public.novu_rust_resend_cancel_command_reviewers WHERE environment_id='cancel-api-env' AND database_principal='cancel_api_fixture'")
+assert review(review_body)[0] in (401,403)
 sql("DELETE FROM public.novu_rust_operator_jwt_resend_cancel_command_health_grants WHERE environment_id='cancel-api-env' AND subject='fixture'")
 assert get(query,endpoint='resend-cancel-command-health')[0] in (401,403) and get(query,endpoint='resend-cancel-command-failures')[0]==200
 sql("INSERT INTO public.novu_rust_operator_jwt_resend_cancel_command_health_grants VALUES('https://issuer.test','fixture','console','cancel-api-env'); DELETE FROM public.novu_rust_operator_jwt_resend_cancel_command_failed_list_grants WHERE environment_id='cancel-api-env' AND subject='fixture'")
