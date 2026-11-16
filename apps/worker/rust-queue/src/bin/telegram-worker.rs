@@ -19,9 +19,6 @@ async fn run(
         Ok("false") | Err(std::env::VarError::NotPresent) => false,
         _ => return Err("invalid Telegram workflow setting".into()),
     };
-    if workflow && scoped {
-        return Err("Telegram workflow is not supported by scoped workers".into());
-    }
     let environment = std::env::var("NOVU_TELEGRAM_ENVIRONMENT_ID")?;
     if environment.trim().is_empty() {
         return Err("Telegram environment required".into());

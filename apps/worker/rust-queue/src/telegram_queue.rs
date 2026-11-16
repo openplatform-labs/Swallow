@@ -131,8 +131,20 @@ async fn claim_scoped(
     db: &Client,
     env: &str,
     destination: &str,
+    workflow: bool,
 ) -> Result<Option<ClaimedJob>, Error> {
     let token = Uuid::new_v4();
+    if workflow {
+        let row = db.query_opt("SELECT id,kind,payload,attempts FROM public.novu_rust_telegram_workflow_claim($1,$2,$3)", &[&env,&destination,&token]).await?;
+        return Ok(row.map(|r| ClaimedJob {
+            id: r.get(0),
+            environment_id: env.to_owned(),
+            kind: r.get(1),
+            payload: r.get(2),
+            attempts: r.get(3),
+            lease_token: token,
+        }));
+    }
     let row = db
         .query_opt(
             "SELECT id,payload,attempts FROM public.novu_rust_telegram_worker_claim($1,$2,$3)",
@@ -169,9 +181,6 @@ pub async fn process_one_with_scope(
 ) -> Result<bool, Error> {
     process_one_with_workflow(db, env, destination, provider, scoped, false).await
 }
-async fn invalid_scoped_workflow(db: &Client) -> Error {
-    db.query_one("SELECT 1/0", &[]).await.unwrap_err()
-}
 pub async fn process_one_with_workflow(
     db: &mut Client,
     env: &str,
@@ -180,16 +189,97 @@ pub async fn process_one_with_workflow(
     scoped: bool,
     workflow: bool,
 ) -> Result<bool, Error> {
-    if scoped && workflow {
-        return Err(invalid_scoped_workflow(db).await);
-    }
     let claimed = if scoped {
-        claim_scoped(db, env, destination).await?
+        claim_scoped(db, env, destination, workflow).await?
     } else {
         claim(db, env, destination, workflow).await?
     };
     let Some(job) = claimed else { return Ok(false) };
-    let body = if job.kind == WORKFLOW_KIND {
+    let body = if job.kind == WORKFLOW_KIND && scoped {
+        let message = serde_json::from_value::<WorkflowMessage>(job.payload.clone());
+        let tx = db.transaction().await?;
+        let result: Result<Value, &str> = match message {
+            Ok(ref m) if m.destination == destination => {
+                let snapshot: Option<Value> = tx
+                    .query_one(
+                        "SELECT public.novu_rust_telegram_workflow_snapshot($1,$2,$3,$4,$5)",
+                        &[
+                            &env,
+                            &destination,
+                            &job.id,
+                            &job.lease_token,
+                            &crate::allow_recreated_subscriber(),
+                        ],
+                    )
+                    .await?
+                    .get(0);
+                let Some(snapshot) = snapshot else {
+                    tx.rollback().await?;
+                    return Ok(true);
+                };
+                if let Some(reason) = snapshot.get("error").and_then(Value::as_str) {
+                    // Only fixed diagnostics from the database are forwarded below.
+                    let reason: &'static str = match reason {
+                        "subscriber not found" => "subscriber not found",
+                        "subscriber identity changed" => "subscriber identity changed",
+                        "invalid subscriber profile" => "invalid subscriber profile",
+                        "chat preference disabled" => "chat preference disabled",
+                        "Telegram workflow step changed or disabled" => {
+                            "Telegram workflow step changed or disabled"
+                        }
+                        "Telegram endpoint changed or deleted" => {
+                            "Telegram endpoint changed or deleted"
+                        }
+                        "actor identity changed or missing" => "actor identity changed or missing",
+                        _ => "invalid Telegram workflow job",
+                    };
+                    Err(reason)
+                } else {
+                    let actor = snapshot.get("actor").filter(|v| !v.is_null());
+                    match novu_rust_contracts::template::render_in_app_with_actor(
+                        &m.workflow_context.content_template,
+                        &m.workflow_context.payload,
+                        &snapshot["profile"],
+                        &snapshot["contexts"],
+                        actor,
+                    ) {
+                        Ok(text) => request_body(&Message {
+                            destination: m.destination.clone(),
+                            chat_id: snapshot["chatId"].as_str().unwrap_or("").to_owned(),
+                            text,
+                            passthrough: Map::new(),
+                        })
+                        .map_err(|_| "invalid Telegram request"),
+                        Err(_) => Err("unsupported Telegram template or input"),
+                    }
+                }
+            }
+            _ => Err("invalid Telegram workflow job"),
+        };
+        let reason = result.as_ref().err().copied();
+        let prepared: bool = tx
+            .query_one(
+                "SELECT public.novu_rust_telegram_workflow_prepare($1,$2,$3,$4,$5,$6)",
+                &[
+                    &env,
+                    &destination,
+                    &job.id,
+                    &job.lease_token,
+                    &reason,
+                    &crate::allow_recreated_subscriber(),
+                ],
+            )
+            .await?
+            .get(0);
+        tx.commit().await?;
+        if !prepared {
+            return Ok(true);
+        }
+        match result {
+            Ok(body) => body,
+            Err(_) => return Ok(true),
+        }
+    } else if job.kind == WORKFLOW_KIND {
         let message = serde_json::from_value::<WorkflowMessage>(job.payload.clone());
         let tx = db.transaction().await?;
         let result = match message {
@@ -357,13 +447,14 @@ pub async fn recover_expired_with_workflow(
     scoped: bool,
     workflow: bool,
 ) -> Result<usize, Error> {
-    if scoped && workflow {
-        return Err(invalid_scoped_workflow(db).await);
-    }
     if scoped {
         let n: i32 = db
             .query_one(
-                "SELECT public.novu_rust_telegram_worker_recover($1,$2)",
+                if workflow {
+                    "SELECT public.novu_rust_telegram_workflow_recover($1,$2)"
+                } else {
+                    "SELECT public.novu_rust_telegram_worker_recover($1,$2)"
+                },
                 &[&env, &destination],
             )
             .await?
