@@ -15,6 +15,7 @@ cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-wo
 "$TEST_PG_BIN/psql" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
 CREATE ROLE cancel_fixture LOGIN; CREATE ROLE cancel_unprivileged LOGIN; CREATE ROLE cancel_resolver LOGIN; CREATE ROLE cancel_submitter LOGIN; CREATE ROLE cancel_worker LOGIN;
 GRANT USAGE ON SCHEMA public TO cancel_fixture,cancel_unprivileged,cancel_resolver,cancel_submitter,cancel_worker;
+GRANT EXECUTE ON FUNCTION public.novu_rust_channel_result(text,uuid,text) TO cancel_fixture,cancel_unprivileged;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_reserve(text,uuid,uuid,text),public.novu_rust_resend_cancel_finish(text,uuid,text,integer),public.novu_rust_resend_cancel_get(text,uuid) TO cancel_fixture,cancel_unprivileged;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_reserve_tagged(text,uuid,uuid,text,text) TO cancel_fixture,cancel_unprivileged;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_resolve(text,uuid,uuid,text,text),public.novu_rust_resend_cancel_resolution_get(text,uuid),public.novu_rust_resend_cancel_get(text,uuid) TO cancel_resolver,cancel_fixture;

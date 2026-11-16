@@ -84,6 +84,24 @@ try:
     assert json.loads(run('get','cancel-env',request3).stdout)['request']['state']=='confirmed'
     assert run('cancel','cancel-env','99999999-9999-4999-8999-999999999999','33333333-3333-4333-8333-333333333333','new').returncode!=0
     assert len(server.calls)==3
+    # Delivery evidence remains separate from provider and operator confirmations.
+    def result(job, url=None, environment='cancel-env'):
+        query="SELECT public.novu_rust_channel_result('%s','%s','resend')"%(environment,job)
+        return subprocess.run([psql,url or env['DATABASE_URL'],'-qAt','-v','ON_ERROR_STOP=1','-c',query],text=True,capture_output=True)
+    provider=json.loads(result(job1).stdout)
+    assert provider['cancellationState']=='confirmed' and provider['cancellationConfirmationSource']=='provider_response' and provider['cancellationEvidence']=='no_conflict_observed',provider
+    operator=json.loads(result('33333333-3333-4333-8333-333333333333').stdout)
+    assert operator['cancellationConfirmationSource']=='operator' and operator['cancellationEvidence']=='no_conflict_observed',operator
+    assert result(job1,denied['DATABASE_URL']).returncode!=0
+    assert result(job1,environment='cancel-other').returncode!=0
+    insert_event="INSERT INTO public.novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type) VALUES ('cancel-env','cancel-conflict','fixture-one','email.delivered')"
+    subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',insert_event],check=True,capture_output=True)
+    conflict=json.loads(result(job1).stdout)
+    assert conflict['cancellationEvidence']=='conflicting' and conflict['result']==provider['result'],conflict
+    collision="UPDATE public.novu_rust_resend_attempts SET provider_message_id='fixture-one' WHERE job_id='88888888-8888-4888-8888-888888888888'"
+    subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',collision],check=True,capture_output=True)
+    ambiguous=json.loads(result(job1).stdout)
+    assert ambiguous['cancellationEvidence']=='ambiguous' and ambiguous['result']=='unknown',ambiguous
     # Page unknown requests without exposing provider IDs or investigation reasons.
     insert="""WITH jobs AS (INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) SELECT gen_random_uuid(),'cancel-env','experimental_resend_email','{}','completed' FROM generate_series(1,55) RETURNING id)
     INSERT INTO public.novu_rust_resend_cancel_requests(environment_id,request_id,job_id,provider_id,database_principal,principal_oid,reason,state,created_at)
