@@ -130,6 +130,7 @@ async fn run() -> Result<()> {
         sendgrid_webhook_keys: None,
         fcm_credentials: None,
         smtp_credentials: None,
+        resend_cancel_credentials: None,
         smtp_ca: None,
         slack_attempts: None,
         slack_policy_cancelled: None,

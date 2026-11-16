@@ -314,6 +314,7 @@ pub struct Alert {
     pub sendgrid_webhook_keys: Option<Result<u64, ()>>,
     pub fcm_credentials: Option<Result<(u64, u64, u64, u64), ()>>,
     pub smtp_credentials: Option<Result<(u64, u64, u64, u64), ()>>,
+    pub resend_cancel_credentials: Option<Result<(u64, u64, u64, u64), ()>>,
     pub smtp_ca: Option<Result<(u64, u64, u64, u64), ()>>,
     pub slack_attempts: Option<(u64, u64, u64, u64, Option<u64>)>,
     pub slack_policy_cancelled: Option<u64>,
@@ -389,6 +390,7 @@ impl Alert {
             || self.fcm_unrecorded_claims.is_some_and(|value| matches!(value,Ok(n) if n>0))
             || self.smtp_ca.is_some_and(|v| matches!(v,Ok((healthy,unhealthy,_,minimum)) if healthy<minimum||unhealthy>0))
             || self.smtp_credentials.is_some_and(|v| matches!(v,Ok((healthy,unhealthy,_,minimum)) if healthy<minimum||unhealthy>0))
+            || self.resend_cancel_credentials.is_some_and(|v| matches!(v,Ok((healthy,unhealthy,_,minimum)) if healthy<minimum||unhealthy>0))
             || self.smtp_health.is_some_and(|v| matches!(v,Ok((a,b,c)) if a>0||b>0||c>0))
             || self.resend_cancel_commands.is_some_and(|v| matches!(v,Ok((_,overdue,unreviewed)) if overdue>0||unreviewed>0))
             || self.resend_cancel_legacy.is_some_and(|v| matches!(v,Ok(n) if n>0))
@@ -403,7 +405,7 @@ impl Alert {
         {
             mask |= 1 << 18;
         }
-        if self.resend_cancel_legacy.is_some_and(|value| value.is_err()) || self.resend_cancel_evidence.is_some_and(|value| value.is_err()) || self.resend_cancel_commands.is_some_and(|value| value.is_err()) || self.resend_cancel_health.is_some_and(|value| value.is_err()) || self.smtp_auto_workers.is_some_and(|value| value.is_err()) || self.smtp_auto_health.is_some_and(|value| value.is_err()) || self.smtp_ca.is_some_and(|value| value.is_err()) || self.smtp_credentials.is_some_and(|value| value.is_err()) || self.discord_cooldown_health.is_some_and(|value| value.is_err()) || self.smtp_health.is_some_and(|value| value.is_err()) || self.discord_retry_health.is_some_and(|value| value.is_err()) || self.discord_health.is_some_and(|value| value.is_err()) || self.fcm_unrecorded_claims.is_some_and(|value| value.is_err()) || self.failed_jobs_check_failed || self.resend_auto.is_some_and(|value| value.is_err()) || self.slack_cooldown.is_some_and(|value| value.is_err()) || self.resend_cooldown.is_some_and(|value| value.is_err()) || self.twilio_delayed.is_some_and(|value| value.is_err()) || self.fcm_partial.is_some_and(|value| value.is_err()) || self.fcm_unreviewed.is_some_and(|value| value.is_err()) || self.fcm_cooldown.is_some_and(|value| value.is_err()) {
+        if self.resend_cancel_credentials.is_some_and(|value| value.is_err()) || self.resend_cancel_legacy.is_some_and(|value| value.is_err()) || self.resend_cancel_evidence.is_some_and(|value| value.is_err()) || self.resend_cancel_commands.is_some_and(|value| value.is_err()) || self.resend_cancel_health.is_some_and(|value| value.is_err()) || self.smtp_auto_workers.is_some_and(|value| value.is_err()) || self.smtp_auto_health.is_some_and(|value| value.is_err()) || self.smtp_ca.is_some_and(|value| value.is_err()) || self.smtp_credentials.is_some_and(|value| value.is_err()) || self.discord_cooldown_health.is_some_and(|value| value.is_err()) || self.smtp_health.is_some_and(|value| value.is_err()) || self.discord_retry_health.is_some_and(|value| value.is_err()) || self.discord_health.is_some_and(|value| value.is_err()) || self.fcm_unrecorded_claims.is_some_and(|value| value.is_err()) || self.failed_jobs_check_failed || self.resend_auto.is_some_and(|value| value.is_err()) || self.slack_cooldown.is_some_and(|value| value.is_err()) || self.resend_cooldown.is_some_and(|value| value.is_err()) || self.twilio_delayed.is_some_and(|value| value.is_err()) || self.fcm_partial.is_some_and(|value| value.is_err()) || self.fcm_unreviewed.is_some_and(|value| value.is_err()) || self.fcm_cooldown.is_some_and(|value| value.is_err()) {
             mask |= 1 << 19;
         }
         if self
@@ -516,6 +518,8 @@ impl Alert {
         if self.resend_cancel_evidence.is_some_and(|v|v.is_err()) {high|=32768;}
         if self.resend_cancel_legacy.is_some_and(|v|matches!(v,Ok(n) if n>0)) {high|=65536;}
         if self.resend_cancel_legacy.is_some_and(|v|v.is_err()) {high|=131072;}
+        if self.resend_cancel_credentials.is_some_and(|v| matches!(v,Ok((healthy,unhealthy,_,minimum)) if healthy<minimum||unhealthy>0)) {high|=262144;}
+        if self.resend_cancel_credentials.is_some_and(|v|v.is_err()) {high|=524288;}
         (self.condition_mask_v2(),high)
     }
     pub fn observed_condition_mask_v3(&self) -> (i64,i64) {
@@ -536,6 +540,8 @@ impl Alert {
         if self.resend_cancel_evidence.is_some() {high|=32768;}
         if self.resend_cancel_legacy.is_some_and(|v|v.is_ok()) {high|=65536;}
         if self.resend_cancel_legacy.is_some() {high|=131072;}
+        if self.resend_cancel_credentials.is_some_and(|v|v.is_ok()) {high|=262144;}
+        if self.resend_cancel_credentials.is_some() {high|=524288;}
         (self.observed_condition_mask_v2(),high)
     }
     pub fn observed_condition_mask_v2(&self) -> i64 {
@@ -607,7 +613,8 @@ impl Alert {
         }
         // Both checks share the existing failed-job cooldown category. Do
         // not mark it observed healthy if either enabled check failed.
-        if (self.resend_cancel_legacy.is_some() || self.resend_cancel_evidence.is_some() || self.resend_cancel_commands.is_some() || self.resend_cancel_health.is_some() || self.smtp_auto_workers.is_some() || self.smtp_auto_health.is_some() || self.smtp_ca.is_some() || self.smtp_credentials.is_some() || self.discord_cooldown_health.is_some() || self.smtp_health.is_some() || self.discord_retry_health.is_some() || self.discord_health.is_some() || self.fcm_unrecorded_claims.is_some() || self.failed_jobs.is_some() || self.resend_auto.is_some() || self.slack_cooldown.is_some() || self.resend_cooldown.is_some() || self.twilio_delayed.is_some() || self.fcm_partial.is_some() || self.fcm_unreviewed.is_some() || self.fcm_cooldown.is_some())
+        if (self.resend_cancel_credentials.is_some() || self.resend_cancel_legacy.is_some() || self.resend_cancel_evidence.is_some() || self.resend_cancel_commands.is_some() || self.resend_cancel_health.is_some() || self.smtp_auto_workers.is_some() || self.smtp_auto_health.is_some() || self.smtp_ca.is_some() || self.smtp_credentials.is_some() || self.discord_cooldown_health.is_some() || self.smtp_health.is_some() || self.discord_retry_health.is_some() || self.discord_health.is_some() || self.fcm_unrecorded_claims.is_some() || self.failed_jobs.is_some() || self.resend_auto.is_some() || self.slack_cooldown.is_some() || self.resend_cooldown.is_some() || self.twilio_delayed.is_some() || self.fcm_partial.is_some() || self.fcm_unreviewed.is_some() || self.fcm_cooldown.is_some())
+            && !self.resend_cancel_credentials.is_some_and(|value| value.is_err())
             && !self.resend_cancel_legacy.is_some_and(|value| value.is_err())
             && !self.resend_cancel_evidence.is_some_and(|value| value.is_err())
             && !self.resend_cancel_commands.is_some_and(|value| value.is_err())
@@ -632,7 +639,7 @@ impl Alert {
         {
             known |= 1 << 18;
         }
-        if self.resend_cancel_legacy.is_some() || self.resend_cancel_evidence.is_some() || self.resend_cancel_commands.is_some() || self.resend_cancel_health.is_some() || self.smtp_auto_workers.is_some() || self.smtp_auto_health.is_some() || self.smtp_ca.is_some() || self.smtp_credentials.is_some() || self.discord_cooldown_health.is_some() || self.smtp_health.is_some() || self.discord_retry_health.is_some() || self.discord_health.is_some() || self.fcm_unrecorded_claims.is_some() || self.failed_jobs.is_some() || self.failed_jobs_check_failed || self.resend_auto.is_some() || self.slack_cooldown.is_some() || self.resend_cooldown.is_some() || self.twilio_delayed.is_some() || self.fcm_partial.is_some() || self.fcm_unreviewed.is_some() || self.fcm_cooldown.is_some()
+        if self.resend_cancel_credentials.is_some() || self.resend_cancel_legacy.is_some() || self.resend_cancel_evidence.is_some() || self.resend_cancel_commands.is_some() || self.resend_cancel_health.is_some() || self.smtp_auto_workers.is_some() || self.smtp_auto_health.is_some() || self.smtp_ca.is_some() || self.smtp_credentials.is_some() || self.discord_cooldown_health.is_some() || self.smtp_health.is_some() || self.discord_retry_health.is_some() || self.discord_health.is_some() || self.fcm_unrecorded_claims.is_some() || self.failed_jobs.is_some() || self.failed_jobs_check_failed || self.resend_auto.is_some() || self.slack_cooldown.is_some() || self.resend_cooldown.is_some() || self.twilio_delayed.is_some() || self.fcm_partial.is_some() || self.fcm_unreviewed.is_some() || self.fcm_cooldown.is_some()
         {
             known |= 1 << 19;
         }
@@ -721,6 +728,9 @@ impl Alert {
         }
         if let Some(result) = self.smtp_ca {
             match result { Ok((healthy,unhealthy,stale,minimum)) => details.push(format!("SMTP CA workers: healthy {healthy}; unhealthy {unhealthy}; stale {stale}; minimum healthy {minimum}")), Err(()) => details.push("SMTP CA worker check failed".into()) }
+        }
+        if let Some(result) = self.resend_cancel_credentials {
+            match result { Ok((healthy,unhealthy,stale,minimum)) => details.push(format!("Resend cancellation credential workers: healthy {healthy}; unhealthy {unhealthy}; stale {stale}; minimum healthy {minimum}")), Err(()) => details.push("Resend cancellation credential worker check failed".into()) }
         }
         if let Some(result) = self.smtp_credentials {
             match result { Ok((healthy,unhealthy,stale,minimum)) => details.push(format!("SMTP credential workers: healthy {healthy}; unhealthy {unhealthy}; stale {stale}; minimum healthy {minimum}")), Err(()) => details.push("SMTP credential worker check failed".into()) }
@@ -1666,6 +1676,7 @@ mod tests {
             sendgrid_webhook_keys: None,
             fcm_credentials: None,
             smtp_credentials: None,
+            resend_cancel_credentials: None,
             smtp_ca: None,
             slack_attempts: None,
             slack_policy_cancelled: None,
@@ -1880,6 +1891,18 @@ mod tests {
         assert_eq!(sent.0,Some(Ok(())));assert_eq!(sent.1,Some(Ok(())));
         for payload in [server.await.unwrap(),email_server.await.unwrap()] {assert!(payload.contains("SMTP credential workers: healthy 0; unhealthy 1; stale 2; minimum healthy 1"));}
         a.smtp_credentials=Some(Err(()));assert!(a.text().unwrap().contains("SMTP credential worker check failed"));assert_eq!(a.condition_mask_v3(),(0,2));assert_eq!(a.observed_condition_mask_v3().1,2);
+    }
+    #[tokio::test]
+    async fn resend_cancel_credential_health_reaches_slack_and_email() {
+        let mut a=alert();a.resend_enabled=false;a.resend_cancel_credentials=Some(Ok((0,1,2,1)));
+        assert_eq!(a.condition_mask_v3(),(0,262144));assert_eq!(a.observed_condition_mask_v3().1,786432);
+        let (url,server)=mock_server("200 OK","ok").await;let slack=SlackWebhook::with_endpoint(url).unwrap();
+        let (email_url,email_server)=mock_server("200 OK",r#"{"id":"mock-email"}"#).await;
+        let email=AlertEmailProvider::Resend(crate::resend::Resend::test_endpoint(crate::resend::Config{api_key:"re_test".into(),from:"sender@example.test".into(),sender_name:String::new()},email_url.as_str()).unwrap());
+        let sent=send_uncoordinated_selected(&a,Some(&slack),Some((&email,"ops@example.test")),Duration::from_secs(2),false).await;
+        assert_eq!(sent.0,Some(Ok(())));assert_eq!(sent.1,Some(Ok(())));
+        for payload in [server.await.unwrap(),email_server.await.unwrap()] {assert!(payload.contains("Resend cancellation credential workers: healthy 0; unhealthy 1; stale 2; minimum healthy 1"));}
+        a.resend_cancel_credentials=Some(Err(()));assert!(a.text().unwrap().contains("Resend cancellation credential worker check failed"));assert_eq!(a.condition_mask_v3(),(0,524288));assert_eq!(a.observed_condition_mask_v3().1,524288);
     }
     #[tokio::test]
     #[ignore = "requires fully migrated disposable PostgreSQL"]
@@ -2968,6 +2991,7 @@ mod tests {
             sendgrid_webhook_keys: None,
             fcm_credentials: None,
             smtp_credentials: None,
+            resend_cancel_credentials: None,
             smtp_ca: None,
             slack_attempts: None,
             slack_policy_cancelled: None,

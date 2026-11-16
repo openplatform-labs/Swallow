@@ -111,12 +111,21 @@ try:
             enqueue(request,job);return request
         wait(lambda:sql("SELECT count(*) FROM public.novu_rust_resend_cancel_credential_health WHERE environment_id='cancel-env' AND state='healthy'")=='1')
         healthy=cli(['check-resend-cancel-credentials','cancel-env','60','1']);assert healthy.returncode==0 and json.loads(healthy.stdout)['healthy']==1
+        credential_alert={**alert_env,'SWALLOW_ALERT_RESEND_CANCEL_CREDENTIAL_MAX_AGE_SECONDS':'60','SWALLOW_ALERT_RESEND_CANCEL_CREDENTIAL_MIN_HEALTHY':'1'}
+        credential_alert.pop('SWALLOW_ALERT_RESEND_CANCEL_COMMAND_GRACE_SECONDS')
+        def check_alert(settings=credential_alert):return subprocess.run([os.path.join(os.environ['TEST_WORKER_DIR'],'send-delivery-alert'),'cancel-env','300','120','60'],env=settings,capture_output=True,text=True,timeout=10)
+        assert check_alert().returncode==0
+        sql('REVOKE EXECUTE ON FUNCTION public.novu_rust_resend_cancel_credential_health_check(text,integer) FROM cancel_fixture')
+        failed_check=check_alert();assert failed_check.returncode==1 and 'credential worker check failed' in failed_check.stderr
+        sql('GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_credential_health_check(text,integer) TO cancel_fixture')
         assert cli(['check-resend-cancel-credentials','cancel-other','60','1']).returncode!=0
         denied={**monitor,'DATABASE_URL':admin.replace('postgres://postgres@','postgres://cancel_unprivileged@')};assert cli(['check-resend-cancel-credentials','cancel-env','60','1'],denied).returncode!=0
         first=rotation_job(1);wait(lambda:sql("SELECT state FROM public.novu_rust_resend_cancel_commands WHERE request_id='%s'"%first)=='finished')
         assert auths['/emails/rotation-1/cancel']=='Bearer rotation-one'
         open(key,'w').write('');wait(lambda:sql("SELECT count(*) FROM public.novu_rust_resend_cancel_credential_health WHERE environment_id='cancel-env' AND state='unhealthy'")=='1')
         unhealthy=cli(['check-resend-cancel-credentials','cancel-env','60','1']);assert unhealthy.returncode==2 and json.loads(unhealthy.stdout)['unhealthy']==1
+        alerted=check_alert();assert alerted.returncode==2 and 'requires operator review' in alerted.stderr,(alerted.stdout,alerted.stderr)
+        bad_alert={**credential_alert,'SWALLOW_ALERT_RESEND_CANCEL_CREDENTIAL_MIN_HEALTHY':'0'};assert check_alert(bad_alert).returncode==1
         second=rotation_job(2);time.sleep(3)
         assert sql("SELECT state FROM public.novu_rust_resend_cancel_commands WHERE request_id='%s'"%second)=='pending'
         assert '/emails/rotation-2/cancel' not in calls
@@ -124,6 +133,7 @@ try:
         wait(lambda:sql("SELECT state FROM public.novu_rust_resend_cancel_commands WHERE request_id='%s'"%second)=='finished')
         assert auths['/emails/rotation-2/cancel']=='Bearer rotation-two'
         assert cli(['check-resend-cancel-credentials','cancel-env','60','1']).returncode==0
+        assert check_alert().returncode==0
         # A revoked heartbeat grant must stop claims until an authorized reconnect.
         sql('REVOKE EXECUTE ON FUNCTION public.novu_rust_resend_cancel_credential_heartbeat(text,uuid,text) FROM cancel_worker')
         open(key,'w').write('');time.sleep(3);third=rotation_job(3);time.sleep(3)
