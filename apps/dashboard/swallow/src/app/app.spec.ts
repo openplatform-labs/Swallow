@@ -1145,6 +1145,13 @@ describe('Swallow console', () => {
     expect(app.alertSlots()).toEqual([]);
   });
 
+  it('highlights historical ambiguous status and rejects inconsistent API data',async()=>{
+    const id='1889f88e-c0a3-4ab5-b861-2fdc1f26f254';const row={channel:'slack',targetId:'ops',state:'rejected',lastStartedAt:null,attemptId:id,legacyAmbiguousHttpStatus:409};
+    const page=(item:unknown)=>new Response(JSON.stringify({data:[item],hasMore:false,next:null}));
+    vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(page(row)).mockResolvedValueOnce(page({...row,state:'unknown'})).mockResolvedValueOnce(page({...row,legacyAmbiguousHttpStatus:400}));
+    const fixture=TestBed.createComponent(App),app=fixture.componentInstance;app.setSection('alerts');app.alertKey='a'.repeat(64);await app.loadAlerts();app.selectAlert(app.alertSlots()[0]);fixture.detectChanges();expect(fixture.nativeElement.textContent).toContain('과거 HTTP 409');app.clearDecision();await app.loadAlerts();expect(app.alertStatus()).toBe('error');await app.loadAlerts();expect(app.alertStatus()).toBe('error');fixture.destroy();
+  });
+
   it('distinguishes absent attempts from an older API response', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify({data:[{channel:'email',targetId:'one',state:'idle',lastStartedAt:null,attemptId:null},{channel:'slack',targetId:'two',state:'unknown',lastStartedAt:null}],hasMore:false,next:null}),{status:200}));
     const fixture = TestBed.createComponent(App);

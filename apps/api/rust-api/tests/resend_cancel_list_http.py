@@ -17,6 +17,13 @@ def grant(method,path,body=None):
     try:
         with urllib.request.urlopen(req,timeout=5) as r:return r.status,json.loads(r.read())
     except urllib.error.HTTPError as e:return e.code,json.loads(e.read())
+# Both existing alert-read modes expose only current ambiguous status, under their existing read grants.
+status,alert_page=get('environmentId=cancel-api-env',endpoint='alerts');assert status==200
+rows={r['targetId']:r for r in alert_page['data']};assert rows['legacy-409']['legacyAmbiguousHttpStatus']==409 and rows['current-400']['legacyAmbiguousHttpStatus'] is None
+request=urllib.request.Request(origin+'/v1/experimental/console/alerts',headers={'Authorization':'SwallowConsole '+'a'*64})
+with urllib.request.urlopen(request,timeout=5) as response:console=json.loads(response.read())
+assert next(r for r in console['data'] if r['targetId']=='legacy-409')['legacyAmbiguousHttpStatus']==409
+assert get('environmentId=cancel-api-other',endpoint='alerts')[0] in (401,403)
 # Credential health requires independent JWT and database grants, and is environment scoped.
 health_query='environmentId=cancel-api-env&maxAgeSeconds=60&minimumHealthy=1'
 status,health=get(health_query,endpoint='resend-cancel-credential-health');assert status==200 and health=={'healthy':0,'unhealthy':0,'stale':0,'minimumHealthy':1,'needsAttention':True},(status,health)

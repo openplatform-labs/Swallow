@@ -284,7 +284,7 @@
           @else if (alertStatus() === 'loading') {<p aria-live="polite">상태를 불러오는 중입니다.</p>}
           @else if (alertStatus() === 'idle') {<p>인증 값을 입력하고 조회해 주세요.</p>}
           @else if (alertSlots().length === 0) {<p>조회된 경보 대상이 없습니다.</p>}
-          @else {<div class="table-wrap"><table class="table"><thead><tr><th>채널</th><th>대상 ID</th><th>상태</th><th>발송 시도 ID</th><th>최근 시도</th><th>판정</th></tr></thead><tbody>@for (slot of alertSlots(); track slot.channel + ':' + slot.targetId) {<tr><td>{{ slot.channel }}</td><td>{{ slot.targetId }}</td><td>{{ slot.state }}</td><td>{{ slot.attemptId === undefined ? "API 업데이트 필요" : slot.attemptId || "—" }}</td><td>{{ slot.lastStartedAt || '—' }}</td><td><button type="button" class="btn btn-sm btn-outline" [disabled]="decisionStatus() === 'sending' || !slot.attemptId || (slot.state !== 'unknown' && slot.state !== 'rejected')" (click)="selectAlert(slot)">검토</button></td></tr>}</tbody></table></div>}
+          @else {<div class="table-wrap"><table class="table"><thead><tr><th>채널</th><th>대상 ID</th><th>상태</th><th>발송 시도 ID</th><th>최근 시도</th><th>판정</th></tr></thead><tbody>@for (slot of alertSlots(); track slot.channel + ':' + slot.targetId) {<tr><td>{{ slot.channel }}</td><td>{{ slot.targetId }}</td><td>{{ slot.state }}@if(slot.legacyAmbiguousHttpStatus){<br><strong>과거 HTTP {{slot.legacyAmbiguousHttpStatus}}: 결과 불명 조사 필요</strong>}@else if(slot.legacyAmbiguousHttpStatus===undefined){<br><small>과거 HTTP 상태를 확인할 수 없음: API 업데이트 필요</small>}</td><td>{{ slot.attemptId === undefined ? "API 업데이트 필요" : slot.attemptId || "—" }}</td><td>{{ slot.lastStartedAt || '—' }}</td><td><button type="button" class="btn btn-sm btn-outline" [disabled]="decisionStatus() === 'sending' || !slot.attemptId || (slot.state !== 'unknown' && slot.state !== 'rejected')" (click)="selectAlert(slot)">검토</button></td></tr>}</tbody></table></div>}
           @if (alertStatus() === 'loaded') {<div class="pagination"><span>{{ alertPage() }}페이지 · 조회 시점의 결과</span><button class="btn btn-sm btn-outline" (click)="loadAlerts()" [disabled]="alertPage() === 1 || decisionStatus() === 'sending'">처음</button><button class="btn btn-sm btn-outline" (click)="loadAlerts('previous')" [disabled]="alertPage() === 1 || decisionStatus() === 'sending'">이전</button><button class="btn btn-sm btn-outline" (click)="loadAlerts('next')" [disabled]="!alertsHaveMore() || decisionStatus() === 'sending'">다음</button></div>}
         </div></section>
         @if (decisionStatus() === 'recorded') { <p class="decision-result" role="status">판정을 기록했습니다. 현재 상태와 감사 기록을 다시 확인해 주세요. 실제 수신이 확인된 것은 아닙니다.</p> }
@@ -338,7 +338,7 @@
         </div></section>}
         @if (selectedAlert(); as slot) {
           <section class="card decision-card"><div class="card-block">
-            <div class="card-eyebrow">REVIEW DECISION</div><h2>경보 발송 판정</h2>
+            <div class="card-eyebrow">REVIEW DECISION</div><h2>경보 발송 판정</h2>@if(slot.legacyAmbiguousHttpStatus){<p role="alert">과거 HTTP {{slot.legacyAmbiguousHttpStatus}}는 결과가 불명확합니다. 제공자 기록을 확인하세요. 현재 이 상태는 재시도 허용만 지원합니다.</p>}
             <p><strong>{{ slot.channel }} · {{ slot.targetId }}</strong> / {{ slot.state }}<br>발송 시도 ID: {{ slot.attemptId }}</p>
             <p>공급자의 결과를 별도로 확인한 후 선택하세요. 재시도 허용은 이후 발송에서 중복이 생길 수 있습니다. 접수 판정은 수신을 보장하지 않습니다.</p>
             <form class="decision-form" (ngSubmit)="resolveAlert()">

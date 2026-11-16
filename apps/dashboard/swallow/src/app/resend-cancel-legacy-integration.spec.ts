@@ -2,6 +2,7 @@ import { TestBed } from '@angular/core/testing';
 import { describe,expect,it,vi } from 'vitest';
 import { ResendCancelList } from './resend-cancel-list';
 import { SmtpCredentialHealth } from './smtp-credential-health';
+import { App } from './app';
 const env=(globalThis as unknown as {process?:{env:Record<string,string|undefined>}}).process?.env;
 const origin=env?.['SWALLOW_UI_TEST_API'],token=env?.['SWALLOW_UI_TEST_JWT'];
 describe.skipIf(!origin||!token)('Legacy cancellation resolution with local API',()=>{
@@ -11,5 +12,7 @@ describe.skipIf(!origin||!token)('Legacy cancellation resolution with local API'
   try{const pending=c.submitResolution();await started;c.environment='cancel-api-other';c.ngOnChanges();release();await pending;expect(c.resolutionStatus()).toBe('unknown');c.environment='cancel-api-env';c.ngOnChanges();await c.submitResolution();expect(c.resolutionStatus()).toBe('recorded');expect(mock.mock.calls[0][1]?.body).toEqual(mock.mock.calls[1][1]?.body);}finally{mock.mockRestore();}
   expect(c.legacyRows()).toHaveLength(0);await c.loadLegacyHealth();expect(c.legacyHealth()).toBe(0);c.resetResolution();await c.loadDetail(id);expect(c.detail()?.state).toBe('confirmed');expect(c.detail()?.httpStatus).toBe(408);expect(c.detail()?.resolution?.operator?.subject).toBe('fixture');f.destroy();});
  it('loads the cancellation credential health through the local API',async()=>{const f=TestBed.createComponent(SmtpCredentialHealth),c=f.componentInstance;c.kind='resend-cancel';c.apiOrigin=origin!;c.environment='cancel-api-env';c.token=token!;await c.load();expect(c.health()).toEqual({healthy:0,unhealthy:0,stale:0,minimumHealthy:1,needsAttention:true});c.environment='cancel-api-other';c.ngOnChanges();await c.load();expect(c.status()).toBe('error');f.destroy();});
+
+ it('highlights a historical 409 in the alert list and review',async()=>{const f=TestBed.createComponent(App),app=f.componentInstance;app.apiOrigin=origin!;app.setSection('alerts');app.alertAuthMode='jwt';app.alertEnvironment='cancel-api-env';app.alertKey=token!;await app.loadAlerts();const slot=app.alertSlots().find(x=>x.targetId==='legacy-409');expect(slot?.legacyAmbiguousHttpStatus).toBe(409);app.selectAlert(slot!);f.detectChanges();expect(f.nativeElement.textContent).toContain('과거 HTTP 409');expect(f.nativeElement.textContent).toContain('결과가 불명확');f.destroy();});
 
 });

@@ -42,7 +42,7 @@ type SubscriberProfileRetry = {origin:string;environment:string;keyHash:string;b
 type SubscriberProfileRecord = {requestId:string;subscriberId:string;generation:string;previousRevision:string;revision:string;changed:boolean;fields:string[];reason:string;createdAt:string};
 type SubscriberEditSnapshot = {id:string;generation:string;revision:string;profile:SubscriberProfile};
 type Subscriber = { id: string; firstName: string; lastName: string; email: string };
-type AlertSlot = { channel: string; targetId: string; state: string; lastStartedAt: string | null; attemptId?: string | null };
+type AlertSlot = { channel: string; targetId: string; state: string; lastStartedAt: string | null; attemptId?: string | null; legacyAmbiguousHttpStatus?: 408 | 409 | null };
 type AlertCursor = { channel: string; targetId: string };
 type ResendResult = { jobId:string; jobStatus:string; result:string; attemptState:string|null; attemptId?:string|null; attemptHttpStatus:number|null|undefined; sameRequestReplayReserved?:boolean|null; lastResolvedAttemptId?:string|null; lastResolvedReplayReserved?:boolean|null; retryAfterSeconds:number|null|undefined; retryNotBefore:string|null|undefined; providerIdKnown:boolean; providerIdAmbiguous:boolean; autoCorrelated:boolean; autoCorrelationConflict:boolean; autoCorrelatedAt:string|null; lastCompletedScanAt:string|null };
 type ResendDecisionAudit = {id:string;actorIssuer:string;actorSubject:string;actorClientId:string;databasePrincipal:string;requestId:string;jobId:string;attemptId:string;mode:'immediate'|'after';reason:string;availableAt:string;recordedAt:string};
@@ -1762,7 +1762,8 @@ export class App implements OnDestroy {
       const rows: AlertSlot[] = body.data.map((row: unknown) => {
         if (typeof row !== 'object' || row === null || !('channel' in row) || typeof row.channel !== 'string' || !('targetId' in row) || typeof row.targetId !== 'string' || !('state' in row) || typeof row.state !== 'string' || !('lastStartedAt' in row) || !(typeof row.lastStartedAt === 'string' || row.lastStartedAt === null)) throw new Error('API 응답 형식을 확인해 주세요.');
         if ('attemptId' in row && row.attemptId !== null && (typeof row.attemptId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(row.attemptId))) throw new Error('API 응답 형식을 확인해 주세요.');
-        return { channel: row.channel, targetId: row.targetId, state: row.state, lastStartedAt: row.lastStartedAt, ...('attemptId' in row ? { attemptId: row.attemptId as string | null } : {}) };
+        if ('legacyAmbiguousHttpStatus' in row && row.legacyAmbiguousHttpStatus !== null && (row.state !== 'rejected' || ![408,409].includes(row.legacyAmbiguousHttpStatus as number))) throw new Error('API 응답 형식을 확인해 주세요.');
+        return { channel: row.channel, targetId: row.targetId, state: row.state, lastStartedAt: row.lastStartedAt, ...('attemptId' in row ? { attemptId: row.attemptId as string | null } : {}), ...('legacyAmbiguousHttpStatus' in row ? {legacyAmbiguousHttpStatus:row.legacyAmbiguousHttpStatus as 408 | 409 | null} : {}) };
       });
       this.expireOidcIfNeeded();
       if (id !== this.alertRequestId) return;
