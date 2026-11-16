@@ -13,5 +13,6 @@ cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-wo
 cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-worker -- apply worker "$WORKER/migrations"
 cargo build --quiet --locked --manifest-path "$WORKER/Cargo.toml" --features test-mocks --bin telegram-worker
 cp "$WORKER/target/debug/telegram-worker" "$DIR/telegram-worker-fixture"
-cargo build --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin telegram-worker --bin telegram-enqueue
+cargo build --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin telegram-worker --bin telegram-enqueue --bin delivery-reconcile
 TEST_TELEGRAM_ENQUEUE="$WORKER/target/debug/telegram-enqueue" TEST_PSQL="$TEST_PG_BIN/psql" TEST_TELEGRAM_WORKER="$DIR/telegram-worker-fixture" python3 "$WORKER/tests/telegram_worker_process.py"
+TEST_PSQL="$TEST_PG_BIN/psql" TEST_TELEGRAM_WORKER="$DIR/telegram-worker-fixture" TEST_DELIVERY_CLI="$WORKER/target/debug/delivery-reconcile" python3 "$WORKER/tests/telegram_operator_process.py"
