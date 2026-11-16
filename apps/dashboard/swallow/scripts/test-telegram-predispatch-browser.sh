@@ -29,7 +29,7 @@ cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-wo
 "$TEST_PG_BIN/psql" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
 CREATE ROLE ui_fixture_api LOGIN;
 GRANT USAGE ON SCHEMA public TO ui_fixture_api;
-GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_telegram_predispatch_cancel(text,text,text,text,bigint,uuid,uuid,bigint,text),public.novu_rust_operator_jwt_telegram_predispatch_cancel_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_telegram_predispatch(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_telegram_predispatch_retry(text,text,text,text,bigint,uuid,uuid,bigint,text),public.novu_rust_operator_jwt_telegram_predispatch_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_telegram_resolution_history(text,text,text,text,bigint,uuid,uuid),public.novu_rust_operator_jwt_telegram_health(text,text,text,text,bigint),public.novu_rust_operator_jwt_telegram_attention(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_telegram_resolve(text,text,text,text,bigint,uuid,uuid,uuid,text,text),public.novu_rust_operator_jwt_telegram_resolution_request(text,text,text,text,bigint,uuid,text) TO ui_fixture_api;
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_telegram_predispatch_history(text,text,text,text,bigint,uuid,uuid,text),public.novu_rust_operator_jwt_telegram_predispatch_cancel(text,text,text,text,bigint,uuid,uuid,bigint,text),public.novu_rust_operator_jwt_telegram_predispatch_cancel_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_telegram_predispatch(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_telegram_predispatch_retry(text,text,text,text,bigint,uuid,uuid,bigint,text),public.novu_rust_operator_jwt_telegram_predispatch_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_telegram_resolution_history(text,text,text,text,bigint,uuid,uuid),public.novu_rust_operator_jwt_telegram_health(text,text,text,text,bigint),public.novu_rust_operator_jwt_telegram_attention(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_telegram_resolve(text,text,text,text,bigint,uuid,uuid,uuid,text,text),public.novu_rust_operator_jwt_telegram_resolution_request(text,text,text,text,bigint,uuid,text) TO ui_fixture_api;
 INSERT INTO public.novu_rust_environments VALUES('fixture-env','fixture-org'),('other-env','fixture-org');
 INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES('https://issuer.test','admin','console','fixture-env'),('https://issuer.test','target','console','fixture-env'),('https://issuer.test','admin','console','other-env');
 INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname='ui_fixture_api';
@@ -102,9 +102,12 @@ await page.click('input[name="telegramPreConfirm"]');await page.click('app-disco
 await page.waitForFunction(()=>document.querySelector('app-discord-reviews')?.innerText.includes('발송 취소 요청이 기록됐습니다.'));
 await page.click('app-discord-reviews button:text-is("조치 요청 조회")');
 await page.waitForFunction(()=>document.querySelector('app-discord-reviews')?.innerText.includes('cancel confirmed') && document.querySelector('app-discord-reviews')?.innerText.includes('기록됨:'));
+await fill('input[name="telegramPreHistoryJob"]','33333333-3333-4333-8333-333333333333');
+await page.click('app-discord-reviews button:text-is("발송 전 조치 이력 조회")');
+await page.waitForFunction(()=>[...document.querySelectorAll('app-discord-reviews table')].some(t=>t.innerText.includes('cancel confirmed')&&t.innerText.includes('admin')&&t.innerText.includes('cancel')));
 await fill('input[name="alertKey"]',target);await page.click('app-discord-reviews button:has-text("Telegram 발송 전 실패 조회")');
 await page.waitForFunction(()=>document.querySelector('app-discord-reviews')?.innerText.includes('발송 전 실패 목록을 조회하지 못했습니다.'));
-console.log('Telegram pre-dispatch browser retry, cancellation, exact revision, lookup and authorization passed');
+console.log('Telegram pre-dispatch browser retry, cancellation, attributed history, lookup and authorization passed');
 '''
 with open(root+'/browser.mjs','w') as f:f.write('const API='+json.dumps(api)+'; const UI='+json.dumps(ui)+'; const ROOT='+json.dumps(root)+'; const SPACE='+json.dumps(int(space) if space else None)+';\n'+script)
 PY

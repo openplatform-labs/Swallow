@@ -588,6 +588,7 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/operator/telegram-predispatch-cancel-request", get(operator_identity::telegram_predispatch_cancel_request))
         .route("/v1/experimental/operator/telegram-resolution", post(operator_identity::telegram_resolve))
         .route("/v1/experimental/operator/telegram-resolution-history", get(operator_identity::telegram_resolution_history))
+        .route("/v1/experimental/operator/telegram-predispatch-history", get(operator_identity::telegram_predispatch_history))
         .route("/v1/experimental/operator/telegram-resolution-request", get(operator_identity::telegram_resolution_request))
         .route("/v1/experimental/operator/discord-attention", get(operator_identity::discord_attention))
         .route("/v1/experimental/operator/discord-failure", get(operator_identity::discord_failure))

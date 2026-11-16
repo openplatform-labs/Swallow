@@ -30,6 +30,11 @@
 @if(telegramLookupStatus()==='missing'){<p>기록이 없습니다. 요청이 진행 중일 수 있습니다.</p>}@else if(telegramLookupStatus()==='error'){<p role="alert">요청을 조회하지 못했습니다.</p>}@else if(telegramLookupRecord();as r){<p role="status">기록됨: {{r.requestId}} · {{r.jobId}} · {{r.attemptId}} · {{r.decision}} · {{r.reason}}</p>}
 </div></section>
 
+<section class="card decision-card"><div class="card-block"><h2>Telegram 발송 전 조치 이력</h2>
+<p>작업별 재시도·취소 이력을 조회합니다. CLI 조치에는 JWT 운영자가 표시되지 않으며 UUID 순서는 시간순이 아닙니다.</p>
+<form class="decision-form" (ngSubmit)="loadTelegramPreHistory()"><label for="telegram-pre-history-job">작업 ID</label><input id="telegram-pre-history-job" name="telegramPreHistoryJob" [(ngModel)]="telegramPreHistoryJob" (ngModelChange)="clearTelegramPreHistory()"><button type="submit" class="btn btn-outline" [disabled]="telegramPreHistoryStatus()==='loading'">발송 전 조치 이력 조회</button></form>
+@if(telegramPreHistoryStatus()==='error'){<p role="alert">조치 이력을 조회하지 못했습니다.</p>}@else if(telegramPreHistoryStatus()==='loaded'){@if(telegramPreHistory().length===0){<p>조회된 조치 이력이 없습니다.</p>}@else{<div class="table-wrap"><table class="table"><thead><tr><th>기록</th><th>운영자</th><th>조치</th><th>사유</th></tr></thead><tbody>@for(row of telegramPreHistory();track row.requestId + row.action){<tr><td>{{row.createdAt}}<br>{{row.requestId}}<br>리비전 {{row.failureRevision}}</td><td>{{row.databasePrincipal}} · {{row.principalOid}}@if(row.operator;as actor){<br>{{actor.issuer}} · {{actor.subject}} · {{actor.clientId}}<br>{{actor.requestId}}}@else{<br>JWT 운영자 기록 없음}</td><td>{{row.action}}</td><td>{{row.reason}}</td></tr>}</tbody></table></div>}<button type="button" class="btn btn-sm btn-outline" (click)="loadTelegramPreHistory(true)" [disabled]="!telegramPreHistoryNext()">조치 이력 다음</button>}
+</div></section>
 <section class="card decision-card"><div class="card-block"><h2>Telegram 판정 이력</h2>
 <p>별도 이력 조회 권한이 필요합니다. UUID 순서는 시간순이 아니며 CLI 판정은 JWT 운영자가 표시되지 않습니다.</p>
 <form class="decision-form" (ngSubmit)="loadTelegramHistory()"><label for="telegram-history-job">작업 ID</label><input id="telegram-history-job" name="telegramHistoryJob" [(ngModel)]="telegramHistoryJob" (ngModelChange)="clearTelegramHistory()"><button type="submit" class="btn btn-outline" [disabled]="telegramHistoryStatus()==='loading'">Telegram 판정 이력 조회</button></form>
