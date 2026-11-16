@@ -12,6 +12,15 @@ fn config(kids: &[&str]) -> Value {
     json!({"issuer":"https://issuer.test","audience":"swallow",
         "keys":kids.iter().map(|kid| json!({"kid":kid,"pem":if *kid == "new" { OTHER_PUBLIC } else { PUBLIC }})).collect::<Vec<_>>()})
 }
+fn jwks_config(kids:&[&str]) -> Value {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use rsa::{RsaPublicKey,pkcs8::DecodePublicKey,traits::PublicKeyParts};
+    let keys:Vec<_>=kids.iter().map(|kid| {
+        let public=RsaPublicKey::from_public_key_pem(if *kid=="new" {OTHER_PUBLIC} else {PUBLIC}).unwrap();
+        json!({"kty":"RSA","kid":kid,"use":"sig","alg":"RS256","n":URL_SAFE_NO_PAD.encode(public.n().to_bytes_be()),"e":URL_SAFE_NO_PAD.encode(public.e().to_bytes_be())})
+    }).collect();
+    json!({"issuer":"https://issuer.test","audience":"swallow","jwks":{"keys":keys}})
+}
 fn token(kid: &str) -> String {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     let mut header = Header::new(Algorithm::RS256);
@@ -120,9 +129,9 @@ async fn process_reloads_keys_and_applies_each_failure_policy() {
     for (_, _, url) in &processes { wait_status(&client, &ready(url), "", 200).await; }
     for (_, _, url) in &processes { wait_status(&client, &health(url), "", 200).await; }
     for (_, _, url) in &processes { wait_status(&client, url, &old, 200).await; wait_status(&client, url, &new, 401).await; }
-    for (_, path, _) in &processes { replace(path, &config(&["old", "new"]).to_string()); }
+    for (_, path, _) in &processes { replace(path, &jwks_config(&["old", "new"]).to_string()); }
     for (_, _, url) in &processes { wait_status(&client, url, &new, 200).await; wait_status(&client, url, &old, 200).await; }
-    for (_, path, _) in &processes { replace(path, &config(&["new"]).to_string()); }
+    for (_, path, _) in &processes { replace(path, &jwks_config(&["new"]).to_string()); }
     for (_, _, url) in &processes { wait_status(&client, url, &old, 401).await; wait_status(&client, url, &new, 200).await; }
     for (_, path, _) in &processes { replace(path, "{"); }
     wait_status(&client, &processes[1].2, &new, 503).await;
@@ -177,4 +186,36 @@ fn key_readiness_rejects_invalid_or_incomplete_configuration() {
             .stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap();
         assert!(!status.success());
     }
+}
+
+#[test]
+fn jwks_public_rsa_keys_rotate_and_invalid_sets_leave_previous_keys() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use rsa::{RsaPublicKey,pkcs8::DecodePublicKey,traits::PublicKeyParts};
+    fn jwk(kid:&str,pem:&str)->Value {
+        let key=RsaPublicKey::from_public_key_pem(pem).unwrap();
+        json!({"kty":"RSA","kid":kid,"use":"sig","alg":"RS256","key_ops":["verify"],"n":URL_SAFE_NO_PAD.encode(key.n().to_bytes_be()),"e":URL_SAFE_NO_PAD.encode(key.e().to_bytes_be())})
+    }
+    let old=jwk("old",PUBLIC);let new=jwk("new",OTHER_PUBLIC);
+    let jwks=|keys:Vec<Value>|json!({"issuer":"https://issuer.test","audience":"swallow","jwks":{"keys":keys}});
+    let verifier=AccessTokenVerifier::from_json(&jwks(vec![old.clone()]).to_string()).unwrap();
+    assert!(verifier.verify(&token("old")).is_some());assert!(verifier.verify(&token("new")).is_none());
+    verifier.reload_keys(&jwks(vec![old.clone(),new.clone()]).to_string()).unwrap();
+    assert!(verifier.verify(&token("old")).is_some() && verifier.verify(&token("new")).is_some());
+    verifier.reload_keys(&jwks(vec![new.clone()]).to_string()).unwrap();
+    assert!(verifier.verify(&token("old")).is_none() && verifier.verify(&token("new")).is_some());
+    let mut bad=old.clone();bad["d"]=json!("secret");
+    let mut malformed=old.clone();malformed["n"]=json!("AA");
+    let mut no_kid=old.clone();no_kid.as_object_mut().unwrap().remove("kid");
+    let mut mixed=jwks(vec![old.clone()]);mixed["keys"]=config(&["old"])["keys"].clone();
+    for invalid in [jwks(vec![]),jwks(vec![old.clone(),old.clone()]),jwks(vec![bad]),jwks(vec![malformed]),jwks(vec![no_kid]),mixed,jwks(vec![json!({"kty":"oct","k":"secret"})])] {
+        assert!(verifier.reload_keys(&invalid.to_string()).is_err());
+        assert!(verifier.verify(&token("new")).is_some());
+    }
+    let mut wrong=old.clone();wrong["use"]=json!("enc");
+    let mut other_alg=old.clone();other_alg["alg"]=json!("RS512");
+    let mut wrong_ops=old.clone();wrong_ops["key_ops"]=json!(["sign"]);
+    assert!(AccessTokenVerifier::from_json(&jwks(vec![wrong,other_alg,wrong_ops]).to_string()).is_err());
+    let valid_mixed=jwks(vec![json!({"kty":"EC","kid":"other"}),old]);
+    assert!(AccessTokenVerifier::from_json(&valid_mixed.to_string()).unwrap().verify(&token("old")).is_some());
 }

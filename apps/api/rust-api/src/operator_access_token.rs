@@ -1,7 +1,8 @@
 //! RFC 9068-style access-token verification for an opt-in operator identity endpoint.
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use rsa::{
-    RsaPublicKey, pkcs1::DecodeRsaPublicKey, pkcs8::DecodePublicKey, traits::PublicKeyParts,
+    BigUint, RsaPublicKey, pkcs1::DecodeRsaPublicKey, pkcs8::{DecodePublicKey, EncodePublicKey}, traits::PublicKeyParts,
 };
 use serde::{Deserialize, Deserializer};
 use std::{
@@ -37,7 +38,8 @@ struct AccessClaims {
 struct VerifierConfig {
     issuer: String,
     audience: String,
-    keys: Vec<VerifierKey>,
+    keys: Option<Vec<VerifierKey>>,
+    jwks: Option<JwkSet>,
     max_token_lifetime_seconds: Option<u64>,
     #[serde(default)]
     check_token_revocation: bool,
@@ -47,6 +49,45 @@ struct VerifierConfig {
 struct VerifierKey {
     kid: String,
     pem: String,
+}
+
+#[derive(Deserialize)]
+struct JwkSet { keys: Vec<serde_json::Value> }
+
+/// Convert a trusted public JWKS to the same strictly validated PEM path.
+fn jwks_keys(jwks: &JwkSet) -> Result<Vec<VerifierKey>, &'static str> {
+    if jwks.keys.is_empty() || jwks.keys.len() > 64 { return Err("invalid JWKS"); }
+    let mut result = Vec::new();
+    for key in &jwks.keys {
+        let item=key.as_object().ok_or("invalid JWKS")?;
+        // Never accept private or symmetric material from a public-key set.
+        if ["d","p","q","dp","dq","qi","oth","k"].iter().any(|k| item.contains_key(*k)) { return Err("private JWKS material"); }
+        let kty=item.get("kty").and_then(|v|v.as_str()).ok_or("invalid JWKS")?;
+        if kty!="RSA" { continue; }
+        let allowed=|name:&str, expected:&str| -> Result<bool,&'static str> {
+            match item.get(name) { None=>Ok(true), Some(v)=>Ok(v.as_str().ok_or("invalid JWKS")?==expected) }
+        };
+        if !allowed("use","sig")? || !allowed("alg","RS256")? { continue; }
+        if let Some(ops)=item.get("key_ops") {
+            let ops=ops.as_array().ok_or("invalid JWKS")?;
+            if ops.len()!=1 || ops[0].as_str()!=Some("verify") { continue; }
+        }
+        let id=item.get("kid").and_then(|v|v.as_str()).filter(|v|!v.is_empty()&&v.len()<=256).ok_or("invalid JWKS")?;
+        let decode_integer=|name:&str,limit:usize| -> Result<BigUint,&'static str> {
+            let text=item.get(name).and_then(|v|v.as_str()).ok_or("invalid JWKS")?;
+            if text.len()>limit*2 { return Err("invalid JWKS"); }
+            let bytes=URL_SAFE_NO_PAD.decode(text).map_err(|_|"invalid JWKS")?;
+            if bytes.is_empty() || bytes.len()>limit || bytes[0]==0 || URL_SAFE_NO_PAD.encode(&bytes)!=text { return Err("invalid JWKS"); }
+            Ok(BigUint::from_bytes_be(&bytes))
+        };
+        let public=RsaPublicKey::new(decode_integer("n",1024)?,decode_integer("e",8)?).map_err(|_|"invalid JWKS")?;
+        if !(2048..=8192).contains(&public.n().bits()) { return Err("invalid JWKS"); }
+        let pem=public.to_public_key_pem(rsa::pkcs8::LineEnding::LF).map_err(|_|"invalid JWKS")?;
+        result.push(VerifierKey{kid:id.to_owned(),pem});
+        if result.len()>16 { return Err("invalid JWKS"); }
+    }
+    if result.is_empty() { return Err("invalid JWKS"); }
+    Ok(result)
 }
 
 fn optional_numeric<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
@@ -71,11 +112,12 @@ impl AccessTokenVerifier {
         }
         let config: VerifierConfig =
             serde_json::from_str(value).map_err(|_| "invalid verifier configuration")?;
-        let keys: Vec<_> = config
-            .keys
-            .iter()
-            .map(|key| (key.kid.as_str(), key.pem.as_bytes()))
-            .collect();
+        let configured_keys = match (&config.keys, &config.jwks) {
+            (Some(keys), None) => keys.iter().map(|key| VerifierKey {kid:key.kid.clone(),pem:key.pem.clone()}).collect(),
+            (None, Some(jwks)) => jwks_keys(jwks)?,
+            _ => return Err("invalid verifier configuration"),
+        };
+        let keys: Vec<_> = configured_keys.iter().map(|key| (key.kid.as_str(), key.pem.as_bytes())).collect();
         if config
             .max_token_lifetime_seconds
             .is_some_and(|v| !(1..=31_536_000).contains(&v))
