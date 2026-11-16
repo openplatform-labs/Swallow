@@ -507,3 +507,9 @@ Angular 단위 테스트는 다섯 채널의 입력 변경 후 동일 요청 재
 
 
 API 0182부터 경보 대상 목록과 검토 화면은 현재 차단된 과거 HTTP 408·409 시도를 결과 불명 조사 대상으로 표시한다. 기존 경보 조회 권한으로 상태 코드가 추가 공개된다. 이전 API에서는 표시할 정보가 없다. 공급자에서 실제 결과를 조사해야 하며 워커 0276을 적용하면 이 상태에서도 별도 접수 판정 권한으로 공급자 접수를 확인했다고 기록할 수 있다. 로컬 API·PostgreSQL과 Angular 컴포넌트에서 JWT 표시를 확인했으며 실제 브라우저·공급자·운영 HA는 미검증이다. [API 문서](../../api/rust-api/README.md)를 참고한다.
+
+### Telegram subscriber endpoints
+
+In **채널**, the existing subscriber endpoint card offers a Discord/Telegram channel selector. For Telegram it lists registered bot destinations and manages endpoint ID, subscriber ID, chat ID and optional context, with revision-checked update/delete and the separate audit list. It calls the experimental `/v1/experimental/telegram-*` API using a separately entered environment API key; the key needs the relevant explicit endpoint read, write and/or audit grants. The chat ID is sensitive and is visible to endpoint readers. Switching channels clears the key and loaded data. An uncertain write is not retried automatically; inspect the list and audit before acknowledging it. Creating an endpoint alone does not enable workflow delivery: see [worker configuration](../../worker/rust-queue/README.md).
+
+`TEST_PG_BIN=/opt/homebrew/opt/postgresql@17/bin scripts/test-telegram-endpoints-browser.sh` builds the UI, starts an isolated local PostgreSQL and Rust API with a restricted API login, and exercises create/list/update/delete/audit in a browser; it requires ego-browser. The component tests cover recipient validation, channel switching, a mismatched response and uncertain writes. This screen does not manage Telegram bot secrets, worker policy, delivery health or operator decisions; it is not the original Novu endpoint UI/API, and real Telegram and production HA remain unverified.
