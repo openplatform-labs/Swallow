@@ -1,3 +1,5 @@
+Telegram 발송 전 조치 이력: 워커 0291과 CLI는 별도 DB 이력 조회 권한으로 작업별 재시도·취소 감사 기록을 함께 조회한다. 동일 요청 UUID가 양쪽에 있어도 페이지 경계에서 누락되지 않도록 조치 종류를 함께 사용한다. 격리 PostgreSQL·제한 로그인·실제 CLI에서 권한 회수·환경 격리, 두 페이지와 큰 리비전을 검증했다. 기존 이력 조회자의 정보 범위가 확대된다. JWT 운영자 식별 연결과 API·화면 이력 조회, 보존 정책과 운영 HA는 미구현 또는 미검증이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
+
 Telegram 발송 전 취소 권한 위임: API 0195와 설정 화면에서 기존 Telegram 판정 권한 관리자가 등록된 운영자에게 취소 JWT 권한을 위임·회수하고 요청과 감사를 조회할 수 있다. 기존 관리자의 권한 범위가 확대되며 최초 관리자와 API DB 취소 권한은 DBA가 설정한다. 제한 로그인·시험 JWT·격리 PostgreSQL·API 라우터에서 권한 변경, 회수, 동시 제출과 감사 실패 롤백을 검증했고 실제 브라우저와 로컬 API에서 권한 부여·회수 및 감사 기록을 확인했다. 실제 IdP·운영 HA는 미검증이다. [API README](apps/api/rust-api/README.md)를 참고한다.
 
 Telegram 발송 전 실패 취소 API: API 0194는 기존 재시도와 독립된 환경별 JWT·DB 권한으로 취소 요청과 본인 요청 조회를 제공한다. 제한 로그인·시험 JWT·격리 PostgreSQL·Rust API 라우터에서 권한 분리·회수, 환경 격리, 동시 재제출과 감사 실패 롤백을 검증했다. Angular 화면은 별도 확인을 거쳐 취소하고 동일 요청의 결과 조회·재제출을 지원한다. 격리 PostgreSQL·실제 브라우저·제한 API 계정·시험 JWT·실제 워커와 모의 Telegram에서 취소 작업이 발송되지 않음을 확인했다. JWT 권한 위임은 위 0195 항목을 참고하며 최초 관리자와 API DB 권한은 DBA가 설정한다. 취소 이력 조회·보존, 실제 IdP·Telegram·운영 HA는 미구현 또는 미검증이다. [API README](apps/api/rust-api/README.md)를 참고한다.

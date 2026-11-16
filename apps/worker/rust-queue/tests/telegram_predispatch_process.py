@@ -31,7 +31,7 @@ def call(env, *args, success=True):
 sql("""
 CREATE ROLE telegram_predispatch_reader LOGIN;
 GRANT USAGE ON SCHEMA public TO telegram_predispatch_reader;
-GRANT EXECUTE ON FUNCTION public.novu_rust_telegram_predispatch_list(text,uuid),public.novu_rust_telegram_predispatch_retry(text,uuid,uuid,bigint,text),public.novu_rust_telegram_predispatch_cancel(text,uuid,uuid,bigint,text),public.novu_rust_telegram_health(text) TO telegram_predispatch_reader;
+GRANT EXECUTE ON FUNCTION public.novu_rust_telegram_predispatch_list(text,uuid),public.novu_rust_telegram_predispatch_retry(text,uuid,uuid,bigint,text),public.novu_rust_telegram_predispatch_cancel(text,uuid,uuid,bigint,text),public.novu_rust_telegram_predispatch_history(text,uuid,uuid,text),public.novu_rust_telegram_health(text) TO telegram_predispatch_reader;
 INSERT INTO public.novu_rust_environments VALUES ('telegram-pre','org'),('telegram-pre-other','org');
 INSERT INTO public.novu_rust_telegram_operator_grants
  SELECT 'telegram-pre',rolname,oid,true,false,false FROM pg_roles WHERE rolname='telegram_predispatch_reader';
@@ -119,6 +119,28 @@ assert sql("SELECT (SELECT count(*) FROM public.novu_rust_telegram_predispatch_c
 sql("DELETE FROM public.novu_rust_telegram_predispatch_cancel_grants WHERE environment_id='telegram-pre' AND database_principal='telegram_predispatch_reader'")
 cancel(cancel_request,cancel_job,0,success=False)
 
+def history(env, history_job, *cursor, success=True):
+    result=subprocess.run([cli,'telegram-predispatch-history',env,history_job,*cursor],env={**os.environ,'DATABASE_URL':reader},capture_output=True,text=True,timeout=10)
+    assert (result.returncode==0)==success,result.stderr
+    return json.loads(result.stdout) if success else None
+
+history('telegram-pre',job,success=False)
+sql("INSERT INTO public.novu_rust_telegram_history_viewers SELECT 'telegram-pre',rolname,oid FROM pg_roles WHERE rolname='telegram_predispatch_reader'")
+assert history('telegram-pre',job)['data'][0]['requestId']==request
+assert history('telegram-pre',cancel_job)['data'][0]['requestId']==cancel_request
+history('telegram-pre-other',job,success=False)
+history('telegram-pre',job,str(uuid.uuid4()),'invalid',success=False)
+history_job=str(uuid.uuid4())
+sql("""INSERT INTO public.novu_rust_telegram_predispatch_retries(environment_id,request_id,job_id,failure_revision,reason,database_principal,principal_oid)
+ SELECT 'telegram-pre',lpad(to_hex(i),32,'0')::uuid,'%s',9007199254740993,'fixture',rolname,oid FROM generate_series(1,51) i CROSS JOIN pg_roles WHERE rolname='telegram_predispatch_reader';
+ INSERT INTO public.novu_rust_telegram_predispatch_cancellations(environment_id,request_id,job_id,failure_revision,reason,database_principal,principal_oid)
+ SELECT 'telegram-pre',lpad(to_hex(50),32,'0')::uuid,'%s',9007199254740993,'fixture',rolname,oid FROM pg_roles WHERE rolname='telegram_predispatch_reader'""" % (history_job,history_job))
+page=history('telegram-pre',history_job);assert len(page['data'])==50 and page['hasMore'] and page['next']['action']=='cancel'
+page2=history('telegram-pre',history_job,page['next']['requestId'],page['next']['action']);assert len(page2['data'])==2 and not page2['hasMore']
+assert page2['data'][0]['action']=='retry' and page2['data'][0]['requestId']==page['next']['requestId'] and page2['data'][0]['failureRevision']=='9007199254740993'
+sql("DELETE FROM public.novu_rust_telegram_history_viewers WHERE environment_id='telegram-pre' AND database_principal='telegram_predispatch_reader'")
+history('telegram-pre',job,success=False)
+
 calls = []
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -144,4 +166,4 @@ try:
 finally:
     worker.terminate(); worker.wait(timeout=5)
     server.shutdown(); server.server_close(); thread.join()
-print('Telegram pre-dispatch CLI isolates lists and enforces retry/cancel permissions, revision, idempotency, rollback, health and worker dispatch.')
+print('Telegram pre-dispatch CLI enforces scoped history pagination, retry/cancel permissions, idempotency, rollback, health and worker dispatch.')
