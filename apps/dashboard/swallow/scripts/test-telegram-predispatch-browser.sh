@@ -29,7 +29,7 @@ cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-wo
 "$TEST_PG_BIN/psql" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
 CREATE ROLE ui_fixture_api LOGIN;
 GRANT USAGE ON SCHEMA public TO ui_fixture_api;
-GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_telegram_predispatch(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_telegram_predispatch_retry(text,text,text,text,bigint,uuid,uuid,bigint,text),public.novu_rust_operator_jwt_telegram_predispatch_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_telegram_resolution_history(text,text,text,text,bigint,uuid,uuid),public.novu_rust_operator_jwt_telegram_health(text,text,text,text,bigint),public.novu_rust_operator_jwt_telegram_attention(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_telegram_resolve(text,text,text,text,bigint,uuid,uuid,uuid,text,text),public.novu_rust_operator_jwt_telegram_resolution_request(text,text,text,text,bigint,uuid,text) TO ui_fixture_api;
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_telegram_predispatch_cancel(text,text,text,text,bigint,uuid,uuid,bigint,text),public.novu_rust_operator_jwt_telegram_predispatch_cancel_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_telegram_predispatch(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_telegram_predispatch_retry(text,text,text,text,bigint,uuid,uuid,bigint,text),public.novu_rust_operator_jwt_telegram_predispatch_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_telegram_resolution_history(text,text,text,text,bigint,uuid,uuid),public.novu_rust_operator_jwt_telegram_health(text,text,text,text,bigint),public.novu_rust_operator_jwt_telegram_attention(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_telegram_resolve(text,text,text,text,bigint,uuid,uuid,uuid,text,text),public.novu_rust_operator_jwt_telegram_resolution_request(text,text,text,text,bigint,uuid,text) TO ui_fixture_api;
 INSERT INTO public.novu_rust_environments VALUES('fixture-env','fixture-org'),('other-env','fixture-org');
 INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES('https://issuer.test','admin','console','fixture-env'),('https://issuer.test','target','console','fixture-env'),('https://issuer.test','admin','console','other-env');
 INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname='ui_fixture_api';
@@ -37,11 +37,14 @@ INSERT INTO public.novu_rust_delivery_operator_grants SELECT 'fixture-env',rolna
 INSERT INTO public.novu_rust_operator_jwt_telegram_health_grants VALUES('https://issuer.test','admin','console','fixture-env');
 INSERT INTO public.novu_rust_operator_jwt_telegram_resolution_grants VALUES('https://issuer.test','admin','console','fixture-env',true,true,true);
 INSERT INTO public.novu_rust_telegram_operator_grants SELECT 'fixture-env',rolname,oid,true,true,true FROM pg_roles WHERE rolname='ui_fixture_api';
+INSERT INTO public.novu_rust_telegram_predispatch_cancel_grants SELECT 'fixture-env',rolname,oid FROM pg_roles WHERE rolname='ui_fixture_api';
+INSERT INTO public.novu_rust_operator_jwt_telegram_predispatch_cancellers VALUES('https://issuer.test','admin','console','fixture-env');
 INSERT INTO public.novu_rust_telegram_history_viewers SELECT 'fixture-env',rolname,oid FROM pg_roles WHERE rolname='ui_fixture_api';
 INSERT INTO public.novu_rust_operator_jwt_telegram_resolution_history_viewers VALUES('https://issuer.test','admin','console','fixture-env');
 INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES('11111111-1111-4111-8111-111111111111','fixture-env','experimental_telegram_workflow','{"destination":"secret"}','failed');
 INSERT INTO public.novu_rust_telegram_attempts(job_id,environment_id,state) VALUES('11111111-1111-4111-8111-111111111111','fixture-env','unknown');
 INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status,last_error,failure_revision) VALUES('22222222-2222-4222-8222-222222222222','fixture-env','experimental_telegram','{"destination":"ops","chatId":"123","text":"browser fixture"}','failed','invalid Telegram job',9007199254740993);
+INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status,last_error) VALUES('33333333-3333-4333-8333-333333333333','fixture-env','experimental_telegram','{"destination":"ops","chatId":"123","text":"cancelled fixture"}','failed','invalid Telegram job');
 SQL
 python3 - "$API/tests/fixtures/operator_jwt/test-only-public.pem" "$API/tests/fixtures/operator_jwt/test-only-private.pem" "$TEST_DIR" <<'PY'
 import base64,json,subprocess,sys,time
@@ -84,16 +87,24 @@ await fill('input[name="apiOrigin"]',api);await page.click('nav.sidenav button >
 await fill('input[name="alertEnvironment"]','fixture-env');await fill('input[name="alertKey"]',admin);
 await page.click('app-discord-reviews button:has-text("Telegram 발송 전 실패 조회")');
 await page.waitForFunction(()=>document.querySelector('app-discord-reviews')?.innerText.includes('22222222-2222-4222-8222-222222222222'));
-await fill('textarea[name="telegramPreReason"]','configuration checked');await page.click('app-discord-reviews button:has-text("재시도 준비")');
+await fill('textarea[name="telegramPreReason"]','configuration checked');await page.click('app-discord-reviews button:text-is("재시도 준비") >> nth=0');
 await page.waitForSelector('input[name="telegramPreConfirm"]');
 const req=await page.evaluate(()=>{const text=document.querySelector('app-discord-reviews')?.innerText||'';const m=text.match(/요청 ID ([0-9a-f-]{36})/);if(!m||!text.includes('9007199254740993'))throw Error('request or exact revision missing');return m[1]});
 await page.click('input[name="telegramPreConfirm"]');await page.click('app-discord-reviews button:text-is("재시도 제출")');
 await page.waitForFunction(()=>document.querySelector('app-discord-reviews')?.innerText.includes('재시도 요청이 기록됐습니다.'));
-await fill('input[name="telegramPreLookupId"]',req);await page.click('app-discord-reviews button:text-is("재시도 요청 조회")');
+await fill('input[name="telegramPreLookupId"]',req);await page.click('app-discord-reviews button:text-is("조치 요청 조회")');
 await page.waitForFunction(id=>document.querySelector('app-discord-reviews')?.innerText.includes('기록됨: '+id),req);
+await page.click('app-discord-reviews button:text-is("요청 정보 지우기")');
+await page.click('app-discord-reviews button:has-text("Telegram 발송 전 실패 조회")');
+await page.waitForFunction(()=>document.querySelector('app-discord-reviews')?.innerText.includes('33333333-3333-4333-8333-333333333333'));
+await fill('textarea[name="telegramPreReason"]','cancel confirmed');await page.click('app-discord-reviews button:text-is("발송 취소 준비")');
+await page.click('input[name="telegramPreConfirm"]');await page.click('app-discord-reviews button:text-is("발송 취소 제출")');
+await page.waitForFunction(()=>document.querySelector('app-discord-reviews')?.innerText.includes('발송 취소 요청이 기록됐습니다.'));
+await page.click('app-discord-reviews button:text-is("조치 요청 조회")');
+await page.waitForFunction(()=>document.querySelector('app-discord-reviews')?.innerText.includes('cancel confirmed') && document.querySelector('app-discord-reviews')?.innerText.includes('기록됨:'));
 await fill('input[name="alertKey"]',target);await page.click('app-discord-reviews button:has-text("Telegram 발송 전 실패 조회")');
 await page.waitForFunction(()=>document.querySelector('app-discord-reviews')?.innerText.includes('발송 전 실패 목록을 조회하지 못했습니다.'));
-console.log('Telegram pre-dispatch browser retry, exact revision, lookup and authorization passed');
+console.log('Telegram pre-dispatch browser retry, cancellation, exact revision, lookup and authorization passed');
 '''
 with open(root+'/browser.mjs','w') as f:f.write('const API='+json.dumps(api)+'; const UI='+json.dumps(ui)+'; const ROOT='+json.dumps(root)+'; const SPACE='+json.dumps(int(space) if space else None)+';\n'+script)
 PY
@@ -102,6 +113,8 @@ SPACE_ID=$(cat "$TEST_DIR/space-id")
 printf 'const task=await taskSpace(%s); await task.finish({keep:[]});\n' "$SPACE_ID" | ego-browser nodejs
 
 [[ $("$TEST_PG_BIN/psql" "$DATABASE_URL" -At -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM public.novu_rust_operator_jwt_telegram_predispatch_requests WHERE subject='admin' AND failure_revision=9007199254740993") == 1 ]]
+[[ $("$TEST_PG_BIN/psql" "$DATABASE_URL" -At -v ON_ERROR_STOP=1 -c "SELECT status FROM public.novu_queue_jobs WHERE id='33333333-3333-4333-8333-333333333333'") == cancelled ]]
+[[ $("$TEST_PG_BIN/psql" "$DATABASE_URL" -At -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM public.novu_rust_operator_jwt_telegram_predispatch_cancellations WHERE subject='admin'") == 1 ]]
 python3 - "$PROVIDER_PORT" "$TEST_DIR/calls" <<'PYMOCK' &
 import json,sys
 from http.server import BaseHTTPRequestHandler,HTTPServer
