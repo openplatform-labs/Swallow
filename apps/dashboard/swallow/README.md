@@ -534,4 +534,6 @@ Telegram 발송 전 조치 이력: API 0196과 기존 Telegram 이력 JWT·DB �
 
 운영 경보 화면에서 인증 방식을 운영자 JWT로 선택하면 오래된 취소 워커 자격 증명 관측 기록을 정리하는 카드가 나타난다. 환경별 정리 JWT 권한과 API DB 로그인 권한은 DBA가 별도로 등록해야 하며 API 0197 및 워커 0293–0294가 필요하다. 사용자가 보존 기간·최대 건수·사유를 선택하고 확인해 요청을 준비한 뒤 별도로 제출한다. 결과가 불명확하면 요청 ID를 기록하고 원래 환경·토큰으로 같은 요청을 재제출하거나 조회한다. 조회 결과가 없어도 진행 중일 수 있다. 화면의 요청 상태는 메모리에서만 유지되며 새로고침하거나 화면을 떠나기 전에 ID를 보관해야 한다. 백업이나 복제본의 기록은 제거하지 않는다.
 
-컴포넌트 테스트는 준비·확인, 동일 요청 재제출, 인증 변경, 지연 응답 폐기, 입력 제한과 전송 중 화면 이동 차단을 확인한다. `TMPDIR=/tmp TEST_PG_BIN=/path/to/postgresql/bin scripts/test-cancel-credential-retention-browser.sh`는 격리 로컬 PostgreSQL, 제한 API 로그인, 시험 JWT, 실제 Rust API와 브라우저를 연결해 준비 전 DB 불변, 제출·요청 조회 및 권한 없는 사용자 거절을 확인한다. 외부 IdP, 권한 위임 UI 및 운영 HA는 검증하지 않았다. 서버 권한과 동작은 [API 문서](../../api/rust-api/README.md)를 참고한다.
+컴포넌트 테스트는 준비·확인, 동일 요청 재제출, 인증 변경, 지연 응답 폐기, 입력 제한과 전송 중 화면 이동 차단을 확인한다. `TMPDIR=/tmp TEST_PG_BIN=/path/to/postgresql/bin scripts/test-cancel-credential-retention-browser.sh`는 격리 로컬 PostgreSQL, 제한 API 로그인, 시험 JWT, 실제 Rust API와 브라우저를 연결해 준비 전 DB 불변, 제출·요청 조회 및 권한 없는 사용자 거절을 확인한다. 외부 IdP와 운영 HA는 검증하지 않았다. 서버 권한과 동작은 [API 문서](../../api/rust-api/README.md)를 참고한다.
+
+API 0198 적용 후 설정 화면의 권한 위임에서 `Resend 취소 워커 관측 정리`를 선택해 해당 JWT 권한을 부여·회수할 수 있다. 기존 Resend 취소 위임 관리자의 권한 범위가 확대되므로 배포 전 관리자를 검토해야 한다. 같은 브라우저 시험에서 권한 부여 후 대상의 자기 요청 조회와 회수 후 거절도 확인한다. API DB 로그인 권한은 별도이며 외부 IdP와 운영 HA는 미검증이다.
