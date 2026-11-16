@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$(cd ../../.. && pwd)
 scenario=${SWALLOW_LOCAL_FAILOVER_SCENARIO:-alert-binding}
-case "$scenario" in alert-binding|alert-scheduler|alert-v2|alert-v3|alert-timing|trigger-key|trigger-inflight|execution-grant-inflight|sendgrid-inflight|sendgrid-sandbox-inflight|smtp|smtp-rls|smtp-plain|smtp-plain-rls|smtp-plain-fenced|smtp-policy|smtp-auto-policy|smtp-auto-inflight|smtp-resolution|discord-manual-retry|discord-cooldown|discord-inflight|in-app|resend|resend-cooldown|resend-invalid|resend-cancel-inflight|resend-cancel-credential-inflight|resend-cancel-evidence|resend-replay-inflight|resend-reconciliation|twilio|fcm|fcm-delay|fcm-exp|fcm-exp-repeat|fcm-review) ;; *) echo 'invalid local failover scenario' >&2; exit 2;; esac
+case "$scenario" in telegram-inflight|alert-binding|alert-scheduler|alert-v2|alert-v3|alert-timing|trigger-key|trigger-inflight|execution-grant-inflight|sendgrid-inflight|sendgrid-sandbox-inflight|smtp|smtp-rls|smtp-plain|smtp-plain-rls|smtp-plain-fenced|smtp-policy|smtp-auto-policy|smtp-auto-inflight|smtp-resolution|discord-manual-retry|discord-cooldown|discord-inflight|in-app|resend|resend-cooldown|resend-invalid|resend-cancel-inflight|resend-cancel-credential-inflight|resend-cancel-evidence|resend-replay-inflight|resend-reconciliation|twilio|fcm|fcm-delay|fcm-exp|fcm-exp-repeat|fcm-review) ;; *) echo 'invalid local failover scenario' >&2; exit 2;; esac
 pgbin=${SWALLOW_TEST_POSTGRES_BIN:-/opt/homebrew/opt/postgresql@17/bin}
 [[ -x "$pgbin/pg_ctl" && -x "$pgbin/pg_basebackup" ]] || { echo 'PostgreSQL 17 server binaries are required' >&2; exit 1; }
 testdir=$(mktemp -d /private/tmp/swallow-alert-ha.XXXXXX)
@@ -46,7 +46,12 @@ done
 export TEST_PRIMARY_URL="$DATABASE_URL" TEST_STANDBY_URL="postgres://postgres@127.0.0.1:$standby_port/postgres"
 export TEST_FAILOVER_URL="postgres://postgres@127.0.0.1:$standby_port,127.0.0.1:$primary_port/postgres?target_session_attrs=read-write&connect_timeout=2"
 export TEST_LOCAL_PRIMARY_DATA="$testdir/primary" TEST_LOCAL_STANDBY_DATA="$testdir/standby" TEST_LOCAL_PG_CTL="$pgbin/pg_ctl"
-if [[ "$scenario" == alert-timing ]]; then
+if [[ "$scenario" == telegram-inflight ]]; then
+  cargo build --quiet --locked --features test-mocks --bin telegram-worker
+  cp target/debug/telegram-worker "$testdir/telegram-worker-mock"
+  cargo build --quiet --locked --bin telegram-worker
+  TEST_TELEGRAM_WORKER="$testdir/telegram-worker-mock" TEST_PSQL="$pgbin/psql" python3 tests/telegram_inflight_failover.py
+elif [[ "$scenario" == alert-timing ]]; then
   "$root/apps/worker/rust-queue/scripts/test-alert-timing-failover.sh" "$root" "$testdir" "$pgbin"
 elif [[ "$scenario" == trigger-key || "$scenario" == trigger-inflight ]]; then
   export TEST_TRIGGER_INFLIGHT=$([[ "$scenario" == trigger-inflight ]] && printf true || printf false)
