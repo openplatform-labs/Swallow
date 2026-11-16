@@ -11,6 +11,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         calls.append(self.path);assert self.headers.get('Authorization')=='Bearer fixture'
         if self.path=='/emails/fixture-five/cancel':received.set();release.wait(10);return
+        if self.path in ('/emails/status-408/cancel','/emails/status-409/cancel'):
+            self.send_response(int(self.path.split('-')[1].split('/')[0]));self.send_header('Content-Length','0');self.end_headers();return
         assert self.path=='/emails/fixture-four/cancel';data=b'{"object":"email","id":"fixture-four"}'
         self.send_response(200);self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
     def log_message(self,*args):pass
@@ -78,6 +80,23 @@ try:
     ack=cli(['ack-resend-cancel-failed','cancel-env',fail,failed['failedAt'],'checked'],reviewer);assert ack.returncode==0 and json.loads(ack.stdout)['recorded'] is True
     assert json.loads(cli(['check-resend-cancel-commands','cancel-env','60']).stdout)=={'pending':1,'overdue':1,'unreviewed':2}
     assert json.loads(cli(['ack-resend-cancel-failed','cancel-env',fail,failed['failedAt'],'checked'],reviewer).stdout)['recorded'] is False
+    # Keep the deliberately aged fixture from dispatching during the following scenario.
+    sql("UPDATE public.novu_rust_resend_cancel_commands SET state='failed' WHERE request_id='99999999-9999-4999-8999-999999999999'")
+    # Timeout and conflict can be ambiguous: never release the live-request fence.
+    for code in (408,409):
+        job='99999999-9999-4999-8999-'+str(code).zfill(12);request='dddddddd-dddd-4ddd-8ddd-'+str(code).zfill(12)
+        sql("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status,resend_scheduled_at) VALUES('%s','cancel-env','experimental_resend_email','{}','completed',clock_timestamp()+interval '1 hour'); INSERT INTO public.novu_rust_resend_attempts(job_id,environment_id,state,provider_message_id,account_tag) VALUES('%s','cancel-env','accepted','status-%s','account-a')"%(job,job,code))
+        enqueue(request,job)
+    worker2=start()
+    for code in (408,409):
+        request='dddddddd-dddd-4ddd-8ddd-'+str(code).zfill(12);job='99999999-9999-4999-8999-'+str(code).zfill(12)
+        wait(lambda:sql("SELECT count(*) FROM public.novu_rust_resend_cancel_requests WHERE request_id='%s' AND state='unknown'"%request)=='1')
+        assert sql("SELECT state FROM public.novu_rust_resend_cancel_commands WHERE request_id='%s'"%request)=='dispatching'
+        assert sql("SELECT public.novu_rust_resend_cancel_finish('cancel-env','%s','rejected',%s)"%(request,code),worker_db,False)!=0
+        assert sql("SELECT public.novu_rust_resend_cancel_enqueue('cancel-env',gen_random_uuid(),'%s','new')"%job,submit,False)!=0
+    time.sleep(2)
+    for code in (408,409):assert calls.count('/emails/status-%s/cancel'%code)==1,calls
+    worker2.terminate();worker2.wait(timeout=5)
 finally:
     release.set()
     for p in children:

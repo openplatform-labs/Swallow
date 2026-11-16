@@ -205,7 +205,7 @@ impl Resend {
             Err(_)=>return Ok(CancelOutcome::Unknown),
         };
         let status=response.status();
-        if status.is_client_error() {return Ok(CancelOutcome::Rejected(status.as_u16()));}
+        if status.is_client_error() && ![408,409].contains(&status.as_u16()) {return Ok(CancelOutcome::Rejected(status.as_u16()));}
         if !status.is_success() {return Ok(CancelOutcome::Unknown);}
         let mut bytes=Vec::new();
         loop {
@@ -325,6 +325,8 @@ mod tests {
             (200,"{\"object\":\"email\",\"id\":\"other\"}",CancelOutcome::Unknown),
             (200,"{}",CancelOutcome::Unknown),
             (400,"{}",CancelOutcome::Rejected(400)),
+            (408,"{}",CancelOutcome::Unknown),
+            (409,"{}",CancelOutcome::Unknown),
             (429,"{}",CancelOutcome::Rejected(429)),
             (500,"{}",CancelOutcome::Unknown),
             (302,"{}",CancelOutcome::Unknown),

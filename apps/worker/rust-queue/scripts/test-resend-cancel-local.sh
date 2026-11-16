@@ -21,7 +21,7 @@ GRANT EXECUTE ON FUNCTION public.novu_rust_resend_health_exclude_confirmed_cance
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_reserve(text,uuid,uuid,text),public.novu_rust_resend_cancel_finish(text,uuid,text,integer),public.novu_rust_resend_cancel_get(text,uuid) TO cancel_fixture,cancel_unprivileged;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_reserve_tagged(text,uuid,uuid,text,text) TO cancel_fixture,cancel_unprivileged;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_resolve(text,uuid,uuid,text,text),public.novu_rust_resend_cancel_resolution_get(text,uuid),public.novu_rust_resend_cancel_get(text,uuid) TO cancel_resolver,cancel_fixture;
-GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_list(text,integer,uuid) TO cancel_resolver,cancel_fixture,cancel_unprivileged;
+GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_list(text,integer,uuid),public.novu_rust_resend_cancel_legacy_ambiguous(text,uuid) TO cancel_resolver,cancel_fixture,cancel_unprivileged;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_enqueue(text,uuid,uuid,text),public.novu_rust_resend_cancel_command_get(text,uuid) TO cancel_submitter,cancel_unprivileged;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_claim(text),public.novu_rust_resend_cancel_finish(text,uuid,text,integer) TO cancel_worker;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_claim_tagged(text,text) TO cancel_worker;

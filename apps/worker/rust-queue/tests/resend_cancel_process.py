@@ -193,6 +193,16 @@ try:
     assert ambiguous['cancellationEvidence']=='ambiguous' and ambiguous['result']=='unknown',ambiguous
     assert policy_health().stdout.strip()=='2|2'
     check=evidence_cli('check-resend-cancel-evidence');assert json.loads(check.stdout)=={'conflicting':0,'ambiguous':1},check.stdout
+    # Historical 408/409 rows remain unchanged but can be found by scoped readers.
+    legacy="INSERT INTO public.novu_rust_resend_cancel_requests(environment_id,request_id,job_id,provider_id,database_principal,principal_oid,reason,state,http_status) SELECT 'cancel-env','aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa0','66666666-6666-4666-8666-666666666666','fixture-six',rolname,oid,'private reason','rejected',408 FROM pg_roles WHERE rolname='cancel_fixture'"
+    subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',legacy],check=True,capture_output=True)
+    legacy409=legacy.replace('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa0','aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1').replace("'rejected',408","'rejected',409")
+    subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',legacy409],check=True,capture_output=True)
+    history=run('list-legacy-ambiguous','cancel-env',override=resolver);assert history.returncode==0,(history.stdout,history.stderr)
+    page=json.loads(history.stdout);assert len(page['data'])==2 and [x['httpStatus'] for x in page['data']]==[408,409] and 'private' not in history.stdout,page
+    assert json.loads(run('list-legacy-ambiguous','cancel-env',page['data'][-1]['requestId'],override=resolver).stdout)['data']==[]
+    assert run('list-legacy-ambiguous','cancel-other',override=resolver).returncode!=0
+    assert run('list-legacy-ambiguous','cancel-env',override=denied).returncode!=0
     # Page unknown requests without exposing provider IDs or investigation reasons.
     insert="""WITH jobs AS (INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) SELECT gen_random_uuid(),'cancel-env','experimental_resend_email','{}','completed' FROM generate_series(1,55) RETURNING id)
     INSERT INTO public.novu_rust_resend_cancel_requests(environment_id,request_id,job_id,provider_id,database_principal,principal_oid,reason,state,created_at)

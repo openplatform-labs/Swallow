@@ -6,10 +6,10 @@ use uuid::Uuid;
 #[tokio::main]
 async fn main() -> Result<(),Box<dyn Error+Send+Sync>> {
     let args:Vec<String>=std::env::args().skip(1).collect();
-    if !(args.len()==3 && (args[0]=="get" || args[0]=="resolution-get") || (args.len()==3 || args.len()==4) && args[0]=="list" || args.len()==5 && args[0]=="cancel" || args.len()==6 && args[0]=="resolve") {
-        return Err("usage: resend-cancel list ENV GRACE_SECONDS [AFTER_REQUEST_UUID] | get ENV REQUEST_UUID | resolution-get ENV RESOLUTION_UUID | cancel ENV REQUEST_UUID JOB_UUID REASON | resolve ENV RESOLUTION_UUID REQUEST_UUID confirmed|not_cancelled REASON".into());
+    if !((args.len()==2 || args.len()==3) && args[0]=="list-legacy-ambiguous" || args.len()==3 && (args[0]=="get" || args[0]=="resolution-get") || (args.len()==3 || args.len()==4) && args[0]=="list" || args.len()==5 && args[0]=="cancel" || args.len()==6 && args[0]=="resolve") {
+        return Err("usage: resend-cancel list-legacy-ambiguous ENV [AFTER_REQUEST_UUID] | list ENV GRACE_SECONDS [AFTER_REQUEST_UUID] | get ENV REQUEST_UUID | resolution-get ENV RESOLUTION_UUID | cancel ENV REQUEST_UUID JOB_UUID REASON | resolve ENV RESOLUTION_UUID REQUEST_UUID confirmed|not_cancelled REASON".into());
     }
-    let request=if args[0]=="list" {None} else {Some(Uuid::parse_str(&args[2])?)};
+    let request=if args[0]=="list" || args[0]=="list-legacy-ambiguous" {None} else {Some(Uuid::parse_str(&args[2])?)};
     // Validate the provider configuration before committing an unknown marker.
     let provider=if args[0]=="cancel" {
         let api_key=novu_rust_contracts::secret::from_env("NOVU_RESEND_API_KEY","NOVU_RESEND_API_KEY_FILE")?.ok_or("Resend API key is required")?;
@@ -35,6 +35,13 @@ async fn main() -> Result<(),Box<dyn Error+Send+Sync>> {
     let (config,tls)=novu_rust_contracts::postgres::configure(&std::env::var("DATABASE_URL")?)?;
     let (db,connection)=config.connect(tls).await?;
     tokio::spawn(async move {if connection.await.is_err(){eprintln!("database connection failed");}});
+    if args[0]=="list-legacy-ambiguous" {
+        let after=args.get(2).map(|value|Uuid::parse_str(value)).transpose()?;
+        let rows=db.query("SELECT * FROM public.novu_rust_resend_cancel_legacy_ambiguous($1,$2)",&[&args[1],&after]).await?;
+        let data:Vec<_>=rows.iter().take(50).map(|row|serde_json::json!({"requestId":row.get::<_,Uuid>(0),"jobId":row.get::<_,Uuid>(1),"httpStatus":row.get::<_,i32>(2),"createdAt":row.get::<_,String>(3)})).collect();
+        let next=if rows.len()>50 {data.last().and_then(|row|row["requestId"].as_str())} else {None};
+        println!("{}",serde_json::json!({"data":data,"next":next}));return Ok(());
+    }
     if args[0]=="list" {
         let grace=args[2].parse::<i32>()?;
         let after=args.get(3).map(|value|Uuid::parse_str(value)).transpose()?;
