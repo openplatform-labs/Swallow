@@ -205,6 +205,15 @@ try:
     assert json.loads(run('list-legacy-ambiguous','cancel-env',page['data'][-1]['requestId'],override=resolver).stdout)['data']==[]
     assert run('list-legacy-ambiguous','cancel-other',override=resolver).returncode!=0
     assert run('list-legacy-ambiguous','cancel-env',override=denied).returncode!=0
+    def legacy_health(environment='cancel-env',override=None):
+        return subprocess.run([health_bin,'check-resend-cancel-legacy',environment],env=override or env,text=True,capture_output=True,timeout=10)
+    check=legacy_health();assert check.returncode==2 and json.loads(check.stdout)=={'legacyAmbiguous':2},(check.stdout,check.stderr)
+    assert legacy_health('cancel-other').returncode!=0 and legacy_health(override=denied).returncode!=0
+    legacy_alert={**alert_env,'SWALLOW_ALERT_RESEND_CANCEL_LEGACY_ENABLED':'true'};legacy_alert.pop('SWALLOW_ALERT_RESEND_CANCEL_GRACE_SECONDS')
+    sent=subprocess.run([os.path.join(env['TEST_WORKER_DIR'],'send-delivery-alert'),'cancel-env','300','120','60'],env=legacy_alert,text=True,capture_output=True,timeout=15)
+    assert sent.returncode==2 and 'requires operator review' in sent.stderr,(sent.stdout,sent.stderr)
+    unsupported={**legacy_alert,'SWALLOW_ALERT_CONDITIONS_V3':'false'}
+    assert subprocess.run([os.path.join(env['TEST_WORKER_DIR'],'send-delivery-alert'),'cancel-env','300','120','60'],env=unsupported,capture_output=True,timeout=15).returncode==1
     req408=page['data'][0]['requestId'];req409=page['data'][1]['requestId'];review408='abababab-abab-4bab-8bab-abababababab';review409='cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd'
     fresh='dddddddd-aaaa-4ddd-8ddd-dddddddddddd'
     reserve="SELECT public.novu_rust_resend_cancel_reserve('cancel-env','%s','%s','fixture')"%(fresh,legacy_job)
@@ -242,6 +251,7 @@ try:
     assert run('resolve','cancel-env',third_resolution,third,'not_cancelled','checked',override=resolver).returncode==0
     assert json.loads(run('get','cancel-env',req409).stdout)['request']['httpStatus']==409
     assert json.loads(run('list-legacy-ambiguous','cancel-env',override=resolver).stdout)['data']==[]
+    check=legacy_health();assert check.returncode==0 and json.loads(check.stdout)=={'legacyAmbiguous':0}
     # Page unknown requests without exposing provider IDs or investigation reasons.
     insert="""WITH jobs AS (INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) SELECT gen_random_uuid(),'cancel-env','experimental_resend_email','{}','completed' FROM generate_series(1,55) RETURNING id)
     INSERT INTO public.novu_rust_resend_cancel_requests(environment_id,request_id,job_id,provider_id,database_principal,principal_oid,reason,state,created_at)

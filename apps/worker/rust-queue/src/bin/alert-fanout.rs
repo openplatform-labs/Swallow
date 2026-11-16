@@ -22,6 +22,7 @@ struct Config {
 struct DeliveryChecks {
     resend: Option<bool>,
     attempts: Option<bool>,
+    resend_cancel_legacy: Option<bool>,
     resend_cancel_evidence: Option<bool>,
     resend_exclude_confirmed_cancel: Option<bool>,
     slack_jobs: Option<bool>,
@@ -50,6 +51,7 @@ impl DeliveryChecks {
         for (key, value) in [
             ("SWALLOW_ALERT_RESEND_ENABLED", self.resend),
             ("SWALLOW_ALERT_ATTEMPTS_ENABLED", self.attempts),
+            ("SWALLOW_ALERT_RESEND_CANCEL_LEGACY_ENABLED", self.resend_cancel_legacy),
             ("SWALLOW_ALERT_RESEND_CANCEL_EVIDENCE_ENABLED", self.resend_cancel_evidence),
             ("SWALLOW_ALERT_RESEND_EXCLUDE_CONFIRMED_CANCEL", self.resend_exclude_confirmed_cancel),
             ("SWALLOW_ALERT_SLACK_JOBS_ENABLED", self.slack_jobs),

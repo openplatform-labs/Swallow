@@ -16,7 +16,7 @@ cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-wo
 CREATE ROLE cancel_fixture LOGIN; CREATE ROLE cancel_unprivileged LOGIN; CREATE ROLE cancel_resolver LOGIN; CREATE ROLE cancel_submitter LOGIN; CREATE ROLE cancel_worker LOGIN;
 GRANT USAGE ON SCHEMA public TO cancel_fixture,cancel_unprivileged,cancel_resolver,cancel_submitter,cancel_worker;
 GRANT EXECUTE ON FUNCTION public.novu_rust_channel_result(text,uuid,text) TO cancel_fixture,cancel_unprivileged;
-GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_evidence_health(text),public.novu_rust_resend_cancel_evidence_list(text,uuid) TO cancel_fixture,cancel_unprivileged;
+GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_evidence_health(text),public.novu_rust_resend_cancel_evidence_list(text,uuid),public.novu_rust_resend_cancel_legacy_health(text) TO cancel_fixture,cancel_unprivileged;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_health_exclude_confirmed_cancel(text,integer,integer),public.novu_rust_provider_health(text,text,integer,integer) TO cancel_fixture,cancel_unprivileged;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_reserve(text,uuid,uuid,text),public.novu_rust_resend_cancel_finish(text,uuid,text,integer),public.novu_rust_resend_cancel_get(text,uuid) TO cancel_fixture,cancel_unprivileged;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_reserve_tagged(text,uuid,uuid,text,text) TO cancel_fixture,cancel_unprivileged;

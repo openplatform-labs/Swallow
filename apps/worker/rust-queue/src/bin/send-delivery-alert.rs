@@ -162,6 +162,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     if exclude_confirmed_cancel && (!resend_enabled || !scoped_checks || !env_bool("SWALLOW_ALERT_RESEND_CANCEL_EVIDENCE_ENABLED", false)?) {return Err("excluding confirmed cancellations requires scoped Resend health and cancellation evidence alerts".into());}
     let attempts_enabled = env_bool("SWALLOW_ALERT_ATTEMPTS_ENABLED", false)?;
     let slack_jobs_enabled = env_bool("SWALLOW_ALERT_SLACK_JOBS_ENABLED", false)?;
+    let resend_cancel_legacy_enabled=env_bool("SWALLOW_ALERT_RESEND_CANCEL_LEGACY_ENABLED",false)?;
+    if resend_cancel_legacy_enabled && on_new_condition && !conditions_v3 {return Err("Resend legacy cancellation new-condition requires v3 conditions".into());}
     let resend_cancel_evidence_enabled=env_bool("SWALLOW_ALERT_RESEND_CANCEL_EVIDENCE_ENABLED", false)?;
     if resend_cancel_evidence_enabled && on_new_condition && !conditions_v3 {return Err("Resend cancellation evidence new-condition requires v3 conditions".into());}
     let resend_cancel_command_grace=env_optional_i32("SWALLOW_ALERT_RESEND_CANCEL_COMMAND_GRACE_SECONDS")?;
@@ -282,6 +284,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         && !attempts_enabled
         && !discord_enabled
         && !smtp_enabled
+        && !resend_cancel_legacy_enabled
         && !resend_cancel_evidence_enabled
         && resend_cancel_command_grace.is_none()
         && resend_cancel_grace.is_none()
@@ -558,6 +561,10 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     } else {
         None
     };
+    let resend_cancel_legacy=if resend_cancel_legacy_enabled {
+        let result=tokio::time::timeout(operation_timeout,db.query_one("SELECT public.novu_rust_resend_cancel_legacy_health($1)",&[&args[0]])).await;
+        Some(match result {Ok(Ok(row))=>u64::try_from(row.get::<_,i64>(0)).map_err(|_|()),_=>{eprintln!("Resend legacy cancellation health check failed");Err(())}})
+    }else{None};
     let resend_cancel_evidence=if resend_cancel_evidence_enabled {
         let result=tokio::time::timeout(operation_timeout,db.query_one("SELECT * FROM public.novu_rust_resend_cancel_evidence_health($1)",&[&args[0]])).await;
         Some(match result {Ok(Ok(row))=>match(u64::try_from(row.get::<_,i64>(0)),u64::try_from(row.get::<_,i64>(1))){(Ok(conflicting),Ok(ambiguous))=>Ok((conflicting,ambiguous)),_=>Err(())},_=>{eprintln!("Resend cancellation evidence health check failed");Err(())}})
@@ -756,7 +763,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         });
         Some(match values {Some(value)=>Ok(value),None=>{eprintln!("FCM cooldown check failed");Err(())}})
     } else {None};
-    let unhealthy = resend_cancel_evidence.is_some_and(|v|!matches!(v,Ok((0,0)))) || resend_cancel_commands.is_some_and(|v|!matches!(v,Ok((_,0,0)))) || resend_cancel_health.is_some_and(|v|!matches!(v,Ok((_,0)))) || smtp_auto_workers.is_some_and(|v| match v {Ok((healthy,_,minimum))=>healthy<minimum,Err(())=>true}) || smtp_auto_health.is_some_and(|v| !matches!(v,Ok((_,_,0,0)))) || smtp_ca.is_some_and(|value| match value {Ok((healthy,unhealthy,_,minimum))=>healthy<minimum||unhealthy>0,Err(())=>true}) || smtp_credentials.is_some_and(|value| match value {Ok((healthy,unhealthy,_,minimum))=>healthy<minimum||unhealthy>0,Err(())=>true}) || discord_cooldown_health.is_some_and(|v| match v {Ok((active,deferred,overdue))=>overdue>0||(!discord_cooldown_overdue_only&&(active>0||deferred>0)),Err(())=>true}) || smtp_health.is_some_and(|v| !matches!(v,Ok((0,0,0)))) || discord_retry_health.is_some_and(|v| !matches!(v,Ok((_,0)))) || discord_health.is_some_and(|v| !matches!(v,Ok((0,0,0,0)))) || fcm_credentials.is_some_and(|value| match value {
+    let unhealthy = resend_cancel_legacy.is_some_and(|v|!matches!(v,Ok(0))) || resend_cancel_evidence.is_some_and(|v|!matches!(v,Ok((0,0)))) || resend_cancel_commands.is_some_and(|v|!matches!(v,Ok((_,0,0)))) || resend_cancel_health.is_some_and(|v|!matches!(v,Ok((_,0)))) || smtp_auto_workers.is_some_and(|v| match v {Ok((healthy,_,minimum))=>healthy<minimum,Err(())=>true}) || smtp_auto_health.is_some_and(|v| !matches!(v,Ok((_,_,0,0)))) || smtp_ca.is_some_and(|value| match value {Ok((healthy,unhealthy,_,minimum))=>healthy<minimum||unhealthy>0,Err(())=>true}) || smtp_credentials.is_some_and(|value| match value {Ok((healthy,unhealthy,_,minimum))=>healthy<minimum||unhealthy>0,Err(())=>true}) || discord_cooldown_health.is_some_and(|v| match v {Ok((active,deferred,overdue))=>overdue>0||(!discord_cooldown_overdue_only&&(active>0||deferred>0)),Err(())=>true}) || smtp_health.is_some_and(|v| !matches!(v,Ok((0,0,0)))) || discord_retry_health.is_some_and(|v| !matches!(v,Ok((_,0)))) || discord_health.is_some_and(|v| !matches!(v,Ok((0,0,0,0)))) || fcm_credentials.is_some_and(|value| match value {
         Ok((healthy, failed, _, minimum)) => healthy < minimum || failed > 0,
         Err(()) => true,
     }) || sendgrid_webhook_keys.is_some_and(|v| !matches!(v, Ok(1..=10)))
@@ -810,6 +817,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         smtp_health,
         smtp_auto_workers,
         smtp_auto_health,
+        resend_cancel_legacy,
         resend_cancel_evidence,
         resend_cancel_health,
         resend_cancel_commands,
@@ -879,7 +887,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         println!("{{\"status\":\"healthy\"}}");
         return Ok(());
     }
-    let mut error = resend_cancel_evidence.is_some_and(|v|v.is_err()) || resend_cancel_commands.is_some_and(|v|v.is_err()) || resend_cancel_health.is_some_and(|v|v.is_err()) || smtp_auto_workers.is_some_and(|v| v.is_err()) || smtp_auto_health.is_some_and(|v| v.is_err()) || discord_cooldown_health.is_some_and(|v| v.is_err()) || smtp_health.is_some_and(|v| v.is_err()) || discord_retry_health.is_some_and(|v| v.is_err()) || discord_health.is_some_and(|v| v.is_err()) || configuration_error
+    let mut error = resend_cancel_legacy.is_some_and(|v|v.is_err()) || resend_cancel_evidence.is_some_and(|v|v.is_err()) || resend_cancel_commands.is_some_and(|v|v.is_err()) || resend_cancel_health.is_some_and(|v|v.is_err()) || smtp_auto_workers.is_some_and(|v| v.is_err()) || smtp_auto_health.is_some_and(|v| v.is_err()) || discord_cooldown_health.is_some_and(|v| v.is_err()) || smtp_health.is_some_and(|v| v.is_err()) || discord_retry_health.is_some_and(|v| v.is_err()) || discord_health.is_some_and(|v| v.is_err()) || configuration_error
         || observation_error
         || sendgrid_webhook_keys.is_some_and(|v| v.is_err())
         || fcm_credentials.is_some_and(|v| v.is_err())
