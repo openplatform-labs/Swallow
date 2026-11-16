@@ -28,11 +28,14 @@ cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-wo
 CREATE ROLE ui_retention_api LOGIN;
 GRANT USAGE ON SCHEMA public TO ui_retention_api;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_cancel_cred_retention_submit(text,text,text,text,bigint,uuid,integer,integer,text),public.novu_rust_operator_jwt_cancel_cred_retention_get(text,text,text,text,bigint,uuid) TO ui_retention_api;
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_cancel_cred_retention_audit(text,text,text,text,bigint,uuid) TO ui_retention_api;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_cancel_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_resend_cancel_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text) TO ui_retention_api;
 INSERT INTO public.novu_rust_environments VALUES('fixture-env','fixture-org');
 INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES('https://issuer.test','admin','console','fixture-env'),('https://issuer.test','target','console','fixture-env');
 INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname='ui_retention_api';
 INSERT INTO public.novu_rust_operator_jwt_cancel_cred_retention_grants VALUES('https://issuer.test','admin','console','fixture-env');
+INSERT INTO public.novu_rust_operator_jwt_cancel_cred_retention_audit_viewers VALUES('https://issuer.test','admin','console','fixture-env');
+INSERT INTO public.novu_rust_cancel_cred_retention_audit_db_viewers SELECT 'fixture-env',rolname,oid FROM pg_roles WHERE rolname='ui_retention_api';
 INSERT INTO public.novu_rust_operator_jwt_resend_cancel_grant_admins VALUES('https://issuer.test','admin','console','fixture-env',true,true);
 INSERT INTO public.novu_rust_resend_cancel_cred_retention_operators SELECT 'fixture-env',rolname,oid FROM pg_roles WHERE rolname='ui_retention_api';
 INSERT INTO public.novu_rust_resend_cancel_credential_health VALUES('fixture-env','11111111-1111-4111-8111-111111111111',session_user,-1,clock_timestamp()-interval '4 days','unhealthy',clock_timestamp()-interval '3 days'),('fixture-env','22222222-2222-4222-8222-222222222222',session_user,-1,clock_timestamp()-interval '4 days','unhealthy',clock_timestamp());
@@ -82,6 +85,7 @@ await page.click('app-resend-cancel-credential-retention input[type="checkbox"]'
 await page.waitForFunction(()=>document.querySelector('app-resend-cancel-credential-retention')?.innerText.includes('정리 완료: 1건'));if(count()!=='1')throw Error('incorrect deletion');
 await fill('input[name="cancelRetentionRequest"]',req);await page.click('app-resend-cancel-credential-retention button:has-text("요청 조회")');
 await page.waitForFunction(()=>document.querySelector('app-resend-cancel-credential-retention')?.innerText.includes('정리 1건'));
+await page.click('app-resend-cancel-credential-retention button:has-text("정리 이력 조회")');await page.waitForFunction(id=>[...document.querySelectorAll('app-resend-cancel-credential-retention table')].some(t=>t.innerText.includes(id)&&t.innerText.includes('admin')&&t.innerText.includes('browser ticket')),req);
 await fill('input[name="alertKey"]',target);await fill('input[name="cancelRetentionRequest"]',req);await page.click('app-resend-cancel-credential-retention button:has-text("요청 조회")');
 await page.waitForFunction(()=>document.querySelector('app-resend-cancel-credential-retention')?.innerText.includes('조회하지 못했습니다.'));if(count()!=='1')throw Error('unauthorized request changed data');
 async function settings(){await page.click('nav.sidenav button >> nth=6');await fill('input[name="permissionEnvironment"]','fixture-env');await fill('input[name="permissionKey"]',admin);await fill('input[name="permissionIssuer"]','https://issuer.test');await fill('input[name="permissionSubject"]','target');await fill('input[name="permissionClient"]','console');await page.selectOption('select[name="grantKind"]','resend-cancel:credential-retention');await page.click('loc=role:button[name="선택 권한 조회"]');}

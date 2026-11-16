@@ -6211,6 +6211,20 @@ pub(super) async fn discord_retry_grant_read(State(db):State<Arc<Client>>,header
 pub(super) async fn discord_retry_grant_request(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response { query(db,headers,uri,verifier,Lookup::DiscordRetryGrantRequest).await }
 pub(super) async fn discord_retry_grant_audit(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response { query(db,headers,uri,verifier,Lookup::DiscordRetryGrantAudit).await }
 
+pub(super) async fn resend_cancel_credential_retention_audit(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
+    let identity=match authenticate(&db,&headers,verifier).await {Ok(v)=>v,Err(status)=>return failure(status,uri.path())};
+    let params:Vec<_>=form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).collect();
+    if params.is_empty()||params.len()>2||params.iter().any(|(k,_)|k!="environmentId"&&k!="after")||params.iter().filter(|(k,_)|k=="environmentId").count()!=1||params.iter().filter(|(k,_)|k=="after").count()>1{return failure(StatusCode::BAD_REQUEST,uri.path());}
+    let env=params.iter().find(|(k,_)|k=="environmentId").map(|(_,v)|v.as_ref());let after=params.iter().find(|(k,_)|k=="after").map(|(_,v)|Uuid::parse_str(v)).transpose();
+    let (Some(env),Ok(after),Ok(exp))=(env.filter(|v|!v.is_empty()&&v.len()<=512&&!v.contains('\0')),after,i64::try_from(identity.expires_at)) else{return failure(StatusCode::BAD_REQUEST,uri.path());};
+    match guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_cancel_cred_retention_audit($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&after]).await {
+        Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
+        Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
+        Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
+        Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path()),
+    }
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all="camelCase",deny_unknown_fields)]
 struct CancelCredentialRetentionBody {request_id:String,older_than_seconds:i32,batch_limit:i32,reason:String}
