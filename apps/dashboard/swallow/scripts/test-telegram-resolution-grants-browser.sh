@@ -94,7 +94,7 @@ async function alerts() {
  await page.click('nav.sidenav button >> nth=5');await page.selectOption('select[name="alertAuthMode"]','jwt');
  await fill('input[name="alertEnvironment"]','fixture-env');await fill('input[name="alertKey"]',target);
 }
-await settings();await change('list','없음');await change('retry','없음');await change('accepted','없음');
+await settings();await change('list','없음');await change('retry','없음');await change('accepted','없음');await change('cancel-predispatch','없음');await change('cancel-predispatch','허용');
 await page.selectOption('select[name="grantAuditScope"]','telegram-resolution');await page.click('section:has(select[name="grantAuditScope"]) button:has-text("위임 이력 조회")');
 await page.waitForFunction(()=>[...document.querySelectorAll('table')].some(t=>t.innerText.includes('Telegram resolution grants browser accepted')));
 await alerts();await page.click('app-discord-reviews button:has-text("Telegram 검토 목록 조회")');
@@ -111,3 +111,6 @@ SPACE_ID=$(cat "$TEST_DIR/space-id")
 printf 'const task=await taskSpace(%s); await task.finish({keep:[]});\n' "$SPACE_ID" | ego-browser nodejs
 [[ $("$TEST_PG_BIN/psql" "$DATABASE_URL" -At -v ON_ERROR_STOP=1 -c "SELECT count(*)=4 FROM public.novu_rust_operator_jwt_telegram_resolution_grant_audit WHERE environment_id='fixture-env'") == t ]]
 [[ $("$TEST_PG_BIN/psql" "$DATABASE_URL" -At -v ON_ERROR_STOP=1 -c "SELECT NOT can_list AND can_retry AND can_accept FROM public.novu_rust_operator_jwt_telegram_resolution_grants WHERE environment_id='fixture-env' AND subject='target'") == t ]]
+
+[[ $("$TEST_PG_BIN/psql" "$DATABASE_URL" -At -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM public.novu_rust_operator_jwt_telegram_resolution_grant_audit WHERE permission='cancel-predispatch'") == 2 ]]
+[[ $("$TEST_PG_BIN/psql" "$DATABASE_URL" -At -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM public.novu_rust_operator_jwt_telegram_predispatch_cancellers WHERE subject='target'") == 0 ]]
