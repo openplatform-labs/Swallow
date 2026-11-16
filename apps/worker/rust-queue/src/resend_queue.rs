@@ -624,6 +624,44 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires fully migrated disposable PostgreSQL and loopback"]
+    async fn immediate_replay_waits_for_opt_out_and_preserves_unknown() {
+        let url=std::env::var("TEST_DATABASE_URL").unwrap();
+        let (mut db,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);
+        let env=format!("resend-replay-preference-{}",Uuid::new_v4());
+        db.execute("INSERT INTO public.novu_rust_environments VALUES($1,'org')",&[&env]).await.unwrap();
+        assert!(register_worker_policy(&db,&env,false,false).await.unwrap());
+        db.execute("INSERT INTO public.novu_rust_workflows(environment_id,identifier,active,has_steps,email_subject,email_html,email_provider,inbox_metadata) VALUES($1,'fixture',true,true,'hello','<p>hello</p>','resend','{\"id\":\"64a000000000000000000051\"}')",&[&env]).await.unwrap();
+        db.execute("INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES($1,'alice','64a000000000000000000054','{\"email\":\"alice@example.test\"}')",&[&env]).await.unwrap();
+        for mode in ["subscriber","default"] {
+            let transaction=format!("replay-preference-{mode}");
+            enqueue(&db,Uuid::new_v4(),&env,crate::in_app::JOB_KIND,&json!({"workflow":"fixture","transactionId":transaction,"content":"","payload":{},"recipients":[{"subscriberId":"alice"}],"recipientIdentitySnapshot":{"alice":"64a000000000000000000054"},"severityOverride":null})).await.unwrap();
+            assert!(crate::in_app::process_one(&mut db).await.unwrap());
+            let job:Uuid=db.query_one("SELECT email_job_id FROM public.novu_rust_email_step_outcomes WHERE environment_id=$1 AND transaction_id=$2",&[&env,&transaction]).await.unwrap().get(0);
+            let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();let endpoint=format!("http://{}/emails",listener.local_addr().unwrap());
+            let (mut worker,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);
+            worker.batch_execute("SET default_transaction_isolation='repeatable read'").await.unwrap();
+            let worker_pid:i32=worker.query_one("SELECT pg_backend_pid()",&[]).await.unwrap().get(0);let target_env=env.clone();
+            let task=tokio::spawn(async move {let provider=Resend::test_endpoint(Config{api_key:"fixture".into(),from:"sender@example.test".into(),sender_name:String::new()},&endpoint).unwrap();process_one_with_immediate_replay(&mut worker,&target_env,&provider,false,crate::email_step_policy::Policy::Snapshot,true,false,false,false,true).await});
+            let (mut socket,_)=tokio::time::timeout(Duration::from_secs(10),listener.accept()).await.unwrap().unwrap();
+            let mut bytes=[0u8;4096];assert!(socket.read(&mut bytes).await.unwrap()>0);
+            let pref_tx=db.transaction().await.unwrap();
+            if mode=="subscriber" {pref_tx.query_one("SELECT 1 FROM public.novu_rust_subscribers WHERE environment_id=$1 AND subscriber_id='alice' FOR UPDATE",&[&env]).await.unwrap();pref_tx.execute("INSERT INTO public.novu_rust_subscriber_preferences(environment_id,subscriber_id,channels) VALUES($1,'alice','{\"email\":false}')",&[&env]).await.unwrap();}
+            else {pref_tx.execute("INSERT INTO public.novu_rust_workflow_preferences(environment_id,workflow_identifier,email_enabled) VALUES($1,'fixture',false)",&[&env]).await.unwrap();}
+            let writer_pid:i32=pref_tx.query_one("SELECT pg_backend_pid()",&[]).await.unwrap().get(0);
+            socket.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();drop(socket);
+            let mut waiting=false;for _ in 0..150 {waiting=pref_tx.query_one("SELECT $1=ANY(pg_blocking_pids($2))",&[&writer_pid,&worker_pid]).await.unwrap().get(0);if waiting {break;}assert!(!task.is_finished());tokio::time::sleep(Duration::from_millis(100)).await;}
+            assert!(waiting,"replay did not wait for {mode} opt-out");pref_tx.commit().await.unwrap();
+            assert!(tokio::time::timeout(Duration::from_secs(10),task).await.unwrap().unwrap().unwrap());
+            assert!(tokio::time::timeout(Duration::from_millis(300),listener.accept()).await.is_err());
+            let row=db.query_one("SELECT j.status,a.state,a.same_request_replays,m.delivery_state FROM public.novu_queue_jobs j JOIN public.novu_rust_resend_attempts a ON a.job_id=j.id JOIN public.novu_rust_email_messages m ON m.email_job_id=j.id WHERE j.id=$1",&[&job]).await.unwrap();
+            assert_eq!(row.get::<_,String>(0),"failed");assert_eq!(row.get::<_,String>(1),"unknown");assert_eq!(row.get::<_,i32>(2),0);assert_eq!(row.get::<_,String>(3),"unknown");
+            db.execute("DELETE FROM public.novu_rust_subscriber_preferences WHERE environment_id=$1 AND subscriber_id='alice'",&[&env]).await.unwrap();
+            db.execute("DELETE FROM public.novu_rust_workflow_preferences WHERE environment_id=$1 AND workflow_identifier='fixture'",&[&env]).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires fully migrated disposable PostgreSQL and loopback"]
     async fn immediate_replay_keeps_body_and_key_and_preserves_uncertainty() {
         use tokio::time::timeout;
         let url=std::env::var("TEST_DATABASE_URL").unwrap();

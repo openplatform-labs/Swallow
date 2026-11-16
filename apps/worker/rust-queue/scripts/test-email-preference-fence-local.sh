@@ -18,3 +18,4 @@ cargo run --quiet --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.t
 cargo run --quiet --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --bin migrate-worker -- apply worker "$ROOT/apps/worker/rust-queue/migrations"
 cargo run --quiet --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --bin migrate-worker -- apply api "$ROOT/apps/api/rust-api/migrations"
 cargo test --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --features test-mocks --lib resend_queue::tests::workflow_subscriber_preference_commit_before_reservation_is_observed -- --ignored --nocapture
+cargo test --locked --manifest-path "$ROOT/apps/worker/rust-queue/Cargo.toml" --features test-mocks --lib resend_queue::tests::immediate_replay_waits_for_opt_out_and_preserves_unknown -- --ignored --nocapture
