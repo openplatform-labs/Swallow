@@ -121,6 +121,7 @@ async fn run() -> Result<()> {
         overdue_undelivered: 0,
         projector_stale: false,
         resend_enabled: false,
+        resend_excludes_confirmed_cancel: false,
         queue: None,
         attempts: None,
         twilio: None,

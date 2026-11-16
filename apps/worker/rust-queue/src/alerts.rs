@@ -305,6 +305,7 @@ pub struct Alert {
     pub overdue_undelivered: u64,
     pub projector_stale: bool,
     pub resend_enabled: bool,
+    pub resend_excludes_confirmed_cancel: bool,
     pub queue: Option<(u64, u64)>,
     pub attempts: Option<(u64, u64)>,
     pub twilio: Option<(u64, bool)>,
@@ -683,6 +684,9 @@ impl Alert {
                 "Resend overdue undelivered jobs: {}; projector stale: {}",
                 self.overdue_undelivered, self.projector_stale
             ));
+        }
+        if self.resend_enabled && self.resend_excludes_confirmed_cancel {
+            details.push("Resend overdue count excludes provider-confirmed cancellations without observed conflicts".into());
         }
         if let Some((overdue, expired)) = self.queue {
             details.push(format!(
@@ -1643,6 +1647,7 @@ mod tests {
             overdue_undelivered: 2,
             projector_stale: true,
             resend_enabled: true,
+            resend_excludes_confirmed_cancel: false,
             queue: None,
             attempts: None,
             twilio: None,
@@ -1906,6 +1911,13 @@ mod tests {
         assert_eq!(sent.0,Some(Ok(())));assert_eq!(sent.1,Some(Ok(())));
         for payload in [server.await.unwrap(),email_server.await.unwrap()] {assert!(payload.contains("Resend cancellation commands: pending 3; overdue 2; unreviewed failures 1"));}
         a.resend_cancel_commands=Some(Err(()));assert_eq!(a.condition_mask_v3().1,8192);assert_eq!(a.observed_condition_mask_v3().1&(2048|4096),0);assert_ne!(a.observed_condition_mask_v3().1&8192,0);
+    }
+    #[test]
+    fn resend_alert_discloses_optional_cancellation_exclusion() {
+        let mut a=alert();
+        assert!(!a.text().unwrap().contains("excludes provider-confirmed cancellations"));
+        a.resend_excludes_confirmed_cancel=true;
+        assert!(a.text().unwrap().contains("excludes provider-confirmed cancellations"));
     }
     #[tokio::test]
     async fn resend_cancel_evidence_alerts_both_destinations_and_preserves_failed_observation() {
@@ -2924,6 +2936,7 @@ mod tests {
             overdue_undelivered: health["overdueUndelivered"].as_u64().unwrap(),
             projector_stale: health["projectorStale"].as_bool().unwrap(),
             resend_enabled: true,
+            resend_excludes_confirmed_cancel: false,
             queue: None,
             attempts: None,
             twilio: None,

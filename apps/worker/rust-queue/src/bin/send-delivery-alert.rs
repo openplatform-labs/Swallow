@@ -158,6 +158,8 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let scoped_checks = env_bool("SWALLOW_ALERT_CHECK_SCOPED_ACCESS", false)?;
     if extended_conditions && (!on_new_condition || !scoped_delivery || require_distinct || bind_shared) { return Err("v2 alert conditions require scoped delivery and new-condition, without legacy shared-check guards".into()); }
     let resend_enabled = env_bool("SWALLOW_ALERT_RESEND_ENABLED", true)?;
+    let exclude_confirmed_cancel=env_bool("SWALLOW_ALERT_RESEND_EXCLUDE_CONFIRMED_CANCEL",false)?;
+    if exclude_confirmed_cancel && (!resend_enabled || !scoped_checks || !env_bool("SWALLOW_ALERT_RESEND_CANCEL_EVIDENCE_ENABLED", false)?) {return Err("excluding confirmed cancellations requires scoped Resend health and cancellation evidence alerts".into());}
     let attempts_enabled = env_bool("SWALLOW_ALERT_ATTEMPTS_ENABLED", false)?;
     let slack_jobs_enabled = env_bool("SWALLOW_ALERT_SLACK_JOBS_ENABLED", false)?;
     let resend_cancel_evidence_enabled=env_bool("SWALLOW_ALERT_RESEND_CANCEL_EVIDENCE_ENABLED", false)?;
@@ -352,7 +354,9 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut failed_checks = [false; 5];
     let resend = if resend_enabled {
         let result = tokio::time::timeout(operation_timeout, async {
-            if scoped_checks {
+            if exclude_confirmed_cancel {
+                reconciliation::resend_health_exclude_confirmed_cancel(&db,&args[0],grace,heartbeat).await
+            } else if scoped_checks {
                 reconciliation::scoped_provider_health(&db, &args[0], "resend", grace, heartbeat)
                     .await
             } else {
@@ -791,6 +795,7 @@ async fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         overdue_undelivered: overdue,
         projector_stale: stale,
         resend_enabled: resend.is_some(),
+        resend_excludes_confirmed_cancel: exclude_confirmed_cancel,
         queue,
         attempts,
         twilio,

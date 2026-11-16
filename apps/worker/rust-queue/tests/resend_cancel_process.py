@@ -94,14 +94,42 @@ try:
     assert operator['cancellationConfirmationSource']=='operator' and operator['cancellationEvidence']=='no_conflict_observed',operator
     assert result(job1,denied['DATABASE_URL']).returncode!=0
     assert result(job1,environment='cancel-other').returncode!=0
+    # Only the provider-confirmed job is excluded; an operator assessment stays visible.
+    ages="UPDATE public.novu_queue_jobs SET available_at=clock_timestamp()-interval '2 hours',resend_scheduled_at=clock_timestamp()-interval '1 hour' WHERE id IN ('%s','33333333-3333-4333-8333-333333333333'); INSERT INTO public.novu_rust_resend_projection_heartbeat VALUES('cancel-env',clock_timestamp())"%job1
+    subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',ages],check=True,capture_output=True)
+    def policy_health(exclude=True,db_url=None,environment='cancel-env'):
+        query=("SELECT overdue,eligible FROM public.novu_rust_resend_health_exclude_confirmed_cancel('%s',60,120)" if exclude else "SELECT overdue,eligible FROM public.novu_rust_provider_health('%s','resend',60,120)")%environment
+        return subprocess.run([psql,db_url or env['DATABASE_URL'],'-qAt','-v','ON_ERROR_STOP=1','-c',query],text=True,capture_output=True)
+    assert policy_health(False).stdout.strip()=='2|2'
+    assert policy_health().stdout.strip()=='1|1'
+    assert policy_health(db_url=denied['DATABASE_URL']).returncode!=0
+    assert policy_health(environment='cancel-other').returncode!=0
+    policy_alert={**alert_env,'SWALLOW_ALERT_RESEND_ENABLED':'true','SWALLOW_ALERT_CHECK_SCOPED_ACCESS':'true','SWALLOW_ALERT_RESEND_EXCLUDE_CONFIRMED_CANCEL':'true','SWALLOW_ALERT_RESEND_CANCEL_EVIDENCE_ENABLED':'true'}
+    policy_alert.pop('SWALLOW_ALERT_RESEND_CANCEL_GRACE_SECONDS')
+    sent=subprocess.run([os.path.join(env['TEST_WORKER_DIR'],'send-delivery-alert'),'cancel-env','60','120','60'],env=policy_alert,text=True,capture_output=True,timeout=15)
+    assert sent.returncode==2 and 'requires operator review' in sent.stderr,(sent.stdout,sent.stderr)
+    subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',"UPDATE public.novu_queue_jobs SET available_at=clock_timestamp()+interval '1 hour',resend_scheduled_at=clock_timestamp()+interval '1 hour' WHERE id='33333333-3333-4333-8333-333333333333'"],check=True,capture_output=True)
+    no_alert=subprocess.run([os.path.join(env['TEST_WORKER_DIR'],'send-delivery-alert'),'cancel-env','60','120','60'],env=policy_alert,text=True,capture_output=True,timeout=15)
+    assert no_alert.returncode==0,(no_alert.stdout,no_alert.stderr)
+    default_policy={**policy_alert,'SWALLOW_ALERT_RESEND_EXCLUDE_CONFIRMED_CANCEL':'false'}
+    default_alert=subprocess.run([os.path.join(env['TEST_WORKER_DIR'],'send-delivery-alert'),'cancel-env','60','120','60'],env=default_policy,text=True,capture_output=True,timeout=15)
+    assert default_alert.returncode==2 and 'requires operator review' in default_alert.stderr,(default_alert.stdout,default_alert.stderr)
+    subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',"UPDATE public.novu_queue_jobs SET available_at=clock_timestamp()-interval '2 hours',resend_scheduled_at=clock_timestamp()-interval '1 hour' WHERE id='33333333-3333-4333-8333-333333333333'"],check=True,capture_output=True)
+    disabled={**policy_alert,'SWALLOW_ALERT_RESEND_CANCEL_EVIDENCE_ENABLED':'false'}
+    sent=subprocess.run([os.path.join(env['TEST_WORKER_DIR'],'send-delivery-alert'),'cancel-env','60','120','60'],env=disabled,text=True,capture_output=True,timeout=15)
+    assert sent.returncode==1 and 'requires scoped Resend health and cancellation evidence alerts' in sent.stderr,(sent.stdout,sent.stderr)
     # Each stored event independently changes the live result and alert count;
     # a scheduled-only event is not a delivery conflict.
     for kind in ('email.scheduled','email.delivery_delayed','email.opened','email.clicked'):
         insert="INSERT INTO public.novu_rust_resend_delivery_events(environment_id,event_id,email_id,event_type) VALUES ('cancel-env','kind-fixture','fixture-one','%s')"%kind
         subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',insert],check=True,capture_output=True)
+        # Webhook invalidation marks the projection unknown; never exclude it until recomputed.
+        assert policy_health().stdout.strip()=='2|2',kind
+        subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',"UPDATE public.novu_queue_jobs SET resend_delivery_result='pending' WHERE id='%s'"%job1],check=True,capture_output=True)
         observed=json.loads(result(job1).stdout)
         expected='no_conflict_observed' if kind=='email.scheduled' else 'conflicting'
         assert observed['cancellationEvidence']==expected,(kind,observed)
+        assert policy_health().stdout.strip()==('1|1' if kind=='email.scheduled' else '2|2'),kind
         if kind!='email.scheduled':
             check=subprocess.run([health_bin,'check-resend-cancel-evidence','cancel-env'],env=env,text=True,capture_output=True,timeout=10)
             assert check.returncode==2 and json.loads(check.stdout)['conflicting']==1,(kind,check.stdout,check.stderr)
@@ -126,6 +154,7 @@ try:
     subprocess.run([psql,admin,'-v','ON_ERROR_STOP=1','-c',collision],check=True,capture_output=True)
     ambiguous=json.loads(result(job1).stdout)
     assert ambiguous['cancellationEvidence']=='ambiguous' and ambiguous['result']=='unknown',ambiguous
+    assert policy_health().stdout.strip()=='2|2'
     check=evidence_cli('check-resend-cancel-evidence');assert json.loads(check.stdout)=={'conflicting':0,'ambiguous':1},check.stdout
     # Page unknown requests without exposing provider IDs or investigation reasons.
     insert="""WITH jobs AS (INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) SELECT gen_random_uuid(),'cancel-env','experimental_resend_email','{}','completed' FROM generate_series(1,55) RETURNING id)

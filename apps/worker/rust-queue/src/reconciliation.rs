@@ -113,6 +113,12 @@ pub async fn scoped_provider_health(
     )
 }
 
+/// Scoped opt-in view excludes only provider-confirmed cancellations without known contradictions.
+pub async fn resend_health_exclude_confirmed_cancel(client:&Client,environment:&str,grace:i32,heartbeat:i32)->Result<Value> {
+    let r=client.query_one("SELECT * FROM public.novu_rust_resend_health_exclude_confirmed_cancel($1,$2,$3)",&[&environment,&grace,&heartbeat]).await?;
+    Ok(json!({"overdueUndelivered":r.get::<_,i64>(0),"eligibleJobs":r.get::<_,i64>(1),"lastProjectionAt":r.get::<_,Option<String>>(2),"projectorStale":r.get::<_,bool>(3),"graceSeconds":grace,"heartbeatMaxSeconds":heartbeat}))
+}
+
 /// Count unacknowledged guarded channel cancellations under alert_view authorization.
 pub async fn channel_policy_count(
     client: &Client,
