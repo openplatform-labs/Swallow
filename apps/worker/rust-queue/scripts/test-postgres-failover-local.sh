@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$(cd ../../.. && pwd)
 scenario=${SWALLOW_LOCAL_FAILOVER_SCENARIO:-alert-binding}
-case "$scenario" in telegram-predispatch|telegram-inflight|alert-binding|alert-scheduler|alert-v2|alert-v3|alert-timing|trigger-key|trigger-inflight|execution-grant-inflight|sendgrid-inflight|sendgrid-sandbox-inflight|smtp|smtp-rls|smtp-plain|smtp-plain-rls|smtp-plain-fenced|smtp-policy|smtp-auto-policy|smtp-auto-inflight|smtp-resolution|discord-manual-retry|discord-cooldown|discord-inflight|in-app|resend|resend-cooldown|resend-invalid|resend-cancel-inflight|resend-cancel-credential-inflight|resend-cancel-evidence|resend-replay-inflight|resend-reconciliation|twilio|fcm|fcm-delay|fcm-exp|fcm-exp-repeat|fcm-review) ;; *) echo 'invalid local failover scenario' >&2; exit 2;; esac
+case "$scenario" in telegram-api-predispatch|telegram-predispatch|telegram-inflight|alert-binding|alert-scheduler|alert-v2|alert-v3|alert-timing|trigger-key|trigger-inflight|execution-grant-inflight|sendgrid-inflight|sendgrid-sandbox-inflight|smtp|smtp-rls|smtp-plain|smtp-plain-rls|smtp-plain-fenced|smtp-policy|smtp-auto-policy|smtp-auto-inflight|smtp-resolution|discord-manual-retry|discord-cooldown|discord-inflight|in-app|resend|resend-cooldown|resend-invalid|resend-cancel-inflight|resend-cancel-credential-inflight|resend-cancel-evidence|resend-replay-inflight|resend-reconciliation|twilio|fcm|fcm-delay|fcm-exp|fcm-exp-repeat|fcm-review) ;; *) echo 'invalid local failover scenario' >&2; exit 2;; esac
 pgbin=${SWALLOW_TEST_POSTGRES_BIN:-/opt/homebrew/opt/postgresql@17/bin}
 [[ -x "$pgbin/pg_ctl" && -x "$pgbin/pg_basebackup" ]] || { echo 'PostgreSQL 17 server binaries are required' >&2; exit 1; }
 testdir=$(mktemp -d /private/tmp/swallow-alert-ha.XXXXXX)
@@ -56,6 +56,9 @@ if [[ "$scenario" == telegram-inflight || "$scenario" == telegram-predispatch ]]
   else
     TEST_TELEGRAM_WORKER="$testdir/telegram-worker-mock" TEST_PSQL="$pgbin/psql" python3 tests/telegram_inflight_failover.py
   fi
+elif [[ "$scenario" == telegram-api-predispatch ]]; then
+  cargo build --quiet --locked --manifest-path "$root/apps/api/rust-api/Cargo.toml" --bin novu-rust-api
+  TEST_API_BINARY="$root/apps/api/rust-api/target/debug/novu-rust-api" TEST_PSQL="$pgbin/psql" TEST_FIXTURE_DIR="$testdir" TEST_ROOT="$root" python3 tests/telegram_api_predispatch_failover.py
 elif [[ "$scenario" == alert-timing ]]; then
   "$root/apps/worker/rust-queue/scripts/test-alert-timing-failover.sh" "$root" "$testdir" "$pgbin"
 elif [[ "$scenario" == trigger-key || "$scenario" == trigger-inflight ]]; then
