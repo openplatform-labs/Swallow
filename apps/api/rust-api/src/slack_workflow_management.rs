@@ -96,7 +96,7 @@ pub(super) async fn put(
     };
     let content: Option<&str> = match &object["content"] {
         Value::Null => None,
-        Value::String(s) if s.len() <= 40_000 && !s.contains('\0') => Some(s),
+        Value::String(s) if s.chars().nth(40_000).is_none() && !s.contains('\0') => Some(s),
         _ => return fail(StatusCode::BAD_REQUEST, "Invalid chat content", &path),
     };
     let Some(active) = object["active"].as_bool() else {
@@ -109,7 +109,7 @@ pub(super) async fn put(
         {
             let content = match &e["content"] {
                 Value::Null => None,
-                Value::String(s) if s.len() <= 40000 && !s.contains('\0') => Some(s.as_str()),
+                Value::String(s) if s.chars().nth(40_000).is_none() && !s.contains('\0') => Some(s.as_str()),
                 _ => return fail(StatusCode::BAD_REQUEST, "Invalid expected step", &path),
             };
             match e["active"].as_bool() {

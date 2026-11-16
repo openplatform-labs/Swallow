@@ -142,6 +142,20 @@ async fn slack_step_management_is_authorized_audited_and_connected_to_fanout() {
     assert_eq!(audit.get::<_, Option<i32>>(0), None);
     assert_eq!(audit.get::<_, Option<i32>>(1), Some(30));
     assert!(audit.get::<_, bool>(2) && audit.get::<_, bool>(3));
+    // Input and conditional comparison both count characters, including non-ASCII.
+    let korean = "한".repeat(40_000);
+    assert_eq!(
+        call(app.clone(), "PUT", path, "a-key", json!({"content":korean,"active":true})).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(app.clone(), "PUT", path, "a-key", json!({"content":"Hello {{subscriber.firstName}}","active":true,"expected":{"content":korean,"active":true}})).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(app.clone(), "PUT", path, "a-key", json!({"content":"한".repeat(40_001),"active":true})).await.0,
+        StatusCode::BAD_REQUEST
+    );
     // An API login needs the lock function and narrowly granted tables, not
     // permission-table access or audit-table reads.
     let role = format!("chat_api_{}", uuid::Uuid::new_v4().simple());
