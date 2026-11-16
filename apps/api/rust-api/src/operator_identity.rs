@@ -26,6 +26,7 @@ enum Lookup {
     ResendAutoHealthJobs,
     ResendCancelList,
     ResendCancelDetail,
+    ResendCancelCommand,
     ResendAutoHealth,
     SlackCooldownHealth,
     ResendCooldownHealth,
@@ -468,6 +469,9 @@ pub(super) async fn smtp_auto_worker_health(State(db):State<Arc<Client>>,headers
 }
 pub(super) async fn discord_cooldown_health(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
     query(db,headers,uri,verifier,Lookup::DiscordCooldownHealth).await
+}
+pub(super) async fn resend_cancel_command_get(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
+    query(db,headers,uri,verifier,Lookup::ResendCancelCommand).await
 }
 pub(super) async fn resend_cancel_detail(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response {
     query(db,headers,uri,verifier,Lookup::ResendCancelDetail).await
@@ -2940,7 +2944,7 @@ async fn query(
         Lookup::DiscordRetryHealth => &["environmentId", "graceSeconds"],
         Lookup::DiscordRetryList => &["environmentId", "graceSeconds", "filter", "after"],
         Lookup::ResendCancelList => &["environmentId", "graceSeconds", "after"],
-        Lookup::ResendCancelDetail => &["environmentId", "requestId"],
+        Lookup::ResendCancelDetail | Lookup::ResendCancelCommand => &["environmentId", "requestId"],
         Lookup::FcmUnrecordedClaimHealth => &["environmentId", "minGap", "graceSeconds"],
         Lookup::FcmUnrecordedClaimList => &["environmentId", "minGap", "graceSeconds", "after"],
         Lookup::FcmPartialHealth => &["environmentId", "windowSeconds"],
@@ -3162,6 +3166,10 @@ async fn query(
         Lookup::DiscordCooldownHealth => {
             let Some(grace)=params.get("graceSeconds").and_then(|v|v.parse::<i32>().ok().filter(|n|(1..=86400).contains(n)&&n.to_string()==*v)) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};
             guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_discord_cooldown_health($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&grace]).await
+        }
+        Lookup::ResendCancelCommand => {
+            let Some(request)=params.get("requestId").and_then(|v|Uuid::parse_str(v).ok()) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};
+            guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_resend_cancel_command_get($1,$2,$3,$4,$5,$6)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request]).await
         }
         Lookup::ResendCancelDetail => {
             let Some(request)=params.get("requestId").and_then(|v|Uuid::parse_str(v).ok()) else {return failure(StatusCode::BAD_REQUEST,"Invalid request","Bad Request");};
@@ -5695,6 +5703,26 @@ pub(super) async fn smtp_auto_grant_audit(State(db):State<Arc<Client>>,headers:H
 pub(super) async fn discord_retry_grant_read(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response { query(db,headers,uri,verifier,Lookup::DiscordRetryGrantRead).await }
 pub(super) async fn discord_retry_grant_request(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response { query(db,headers,uri,verifier,Lookup::DiscordRetryGrantRequest).await }
 pub(super) async fn discord_retry_grant_audit(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>) -> Response { query(db,headers,uri,verifier,Lookup::DiscordRetryGrantAudit).await }
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all="camelCase",deny_unknown_fields)]
+struct ResendCancelCommandBody {request_id:String,job_id:String,reason:String}
+pub(super) async fn resend_cancel_command_submit(State(db):State<Arc<Client>>,headers:HeaderMap,OriginalUri(uri):OriginalUri,verifier:Option<Extension<Arc<AccessTokenVerifier>>>,body:Bytes)->Response {
+    let identity=match authenticate(&db,&headers,verifier).await {Ok(v)=>v,Err(status)=>return failure(status,uri.path())};
+    let params:Vec<_>=form_urlencoded::parse(uri.query().unwrap_or("").as_bytes()).collect();
+    if params.len()!=1||params[0].0!="environmentId"||params[0].1.is_empty()||params[0].1.len()>512||params[0].1.contains('\0'){return failure(StatusCode::BAD_REQUEST,uri.path());}
+    let Some(input)=(body.len()<=4096).then(||serde_json::from_slice::<ResendCancelCommandBody>(&body).ok()).flatten() else{return failure(StatusCode::BAD_REQUEST,uri.path());};
+    if input.reason.trim().is_empty()||input.reason.len()>500||input.reason.chars().any(char::is_control){return failure(StatusCode::BAD_REQUEST,uri.path());}
+    let (Ok(request),Ok(job),Ok(exp))=(Uuid::parse_str(&input.request_id),Uuid::parse_str(&input.job_id),i64::try_from(identity.expires_at)) else{return failure(StatusCode::BAD_REQUEST,uri.path());};
+    let env=params[0].1.as_ref();
+    match guarded_query(&db,&identity,"SELECT public.novu_rust_operator_jwt_resend_cancel_submit($1,$2,$3,$4,$5,$6,$7,$8)",&[&identity.issuer,&identity.subject,&identity.client_id,&env,&exp,&request,&job,&input.reason]).await {
+        Ok(row)=>([(header::CACHE_CONTROL,"no-store")],Json(row.get::<_,serde_json::Value>(0))).into_response(),
+        Err(e) if e.code().is_some_and(|c|c.code()=="42501")=>failure(StatusCode::UNAUTHORIZED,uri.path()),
+        Err(e) if e.code().is_some_and(|c|c.code()=="22023")=>failure(StatusCode::BAD_REQUEST,uri.path()),
+        Err(e) if e.code().is_some_and(|c|matches!(c.code(),"P4090"|"23505"|"55000"|"40001"))=>{let mut response=error_at(StatusCode::CONFLICT,"Command conflict","Conflict",uri.path()).into_response();response.headers_mut().insert(header::CACHE_CONTROL,header::HeaderValue::from_static("no-store"));response},
+        Err(_)=>failure(StatusCode::INTERNAL_SERVER_ERROR,uri.path()),
+    }
+}
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all="camelCase",deny_unknown_fields)]

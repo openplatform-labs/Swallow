@@ -1,4 +1,5 @@
-import concurrent.futures,json,os,subprocess,urllib.error,urllib.request,urllib.parse
+import concurrent.futures,json,os,subprocess,threading,time,urllib.error,urllib.request,urllib.parse
+from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 origin=os.environ['TEST_API']; token=os.environ['TEST_JWT']; admin=os.environ['DATABASE_URL']; psql=os.environ['TEST_PSQL']
 def get(query,credential=token,endpoint='resend-cancel-list'):
     headers={'Authorization':'Bearer '+credential} if credential else {}
@@ -18,7 +19,7 @@ def grant(method,path,body=None):
     except urllib.error.HTTPError as e:return e.code,json.loads(e.read())
 target=os.environ['TEST_TARGET_JWT']
 target_params={'environmentId':'cancel-api-env','targetIssuer':'https://issuer.test','targetSubject':'target','targetClientId':'console','resource':'resend-cancel'}
-for n,permission in enumerate(['list','detail','confirmed','not_cancelled'],1):
+for n,permission in enumerate(['list','detail','confirmed','not_cancelled','submit'],1):
     params={**target_params,'permission':permission};status,data=grant('GET','?'+urllib.parse.urlencode(params));assert status==200 and data['targetExists'] and not data['granted']
     body={'requestId':'11111111-1111-4111-8111-'+str(n).zfill(12),'targetIssuer':'https://issuer.test','targetSubject':'target','targetClientId':'console','resource':'resend-cancel','permission':permission,'expected':False,'desired':True,'reason':'delegate'}
     if n==1:
@@ -34,7 +35,7 @@ for n,permission in enumerate(['list','detail','confirmed','not_cancelled'],1):
     assert grant('PUT','?environmentId=cancel-api-env',body)[1]['replayed']
     assert grant('PUT','?environmentId=cancel-api-env',{**body,'reason':'changed'})[0]==409
     assert grant('GET','?'+urllib.parse.urlencode(params))[1]['granted']
-status,audit=grant('GET','/audit?environmentId=cancel-api-env');assert status==200 and len(audit['data'])==6
+status,audit=grant('GET','/audit?environmentId=cancel-api-env');assert status==200 and len(audit['data'])==7
 query_target='environmentId=cancel-api-env&graceSeconds=60';assert get(query_target,target)[0]==200
 self_change={**body,'requestId':'22222222-2222-4222-8222-222222222222','targetSubject':'fixture'};assert grant('PUT','?environmentId=cancel-api-env',self_change)[0] in (401,403)
 revoke={**body,'requestId':'33333333-3333-4333-8333-333333333333','permission':'list','expected':True,'desired':False};assert grant('PUT','?environmentId=cancel-api-env',revoke)[0]==200
@@ -59,6 +60,51 @@ sql("INSERT INTO public.novu_rust_operator_jwt_resend_cancel_detail_grants VALUE
 status,detail=get(detail_query,endpoint='resend-cancel-detail');assert status==200 and detail['resolution']['decision']=='confirmed' and detail['resolution']['reason']=='fixture evidence'
 assert get('environmentId=cancel-api-other&requestId='+ids[0],endpoint='resend-cancel-detail')[0] in (401,403)
 assert get('environmentId=cancel-api-env&requestId=invalid',endpoint='resend-cancel-detail')[0]==400
+def command(method,request_id,body=None,credential=token):
+    query='environmentId=cancel-api-env'+('&requestId='+request_id if method=='GET' else '')
+    req=urllib.request.Request(origin+'/v1/experimental/operator/resend-cancel-command?'+query,data=json.dumps(body).encode() if body is not None else None,headers={'Authorization':'Bearer '+credential,'Content-Type':'application/json'},method=method)
+    try:
+        with urllib.request.urlopen(req,timeout=5) as r:return r.status,json.loads(r.read())
+    except urllib.error.HTTPError as e:return e.code,json.loads(e.read())
+cmd={'requestId':'dddddddd-dddd-4ddd-8ddd-dddddddddddd','jobId':'44444444-4444-4444-8444-444444444444','reason':'operator request'}
+sql("CREATE FUNCTION public.fail_command_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$; CREATE TRIGGER fail_command_audit BEFORE INSERT ON public.novu_rust_operator_jwt_resend_cancel_command_audit FOR EACH ROW EXECUTE FUNCTION public.fail_command_audit()")
+assert command('POST',cmd['requestId'],cmd)[0]==500
+assert command('GET',cmd['requestId'])[1]['command'] is None
+sql('DROP TRIGGER fail_command_audit ON public.novu_rust_operator_jwt_resend_cancel_command_audit')
+status,result=command('POST',cmd['requestId'],cmd);assert status==200 and result['command']['state']=='pending' and not result['replayed'],(status,result)
+assert command('POST',cmd['requestId'],cmd)[1]['replayed']
+assert command('POST',cmd['requestId'],{**cmd,'reason':'changed'})[0]==409
+assert command('GET',cmd['requestId'],credential=target)[1]['command'] is None
+class Provider(BaseHTTPRequestHandler):
+    def do_POST(self):
+        assert self.path in ('/emails/fixture-cancel/cancel','/emails/fixture-ui/cancel') and self.headers.get('Authorization')=='Bearer fixture'
+        self.server.calls.append(self.path);body=json.dumps({'object':'email','id':self.path.split('/')[2]}).encode();self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+    def log_message(self,*args):pass
+provider=ThreadingHTTPServer(('127.0.0.1',0),Provider);provider.calls=[];thread=threading.Thread(target=provider.serve_forever,daemon=True);thread.start()
+worker_env={**os.environ,'DATABASE_URL':'postgres://cancel_api_worker@127.0.0.1:'+os.environ['TEST_DB_PORT']+'/postgres','NOVU_RESEND_ENVIRONMENT_ID':'cancel-api-env','NOVU_RESEND_API_KEY':'fixture','SWALLOW_TEST_RESEND_ENDPOINT':'http://127.0.0.1:%d/emails'%provider.server_port}
+worker=subprocess.Popen([os.environ['TEST_CANCEL_WORKER']],env=worker_env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+try:
+    end=time.monotonic()+15
+    while time.monotonic()<end:
+        status,result=command('GET',cmd['requestId'])
+        if status==200 and result['command']['state']=='finished' and len(provider.calls)==2:break
+        if worker.poll() is not None:raise AssertionError(worker.stderr.read().decode())
+        time.sleep(.1)
+    else:raise AssertionError('worker did not finish command')
+    assert result['command']['attemptState']=='confirmed' and sorted(provider.calls)==['/emails/fixture-cancel/cancel','/emails/fixture-ui/cancel']
+    end=time.monotonic()+5
+    while time.monotonic()<end:
+        count=subprocess.check_output([psql,admin,'-qAtc',"SELECT count(*) FROM public.novu_rust_resend_cancel_commands WHERE environment_id='cancel-api-env' AND job_id='55555555-5555-4555-8555-555555555555' AND state='finished'"],text=True).strip()
+        if count=='1':break
+        time.sleep(.05)
+    else:raise AssertionError('UI command did not finish')
+    assert command('POST',cmd['requestId'],cmd)[1]['replayed'] and len(provider.calls)==2
+finally:
+    worker.terminate();worker.wait(timeout=5);provider.shutdown();provider.server_close();thread.join()
+sql("DELETE FROM public.novu_rust_operator_jwt_resend_cancel_submit_grants WHERE environment_id='cancel-api-env' AND subject='fixture'")
+assert command('GET',cmd['requestId'])[0] in (401,403)
+sql("INSERT INTO public.novu_rust_operator_jwt_resend_cancel_submit_grants VALUES('https://issuer.test','fixture','console','cancel-api-env'); DELETE FROM public.novu_rust_resend_cancel_submitters WHERE environment_id='cancel-api-env' AND database_principal='cancel_api_fixture'")
+assert command('GET',cmd['requestId'])[0] in (401,403)
 body={'resolutionId':'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb','requestId':ids[1],'decision':'confirmed','reason':'verified provider'}
 assert resolve({**body,'decision':'not_cancelled'})[0] in (401,403)
 status,answer=resolve(body);assert status==200 and answer['replayed'] is False

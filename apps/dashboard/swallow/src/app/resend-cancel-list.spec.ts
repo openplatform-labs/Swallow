@@ -30,4 +30,9 @@ describe('Resend cancellation list',()=>{
     c.environment='other';await c.submitResolution();expect(fetcher).toHaveBeenCalledTimes(2);c.environment='env';await c.submitResolution();expect(c.resolutionStatus()).toBe('recorded');
     const first=JSON.parse(fetcher.mock.calls[1][1]!.body as string),second=JSON.parse(fetcher.mock.calls[2][1]!.body as string);expect(first).toEqual(second);expect(first.resolutionId).toBe(resolutionId);fixture.destroy();
   });
+  it('preserves the cancellation command ID across an uncertain submission',async()=>{
+    const requestId=id(42),jobId=id(100),commandId=id(200);vi.spyOn(crypto,'randomUUID').mockReturnValue(requestId as `${string}-${string}-${string}-${string}-${string}`);
+    const mock=vi.spyOn(globalThis,'fetch').mockRejectedValueOnce(Error('network')).mockResolvedValueOnce(new Response(JSON.stringify({requestId,command:{requestId:commandId,jobId,state:'pending',attemptState:null},replayed:true})));
+    const {fixture,c}=setup();c.commandJobId=jobId;c.commandReason='cancel requested';c.prepareCommand();await c.submitCommand();expect(mock).not.toHaveBeenCalled();c.commandConfirm=true;await c.submitCommand();expect(c.commandStatus()).toBe('unknown');c.token='other.token.value';await c.submitCommand();expect(mock).toHaveBeenCalledTimes(1);c.token='aaa.bbb.ccc';await c.submitCommand();expect(c.commandStatus()).toBe('recorded');expect(c.command()?.state).toBe('pending');expect(mock.mock.calls[0][1]!.body).toEqual(mock.mock.calls[1][1]!.body);fixture.destroy();
+  });
 });

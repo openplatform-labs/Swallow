@@ -6,13 +6,45 @@ type Detail={requestId:string;jobId:string;providerId:string;databasePrincipal:s
 export class ResendCancelList implements OnChanges,OnDestroy {
   @Input() apiOrigin='';@Input() environment='';@Input() token='';
   grace=300;readonly status=signal<'idle'|'loading'|'loaded'|'error'>('idle');readonly rows=signal<Row[]>([]);readonly next=signal<string|null>(null);readonly page=signal(1);
+  commandJobId='';commandReason='';commandLookupId='';commandConfirm=false;
+  readonly commandDraft=signal<{origin:string;environment:string;token:string;requestId:string;jobId:string;reason:string}|null>(null);
+  readonly commandStatus=signal<'idle'|'prepared'|'sending'|'recorded'|'unknown'>('idle');
+  readonly commandLookupStatus=signal<'idle'|'loading'|'loaded'|'missing'|'error'>('idle');
+  readonly command=signal<{requestId:string;jobId:string;state:string;attemptState:string|null}|null>(null);
+  private commandSeq=0;private commandAbort:AbortController|null=null;
   decision:'confirmed'|'not_cancelled'='confirmed';reason='';confirm=false;readonly resolutionStatus=signal<'idle'|'prepared'|'sending'|'recorded'|'unknown'>('idle');
   readonly resolutionDraft=signal<{origin:string;environment:string;token:string;resolutionId:string;requestId:string;decision:string;reason:string}|null>(null);
   requestId='';readonly detail=signal<Detail|null>(null);readonly detailStatus=signal<'idle'|'loading'|'loaded'|'missing'|'error'>('idle');
   private detailSeq=0;private detailAbort:AbortController|null=null;
   private seq=0;private abort:AbortController|null=null;private cursors:(string|null)[]=[null];
-  ngOnChanges():void{this.clear();}ngOnDestroy():void{this.clear();this.resolutionDraft.set(null);this.token='';}
-  clear():void{this.clearDetail();this.seq++;this.abort?.abort();this.abort=null;this.rows.set([]);this.next.set(null);this.page.set(1);this.cursors=[null];this.status.set('idle');}
+  ngOnChanges():void{this.clear();}ngOnDestroy():void{this.clear();this.commandDraft.set(null);this.resolutionDraft.set(null);this.token='';}
+  clear():void{this.clearCommandLookup();this.clearDetail();this.seq++;this.abort?.abort();this.abort=null;this.rows.set([]);this.next.set(null);this.page.set(1);this.cursors=[null];this.status.set('idle');}
+  clearCommandLookup():void{this.commandSeq++;this.commandAbort?.abort();this.commandAbort=null;this.command.set(null);this.commandLookupStatus.set('idle');}
+  private parseCommand(value:unknown):{requestId:string;jobId:string;state:string;attemptState:string|null} {
+    if(!value||typeof value!=='object')throw Error('command');const c=value as Record<string,unknown>;
+    if(!this.uuid(c['requestId'])||!this.uuid(c['jobId'])||!['pending','dispatching','finished','failed'].includes(c['state'] as string)||!(c['attemptState']===null||['unknown','confirmed','rejected','not_cancelled'].includes(c['attemptState'] as string)))throw Error('command');
+    return {requestId:c['requestId'],jobId:c['jobId'],state:c['state'] as string,attemptState:c['attemptState'] as string|null};
+  }
+  prepareCommand():void{
+    if(this.commandStatus()!=='idle')return;
+    try{const origin=this.origin(),environment=this.environment.trim(),token=this.token.trim(),jobId=this.commandJobId.trim(),reason=this.commandReason.trim();
+      if(!this.uuid(jobId)||!environment||new TextEncoder().encode(environment).length>512||/[\0\r\n]/.test(environment)||token.length>16384||!/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(token)||!reason||new TextEncoder().encode(reason).length>500||/[\x00-\x1f\x7f]/.test(reason))throw Error('input');
+      const requestId=crypto.randomUUID();this.commandLookupId=requestId;this.commandDraft.set({origin,environment,token,requestId,jobId,reason});this.commandConfirm=false;this.commandStatus.set('prepared');
+    }catch{this.commandStatus.set('idle');}
+  }
+  resetCommand():void{if(this.commandStatus()==='sending')return;this.commandDraft.set(null);this.commandConfirm=false;this.commandStatus.set('idle');}
+  async submitCommand():Promise<void>{
+    const draft=this.commandDraft();if(!draft||!this.commandConfirm||!['prepared','unknown'].includes(this.commandStatus()))return;
+    try{if(this.origin()!==draft.origin||this.environment.trim()!==draft.environment||this.token.trim()!==draft.token)throw Error('identity changed');}catch{this.commandStatus.set('unknown');return;}
+    this.commandStatus.set('sending');
+    try{const params=new URLSearchParams({environmentId:draft.environment}),body={requestId:draft.requestId,jobId:draft.jobId,reason:draft.reason};const response=await fetch(`${draft.origin}/v1/experimental/operator/resend-cancel-command?${params}`,{method:'POST',headers:{Authorization:`Bearer ${draft.token}`,'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});if(!response.ok)throw Error('result');const value:unknown=await response.json();if(!value||typeof value!=='object')throw Error('result');const result=value as Record<string,unknown>;if(result['requestId']!==draft.requestId||typeof result['replayed']!=='boolean')throw Error('result');const command=this.parseCommand(result['command']);if(command.jobId.toLowerCase()!==draft.jobId.toLowerCase()||this.origin()!==draft.origin||this.environment.trim()!==draft.environment||this.token.trim()!==draft.token)throw Error('context');this.command.set(command);this.commandLookupStatus.set('loaded');this.commandStatus.set('recorded');}catch{this.commandStatus.set('unknown');}
+  }
+  async lookupCommand():Promise<void>{
+    this.clearCommandLookup();const seq=this.commandSeq,controller=new AbortController();this.commandAbort=controller;this.commandLookupStatus.set('loading');
+    try{const origin=this.origin(),token=this.token.trim(),environment=this.environment.trim(),requestId=this.commandLookupId.trim();if(!this.uuid(requestId)||!environment||new TextEncoder().encode(environment).length>512||/[\0\r\n]/.test(environment)||token.length>16384||!/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(token))throw Error('input');
+      const params=new URLSearchParams({environmentId:environment,requestId});const response=await fetch(`${origin}/v1/experimental/operator/resend-cancel-command?${params}`,{headers:{Authorization:`Bearer ${token}`},credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.any([controller.signal,AbortSignal.timeout(10000)])});if(!response.ok)throw Error('request');const value:unknown=await response.json();if(!value||typeof value!=='object')throw Error('response');const r=value as Record<string,unknown>;if(r['requestId']!==requestId)throw Error('request');if(seq!==this.commandSeq)return;if(origin!==this.origin()||token!==this.token.trim()||environment!==this.environment.trim()||requestId!==this.commandLookupId.trim()){this.clearCommandLookup();return;}if(r['command']===null){this.commandLookupStatus.set('missing');return;}this.command.set(this.parseCommand(r['command']));this.commandLookupStatus.set('loaded');
+    }catch{if(seq===this.commandSeq){this.command.set(null);this.commandLookupStatus.set('error');}}finally{if(seq===this.commandSeq)this.commandAbort=null;}
+  }
   prepareResolution():void {
     if(this.resolutionStatus()!=='idle'||this.detail()?.state!=='unknown')return;
     try {const origin=this.origin(),environment=this.environment.trim(),token=this.token.trim(),requestId=this.detail()!.requestId,reason=this.reason.trim();
