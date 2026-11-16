@@ -229,7 +229,7 @@ async fn process_one_inner(
             return Ok(true);
         }
     };
-    let tx = client.transaction().await?;
+    let tx = client.build_transaction().isolation_level(tokio_postgres::IsolationLevel::ReadCommitted).start().await?;
     if registered {
         let scope = if retry_key { "retry" } else { "job" };
         tx.query_one(
@@ -484,7 +484,7 @@ async fn recheck_immediate_replay(
     policy: crate::email_step_policy::Policy, original: &serde_json::Value, reserve: bool,
 ) -> Result<bool, Error> {
     let Ok(mut email) = serde_json::from_value::<Email>(job.payload.clone()) else { return Ok(false); };
-    let tx=client.transaction().await?;
+    let tx=client.build_transaction().isolation_level(tokio_postgres::IsolationLevel::ReadCommitted).start().await?;
     let subscriber=crate::sendgrid_queue::lock_workflow_subscriber(&tx,environment,&email).await?;
     if !live(&tx,job).await? { tx.rollback().await?; return Ok(false); }
     if !matches!(crate::email_step_policy::check(&tx,environment,job,&email,policy).await?,crate::email_step_policy::Check::Continue) { tx.rollback().await?; return Ok(false); }
@@ -583,7 +583,7 @@ mod tests {
             if kind=="smtp-scoped" {config.user("email_fence_smtp");}
             let (mut worker,driver)=config.connect(NoTls).await.unwrap();tokio::spawn(driver);
             if kind=="smtp-scoped" {worker.query_one("SELECT public.novu_rust_assert_smtp_scoped_login($1)",&[&env]).await.unwrap();}
-            worker.batch_execute("SET application_name='email_preference_fence'").await.unwrap();
+            worker.batch_execute("SET application_name='email_preference_fence'; SET default_transaction_isolation='repeatable read'").await.unwrap();
             let target_env=env.clone();
             let task=tokio::spawn(async move {match kind {
                 "resend" => {let provider=Resend::test_endpoint(Config{api_key:"fixture".into(),from:"sender@example.test".into(),sender_name:String::new()},&endpoint).unwrap();process_one(&mut worker,&target_env,&provider).await},

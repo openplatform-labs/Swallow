@@ -345,7 +345,7 @@ pub async fn process_one_with_step_policy(
             return Ok(true);
         }
     };
-    let tx = client.transaction().await?;
+    let tx = client.build_transaction().isolation_level(tokio_postgres::IsolationLevel::ReadCommitted).start().await?;
     let subscriber = lock_workflow_subscriber(&tx, environment, &email).await?;
     if !lock_live(&tx, &job).await? {
         tx.rollback().await?;

@@ -459,7 +459,7 @@ async fn process_claimed(
             .collect::<Result<_, _>>()?,
         _ => return Err(InvalidJob("invalid context").into()),
     };
-    let tx = client.transaction().await?;
+    let tx = client.build_transaction().isolation_level(tokio_postgres::IsolationLevel::ReadCommitted).start().await?;
     // Hold the job row lock until domain writes and completion commit together.
     let owner = tx.query_opt("SELECT id FROM novu_queue_jobs WHERE id = $1 AND status = 'running' AND lease_token = $2 AND lease_until > clock_timestamp() FOR UPDATE", &[&job.id, &job.lease_token]).await?;
     if owner.is_none() {
@@ -1269,7 +1269,7 @@ mod preference_concurrency_tests {
             else if mode=="workflow" {pref_tx.execute("INSERT INTO public.novu_rust_subscriber_workflow_preferences(environment_id,subscriber_id,workflow_identifier,channels) VALUES($1,'alice','fixture','{\"in_app\":false}')",&[&env]).await.unwrap();}
             else {pref_tx.execute("INSERT INTO public.novu_rust_workflow_preferences(environment_id,workflow_identifier,in_app_enabled) VALUES($1,'fixture',false)",&[&env]).await.unwrap();}
             let (mut worker,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);
-            worker.batch_execute("SET application_name='inbox_preference_fence'").await.unwrap();
+            worker.batch_execute("SET application_name='inbox_preference_fence'; SET default_transaction_isolation='repeatable read'").await.unwrap();
             let task=tokio::spawn(async move {process_one(&mut worker).await});
             let mut waiting=false;
             for _ in 0..150 {waiting=pref_tx.query_one("SELECT count(*)=1 FROM pg_stat_activity WHERE application_name='inbox_preference_fence' AND wait_event_type='Lock'",&[]).await.unwrap().get(0);if waiting {break;}assert!(!task.is_finished());tokio::time::sleep(Duration::from_millis(100)).await;}

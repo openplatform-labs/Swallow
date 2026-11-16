@@ -97,7 +97,7 @@ pub async fn process_one_with_step_policy(
             return Ok(true);
         }
     };
-    let tx = client.transaction().await?;
+    let tx = client.build_transaction().isolation_level(tokio_postgres::IsolationLevel::ReadCommitted).start().await?;
     let subscriber = if let Some(context) = sms.workflow_context.as_ref() {
         // Preference writers lock the subscriber, and migration 0292 locks the
         // workflow for default preference changes. Read after both waits so the
@@ -407,7 +407,7 @@ mod tests {
             else if mode=="workflow" {pref_tx.execute("INSERT INTO public.novu_rust_subscriber_workflow_preferences(environment_id,subscriber_id,workflow_identifier,channels) VALUES($1,'alice','fixture','{\"sms\":false}')",&[&env]).await.unwrap();}
             else {pref_tx.execute("INSERT INTO public.novu_rust_workflow_preferences(environment_id,workflow_identifier,sms_enabled) VALUES($1,'fixture',false)",&[&env]).await.unwrap();}
             let (mut worker,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);
-            worker.batch_execute("SET application_name='sms_preference_fence'").await.unwrap();
+            worker.batch_execute("SET application_name='sms_preference_fence'; SET default_transaction_isolation='repeatable read'").await.unwrap();
             let target_env=env.clone();
             let task=tokio::spawn(async move {let provider=Twilio::test_origin(Config{account_sid:"ACfixture".into(),auth_token:"fixture".into(),api_key_sid:None,api_key_secret:None,from:"+15550000001".into(),region:Region::Us},&origin).unwrap();process_one(&mut worker,&target_env,&provider).await});
             let mut waiting=false;

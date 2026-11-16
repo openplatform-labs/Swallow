@@ -463,7 +463,7 @@ async fn process_one_inner(
         }
     };
     let mut prepared_context = push.prepared_context.take();
-    let tx = client.transaction().await?;
+    let tx = client.build_transaction().isolation_level(tokio_postgres::IsolationLevel::ReadCommitted).start().await?;
     // Match subscriber mutation lock ordering before locking the job.
     let subscriber = if let Some(context) = push.workflow_context.as_ref() {
         // Subscriber preference writers lock the subscriber; migration 0292
@@ -1287,7 +1287,7 @@ mod tests {
             else if mode=="workflow" {pref_tx.execute("INSERT INTO public.novu_rust_subscriber_workflow_preferences(environment_id,subscriber_id,workflow_identifier,channels) VALUES($1,'alice','fixture','{\"push\":false}')",&[&env]).await.unwrap();}
             else {pref_tx.execute("INSERT INTO public.novu_rust_workflow_preferences(environment_id,workflow_identifier,push_enabled) VALUES($1,'fixture',false)",&[&env]).await.unwrap();}
             let (mut worker,driver)=tokio_postgres::connect(&url,NoTls).await.unwrap();tokio::spawn(driver);
-            worker.batch_execute("SET application_name='push_preference_fence'").await.unwrap();
+            worker.batch_execute("SET application_name='push_preference_fence'; SET default_transaction_isolation='repeatable read'").await.unwrap();
             let target_env=env.clone();
             let task=tokio::spawn(async move {let provider=Fcm::with_origin("demo","fixture".into(),&origin).unwrap();process_one_with_policies(&mut worker,&target_env,Some(&provider),None,false,crate::push_step_policy::Policy::Snapshot,if phase=="prepared" {crate::push_step_policy::PreferencePolicy::Recheck} else {crate::push_step_policy::PreferencePolicy::Snapshot}).await});
             let mut waiting=false;
