@@ -1,4 +1,4 @@
-import json,os,subprocess,urllib.error,urllib.request
+import concurrent.futures,json,os,subprocess,urllib.error,urllib.request,urllib.parse
 origin=os.environ['TEST_API']; token=os.environ['TEST_JWT']; admin=os.environ['DATABASE_URL']; psql=os.environ['TEST_PSQL']
 def get(query,credential=token,endpoint='resend-cancel-list'):
     headers={'Authorization':'Bearer '+credential} if credential else {}
@@ -11,6 +11,34 @@ def resolve(body):
     try:
         with urllib.request.urlopen(req,timeout=5) as r:return r.status,json.loads(r.read())
     except urllib.error.HTTPError as e:return e.code,json.loads(e.read())
+def grant(method,path,body=None):
+    req=urllib.request.Request(origin+'/v1/experimental/operator/resend-cancel-grants'+path,data=json.dumps(body).encode() if body is not None else None,headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'},method=method)
+    try:
+        with urllib.request.urlopen(req,timeout=5) as r:return r.status,json.loads(r.read())
+    except urllib.error.HTTPError as e:return e.code,json.loads(e.read())
+target=os.environ['TEST_TARGET_JWT']
+target_params={'environmentId':'cancel-api-env','targetIssuer':'https://issuer.test','targetSubject':'target','targetClientId':'console','resource':'resend-cancel'}
+for n,permission in enumerate(['list','detail','confirmed','not_cancelled'],1):
+    params={**target_params,'permission':permission};status,data=grant('GET','?'+urllib.parse.urlencode(params));assert status==200 and data['targetExists'] and not data['granted']
+    body={'requestId':'11111111-1111-4111-8111-'+str(n).zfill(12),'targetIssuer':'https://issuer.test','targetSubject':'target','targetClientId':'console','resource':'resend-cancel','permission':permission,'expected':False,'desired':True,'reason':'delegate'}
+    if n==1:
+        sql("CREATE FUNCTION public.fail_cancel_grant_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$; CREATE TRIGGER fail_cancel_grant_audit BEFORE INSERT ON public.novu_rust_operator_jwt_resend_cancel_grant_audit FOR EACH ROW EXECUTE FUNCTION public.fail_cancel_grant_audit()")
+        assert grant('PUT','?environmentId=cancel-api-env',body)[0]==500
+        assert not grant('GET','?'+urllib.parse.urlencode(params))[1]['granted']
+        sql('DROP TRIGGER fail_cancel_grant_audit ON public.novu_rust_operator_jwt_resend_cancel_grant_audit')
+    if n==2:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool: results=list(pool.map(lambda _:grant('PUT','?environmentId=cancel-api-env',body),range(2)))
+        assert all(code==200 for code,_ in results) and sorted(data['replayed'] for _,data in results)==[False,True],results
+    else:
+        status,data=grant('PUT','?environmentId=cancel-api-env',body);assert status==200 and data['changed'] and not data['replayed'],(status,data)
+    assert grant('PUT','?environmentId=cancel-api-env',body)[1]['replayed']
+    assert grant('PUT','?environmentId=cancel-api-env',{**body,'reason':'changed'})[0]==409
+    assert grant('GET','?'+urllib.parse.urlencode(params))[1]['granted']
+status,audit=grant('GET','/audit?environmentId=cancel-api-env');assert status==200 and len(audit['data'])==6
+query_target='environmentId=cancel-api-env&graceSeconds=60';assert get(query_target,target)[0]==200
+self_change={**body,'requestId':'22222222-2222-4222-8222-222222222222','targetSubject':'fixture'};assert grant('PUT','?environmentId=cancel-api-env',self_change)[0] in (401,403)
+revoke={**body,'requestId':'33333333-3333-4333-8333-333333333333','permission':'list','expected':True,'desired':False};assert grant('PUT','?environmentId=cancel-api-env',revoke)[0]==200
+assert get(query_target,target)[0] in (401,403)
 query='environmentId=cancel-api-env&graceSeconds=60'
 status,page=get(query);assert status==200 and len(page['data'])==50 and page['next'],(status,page)
 assert 'private' not in json.dumps(page)

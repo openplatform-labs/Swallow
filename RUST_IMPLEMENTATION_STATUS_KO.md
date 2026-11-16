@@ -1,3 +1,5 @@
+Resend 취소 권한 위임: API 0174와 설정 화면은 목록·상세·취소 확인·미취소 판정 권한의 개별 위임과 이력을 제공한다. 최초 관리자는 DBA가 등록하며 기존 권한을 자동 확장하지 않는다. 제한 로그인·두 시험 JWT·실제 로컬 API에서 권한 회수, 동시 재제출과 감사 실패 롤백을 검증했고 설정 컴포넌트의 목록 권한 변경을 jsdom과 실제 API로 확인했다. 실제 브라우저·외부 IdP·운영 HA는 미검증이다. [API README](apps/api/rust-api/README.md)를 참고한다.
+
 Resend 취소 결과 불명 판정 API·화면: API 0173은 판정별 독립 JWT 권한과 DB 권한을 확인하고 JWT 운영자와 근거를 워커 판정과 원자 기록한다. Angular 화면에서 준비·확인·동일 ID 재제출을 지원한다. 제한 DB 계정·시험 JWT·실제 로컬 API 및 jsdom에서 감사 실패 롤백과 재제출을 검증했다. 실제 프로세스 중지·Resend 증거 확인은 운영자 책임이며 취소 요청 UI, 권한 위임 UI, 큐 상태 동기화와 실제 브라우저·IdP·운영 HA는 미완성이다. [API README](apps/api/rust-api/README.md)를 참고한다.
 
 Resend 취소 요청 상세 API·화면: API 0172의 별도 JWT 상세 권한으로 요청 및 수동 판정 기록을 조회한다. 목록 권한과 독립적이며 DB 로그인 조회 권한도 필요하다. 제한 로그인·시험 JWT·실제 로컬 API와 jsdom에서 상세 및 권한 회수를 검증했다. 상세 정보는 민감하고 실제 공급자 상태를 증명하지 않는다. 취소·판정 UI와 권한 관리 UI, 실제 브라우저·IdP·Resend 및 운영 HA는 미구현 또는 미검증이다. [API README](apps/api/rust-api/README.md)를 참고한다.
