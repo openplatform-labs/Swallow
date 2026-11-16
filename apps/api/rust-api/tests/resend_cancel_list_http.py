@@ -32,11 +32,11 @@ assert get(health_query,endpoint='resend-cancel-credential-health')[0]==200
 target=os.environ['TEST_TARGET_JWT']
 assert get(health_query,target,endpoint='resend-cancel-credential-health')[0] in (401,403)
 target_params={'environmentId':'cancel-api-env','targetIssuer':'https://issuer.test','targetSubject':'target','targetClientId':'console','resource':'resend-cancel'}
-for n,permission in enumerate(['list','detail','confirmed','not_cancelled','submit','command-health','command-list','command-review','evidence-health','evidence-list','legacy-health','legacy-list'],1):
+for n,permission in enumerate(['list','detail','confirmed','not_cancelled','submit','command-health','command-list','command-review','evidence-health','evidence-list','legacy-health','legacy-list','credential-health'],1):
     params={**target_params,'permission':permission};status,data=grant('GET','?'+urllib.parse.urlencode(params));assert status==200 and data['targetExists'] and not data['granted']
     body={'requestId':'11111111-1111-4111-8111-'+str(n).zfill(12),'targetIssuer':'https://issuer.test','targetSubject':'target','targetClientId':'console','resource':'resend-cancel','permission':permission,'expected':False,'desired':True,'reason':'delegate'}
-    if n==1:
-        sql("CREATE FUNCTION public.fail_cancel_grant_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$; CREATE TRIGGER fail_cancel_grant_audit BEFORE INSERT ON public.novu_rust_operator_jwt_resend_cancel_grant_audit FOR EACH ROW EXECUTE FUNCTION public.fail_cancel_grant_audit()")
+    if n==1 or permission=='credential-health':
+        sql("CREATE OR REPLACE FUNCTION public.fail_cancel_grant_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$; CREATE TRIGGER fail_cancel_grant_audit BEFORE INSERT ON public.novu_rust_operator_jwt_resend_cancel_grant_audit FOR EACH ROW EXECUTE FUNCTION public.fail_cancel_grant_audit()")
         assert grant('PUT','?environmentId=cancel-api-env',body)[0]==500
         assert not grant('GET','?'+urllib.parse.urlencode(params))[1]['granted']
         sql('DROP TRIGGER fail_cancel_grant_audit ON public.novu_rust_operator_jwt_resend_cancel_grant_audit')
@@ -48,7 +48,12 @@ for n,permission in enumerate(['list','detail','confirmed','not_cancelled','subm
     assert grant('PUT','?environmentId=cancel-api-env',body)[1]['replayed']
     assert grant('PUT','?environmentId=cancel-api-env',{**body,'reason':'changed'})[0]==409
     assert grant('GET','?'+urllib.parse.urlencode(params))[1]['granted']
-status,audit=grant('GET','/audit?environmentId=cancel-api-env');assert status==200 and len(audit['data'])==14
+status,audit=grant('GET','/audit?environmentId=cancel-api-env');assert status==200 and len(audit['data'])==17
+assert get(health_query,target,endpoint='resend-cancel-credential-health')[0]==200
+credential_revoke={**body,'requestId':'cccccccc-cccc-4ccc-8ccc-cccccccccccc','expected':True,'desired':False,'reason':'revoke health'}
+assert grant('PUT','?environmentId=cancel-api-env',credential_revoke)[0]==200
+assert get(health_query,target,endpoint='resend-cancel-credential-health')[0] in (401,403)
+assert grant('PUT','?environmentId=cancel-api-env',credential_revoke)[1]['replayed']
 evidence='environmentId=cancel-api-env'
 status,counts=get(evidence,endpoint='resend-cancel-evidence-health');assert status==200 and counts['conflicting']==1 and counts['ambiguous']>=1,(status,counts)
 status,page=get(evidence,endpoint='resend-cancel-evidence-list');assert status==200 and any(x['evidence']=='conflicting' for x in page['data']) and 'private' not in json.dumps(page)

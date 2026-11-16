@@ -36,6 +36,7 @@ INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,en
 INSERT INTO public.novu_rust_operator_jwt_resend_cancel_grant_admins VALUES ('https://issuer.test','fixture','console','cancel-api-env',true,true);
 INSERT INTO public.novu_rust_operator_jwt_resend_cancel_grant_audit_viewers VALUES ('https://issuer.test','fixture','console','cancel-api-env');
 INSERT INTO public.novu_rust_operator_jwt_resend_cancel_credential_health_grants VALUES ('https://issuer.test','fixture','console','cancel-api-env',true);
+INSERT INTO public.novu_rust_operator_jwt_resend_cancel_credential_health_grants VALUES ('https://issuer.test','target','console','cancel-api-env',false);
 INSERT INTO public.novu_rust_operator_jwt_resend_cancel_list_grants VALUES ('https://issuer.test','fixture','console','cancel-api-env');
 INSERT INTO public.novu_rust_operator_jwt_resend_cancel_detail_grants VALUES ('https://issuer.test','fixture','console','cancel-api-env');
 INSERT INTO public.novu_rust_operator_jwt_resend_cancel_resolution_grants VALUES ('https://issuer.test','fixture','console','cancel-api-env','confirmed');
