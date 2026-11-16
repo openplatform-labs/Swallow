@@ -21,4 +21,13 @@ describe('Resend cancellation list',()=>{
     vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({request,resolution}))).mockResolvedValueOnce(new Response('',{status:403}));
     const {fixture,c}=setup();await c.loadDetail(id(1));expect(c.detail()?.resolution?.decision).toBe('confirmed');fixture.detectChanges();expect(fixture.nativeElement.textContent).toContain('운영자 판정');await c.loadDetail(id(1));expect(c.detailStatus()).toBe('error');expect(c.detail()).toBeNull();fixture.destroy();
   });
+  it('prepares a confirmed decision and retries an uncertain response with the same ID',async()=>{
+    const resolutionId=id(42),request={requestId:id(1),jobId:id(101),providerId:'provider-1',databasePrincipal:'service',reason:'investigation',state:'unknown',httpStatus:null,createdAt:'today',updatedAt:'today'};
+    vi.spyOn(crypto,'randomUUID').mockReturnValue(resolutionId as `${string}-${string}-${string}-${string}-${string}`);
+    const fetcher=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({request,resolution:null}))).mockRejectedValueOnce(Error('network')).mockResolvedValueOnce(new Response(JSON.stringify({resolutionId,requestId:id(1),decision:'not_cancelled',replayed:true})));
+    const {fixture,c}=setup();await c.loadDetail(id(1));c.decision='not_cancelled';c.reason='provider checked';c.prepareResolution();expect(c.resolutionStatus()).toBe('prepared');
+    await c.submitResolution();expect(fetcher).toHaveBeenCalledTimes(1);c.confirm=true;await c.submitResolution();expect(c.resolutionStatus()).toBe('unknown');
+    c.environment='other';await c.submitResolution();expect(fetcher).toHaveBeenCalledTimes(2);c.environment='env';await c.submitResolution();expect(c.resolutionStatus()).toBe('recorded');
+    const first=JSON.parse(fetcher.mock.calls[1][1]!.body as string),second=JSON.parse(fetcher.mock.calls[2][1]!.body as string);expect(first).toEqual(second);expect(first.resolutionId).toBe(resolutionId);fixture.destroy();
+  });
 });

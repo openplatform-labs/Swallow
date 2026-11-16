@@ -1,16 +1,37 @@
 import { Component, Input, OnChanges, OnDestroy, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 type Row={requestId:string;jobId:string;createdAt:string;overdue:boolean};
-type Detail={requestId:string;jobId:string;providerId:string;databasePrincipal:string;reason:string;state:string;httpStatus:number|null;createdAt:string;updatedAt:string;resolution:{resolutionId:string;decision:string;databasePrincipal:string;reason:string;recordedAt:string}|null};
+type Detail={requestId:string;jobId:string;providerId:string;databasePrincipal:string;reason:string;state:string;httpStatus:number|null;createdAt:string;updatedAt:string;resolution:{resolutionId:string;decision:string;databasePrincipal:string;reason:string;recordedAt:string;operator:{issuer:string;subject:string;clientId:string;resolutionId:string}|null}|null};
 @Component({selector:'app-resend-cancel-list',imports:[FormsModule],templateUrl:'./resend-cancel-list.html'})
 export class ResendCancelList implements OnChanges,OnDestroy {
   @Input() apiOrigin='';@Input() environment='';@Input() token='';
   grace=300;readonly status=signal<'idle'|'loading'|'loaded'|'error'>('idle');readonly rows=signal<Row[]>([]);readonly next=signal<string|null>(null);readonly page=signal(1);
+  decision:'confirmed'|'not_cancelled'='confirmed';reason='';confirm=false;readonly resolutionStatus=signal<'idle'|'prepared'|'sending'|'recorded'|'unknown'>('idle');
+  readonly resolutionDraft=signal<{origin:string;environment:string;token:string;resolutionId:string;requestId:string;decision:string;reason:string}|null>(null);
   requestId='';readonly detail=signal<Detail|null>(null);readonly detailStatus=signal<'idle'|'loading'|'loaded'|'missing'|'error'>('idle');
   private detailSeq=0;private detailAbort:AbortController|null=null;
   private seq=0;private abort:AbortController|null=null;private cursors:(string|null)[]=[null];
-  ngOnChanges():void{this.clear();}ngOnDestroy():void{this.clear();this.token='';}
+  ngOnChanges():void{this.clear();}ngOnDestroy():void{this.clear();this.resolutionDraft.set(null);this.token='';}
   clear():void{this.clearDetail();this.seq++;this.abort?.abort();this.abort=null;this.rows.set([]);this.next.set(null);this.page.set(1);this.cursors=[null];this.status.set('idle');}
+  prepareResolution():void {
+    if(this.resolutionStatus()!=='idle'||this.detail()?.state!=='unknown')return;
+    try {const origin=this.origin(),environment=this.environment.trim(),token=this.token.trim(),requestId=this.detail()!.requestId,reason=this.reason.trim();
+      if(!this.uuid(requestId)||!environment||new TextEncoder().encode(environment).length>512||/[\0\r\n]/.test(environment)||token.length>16384||!/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(token)||!['confirmed','not_cancelled'].includes(this.decision)||!reason||new TextEncoder().encode(reason).length>500||/[\x00-\x1f\x7f]/.test(reason))throw Error('input');
+      this.resolutionDraft.set({origin,environment,token,resolutionId:crypto.randomUUID(),requestId,decision:this.decision,reason});this.confirm=false;this.resolutionStatus.set('prepared');
+    }catch{this.resolutionStatus.set('idle');}
+  }
+  resetResolution():void{if(this.resolutionStatus()==='sending')return;this.resolutionDraft.set(null);this.confirm=false;this.resolutionStatus.set('idle');}
+  async submitResolution():Promise<void>{
+    const draft=this.resolutionDraft();if(!draft||!this.confirm||!['prepared','unknown'].includes(this.resolutionStatus()))return;
+    try{if(this.origin()!==draft.origin||this.environment.trim()!==draft.environment||this.token.trim()!==draft.token)throw Error('identity changed');}catch{this.resolutionStatus.set('unknown');return;}
+    this.resolutionStatus.set('sending');
+    try{const params=new URLSearchParams({environmentId:draft.environment});const body={resolutionId:draft.resolutionId,requestId:draft.requestId,decision:draft.decision,reason:draft.reason};
+      const response=await fetch(`${draft.origin}/v1/experimental/operator/resend-cancel-resolution?${params}`,{method:'POST',headers:{Authorization:`Bearer ${draft.token}`,'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
+      if(!response.ok)throw Error('result');const value:unknown=await response.json();if(!value||typeof value!=='object')throw Error('result');const result=value as Record<string,unknown>;
+      if(result['resolutionId']!==draft.resolutionId||result['requestId']!==draft.requestId||result['decision']!==draft.decision||typeof result['replayed']!=='boolean')throw Error('result');
+      this.resolutionStatus.set('recorded');this.clearDetail();
+    }catch{this.resolutionStatus.set('unknown');}
+  }
   clearDetail():void{this.detailSeq++;this.detailAbort?.abort();this.detailAbort=null;this.detail.set(null);this.detailStatus.set('idle');}
   async loadDetail(id?:string):Promise<void>{
     if(id)this.requestId=id;this.clearDetail();const seq=this.detailSeq,controller=new AbortController();this.detailAbort=controller;this.detailStatus.set('loading');
@@ -25,7 +46,7 @@ export class ResendCancelList implements OnChanges,OnDestroy {
       const text=(v:unknown,max:number):v is string=>typeof v==='string'&&v.length>0&&v.length<=max;
       if(!this.uuid(r['requestId'])||r['requestId'].toLowerCase()!==requestId.toLowerCase()||!this.uuid(r['jobId'])||!text(r['providerId'],1024)||!text(r['databasePrincipal'],128)||!text(r['reason'],500)||!text(r['createdAt'],128)||!text(r['updatedAt'],128)||!['unknown','confirmed','rejected','not_cancelled'].includes(r['state'] as string)||!(r['httpStatus']===null||(Number.isInteger(r['httpStatus'])&&(r['httpStatus'] as number)>=400&&(r['httpStatus'] as number)<=499)))throw Error('request');
       let resolution:Detail['resolution']=null;
-      if(data['resolution']!==null){if(!data['resolution']||typeof data['resolution']!=='object')throw Error('resolution');const v=data['resolution'] as Record<string,unknown>;if(!this.uuid(v['resolutionId'])||!['confirmed','not_cancelled'].includes(v['decision'] as string)||v['decision']!==r['state']||!text(v['databasePrincipal'],128)||!text(v['reason'],500)||!text(v['recordedAt'],128))throw Error('resolution');resolution={resolutionId:v['resolutionId'],decision:v['decision'] as string,databasePrincipal:v['databasePrincipal'],reason:v['reason'],recordedAt:v['recordedAt']};}
+      if(data['resolution']!==null){if(!data['resolution']||typeof data['resolution']!=='object')throw Error('resolution');const v=data['resolution'] as Record<string,unknown>;if(!this.uuid(v['resolutionId'])||!['confirmed','not_cancelled'].includes(v['decision'] as string)||v['decision']!==r['state']||!text(v['databasePrincipal'],128)||!text(v['reason'],500)||!text(v['recordedAt'],128))throw Error('resolution');let operator:NonNullable<Detail['resolution']>['operator']=null;if(v['operator']!==null && v['operator']!==undefined){if(typeof v['operator']!=='object')throw Error('operator');const o=v['operator'] as Record<string,unknown>;if(!text(o['issuer'],2048)||!text(o['subject'],1024)||!text(o['clientId'],1024)||!this.uuid(o['resolutionId']))throw Error('operator');operator={issuer:o['issuer'],subject:o['subject'],clientId:o['clientId'],resolutionId:o['resolutionId']};}resolution={resolutionId:v['resolutionId'],decision:v['decision'] as string,databasePrincipal:v['databasePrincipal'],reason:v['reason'],recordedAt:v['recordedAt'],operator};}
       this.detail.set({requestId:r['requestId'],jobId:r['jobId'],providerId:r['providerId'],databasePrincipal:r['databasePrincipal'],reason:r['reason'],state:r['state'] as string,httpStatus:r['httpStatus'] as number|null,createdAt:r['createdAt'],updatedAt:r['updatedAt'],resolution});this.detailStatus.set('loaded');
     }catch{if(seq===this.detailSeq){this.detail.set(null);this.detailStatus.set('error');}}finally{if(seq===this.detailSeq)this.detailAbort=null;}
   }

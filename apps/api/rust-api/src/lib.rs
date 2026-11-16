@@ -511,6 +511,7 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/operator/discord-cooldown-health", get(operator_identity::discord_cooldown_health))
         .route("/v1/experimental/operator/resend-cancel-list", get(operator_identity::resend_cancel_list))
         .route("/v1/experimental/operator/resend-cancel-detail", get(operator_identity::resend_cancel_detail))
+        .route("/v1/experimental/operator/resend-cancel-resolution", post(operator_identity::resend_cancel_resolve))
         .route("/v1/experimental/operator/smtp-auto-health", get(operator_identity::smtp_auto_health))
         .route("/v1/experimental/operator/smtp-auto-worker-health", get(operator_identity::smtp_auto_worker_health))
         .route("/v1/experimental/operator/discord-retry-health", get(operator_identity::discord_retry_health))

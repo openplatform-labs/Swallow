@@ -18,13 +18,15 @@ CREATE ROLE cancel_api_fixture LOGIN;
 GRANT USAGE ON SCHEMA public TO cancel_api_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_cancel_list(text,text,text,text,bigint,integer,uuid) TO cancel_api_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_cancel_detail(text,text,text,text,bigint,uuid) TO cancel_api_fixture;
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_cancel_resolve(text,text,text,text,bigint,uuid,uuid,text,text) TO cancel_api_fixture;
 INSERT INTO public.novu_rust_environments VALUES ('cancel-api-env','org'),('cancel-api-other','org');
 INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname='cancel_api_fixture';
 INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES ('https://issuer.test','fixture','console','cancel-api-env'),('https://issuer.test','fixture','console','cancel-api-other');
 INSERT INTO public.novu_rust_operator_jwt_resend_cancel_list_grants VALUES ('https://issuer.test','fixture','console','cancel-api-env');
 INSERT INTO public.novu_rust_operator_jwt_resend_cancel_detail_grants VALUES ('https://issuer.test','fixture','console','cancel-api-env');
-INSERT INTO public.novu_rust_resend_cancel_operators(environment_id,database_principal,principal_oid,can_read) SELECT 'cancel-api-env',rolname,oid,true FROM pg_roles WHERE rolname='cancel_api_fixture';
-WITH jobs AS (INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) SELECT gen_random_uuid(),'cancel-api-env','experimental_resend_email','{}','completed' FROM generate_series(1,55) RETURNING id)
+INSERT INTO public.novu_rust_operator_jwt_resend_cancel_resolution_grants VALUES ('https://issuer.test','fixture','console','cancel-api-env','confirmed');
+INSERT INTO public.novu_rust_resend_cancel_operators(environment_id,database_principal,principal_oid,can_read,can_resolve) SELECT 'cancel-api-env',rolname,oid,true,true FROM pg_roles WHERE rolname='cancel_api_fixture';
+WITH jobs AS (INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) SELECT gen_random_uuid(),'cancel-api-env','experimental_resend_email','{}','completed' FROM generate_series(1,56) RETURNING id)
 INSERT INTO public.novu_rust_resend_cancel_requests(environment_id,request_id,job_id,provider_id,database_principal,principal_oid,reason,state,created_at)
 SELECT 'cancel-api-env',gen_random_uuid(),jobs.id,'private-provider',rolname,oid,'private-reason','unknown',clock_timestamp()-interval '5 minutes' FROM jobs CROSS JOIN pg_roles WHERE rolname='cancel_api_fixture';
 SQL
