@@ -290,6 +290,169 @@ async fn trigger_renders_and_guards_subscriber_endpoint_and_preferences() {
     );
     assert_eq!(db.query_one("SELECT count(*) FROM public.novu_queue_jobs WHERE kind=$1 AND last_error='Telegram workflow step changed or disabled'", &[&novu_postgres_queue::telegram_queue::WORKFLOW_KIND]).await.unwrap().get::<_,i64>(0),1);
     db.batch_execute("UPDATE public.novu_rust_workflows SET chat_content='{{name}} {{subscriber.firstName}}' WHERE environment_id='a' AND identifier='telegram-workflow'").await.unwrap();
+    // A real ambiguous HTTP response is visible to a separately granted operator.
+    produce(&mut db, app.clone(), "operator-retry").await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/sendMessage", listener.local_addr().unwrap());
+    let ambiguous = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0; 4096];
+        assert!(socket.read(&mut buf).await.unwrap() > 0);
+        socket
+            .write_all(b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+    });
+    let failure_provider =
+        novu_postgres_queue::telegram::Telegram::test_endpoint(&endpoint).unwrap();
+    assert!(
+        novu_postgres_queue::telegram_queue::process_one_with_workflow(
+            &mut db,
+            "a",
+            "dest",
+            &failure_provider,
+            false,
+            true
+        )
+        .await
+        .unwrap()
+    );
+    ambiguous.await.unwrap();
+    let row = db.query_one("SELECT j.id,a.attempt_id FROM public.novu_queue_jobs j JOIN public.novu_rust_telegram_attempts a ON a.job_id=j.id WHERE j.kind='experimental_telegram_workflow' AND a.state='unknown'", &[]).await.unwrap();
+    let job: uuid::Uuid = row.get(0);
+    let attempt: uuid::Uuid = row.get(1);
+    db.batch_execute("CREATE ROLE telegram_workflow_ops LOGIN; CREATE ROLE telegram_workflow_denied LOGIN; GRANT USAGE ON SCHEMA public TO telegram_workflow_ops,telegram_workflow_denied; GRANT EXECUTE ON FUNCTION public.novu_rust_telegram_attention(text,uuid),public.novu_rust_telegram_resolve(text,uuid,uuid,uuid,text,text) TO telegram_workflow_ops,telegram_workflow_denied; INSERT INTO public.novu_rust_telegram_operator_grants SELECT 'a',rolname,oid,true,true,true FROM pg_roles WHERE rolname='telegram_workflow_ops'").await.unwrap();
+    let (ops, driver) = tokio_postgres::connect(
+        &url.replace("postgres://postgres@", "postgres://telegram_workflow_ops@"),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(driver);
+    let (denied, driver) = tokio_postgres::connect(
+        &url.replace(
+            "postgres://postgres@",
+            "postgres://telegram_workflow_denied@",
+        ),
+        NoTls,
+    )
+    .await
+    .unwrap();
+    tokio::spawn(driver);
+    let list: Value = ops
+        .query_one(
+            "SELECT public.novu_rust_telegram_attention($1,$2)",
+            &[&"a", &Option::<uuid::Uuid>::None],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(list["data"][0]["jobId"], job.to_string());
+    assert_eq!(list["data"][0]["jobKind"], "experimental_telegram_workflow");
+    assert!(!list.to_string().contains("-123"));
+    assert!(
+        denied
+            .query_one(
+                "SELECT public.novu_rust_telegram_attention($1,$2)",
+                &[&"a", &Option::<uuid::Uuid>::None]
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        ops.query_one(
+            "SELECT public.novu_rust_telegram_attention($1,$2)",
+            &[&"other", &Option::<uuid::Uuid>::None]
+        )
+        .await
+        .is_err()
+    );
+    let request = uuid::Uuid::new_v4();
+    let query = "SELECT public.novu_rust_telegram_resolve($1,$2,$3,$4,$5,$6)";
+    assert!(
+        denied
+            .query_one(
+                query,
+                &[&"a", &request, &job, &attempt, &"retry", &"verified"]
+            )
+            .await
+            .is_err()
+    );
+    db.batch_execute("CREATE FUNCTION public.telegram_workflow_audit_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test'; END $$; CREATE TRIGGER telegram_workflow_audit_failure BEFORE INSERT ON public.novu_rust_telegram_resolutions FOR EACH ROW EXECUTE FUNCTION public.telegram_workflow_audit_failure()").await.unwrap();
+    assert!(
+        ops.query_one(
+            query,
+            &[&"a", &request, &job, &attempt, &"retry", &"verified"]
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        db.query_one(
+            "SELECT state FROM public.novu_rust_telegram_attempts WHERE job_id=$1",
+            &[&job]
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0),
+        "unknown"
+    );
+    db.batch_execute(
+        "DROP TRIGGER telegram_workflow_audit_failure ON public.novu_rust_telegram_resolutions",
+    )
+    .await
+    .unwrap();
+    let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] =
+        &[&"a", &request, &job, &attempt, &"retry", &"verified"];
+    let (first, second) = tokio::join!(ops.query_one(query, params), ops.query_one(query, params));
+    let mut replay = [
+        first.unwrap().get::<_, Value>(0)["replayed"]
+            .as_bool()
+            .unwrap(),
+        second.unwrap().get::<_, Value>(0)["replayed"]
+            .as_bool()
+            .unwrap(),
+    ];
+    replay.sort();
+    assert_eq!(replay, [false, true]);
+    assert!(
+        ops.query_one(
+            query,
+            &[&"a", &request, &job, &attempt, &"retry", &"changed"]
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(db.query_one("SELECT count(*) FROM public.novu_rust_telegram_resolutions WHERE job_id=$1 AND attempt_id=$2 AND previous_state='unknown'", &[&job,&attempt]).await.unwrap().get::<_,i64>(0), 1);
+    db.batch_execute("UPDATE public.novu_rust_telegram_workflow_endpoints SET chat_id='-999' WHERE identifier='ep'").await.unwrap();
+    assert!(
+        novu_postgres_queue::telegram_queue::process_one_with_workflow(
+            &mut db, "a", "dest", &provider, false, true
+        )
+        .await
+        .unwrap()
+    );
+    let result = db
+        .query_one(
+            "SELECT status,last_error FROM public.novu_queue_jobs WHERE id=$1",
+            &[&job],
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.get::<_, String>(0), "failed");
+    assert_eq!(
+        result.get::<_, String>(1),
+        "Telegram endpoint changed or deleted"
+    );
+    assert!(
+        db.query_opt(
+            "SELECT 1 FROM public.novu_rust_telegram_attempts WHERE job_id=$1",
+            &[&job]
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
     produce(&mut db, app, "identity").await;
     db.batch_execute("DELETE FROM public.novu_rust_subscribers WHERE environment_id='a' AND subscriber_id='alice'; INSERT INTO public.novu_rust_subscribers(environment_id,subscriber_id,internal_id,profile) VALUES ('a','alice','new','{}')").await.unwrap();
     assert!(
