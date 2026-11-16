@@ -31,10 +31,12 @@ def call(env, *args, success=True):
 sql("""
 CREATE ROLE telegram_predispatch_reader LOGIN;
 GRANT USAGE ON SCHEMA public TO telegram_predispatch_reader;
-GRANT EXECUTE ON FUNCTION public.novu_rust_telegram_predispatch_list(text,uuid),public.novu_rust_telegram_predispatch_retry(text,uuid,uuid,bigint,text) TO telegram_predispatch_reader;
+GRANT EXECUTE ON FUNCTION public.novu_rust_telegram_predispatch_list(text,uuid),public.novu_rust_telegram_predispatch_retry(text,uuid,uuid,bigint,text),public.novu_rust_telegram_predispatch_cancel(text,uuid,uuid,bigint,text),public.novu_rust_telegram_health(text) TO telegram_predispatch_reader;
 INSERT INTO public.novu_rust_environments VALUES ('telegram-pre','org'),('telegram-pre-other','org');
 INSERT INTO public.novu_rust_telegram_operator_grants
  SELECT 'telegram-pre',rolname,oid,true,false,false FROM pg_roles WHERE rolname='telegram_predispatch_reader';
+INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid)
+ SELECT 'telegram-pre',rolname,'alert_view',oid FROM pg_roles WHERE rolname='telegram_predispatch_reader';
 INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status,last_error)
  SELECT gen_random_uuid(),'telegram-pre','experimental_telegram_workflow','{"secret":"payload-secret"}','failed',
  CASE WHEN i=1 THEN 'Telegram endpoint changed or deleted' ELSE 'secret arbitrary error' END FROM generate_series(1,52) i;
@@ -81,6 +83,42 @@ assert sql("SELECT count(*) FROM public.novu_rust_telegram_predispatch_retries W
 sql("UPDATE public.novu_rust_telegram_operator_grants SET can_retry=false WHERE environment_id='telegram-pre' AND database_principal='telegram_predispatch_reader'")
 retry(request, job, 0, success=False)
 
+def cancel(request, job, revision, reason='not required', success=True):
+    result = subprocess.run([cli, 'cancel-telegram-predispatch', 'telegram-pre', request, job, str(revision), reason],
+                            env={**os.environ, 'DATABASE_URL': reader}, capture_output=True, text=True, timeout=10)
+    assert (result.returncode == 0) == success, result.stderr
+    return json.loads(result.stdout) if success else None
+
+cancel_job = str(uuid.uuid4()); cancel_request = str(uuid.uuid4())
+sql("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status,last_error) VALUES('%s','telegram-pre','experimental_telegram','{\"destination\":\"ops\",\"chatId\":\"123\",\"text\":\"cancelled\"}','failed','invalid Telegram job')" % cancel_job)
+cancel(cancel_request, cancel_job, 0, success=False)
+sql("INSERT INTO public.novu_rust_telegram_predispatch_cancel_grants SELECT 'telegram-pre',rolname,oid FROM pg_roles WHERE rolname='telegram_predispatch_reader'")
+cancel(str(uuid.uuid4()), cancel_job, 1, success=False)
+cancel(str(uuid.uuid4()), excluded, 0, success=False)
+def health():
+    result=subprocess.run([psql,reader,'-qAt','-v','ON_ERROR_STOP=1','-c',"SELECT pre_dispatch_failures FROM public.novu_rust_telegram_health('telegram-pre')"],capture_output=True,text=True,timeout=10,check=True)
+    return int(result.stdout.strip())
+before=health()
+sql("CREATE FUNCTION public.reject_telegram_pre_cancel() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'test'; END$$; CREATE TRIGGER reject_telegram_pre_cancel BEFORE INSERT ON public.novu_rust_telegram_predispatch_cancellations FOR EACH ROW EXECUTE FUNCTION public.reject_telegram_pre_cancel()")
+cancel(cancel_request, cancel_job, 0, success=False)
+assert sql("SELECT status FROM public.novu_queue_jobs WHERE id='%s'" % cancel_job)=='failed' and health()==before
+sql('DROP TRIGGER reject_telegram_pre_cancel ON public.novu_rust_telegram_predispatch_cancellations')
+with ThreadPoolExecutor(max_workers=2) as pool:
+    results=list(pool.map(lambda _: cancel(cancel_request,cancel_job,0),range(2)))
+assert sorted(r['replayed'] for r in results)==[False,True]
+assert sql("SELECT status FROM public.novu_queue_jobs WHERE id='%s'" % cancel_job)=='cancelled' and health()==before-1
+cancel(cancel_request,cancel_job,0,reason='changed',success=False)
+race_job=str(uuid.uuid4())
+sql("INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status,last_error) VALUES('%s','telegram-pre','experimental_telegram','{\"destination\":\"race\"}','failed','invalid Telegram job'); UPDATE public.novu_rust_telegram_operator_grants SET can_retry=true WHERE environment_id='telegram-pre' AND database_principal='telegram_predispatch_reader'" % race_job)
+def race(action):
+    return subprocess.run([cli,action,'telegram-pre',str(uuid.uuid4()),race_job,'0','race'],env={**os.environ,'DATABASE_URL':reader},capture_output=True,text=True,timeout=10).returncode
+with ThreadPoolExecutor(max_workers=2) as pool:
+    codes=list(pool.map(race,['retry-telegram-predispatch','cancel-telegram-predispatch']))
+assert sum(code==0 for code in codes)==1,codes
+assert sql("SELECT (SELECT count(*) FROM public.novu_rust_telegram_predispatch_cancellations WHERE job_id='%s')+(SELECT count(*) FROM public.novu_rust_telegram_predispatch_retries WHERE job_id='%s')" % (race_job,race_job))=='1'
+sql("DELETE FROM public.novu_rust_telegram_predispatch_cancel_grants WHERE environment_id='telegram-pre' AND database_principal='telegram_predispatch_reader'")
+cancel(cancel_request,cancel_job,0,success=False)
+
 calls = []
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -106,4 +144,4 @@ try:
 finally:
     worker.terminate(); worker.wait(timeout=5)
     server.shutdown(); server.server_close(); thread.join()
-print('Telegram pre-dispatch CLI isolates and sanitizes lists; retry enforces revision, permissions, idempotency, audit rollback and real worker dispatch.')
+print('Telegram pre-dispatch CLI isolates lists and enforces retry/cancel permissions, revision, idempotency, rollback, health and worker dispatch.')
