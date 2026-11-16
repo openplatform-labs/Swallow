@@ -20,3 +20,4 @@ TEST_PSQL="$TEST_PG_BIN/psql" TEST_TELEGRAM_WORKER="$DIR/telegram-worker-fixture
 TEST_PSQL="$TEST_PG_BIN/psql" TEST_TELEGRAM_WORKER="$DIR/telegram-worker-fixture" python3 "$WORKER/tests/telegram_scoped_workflow_process.py"
 TEST_PSQL="$TEST_PG_BIN/psql" TEST_TELEGRAM_WORKER="$DIR/telegram-worker-fixture" TEST_TELEGRAM_ENQUEUE="$WORKER/target/debug/telegram-enqueue" python3 "$WORKER/tests/telegram_scoped_enqueue_process.py"
 TEST_PSQL="$TEST_PG_BIN/psql" TEST_DELIVERY_CLI="$WORKER/target/debug/delivery-reconcile" TEST_TELEGRAM_WORKER="$DIR/telegram-worker-fixture" python3 "$WORKER/tests/telegram_predispatch_process.py"
+TEST_PSQL="$TEST_PG_BIN/psql" TEST_DELIVERY_CLI="$WORKER/target/debug/delivery-reconcile" TEST_TELEGRAM_WORKER="$DIR/telegram-worker-fixture" python3 "$WORKER/tests/telegram_delayed_retry_process.py"

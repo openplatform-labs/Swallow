@@ -59,6 +59,12 @@ describe('Discord operator reviews',()=>{
     await c.listTelegram();fixture.detectChanges();expect(fixture.nativeElement.textContent).toContain('API 업데이트 필요');
     await c.listTelegram();expect(c.telegramListStatus()).toBe('error');await c.listTelegram();expect(c.telegramListStatus()).toBe('error');fixture.destroy();
   });
+  it('displays Telegram delayed retry history and rejects invalid guidance',async()=>{
+    const record={requestId,jobId:job,attemptId:revision,previousState:'rejected',httpStatus:429,decision:'retry_after',retryAfterSeconds:120,retryNotBefore:'2026-11-16T00:02:00Z',reason:'checked',databasePrincipal:'operator',principalOid:'123',createdAt:'2026-11-16T00:00:00Z',operator:null};
+    const page=(entry:object)=>new Response(JSON.stringify({data:[entry],hasMore:false,next:null}));
+    vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(page(record)).mockResolvedValueOnce(page({...record,retryAfterSeconds:-1}));
+    const {fixture,c}=component();c.telegramHistoryJob=job;await c.loadTelegramHistory();fixture.detectChanges();expect(c.telegramHistory()[0].decision).toBe('retry_after');expect(fixture.nativeElement.textContent).toContain('공급자 안내: 120초');await c.loadTelegramHistory();expect(c.telegramHistoryStatus()).toBe('error');fixture.destroy();
+  });
   it('loads Telegram aggregate health, rejects malformed data and clears stale responses',async()=>{
     let finish!:(r:Response)=>void;const mock=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({unknownAttempts:1,rejectedAttempts:2,strandedDispatches:3,preDispatchFailures:4,secret:'discard'}))).mockResolvedValueOnce(new Response(JSON.stringify({unknownAttempts:-1,rejectedAttempts:0,strandedDispatches:0,preDispatchFailures:0}))).mockReturnValueOnce(new Promise(resolve=>finish=resolve));
     const {fixture,c}=component();await c.loadTelegramHealth();expect(c.telegramHealth()).toEqual({unknownAttempts:1,rejectedAttempts:2,strandedDispatches:3,preDispatchFailures:4});expect(new URL(mock.mock.calls[0][0] as string).pathname).toBe('/v1/experimental/operator/telegram-health');fixture.detectChanges();expect(fixture.nativeElement.textContent).toContain('결과 불명 1');await c.loadTelegramHealth();expect(c.telegramHealthStatus()).toBe('error');const pending=c.loadTelegramHealth();c.token='other.token.value';c.ngOnChanges();finish(new Response(JSON.stringify({unknownAttempts:9,rejectedAttempts:0,strandedDispatches:0,preDispatchFailures:0})));await pending;expect(c.telegramHealth()).toBeNull();fixture.destroy();

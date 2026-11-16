@@ -41,6 +41,7 @@ INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES
 INSERT INTO public.novu_rust_telegram_attempts(job_id,environment_id,state) VALUES('11111111-1111-4111-8111-111111111111','fixture-env','unknown');
 INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES('22222222-2222-4222-8222-222222222222','fixture-env','experimental_telegram','{"destination":"secret"}','failed');
 INSERT INTO public.novu_rust_telegram_attempts(job_id,environment_id,state,http_status,retry_after_seconds) VALUES('22222222-2222-4222-8222-222222222222','fixture-env','rejected',429,42);
+INSERT INTO public.novu_rust_telegram_resolutions(environment_id,request_id,job_id,attempt_id,previous_state,previous_http_status,previous_updated_at,decision,reason,database_principal,principal_oid,retry_after_seconds,retry_not_before) SELECT 'fixture-env','33333333-3333-4333-8333-333333333333','22222222-2222-4222-8222-222222222222',attempt_id,'rejected',429,clock_timestamp(),'retry_after','scheduled fixture','ui_fixture_api',(SELECT oid FROM pg_roles WHERE rolname='ui_fixture_api'),42,clock_timestamp()+interval '42 seconds' FROM public.novu_rust_telegram_attempts WHERE job_id='22222222-2222-4222-8222-222222222222';
 SQL
 python3 - "$API/tests/fixtures/operator_jwt/test-only-public.pem" "$API/tests/fixtures/operator_jwt/test-only-private.pem" "$TEST_DIR" <<'PY'
 import base64,json,subprocess,sys,time
@@ -90,6 +91,8 @@ await fill('input[name="telegramRequestId"]',req);await page.click('app-discord-
 await page.waitForFunction(id=>document.querySelector('app-discord-reviews')?.innerText.includes('기록됨: '+id),req);
 await fill('input[name="telegramHistoryJob"]','11111111-1111-4111-8111-111111111111');await page.click('app-discord-reviews button:has-text("Telegram 판정 이력 조회")');
 await page.waitForFunction(id=>[...document.querySelectorAll('app-discord-reviews table')].some(t=>t.innerText.includes(id)&&t.innerText.includes('checked browser')&&t.innerText.includes('admin')),req);
+await fill('input[name="telegramHistoryJob"]','22222222-2222-4222-8222-222222222222');await page.click('app-discord-reviews button:has-text("Telegram 판정 이력 조회")');
+await page.waitForFunction(()=>document.querySelector('app-discord-reviews')?.innerText.includes('공급자 안내: 42초'));
 await fill('input[name="alertKey"]',target);await page.click('app-discord-reviews button:has-text("Telegram 검토 목록 조회")');
 await page.waitForFunction(()=>document.querySelector('app-discord-reviews')?.innerText.includes('목록을 조회하지 못했습니다.'));
 console.log('Telegram resolution browser list, retry, history and authorization passed');
