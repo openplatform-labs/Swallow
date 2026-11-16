@@ -1,5 +1,6 @@
 """Live API reconnect and ambiguous pre-dispatch decision during synchronous promotion."""
 import base64
+import http.client
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 root = Path(os.environ['TEST_ROOT'])
 directory = Path(os.environ['TEST_FIXTURE_DIR'])
@@ -62,6 +64,40 @@ def call(path, jwt, method='GET', body=None, timeout=8):
         return 0, None
 
 
+def commit_then_drop_response(path, jwt, body):
+    """Forward one request to the real API, then drop its successful response."""
+    upstream = []
+
+    class Proxy(BaseHTTPRequestHandler):
+        def do_POST(self):
+            request_body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            upstream.append(call(self.path, jwt, 'POST', request_body))
+            self.connection.shutdown(socket.SHUT_RDWR)
+            self.connection.close()
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Proxy)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=10)
+    try:
+        connection.request('POST', path, json.dumps(body), {'Content-Type': 'application/json'})
+        try:
+            connection.getresponse()
+        except http.client.RemoteDisconnected:
+            pass
+        else:
+            raise AssertionError('the client unexpectedly received an HTTP response')
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join()
+    assert len(upstream) == 1 and upstream[0][0] == 200 and upstream[0][1]['replayed'] is False, upstream
+
+
 try:
     sql(primary, """CREATE ROLE telegram_api_ha LOGIN; GRANT USAGE ON SCHEMA public TO telegram_api_ha;
  GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_telegram_predispatch_retry(text,text,text,text,bigint,uuid,uuid,bigint,text),
@@ -89,16 +125,18 @@ try:
     admin, target = token('admin'), token('target')
     retry_path = '/v1/experimental/operator/telegram-predispatch-retry?environmentId=telegram-api-ha'
     cancel_path = '/v1/experimental/operator/telegram-predispatch-cancel?environmentId=telegram-api-ha'
-    retry_id, cancel_id, retry_job, cancel_job = (str(uuid.uuid4()) for _ in range(4))
-    sql(primary, "INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status,last_error) VALUES ('%s','telegram-api-ha','experimental_telegram','{}','failed','invalid Telegram job'),('%s','telegram-api-ha','experimental_telegram','{}','failed','invalid Telegram job')" % (retry_job, cancel_job))
+    retry_id, cancel_id, retry_job, cancel_job, lost_cancel_id, lost_cancel_job = (str(uuid.uuid4()) for _ in range(6))
+    sql(primary, "INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status,last_error) VALUES ('%s','telegram-api-ha','experimental_telegram','{}','failed','invalid Telegram job'),('%s','telegram-api-ha','experimental_telegram','{}','failed','invalid Telegram job'),('%s','telegram-api-ha','experimental_telegram','{}','failed','invalid Telegram job')" % (retry_job, cancel_job, lost_cancel_job))
     retry = {'requestId': retry_id, 'jobId': retry_job, 'failureRevision': '0', 'reason': 'reviewed'}
     cancel = {'requestId': cancel_id, 'jobId': cancel_job, 'failureRevision': '0', 'reason': 'reviewed'}
+    lost_cancel = {'requestId': lost_cancel_id, 'jobId': lost_cancel_job, 'failureRevision': '0', 'reason': 'reviewed'}
     lookup = '/v1/experimental/operator/telegram-predispatch-cancel-request?environmentId=telegram-api-ha&requestId=' + cancel_id
     wait(lambda: call(lookup, admin)[0] == 200)
     assert call(cancel_path, target, 'POST', cancel)[0] == 401
-    status, value = call(retry_path, admin, 'POST', retry)
-    assert status == 200 and value['replayed'] is False
+    commit_then_drop_response(retry_path, admin, retry)
+    commit_then_drop_response(cancel_path, admin, lost_cancel)
     wait(lambda: sql(standby, "SELECT count(*) FROM public.novu_rust_operator_jwt_telegram_predispatch_requests WHERE request_id='%s'" % retry_id) == '1')
+    wait(lambda: sql(standby, "SELECT count(*) FROM public.novu_rust_operator_jwt_telegram_predispatch_cancellations WHERE request_id='%s'" % lost_cancel_id) == '1')
     lock_sql = "BEGIN; SELECT id FROM public.novu_queue_jobs WHERE id='%s' FOR UPDATE; SELECT pg_sleep(90); COMMIT" % cancel_job
     blocker = subprocess.Popen([psql, primary + '?application_name=telegram_api_lock', '-qAt', '-v', 'ON_ERROR_STOP=1', '-c', lock_sql],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -118,6 +156,12 @@ try:
     assert call(lookup, admin)[1] == {'found': False}
     status, value = call(retry_path, admin, 'POST', retry)
     assert status == 200 and value['replayed'] is True
+    assert sql(standby, "SELECT count(*) FROM public.novu_rust_operator_jwt_telegram_predispatch_requests WHERE request_id='%s'" % retry_id) == '1'
+    assert sql(standby, "SELECT count(*) FROM public.novu_rust_telegram_predispatch_retries WHERE job_id='%s'" % retry_job) == '1'
+    status, value = call(cancel_path, admin, 'POST', lost_cancel)
+    assert status == 200 and value['replayed'] is True
+    assert sql(standby, "SELECT status FROM public.novu_queue_jobs WHERE id='%s'" % lost_cancel_job) == 'cancelled'
+    assert sql(standby, "SELECT count(*) FROM public.novu_rust_telegram_predispatch_cancellations WHERE job_id='%s'" % lost_cancel_job) == '1'
     status, value = call(cancel_path, admin, 'POST', cancel)
     assert status == 200 and value['replayed'] is False
     status, value = call(cancel_path, admin, 'POST', cancel)
@@ -127,7 +171,7 @@ try:
     assert sql(standby, "SELECT status FROM public.novu_queue_jobs WHERE id='%s'" % cancel_job) == 'cancelled'
     assert sql(standby, "SELECT count(*) FROM public.novu_rust_operator_jwt_telegram_predispatch_cancellations WHERE request_id='%s'" % cancel_id) == '1'
     assert sql(standby, "SELECT count(*) FROM public.novu_rust_telegram_predispatch_cancellations WHERE job_id='%s'" % cancel_job) == '1'
-    print('Telegram API reconnected after synchronous promotion; committed retry replayed and interrupted cancellation recovered once.')
+    print('Telegram API recovered lost responses after committed retry/cancellation and an interrupted cancellation across synchronous promotion.')
 finally:
     for child in (blocker, api):
         if child is not None and child.poll() is None:
