@@ -8,6 +8,8 @@ TEST_DIR=$(mktemp -d "${TMPDIR:-/tmp}/swallow-telegram-policy-grants-browser.XXX
 API_PID= UI_PID=
 : "${TEST_PG_BIN:?Set TEST_PG_BIN to the PostgreSQL bin directory}"
 cleanup() {
+  local result=$?
+  if (( result != 0 )) && [[ -f "$TEST_DIR/postgres.log" ]]; then tail -n 20 "$TEST_DIR/postgres.log" >&2; fi
   if [[ -n "$API_PID" ]]; then kill "$API_PID" 2>/dev/null || true; wait "$API_PID" 2>/dev/null || true; fi
   if [[ -n "$UI_PID" ]]; then kill "$UI_PID" 2>/dev/null || true; wait "$UI_PID" 2>/dev/null || true; fi
   if [[ -f "$TEST_DIR/data/postmaster.pid" ]] && ! "$TEST_PG_BIN/pg_ctl" -D "$TEST_DIR/data" -m immediate -w stop >/dev/null 2>&1; then echo "Database retained at $TEST_DIR" >&2; return; fi
@@ -27,10 +29,11 @@ cargo run --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin migrate-wo
 "$TEST_PG_BIN/psql" "$DATABASE_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
 CREATE ROLE ui_fixture_api LOGIN;
 GRANT USAGE ON SCHEMA public TO ui_fixture_api;
-GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_telegram_policy_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_telegram_policy_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_telegram_policy_grant_audit_read(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_telegram_policy_grant_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_telegram_policy_read(text,text,text,text,bigint),public.novu_rust_operator_jwt_telegram_policy_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_telegram_policy_audit_read(text,text,text,text,bigint,uuid) TO ui_fixture_api;
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_telegram_policy_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_telegram_policy_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_telegram_policy_grant_audit_read(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_telegram_policy_grant_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_telegram_health(text,text,text,text,bigint),public.novu_rust_operator_jwt_telegram_policy_read(text,text,text,text,bigint),public.novu_rust_operator_jwt_telegram_policy_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_telegram_policy_audit_read(text,text,text,text,bigint,uuid) TO ui_fixture_api;
 INSERT INTO public.novu_rust_environments VALUES('fixture-env','fixture-org');
 INSERT INTO public.novu_rust_operator_jwt_identities(issuer,subject,client_id,environment_id) VALUES('https://issuer.test','admin','console','fixture-env'),('https://issuer.test','target','console','fixture-env');
 INSERT INTO public.novu_rust_operator_jwt_api_logins SELECT rolname,oid FROM pg_roles WHERE rolname='ui_fixture_api';
+INSERT INTO public.novu_rust_delivery_operator_grants SELECT 'fixture-env',rolname,'alert_view',oid FROM pg_roles WHERE rolname='ui_fixture_api';
 INSERT INTO public.novu_rust_operator_jwt_telegram_policy_grant_admins VALUES('https://issuer.test','admin','console','fixture-env',true,true);
 INSERT INTO public.novu_rust_operator_jwt_telegram_policy_grant_audit_viewers VALUES('https://issuer.test','admin','console','fixture-env');
 INSERT INTO public.novu_rust_telegram_policy_admins(environment_id,database_principal,principal_oid,can_read,can_write,can_audit) SELECT 'fixture-env',rolname,oid,true,true,true FROM pg_roles WHERE rolname='ui_fixture_api';
@@ -89,7 +92,7 @@ async function alerts() {
  await page.click('nav.sidenav button >> nth=5');await page.selectOption('select[name="alertAuthMode"]','jwt');
  await fill('input[name="alertEnvironment"]','fixture-env');await fill('input[name="alertKey"]',target);
 }
-await settings();await change('read','없음');await change('write','없음');await change('audit','없음');
+await settings();await change('read','없음');await change('write','없음');await change('audit','없음');await change('health','없음');
 await page.selectOption('select[name="grantAuditScope"]','telegram-policy');await page.click('section:has(select[name="grantAuditScope"]) button:has-text("위임 이력 조회")');
 await page.waitForFunction(()=>[...document.querySelectorAll('table')].some(t=>t.innerText.includes('Telegram policy grants browser audit')));
 await fill('input[name="permissionKey"]',target);await page.selectOption('select[name="workflowPolicyChannel"]','telegram');await page.click('app-discord-policy button:has-text("정책 조회")');
@@ -101,12 +104,18 @@ await fill('input[name="permissionKey"]',target);await page.click('app-discord-p
 await page.waitForFunction(()=>document.querySelector('app-discord-policy')?.innerText.includes('정책을 조회하지 못했습니다.'));
 await page.click('app-discord-policy button:has-text("정책 이력 조회")');
 await page.waitForFunction(()=>document.querySelector('app-discord-policy')?.innerText.includes('조회된 이력이 없습니다.'));
-console.log('Telegram policy grants, actual policy read and audit, and revocation passed');
+await alerts();await page.click('app-discord-reviews button:has-text("Telegram 상태 조회")');
+await page.waitForFunction(()=>document.querySelector('app-discord-reviews')?.innerText.includes('결과 불명 0 · 거절 0 · 중단된 발송 0 · 발송 전 실패 0'));
+await settings();await change('health','허용');
+await alerts();await page.click('app-discord-reviews button:has-text("Telegram 상태 조회")');
+await page.waitForFunction(()=>document.querySelector('app-discord-reviews')?.innerText.includes('Telegram 상태를 조회하지 못했습니다.'));
+console.log('Telegram policy and health grants, access and revocation passed');
 '''
 with open(root+'/browser.mjs','w') as f:f.write('const API='+json.dumps(api)+'; const UI='+json.dumps(ui)+'; const ROOT='+json.dumps(root)+'; const SPACE='+json.dumps(int(space) if space else None)+';\n'+script)
 PY
 ego-browser nodejs < "$TEST_DIR/browser.mjs"
 SPACE_ID=$(cat "$TEST_DIR/space-id")
 printf 'const task=await taskSpace(%s); await task.finish({keep:[]});\n' "$SPACE_ID" | ego-browser nodejs
-[[ $("$TEST_PG_BIN/psql" "$DATABASE_URL" -At -v ON_ERROR_STOP=1 -c "SELECT count(*)=4 FROM public.novu_rust_operator_jwt_telegram_policy_grant_audit WHERE environment_id='fixture-env'") == t ]]
+[[ $("$TEST_PG_BIN/psql" "$DATABASE_URL" -At -v ON_ERROR_STOP=1 -c "SELECT count(*)=6 FROM public.novu_rust_operator_jwt_telegram_policy_grant_audit WHERE environment_id='fixture-env'") == t ]]
 [[ $("$TEST_PG_BIN/psql" "$DATABASE_URL" -At -v ON_ERROR_STOP=1 -c "SELECT NOT can_read AND can_write AND can_audit FROM public.novu_rust_operator_jwt_telegram_policy_grants WHERE environment_id='fixture-env' AND subject='target'") == t ]]
+[[ $("$TEST_PG_BIN/psql" "$DATABASE_URL" -At -v ON_ERROR_STOP=1 -c "SELECT count(*)=0 FROM public.novu_rust_operator_jwt_telegram_health_grants WHERE environment_id='fixture-env' AND subject='target'") == t ]]
