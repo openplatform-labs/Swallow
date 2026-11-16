@@ -47,7 +47,31 @@ try:
     assert sql("SELECT state FROM public.novu_rust_resend_cancel_commands WHERE request_id='%s'"%r2)=='dispatching'
     sql("SELECT public.novu_rust_resend_cancel_resolve('cancel-env','aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab','%s','not_cancelled','verified')"%r2,resolver)
     assert sql("SELECT state FROM public.novu_rust_resend_cancel_commands WHERE request_id='%s'"%r2)=='finished'
+    # An expired scheduled job becomes a visible failed command with no network call.
+    fail='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaac';job6='66666666-6666-4666-8666-666666666666';enqueue(fail,job6)
+    wait(lambda:sql("SELECT state FROM public.novu_rust_resend_cancel_commands WHERE request_id='%s'"%fail)=='failed')
+    assert '/emails/fixture-six/cancel' not in calls
+    d.terminate();d.wait(timeout=5)
     assert json.loads(enqueue('99999999-9999-4999-8999-999999999999',j2))['state']=='pending'
+    sql("UPDATE public.novu_rust_resend_cancel_commands SET created_at=clock_timestamp()-interval '5 minutes' WHERE request_id='99999999-9999-4999-8999-999999999999'")
+    monitor={**os.environ,'DATABASE_URL':admin.replace('postgres://postgres@','postgres://cancel_fixture@')}
+    reconcile=os.path.join(os.environ['TEST_WORKER_DIR'],'delivery-reconcile')
+    def cli(args,env=monitor):return subprocess.run([reconcile,*args],env=env,capture_output=True,text=True,timeout=10)
+    health=cli(['check-resend-cancel-commands','cancel-env','60']);assert health.returncode==2 and json.loads(health.stdout)=={'pending':1,'overdue':1,'unreviewed':1}
+    assert cli(['check-resend-cancel-commands','cancel-other','60']).returncode!=0
+    listing=cli(['list-resend-cancel-failed','cancel-env']);rows=json.loads(listing.stdout)['data'];assert len(rows)==1 and rows[0]['requestId']==fail
+    assert cli(['ack-resend-cancel-failed','cancel-env',fail,rows[0]['failedAt'],'checked'],monitor).returncode!=0
+    reviewer={**monitor,'DATABASE_URL':resolver};assert cli(['ack-resend-cancel-failed','cancel-env',fail,'2020-01-01T00:00:00Z','checked'],reviewer).returncode!=0
+    alert_env={**monitor,'SWALLOW_ALERT_RESEND_ENABLED':'false','SWALLOW_ALERT_RESEND_CANCEL_COMMAND_GRACE_SECONDS':'60','SWALLOW_ALERT_SCOPED_DELIVERY':'true','SWALLOW_ALERT_COOLDOWN_POLICY':'new-condition','SWALLOW_ALERT_CONDITIONS_V3':'true','SWALLOW_ALERT_SLACK_WEBHOOK':'https://hooks.slack.com/services/A/B/C','SWALLOW_ALERT_SLACK_TARGET_ID':'blocked'}
+    alert=subprocess.run([os.path.join(os.environ['TEST_WORKER_DIR'],'send-delivery-alert'),'cancel-env','300','120','60'],env=alert_env,capture_output=True,text=True,timeout=10)
+    assert alert.returncode==2 and 'requires operator review' in alert.stderr,(alert.stdout,alert.stderr)
+    sql("CREATE FUNCTION public.fail_cancel_review() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture'; END $$; CREATE TRIGGER fail_cancel_review BEFORE INSERT ON public.novu_rust_resend_cancel_command_reviews FOR EACH ROW EXECUTE FUNCTION public.fail_cancel_review()")
+    assert cli(['ack-resend-cancel-failed','cancel-env',fail,rows[0]['failedAt'],'checked'],reviewer).returncode!=0
+    assert json.loads(cli(['check-resend-cancel-commands','cancel-env','60']).stdout)['unreviewed']==1
+    sql('DROP TRIGGER fail_cancel_review ON public.novu_rust_resend_cancel_command_reviews')
+    ack=cli(['ack-resend-cancel-failed','cancel-env',fail,rows[0]['failedAt'],'checked'],reviewer);assert ack.returncode==0 and json.loads(ack.stdout)['recorded'] is True
+    assert json.loads(cli(['check-resend-cancel-commands','cancel-env','60']).stdout)=={'pending':1,'overdue':1,'unreviewed':0}
+    assert json.loads(cli(['ack-resend-cancel-failed','cancel-env',fail,rows[0]['failedAt'],'checked'],reviewer).stdout)['recorded'] is False
 finally:
     release.set()
     for p in children:
