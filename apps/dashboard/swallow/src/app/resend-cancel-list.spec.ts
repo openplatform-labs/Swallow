@@ -30,6 +30,15 @@ describe('Resend cancellation list',()=>{
     c.environment='other';await c.submitResolution();expect(fetcher).toHaveBeenCalledTimes(2);c.environment='env';await c.submitResolution();expect(c.resolutionStatus()).toBe('recorded');
     const first=JSON.parse(fetcher.mock.calls[1][1]!.body as string),second=JSON.parse(fetcher.mock.calls[2][1]!.body as string);expect(first).toEqual(second);expect(first.resolutionId).toBe(resolutionId);fixture.destroy();
   });
+  it('keeps an in-flight resolution uncertain if the operator context changes',async()=>{
+    const resolutionId=id(42),request={requestId:id(1),jobId:id(101),providerId:'provider-1',databasePrincipal:'service',reason:'investigation',state:'unknown',httpStatus:null,createdAt:'today',updatedAt:'today'};
+    const result={resolutionId,requestId:id(1),decision:'not_cancelled',replayed:false};let finish!:(r:Response)=>void;
+    vi.spyOn(crypto,'randomUUID').mockReturnValue(resolutionId as `${string}-${string}-${string}-${string}-${string}`);
+    const fetcher=vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({request,resolution:null}))).mockReturnValueOnce(new Promise(resolve=>finish=resolve)).mockResolvedValueOnce(new Response(JSON.stringify({...result,replayed:true})));
+    const {fixture,c}=setup();await c.loadDetail(id(1));c.decision='not_cancelled';c.reason='checked';c.prepareResolution();c.confirm=true;const pending=c.submitResolution();c.environment='other';c.ngOnChanges();finish(new Response(JSON.stringify(result)));await pending;
+    expect(c.resolutionStatus()).toBe('unknown');expect(c.resolutionDraft()?.resolutionId).toBe(resolutionId);expect(c.detail()).toBeNull();
+    c.environment='env';await c.submitResolution();expect(c.resolutionStatus()).toBe('recorded');expect(fetcher.mock.calls[1][1]!.body).toEqual(fetcher.mock.calls[2][1]!.body);fixture.destroy();
+  });
   it('offers resolution for legacy 408 and 409 but not other rejections',async()=>{
     const base={requestId:id(1),jobId:id(101),providerId:'provider',databasePrincipal:'service',reason:'fixture',state:'rejected',createdAt:'today',updatedAt:'today'};
     vi.spyOn(globalThis,'fetch').mockResolvedValueOnce(new Response(JSON.stringify({request:{...base,httpStatus:408},resolution:null}))).mockResolvedValueOnce(new Response(JSON.stringify({request:{...base,httpStatus:409},resolution:null}))).mockResolvedValueOnce(new Response(JSON.stringify({request:{...base,httpStatus:400},resolution:null})));

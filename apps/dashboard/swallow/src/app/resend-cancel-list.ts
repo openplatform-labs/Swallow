@@ -75,6 +75,7 @@ export class ResendCancelList implements OnChanges,OnDestroy {
       const response=await fetch(`${draft.origin}/v1/experimental/operator/resend-cancel-resolution?${params}`,{method:'POST',headers:{Authorization:`Bearer ${draft.token}`,'Content-Type':'application/json'},body:JSON.stringify(body),credentials:'omit',cache:'no-store',redirect:'error',signal:AbortSignal.timeout(10000)});
       if(!response.ok)throw Error('result');const value:unknown=await response.json();if(!value||typeof value!=='object')throw Error('result');const result=value as Record<string,unknown>;
       if(result['resolutionId']!==draft.resolutionId||result['requestId']!==draft.requestId||result['decision']!==draft.decision||typeof result['replayed']!=='boolean')throw Error('result');
+      if(this.origin()!==draft.origin||this.environment.trim()!==draft.environment||this.token.trim()!==draft.token)throw Error('context');
       this.resolutionStatus.set('recorded');this.clearDetail();this.clearLegacy();
     }catch{this.resolutionStatus.set('unknown');}
   }
