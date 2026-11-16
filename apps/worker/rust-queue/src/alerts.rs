@@ -152,6 +152,7 @@ pub async fn finish_scoped(
 ) -> DbResult<bool> {
     let (state, status) = match result {
         Ok(()) => ("accepted", None),
+        Err(AlertError::Rejected(408 | 409)) => ("unknown", None),
         Err(AlertError::Rejected(code)) => ("rejected", Some(i32::from(*code))),
         Err(AlertError::InvalidConfiguration) => ("rejected", None),
         Err(AlertError::Unknown) => ("unknown", None),
@@ -193,6 +194,7 @@ pub async fn finish(
 ) -> DbResult<bool> {
     let (state, status) = match result {
         Ok(()) => ("accepted", None),
+        Err(AlertError::Rejected(408 | 409)) => ("unknown", None),
         Err(AlertError::Rejected(code)) => ("rejected", Some(i32::from(*code))),
         Err(AlertError::InvalidConfiguration) => ("rejected", None),
         Err(AlertError::Unknown) => ("unknown", None),
@@ -1143,7 +1145,7 @@ impl SlackWebhook {
             .map_err(|_| AlertError::Unknown)?;
         let status = response.status().as_u16();
         if status != 200 {
-            return Err(if (400..500).contains(&status) && status != 408 {
+            return Err(if (400..500).contains(&status) && ![408, 409].contains(&status) {
                 AlertError::Rejected(status)
             } else {
                 AlertError::Unknown
@@ -2591,6 +2593,11 @@ mod tests {
             Err(AlertError::Rejected(429))
         );
         server.await.unwrap();
+        for status in ["408 Request Timeout", "409 Conflict"] {
+            let (url, server) = mock_server(status, "ambiguous").await;
+            assert_eq!(SlackWebhook::with_endpoint(url).unwrap().send(&alert()).await, Err(AlertError::Unknown));
+            server.await.unwrap();
+        }
         let (url, server) = mock_server("200 OK", "unexpected").await;
         assert_eq!(
             SlackWebhook::with_endpoint(url)
@@ -2600,6 +2607,32 @@ mod tests {
             Err(AlertError::Unknown)
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires fully migrated disposable PostgreSQL"]
+    async fn slack_ambiguous_status_is_fenced_in_scoped_alerts() {
+        let url=std::env::var("TEST_DATABASE_URL").unwrap();let (mut admin,driver)=tokio_postgres::connect(&url,tokio_postgres::NoTls).await.unwrap();tokio::spawn(driver);
+        let env=format!("ambiguous-alert-{}",Uuid::new_v4());let role=format!("alert_sender_{}",Uuid::new_v4().simple());
+        admin.execute("INSERT INTO public.novu_rust_environments VALUES($1,'org')",&[&env]).await.unwrap();
+        admin.batch_execute(&format!("CREATE ROLE {role} LOGIN; GRANT USAGE ON SCHEMA public TO {role}; GRANT EXECUTE ON FUNCTION public.novu_rust_reserve_alert_v3(text,text,text,integer,bigint,bigint,bigint,bigint),public.novu_rust_finish_alert(text,text,text,uuid,text,integer) TO {role}")).await.unwrap();
+        admin.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,rolname,'alert_send',oid FROM pg_roles WHERE rolname=$2",&[&env,&role]).await.unwrap();
+        let (mut db,driver)=tokio_postgres::connect(&url,tokio_postgres::NoTls).await.unwrap();tokio::spawn(driver);db.batch_execute(&format!("SET SESSION AUTHORIZATION {role}")).await.unwrap();
+        let mut a=alert();a.environment=env.clone();
+        let (url,server)=mock_server("409 Conflict","ambiguous").await;let slack=SlackWebhook::with_endpoint(url).unwrap();
+        let cfg=DispatchPair{alert:&a,slack:Some((&slack,"ops")),email:None,cooldown:60,on_new:true,scoped:true,timeout:Duration::from_secs(3)};
+        assert_eq!(dispatch_pair_v3(&mut db,None,cfg).await.0.unwrap().unwrap(),Dispatch::NeedsReview);server.await.unwrap();
+        assert_eq!(admin.query_one("SELECT state FROM public.novu_rust_alert_delivery_attempts WHERE environment_id=$1 AND target_id='ops'",&[&env]).await.unwrap().get::<_,String>(0),"unknown");
+        let cfg=DispatchPair{alert:&a,slack:Some((&slack,"ops")),email:None,cooldown:60,on_new:true,scoped:true,timeout:Duration::from_secs(3)};assert_eq!(dispatch_pair_v3(&mut db,None,cfg).await.0.unwrap().unwrap(),Dispatch::NeedsReview);
+        let row=db.query_one("SELECT * FROM public.novu_rust_reserve_alert_v3($1,'slack','guarded',60,1,1,0,0)",&[&env]).await.unwrap();let id:Uuid=row.get(1);
+        for code in [408_i32,409] {assert!(db.query_one("SELECT public.novu_rust_finish_alert($1,'slack','guarded',$2,'rejected',$3)",&[&env,&id,&code]).await.is_err());}
+        assert!(finish_scoped(&db,&env,"slack","guarded",id,&Err(AlertError::Rejected(409))).await.unwrap());
+        assert_eq!(admin.query_one("SELECT state FROM public.novu_rust_alert_delivery_attempts WHERE id=$1",&[&id]).await.unwrap().get::<_,String>(0),"unknown");
+        admin.execute("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT $1,rolname,'alert_send',oid FROM pg_roles WHERE rolname=current_user",&[&env]).await.unwrap();
+        let Reservation::Claimed(direct_id)=reserve(&mut admin,&env,"slack","direct",60).await.unwrap() else {panic!("expected direct claim")};
+        assert!(finish(&mut admin,&env,"slack","direct",direct_id,&Err(AlertError::Rejected(408))).await.unwrap());
+        assert_eq!(admin.query_one("SELECT state FROM public.novu_rust_alert_delivery_attempts WHERE id=$1",&[&direct_id]).await.unwrap().get::<_,String>(0),"unknown");
+        assert_eq!(reserve(&mut admin,&env,"slack","direct",60).await.unwrap(),Reservation::Blocked);
     }
 
     #[tokio::test]
