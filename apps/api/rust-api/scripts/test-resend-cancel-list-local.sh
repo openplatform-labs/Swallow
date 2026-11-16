@@ -20,6 +20,7 @@ GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_cancel_list(text,
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_cancel_detail(text,text,text,text,bigint,uuid) TO cancel_api_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_cancel_resolve(text,text,text,text,bigint,uuid,uuid,text,text) TO cancel_api_fixture;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_cancel_submit(text,text,text,text,bigint,uuid,uuid,text),public.novu_rust_operator_jwt_resend_cancel_command_get(text,text,text,text,bigint,uuid) TO cancel_api_fixture;
+GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_cancel_command_monitor(text,text,text,text,bigint,integer,boolean,uuid) TO cancel_api_fixture;
 GRANT USAGE ON SCHEMA public TO cancel_api_worker;
 GRANT EXECUTE ON FUNCTION public.novu_rust_resend_cancel_claim(text),public.novu_rust_resend_cancel_finish(text,uuid,text,integer) TO cancel_api_worker;
 GRANT EXECUTE ON FUNCTION public.novu_rust_operator_jwt_resend_cancel_grant_read(text,text,text,text,bigint,text,text,text,text,text),public.novu_rust_operator_jwt_resend_cancel_grant_change(text,text,text,text,bigint,uuid,text,text,text,text,text,boolean,boolean,text),public.novu_rust_operator_jwt_resend_cancel_grant_request(text,text,text,text,bigint,uuid),public.novu_rust_operator_jwt_resend_cancel_grant_audit_read(text,text,text,text,bigint,uuid) TO cancel_api_fixture;
@@ -32,12 +33,17 @@ INSERT INTO public.novu_rust_operator_jwt_resend_cancel_list_grants VALUES ('htt
 INSERT INTO public.novu_rust_operator_jwt_resend_cancel_detail_grants VALUES ('https://issuer.test','fixture','console','cancel-api-env');
 INSERT INTO public.novu_rust_operator_jwt_resend_cancel_resolution_grants VALUES ('https://issuer.test','fixture','console','cancel-api-env','confirmed');
 INSERT INTO public.novu_rust_operator_jwt_resend_cancel_submit_grants VALUES ('https://issuer.test','fixture','console','cancel-api-env');
+INSERT INTO public.novu_rust_operator_jwt_resend_cancel_command_health_grants VALUES ('https://issuer.test','fixture','console','cancel-api-env');
+INSERT INTO public.novu_rust_operator_jwt_resend_cancel_command_failed_list_grants VALUES ('https://issuer.test','fixture','console','cancel-api-env');
+INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'cancel-api-env',rolname,'alert_view',oid FROM pg_roles WHERE rolname='cancel_api_fixture';
 INSERT INTO public.novu_rust_resend_cancel_operators(environment_id,database_principal,principal_oid,can_read,can_resolve) SELECT 'cancel-api-env',rolname,oid,true,true FROM pg_roles WHERE rolname='cancel_api_fixture';
 INSERT INTO public.novu_rust_resend_cancel_operators(environment_id,database_principal,principal_oid,can_cancel) SELECT 'cancel-api-env',rolname,oid,true FROM pg_roles WHERE rolname='cancel_api_worker';
 INSERT INTO public.novu_rust_resend_cancel_submitters SELECT 'cancel-api-env',rolname,oid FROM pg_roles WHERE rolname='cancel_api_fixture';
 INSERT INTO public.novu_rust_resend_cancel_command_workers SELECT 'cancel-api-env',rolname,oid FROM pg_roles WHERE rolname='cancel_api_worker';
 INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status,resend_scheduled_at) VALUES('44444444-4444-4444-8444-444444444444','cancel-api-env','experimental_resend_email','{}','completed',clock_timestamp()+interval '1 hour'),('55555555-5555-4555-8555-555555555555','cancel-api-env','experimental_resend_email','{}','completed',clock_timestamp()+interval '1 hour');
 INSERT INTO public.novu_rust_resend_attempts(job_id,environment_id,state,provider_message_id) VALUES('44444444-4444-4444-8444-444444444444','cancel-api-env','accepted','fixture-cancel'),('55555555-5555-4555-8555-555555555555','cancel-api-env','accepted','fixture-ui');
+INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) VALUES('66666666-6666-4666-8666-666666666666','cancel-api-env','experimental_resend_email','{}','completed');
+INSERT INTO public.novu_rust_resend_cancel_commands(environment_id,request_id,job_id,reason,submitter,submitter_oid,state) SELECT 'cancel-api-env','ffffffff-ffff-4fff-8fff-ffffffffffff','66666666-6666-4666-8666-666666666666','failure fixture',rolname,oid,'failed' FROM pg_roles WHERE rolname='cancel_api_fixture';
 WITH jobs AS (INSERT INTO public.novu_queue_jobs(id,environment_id,kind,payload,status) SELECT gen_random_uuid(),'cancel-api-env','experimental_resend_email','{}','completed' FROM generate_series(1,56) RETURNING id)
 INSERT INTO public.novu_rust_resend_cancel_requests(environment_id,request_id,job_id,provider_id,database_principal,principal_oid,reason,state,created_at)
 SELECT 'cancel-api-env',gen_random_uuid(),jobs.id,'private-provider',rolname,oid,'private-reason','unknown',clock_timestamp()-interval '5 minutes' FROM jobs CROSS JOIN pg_roles WHERE rolname='cancel_api_fixture';
@@ -62,6 +68,6 @@ cargo build --quiet --locked --manifest-path "$WORKER/Cargo.toml" --bin resend-c
 env -i PATH="$PATH" DATABASE_URL="postgres://cancel_api_fixture@127.0.0.1:$DB_PORT/postgres" NOVU_POSTGRES_ALLOW_INSECURE=true LISTEN_ADDR="127.0.0.1:$API_PORT" SWALLOW_OPERATOR_JWT_CONFIG_FILE="$DIR/keys.json" SWALLOW_API_HEALTH_ENDPOINTS_ENABLED=true "$API/target/debug/novu-rust-api" >"$DIR/api.log" 2>&1 & API_PID=$!
 for _ in $(seq 1 100); do curl -fsS "http://127.0.0.1:$API_PORT/health/ready" >/dev/null 2>&1 && break; kill -0 "$API_PID"; sleep 0.1; done
 curl -fsS "http://127.0.0.1:$API_PORT/health/ready" >/dev/null
-(cd "$ROOT/apps/dashboard/swallow" && SWALLOW_UI_TEST_API="http://127.0.0.1:$API_PORT" SWALLOW_UI_TEST_JWT="$(cat "$DIR/jwt")" npm test -- --watch=false --include src/app/resend-cancel-list-integration.spec.ts --include src/app/resend-cancel-grants-integration.spec.ts)
+(cd "$ROOT/apps/dashboard/swallow" && SWALLOW_UI_TEST_API="http://127.0.0.1:$API_PORT" SWALLOW_UI_TEST_JWT="$(cat "$DIR/jwt")" npm test -- --watch=false --include src/app/resend-cancel-list-integration.spec.ts --include src/app/resend-cancel-grants-integration.spec.ts --include src/app/resend-cancel-command-health-integration.spec.ts)
 TEST_API="http://127.0.0.1:$API_PORT" TEST_JWT="$(cat "$DIR/jwt")" TEST_TARGET_JWT="$(cat "$DIR/target-jwt")" TEST_PSQL="$TEST_PG_BIN/psql" TEST_CANCEL_WORKER="$DIR/cancel-worker-fixture" TEST_DB_PORT="$DB_PORT" python3 "$API/tests/resend_cancel_list_http.py"
 echo 'Restricted JWT Resend cancellation list HTTP test passed.'

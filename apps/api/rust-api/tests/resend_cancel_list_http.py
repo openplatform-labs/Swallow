@@ -19,7 +19,7 @@ def grant(method,path,body=None):
     except urllib.error.HTTPError as e:return e.code,json.loads(e.read())
 target=os.environ['TEST_TARGET_JWT']
 target_params={'environmentId':'cancel-api-env','targetIssuer':'https://issuer.test','targetSubject':'target','targetClientId':'console','resource':'resend-cancel'}
-for n,permission in enumerate(['list','detail','confirmed','not_cancelled','submit'],1):
+for n,permission in enumerate(['list','detail','confirmed','not_cancelled','submit','command-health','command-list'],1):
     params={**target_params,'permission':permission};status,data=grant('GET','?'+urllib.parse.urlencode(params));assert status==200 and data['targetExists'] and not data['granted']
     body={'requestId':'11111111-1111-4111-8111-'+str(n).zfill(12),'targetIssuer':'https://issuer.test','targetSubject':'target','targetClientId':'console','resource':'resend-cancel','permission':permission,'expected':False,'desired':True,'reason':'delegate'}
     if n==1:
@@ -35,12 +35,22 @@ for n,permission in enumerate(['list','detail','confirmed','not_cancelled','subm
     assert grant('PUT','?environmentId=cancel-api-env',body)[1]['replayed']
     assert grant('PUT','?environmentId=cancel-api-env',{**body,'reason':'changed'})[0]==409
     assert grant('GET','?'+urllib.parse.urlencode(params))[1]['granted']
-status,audit=grant('GET','/audit?environmentId=cancel-api-env');assert status==200 and len(audit['data'])==7
+status,audit=grant('GET','/audit?environmentId=cancel-api-env');assert status==200 and len(audit['data'])==9
 query_target='environmentId=cancel-api-env&graceSeconds=60';assert get(query_target,target)[0]==200
 self_change={**body,'requestId':'22222222-2222-4222-8222-222222222222','targetSubject':'fixture'};assert grant('PUT','?environmentId=cancel-api-env',self_change)[0] in (401,403)
 revoke={**body,'requestId':'33333333-3333-4333-8333-333333333333','permission':'list','expected':True,'desired':False};assert grant('PUT','?environmentId=cancel-api-env',revoke)[0]==200
 assert get(query_target,target)[0] in (401,403)
 query='environmentId=cancel-api-env&graceSeconds=60'
+status,monitor=get(query,endpoint='resend-cancel-command-health');assert status==200 and monitor['unreviewed']==1
+status,failures=get(query,endpoint='resend-cancel-command-failures');assert status==200 and len(failures['data'])==1 and failures['data'][0]['requestId']=='ffffffff-ffff-4fff-8fff-ffffffffffff'
+sql("DELETE FROM public.novu_rust_operator_jwt_resend_cancel_command_health_grants WHERE environment_id='cancel-api-env' AND subject='fixture'")
+assert get(query,endpoint='resend-cancel-command-health')[0] in (401,403) and get(query,endpoint='resend-cancel-command-failures')[0]==200
+sql("INSERT INTO public.novu_rust_operator_jwt_resend_cancel_command_health_grants VALUES('https://issuer.test','fixture','console','cancel-api-env'); DELETE FROM public.novu_rust_operator_jwt_resend_cancel_command_failed_list_grants WHERE environment_id='cancel-api-env' AND subject='fixture'")
+assert get(query,endpoint='resend-cancel-command-failures')[0] in (401,403) and get(query,endpoint='resend-cancel-command-health')[0]==200
+sql("INSERT INTO public.novu_rust_operator_jwt_resend_cancel_command_failed_list_grants VALUES('https://issuer.test','fixture','console','cancel-api-env')")
+sql("DELETE FROM public.novu_rust_delivery_operator_grants WHERE environment_id='cancel-api-env' AND database_principal='cancel_api_fixture' AND decision='alert_view'")
+assert get(query,endpoint='resend-cancel-command-health')[0] in (401,403) and get(query,endpoint='resend-cancel-command-failures')[0] in (401,403)
+sql("INSERT INTO public.novu_rust_delivery_operator_grants(environment_id,database_principal,decision,principal_oid) SELECT 'cancel-api-env',rolname,'alert_view',oid FROM pg_roles WHERE rolname='cancel_api_fixture'")
 status,page=get(query);assert status==200 and len(page['data'])==50 and page['next'],(status,page)
 assert 'private' not in json.dumps(page)
 status,second=get(query+'&after='+page['next']);assert status==200 and len(second['data'])==5 and second['next'] is None

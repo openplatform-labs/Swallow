@@ -1,3 +1,5 @@
+Resend 취소 명령 감시 API·화면: API 0176과 운영 경보 화면에서 대기·기한 초과·미확인 실패와 실패 목록을 독립 권한으로 조회한다. 기존 위임 관리자의 권한 범위가 확대되며 API DB `alert_view`는 별도다. 제한 로그인·시험 JWT·실제 로컬 API와 jsdom으로 권한 분리와 화면을 검증했다. 실패 확인 UI, 실제 브라우저·IdP·운영 HA는 미완성이다. [API README](apps/api/rust-api/README.md)를 참고한다.
+
 Resend 취소 명령 대기·실패 감시: 워커 0263은 대기 기한 초과와 미확인 실패를 별도 집계하고 선택형 Slack·이메일 경보를 제공한다. 별도 DB 권한으로 실패 시각을 확인해 감사와 함께 검토할 수 있다. 격리 PostgreSQL·제한 계정·실제 워커와 차단된 경보 목적지, 모의 공급자로 검증했다. API·UI 검토, 명령 보존 정리, 실제 외부 경보·Resend 및 운영 HA는 미완성이다. [워커 README](apps/worker/rust-queue/README.md)를 참고한다.
 
 Resend 예약 취소 명령 API·화면: API 0175는 별도 JWT 제출 권한으로 명령을 감사와 함께 큐에 넣고 소유자가 원래 요청 ID로 상태를 조회한다. Angular 화면의 명시적 확인부터 제한된 전용 워커·모의 공급자까지 로컬 시험했으며 실제 Resend 취소는 미검증이다. 기존 취소 권한 관리자의 위임 범위에 제출 권한이 추가된다. 대기·실패 명령 경보, 메시지 상태 동기화와 실제 브라우저·IdP·운영 HA는 미완성이다. [API README](apps/api/rust-api/README.md)를 참고한다.
