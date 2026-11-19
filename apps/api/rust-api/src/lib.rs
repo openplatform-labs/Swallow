@@ -158,6 +158,8 @@ pub struct RuntimeConfig {
     operator_verifier: Option<Arc<operator_access_token::AccessTokenVerifier>>,
     operator_reload: Option<(OperatorReloadSource, std::time::Duration, bool, bool)>,
     operator_reload_health: Option<Arc<std::sync::Mutex<(std::time::Instant, bool)>>>,
+    /// When false (the default), operator console, JWT and delegation routes are not mounted.
+    operator_console: bool,
 }
 #[derive(Clone, Copy)]
 pub struct RejectResendAlternatives(pub bool);
@@ -313,6 +315,28 @@ impl RuntimeConfig {
         {
             return Err(invalid());
         }
+        // D49: operator/console/JWT/delegation APIs are off unless explicitly enabled.
+        let operator_console = match std::env::var("SWALLOW_OPERATOR_CONSOLE").as_deref() {
+            Ok("true") => true,
+            Ok("false") | Err(std::env::VarError::NotPresent) => false,
+            _ => return Err(invalid()),
+        };
+        if !operator_console {
+            return Ok(Self {
+                secret,
+                keys,
+                twilio,
+                resend,
+                require_jwt_exp,
+                reassert_fcm_registration,
+                reject_resend_alternatives,
+                reject_resend_attachment_disposition,
+                operator_verifier: None,
+                operator_reload: None,
+                operator_reload_health: None,
+                operator_console: false,
+            });
+        }
         let reload_interval = match std::env::var("SWALLOW_OPERATOR_JWT_RELOAD_SECONDS") {
             Ok(value) => Some(std::time::Duration::from_secs(value.parse::<u64>().ok().filter(|n| (1..=300).contains(n)).ok_or_else(invalid)?)),
             Err(std::env::VarError::NotPresent) => None,
@@ -380,6 +404,7 @@ impl RuntimeConfig {
             operator_verifier,
             operator_reload_health: operator_reload.as_ref().map(|_| Arc::new(std::sync::Mutex::new((std::time::Instant::now(), !require_initial_refresh)))),
             operator_reload,
+            operator_console: true,
         })
     }
     /// Start a single process-local key refresh loop; callers own process lifetime.
@@ -443,6 +468,7 @@ impl RuntimeConfig {
             self.resend.clone(),
             self.require_jwt_exp,
             self.reassert_fcm_registration,
+            self.operator_console,
         );
         let router = router.layer(Extension(RejectResendAlternatives(self.reject_resend_alternatives)))
             .layer(Extension(RejectResendAttachmentDisposition(self.reject_resend_attachment_disposition)));
@@ -475,6 +501,7 @@ pub fn router_with_subscriber_secret_and_exp_policy(
         None,
         require_exp,
         false,
+        true,
     )
 }
 
@@ -502,39 +529,13 @@ pub fn router_with_webhook_configs(
     twilio: Option<twilio_webhook::Config>,
     resend: Option<resend_webhook::Config>,
 ) -> Router {
-    router_with_webhook_configs_and_jwt_policy(db, secret, keys, twilio, resend, false, false)
+    router_with_webhook_configs_and_jwt_policy(db, secret, keys, twilio, resend, false, false, true)
 }
 
-fn router_with_webhook_configs_and_jwt_policy(
-    db: Arc<Client>,
-    secret: Option<Vec<u8>>,
-    keys: HashMap<String, Vec<String>>,
-    twilio: Option<twilio_webhook::Config>,
-    resend: Option<resend_webhook::Config>,
-    require_jwt_exp: bool,
-    reassert_fcm_registration: bool,
-) -> Router {
+/// Operator console, JWT identity and delegation APIs.
+/// Mounted only when `SWALLOW_OPERATOR_CONSOLE=true` (default off).
+fn operator_console_routes() -> Router<Arc<Client>> {
     Router::new()
-        .route(
-            "/webhooks/organizations/{organization}/environments/{environment}/email/resend",
-            post(resend_webhook::receive),
-        )
-        .route(
-            "/webhooks/organizations/{organization}/environments/{environment}/email/{provider}",
-            post(sendgrid_webhook::receive),
-        )
-        .route(
-            "/webhooks/organizations/{organization}/environments/{environment}/sms/twilio",
-            post(twilio_webhook::receive),
-        )
-        .route(
-            "/webhooks/organizations/{organization}/environments/{environment}/sms/twilio/jobs/{job}",
-            post(twilio_webhook::receive_job),
-        )
-        .route(
-            "/webhooks/organizations/{organization}/environments/{environment}/sms/twilio/jobs/{job}/attempts/{dispatch}",
-            post(twilio_webhook::receive_dispatch),
-        )
         .route("/v1/experimental/console/subscribers", get(console_subscribers::list))
         .route("/v1/experimental/operator/me", get(operator_identity::me))
         .route("/v1/experimental/operator/token/revoke-self", post(operator_identity::revoke_self))
@@ -738,8 +739,48 @@ fn router_with_webhook_configs_and_jwt_policy(
         .route("/v1/experimental/console/alerts/resolve-v2", post(console_alerts::resolve_v2))
         .route("/v1/experimental/console/alerts/request", get(console_alerts::request_status))
         .route("/v1/experimental/console/alerts/decisions", get(console_alerts::history))
-        .route("/v1/events/trigger", post(trigger))
         .route("/v1/experimental/operator/events/trigger", post(operator_trigger))
+}
+
+fn router_with_webhook_configs_and_jwt_policy(
+    db: Arc<Client>,
+    secret: Option<Vec<u8>>,
+    keys: HashMap<String, Vec<String>>,
+    twilio: Option<twilio_webhook::Config>,
+    resend: Option<resend_webhook::Config>,
+    require_jwt_exp: bool,
+    reassert_fcm_registration: bool,
+    operator_console: bool,
+) -> Router {
+    let router = Router::new()
+        .route(
+            "/webhooks/organizations/{organization}/environments/{environment}/email/resend",
+            post(resend_webhook::receive),
+        )
+        .route(
+            "/webhooks/organizations/{organization}/environments/{environment}/email/{provider}",
+            post(sendgrid_webhook::receive),
+        )
+        .route(
+            "/webhooks/organizations/{organization}/environments/{environment}/sms/twilio",
+            post(twilio_webhook::receive),
+        )
+        .route(
+            "/webhooks/organizations/{organization}/environments/{environment}/sms/twilio/jobs/{job}",
+            post(twilio_webhook::receive_job),
+        )
+        .route(
+            "/webhooks/organizations/{organization}/environments/{environment}/sms/twilio/jobs/{job}/attempts/{dispatch}",
+            post(twilio_webhook::receive_dispatch),
+        )
+        ;
+    let router = if operator_console {
+        router.merge(operator_console_routes())
+    } else {
+        router
+    };
+    router
+        .route("/v1/events/trigger", post(trigger))
         .route("/v1/experimental/workflow-trigger-result", get(workflow_trigger_result))
         .route("/v1/experimental/fcm-integrations", get(fcm_integrations::list).post(fcm_integrations::create))
         .route("/v1/experimental/fcm-integration-audit", get(fcm_integrations::audit))
